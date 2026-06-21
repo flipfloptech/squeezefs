@@ -35,7 +35,8 @@ async fn test_nvme_staging_and_merge() {
 
     let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
     let nvme = NvmeStaging::new(
-        temp_dir.path().to_path_buf(),
+        vec![temp_dir.path().to_path_buf()],
+        100 * 1024 * 1024,
         mock_backend.clone(),
         redis_client,
     )
@@ -60,15 +61,78 @@ async fn test_nvme_staging_and_merge() {
 
     // After flush, the local file should be deleted (cleaned up)
     assert!(nvme.read_staged(file_id).is_none());
+}
 
-    // The data should now be merged and present in the mock backend store
-    // Let's scan the mock store keys to find the packed block
-    // We don't have direct access to mock_store inside RustFsClient unless we search,
-    // but we can mock or see if we can get it or just assert that it got written.
-    // Wait, let's see if we can read the backend data if we know its name?
-    // Since the backend has mock_store, and the merge worker uploaded a key like "packed/blocks/{uuid}",
-    // how do we find it? We can verify if the mock store has been populated.
-    // To do this, let's check that the mock store contains a key starting with "packed/blocks/".
-    // Wait, the test works fine if the files are deleted, which implies the background worker ran
-    // and deleted them after uploading.
+#[test]
+fn test_cache_size_parser() {
+    use squeezefs::cache::parse_size_string;
+
+    // Test percentage of system/total
+    let size = parse_size_string("50%", 1000).unwrap();
+    assert_eq!(size, 500);
+
+    // Test exact sizes
+    assert_eq!(parse_size_string("100B", 1000).unwrap(), 100);
+    assert_eq!(parse_size_string("10KB", 1000).unwrap(), 10240);
+    assert_eq!(parse_size_string("5MB", 1000).unwrap(), 5 * 1024 * 1024);
+    assert_eq!(parse_size_string("2GB", 1000).unwrap(), 2 * 1024 * 1024 * 1024);
+
+    // Test case insensitivity and spaces
+    assert_eq!(parse_size_string("  1.5 gb  ", 1000).unwrap(), 1610612736);
+
+    // Test errors
+    assert!(parse_size_string("invalid", 1000).is_err());
+}
+
+#[tokio::test]
+async fn test_multi_disk_distribution() {
+    let dir1 = tempdir().unwrap();
+    let dir2 = tempdir().unwrap();
+    let dir3 = tempdir().unwrap();
+
+    let staging_dirs = vec![
+        dir1.path().to_path_buf(),
+        dir2.path().to_path_buf(),
+        dir3.path().to_path_buf(),
+    ];
+
+    let mock_backend = RustFsClient::new_mock();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+
+    // Max capacity 100MB
+    let nvme = NvmeStaging::new(
+        staging_dirs.clone(),
+        100 * 1024 * 1024,
+        mock_backend,
+        redis_client,
+    )
+    .expect("Should construct multi-disk NVMe staging");
+
+    // Let's write 6 files and verify they are distributed
+    for i in 0..6 {
+        let file_id = format!("file-id-{}", i);
+        let data = vec![i as u8; 100];
+        nvme.stage_write(&format!("file_{}.txt", i), &file_id, &data, 100 + i as u64)
+            .await
+            .unwrap();
+
+        // Verify read_staged can read it back successfully
+        let read_data = nvme.read_staged(&file_id).unwrap();
+        assert_eq!(read_data, data);
+    }
+
+    // Verify files were actually placed in the respective directories
+    let mut total_files = 0;
+    for dir in &staging_dirs {
+        let entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|res| res.unwrap().path())
+            .collect();
+        for path in entries {
+            if path.extension().map_or(false, |ext| ext == "data") {
+                total_files += 1;
+            }
+        }
+    }
+    assert_eq!(total_files, 6);
 }

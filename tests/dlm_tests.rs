@@ -165,3 +165,20 @@ async fn test_byte_range_locks() {
     lease1.release().await.expect("Should release");
     lease2.release().await.expect("Should release");
 }
+
+#[tokio::test]
+async fn test_cluster_client_initialization() {
+    use squeezefs::dlm::MetaClient;
+
+    // Single-node mode
+    let single_client = MetaClient::new("redis://127.0.0.1:6379").unwrap();
+    assert!(matches!(single_client, MetaClient::Single(_)));
+
+    // Cluster mode via comma-separated list
+    let cluster_client_comma = MetaClient::new("redis://127.0.0.1:6379,redis://127.0.0.1:6380").unwrap();
+    assert!(matches!(cluster_client_comma, MetaClient::Cluster(_)));
+
+    // Cluster mode via protocol prefix
+    let cluster_client_proto = MetaClient::new("redis+cluster://127.0.0.1:6379").unwrap();
+    assert!(matches!(cluster_client_proto, MetaClient::Cluster(_)));
+}

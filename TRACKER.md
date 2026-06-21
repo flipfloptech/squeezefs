@@ -70,9 +70,9 @@ JuiceFS is the gold standard for POSIX distributed filesystems. To achieve absol
 - [x] Add integration tests in `tests/metadata_tests.rs` for partial writes and random access offsets.
 
 ### Phase 2: Metadata Scale & HA
-- [ ] Implement cluster slots mapping for Garnet to scale to 15,000+ nodes.
-- [ ] Implement read scaling: redirect read-only metadata lookups to Garnet replicas.
-- [ ] Add heartbeat lease renewal logging in `dlm.rs`.
+- [x] Implement cluster slots mapping for Garnet to scale to 15,000+ nodes.
+- [x] Implement read scaling: redirect read-only metadata lookups to Garnet replicas.
+- [x] Add heartbeat lease renewal logging in `dlm.rs`.
 
 ### Phase 3: GPU Direct Storage (GDS) integration
 - [ ] Add conditional compilation features for CUDA / GDS.

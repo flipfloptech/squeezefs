@@ -3,7 +3,7 @@ use crate::error::SqueezefsError;
 use crate::routing::DataRouter;
 use fuse3::raw::{
     prelude::*,
-    reply::{DirectoryEntry, FileAttr},
+    reply::{DirectoryEntry, FileAttr, ReplyCopyFileRange},
     Request,
 };
 use fuse3::{Errno, MountOptions, Result as FuseResult, Timestamp};
@@ -1416,6 +1416,134 @@ impl Filesystem for SqueezefsFilesystem {
         let stream = stream::iter(filtered_entries.into_iter().map(Ok)).boxed();
 
         Ok(ReplyDirectoryPlus { entries: stream })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_file_range(
+        &self,
+        _req: Request,
+        inode: u64,
+        _fh_in: u64,
+        off_in: u64,
+        inode_out: u64,
+        _fh_out: u64,
+        off_out: u64,
+        length: u64,
+        _flags: u64,
+    ) -> FuseResult<ReplyCopyFileRange> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            "FUSE copy_file_range: src_ino = {}, off_in = {}, dest_ino = {}, off_out = {}, length = {}",
+            inode, off_in, inode_out, off_out, length
+        );
+
+        let src_path = format!("inode_{}", inode);
+        let dest_path = format!("inode_{}", inode_out);
+
+        // 1. Acquire locks on both files to ensure consistency
+        let _src_lease = match self
+            .dlm
+            .acquire_lock(&src_path, None, Duration::from_secs(5))
+            .await
+        {
+            Ok(l) => l,
+            Err(_) => return Err(Errno::from(libc::EAGAIN)),
+        };
+        let dest_lease = match self
+            .dlm
+            .acquire_lock(&dest_path, None, Duration::from_secs(5))
+            .await
+        {
+            Ok(l) => l,
+            Err(_) => return Err(Errno::from(libc::EAGAIN)),
+        };
+
+        // 2. Read sizes to check if we can perform metadata clone
+        let src_size = self
+            .router
+            .get_file_size(&src_path)
+            .await
+            .map_err(map_squeezefs_err)?;
+        let dest_size = self.router.get_file_size(&dest_path).await.unwrap_or(0);
+
+        if off_in == 0 && off_out == 0 && length >= src_size && dest_size == 0 {
+            // Drop locks before cloning, clone_file will re-acquire them.
+            drop(_src_lease);
+            drop(dest_lease);
+
+            self.router
+                .clone_file(&src_path, &dest_path)
+                .await
+                .map_err(map_squeezefs_err)?;
+
+            // Update destination attributes size and times in Garnet
+            if let Ok(mut con) = self.dlm.get_connection().await {
+                let attr_key = format!("squeezefs:attr:{}", inode_out);
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO);
+                let sec = now.as_secs() as i64;
+                let nsec = now.subsec_nanos();
+                let _: Result<(), redis::RedisError> = redis::pipe()
+                    .hset(&attr_key, "size", src_size)
+                    .hset(&attr_key, "mtime_sec", sec)
+                    .hset(&attr_key, "mtime_nsec", nsec)
+                    .hset(&attr_key, "ctime_sec", sec)
+                    .hset(&attr_key, "ctime_nsec", nsec)
+                    .query_async(&mut con)
+                    .await;
+            }
+
+            return Ok(ReplyCopyFileRange { copied: src_size });
+        }
+
+        // 3. General copy: read range from source, write to destination
+        let src_data = self
+            .router
+            .read_file(&src_path)
+            .await
+            .map_err(map_squeezefs_err)?;
+        if off_in >= src_data.len() as u64 {
+            return Ok(ReplyCopyFileRange { copied: 0 });
+        }
+
+        let start = off_in as usize;
+        let end = std::cmp::min((off_in + length) as usize, src_data.len());
+        let chunk = &src_data[start..end];
+
+        if chunk.is_empty() {
+            return Ok(ReplyCopyFileRange { copied: 0 });
+        }
+
+        // Perform write to destination
+        self.router
+            .write_file(&dest_path, off_out, chunk, dest_lease.fencing_token())
+            .await
+            .map_err(map_squeezefs_err)?;
+
+        // Update destination size and times in Garnet
+        let copied_len = chunk.len() as u64;
+        let new_dest_size = std::cmp::max(dest_size, off_out + copied_len);
+
+        if let Ok(mut con) = self.dlm.get_connection().await {
+            let attr_key = format!("squeezefs:attr:{}", inode_out);
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO);
+            let sec = now.as_secs() as i64;
+            let nsec = now.subsec_nanos();
+            let _: Result<(), redis::RedisError> = redis::pipe()
+                .hset(&attr_key, "size", new_dest_size)
+                .hset(&attr_key, "mtime_sec", sec)
+                .hset(&attr_key, "mtime_nsec", nsec)
+                .hset(&attr_key, "ctime_sec", sec)
+                .hset(&attr_key, "ctime_nsec", nsec)
+                .query_async(&mut con)
+                .await;
+        }
+
+        Ok(ReplyCopyFileRange { copied: copied_len })
     }
 }
 

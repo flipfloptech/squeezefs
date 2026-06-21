@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let router = DataRouter::new(dlm, backend, cache);
 
             println!("Cloning file from {} to {}...", src, dest);
-            router.clone_file(&src, &dest).await?;
+            router.clone_path(&src, &dest).await?;
             println!("File cloned successfully.");
         }
     }

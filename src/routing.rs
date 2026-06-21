@@ -6,6 +6,7 @@ use crate::fuse_client::METRICS;
 use log::debug;
 use redis::AsyncCommands;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -926,6 +927,116 @@ impl DataRouter {
             }
         }
         self.cache.lru.remove(file_path);
+        Ok(())
+    }
+
+    /// Resolve a logical filesystem path (e.g., "/dir1/file.txt") to its FUSE inode number.
+    pub async fn resolve_path_to_inode(&self, path: &str) -> Result<u64> {
+        let mut con = self.dlm.get_connection().await?;
+        let mut current_ino = 1u64; // Root inode
+
+        for part in path.split('/') {
+            if part.is_empty() || part == "." {
+                continue;
+            }
+            let dir_key = format!("squeezefs:dir:{}", current_ino);
+            let next_ino_opt: Option<u64> = con.hget(&dir_key, part).await?;
+            match next_ino_opt {
+                Some(next_ino) => {
+                    current_ino = next_ino;
+                }
+                None => {
+                    return Err(SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "Path component '{}' not found in inode {}",
+                            part, current_ino
+                        ),
+                    )));
+                }
+            }
+        }
+
+        Ok(current_ino)
+    }
+
+    /// Clone a path to another path metadata-only.
+    pub async fn clone_path(&self, src_path: &str, dest_path: &str) -> Result<()> {
+        // Resolve source path to inode
+        let src_ino = self.resolve_path_to_inode(src_path).await?;
+
+        // Parse dest path into parent path and file name
+        let dest_p = std::path::Path::new(dest_path);
+        let parent_str = dest_p.parent().and_then(|p| p.to_str()).unwrap_or("");
+        let file_name = dest_p.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            SqueezefsError::InvalidOperation("Invalid destination filename".to_string())
+        })?;
+
+        // Resolve parent directory to inode
+        let parent_ino = self.resolve_path_to_inode(parent_str).await?;
+
+        let mut con = self.dlm.get_connection().await?;
+        let parent_dir_key = format!("squeezefs:dir:{}", parent_ino);
+
+        // Check if destination already exists
+        let exists: bool = con.hexists(&parent_dir_key, file_name).await?;
+        if exists {
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Destination file '{}' already exists", dest_path),
+            )));
+        }
+
+        // Generate new inode number
+        let dest_ino: u64 = con.incr("squeezefs:inode_counter", 1).await?;
+
+        // Retrieve attributes of source inode
+        let src_attr_key = format!("squeezefs:attr:{}", src_ino);
+        let size_opt: Option<u64> = con.hget(&src_attr_key, "size").await?;
+        let size = size_opt.unwrap_or(0);
+        let mode_opt: Option<u32> = con.hget(&src_attr_key, "mode").await?;
+        let mode = mode_opt.unwrap_or(0o644);
+        let uid_opt: Option<u32> = con.hget(&src_attr_key, "uid").await?;
+        let uid = uid_opt.unwrap_or(1000);
+        let gid_opt: Option<u32> = con.hget(&src_attr_key, "gid").await?;
+        let gid = gid_opt.unwrap_or(1000);
+        let kind_opt: Option<u8> = con.hget(&src_attr_key, "kind").await?;
+        let kind = kind_opt.unwrap_or(1); // 1 = Regular file
+
+        // Set attributes of destination inode
+        let dest_attr_key = format!("squeezefs:attr:{}", dest_ino);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        let sec = now.as_secs() as i64;
+        let nsec = now.subsec_nanos();
+
+        let mut pipe = redis::pipe();
+        pipe.hset(&dest_attr_key, "ino", dest_ino)
+            .hset(&dest_attr_key, "size", size)
+            .hset(&dest_attr_key, "blocks", size.div_ceil(512))
+            .hset(&dest_attr_key, "atime_sec", sec)
+            .hset(&dest_attr_key, "atime_nsec", nsec)
+            .hset(&dest_attr_key, "mtime_sec", sec)
+            .hset(&dest_attr_key, "mtime_nsec", nsec)
+            .hset(&dest_attr_key, "ctime_sec", sec)
+            .hset(&dest_attr_key, "ctime_nsec", nsec)
+            .hset(&dest_attr_key, "kind", kind)
+            .hset(&dest_attr_key, "mode", mode)
+            .hset(&dest_attr_key, "nlink", 1)
+            .hset(&dest_attr_key, "uid", uid)
+            .hset(&dest_attr_key, "gid", gid)
+            .hset(&dest_attr_key, "rdev", 0)
+            .hset(&parent_dir_key, file_name, dest_ino);
+        let _: () = pipe.query_async(&mut con).await?;
+
+        // Clone the underlying data blocks/metadata
+        self.clone_file(
+            &format!("inode_{}", src_ino),
+            &format!("inode_{}", dest_ino),
+        )
+        .await?;
+
         Ok(())
     }
 }

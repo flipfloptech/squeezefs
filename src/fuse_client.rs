@@ -600,7 +600,7 @@ impl Filesystem for SqueezefsFilesystem {
         // 2. Perform progressive routed write with fencing token
         let write_future = self
             .router
-            .write_file(&file_path, data, lease.fencing_token());
+            .write_file(&file_path, offset, data, lease.fencing_token());
 
         // Timeout protection (fail fast within 2 seconds)
         match tokio::time::timeout(Duration::from_secs(2), write_future).await {

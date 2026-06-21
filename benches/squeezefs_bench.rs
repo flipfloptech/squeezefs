@@ -45,7 +45,7 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     group.bench_function("write_micro_file_1kb", |b| {
         b.to_async(&rt).iter(|| async {
             router
-                .write_file("bench_micro.bin", &micro_data, 1)
+                .write_file("bench_micro.bin", 0, &micro_data, 1)
                 .await
                 .unwrap();
         });
@@ -56,7 +56,7 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     group.bench_function("write_small_file_128kb", |b| {
         b.to_async(&rt).iter(|| async {
             router
-                .write_file("bench_small.bin", &small_data, 2)
+                .write_file("bench_small.bin", 0, &small_data, 2)
                 .await
                 .unwrap();
         });

@@ -1,7 +1,7 @@
 use fuse3::raw::{prelude::*, Request};
 use fuse3::Errno;
-use squeezefs::backend::RustFsClient;
 use redis::AsyncCommands;
+use squeezefs::backend::RustFsClient;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;

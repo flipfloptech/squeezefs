@@ -49,7 +49,7 @@ async fn test_route_micro_file_inline() {
 
     // Write file
     router
-        .write_file(file_path, &data, 101)
+        .write_file(file_path, 0, &data, 101)
         .await
         .expect("Should write micro file");
 
@@ -83,7 +83,7 @@ async fn test_route_small_file_staged() {
 
     // Write file
     router
-        .write_file(file_path, &data, 102)
+        .write_file(file_path, 0, &data, 102)
         .await
         .expect("Should write small file");
 
@@ -127,7 +127,7 @@ async fn test_route_large_file_striped() {
 
     // Write file
     router
-        .write_file(file_path, &data, 103)
+        .write_file(file_path, 0, &data, 103)
         .await
         .expect("Should write large file");
 

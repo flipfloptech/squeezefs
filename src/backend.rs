@@ -1,8 +1,10 @@
 use crate::error::{Result, SqueezefsError};
+use crate::fuse_client::METRICS;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
 use dashmap::DashMap;
 use log::{info, warn};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -100,6 +102,7 @@ impl RustFsClient {
     /// Upload data to S3.
     /// Before uploading, checks if a newer fencing token has already been written.
     pub async fn put_object(&self, key: &str, data: Vec<u8>, fencing_token: u64) -> Result<()> {
+        METRICS.put_obj.fetch_add(1, Ordering::Relaxed);
         if let Some(store) = &self.mock_store {
             if let Some(existing) = store.get(key) {
                 let (_, existing_token) = *existing;
@@ -150,6 +153,7 @@ impl RustFsClient {
 
     /// Download data from S3.
     pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
+        METRICS.get_obj.fetch_add(1, Ordering::Relaxed);
         if let Some(store) = &self.mock_store {
             if let Some(val) = store.get(key) {
                 return Ok(val.0.clone());
@@ -190,6 +194,7 @@ impl RustFsClient {
 
     /// Delete an object from S3.
     pub async fn delete_object(&self, key: &str) -> Result<()> {
+        METRICS.del_obj.fetch_add(1, Ordering::Relaxed);
         if let Some(store) = &self.mock_store {
             store.remove(key);
             return Ok(());

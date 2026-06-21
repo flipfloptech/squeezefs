@@ -2,8 +2,10 @@ use crate::backend::RustFsClient;
 use crate::cache::TieredCache;
 use crate::dlm::DlmClient;
 use crate::error::{Result, SqueezefsError};
+use crate::fuse_client::METRICS;
 use log::{debug, info};
 use redis::AsyncCommands;
+use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -24,6 +26,7 @@ impl DataRouter {
 
     /// Write file data using progressive data layout routing.
     pub async fn write_file(&self, file_path: &str, data: &[u8], fencing_token: u64) -> Result<()> {
+        METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         let size = data.len();
 
         if size < 64 * 1024 {
@@ -151,12 +154,14 @@ impl DataRouter {
     pub async fn read_file(&self, file_path: &str) -> Result<Vec<u8>> {
         // Tier 2 check: System RAM LRU Cache
         if let Some(cached_data) = self.cache.lru.get(file_path) {
+            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!(
                 "Routing: Cache hit (Tier 2 - Unified System RAM) for '{}'",
                 file_path
             );
             return Ok(cached_data);
         }
+        METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         // Fetch file metadata from Garnet
         let mut con = self
@@ -193,6 +198,7 @@ impl DataRouter {
                 })?;
 
                 if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
+                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     debug!(
                         "Routing: Cache hit (Tier 3 - NVMe Staging) for '{}' (ID: {})",
                         file_path, file_id
@@ -295,5 +301,9 @@ impl DataRouter {
 
     pub fn cache(&self) -> &TieredCache {
         &self.cache
+    }
+
+    pub fn backend(&self) -> &RustFsClient {
+        &self.backend
     }
 }

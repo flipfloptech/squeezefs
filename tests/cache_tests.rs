@@ -75,7 +75,10 @@ fn test_cache_size_parser() {
     assert_eq!(parse_size_string("100B", 1000).unwrap(), 100);
     assert_eq!(parse_size_string("10KB", 1000).unwrap(), 10240);
     assert_eq!(parse_size_string("5MB", 1000).unwrap(), 5 * 1024 * 1024);
-    assert_eq!(parse_size_string("2GB", 1000).unwrap(), 2 * 1024 * 1024 * 1024);
+    assert_eq!(
+        parse_size_string("2GB", 1000).unwrap(),
+        2 * 1024 * 1024 * 1024
+    );
 
     // Test case insensitivity and spaces
     assert_eq!(parse_size_string("  1.5 gb  ", 1000).unwrap(), 1610612736);
@@ -129,7 +132,7 @@ async fn test_multi_disk_distribution() {
             .map(|res| res.unwrap().path())
             .collect();
         for path in entries {
-            if path.extension().map_or(false, |ext| ext == "data") {
+            if path.extension().is_some_and(|ext| ext == "data") {
                 total_files += 1;
             }
         }

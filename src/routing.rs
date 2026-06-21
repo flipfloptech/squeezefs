@@ -115,12 +115,12 @@ impl DataRouter {
                 let old_data_path = self
                     .cache
                     .nvme
-                    .staging_dir()
+                    .get_staged_path(&old_id)
                     .join(format!("{}.data", old_id));
                 let old_meta_path = self
                     .cache
                     .nvme
-                    .staging_dir()
+                    .get_staged_path(&old_id)
                     .join(format!("{}.meta", old_id));
                 let _ = tokio::fs::remove_file(old_data_path).await;
                 let _ = tokio::fs::remove_file(old_meta_path).await;
@@ -161,12 +161,12 @@ impl DataRouter {
                 let old_data_path = self
                     .cache
                     .nvme
-                    .staging_dir()
+                    .get_staged_path(&old_id)
                     .join(format!("{}.data", old_id));
                 let old_meta_path = self
                     .cache
                     .nvme
-                    .staging_dir()
+                    .get_staged_path(&old_id)
                     .join(format!("{}.meta", old_id));
                 let _ = tokio::fs::remove_file(old_data_path).await;
                 let _ = tokio::fs::remove_file(old_meta_path).await;
@@ -234,12 +234,12 @@ impl DataRouter {
                 let old_data_path = self
                     .cache
                     .nvme
-                    .staging_dir()
+                    .get_staged_path(&old_id)
                     .join(format!("{}.data", old_id));
                 let old_meta_path = self
                     .cache
                     .nvme
-                    .staging_dir()
+                    .get_staged_path(&old_id)
                     .join(format!("{}.meta", old_id));
                 let _ = tokio::fs::remove_file(old_data_path).await;
                 let _ = tokio::fs::remove_file(old_meta_path).await;

@@ -32,7 +32,9 @@ async fn setup_fs() -> Option<(SqueezefsFilesystem, tempfile::TempDir)> {
     let backend = RustFsClient::new().await;
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
-        temp_dir.path().to_path_buf(),
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         backend.clone(),
         dlm.redis_client().clone(),
     )

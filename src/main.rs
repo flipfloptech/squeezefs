@@ -27,6 +27,18 @@ enum Commands {
     Mount {
         /// Path to mount the filesystem at
         mountpoint: PathBuf,
+
+        /// Memory cache limit (e.g., "128GB" or "50%")
+        #[arg(long)]
+        mem_cache_size: Option<String>,
+
+        /// Disk cache limit (e.g., "200GB" or "80%")
+        #[arg(long)]
+        disk_cache_size: Option<String>,
+
+        /// Comma-separated paths to local staging/cache directories
+        #[arg(long, value_delimiter = ',')]
+        disk_cache_paths: Option<Vec<PathBuf>>,
     },
     /// Benchmark performance of the filesystem
     Bench {
@@ -47,16 +59,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Mount { mountpoint } => {
+        Commands::Mount {
+            mountpoint,
+            mem_cache_size,
+            disk_cache_size,
+            disk_cache_paths,
+        } => {
             let redis_url = std::env::var("GARNET_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-            let staging_dir = PathBuf::from("/tmp/squeezefs_staging");
-            fs::create_dir_all(&staging_dir).await?;
+            let staging_dirs = if let Some(dirs) = disk_cache_paths {
+                if dirs.is_empty() {
+                    vec![PathBuf::from("/tmp/squeezefs_staging")]
+                } else {
+                    dirs
+                }
+            } else {
+                vec![PathBuf::from("/tmp/squeezefs_staging")]
+            };
+
+            for dir in &staging_dirs {
+                fs::create_dir_all(dir).await?;
+            }
 
             println!("Initializing distributed clients...");
             let dlm = DlmClient::new(&redis_url)?;
             let backend = RustFsClient::new().await;
-            let cache = TieredCache::new(staging_dir, backend.clone(), dlm.redis_client().clone())?;
+            let cache = TieredCache::new(
+                staging_dirs,
+                mem_cache_size.as_deref(),
+                disk_cache_size.as_deref(),
+                backend.clone(),
+                dlm.redis_client().clone(),
+            )?;
             let router = DataRouter::new(dlm.clone(), backend, cache);
             let fs_engine = SqueezefsFilesystem::new(router, dlm);
 

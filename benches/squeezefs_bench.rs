@@ -30,7 +30,9 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     let temp_dir = tempdir().unwrap();
     let cache = rt.block_on(async {
         TieredCache::new(
-            temp_dir.path().to_path_buf(),
+            vec![temp_dir.path().to_path_buf()],
+            None,
+            None,
             backend.clone(),
             dlm.redis_client().clone(),
         )

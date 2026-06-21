@@ -2,14 +2,15 @@ use crate::backend::RustFsClient;
 use crate::error::{Result, SqueezefsError};
 use log::{debug, error, info, warn};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct NvmeStaging {
-    staging_dir: PathBuf,
+    staging_dirs: Vec<PathBuf>,
+    max_bytes: u64,
     backend: RustFsClient,
     redis_client: redis::Client,
     write_tx: mpsc::Sender<PendingStagedWrite>,
@@ -22,21 +23,40 @@ pub struct PendingStagedWrite {
     pub fencing_token: u64,
 }
 
+fn get_dir_index(file_id: &str, num_dirs: usize) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    file_id.hash(&mut hasher);
+    (hasher.finish() as usize) % num_dirs
+}
+
 impl NvmeStaging {
     pub fn new(
-        staging_dir: PathBuf,
+        staging_dirs: Vec<PathBuf>,
+        max_bytes: u64,
         backend: RustFsClient,
         redis_client: redis::Client,
     ) -> Result<Self> {
-        // Ensure staging directory exists
-        if !staging_dir.exists() {
-            fs::create_dir_all(&staging_dir)?;
+        if staging_dirs.is_empty() {
+            return Err(SqueezefsError::InvalidOperation(
+                "At least one staging directory must be specified".to_string(),
+            ));
+        }
+
+        // Ensure all staging directories exist
+        for dir in &staging_dirs {
+            if !dir.exists() {
+                fs::create_dir_all(dir)?;
+            }
         }
 
         let (write_tx, write_rx) = mpsc::channel::<PendingStagedWrite>(1000);
 
         let staging = Self {
-            staging_dir: staging_dir.clone(),
+            staging_dirs: staging_dirs.clone(),
+            max_bytes,
             backend: backend.clone(),
             redis_client: redis_client.clone(),
             write_tx,
@@ -48,6 +68,12 @@ impl NvmeStaging {
         Ok(staging)
     }
 
+    /// Retrieve the staging directory for a specific file_id.
+    pub fn get_staged_path(&self, file_id: &str) -> PathBuf {
+        let idx = get_dir_index(file_id, self.staging_dirs.len());
+        self.staging_dirs[idx].clone()
+    }
+
     /// Stage a write locally to NVMe staging, returning immediately.
     /// The background worker will pack it and upload it asynchronously.
     pub async fn stage_write(
@@ -57,8 +83,35 @@ impl NvmeStaging {
         data: &[u8],
         fencing_token: u64,
     ) -> Result<()> {
-        let data_path = self.staging_dir.join(format!("{}.data", file_id));
-        let meta_path = self.staging_dir.join(format!("{}.meta", file_id));
+        // Enforce max bytes capacity constraint
+        let mut total_staged_bytes = 0u64;
+        for dir in &self.staging_dirs {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file()
+                            && entry.path().extension().is_some_and(|ext| ext == "data")
+                        {
+                            total_staged_bytes += meta.len();
+                        }
+                    }
+                }
+            }
+        }
+
+        if total_staged_bytes + data.len() as u64 > self.max_bytes {
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "Local NVMe staging cache capacity exceeded: current {} bytes, writing {} bytes, max capacity {} bytes",
+                    total_staged_bytes, data.len(), self.max_bytes
+                )
+            )));
+        }
+
+        let target_dir = self.get_staged_path(file_id);
+        let data_path = target_dir.join(format!("{}.data", file_id));
+        let meta_path = target_dir.join(format!("{}.meta", file_id));
 
         // Write the data and metadata to NVMe staging synchronously
         fs::write(&data_path, data)?;
@@ -93,7 +146,8 @@ impl NvmeStaging {
 
     /// Read staged data directly from NVMe if it exists locally and has not yet been merged/cleared.
     pub fn read_staged(&self, file_id: &str) -> Option<Vec<u8>> {
-        let data_path = self.staging_dir.join(format!("{}.data", file_id));
+        let target_dir = self.get_staged_path(file_id);
+        let data_path = target_dir.join(format!("{}.data", file_id));
         if data_path.exists() {
             fs::read(data_path).ok()
         } else {
@@ -103,7 +157,7 @@ impl NvmeStaging {
 
     /// Start background merge worker.
     fn start_merge_worker(&self, mut write_rx: mpsc::Receiver<PendingStagedWrite>) {
-        let staging_dir = self.staging_dir.clone();
+        let staging_dirs = self.staging_dirs.clone();
         let backend = self.backend.clone();
         let redis_client = self.redis_client.clone();
 
@@ -119,7 +173,8 @@ impl NvmeStaging {
 
                 tokio::select! {
                     Some(pending) = write_rx.recv() => {
-                        let local_path = staging_dir.join(format!("{}.data", pending.file_id));
+                        let idx = get_dir_index(&pending.file_id, staging_dirs.len());
+                        let local_path = staging_dirs[idx].join(format!("{}.data", pending.file_id));
                         if let Ok(metadata) = fs::metadata(&local_path) {
                             current_bytes += metadata.len();
                             batch.push(pending);
@@ -127,7 +182,7 @@ impl NvmeStaging {
 
                         if current_bytes >= max_batch_bytes {
                             info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_dir, &backend, &redis_client, &mut batch, &mut current_bytes).await {
+                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes).await {
                                 error!("Failed to flush NVMe staging batch: {:?}", e);
                             }
                         }
@@ -135,7 +190,7 @@ impl NvmeStaging {
                     _ = &mut sleep => {
                         if !batch.is_empty() {
                             info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_dir, &backend, &redis_client, &mut batch, &mut current_bytes).await {
+                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes).await {
                                 error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
                             }
                         }
@@ -147,7 +202,7 @@ impl NvmeStaging {
 
     /// Merge the batch of NVMe files, upload to S3 (RustFS), and record mappings.
     async fn flush_batch(
-        staging_dir: &Path,
+        staging_dirs: &[PathBuf],
         backend: &RustFsClient,
         redis_client: &redis::Client,
         batch: &mut Vec<PendingStagedWrite>,
@@ -166,7 +221,8 @@ impl NvmeStaging {
 
         // 1. Pack individual staged file bytes into one payload
         for item in batch.iter() {
-            let local_path = staging_dir.join(format!("{}.data", item.file_id));
+            let idx = get_dir_index(&item.file_id, staging_dirs.len());
+            let local_path = staging_dirs[idx].join(format!("{}.data", item.file_id));
             if let Ok(data) = fs::read(&local_path) {
                 let offset = packed_payload.len() as u64;
                 let size = data.len() as u64;
@@ -207,13 +263,15 @@ impl NvmeStaging {
 
         // 4. Remove local NVMe staging files
         for item in batch.iter() {
-            let local_path = staging_dir.join(format!("{}.data", item.file_id));
+            let idx = get_dir_index(&item.file_id, staging_dirs.len());
+            let target_dir = &staging_dirs[idx];
+            let local_path = target_dir.join(format!("{}.data", item.file_id));
             if local_path.exists() {
                 if let Err(e) = fs::remove_file(&local_path) {
                     error!("Failed to remove staged file {:?}: {:?}", local_path, e);
                 }
             }
-            let meta_path = staging_dir.join(format!("{}.meta", item.file_id));
+            let meta_path = target_dir.join(format!("{}.meta", item.file_id));
             if meta_path.exists() {
                 if let Err(e) = fs::remove_file(&meta_path) {
                     error!(
@@ -231,7 +289,7 @@ impl NvmeStaging {
         Ok(())
     }
 
-    pub fn staging_dir(&self) -> &Path {
-        &self.staging_dir
+    pub fn staging_dirs(&self) -> &[PathBuf] {
+        &self.staging_dirs
     }
 }

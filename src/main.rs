@@ -39,6 +39,10 @@ enum Commands {
         /// Comma-separated paths to local staging/cache directories
         #[arg(long, value_delimiter = ',')]
         disk_cache_paths: Option<Vec<PathBuf>>,
+
+        /// Comma-separated list of local source IP interfaces for multi-rail connection bonding
+        #[arg(long, value_delimiter = ',')]
+        local_ips: Option<Vec<std::net::IpAddr>>,
     },
     /// Benchmark performance of the filesystem
     Bench {
@@ -73,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
+            local_ips,
         } => {
             let redis_url = std::env::var("GARNET_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -94,8 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = tune_system();
 
             println!("Initializing distributed clients...");
-            let dlm = DlmClient::new(&redis_url)?;
-            let backend = RustFsClient::new().await;
+            let dlm =
+                DlmClient::new_with_local_ips(&redis_url, local_ips.clone().unwrap_or_default())
+                    .await?;
+            let backend = RustFsClient::new_with_local_ips(local_ips.unwrap_or_default()).await;
             let cache = TieredCache::new(
                 staging_dirs,
                 mem_cache_size.as_deref(),

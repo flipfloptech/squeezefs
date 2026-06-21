@@ -1,7 +1,9 @@
 use crate::error::{Result, SqueezefsError};
-use log::{debug, error};
+use log::{debug, error, warn};
 use redis::aio::ConnectionLike;
 use redis::AsyncCommands;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -11,6 +13,11 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub enum MetaClient {
     Single(redis::Client),
+    SingleBound {
+        client: redis::Client,
+        bound_conns: Vec<redis::aio::MultiplexedConnection>,
+        current_idx: std::sync::Arc<AtomicUsize>,
+    },
     Cluster(redis::cluster::ClusterClient),
     Sentinel(std::sync::Arc<tokio::sync::Mutex<redis::sentinel::SentinelClient>>),
 }
@@ -49,6 +56,37 @@ impl ConnectionLike for MetaConnection {
             MetaConnection::Cluster(c) => c.get_db(),
         }
     }
+}
+
+fn resolve_redis_addr(redis_url: &str) -> Result<SocketAddr> {
+    let cleaned = redis_url.strip_prefix("redis://").unwrap_or(redis_url);
+    let host_port = cleaned.split('/').next().unwrap_or(cleaned);
+    let host_port = host_port.split('?').next().unwrap_or(host_port);
+
+    let parts: Vec<&str> = host_port.split(':').collect();
+    let host = parts[0];
+    let port = if parts.len() > 1 {
+        parts[1].parse::<u16>().unwrap_or(6379)
+    } else {
+        6379
+    };
+
+    use std::net::ToSocketAddrs;
+    let addrs = (host, port).to_socket_addrs().map_err(|e| {
+        SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("DNS lookup failed for {}:{}: {:?}", host, port, e),
+        ))
+    })?;
+
+    if let Some(addr) = addrs.into_iter().next() {
+        return Ok(addr);
+    }
+
+    Err(SqueezefsError::Io(std::io::Error::new(
+        std::io::ErrorKind::AddrNotAvailable,
+        format!("No resolved addresses for host: {}", host),
+    )))
 }
 
 impl MetaClient {
@@ -105,11 +143,129 @@ impl MetaClient {
         }
     }
 
+    pub async fn new_with_local_ips(redis_url: &str, local_ips: Vec<IpAddr>) -> Result<Self> {
+        let is_sentinel = redis_url.starts_with("redis-sentinel://");
+        let is_cluster = !is_sentinel
+            && (redis_url.contains(',')
+                || redis_url.starts_with("redis+cluster://")
+                || redis_url.contains("cluster=true"));
+
+        if is_cluster {
+            let cleaned_url = redis_url.replace("redis+cluster://", "redis://");
+            let nodes: Vec<&str> = cleaned_url
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let client = redis::cluster::ClusterClientBuilder::new(nodes)
+                .read_from_replicas()
+                .build()?;
+            Ok(Self::Cluster(client))
+        } else if let Some(remainder) = redis_url.strip_prefix("redis-sentinel://") {
+            let parts: Vec<&str> = remainder.split('/').collect();
+            if parts.len() < 2 {
+                return Err(SqueezefsError::InvalidOperation(
+                    "Invalid sentinel URL. Expected format: redis-sentinel://host1:port1,host2:port2/service_name".to_string()
+                ));
+            }
+            let service_name = parts[1].to_string();
+            let nodes: Vec<String> = parts[0]
+                .split(',')
+                .map(|s| {
+                    let host_port = s.trim();
+                    if host_port.starts_with("redis://") {
+                        host_port.to_string()
+                    } else {
+                        format!("redis://{}", host_port)
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            let client = redis::sentinel::SentinelClient::build(
+                nodes,
+                service_name,
+                None,
+                redis::sentinel::SentinelServerType::Master,
+            )?;
+            Ok(Self::Sentinel(std::sync::Arc::new(
+                tokio::sync::Mutex::new(client),
+            )))
+        } else {
+            let client = redis::Client::open(redis_url)?;
+            if local_ips.is_empty() {
+                Ok(Self::Single(client))
+            } else {
+                let remote_addr = match resolve_redis_addr(redis_url) {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        warn!("Could not resolve Redis address: {:?}. Falling back to default client.", e);
+                        return Ok(Self::Single(client));
+                    }
+                };
+
+                let mut bound_conns = Vec::new();
+                let conn_info = client.get_connection_info();
+
+                for ip in local_ips {
+                    let socket = match ip {
+                        IpAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+                        IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+                    };
+                    let _ = socket.bind(SocketAddr::new(ip, 0));
+
+                    match socket.connect(remote_addr).await {
+                        Ok(stream) => {
+                            match redis::aio::MultiplexedConnection::new(&conn_info.redis, stream)
+                                .await
+                            {
+                                Ok((conn, driver)) => {
+                                    tokio::spawn(driver);
+                                    bound_conns.push(conn);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to establish MultiplexedConnection on interface {}: {:?}", ip, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to connect to Redis on interface {}: {:?}", ip, e);
+                        }
+                    }
+                }
+
+                if bound_conns.is_empty() {
+                    warn!("Failed to connect on all interfaces. Falling back to default routing.");
+                    Ok(Self::Single(client))
+                } else {
+                    Ok(Self::SingleBound {
+                        client,
+                        bound_conns,
+                        current_idx: std::sync::Arc::new(AtomicUsize::new(0)),
+                    })
+                }
+            }
+        }
+    }
+
     pub async fn get_connection(&self) -> Result<MetaConnection> {
         match self {
             Self::Single(c) => {
                 let conn = c.get_multiplexed_tokio_connection().await?;
                 Ok(MetaConnection::Single(conn))
+            }
+            Self::SingleBound {
+                bound_conns,
+                current_idx,
+                ..
+            } => {
+                if !bound_conns.is_empty() {
+                    let idx = current_idx.fetch_add(1, Ordering::Relaxed);
+                    let conn = bound_conns[idx % bound_conns.len()].clone();
+                    return Ok(MetaConnection::Single(conn));
+                }
+                Err(SqueezefsError::InvalidOperation(
+                    "No bound connections available".to_string(),
+                ))
             }
             Self::Cluster(c) => {
                 let conn = c.get_async_connection().await?;
@@ -148,6 +304,23 @@ impl DlmClient {
             client_id,
             meta_client,
         })
+    }
+
+    pub async fn new_with_local_ips(redis_url: &str, local_ips: Vec<IpAddr>) -> Result<Self> {
+        let meta_client = MetaClient::new_with_local_ips(redis_url, local_ips).await?;
+        let client_id = Uuid::new_v4().to_string();
+        Ok(Self {
+            client_id,
+            meta_client,
+        })
+    }
+
+    pub fn connection_count(&self) -> usize {
+        match &self.meta_client {
+            MetaClient::Single(_) => 1,
+            MetaClient::SingleBound { bound_conns, .. } => bound_conns.len(),
+            _ => 1,
+        }
     }
 
     pub fn meta_client(&self) -> &MetaClient {

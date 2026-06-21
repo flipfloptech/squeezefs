@@ -15,7 +15,7 @@ async fn test_multi_rail_backend_initialization() {
     ];
 
     let backend = RustFsClient::new_with_local_ips(local_ips.clone()).await;
-    
+
     // Check that we initialized two clients (or mock storage if S3 endpoint is not configured)
     assert_eq!(backend.client_count(), 2);
 }
@@ -23,12 +23,10 @@ async fn test_multi_rail_backend_initialization() {
 #[tokio::test]
 async fn test_multi_rail_dlm_initialization() {
     let redis_url = get_redis_url();
-    let local_ips = vec![
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-    ];
+    let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
 
     // Verify DlmClient constructs with local IPs
-    let dlm_client = DlmClient::new_with_local_ips(&redis_url, local_ips);
+    let dlm_client = DlmClient::new_with_local_ips(&redis_url, local_ips).await;
     assert!(dlm_client.is_ok());
     let dlm_client = dlm_client.unwrap();
 
@@ -44,7 +42,7 @@ async fn test_multi_rail_dlm_rotation_and_failover() {
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), // Use 127.0.0.1 twice to mock two NIC rails pointing to localhost
     ];
 
-    let dlm_client = match DlmClient::new_with_local_ips(&redis_url, local_ips) {
+    let dlm_client = match DlmClient::new_with_local_ips(&redis_url, local_ips).await {
         Ok(c) => c,
         Err(_) => {
             println!("Skipping rotation test: local Redis/Garnet not available");

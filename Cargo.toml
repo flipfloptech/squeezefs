@@ -26,6 +26,9 @@ clap = { version = "4.4", features = ["derive"] }
 indicatif = "0.17"
 colored = "2.1"
 libloading = { version = "0.8", optional = true }
+hyper-014 = { package = "hyper", version = "0.14", features = ["full"] }
+hyper-rustls-024 = { package = "hyper-rustls", version = "0.24", features = ["webpki-roots", "tokio-runtime", "http1", "http2"] }
+aws-smithy-runtime = "1.1"
 
 [features]
 default = []

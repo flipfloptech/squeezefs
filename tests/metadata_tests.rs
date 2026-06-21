@@ -1,6 +1,7 @@
 use fuse3::raw::{prelude::*, Request};
 use fuse3::Errno;
 use squeezefs::backend::RustFsClient;
+use redis::AsyncCommands;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
@@ -558,4 +559,312 @@ async fn test_metadata_parent_timestamps() {
         initial_ctime,
         after_ctime
     );
+}
+
+#[tokio::test]
+async fn test_metadata_offset_write_inline() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 12,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // 1. Create file
+    let reply_created = fs
+        .create(req, 1, OsStr::new("inline_offset.bin"), 0o644, 0)
+        .await
+        .expect("create file should succeed");
+    let ino = reply_created.attr.ino;
+
+    // 2. Write "hello" at offset 0
+    fs.write(req, ino, ino, 0, b"hello", 0, 0)
+        .await
+        .expect("write at 0 should succeed");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+
+    // 3. Write "world" at offset 10 (causing a gap of 5 zeros)
+    fs.write(req, ino, ino, 10, b"world", 0, 0)
+        .await
+        .expect("write at 10 should succeed");
+
+    // 4. Read the file back (size 15)
+    let reply_read = fs
+        .read(req, ino, ino, 0, 15)
+        .await
+        .expect("read should succeed");
+    assert_eq!(reply_read.data.as_ref(), b"hello\0\0\0\0\0world");
+
+    // 5. Verify type remains inline in Garnet
+    let mut con = redis::Client::open(get_redis_url())
+        .unwrap()
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let file_path = format!("inode_{}", ino);
+    let meta_key = format!("metadata:{}", file_path);
+    let t: String = con.hget(&meta_key, "type").await.unwrap();
+    assert_eq!(t, "inline");
+}
+
+#[tokio::test]
+async fn test_metadata_offset_write_staged() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 13,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // 1. Create file
+    let reply_created = fs
+        .create(req, 1, OsStr::new("staged_offset.bin"), 0o644, 0)
+        .await
+        .expect("create file should succeed");
+    let ino = reply_created.attr.ino;
+
+    // 2. Write 100KB at offset 0 (staged size)
+    let initial_data = vec![b'A'; 100 * 1024];
+    fs.write(req, ino, ino, 0, &initial_data, 0, 0)
+        .await
+        .expect("initial write should succeed");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+
+    // 3. Overwrite 10 bytes at offset 50 with "abcdefghij"
+    fs.write(req, ino, ino, 50, b"abcdefghij", 0, 0)
+        .await
+        .expect("offset write should succeed");
+
+    // 4. Read the file back (size 100KB)
+    let reply_read = fs
+        .read(req, ino, ino, 0, 100 * 1024)
+        .await
+        .expect("read should succeed");
+
+    let mut expected_data = vec![b'A'; 100 * 1024];
+    expected_data[50..60].copy_from_slice(b"abcdefghij");
+    assert_eq!(reply_read.data.as_ref(), &expected_data);
+
+    // 5. Verify type is staged in Garnet
+    let mut con = redis::Client::open(get_redis_url())
+        .unwrap()
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let file_path = format!("inode_{}", ino);
+    let meta_key = format!("metadata:{}", file_path);
+    let t: String = con.hget(&meta_key, "type").await.unwrap();
+    assert_eq!(t, "staged");
+}
+
+#[tokio::test]
+async fn test_metadata_offset_write_striped() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 14,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // 1. Create file
+    let reply_created = fs
+        .create(req, 1, OsStr::new("striped_offset.bin"), 0o644, 0)
+        .await
+        .expect("create file should succeed");
+    let ino = reply_created.attr.ino;
+
+    // 2. Write 5MB at offset 0 (striped layout, 2 blocks)
+    let initial_data = vec![b'B'; 5 * 1024 * 1024];
+    fs.write(req, ino, ino, 0, &initial_data, 0, 0)
+        .await
+        .expect("initial write should succeed");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+
+    // 3. Write 10 bytes crossing block boundary at 4MB - 5 bytes
+    let target_offset = 4 * 1024 * 1024 - 5;
+    fs.write(req, ino, ino, target_offset as u64, b"1234567890", 0, 0)
+        .await
+        .expect("boundary crossing write should succeed");
+
+    // 4. Read back around the boundary
+    let read_start = target_offset - 5;
+    let reply_read = fs
+        .read(req, ino, ino, read_start as u64, 20)
+        .await
+        .expect("read should succeed");
+
+    // Expected bytes: 5 'B's, "1234567890", 5 'B's
+    let mut expected_bytes = vec![b'B'; 20];
+    expected_bytes[5..15].copy_from_slice(b"1234567890");
+    assert_eq!(reply_read.data.as_ref(), &expected_bytes);
+
+    // 5. Verify type is striped in Garnet
+    let mut con = redis::Client::open(get_redis_url())
+        .unwrap()
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let file_path = format!("inode_{}", ino);
+    let meta_key = format!("metadata:{}", file_path);
+    let t: String = con.hget(&meta_key, "type").await.unwrap();
+    assert_eq!(t, "striped");
+}
+
+#[tokio::test]
+async fn test_metadata_write_transition_inline_to_staged() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 15,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // 1. Create file
+    let reply_created = fs
+        .create(req, 1, OsStr::new("transition_inline.bin"), 0o644, 0)
+        .await
+        .expect("create file should succeed");
+    let ino = reply_created.attr.ino;
+
+    // 2. Write 10KB at offset 0 (inline)
+    let data1 = vec![b'X'; 10 * 1024];
+    fs.write(req, ino, ino, 0, &data1, 0, 0)
+        .await
+        .expect("write 1 should succeed");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+
+    // 3. Write 80KB at offset 5KB (crossing 64KB boundary, final size 85KB)
+    let data2 = vec![b'Y'; 80 * 1024];
+    fs.write(req, ino, ino, 5 * 1024, &data2, 0, 0)
+        .await
+        .expect("write 2 should succeed");
+
+    // 4. Verify transition to staged
+    let mut con = redis::Client::open(get_redis_url())
+        .unwrap()
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let file_path = format!("inode_{}", ino);
+    let meta_key = format!("metadata:{}", file_path);
+    let t: String = con.hget(&meta_key, "type").await.unwrap();
+    assert_eq!(t, "staged");
+
+    // Verify inline data key is deleted
+    let inline_key = format!("inline_data:{}", file_path);
+    let exists: bool = con.exists(&inline_key).await.unwrap();
+    assert!(!exists);
+
+    // 5. Read back and verify correctness
+    let reply_read = fs
+        .read(req, ino, ino, 0, 85 * 1024)
+        .await
+        .expect("read should succeed");
+    let mut expected_data = vec![b'X'; 5 * 1024];
+    expected_data.extend(vec![b'Y'; 80 * 1024]);
+    assert_eq!(reply_read.data.as_ref(), &expected_data);
+}
+
+#[tokio::test]
+async fn test_metadata_write_transition_staged_to_striped() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 16,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // 1. Create file
+    let reply_created = fs
+        .create(req, 1, OsStr::new("transition_staged.bin"), 0o644, 0)
+        .await
+        .expect("create file should succeed");
+    let ino = reply_created.attr.ino;
+
+    // 2. Write 100KB at offset 0 (staged)
+    let data1 = vec![b'W'; 100 * 1024];
+    fs.write(req, ino, ino, 0, &data1, 0, 0)
+        .await
+        .expect("write 1 should succeed");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+
+    // 3. Write 5MB at offset 1MB (crossing 4MB boundary, final size 6MB)
+    let data2 = vec![b'Z'; 5 * 1024 * 1024];
+    fs.write(req, ino, ino, 1024 * 1024, &data2, 0, 0)
+        .await
+        .expect("write 2 should succeed");
+
+    // 4. Verify transition to striped
+    let mut con = redis::Client::open(get_redis_url())
+        .unwrap()
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let file_path = format!("inode_{}", ino);
+    let meta_key = format!("metadata:{}", file_path);
+    let t: String = con.hget(&meta_key, "type").await.unwrap();
+    assert_eq!(t, "striped");
+
+    // Verify staged file ID is cleaned up or not present in mapping
+    let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await.unwrap();
+    assert!(file_id_opt.is_none());
+
+    // 5. Read back and verify correctness
+    let reply_read = fs
+        .read(req, ino, ino, 0, 6 * 1024 * 1024)
+        .await
+        .expect("read should succeed");
+
+    // Expected size: 100KB of 'W's, 924KB of '\0's, 5MB of 'Z's (total 6.024MB)
+    let mut expected_data = vec![b'W'; 100 * 1024];
+    expected_data.extend(vec![b'\0'; 924 * 1024]);
+    expected_data.extend(vec![b'Z'; 5 * 1024 * 1024]);
+
+    assert_eq!(reply_read.data.len(), expected_data.len());
+    assert_eq!(reply_read.data.as_ref(), &expected_data);
 }

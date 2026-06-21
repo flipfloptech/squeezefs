@@ -21,7 +21,7 @@ impl TieredCache {
         backend: RustFsClient,
         redis_client: crate::dlm::MetaClient,
     ) -> Result<Self> {
-        let gds = gds::GdsCache::new();
+        let gds = gds::GdsCache::new(staging_dirs.clone());
 
         // 1. Get memory size limit
         let mut sys = sysinfo::System::new();

@@ -24,7 +24,7 @@ Squeezefs is designed as a high-performance, decoupled distributed filesystem fo
 | **Progressive Layout** | Micro-Files (<64KB) | **Complete** | Inlined directly into Garnet (`inline_data:<path>`). Zero S3 calls. |
 | | Small Files (64K-4M) | **Complete** | NVMe staged, immediately ACKed to OS, merged asynchronously by worker. |
 | | Large Files (>4MB) | **Complete** | Sliced into 4MB blocks, uploaded via parallel thread pool. |
-| **Tiered Caching** | Tier 1 (GPU Direct) | **Simulated** | Detects CUDA/Nvidia devices; mock direct RDMA transfer exists. |
+| **Tiered Caching** | Tier 1 (GPU Direct) | **Complete** | Detects CUDA/Nvidia devices; performs dynamic loading of libcufile.so and fallback GDS RDMA transfers. |
 | | Tier 2 (System RAM) | **Complete** | Thread-safe LRU cache. Configurable capacity via size (e.g. 128GB) or percentage (e.g. 50%). |
 | | Tier 3 (NVMe Staging) | **Complete** | Configurable size/percentage capacity check. Supports multiple directories/disks with hash-based routing. |
 | **Operational Tools** | CLI Subcommands | **Complete** | Clap-based interface supporting `mount` and `bench` subcommands. |
@@ -75,9 +75,9 @@ JuiceFS is the gold standard for POSIX distributed filesystems. To achieve absol
 - [x] Add heartbeat lease renewal logging in `dlm.rs`.
 
 ### Phase 3: GPU Direct Storage (GDS) integration
-- [ ] Add conditional compilation features for CUDA / GDS.
-- [ ] Use `dlopen` to load `libcufile.so` dynamically if present.
-- [ ] Implement direct block transfer mapping to GPU virtual addresses.
+- [x] Add conditional compilation features for CUDA / GDS.
+- [x] Use `dlopen` to load `libcufile.so` dynamically if present.
+- [x] Implement direct block transfer mapping to GPU virtual addresses.
 
 ### Phase 4: io_uring Performance Tuning
 - [ ] Hook the low-level `io_uring` polling loop in `src/fuse_client.rs` directly to the session message dispatcher.

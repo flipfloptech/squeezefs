@@ -25,6 +25,11 @@ uuid = { version = "1.7", features = ["v4"] }
 clap = { version = "4.4", features = ["derive"] }
 indicatif = "0.17"
 colored = "2.1"
+libloading = { version = "0.8", optional = true }
+
+[features]
+default = []
+gds = ["dep:libloading"]
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -80,5 +80,5 @@ JuiceFS is the gold standard for POSIX distributed filesystems. To achieve absol
 - [x] Implement direct block transfer mapping to GPU virtual addresses.
 
 ### Phase 4: io_uring Performance Tuning
-- [ ] Hook the low-level `io_uring` polling loop in `src/fuse_client.rs` directly to the session message dispatcher.
-- [ ] Benchmark FUSE latency using `squeezefs bench` before and after direct loop integration.
+- [x] Hook the low-level `io_uring` polling loop in `src/fuse_client.rs` directly to the session message dispatcher.
+- [x] Benchmark FUSE latency using `squeezefs bench` before and after direct loop integration.

@@ -1,9 +1,9 @@
+use fuse3::raw::{prelude::*, Request};
 use squeezefs::backend::RustFsClient;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::routing::DataRouter;
-use fuse3::raw::{prelude::*, Request};
 use std::ffi::OsStr;
 use tempfile::tempdir;
 
@@ -22,7 +22,10 @@ async fn setup_fs() -> Option<(SqueezefsFilesystem, tempfile::TempDir)> {
         .await
         .ok()?;
 
-    let _: () = redis::cmd("FLUSHALL").query_async(&mut con).await.unwrap_or(());
+    let _: () = redis::cmd("FLUSHALL")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
 
     let backend = RustFsClient::new().await;
     let temp_dir = tempdir().unwrap();
@@ -109,8 +112,10 @@ async fn test_metadata_create_and_setattr() {
     assert_eq!(reply_created.attr.perm, 0o644);
 
     // 2. Modify permissions to 0o700 via setattr (chmod)
-    let mut setattr_req = SetAttr::default();
-    setattr_req.mode = Some(0o700);
+    let setattr_req = SetAttr {
+        mode: Some(0o700),
+        ..Default::default()
+    };
 
     let reply_setattr = fs
         .setattr(req, ino, None, setattr_req)
@@ -119,9 +124,11 @@ async fn test_metadata_create_and_setattr() {
     assert_eq!(reply_setattr.attr.perm, 0o700);
 
     // 3. Modify uid/gid (chown)
-    let mut setattr_req2 = SetAttr::default();
-    setattr_req2.uid = Some(2000);
-    setattr_req2.gid = Some(3000);
+    let setattr_req2 = SetAttr {
+        uid: Some(2000),
+        gid: Some(3000),
+        ..Default::default()
+    };
 
     let reply_setattr2 = fs
         .setattr(req, ino, None, setattr_req2)
@@ -131,8 +138,10 @@ async fn test_metadata_create_and_setattr() {
     assert_eq!(reply_setattr2.attr.gid, 3000);
 
     // 4. Truncate file size
-    let mut setattr_req3 = SetAttr::default();
-    setattr_req3.size = Some(1024);
+    let setattr_req3 = SetAttr {
+        size: Some(1024),
+        ..Default::default()
+    };
 
     let reply_setattr3 = fs
         .setattr(req, ino, None, setattr_req3)
@@ -269,9 +278,15 @@ async fn test_metadata_rename() {
     let dest_dir_ino = reply_mkdir.attr.ino;
 
     // 3. Rename "source_rename.txt" to "destdir_rename/target_rename.txt"
-    fs.rename(req, 1, OsStr::new("source_rename.txt"), dest_dir_ino, OsStr::new("target_rename.txt"))
-        .await
-        .expect("rename should succeed");
+    fs.rename(
+        req,
+        1,
+        OsStr::new("source_rename.txt"),
+        dest_dir_ino,
+        OsStr::new("target_rename.txt"),
+    )
+    .await
+    .expect("rename should succeed");
 
     // 4. Old lookup should fail
     let lookup_old = fs.lookup(req, 1, OsStr::new("source_rename.txt")).await;

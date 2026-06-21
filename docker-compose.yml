@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  squeezefs-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/usr/src/squeezefs
+      - cargo-cache:/usr/local/cargo/registry
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse:/dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - GARNET_URL=redis://garnet:6379
+      - RUSTFS_ENDPOINT=http://rustfs-mock:9000
+      - RUSTFS_ACCESS_KEY=admin
+      - RUSTFS_SECRET_KEY=password
+      - RUSTFS_BUCKET=squeezefs-data
+      - RUST_LOG=info
+    depends_on:
+      - garnet
+      - rustfs-mock
+    entrypoint: ["cargo", "test", "--all-features", "--", "--nocapture"]
+
+  garnet:
+    image: ghcr.io/microsoft/garnet:latest
+    ports:
+      - "6379:6379"
+
+  rustfs-mock:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+    command: server /data --console-address ":9001"
+
+volumes:
+  cargo-cache:

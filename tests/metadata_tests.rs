@@ -1,4 +1,5 @@
 use fuse3::raw::{prelude::*, Request};
+use fuse3::Errno;
 use squeezefs::backend::RustFsClient;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
@@ -37,7 +38,15 @@ async fn setup_fs() -> Option<(SqueezefsFilesystem, tempfile::TempDir)> {
     .ok()?;
 
     let router = DataRouter::new(dlm.clone(), backend, cache);
-    Some((SqueezefsFilesystem::new(router, dlm), temp_dir))
+    let fs = SqueezefsFilesystem::new(router, dlm);
+    let req = Request {
+        unique: 0,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    let _ = fs.init(req).await.ok()?;
+    Some((fs, temp_dir))
 }
 
 #[tokio::test]
@@ -298,4 +307,235 @@ async fn test_metadata_rename() {
         .await
         .expect("lookup target should succeed");
     assert_eq!(lookup_new.attr.ino, ino);
+}
+
+#[tokio::test]
+async fn test_metadata_mknod() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 6,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // Create a FIFO (NamedPipe) named "my_fifo" under root (parent=1)
+    let fifo_mode = (libc::S_IFIFO | 0o644) as u32;
+    let reply = fs
+        .mknod(req, 1, OsStr::new("my_fifo"), fifo_mode, 0)
+        .await
+        .expect("mknod should succeed");
+
+    assert_eq!(reply.attr.kind, FileType::NamedPipe);
+    assert_eq!(reply.attr.perm, 0o644);
+
+    // Verify lookup finds it
+    let reply_lookup = fs
+        .lookup(req, 1, OsStr::new("my_fifo"))
+        .await
+        .expect("lookup fifo should succeed");
+    assert_eq!(reply_lookup.attr.ino, reply.attr.ino);
+    assert_eq!(reply_lookup.attr.kind, FileType::NamedPipe);
+}
+
+#[tokio::test]
+async fn test_metadata_hardlink_directory_fails() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 7,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // 1. Create a directory "test_dir_link"
+    let reply_mkdir = fs
+        .mkdir(req, 1, OsStr::new("test_dir_link"), 0o755, 0)
+        .await
+        .expect("mkdir should succeed");
+    let dir_ino = reply_mkdir.attr.ino;
+
+    // 2. Attempting to create a hard link to this directory should fail with EPERM
+    let res = fs.link(req, dir_ino, 1, OsStr::new("linked_dir")).await;
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err(), Errno::from(libc::EPERM));
+}
+
+#[tokio::test]
+async fn test_metadata_unlink_directory_fails() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 8,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // 1. Create a directory "test_dir_unlink"
+    let _reply_mkdir = fs
+        .mkdir(req, 1, OsStr::new("test_dir_unlink"), 0o755, 0)
+        .await
+        .expect("mkdir should succeed");
+
+    // 2. Attempting to unlink a directory using unlink instead of rmdir should fail with EISDIR
+    let res = fs.unlink(req, 1, OsStr::new("test_dir_unlink")).await;
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err(), Errno::from(libc::EISDIR));
+}
+
+#[tokio::test]
+async fn test_metadata_rename_directory_loop_fails() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 9,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // Create a directory tree: /parent/child
+    let reply_parent = fs
+        .mkdir(req, 1, OsStr::new("parent"), 0o755, 0)
+        .await
+        .expect("mkdir parent should succeed");
+    let parent_ino = reply_parent.attr.ino;
+
+    let reply_child = fs
+        .mkdir(req, parent_ino, OsStr::new("child"), 0o755, 0)
+        .await
+        .expect("mkdir child should succeed");
+    let child_ino = reply_child.attr.ino;
+
+    // Attempting to rename parent into child (making /parent a child of /parent/child)
+    // should fail with EINVAL (directory loop)
+    let res = fs
+        .rename(req, 1, OsStr::new("parent"), child_ino, OsStr::new("parent"))
+        .await;
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err(), Errno::from(libc::EINVAL));
+}
+
+#[tokio::test]
+async fn test_metadata_rename_cross_type_fails() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 10,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // 1. Create a directory "mydir"
+    let reply_mkdir = fs
+        .mkdir(req, 1, OsStr::new("mydir"), 0o755, 0)
+        .await
+        .expect("mkdir should succeed");
+    let _dir_ino = reply_mkdir.attr.ino;
+
+    // 2. Create a file "myfile"
+    let _reply_create = fs
+        .create(req, 1, OsStr::new("myfile"), 0o644, 0)
+        .await
+        .expect("create file should succeed");
+
+    // Attempt to rename the directory "mydir" to replace the file "myfile" (cross type, dir replacing file)
+    // Should fail with ENOTDIR
+    let res1 = fs
+        .rename(req, 1, OsStr::new("mydir"), 1, OsStr::new("myfile"))
+        .await;
+    assert!(res1.is_err());
+    assert_eq!(res1.unwrap_err(), Errno::from(libc::ENOTDIR));
+
+    // Attempt to rename the file "myfile" to replace the directory "mydir" (cross type, file replacing dir)
+    // Should fail with EISDIR
+    let res2 = fs
+        .rename(req, 1, OsStr::new("myfile"), 1, OsStr::new("mydir"))
+        .await;
+    assert!(res2.is_err());
+    assert_eq!(res2.unwrap_err(), Errno::from(libc::EISDIR));
+}
+
+#[tokio::test]
+async fn test_metadata_parent_timestamps() {
+    let (fs, _temp_dir) = match setup_fs().await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 11,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // 1. Get initial mtime/ctime of root directory (parent inode = 1)
+    let parent_attr_initial = fs
+        .getattr(req, 1, None, 0)
+        .await
+        .expect("getattr parent should succeed")
+        .attr;
+
+    // Sleep briefly to ensure timestamp ticks
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // 2. Create child file in root parent
+    let _reply_create = fs
+        .create(req, 1, OsStr::new("child_for_timestamps"), 0o644, 0)
+        .await
+        .expect("create file should succeed");
+
+    // 3. Get updated mtime/ctime of root
+    let parent_attr_after = fs
+        .getattr(req, 1, None, 0)
+        .await
+        .expect("getattr parent should succeed")
+        .attr;
+
+    // The root directory mtime and ctime must be updated (greater than or equal to initial)
+    let initial_mtime = parent_attr_initial.mtime.sec as f64 + (parent_attr_initial.mtime.nsec as f64 / 1_000_000_000.0);
+    let after_mtime = parent_attr_after.mtime.sec as f64 + (parent_attr_after.mtime.nsec as f64 / 1_000_000_000.0);
+    assert!(after_mtime > initial_mtime, "parent mtime did not advance: {} -> {}", initial_mtime, after_mtime);
+
+    let initial_ctime = parent_attr_initial.ctime.sec as f64 + (parent_attr_initial.ctime.nsec as f64 / 1_000_000_000.0);
+    let after_ctime = parent_attr_after.ctime.sec as f64 + (parent_attr_after.ctime.nsec as f64 / 1_000_000_000.0);
+    assert!(after_ctime > initial_ctime, "parent ctime did not advance: {} -> {}", initial_ctime, after_ctime);
 }

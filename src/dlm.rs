@@ -12,6 +12,7 @@ use uuid::Uuid;
 pub enum MetaClient {
     Single(redis::Client),
     Cluster(redis::cluster::ClusterClient),
+    Sentinel(std::sync::Arc<tokio::sync::Mutex<redis::sentinel::SentinelClient>>),
 }
 
 pub enum MetaConnection {
@@ -52,9 +53,11 @@ impl ConnectionLike for MetaConnection {
 
 impl MetaClient {
     pub fn new(redis_url: &str) -> Result<Self> {
-        let is_cluster = redis_url.contains(',')
-            || redis_url.starts_with("redis+cluster://")
-            || redis_url.contains("cluster=true");
+        let is_sentinel = redis_url.starts_with("redis-sentinel://");
+        let is_cluster = !is_sentinel
+            && (redis_url.contains(',')
+                || redis_url.starts_with("redis+cluster://")
+                || redis_url.contains("cluster=true"));
 
         if is_cluster {
             let cleaned_url = redis_url.replace("redis+cluster://", "redis://");
@@ -67,6 +70,35 @@ impl MetaClient {
                 .read_from_replicas()
                 .build()?;
             Ok(Self::Cluster(client))
+        } else if let Some(remainder) = redis_url.strip_prefix("redis-sentinel://") {
+            let parts: Vec<&str> = remainder.split('/').collect();
+            if parts.len() < 2 {
+                return Err(SqueezefsError::InvalidOperation(
+                    "Invalid sentinel URL. Expected format: redis-sentinel://host1:port1,host2:port2/service_name".to_string()
+                ));
+            }
+            let service_name = parts[1].to_string();
+            let nodes: Vec<String> = parts[0]
+                .split(',')
+                .map(|s| {
+                    let host_port = s.trim();
+                    if host_port.starts_with("redis://") {
+                        host_port.to_string()
+                    } else {
+                        format!("redis://{}", host_port)
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            let client = redis::sentinel::SentinelClient::build(
+                nodes,
+                service_name,
+                None,
+                redis::sentinel::SentinelServerType::Master,
+            )?;
+            Ok(Self::Sentinel(std::sync::Arc::new(
+                tokio::sync::Mutex::new(client),
+            )))
         } else {
             let client = redis::Client::open(redis_url)?;
             Ok(Self::Single(client))
@@ -82,6 +114,11 @@ impl MetaClient {
             Self::Cluster(c) => {
                 let conn = c.get_async_connection().await?;
                 Ok(MetaConnection::Cluster(conn))
+            }
+            Self::Sentinel(c) => {
+                let mut guard = c.lock().await;
+                let conn = guard.get_async_connection().await?;
+                Ok(MetaConnection::Single(conn))
             }
         }
     }

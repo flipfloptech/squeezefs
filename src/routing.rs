@@ -606,6 +606,157 @@ impl DataRouter {
         Ok(data)
     }
 
+    /// Read a specific byte range of a file, downloading only the required 4MB blocks.
+    pub async fn read_file_range(
+        &self,
+        file_path: &str,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>> {
+        // Tier 2 check: System RAM LRU Cache
+        if let Some(cached_data) = self.cache.lru.get(file_path) {
+            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+            let start = std::cmp::min(offset as usize, cached_data.len());
+            let end = std::cmp::min((offset + size as u64) as usize, cached_data.len());
+            return Ok(cached_data[start..end].to_vec());
+        }
+
+        // Fetch file metadata from Garnet
+        let mut con = self.dlm.get_connection().await?;
+        let meta_key = format!("metadata:{}", file_path);
+
+        let file_type: Option<String> = con.hget(&meta_key, "type").await?;
+        let file_type = file_type.ok_or_else(|| {
+            SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("File not found: {}", file_path),
+            ))
+        })?;
+
+        match file_type.as_str() {
+            "inline" => {
+                let inline_key = format!("inline_data:{}", file_path);
+                let bytes: Vec<u8> = con.get(&inline_key).await?;
+                let start = std::cmp::min(offset as usize, bytes.len());
+                let end = std::cmp::min((offset + size as u64) as usize, bytes.len());
+                Ok(bytes[start..end].to_vec())
+            }
+            "staged" => {
+                let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;
+                let file_id = file_id_opt.ok_or_else(|| {
+                    SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
+                })?;
+
+                let data = if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
+                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    staged_data
+                } else {
+                    let mapping_key = format!("mapping:{}", file_id);
+                    let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
+                    let off_opt: Option<u64> = con.hget(&mapping_key, "offset").await?;
+                    let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
+
+                    if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
+                        let packed_bytes = self.backend.get_object(&bk).await?;
+                        let start = off as usize;
+                        let end = (off + sz) as usize;
+                        packed_bytes[start..end].to_vec()
+                    } else {
+                        return Err(SqueezefsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Staged file ID {} mapping not found in Garnet", file_id),
+                        )));
+                    }
+                };
+                let start = std::cmp::min(offset as usize, data.len());
+                let end = std::cmp::min((offset + size as u64) as usize, data.len());
+                Ok(data[start..end].to_vec())
+            }
+            "striped" => {
+                let block_size = 4 * 1024 * 1024;
+                let file_size_opt: Option<u64> = con.hget(&meta_key, "size").await?;
+                let file_size = file_size_opt.unwrap_or(0);
+
+                if offset >= file_size {
+                    return Ok(Vec::new());
+                }
+
+                let end_offset = std::cmp::min(offset + size as u64, file_size);
+                if offset >= end_offset {
+                    return Ok(Vec::new());
+                }
+
+                let start_block = (offset / block_size as u64) as u32;
+                let end_block = ((end_offset - 1) / block_size as u64) as u32;
+
+                let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+                let block_prefix_opt: Option<String> = con.hget(&meta_key, "block_prefix").await?;
+
+                let mut block_keys = Vec::new();
+                if let Some(block_map_id) = block_map_id_opt {
+                    let block_map_key = format!("block_map:{}", block_map_id);
+                    let mut pipe = redis::pipe();
+                    for b in start_block..=end_block {
+                        pipe.hget(&block_map_key, b.to_string());
+                    }
+                    let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
+                    for (idx, key_opt) in res.into_iter().enumerate() {
+                        let bk = key_opt.ok_or_else(|| {
+                            SqueezefsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!(
+                                    "Block {} mapping not found in Garnet",
+                                    start_block + idx as u32
+                                ),
+                            ))
+                        })?;
+                        block_keys.push((start_block + idx as u32, bk));
+                    }
+                } else if let Some(block_prefix) = block_prefix_opt {
+                    for b in start_block..=end_block {
+                        block_keys.push((b, format!("{}/part_{}", block_prefix, b)));
+                    }
+                } else {
+                    return Err(SqueezefsError::InvalidOperation(
+                        "Missing block_map_id and block_prefix for striped file".to_string(),
+                    ));
+                }
+
+                let mut range_data = Vec::new();
+                for (b_idx, b_key) in block_keys {
+                    let block_data =
+                        if let Some(cached) = self.cache.nvme.get_cached_read_block(&b_key) {
+                            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                            cached
+                        } else {
+                            METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+                            let downloaded = self.backend.get_object(&b_key).await?;
+                            let _ = self.cache.nvme.cache_read_block(&b_key, &downloaded);
+                            downloaded
+                        };
+
+                    let b_start_offset = b_idx as u64 * block_size as u64;
+                    let b_end_offset = b_start_offset + block_data.len() as u64;
+
+                    let slice_start = std::cmp::max(offset, b_start_offset) - b_start_offset;
+                    let slice_end = std::cmp::min(end_offset, b_end_offset) - b_start_offset;
+
+                    if slice_start < slice_end {
+                        range_data.extend_from_slice(
+                            &block_data[slice_start as usize..slice_end as usize],
+                        );
+                    }
+                }
+
+                Ok(range_data)
+            }
+            _ => Err(SqueezefsError::InvalidOperation(format!(
+                "Unknown file type: {}",
+                file_type
+            ))),
+        }
+    }
+
     /// Retrieve the file size from metadata.
     pub async fn get_file_size(&self, file_path: &str) -> Result<u64> {
         let mut con = self.dlm.get_connection().await?;

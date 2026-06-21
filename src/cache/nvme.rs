@@ -90,7 +90,10 @@ impl NvmeStaging {
                 for entry in entries.flatten() {
                     if let Ok(meta) = entry.metadata() {
                         if meta.is_file()
-                            && entry.path().extension().is_some_and(|ext| ext == "data")
+                            && entry
+                                .path()
+                                .extension()
+                                .is_some_and(|ext| ext == "data" || ext == "block")
                         {
                             total_staged_bytes += meta.len();
                         }
@@ -291,5 +294,88 @@ impl NvmeStaging {
 
     pub fn staging_dirs(&self) -> &[PathBuf] {
         &self.staging_dirs
+    }
+
+    /// Cache a block of read data on local NVMe, performing eviction if capacity is reached.
+    pub fn cache_read_block(&self, block_key: &str, data: &[u8]) -> Result<()> {
+        // Enforce max bytes capacity check
+        let mut total_bytes = 0u64;
+        let mut block_files = Vec::new();
+
+        for dir in &self.staging_dirs {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            let path = entry.path();
+                            if let Some(ext) = path.extension() {
+                                if ext == "data" || ext == "block" {
+                                    total_bytes += meta.len();
+                                    if ext == "block" {
+                                        let time = meta
+                                            .accessed()
+                                            .or_else(|_| meta.modified())
+                                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                        block_files.push((path, meta.len(), time));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let new_data_len = data.len() as u64;
+        if total_bytes + new_data_len > self.max_bytes {
+            // Sort block files by accessed time (oldest first)
+            block_files.sort_by_key(|&(_, _, time)| time);
+
+            let mut freed_bytes = 0u64;
+            let target_to_free = (total_bytes + new_data_len).saturating_sub(self.max_bytes);
+
+            for (path, len, _) in block_files {
+                if freed_bytes >= target_to_free {
+                    break;
+                }
+                if fs::remove_file(&path).is_ok() {
+                    freed_bytes += len;
+                    debug!("NVMe Staging: Evicted block cache file {:?}", path);
+                }
+            }
+
+            if total_bytes - freed_bytes + new_data_len > self.max_bytes {
+                warn!(
+                    "NVMe Staging: Cannot cache block {} - local storage full of staging writes.",
+                    block_key
+                );
+                return Ok(()); // Fail silently as caching is opportunistic
+            }
+        }
+
+        let safe_name = block_key.replace('/', "_");
+        let idx = get_dir_index(&safe_name, self.staging_dirs.len());
+        let target_dir = &self.staging_dirs[idx];
+        let block_path = target_dir.join(format!("{}.block", safe_name));
+
+        fs::write(&block_path, data)?;
+        debug!(
+            "NVMe Staging: Cached block {} -> {:?}",
+            block_key, block_path
+        );
+        Ok(())
+    }
+
+    /// Retrieve a cached block file if it exists locally.
+    pub fn get_cached_read_block(&self, block_key: &str) -> Option<Vec<u8>> {
+        let safe_name = block_key.replace('/', "_");
+        let idx = get_dir_index(&safe_name, self.staging_dirs.len());
+        let target_dir = &self.staging_dirs[idx];
+        let block_path = target_dir.join(format!("{}.block", safe_name));
+        if block_path.exists() {
+            fs::read(block_path).ok()
+        } else {
+            None
+        }
     }
 }

@@ -511,7 +511,7 @@ impl Filesystem for SqueezefsFilesystem {
         let file_path = format!("inode_{}", ino);
 
         // Timeout protection (fail fast within 2 seconds to prevent kernel hang)
-        let read_future = self.router.read_file(&file_path);
+        let read_future = self.router.read_file_range(&file_path, offset, size);
         let read_result = match tokio::time::timeout(Duration::from_secs(2), read_future).await {
             Ok(Ok(data)) => data,
             Ok(Err(e)) => {
@@ -524,18 +524,9 @@ impl Filesystem for SqueezefsFilesystem {
             }
         };
 
-        let data_len = read_result.len() as u64;
-        if offset >= data_len {
-            return Ok(ReplyData {
-                data: vec![].into(),
-            });
-        }
-
-        let start = offset as usize;
-        let end = std::cmp::min((offset + size as u64) as usize, read_result.len());
-        let slice = read_result[start..end].to_vec();
-
-        Ok(ReplyData { data: slice.into() })
+        Ok(ReplyData {
+            data: read_result.into(),
+        })
     }
 
     async fn write(

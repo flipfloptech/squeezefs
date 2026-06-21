@@ -28,12 +28,14 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     let dlm = DlmClient::new(&redis_url).unwrap();
     let backend = rt.block_on(RustFsClient::new());
     let temp_dir = tempdir().unwrap();
-    let cache = TieredCache::new(
-        temp_dir.path().to_path_buf(),
-        backend.clone(),
-        dlm.redis_client().clone(),
-    )
-    .unwrap();
+    let cache = rt.block_on(async {
+        TieredCache::new(
+            temp_dir.path().to_path_buf(),
+            backend.clone(),
+            dlm.redis_client().clone(),
+        )
+        .unwrap()
+    });
     let router = DataRouter::new(dlm, backend, cache);
 
     let mut group = c.benchmark_group("squeezefs_routing_writes");

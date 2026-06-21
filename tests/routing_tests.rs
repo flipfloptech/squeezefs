@@ -9,7 +9,7 @@ fn get_redis_url() -> String {
     std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
 }
 
-async fn setup_router() -> Option<DataRouter> {
+async fn setup_router() -> Option<(DataRouter, tempfile::TempDir)> {
     let redis_url = get_redis_url();
     let dlm = DlmClient::new(&redis_url).ok()?;
 
@@ -31,12 +31,12 @@ async fn setup_router() -> Option<DataRouter> {
     )
     .ok()?;
 
-    Some(DataRouter::new(dlm, backend, cache))
+    Some((DataRouter::new(dlm, backend, cache), temp_dir))
 }
 
 #[tokio::test]
 async fn test_route_micro_file_inline() {
-    let router = match setup_router().await {
+    let (router, _temp_dir) = match setup_router().await {
         Some(r) => r,
         None => {
             println!("Skipping test: Redis/Garnet or S3 not available");
@@ -70,7 +70,7 @@ async fn test_route_micro_file_inline() {
 
 #[tokio::test]
 async fn test_route_small_file_staged() {
-    let router = match setup_router().await {
+    let (router, _temp_dir) = match setup_router().await {
         Some(r) => r,
         None => {
             println!("Skipping test: Redis/Garnet or S3 not available");
@@ -113,7 +113,7 @@ async fn test_route_small_file_staged() {
 
 #[tokio::test]
 async fn test_route_large_file_striped() {
-    let router = match setup_router().await {
+    let (router, _temp_dir) = match setup_router().await {
         Some(r) => r,
         None => {
             println!("Skipping test: Redis/Garnet or S3 not available");

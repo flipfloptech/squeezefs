@@ -506,7 +506,10 @@ async fn run_benchmark(
 
 /// Auto-tune client node configurations (dirty page ratios, socket buffers, ulimit limits, and FUSE background connections)
 pub fn tune_system() -> Result<(), std::io::Error> {
-    println!("{}", "=== Squeezefs Client Node Auto-Tuning ===".bold().cyan());
+    println!(
+        "{}",
+        "=== Squeezefs Client Node Auto-Tuning ===".bold().cyan()
+    );
 
     let is_root = unsafe { libc::getuid() } == 0;
     if !is_root {
@@ -526,7 +529,9 @@ pub fn tune_system() -> Result<(), std::io::Error> {
         println!("vm.dirty_background_ratio: current = {}", curr.trim());
     }
     if is_root {
-        println!("Applying optimized VM dirty ratios (dirty_ratio = 40, dirty_background_ratio = 10)...");
+        println!(
+            "Applying optimized VM dirty ratios (dirty_ratio = 40, dirty_background_ratio = 10)..."
+        );
         let _ = std::fs::write(dr_path, "40\n");
         let _ = std::fs::write(dbg_path, "10\n");
     }
@@ -541,7 +546,9 @@ pub fn tune_system() -> Result<(), std::io::Error> {
         println!("net.core.wmem_max: current = {} bytes", curr.trim());
     }
     if is_root {
-        println!("Optimizing net.core socket buffers (rmem_max = 67108864, wmem_max = 67108864)...");
+        println!(
+            "Optimizing net.core socket buffers (rmem_max = 67108864, wmem_max = 67108864)..."
+        );
         let _ = std::fs::write(rmem_path, "67108864\n");
         let _ = std::fs::write(wmem_path, "67108864\n");
     }
@@ -556,7 +563,11 @@ pub fn tune_system() -> Result<(), std::io::Error> {
                 let cong_path = conn_path.join("congestion_threshold");
                 if max_bg_path.exists() {
                     if let Ok(curr) = std::fs::read_to_string(&max_bg_path) {
-                        println!("FUSE Connection {:?}: max_background = {}", entry.file_name(), curr.trim());
+                        println!(
+                            "FUSE Connection {:?}: max_background = {}",
+                            entry.file_name(),
+                            curr.trim()
+                        );
                     }
                     if is_root {
                         let _ = std::fs::write(max_bg_path, "64\n");

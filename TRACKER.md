@@ -82,3 +82,10 @@ JuiceFS is the gold standard for POSIX distributed filesystems. To achieve absol
 ### Phase 4: io_uring Performance Tuning
 - [x] Hook the low-level `io_uring` polling loop in `src/fuse_client.rs` directly to the session message dispatcher.
 - [x] Benchmark FUSE latency using `squeezefs bench` before and after direct loop integration.
+
+### Phase 5: Copy-on-Write (COW) Writes & Snapshot Cloning
+- [ ] Refactor `write_striped` to upload blocks to unique S3 keys and update `block_map:<block_map_id>` in Garnet.
+- [ ] Refactor `read_file` (striped layout arm) to lookup the S3 keys from `block_map:<block_map_id>`.
+- [ ] Implement `clone_file` in `DataRouter` to support zero-copy metadata-level cloning of inline, staged, and striped files.
+- [ ] Add `squeezefs clone` CLI subcommand in `src/main.rs`.
+- [ ] Add integration tests in `tests/clone_tests.rs` verifying COW and cloning behavior.

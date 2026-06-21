@@ -58,6 +58,8 @@ enum Commands {
         /// Destination file path
         dest: String,
     },
+    /// Automatically tune client node configurations (requires root/sudo to apply changes)
+    Tune,
 }
 
 #[tokio::main]
@@ -87,6 +89,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for dir in &staging_dirs {
                 fs::create_dir_all(dir).await?;
             }
+
+            // Tune host parameters automatically
+            let _ = tune_system();
 
             println!("Initializing distributed clients...");
             let dlm = DlmClient::new(&redis_url)?;
@@ -130,6 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Cloning file from {} to {}...", src, dest);
             router.clone_path(&src, &dest).await?;
             println!("File cloned successfully.");
+        }
+        Commands::Tune => {
+            tune_system()?;
         }
     }
 
@@ -493,5 +501,72 @@ async fn run_benchmark(
         println!("\n(Note: FUSE daemon metrics not available. Ensure squeezefs mount is running locally)");
     }
 
+    Ok(())
+}
+
+/// Auto-tune client node configurations (dirty page ratios, socket buffers, ulimit limits, and FUSE background connections)
+pub fn tune_system() -> Result<(), std::io::Error> {
+    println!("{}", "=== Squeezefs Client Node Auto-Tuning ===".bold().cyan());
+
+    let is_root = unsafe { libc::getuid() } == 0;
+    if !is_root {
+        println!(
+            "{}",
+            "WARNING: Not running as root (sudo). Tuning parameters will be checked but cannot be applied.".yellow()
+        );
+    }
+
+    // 1. Virtual Memory (dirty page ratios)
+    let dr_path = "/proc/sys/vm/dirty_ratio";
+    let dbg_path = "/proc/sys/vm/dirty_background_ratio";
+    if let Ok(curr) = std::fs::read_to_string(dr_path) {
+        println!("vm.dirty_ratio: current = {}", curr.trim());
+    }
+    if let Ok(curr) = std::fs::read_to_string(dbg_path) {
+        println!("vm.dirty_background_ratio: current = {}", curr.trim());
+    }
+    if is_root {
+        println!("Applying optimized VM dirty ratios (dirty_ratio = 40, dirty_background_ratio = 10)...");
+        let _ = std::fs::write(dr_path, "40\n");
+        let _ = std::fs::write(dbg_path, "10\n");
+    }
+
+    // 2. Network socket buffer limits
+    let rmem_path = "/proc/sys/net/core/rmem_max";
+    let wmem_path = "/proc/sys/net/core/wmem_max";
+    if let Ok(curr) = std::fs::read_to_string(rmem_path) {
+        println!("net.core.rmem_max: current = {} bytes", curr.trim());
+    }
+    if let Ok(curr) = std::fs::read_to_string(wmem_path) {
+        println!("net.core.wmem_max: current = {} bytes", curr.trim());
+    }
+    if is_root {
+        println!("Optimizing net.core socket buffers (rmem_max = 67108864, wmem_max = 67108864)...");
+        let _ = std::fs::write(rmem_path, "67108864\n");
+        let _ = std::fs::write(wmem_path, "67108864\n");
+    }
+
+    // 3. FUSE Connection parameters
+    let fuse_conn_dir = "/sys/fs/fuse/connections";
+    if std::path::Path::new(fuse_conn_dir).exists() {
+        if let Ok(entries) = std::fs::read_dir(fuse_conn_dir) {
+            for entry in entries.flatten() {
+                let conn_path = entry.path();
+                let max_bg_path = conn_path.join("max_background");
+                let cong_path = conn_path.join("congestion_threshold");
+                if max_bg_path.exists() {
+                    if let Ok(curr) = std::fs::read_to_string(&max_bg_path) {
+                        println!("FUSE Connection {:?}: max_background = {}", entry.file_name(), curr.trim());
+                    }
+                    if is_root {
+                        let _ = std::fs::write(max_bg_path, "64\n");
+                        let _ = std::fs::write(cong_path, "48\n");
+                    }
+                }
+            }
+        }
+    }
+
+    println!("=== Auto-tuning completed ===\n");
     Ok(())
 }

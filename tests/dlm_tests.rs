@@ -175,7 +175,8 @@ async fn test_cluster_client_initialization() {
     assert!(matches!(single_client, MetaClient::Single(_)));
 
     // Cluster mode via comma-separated list
-    let cluster_client_comma = MetaClient::new("redis://127.0.0.1:6379,redis://127.0.0.1:6380").unwrap();
+    let cluster_client_comma =
+        MetaClient::new("redis://127.0.0.1:6379,redis://127.0.0.1:6380").unwrap();
     assert!(matches!(cluster_client_comma, MetaClient::Cluster(_)));
 
     // Cluster mode via protocol prefix

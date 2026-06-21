@@ -38,7 +38,7 @@ async fn test_nvme_staging_and_merge() {
         vec![temp_dir.path().to_path_buf()],
         100 * 1024 * 1024,
         mock_backend.clone(),
-        redis_client,
+        squeezefs::dlm::MetaClient::Single(redis_client),
     )
     .expect("Should construct NVMe staging");
 
@@ -107,7 +107,7 @@ async fn test_multi_disk_distribution() {
         staging_dirs.clone(),
         100 * 1024 * 1024,
         mock_backend,
-        redis_client,
+        squeezefs::dlm::MetaClient::Single(redis_client),
     )
     .expect("Should construct multi-disk NVMe staging");
 

@@ -34,11 +34,7 @@ impl DataRouter {
     ) -> Result<()> {
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await?;
+        let mut con = self.dlm.get_connection().await?;
         let meta_key = format!("metadata:{}", file_path);
 
         let file_type: Option<String> = con.hget(&meta_key, "type").await?;
@@ -261,7 +257,7 @@ impl DataRouter {
         offset: u64,
         data: &[u8],
         fencing_token: u64,
-        con: &mut redis::aio::MultiplexedConnection,
+        con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
         let block_prefix_opt: Option<String> = con.hget(meta_key, "block_prefix").await?;
         let block_prefix = block_prefix_opt.ok_or_else(|| {
@@ -365,11 +361,7 @@ impl DataRouter {
         METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         // Fetch file metadata from Garnet
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await?;
+        let mut con = self.dlm.get_connection().await?;
         let meta_key = format!("metadata:{}", file_path);
 
         let file_type: Option<String> = con.hget(&meta_key, "type").await?;
@@ -485,11 +477,7 @@ impl DataRouter {
 
     /// Retrieve the file size from metadata.
     pub async fn get_file_size(&self, file_path: &str) -> Result<u64> {
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await?;
+        let mut con = self.dlm.get_connection().await?;
         let meta_key = format!("metadata:{}", file_path);
         let size: Option<u64> = con.hget(&meta_key, "size").await?;
         size.ok_or_else(|| {

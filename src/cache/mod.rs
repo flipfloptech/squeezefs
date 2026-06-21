@@ -19,7 +19,7 @@ impl TieredCache {
         mem_cache_size: Option<&str>,
         disk_cache_size: Option<&str>,
         backend: RustFsClient,
-        redis_client: redis::Client,
+        redis_client: crate::dlm::MetaClient,
     ) -> Result<Self> {
         let gds = gds::GdsCache::new();
 

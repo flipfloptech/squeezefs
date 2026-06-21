@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mem_cache_size.as_deref(),
                 disk_cache_size.as_deref(),
                 backend.clone(),
-                dlm.redis_client().clone(),
+                dlm.meta_client().clone(),
             )?;
             let router = DataRouter::new(dlm.clone(), backend, cache);
             let fs_engine = SqueezefsFilesystem::new(router, dlm);
@@ -112,8 +112,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn get_daemon_metrics() -> Option<HashMap<String, u64>> {
     let redis_url =
         std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let client = redis::Client::open(redis_url).ok()?;
-    let mut con = client.get_multiplexed_tokio_connection().await.ok()?;
+    let client = squeezefs::dlm::MetaClient::new(&redis_url).ok()?;
+    let mut con = client.get_connection().await.ok()?;
     let metrics: HashMap<String, String> = con.hgetall("metrics:daemon").await.ok()?;
 
     let mut parsed = HashMap::new();

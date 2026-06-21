@@ -59,8 +59,9 @@ async fn test_crash_recovery_flow() {
         .await
         .unwrap();
 
+    let meta_client = squeezefs::dlm::MetaClient::Single(redis_client.clone());
     // 3. Execute recovery
-    let recovered = recover_staging(temp_dir.path(), &mock_backend, &redis_client)
+    let recovered = recover_staging(temp_dir.path(), &mock_backend, &meta_client)
         .await
         .expect("Recovery should complete");
 
@@ -132,8 +133,9 @@ async fn test_stale_write_recovery_discard() {
         .await
         .unwrap();
 
+    let meta_client = squeezefs::dlm::MetaClient::Single(redis_client.clone());
     // 3. Execute recovery
-    let recovered = recover_staging(temp_dir.path(), &mock_backend, &redis_client)
+    let recovered = recover_staging(temp_dir.path(), &mock_backend, &meta_client)
         .await
         .expect("Recovery should complete");
 

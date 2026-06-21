@@ -12,7 +12,7 @@ pub struct NvmeStaging {
     staging_dirs: Vec<PathBuf>,
     max_bytes: u64,
     backend: RustFsClient,
-    redis_client: redis::Client,
+    redis_client: crate::dlm::MetaClient,
     write_tx: mpsc::Sender<PendingStagedWrite>,
 }
 
@@ -37,7 +37,7 @@ impl NvmeStaging {
         staging_dirs: Vec<PathBuf>,
         max_bytes: u64,
         backend: RustFsClient,
-        redis_client: redis::Client,
+        redis_client: crate::dlm::MetaClient,
     ) -> Result<Self> {
         if staging_dirs.is_empty() {
             return Err(SqueezefsError::InvalidOperation(
@@ -204,7 +204,7 @@ impl NvmeStaging {
     async fn flush_batch(
         staging_dirs: &[PathBuf],
         backend: &RustFsClient,
-        redis_client: &redis::Client,
+        redis_client: &crate::dlm::MetaClient,
         batch: &mut Vec<PendingStagedWrite>,
         current_bytes: &mut u64,
     ) -> Result<()> {
@@ -242,7 +242,7 @@ impl NvmeStaging {
             .await?;
 
         // 3. Update Garnet metadata mapping for each individual file ID
-        if let Ok(mut con) = redis_client.get_multiplexed_tokio_connection().await {
+        if let Ok(mut con) = redis_client.get_connection().await {
             for (file_id, offset, size) in mappings.iter() {
                 let mapping_key = format!("mapping:{}", file_id);
                 let _: std::result::Result<(), redis::RedisError> = redis::pipe()

@@ -18,7 +18,7 @@ struct StagedMetadata {
 pub async fn recover_staging(
     staging_dir: &Path,
     backend: &RustFsClient,
-    redis_client: &redis::Client,
+    redis_client: &crate::dlm::MetaClient,
 ) -> Result<usize> {
     if !staging_dir.exists() {
         return Ok(0);
@@ -29,7 +29,7 @@ pub async fn recover_staging(
         staging_dir
     );
     let mut recovered_count = 0;
-    let mut con = redis_client.get_multiplexed_tokio_connection().await?;
+    let mut con = redis_client.get_connection().await?;
 
     let entries = fs::read_dir(staging_dir)?;
     for entry in entries {

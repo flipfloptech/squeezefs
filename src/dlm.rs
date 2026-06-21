@@ -1,5 +1,6 @@
 use crate::error::{Result, SqueezefsError};
 use log::{debug, error};
+use redis::aio::ConnectionLike;
 use redis::AsyncCommands;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -8,9 +9,88 @@ use tokio::time;
 use uuid::Uuid;
 
 #[derive(Clone)]
+pub enum MetaClient {
+    Single(redis::Client),
+    Cluster(redis::cluster::ClusterClient),
+}
+
+pub enum MetaConnection {
+    Single(redis::aio::MultiplexedConnection),
+    Cluster(redis::cluster_async::ClusterConnection),
+}
+
+impl ConnectionLike for MetaConnection {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        match self {
+            MetaConnection::Single(c) => c.req_packed_command(cmd),
+            MetaConnection::Cluster(c) => c.req_packed_command(cmd),
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        cmd: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        match self {
+            MetaConnection::Single(c) => c.req_packed_commands(cmd, offset, count),
+            MetaConnection::Cluster(c) => c.req_packed_commands(cmd, offset, count),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            MetaConnection::Single(c) => c.get_db(),
+            MetaConnection::Cluster(c) => c.get_db(),
+        }
+    }
+}
+
+impl MetaClient {
+    pub fn new(redis_url: &str) -> Result<Self> {
+        let is_cluster = redis_url.contains(',')
+            || redis_url.starts_with("redis+cluster://")
+            || redis_url.contains("cluster=true");
+
+        if is_cluster {
+            let cleaned_url = redis_url.replace("redis+cluster://", "redis://");
+            let nodes: Vec<&str> = cleaned_url
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let client = redis::cluster::ClusterClientBuilder::new(nodes)
+                .read_from_replicas()
+                .build()?;
+            Ok(Self::Cluster(client))
+        } else {
+            let client = redis::Client::open(redis_url)?;
+            Ok(Self::Single(client))
+        }
+    }
+
+    pub async fn get_connection(&self) -> Result<MetaConnection> {
+        match self {
+            Self::Single(c) => {
+                let conn = c.get_multiplexed_tokio_connection().await?;
+                Ok(MetaConnection::Single(conn))
+            }
+            Self::Cluster(c) => {
+                let conn = c.get_async_connection().await?;
+                Ok(MetaConnection::Cluster(conn))
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct DlmClient {
     client_id: String,
-    redis_client: redis::Client,
+    meta_client: MetaClient,
 }
 
 pub struct LockLease {
@@ -19,22 +99,26 @@ pub struct LockLease {
     fencing_token: u64,
     heartbeat_tx: Option<oneshot::Sender<()>>,
     _heartbeat_handle: Option<JoinHandle<()>>,
-    redis_client: redis::Client,
+    meta_client: MetaClient,
     range: Option<(u64, u64)>,
 }
 
 impl DlmClient {
     pub fn new(redis_url: &str) -> Result<Self> {
-        let redis_client = redis::Client::open(redis_url)?;
+        let meta_client = MetaClient::new(redis_url)?;
         let client_id = Uuid::new_v4().to_string();
         Ok(Self {
             client_id,
-            redis_client,
+            meta_client,
         })
     }
 
-    pub fn redis_client(&self) -> &redis::Client {
-        &self.redis_client
+    pub fn meta_client(&self) -> &MetaClient {
+        &self.meta_client
+    }
+
+    pub async fn get_connection(&self) -> Result<MetaConnection> {
+        self.meta_client.get_connection().await
     }
 
     /// Acquire a lease for a file-level or byte-range lock.
@@ -53,7 +137,7 @@ impl DlmClient {
             format!("lock:{}", file_path)
         };
 
-        let mut con = self.redis_client.get_multiplexed_tokio_connection().await?;
+        let mut con = self.meta_client.get_connection().await?;
         let ttl_ms = ttl.as_millis() as u64;
 
         // Perform SET key client_id NX PX ttl_ms
@@ -81,7 +165,7 @@ impl DlmClient {
         let (heartbeat_tx, mut heartbeat_rx) = oneshot::channel::<()>();
         let client_id_clone = self.client_id.clone();
         let lock_key_clone = lock_key.clone();
-        let redis_client_clone = self.redis_client.clone();
+        let meta_client_clone = self.meta_client.clone();
         let interval_duration = ttl / 3; // Renew at 1/3 of TTL (e.g. every 1.6s for 5s TTL)
 
         let heartbeat_handle = tokio::spawn(async move {
@@ -89,7 +173,7 @@ impl DlmClient {
             // First tick is immediate, skip it
             interval.tick().await;
 
-            let mut con = match redis_client_clone.get_multiplexed_tokio_connection().await {
+            let mut con = match meta_client_clone.get_connection().await {
                 Ok(c) => c,
                 Err(e) => {
                     error!("Heartbeat failed to establish Redis connection: {:?}", e);
@@ -118,14 +202,14 @@ impl DlmClient {
 
                         match script.key(&lock_key_clone).arg(&client_id_clone).arg(ttl_ms).invoke_async::<_, i32>(&mut con).await {
                             Ok(1) => {
-                                debug!("Successfully renewed lease for key: {}", lock_key_clone);
+                                debug!("Successfully renewed lease for key: {} (client_id: {}, ttl: {}ms)", lock_key_clone, client_id_clone, ttl_ms);
                             }
                             Ok(_) => {
-                                error!("Failed to renew lease for key: {}, lock was stolen or expired!", lock_key_clone);
+                                error!("Failed to renew lease for key: {} (client_id: {}, ttl: {}ms) - lock was stolen or expired!", lock_key_clone, client_id_clone, ttl_ms);
                                 break;
                             }
                             Err(e) => {
-                                error!("Error executing lease renewal script for key {}: {:?}", lock_key_clone, e);
+                                error!("Error executing lease renewal script for key {} (client_id: {}, ttl: {}ms): {:?}", lock_key_clone, client_id_clone, ttl_ms, e);
                             }
                         }
                     }
@@ -139,7 +223,7 @@ impl DlmClient {
             fencing_token,
             heartbeat_tx: Some(heartbeat_tx),
             _heartbeat_handle: Some(heartbeat_handle),
-            redis_client: self.redis_client.clone(),
+            meta_client: self.meta_client.clone(),
             range,
         })
     }
@@ -168,7 +252,7 @@ impl LockLease {
             format!("lock:{}", self.file_path)
         };
 
-        let mut con = self.redis_client.get_multiplexed_tokio_connection().await?;
+        let mut con = self.meta_client.get_connection().await?;
         // Release ONLY if we still own it to avoid releasing other client's lock
         let script = redis::Script::new(
             r#"
@@ -202,7 +286,7 @@ impl Drop for LockLease {
         let file_path = self.file_path.clone();
         let client_id = self.client_id.clone();
         let range = self.range;
-        let redis_client = self.redis_client.clone();
+        let meta_client = self.meta_client.clone();
 
         tokio::spawn(async move {
             let lock_key = if let Some((start, end)) = range {
@@ -210,7 +294,7 @@ impl Drop for LockLease {
             } else {
                 format!("lock:{}", file_path)
             };
-            if let Ok(mut con) = redis_client.get_multiplexed_tokio_connection().await {
+            if let Ok(mut con) = meta_client.get_connection().await {
                 let script = redis::Script::new(
                     r#"
                     if redis.call("get", KEYS[1]) == ARGV[1] then

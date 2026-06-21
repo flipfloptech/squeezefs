@@ -34,7 +34,7 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
             None,
             None,
             backend.clone(),
-            dlm.redis_client().clone(),
+            dlm.meta_client().clone(),
         )
         .unwrap()
     });

@@ -50,11 +50,7 @@ impl SqueezefsFilesystem {
     }
 
     async fn init_root_inode(&self) -> Result<(), SqueezefsError> {
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await?;
+        let mut con = self.dlm.get_connection().await?;
         let exists: bool = con.exists("squeezefs:attr:1").await?;
         if !exists {
             let now = SystemTime::now()
@@ -86,11 +82,7 @@ impl SqueezefsFilesystem {
     }
 
     async fn get_attr_internal(&self, ino: u64) -> Result<FileAttr, SqueezefsError> {
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await?;
+        let mut con = self.dlm.get_connection().await?;
         let attr_key = format!("squeezefs:attr:{}", ino);
         let fields: std::collections::HashMap<String, String> = con.hgetall(&attr_key).await?;
 
@@ -186,7 +178,7 @@ impl SqueezefsFilesystem {
 
     async fn update_parent_timestamps(
         &self,
-        con: &mut redis::aio::MultiplexedConnection,
+        con: &mut crate::dlm::MetaConnection,
         parent: u64,
     ) -> Result<(), redis::RedisError> {
         let now = SystemTime::now()
@@ -222,12 +214,12 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // Start background metrics publishing task
-        let redis_client = self.dlm.redis_client().clone();
+        let redis_client = self.dlm.meta_client().clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             loop {
                 interval.tick().await;
-                if let Ok(mut con) = redis_client.get_multiplexed_tokio_connection().await {
+                if let Ok(mut con) = redis_client.get_connection().await {
                     let _: Result<(), redis::RedisError> = redis::pipe()
                         .hset(
                             "metrics:daemon",
@@ -285,12 +277,7 @@ impl Filesystem for SqueezefsFilesystem {
         let name_str = name.to_string_lossy();
         debug!("FUSE Lookup: parent = {}, name = {}", parent, name_str);
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let dir_key = format!("squeezefs:dir:{}", parent);
         let child_ino_opt: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
 
@@ -348,12 +335,7 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, mode, rdev
         );
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         // Check if name already exists in parent
         let dir_key = format!("squeezefs:dir:{}", parent);
@@ -449,12 +431,7 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, mode, flags
         );
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         // Check if file already exists
         let dir_key = format!("squeezefs:dir:{}", parent);
@@ -608,12 +585,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let bytes_written = data.len() as u32;
 
                 // Update size in inode attributes in Garnet
-                if let Ok(mut con) = self
-                    .dlm
-                    .redis_client()
-                    .get_multiplexed_tokio_connection()
-                    .await
-                {
+                if let Ok(mut con) = self.dlm.get_connection().await {
                     let attr_key = format!("squeezefs:attr:{}", ino);
                     let now = SystemTime::now()
                         .duration_since(SystemTime::UNIX_EPOCH)
@@ -679,12 +651,7 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, mode
         );
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         // Check if name already exists in parent
         let dir_key = format!("squeezefs:dir:{}", parent);
@@ -758,12 +725,7 @@ impl Filesystem for SqueezefsFilesystem {
         let name_str = name.to_string_lossy();
         debug!("FUSE rmdir: parent = {}, name = {}", parent, name_str);
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let dir_key = format!("squeezefs:dir:{}", parent);
         let ino_opt: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
@@ -812,12 +774,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyAttr> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let attr_key = format!("squeezefs:attr:{}", ino);
 
         // Check if inode exists first
@@ -892,12 +849,7 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, link_str
         );
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         // Check if name already exists in parent
         let dir_key = format!("squeezefs:dir:{}", parent);
@@ -961,12 +913,7 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn readlink(&self, _req: Request, ino: u64) -> FuseResult<ReplyData> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let symlink_key = format!("squeezefs:symlink:{}", ino);
         let target: Option<String> = con.get(&symlink_key).await.map_err(map_err)?;
 
@@ -995,12 +942,7 @@ impl Filesystem for SqueezefsFilesystem {
             ino, new_parent, new_name_str
         );
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         // Check if destination name already exists in new_parent
         let dir_key = format!("squeezefs:dir:{}", new_parent);
@@ -1071,12 +1013,7 @@ impl Filesystem for SqueezefsFilesystem {
         let name_str = name.to_string_lossy();
         debug!("FUSE unlink: parent = {}, name = {}", parent, name_str);
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let dir_key = format!("squeezefs:dir:{}", parent);
         let ino_opt: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
@@ -1187,12 +1124,7 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, new_parent, new_name_str
         );
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let src_dir_key = format!("squeezefs:dir:{}", parent);
         let dest_dir_key = format!("squeezefs:dir:{}", new_parent);
@@ -1335,12 +1267,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE readdir: parent = {}, offset = {}", parent, offset);
 
-        let mut con = self
-            .dlm
-            .redis_client()
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(map_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let dir_key = format!("squeezefs:dir:{}", parent);
         let entries_map: std::collections::HashMap<String, u64> =
             con.hgetall(&dir_key).await.map_err(map_err)?;

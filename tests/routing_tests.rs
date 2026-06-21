@@ -29,7 +29,7 @@ async fn setup_router() -> Option<(DataRouter, tempfile::TempDir)> {
         None,
         None,
         backend.clone(),
-        dlm.redis_client().clone(),
+        dlm.meta_client().clone(),
     )
     .ok()?;
 

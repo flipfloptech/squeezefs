@@ -174,15 +174,23 @@ impl DataRouter {
         } else {
             // Layout: striped
             let file_uuid = Uuid::new_v4().to_string();
+            let block_map_id = Uuid::new_v4().to_string();
             let block_size = 4 * 1024 * 1024;
             let mut futures = Vec::new();
             let mut offset_cursor = 0;
             let mut block_count = 0;
+            let mut block_mappings = Vec::new();
 
             while offset_cursor < new_size {
                 let end = std::cmp::min(offset_cursor + block_size, new_size);
                 let chunk = existing_data[offset_cursor..end].to_vec();
-                let block_key = format!("blocks/{}/part_{}", file_uuid, block_count);
+                let block_write_uuid = Uuid::new_v4().to_string();
+                let block_key = format!(
+                    "blocks/{}/block_{}_{}",
+                    file_uuid, block_count, block_write_uuid
+                );
+
+                block_mappings.push((block_count.to_string(), block_key.clone()));
 
                 let backend_clone = self.backend.clone();
                 let task = tokio::spawn(async move {
@@ -205,10 +213,21 @@ impl DataRouter {
                 })??;
             }
 
+            // Register block mappings and reference counts in Garnet
+            let block_map_key = format!("block_map:{}", block_map_id);
+            let refcounts_key = "squeezefs:block_refcounts";
+            let mut pipe_map = redis::pipe();
+            for (idx_str, key) in &block_mappings {
+                pipe_map.hset(&block_map_key, idx_str, key);
+                pipe_map.hset(refcounts_key, key, 1);
+            }
+            let _: () = pipe_map.query_async(&mut con).await?;
+
             let mut pipe = redis::pipe();
             pipe.hset(&meta_key, "size", new_size)
                 .hset(&meta_key, "type", "striped")
                 .hset(&meta_key, "block_prefix", format!("blocks/{}", file_uuid))
+                .hset(&meta_key, "block_map_id", &block_map_id)
                 .hset(&meta_key, "num_blocks", block_count)
                 .hset(&meta_key, "fencing_token", fencing_token);
 
@@ -240,6 +259,22 @@ impl DataRouter {
                 let _ = tokio::fs::remove_file(old_data_path).await;
                 let _ = tokio::fs::remove_file(old_meta_path).await;
                 let mapping_key = format!("mapping:{}", old_id);
+                // Decrement refcount of old staged merged block if it exists
+                let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
+                if let Some(bk) = block_key {
+                    let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+                    if let Some(mut r) = current_ref {
+                        r -= 1;
+                        if r <= 0 {
+                            let _: () = con.hdel(refcounts_key, &bk).await?;
+                            let _ = self.backend.delete_object(&bk).await;
+                        } else {
+                            let _: () = con.hset(refcounts_key, &bk, r).await?;
+                        }
+                    } else {
+                        let _ = self.backend.delete_object(&bk).await;
+                    }
+                }
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
 
@@ -259,10 +294,33 @@ impl DataRouter {
         fencing_token: u64,
         con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
-        let block_prefix_opt: Option<String> = con.hget(meta_key, "block_prefix").await?;
-        let block_prefix = block_prefix_opt.ok_or_else(|| {
-            SqueezefsError::InvalidOperation("Missing block_prefix for striped file".to_string())
-        })?;
+        let block_map_id_opt: Option<String> = con.hget(meta_key, "block_map_id").await?;
+        let block_map_id = match block_map_id_opt {
+            Some(id) => id,
+            None => {
+                let block_prefix_opt: Option<String> = con.hget(meta_key, "block_prefix").await?;
+                let block_prefix = block_prefix_opt.ok_or_else(|| {
+                    SqueezefsError::InvalidOperation(
+                        "Missing block_map_id and block_prefix for striped file".to_string(),
+                    )
+                })?;
+                let num_blocks_opt: Option<u32> = con.hget(meta_key, "num_blocks").await?;
+                let num_blocks = num_blocks_opt.unwrap_or(0);
+
+                let new_id = Uuid::new_v4().to_string();
+                let block_map_key = format!("block_map:{}", new_id);
+                let refcounts_key = "squeezefs:block_refcounts";
+                let mut pipe = redis::pipe();
+                for i in 0..num_blocks {
+                    let old_key = format!("{}/part_{}", block_prefix, i);
+                    pipe.hset(&block_map_key, i.to_string(), &old_key);
+                    pipe.hset(refcounts_key, &old_key, 1);
+                }
+                pipe.hset(meta_key, "block_map_id", &new_id);
+                let _: () = pipe.query_async(con).await?;
+                new_id
+            }
+        };
 
         let num_blocks_opt: Option<u32> = con.hget(meta_key, "num_blocks").await?;
         let num_blocks = num_blocks_opt.unwrap_or(0);
@@ -284,12 +342,23 @@ impl DataRouter {
             return Ok(());
         }
 
+        let block_map_key = format!("block_map:{}", block_map_id);
+        let refcounts_key = "squeezefs:block_refcounts";
+
         // 1. Fill any block gaps if writing far past existing blocks
         for b in num_blocks..start_block {
-            let gap_key = format!("{}/part_{}", block_prefix, b);
+            let gap_write_uuid = Uuid::new_v4().to_string();
+            let file_uuid = Uuid::new_v4().to_string();
+            let gap_key = format!("blocks/{}/block_{}_{}", file_uuid, b, gap_write_uuid);
             let gap_data = vec![0; block_size as usize];
             self.backend
                 .put_object(&gap_key, gap_data, fencing_token)
+                .await?;
+
+            let _: () = redis::pipe()
+                .hset(refcounts_key, &gap_key, 1)
+                .hset(&block_map_key, b.to_string(), &gap_key)
+                .query_async(con)
                 .await?;
         }
 
@@ -306,10 +375,11 @@ impl DataRouter {
 
             let data_slice =
                 &data[(overlap_start - offset) as usize..(overlap_end - offset) as usize];
-            let block_key = format!("{}/part_{}", block_prefix, b);
 
-            let mut block_data = if b < num_blocks {
-                self.backend.get_object(&block_key).await?
+            let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
+
+            let mut block_data = if let Some(ref bk) = old_block_key {
+                self.backend.get_object(bk).await?
             } else {
                 vec![0; rel_end]
             };
@@ -319,9 +389,41 @@ impl DataRouter {
             }
 
             block_data[rel_start..rel_end].copy_from_slice(data_slice);
+
+            // Copy-on-Write: write to a NEW block key!
+            let file_uuid = Uuid::new_v4().to_string();
+            let block_write_uuid = Uuid::new_v4().to_string();
+            let new_block_key = format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
+
             self.backend
-                .put_object(&block_key, block_data, fencing_token)
+                .put_object(&new_block_key, block_data, fencing_token)
                 .await?;
+
+            let mut pipe = redis::pipe();
+            pipe.hset(refcounts_key, &new_block_key, 1).hset(
+                &block_map_key,
+                b.to_string(),
+                &new_block_key,
+            );
+            let _: () = pipe.query_async(con).await?;
+
+            if let Some(ref bk) = old_block_key {
+                let old_ref: Option<i32> = con.hget(refcounts_key, bk).await?;
+                if let Some(mut r) = old_ref {
+                    r -= 1;
+                    if r <= 0 {
+                        let _: () = redis::pipe()
+                            .hdel(refcounts_key, bk)
+                            .query_async(con)
+                            .await?;
+                        let _ = self.backend.delete_object(bk).await;
+                    } else {
+                        let _: () = con.hset(refcounts_key, bk, r).await?;
+                    }
+                } else {
+                    let _ = self.backend.delete_object(bk).await;
+                }
+            }
         }
 
         let new_num_blocks = std::cmp::max(num_blocks, end_block + 1);
@@ -427,12 +529,6 @@ impl DataRouter {
                     "Routing: Striped file '{}' reading blocks in parallel.",
                     file_path
                 );
-                let block_prefix_opt: Option<String> = con.hget(&meta_key, "block_prefix").await?;
-                let block_prefix = block_prefix_opt.ok_or_else(|| {
-                    SqueezefsError::InvalidOperation(
-                        "Missing block_prefix for striped file".to_string(),
-                    )
-                })?;
                 let num_blocks_opt: Option<u32> = con.hget(&meta_key, "num_blocks").await?;
                 let num_blocks = num_blocks_opt.ok_or_else(|| {
                     SqueezefsError::InvalidOperation(
@@ -440,9 +536,43 @@ impl DataRouter {
                     )
                 })?;
 
+                let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+
+                let block_keys = if let Some(block_map_id) = block_map_id_opt {
+                    let block_map_key = format!("block_map:{}", block_map_id);
+                    let mut keys = Vec::new();
+                    let mut pipe = redis::pipe();
+                    for i in 0..num_blocks {
+                        pipe.hget(&block_map_key, i.to_string());
+                    }
+                    let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
+                    for (i, key_opt) in res.into_iter().enumerate() {
+                        let bk = key_opt.ok_or_else(|| {
+                            SqueezefsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("Block {} mapping not found in Garnet", i),
+                            ))
+                        })?;
+                        keys.push(bk);
+                    }
+                    keys
+                } else {
+                    let block_prefix_opt: Option<String> =
+                        con.hget(&meta_key, "block_prefix").await?;
+                    let block_prefix = block_prefix_opt.ok_or_else(|| {
+                        SqueezefsError::InvalidOperation(
+                            "Missing block_prefix for striped file".to_string(),
+                        )
+                    })?;
+                    let mut keys = Vec::new();
+                    for i in 0..num_blocks {
+                        keys.push(format!("{}/part_{}", block_prefix, i));
+                    }
+                    keys
+                };
+
                 let mut futures = Vec::new();
-                for i in 0..num_blocks {
-                    let block_key = format!("{}/part_{}", block_prefix, i);
+                for block_key in block_keys {
                     let backend_clone = self.backend.clone();
                     let task =
                         tokio::spawn(async move { backend_clone.get_object(&block_key).await });
@@ -494,5 +624,308 @@ impl DataRouter {
 
     pub fn backend(&self) -> &RustFsClient {
         &self.backend
+    }
+
+    /// Clone a file metadata-only. If it's inline, copy the inline data.
+    /// If it's staged, copy the staging folder/files and mapping.
+    /// If it's striped, copy the block map and increment all block reference counts.
+    pub async fn clone_file(&self, src: &str, dest: &str) -> Result<()> {
+        let _src_lock = self
+            .dlm
+            .acquire_lock(src, None, std::time::Duration::from_secs(5))
+            .await?;
+        let dest_lock = self
+            .dlm
+            .acquire_lock(dest, None, std::time::Duration::from_secs(5))
+            .await?;
+
+        let mut con = self.dlm.get_connection().await?;
+        let src_meta_key = format!("metadata:{}", src);
+        let dest_meta_key = format!("metadata:{}", dest);
+
+        let exists_src: bool = con.exists(&src_meta_key).await?;
+        if !exists_src {
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Source file not found: {}", src),
+            )));
+        }
+
+        let exists_dest: bool = con.exists(&dest_meta_key).await?;
+        if exists_dest {
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Destination file already exists: {}", dest),
+            )));
+        }
+
+        let file_type: Option<String> = con.hget(&src_meta_key, "type").await?;
+        let file_type = file_type
+            .ok_or_else(|| SqueezefsError::InvalidOperation("Missing file type".to_string()))?;
+
+        if file_type == "inline" {
+            let inline_src_key = format!("inline_data:{}", src);
+            let inline_dest_key = format!("inline_data:{}", dest);
+
+            let inline_data: Option<Vec<u8>> = con.get(&inline_src_key).await?;
+            let inline_data = inline_data.unwrap_or_default();
+            let size_opt: Option<u64> = con.hget(&src_meta_key, "size").await?;
+            let size = size_opt.unwrap_or(0);
+
+            let mut pipe = redis::pipe();
+            pipe.set(&inline_dest_key, &inline_data)
+                .hset(&dest_meta_key, "size", size)
+                .hset(&dest_meta_key, "type", "inline")
+                .hset(&dest_meta_key, "fencing_token", dest_lock.fencing_token());
+            let _: () = pipe.query_async(&mut con).await?;
+
+            if let Some(cached) = self.cache.lru.get(src) {
+                self.cache.lru.put(dest, cached);
+            }
+        } else if file_type == "staged" {
+            let src_file_id_opt: Option<String> = con.hget(&src_meta_key, "file_id").await?;
+            let src_file_id = src_file_id_opt.ok_or_else(|| {
+                SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
+            })?;
+
+            let size_opt: Option<u64> = con.hget(&src_meta_key, "size").await?;
+            let size = size_opt.unwrap_or(0);
+            let new_file_id = Uuid::new_v4().to_string();
+
+            let src_data_path = self
+                .cache
+                .nvme
+                .get_staged_path(&src_file_id)
+                .join(format!("{}.data", src_file_id));
+            let src_meta_path = self
+                .cache
+                .nvme
+                .get_staged_path(&src_file_id)
+                .join(format!("{}.meta", src_file_id));
+
+            let dest_dir = self.cache.nvme.get_staged_path(&new_file_id);
+            tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
+                SqueezefsError::Io(std::io::Error::other(format!(
+                    "Failed to create stage dir for clone: {:?}",
+                    e
+                )))
+            })?;
+
+            let dest_data_path = dest_dir.join(format!("{}.data", new_file_id));
+            let dest_meta_path = dest_dir.join(format!("{}.meta", new_file_id));
+
+            if tokio::fs::metadata(&src_data_path).await.is_ok() {
+                tokio::fs::copy(&src_data_path, &dest_data_path)
+                    .await
+                    .map_err(|e| {
+                        SqueezefsError::Io(std::io::Error::other(format!(
+                            "Failed to copy stage data: {:?}",
+                            e
+                        )))
+                    })?;
+            }
+
+            if tokio::fs::metadata(&src_meta_path).await.is_ok() {
+                tokio::fs::copy(&src_meta_path, &dest_meta_path)
+                    .await
+                    .map_err(|e| {
+                        SqueezefsError::Io(std::io::Error::other(format!(
+                            "Failed to copy stage meta: {:?}",
+                            e
+                        )))
+                    })?;
+            }
+
+            let mapping_src_key = format!("mapping:{}", src_file_id);
+            let mapping_dest_key = format!("mapping:{}", new_file_id);
+            let block: Option<String> = con.hget(&mapping_src_key, "block").await?;
+            let offset: Option<u64> = con.hget(&mapping_src_key, "offset").await?;
+            let sz: Option<u64> = con.hget(&mapping_src_key, "size").await?;
+
+            let mut pipe = redis::pipe();
+            if let (Some(ref bk), Some(off), Some(s)) = (&block, offset, sz) {
+                pipe.hset(&mapping_dest_key, "block", bk)
+                    .hset(&mapping_dest_key, "offset", off)
+                    .hset(&mapping_dest_key, "size", s);
+
+                let refcounts_key = "squeezefs:block_refcounts";
+                let current_ref: Option<i32> = con.hget(refcounts_key, bk).await?;
+                let new_ref = current_ref.unwrap_or(1) + 1;
+                pipe.hset(refcounts_key, bk, new_ref);
+            }
+
+            pipe.hset(&dest_meta_key, "size", size)
+                .hset(&dest_meta_key, "type", "staged")
+                .hset(&dest_meta_key, "file_id", &new_file_id)
+                .hset(&dest_meta_key, "fencing_token", dest_lock.fencing_token());
+
+            let _: () = pipe.query_async(&mut con).await?;
+
+            if let Some(cached) = self.cache.lru.get(src) {
+                self.cache.lru.put(dest, cached);
+            }
+        } else if file_type == "striped" {
+            let src_block_map_id_opt: Option<String> =
+                con.hget(&src_meta_key, "block_map_id").await?;
+            let src_block_map_id = match src_block_map_id_opt {
+                Some(id) => id,
+                None => {
+                    let block_prefix_opt: Option<String> =
+                        con.hget(&src_meta_key, "block_prefix").await?;
+                    let block_prefix = block_prefix_opt.ok_or_else(|| {
+                        SqueezefsError::InvalidOperation(
+                            "Missing block_map_id and block_prefix for striped file".to_string(),
+                        )
+                    })?;
+                    let num_blocks_opt: Option<u32> = con.hget(&src_meta_key, "num_blocks").await?;
+                    let num_blocks = num_blocks_opt.unwrap_or(0);
+
+                    let new_id = Uuid::new_v4().to_string();
+                    let block_map_key = format!("block_map:{}", new_id);
+                    let refcounts_key = "squeezefs:block_refcounts";
+                    let mut pipe = redis::pipe();
+                    for i in 0..num_blocks {
+                        let old_key = format!("{}/part_{}", block_prefix, i);
+                        pipe.hset(&block_map_key, i.to_string(), &old_key);
+                        pipe.hset(refcounts_key, &old_key, 1);
+                    }
+                    pipe.hset(&src_meta_key, "block_map_id", &new_id);
+                    let _: () = pipe.query_async(&mut con).await?;
+                    new_id
+                }
+            };
+
+            let size_opt: Option<u64> = con.hget(&src_meta_key, "size").await?;
+            let size = size_opt.unwrap_or(0);
+            let num_blocks_opt: Option<u32> = con.hget(&src_meta_key, "num_blocks").await?;
+            let num_blocks = num_blocks_opt.unwrap_or(0);
+
+            let dest_block_map_id = Uuid::new_v4().to_string();
+            let src_block_map_key = format!("block_map:{}", src_block_map_id);
+            let dest_block_map_key = format!("block_map:{}", dest_block_map_id);
+            let refcounts_key = "squeezefs:block_refcounts";
+
+            let block_mappings: std::collections::HashMap<String, String> =
+                con.hgetall(&src_block_map_key).await?;
+
+            let mut pipe = redis::pipe();
+            for (idx_str, bk) in &block_mappings {
+                pipe.hset(&dest_block_map_key, idx_str, bk);
+            }
+            let _: () = pipe.query_async(&mut con).await?;
+
+            let mut pipe_fetch = redis::pipe();
+            for bk in block_mappings.values() {
+                pipe_fetch.hget(refcounts_key, bk);
+            }
+            let current_refs: Vec<Option<i32>> = pipe_fetch.query_async(&mut con).await?;
+
+            let mut pipe_set = redis::pipe();
+            for (bk, ref_opt) in block_mappings.values().zip(current_refs) {
+                let new_ref = ref_opt.unwrap_or(1) + 1;
+                pipe_set.hset(refcounts_key, bk, new_ref);
+            }
+            let _: () = pipe_set.query_async(&mut con).await?;
+
+            let mut pipe_meta = redis::pipe();
+            pipe_meta
+                .hset(&dest_meta_key, "size", size)
+                .hset(&dest_meta_key, "type", "striped")
+                .hset(&dest_meta_key, "block_map_id", &dest_block_map_id)
+                .hset(&dest_meta_key, "num_blocks", num_blocks)
+                .hset(&dest_meta_key, "fencing_token", dest_lock.fencing_token());
+            let _: () = pipe_meta.query_async(&mut con).await?;
+
+            if let Some(cached) = self.cache.lru.get(src) {
+                self.cache.lru.put(dest, cached);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Safely delete all underlying storage files/blocks associated with the file.
+    pub async fn delete_file(
+        &self,
+        file_path: &str,
+        con: &mut crate::dlm::MetaConnection,
+    ) -> Result<()> {
+        let meta_key = format!("metadata:{}", file_path);
+        let file_type: Option<String> = con.hget(&meta_key, "type").await?;
+        if let Some(t) = file_type {
+            if t == "striped" {
+                let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+                if let Some(block_map_id) = block_map_id_opt {
+                    let block_map_key = format!("block_map:{}", block_map_id);
+                    let refcounts_key = "squeezefs:block_refcounts";
+
+                    let block_mappings: std::collections::HashMap<String, String> =
+                        con.hgetall(&block_map_key).await?;
+
+                    for (_, bk) in block_mappings {
+                        let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+                        if let Some(mut r) = current_ref {
+                            r -= 1;
+                            if r <= 0 {
+                                let _: () = con.hdel(refcounts_key, &bk).await?;
+                                let _ = self.backend.delete_object(&bk).await;
+                            } else {
+                                let _: () = con.hset(refcounts_key, &bk, r).await?;
+                            }
+                        } else {
+                            let _ = self.backend.delete_object(&bk).await;
+                        }
+                    }
+                    let _: () = con.del(&block_map_key).await?;
+                } else {
+                    let block_prefix_opt: Option<String> =
+                        con.hget(&meta_key, "block_prefix").await?;
+                    let num_blocks_opt: Option<u32> = con.hget(&meta_key, "num_blocks").await?;
+                    if let (Some(bp), Some(nb)) = (block_prefix_opt, num_blocks_opt) {
+                        for i in 0..nb {
+                            let block_key = format!("{}/part_{}", bp, i);
+                            let _ = self.backend.delete_object(&block_key).await;
+                        }
+                    }
+                }
+            } else if t == "staged" {
+                let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;
+                if let Some(fid) = file_id_opt {
+                    let mapping_key = format!("mapping:{}", fid);
+                    let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
+                    if let Some(bk) = block_key {
+                        let refcounts_key = "squeezefs:block_refcounts";
+                        let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+                        if let Some(mut r) = current_ref {
+                            r -= 1;
+                            if r <= 0 {
+                                let _: () = con.hdel(refcounts_key, &bk).await?;
+                                let _ = self.backend.delete_object(&bk).await;
+                            } else {
+                                let _: () = con.hset(refcounts_key, &bk, r).await?;
+                            }
+                        } else {
+                            let _ = self.backend.delete_object(&bk).await;
+                        }
+                    }
+                    let _: () = con.del(&mapping_key).await?;
+
+                    let old_data_path = self
+                        .cache
+                        .nvme
+                        .get_staged_path(&fid)
+                        .join(format!("{}.data", fid));
+                    let old_meta_path = self
+                        .cache
+                        .nvme
+                        .get_staged_path(&fid)
+                        .join(format!("{}.meta", fid));
+                    let _ = tokio::fs::remove_file(old_data_path).await;
+                    let _ = tokio::fs::remove_file(old_meta_path).await;
+                }
+            }
+        }
+        self.cache.lru.remove(file_path);
+        Ok(())
     }
 }

@@ -51,6 +51,13 @@ enum Commands {
         #[arg(long, default_value_t = 128)]
         size: usize,
     },
+    /// Clone a file metadata-only (instant Copy-on-Write cloning)
+    Clone {
+        /// Source file path
+        src: String,
+        /// Destination file path
+        dest: String,
+    },
 }
 
 #[tokio::main]
@@ -103,6 +110,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             size,
         } => {
             run_benchmark(&path, threads, size).await?;
+        }
+        Commands::Clone { src, dest } => {
+            let redis_url = std::env::var("GARNET_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            let staging_dirs = vec![PathBuf::from("/tmp/squeezefs_staging")];
+
+            let dlm = DlmClient::new(&redis_url)?;
+            let backend = RustFsClient::new().await;
+            let cache = TieredCache::new(
+                staging_dirs,
+                None,
+                None,
+                backend.clone(),
+                dlm.meta_client().clone(),
+            )?;
+            let router = DataRouter::new(dlm, backend, cache);
+
+            println!("Cloning file from {} to {}...", src, dest);
+            router.clone_file(&src, &dest).await?;
+            println!("File cloned successfully.");
         }
     }
 

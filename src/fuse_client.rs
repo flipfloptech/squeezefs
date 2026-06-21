@@ -1070,34 +1070,10 @@ impl Filesystem for SqueezefsFilesystem {
             let meta_key = format!("metadata:{}", file_path);
             let symlink_key = format!("squeezefs:symlink:{}", ino);
 
-            // Fetch block prefix if it was striped
-            let file_type: Option<String> = con.hget(&meta_key, "type").await.map_err(map_err)?;
-            if let Some(t) = file_type {
-                if t == "striped" {
-                    let block_prefix: Option<String> =
-                        con.hget(&meta_key, "block_prefix").await.map_err(map_err)?;
-                    let num_blocks: Option<u32> =
-                        con.hget(&meta_key, "num_blocks").await.map_err(map_err)?;
-                    if let (Some(bp), Some(nb)) = (block_prefix, num_blocks) {
-                        for i in 0..nb {
-                            let block_key = format!("{}/part_{}", bp, i);
-                            let _ = self.router.backend().delete_object(&block_key).await;
-                        }
-                    }
-                } else if t == "staged" {
-                    let file_id_opt: Option<String> =
-                        con.hget(&meta_key, "file_id").await.map_err(map_err)?;
-                    if let Some(fid) = file_id_opt {
-                        let mapping_key = format!("mapping:{}", fid);
-                        let block_key: Option<String> =
-                            con.hget(&mapping_key, "block").await.map_err(map_err)?;
-                        if let Some(bk) = block_key {
-                            let _ = self.router.backend().delete_object(&bk).await;
-                        }
-                        let _: () = con.del(&mapping_key).await.map_err(map_err)?;
-                    }
-                }
-            }
+            self.router
+                .delete_file(&file_path, &mut con)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             let _: () = redis::pipe()
                 .del(&attr_key)

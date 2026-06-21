@@ -327,7 +327,7 @@ async fn test_metadata_mknod() {
     };
 
     // Create a FIFO (NamedPipe) named "my_fifo" under root (parent=1)
-    let fifo_mode = (libc::S_IFIFO | 0o644) as u32;
+    let fifo_mode = libc::S_IFIFO | 0o644;
     let reply = fs
         .mknod(req, 1, OsStr::new("my_fifo"), fifo_mode, 0)
         .await
@@ -437,7 +437,13 @@ async fn test_metadata_rename_directory_loop_fails() {
     // Attempting to rename parent into child (making /parent a child of /parent/child)
     // should fail with EINVAL (directory loop)
     let res = fs
-        .rename(req, 1, OsStr::new("parent"), child_ino, OsStr::new("parent"))
+        .rename(
+            req,
+            1,
+            OsStr::new("parent"),
+            child_ino,
+            OsStr::new("parent"),
+        )
         .await;
     assert!(res.is_err());
     assert_eq!(res.unwrap_err(), Errno::from(libc::EINVAL));
@@ -531,11 +537,25 @@ async fn test_metadata_parent_timestamps() {
         .attr;
 
     // The root directory mtime and ctime must be updated (greater than or equal to initial)
-    let initial_mtime = parent_attr_initial.mtime.sec as f64 + (parent_attr_initial.mtime.nsec as f64 / 1_000_000_000.0);
-    let after_mtime = parent_attr_after.mtime.sec as f64 + (parent_attr_after.mtime.nsec as f64 / 1_000_000_000.0);
-    assert!(after_mtime > initial_mtime, "parent mtime did not advance: {} -> {}", initial_mtime, after_mtime);
+    let initial_mtime = parent_attr_initial.mtime.sec as f64
+        + (parent_attr_initial.mtime.nsec as f64 / 1_000_000_000.0);
+    let after_mtime = parent_attr_after.mtime.sec as f64
+        + (parent_attr_after.mtime.nsec as f64 / 1_000_000_000.0);
+    assert!(
+        after_mtime > initial_mtime,
+        "parent mtime did not advance: {} -> {}",
+        initial_mtime,
+        after_mtime
+    );
 
-    let initial_ctime = parent_attr_initial.ctime.sec as f64 + (parent_attr_initial.ctime.nsec as f64 / 1_000_000_000.0);
-    let after_ctime = parent_attr_after.ctime.sec as f64 + (parent_attr_after.ctime.nsec as f64 / 1_000_000_000.0);
-    assert!(after_ctime > initial_ctime, "parent ctime did not advance: {} -> {}", initial_ctime, after_ctime);
+    let initial_ctime = parent_attr_initial.ctime.sec as f64
+        + (parent_attr_initial.ctime.nsec as f64 / 1_000_000_000.0);
+    let after_ctime = parent_attr_after.ctime.sec as f64
+        + (parent_attr_after.ctime.nsec as f64 / 1_000_000_000.0);
+    assert!(
+        after_ctime > initial_ctime,
+        "parent ctime did not advance: {} -> {}",
+        initial_ctime,
+        after_ctime
+    );
 }

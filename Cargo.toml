@@ -38,3 +38,7 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 [[bench]]
 name = "squeezefs_bench"
 harness = false
+
+[patch.crates-io]
+fuse3 = { path = "third_party/fuse3" }
+

@@ -580,7 +580,7 @@ impl Filesystem for SqueezefsFilesystem {
             .write_file(&file_path, offset, data, lease.fencing_token());
 
         // Timeout protection (fail fast within 2 seconds)
-        match tokio::time::timeout(Duration::from_secs(2), write_future).await {
+        let res = match tokio::time::timeout(Duration::from_secs(2), write_future).await {
             Ok(Ok(())) => {
                 let bytes_written = data.len() as u32;
 
@@ -618,21 +618,26 @@ impl Filesystem for SqueezefsFilesystem {
                 error!("FUSE Write timed out! Falling back to local NVMe staging disk.");
                 // If it timed out, try to force stage it on NVMe directly as fallback
                 let file_id = uuid::Uuid::new_v4().to_string();
-                if let Err(stage_err) = self
+                match self
                     .router
                     .cache()
                     .nvme
                     .stage_write(&file_path, &file_id, data, lease.fencing_token())
                     .await
                 {
-                    error!("NVMe staging fallback write also failed: {:?}", stage_err);
-                    return Err(Errno::from(libc::EIO));
+                    Ok(()) => Ok(ReplyWrite {
+                        written: data.len() as u32,
+                    }),
+                    Err(stage_err) => {
+                        error!("NVMe staging fallback write also failed: {:?}", stage_err);
+                        Err(Errno::from(libc::EIO))
+                    }
                 }
-                Ok(ReplyWrite {
-                    written: data.len() as u32,
-                })
             }
-        }
+        };
+
+        let _ = lease.release().await;
+        res
     }
 
     async fn mkdir(
@@ -1338,6 +1343,104 @@ impl Filesystem for SqueezefsFilesystem {
 
         Ok(ReplyDirectory { entries: stream })
     }
+
+    async fn readdirplus<'a>(
+        &'a self,
+        _req: Request,
+        parent: u64,
+        _fh: u64,
+        offset: u64,
+        _lock_owner: u64,
+    ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE readdirplus: parent = {}, offset = {}", parent, offset);
+
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+        let dir_key = format!("squeezefs:dir:{}", parent);
+        let entries_map: std::collections::HashMap<String, u64> =
+            con.hgetall(&dir_key).await.map_err(map_err)?;
+
+        let mut entries = Vec::new();
+
+        // Standard "." and ".." entries
+        if !entries_map.contains_key(".") {
+            let attr = self
+                .get_attr_internal(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
+            entries.push(DirectoryEntryPlus {
+                name: ".".into(),
+                kind: FileType::Directory,
+                inode: parent,
+                generation: 1,
+                attr,
+                entry_ttl: Duration::from_secs(1),
+                attr_ttl: Duration::from_secs(1),
+                offset: 1,
+            });
+        }
+        if !entries_map.contains_key("..") {
+            let parent_parent = if parent == 1 {
+                1
+            } else {
+                let child_dir_key = format!("squeezefs:dir:{}", parent);
+                let p: Option<u64> = con.hget(&child_dir_key, "..").await.unwrap_or(None);
+                p.unwrap_or(1)
+            };
+            let attr = self
+                .get_attr_internal(parent_parent)
+                .await
+                .map_err(map_squeezefs_err)?;
+            entries.push(DirectoryEntryPlus {
+                name: "..".into(),
+                kind: FileType::Directory,
+                inode: parent_parent,
+                generation: 1,
+                attr,
+                entry_ttl: Duration::from_secs(1),
+                attr_ttl: Duration::from_secs(1),
+                offset: 2,
+            });
+        }
+
+        let mut current_offset = (entries.len() + 1) as i64;
+        for (name, child_ino) in entries_map {
+            if name == "." || name == ".." {
+                continue;
+            }
+            let attr = match self.get_attr_internal(child_ino).await {
+                Ok(a) => a,
+                Err(e) => {
+                    error!(
+                        "readdirplus failed to get attr for child {}: {:?}",
+                        child_ino, e
+                    );
+                    continue;
+                }
+            };
+            let kind = attr.kind;
+
+            entries.push(DirectoryEntryPlus {
+                name: name.into(),
+                kind,
+                inode: child_ino,
+                generation: 1,
+                attr,
+                entry_ttl: Duration::from_secs(1),
+                attr_ttl: Duration::from_secs(1),
+                offset: current_offset,
+            });
+            current_offset += 1;
+        }
+
+        let filtered_entries: Vec<DirectoryEntryPlus> =
+            entries.into_iter().skip(offset as usize).collect();
+
+        use futures::stream::{self, StreamExt};
+        let stream = stream::iter(filtered_entries.into_iter().map(Ok)).boxed();
+
+        Ok(ReplyDirectoryPlus { entries: stream })
+    }
 }
 
 /// Initialize the multi-threaded work-stealing tokio runtime
@@ -1431,9 +1534,11 @@ pub async fn start_mount<P: AsRef<Path>>(
     let mount_path = mountpoint.as_ref().to_path_buf();
 
     // Spawns the mount loop using fuse3 Session
-    let _session = fuse3::raw::Session::new(options)
+    let session = fuse3::raw::Session::new(options)
         .mount_with_unprivileged(fs, mount_path)
         .await?;
+
+    session.await?;
 
     Ok(())
 }

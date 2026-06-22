@@ -1,5 +1,4 @@
 use fuse3::raw::{prelude::*, Request};
-use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use rand::SeedableRng;
 use rand::RngCore;
@@ -82,7 +81,7 @@ async fn test_data_integrity_various_sizes() {
         vec![temp_staging.path().to_path_buf()],
         Some("128MB"),
         Some("500MB"),
-        backend,
+        backend.clone(),
         dlm.meta_client().clone(),
     )
     .unwrap();

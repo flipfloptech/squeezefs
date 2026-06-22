@@ -22,7 +22,7 @@ futures = "0.3"
 async-trait = "0.1"
 once_cell = "1.19"
 uuid = { version = "1.7", features = ["v4"] }
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 indicatif = "0.17"
 colored = "2.1"
 libloading = { version = "0.8", optional = true }

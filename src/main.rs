@@ -90,6 +90,22 @@ enum Commands {
         /// S3 compatible object store bucket name (overrides stored configuration)
         #[arg(long)]
         s3_bucket: Option<String>,
+
+        /// Run FUSE daemon in the background (detach from terminal)
+        #[arg(long)]
+        daemon: bool,
+
+        /// Custom UID owner for the mount (default: current user or SUDO_UID)
+        #[arg(long)]
+        uid: Option<u32>,
+
+        /// Custom GID owner for the mount (default: current group or SUDO_GID)
+        #[arg(long)]
+        gid: Option<u32>,
+
+        /// Path to write daemon logs to when running in background
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
     /// Benchmark performance of the filesystem
     Bench {
@@ -165,6 +181,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             s3_access_key,
             s3_secret_key,
             s3_bucket,
+            daemon,
+            uid,
+            gid,
+            log_file,
         } => {
             let redis_url = std::env::var("GARNET_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -330,19 +350,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dlm.meta_client().clone(),
             )?;
             let router = DataRouter::new(dlm.clone(), multi_backend, cache);
-            let uid = std::env::var("SUDO_UID")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or_else(|| unsafe { libc::getuid() });
-            let gid = std::env::var("SUDO_GID")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or_else(|| unsafe { libc::getgid() });
+            let resolved_uid = uid.unwrap_or_else(|| {
+                std::env::var("SUDO_UID")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or_else(|| unsafe { libc::getuid() })
+            });
+            let resolved_gid = gid.unwrap_or_else(|| {
+                std::env::var("SUDO_GID")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or_else(|| unsafe { libc::getgid() })
+            });
 
-            let fs_engine = SqueezefsFilesystem::new(router, dlm, uid, gid);
+            let fs_engine = SqueezefsFilesystem::new(router, dlm, resolved_uid, resolved_gid);
 
             println!("Mounting Squeezefs at {:?}...", mountpoint);
-            start_mount(mountpoint, fs_engine, uid, gid).await?;
+
+            if daemon {
+                unsafe {
+                    let pid = libc::fork();
+                    if pid < 0 {
+                        eprintln!("Failed to fork daemon process");
+                        std::process::exit(1);
+                    } else if pid > 0 {
+                        println!("Squeezefs daemon started (PID: {})", pid);
+                        std::process::exit(0);
+                    }
+                    // Child process detaches
+                    libc::setsid();
+                    // Redirect stdin to /dev/null
+                    if let Ok(null_file) = std::fs::File::open("/dev/null") {
+                        use std::os::unix::io::AsRawFd;
+                        libc::dup2(null_file.as_raw_fd(), 0);
+                    }
+                    // Redirect stdout/stderr to log_file if provided, else /dev/null
+                    let output_file = if let Some(ref path) = log_file {
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                            .ok()
+                    } else {
+                        None
+                    };
+                    if let Some(out_f) = output_file {
+                        use std::os::unix::io::AsRawFd;
+                        let fd = out_f.as_raw_fd();
+                        libc::dup2(fd, 1);
+                        libc::dup2(fd, 2);
+                    } else if let Ok(null_file) = std::fs::File::open("/dev/null") {
+                        use std::os::unix::io::AsRawFd;
+                        let fd = null_file.as_raw_fd();
+                        libc::dup2(fd, 1);
+                        libc::dup2(fd, 2);
+                    }
+                }
+            }
+
+            start_mount(mountpoint, fs_engine, resolved_uid, resolved_gid).await?;
         }
         Commands::Bench {
             path,

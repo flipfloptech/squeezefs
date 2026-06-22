@@ -134,6 +134,9 @@ async fn test_mount_auto_format_and_abi_check() {
         res.is_err(),
         "Init should fail because database ABI version (99) is higher than supported"
     );
+
+    // Clean up format version so other tests are not broken
+    let _: () = con.hset("squeezefs:format", "version", 1).await.unwrap();
 }
 
 #[tokio::test]
@@ -336,7 +339,7 @@ async fn test_three_tiered_writeback_and_lease_cache() {
 
     // Retrieve block map id from redis to verify block keys and contents in S3
     let block_map_id: Option<String> = con
-        .hget(format!("inode:{}", ino), "block_map_id")
+        .hget(format!("metadata:inode_{}", ino), "block_map_id")
         .await
         .unwrap();
     assert!(block_map_id.is_some());
@@ -398,7 +401,7 @@ async fn test_parallel_reads() {
     fs.flush(req, ino, 0, 0).await.unwrap();
 
     // Read back a range spanning multiple blocks
-    let read_result = fs.read(req, ino, 0, 1024, 12 * 1024 * 1024).await.unwrap();
+    let read_result = fs.read(req, ino, 0, 0, 12 * 1024 * 1024).await.unwrap();
     assert_eq!(read_result.data.len(), 12 * 1024 * 1024);
     assert_eq!(read_result.data[..], initial_data[..]);
 }
@@ -478,10 +481,11 @@ async fn test_multi_backend_routing() {
     // Write 5MB (which triggers a striped write and bypasses KV inlining)
     let write_data = vec![99u8; 5 * 1024 * 1024];
     fs.write(req, ino, 0, 0, &write_data, 0, 0).await.unwrap();
+    fs.flush(req, ino, 0, 0).await.unwrap();
 
     // Retrieve block map id from redis to verify the key starts with "backend_1:"
     let block_map_id: Option<String> = con
-        .hget(format!("inode:{}", ino), "block_map_id")
+        .hget(format!("metadata:inode_{}", ino), "block_map_id")
         .await
         .unwrap();
     assert!(block_map_id.is_some());
@@ -514,7 +518,7 @@ async fn test_multi_backend_routing() {
     multi_backend.set_active_backend_id("backend_0".to_string());
 
     // Attempt to read the data back. It should successfully route to backend_1 and retrieve the data
-    let read_result = fs.read(req, ino, 0, 5 * 1024 * 1024, 0).await.unwrap();
+    let read_result = fs.read(req, ino, 0, 0, 5 * 1024 * 1024).await.unwrap();
     assert_eq!(read_result.data.len(), 5 * 1024 * 1024);
     assert_eq!(read_result.data, write_data);
 
@@ -583,4 +587,69 @@ async fn test_mount_uid_gid_override() {
         root_attr.attr.gid, 5002,
         "Root directory GID must match overridden mount GID"
     );
+}
+
+#[tokio::test]
+async fn test_fuse_create_write_read_cycle() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = get_redis_url();
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // 1. Create file via FUSE
+    let file_name = OsStr::new("cycle_test.txt");
+    let reply_create = fs.create(req, 1, file_name, 0o644, 0).await.unwrap();
+    let ino = reply_create.attr.ino;
+
+    // 2. Mock test file locks (getlk / setlk)
+    fs.setlk(req, ino, 0, 9999, 0, 100, libc::F_WRLCK as u32, 1234, false)
+        .await
+        .unwrap();
+    let reply_lock = fs
+        .getlk(req, ino, 0, 9999, 0, 100, libc::F_WRLCK as u32, 1234)
+        .await
+        .unwrap();
+    assert_eq!(reply_lock.r#type, libc::F_UNLCK as u32);
+
+    // 3. Write data via FUSE
+    let initial_data = b"hello, squeezefs FUSE read-write cycle test!";
+    fs.write(req, ino, 0, 0, initial_data, 0, 0).await.unwrap();
+    fs.flush(req, ino, 0, 0).await.unwrap();
+
+    // 4. Read back via FUSE without relying on LRU cache
+    fs.router.cache.lru.remove(&format!("inode_{}", ino));
+    fs.router.metadata_cache.remove(&format!("inode_{}", ino));
+
+    let read_result = fs
+        .read(req, ino, 0, 0, initial_data.len() as u32)
+        .await
+        .unwrap();
+    assert_eq!(read_result.data[..], initial_data[..]);
 }

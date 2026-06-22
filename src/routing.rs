@@ -1018,10 +1018,15 @@ impl DataRouter {
 
         let exists_dest: bool = con.exists(&dest_meta_key).await?;
         if exists_dest {
-            return Err(SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("Destination file already exists: {}", dest),
-            )));
+            let dest_size_opt: Option<u64> = con.hget(&dest_meta_key, "size").await?;
+            let dest_size = dest_size_opt.unwrap_or(0);
+            if dest_size > 0 {
+                return Err(SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("Destination file already exists and is not empty: {}", dest),
+                )));
+            }
+            let _: () = con.del(&dest_meta_key).await?;
         }
 
         let file_type: Option<String> = con.hget(&src_meta_key, "type").await?;

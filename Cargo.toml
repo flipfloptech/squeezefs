@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
-fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
+fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged", "file-lock"] }
 io-uring = "0.6"
 redis = { version = "0.24", features = ["tokio-comp", "cluster-async", "connection-manager", "sentinel"] }
 aws-config = "1.1"

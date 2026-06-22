@@ -133,7 +133,7 @@ async fn test_p2p_fallback_path() {
 
     // S3 mock client prepopulated with block data
     let backend = RustFsClient::new_mock();
-    let block_key = "backend_0/part_fallback_p2p";
+    let block_key = "backend_0/part_fallback_p2p/part_0";
     let block_data = vec![77u8; 1000];
     backend
         .put_object(block_key, block_data.clone(), 0)
@@ -181,6 +181,9 @@ async fn test_p2p_fallback_path() {
         .expect("Should read range via S3 fallback");
 
     assert_eq!(read_res, block_data);
+
+    // Wait a brief moment to ensure asynchronous registration has completed
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
     // Assert B registered itself in Garnet since it downloaded and cached the block
     let peers: Vec<String> = con_meta

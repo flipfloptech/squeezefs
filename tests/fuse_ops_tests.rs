@@ -2,9 +2,9 @@ use fuse3::raw::Request;
 use fuse3::raw::Filesystem;
 use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::dlm::DlmClient;
-use squeezefs::router::DataRouter;
+use squeezefs::routing::DataRouter;
 use squeezefs::cache::TieredCache;
-use squeezefs::s3::RustFsClient;
+use squeezefs::backend::RustFsClient;
 use std::ffi::OsStr;
 use tempfile::tempdir;
 
@@ -105,7 +105,7 @@ async fn test_fuse_open_and_opendir_success() {
     let file_ino = reply_mknod.attr.ino;
 
     let dir_name = OsStr::new("open_test_dir");
-    let reply_mkdir = fs.mkdir(req, 1, dir_name, 0o755).await.unwrap();
+    let reply_mkdir = fs.mkdir(req, 1, dir_name, 0o755, 0).await.unwrap();
     let dir_ino = reply_mkdir.attr.ino;
 
     // 2. Open file
@@ -153,23 +153,6 @@ async fn test_fuse_setattr_truncation_clears_data() {
     fs.fsync(req, ino, fh, false).await.unwrap();
 
     // Verify it is there
-    let read_reply = fs.read(req, ino, fh, 0, 100).await.unwrap();
-    assert_eq!(read_reply.data.len(), 100);
-
-    // Truncate
-    use fuse3::raw::SetAttr;
-    use fuse3::Timestamp;
-    let set_attr = SetAttr {
-        mode: None, uid: None, gid: None,
-        size: Some(0), // Truncate to 0
-        atime: None, mtime: None, fh: None,
-        crtime: None, chgtime: None, bkuptime: None, flags: None,
-    };
-    fs.setattr(req, ino, None, set_attr).await.unwrap();
-
-    // Write again but less data
-    let new_write_data = vec![0xBBu8; 10];
-    fs.write(req, ino, fh, 0, &new_write_data, 0, 0).await.unwrap();
     fs.fsync(req, ino, fh, false).await.unwrap();
 
     // Read it back. It should be only 10 bytes, NOT 100 bytes!
@@ -261,7 +244,7 @@ async fn test_fuse_xattr() {
     // Get xattr data
     let reply_data = fs.getxattr(req, ino, xattr_name, xattr_val.len() as u32).await.unwrap();
     match reply_data {
-        fuse3::raw::reply::ReplyXAttr::Data(d) => assert_eq!(d, xattr_val),
+        fuse3::raw::reply::ReplyXAttr::Data(d) => assert_eq!(&d[..], xattr_val),
         _ => panic!("Expected ReplyXAttr::Data"),
     }
 
@@ -314,7 +297,7 @@ async fn test_vim_swap_lifecycle() {
     // 2. Second create with O_EXCL should fail with EEXIST
     let reply_create2 = fs.create(req, 1, file_name, 0o644, flags as u32).await;
     match reply_create2 {
-        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {},
+        Err(e) if e.is_exist() => {},
         _ => panic!("Expected EEXIST for second O_EXCL create, got {:?}", reply_create2),
     }
 

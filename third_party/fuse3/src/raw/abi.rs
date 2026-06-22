@@ -340,7 +340,7 @@ pub enum fuse_opcode {
     FUSE_BMAP = 37,
     FUSE_DESTROY = 38,
     // TODO implement it after get enough info about it
-    // FUSE_IOCTL = 39,
+    FUSE_IOCTL = 39,
     FUSE_POLL = 40,
     FUSE_NOTIFY_REPLY = 41,
     FUSE_BATCH_FORGET = 42,
@@ -410,7 +410,7 @@ impl TryFrom<u32> for fuse_opcode {
             36 => Ok(fuse_opcode::FUSE_INTERRUPT),
             37 => Ok(fuse_opcode::FUSE_BMAP),
             38 => Ok(fuse_opcode::FUSE_DESTROY),
-            // 39 => Ok(fuse_opcode::FUSE_IOCTL),
+            39 => Ok(fuse_opcode::FUSE_IOCTL),
             40 => Ok(fuse_opcode::FUSE_POLL),
             41 => Ok(fuse_opcode::FUSE_NOTIFY_REPLY),
             42 => Ok(fuse_opcode::FUSE_BATCH_FORGET),

@@ -14,6 +14,7 @@ pub struct NvmeStaging {
     backend: RustFsClient,
     redis_client: crate::dlm::MetaClient,
     write_tx: mpsc::Sender<PendingStagedWrite>,
+    pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 #[derive(Debug)]
@@ -60,6 +61,7 @@ impl NvmeStaging {
             backend: backend.clone(),
             redis_client: redis_client.clone(),
             write_tx,
+            p2p_addr: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         // Spawn the background merge worker
@@ -373,6 +375,24 @@ impl NvmeStaging {
             "NVMe Staging: Cached block {} -> {:?}",
             block_key, block_path
         );
+
+        if let Some(p2p_addr) = self.p2p_addr.get() {
+            let redis_client = self.redis_client.clone();
+            let block_key = block_key.to_string();
+            let p2p_addr = p2p_addr.clone();
+            tokio::spawn(async move {
+                if let Ok(mut con) = redis_client.get_connection().await {
+                    let safe_name = block_key.replace(['/', ':'], "_");
+                    let peer_key = format!("block_peers:{}", safe_name);
+                    let _: std::result::Result<(), redis::RedisError> = redis::pipe()
+                        .sadd(&peer_key, &p2p_addr)
+                        .expire(&peer_key, 60)
+                        .query_async(&mut con)
+                        .await;
+                }
+            });
+        }
+
         Ok(())
     }
 

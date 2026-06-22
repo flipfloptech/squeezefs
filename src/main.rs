@@ -106,6 +106,10 @@ enum Commands {
         /// Path to write daemon logs to when running in background
         #[arg(long)]
         log_file: Option<PathBuf>,
+
+        /// Peer-to-peer cache server address (e.g. 127.0.0.1:9099)
+        #[arg(long)]
+        p2p_addr: Option<String>,
     },
     /// Benchmark performance of the filesystem
     Bench {
@@ -185,6 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             uid,
             gid,
             log_file,
+            p2p_addr,
         } => {
             let redis_url = std::env::var("GARNET_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -349,6 +354,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 multi_backend.clone().get_backend("backend_0").unwrap(), // Cache uses default backend for staging
                 dlm.meta_client().clone(),
             )?;
+            if let Some(ref addr) = p2p_addr {
+                let _ = cache.nvme.p2p_addr.set(addr.clone());
+            }
             let router = DataRouter::new(dlm.clone(), multi_backend, cache);
             let resolved_uid = uid.unwrap_or_else(|| {
                 std::env::var("SUDO_UID")
@@ -406,6 +414,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         libc::dup2(fd, 2);
                     }
                 }
+            }
+
+            if let Some(ref addr) = p2p_addr {
+                let server = squeezefs::p2p::P2pServer::new(
+                    addr.clone(),
+                    fs_engine.router.cache.nvme.clone(),
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = server.run().await {
+                        log::error!("P2P Server error: {:?}", e);
+                    }
+                });
             }
 
             start_mount(mountpoint, fs_engine, resolved_uid, resolved_gid).await?;

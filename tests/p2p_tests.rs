@@ -11,6 +11,14 @@ fn get_redis_url() -> String {
     std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
 }
 
+async fn get_dlm_client() -> Option<DlmClient> {
+    let url = get_redis_url();
+    let client = DlmClient::new(&url).ok()?;
+    let redis_client = redis::Client::open(url).ok()?;
+    let _con = redis_client.get_multiplexed_tokio_connection().await.ok()?;
+    Some(client)
+}
+
 async fn clear_garnet_keys(dlm: &DlmClient) {
     if let Ok(mut con) = dlm.meta_client().get_connection().await {
         let keys: Vec<String> = redis::cmd("KEYS")
@@ -26,11 +34,10 @@ async fn clear_garnet_keys(dlm: &DlmClient) {
 
 #[tokio::test]
 async fn test_p2p_happy_path() {
-    let redis_url = get_redis_url();
-    let dlm_a = match DlmClient::new(&redis_url) {
-        Ok(d) => d,
-        Err(_) => {
-            println!("Skipping test: Garnet not available");
+    let dlm_a = match get_dlm_client().await {
+        Some(d) => d,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
             return;
         }
     };
@@ -46,9 +53,9 @@ async fn test_p2p_happy_path() {
         None,
         backend_a.clone(),
         dlm_a.meta_client().clone(),
-        Some(p2p_addr_a.clone()),
     )
     .expect("Should create cache A");
+    let _ = cache_a.nvme.p2p_addr.set(p2p_addr_a.clone());
 
     let router_a = DataRouter::new(dlm_a.clone(), backend_a, cache_a);
 
@@ -71,7 +78,10 @@ async fn test_p2p_happy_path() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify registration on Garnet
-    let mut con = dlm_a.get_connection().await.expect("Should connect to Garnet");
+    let mut con = dlm_a
+        .get_connection()
+        .await
+        .expect("Should connect to Garnet");
     let safe_name = block_key.replace(['/', ':'], "_");
     let peers: Vec<String> = con
         .smembers(format!("block_peers:{}", safe_name))
@@ -80,7 +90,7 @@ async fn test_p2p_happy_path() {
     assert!(peers.contains(&p2p_addr_a));
 
     // Setup Node B (client)
-    let dlm_b = DlmClient::new(&redis_url).unwrap();
+    let dlm_b = DlmClient::new(&get_redis_url()).unwrap();
     let temp_dir_b = tempdir().unwrap();
     let backend_b = RustFsClient::new_mock();
     let p2p_addr_b = "127.0.0.1:29100".to_string();
@@ -91,11 +101,11 @@ async fn test_p2p_happy_path() {
         None,
         backend_b.clone(),
         dlm_b.meta_client().clone(),
-        Some(p2p_addr_b.clone()),
     )
     .expect("Should create cache B");
+    let _ = cache_b.nvme.p2p_addr.set(p2p_addr_b.clone());
 
-    let router_b = DataRouter::new(dlm_b.clone(), backend_b, cache_b);
+    let _router_b = DataRouter::new(dlm_b.clone(), backend_b, cache_b);
 
     // Read the block from B using P2P client
     let client = P2pClient::new();
@@ -112,11 +122,10 @@ async fn test_p2p_happy_path() {
 
 #[tokio::test]
 async fn test_p2p_fallback_path() {
-    let redis_url = get_redis_url();
-    let dlm = match DlmClient::new(&redis_url) {
-        Ok(d) => d,
-        Err(_) => {
-            println!("Skipping test: Garnet not available");
+    let dlm = match get_dlm_client().await {
+        Some(d) => d,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
             return;
         }
     };
@@ -147,15 +156,15 @@ async fn test_p2p_fallback_path() {
         None,
         backend.clone(),
         dlm.meta_client().clone(),
-        Some("127.0.0.1:29101".to_string()),
     )
     .expect("Should create cache");
+    let _ = cache.nvme.p2p_addr.set("127.0.0.1:29101".to_string());
 
-    let router = DataRouter::new(dlm, backend, cache);
+    let router = DataRouter::new(dlm.clone(), backend, cache);
 
     // Write metadata for striped file using this block
     let file_path = "fallback_striped.bin";
-    let mut con_meta = router.dlm.get_connection().await.unwrap();
+    let mut con_meta = dlm.get_connection().await.unwrap();
     let meta_key = format!("metadata:{}", file_path);
     let _: () = redis::pipe()
         .hset(&meta_key, "type", "striped")
@@ -183,11 +192,10 @@ async fn test_p2p_fallback_path() {
 
 #[tokio::test]
 async fn test_p2p_ttl_expiration() {
-    let redis_url = get_redis_url();
-    let dlm = match DlmClient::new(&redis_url) {
-        Ok(d) => d,
-        Err(_) => {
-            println!("Skipping test: Garnet not available");
+    let dlm = match get_dlm_client().await {
+        Some(d) => d,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
             return;
         }
     };
@@ -201,9 +209,9 @@ async fn test_p2p_ttl_expiration() {
         None,
         backend.clone(),
         dlm.meta_client().clone(),
-        Some("127.0.0.1:29102".to_string()),
     )
     .expect("Should create cache");
+    let _ = cache.nvme.p2p_addr.set("127.0.0.1:29102".to_string());
 
     let block_key = "backend_0/part_ttl_p2p";
     // Directly cache block to trigger registration with expiration (we can mock local registration or just test the key expiration)

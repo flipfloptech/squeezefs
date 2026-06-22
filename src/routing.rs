@@ -704,18 +704,28 @@ impl DataRouter {
             None => {
                 let mut con = self.dlm.get_connection().await?;
                 let meta_key = format!("metadata:{}", file_path);
-                let file_type: Option<String> = con.hget(&meta_key, "type").await?;
-                let file_type = file_type.ok_or_else(|| {
+                let fields: std::collections::HashMap<String, String> =
+                    con.hgetall(&meta_key).await?;
+
+                let file_type = fields.get("type").cloned().ok_or_else(|| {
                     SqueezefsError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         format!("File not found: {}", file_path),
                     ))
                 })?;
-                let size_val_opt: Option<u64> = con.hget(&meta_key, "size").await?;
-                let size_val = size_val_opt.unwrap_or(0);
-                let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await?;
-                let block_prefix: Option<String> = con.hget(&meta_key, "block_prefix").await?;
-                let file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
+                let size_val = fields
+                    .get("size")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let block_map_id = fields
+                    .get("block_map_id")
+                    .filter(|s| !s.is_empty())
+                    .cloned();
+                let block_prefix = fields
+                    .get("block_prefix")
+                    .filter(|s| !s.is_empty())
+                    .cloned();
+                let file_id = fields.get("file_id").filter(|s| !s.is_empty()).cloned();
 
                 let m = CachedMetadata {
                     file_type,
@@ -836,11 +846,46 @@ impl DataRouter {
                     ));
                 }
 
+                // Pipelined discovery of block peers for cache misses
+                let mut cache_misses = Vec::new();
+                for (_, b_key) in &block_keys {
+                    let safe_name = b_key.replace(['/', ':'], "_");
+                    let exists = self
+                        .cache
+                        .nvme
+                        .staging_dirs()
+                        .iter()
+                        .any(|dir| dir.join(format!("{}.block", safe_name)).exists());
+                    if !exists {
+                        cache_misses.push(b_key.clone());
+                    }
+                }
+
+                let mut peer_mappings = std::collections::HashMap::new();
+                if !cache_misses.is_empty() {
+                    if let Ok(mut con) = self.dlm.get_connection().await {
+                        let mut pipe = redis::pipe();
+                        for key in &cache_misses {
+                            let safe_name = key.replace(['/', ':'], "_");
+                            pipe.smembers(format!("block_peers:{}", safe_name));
+                        }
+                        if let Ok(peer_lists) =
+                            pipe.query_async::<_, Vec<Vec<String>>>(&mut con).await
+                        {
+                            for (idx, list) in peer_lists.into_iter().enumerate() {
+                                peer_mappings.insert(cache_misses[idx].clone(), list);
+                            }
+                        }
+                    }
+                }
+
                 // Spawn concurrent tasks to download block data in parallel
                 let mut futures = Vec::new();
                 for (b_idx, b_key) in block_keys {
                     let cache_ref = self.cache.nvme.clone();
                     let backend_ref = self.backend.clone();
+                    let peers = peer_mappings.get(&b_key).cloned().unwrap_or_default();
+                    let own_p2p_addr = self.cache.nvme.p2p_addr.clone();
 
                     let b_start_offset = b_idx as u64 * block_size;
                     let b_end_offset = b_start_offset + block_size;
@@ -857,9 +902,36 @@ impl DataRouter {
                             cached_range
                         } else {
                             METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-                            let (be_id, real_key) = parse_backend_and_key(&b_key);
-                            let downloaded = backend_ref.get_object(&be_id, &real_key).await?;
-                            let _ = cache_ref.cache_read_block(&b_key, &downloaded);
+
+                            // Try P2P download
+                            let mut downloaded_data = None;
+                            let client = crate::p2p::P2pClient::new();
+                            for peer in &peers {
+                                if Some(peer) == own_p2p_addr.get() {
+                                    continue;
+                                }
+                                if let Ok(data) =
+                                    client.download_block_from_peer(peer, &b_key).await
+                                {
+                                    downloaded_data = Some(data);
+                                    break;
+                                }
+                            }
+
+                            let downloaded = match downloaded_data {
+                                Some(data) => {
+                                    let _ = cache_ref.cache_read_block(&b_key, &data);
+                                    data
+                                }
+                                None => {
+                                    // Fallback to S3
+                                    let (be_id, real_key) = parse_backend_and_key(&b_key);
+                                    let data = backend_ref.get_object(&be_id, &real_key).await?;
+                                    let _ = cache_ref.cache_read_block(&b_key, &data);
+                                    data
+                                }
+                            };
+
                             let start = std::cmp::min(slice_start as usize, downloaded.len());
                             let end = std::cmp::min(
                                 (slice_start + slice_len as u64) as usize,

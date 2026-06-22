@@ -893,7 +893,7 @@ pub struct fuse_ioctl_in {
 }
 
 #[derive(Debug)]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, dead_code)]
 pub struct fuse_ioctl_iovec {
     pub base: u64,
     pub len: u64,

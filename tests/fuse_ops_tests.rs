@@ -1,0 +1,219 @@
+use fuse3::raw::Request;
+use fuse3::raw::Filesystem;
+use squeezefs::fuse_client::SqueezefsFilesystem;
+use squeezefs::dlm::DlmClient;
+use squeezefs::router::DataRouter;
+use squeezefs::cache::TieredCache;
+use squeezefs::s3::RustFsClient;
+use std::ffi::OsStr;
+use tempfile::tempdir;
+
+async fn clean_db() -> Option<redis::aio::MultiplexedConnection> {
+    let client = match redis::Client::open("redis://127.0.0.1:6379/") {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let mut con = match client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut con).await.unwrap();
+    Some(con)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuse_create_returns_zero_flags() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = "redis://127.0.0.1:6379/";
+    let dlm = DlmClient::new(redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // 1. Create file via FUSE with O_CREAT | O_EXCL (0301 octal = 193)
+    let file_name = OsStr::new("create_flags_test.swp");
+    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY;
+    let reply_create = fs.create(req, 1, file_name, 0o644, flags as u32).await.unwrap();
+    
+    // IMPORTANT: The FUSE reply flags should NOT be the POSIX flags!
+    // They should be FOPEN_* flags. Default is 0.
+    assert_eq!(reply_create.flags, 0, "FUSE create should not echo POSIX open flags back to kernel");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuse_open_and_opendir_success() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = "redis://127.0.0.1:6379/";
+    let dlm = DlmClient::new(redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // 1. Create file and dir via mknod / mkdir to simulate existing
+    let file_name = OsStr::new("open_test.txt");
+    let reply_mknod = fs.mknod(req, 1, file_name, 0o644 | libc::S_IFREG, 0).await.unwrap();
+    let file_ino = reply_mknod.attr.ino;
+
+    let dir_name = OsStr::new("open_test_dir");
+    let reply_mkdir = fs.mkdir(req, 1, dir_name, 0o755).await.unwrap();
+    let dir_ino = reply_mkdir.attr.ino;
+
+    // 2. Open file
+    let reply_open = fs.open(req, file_ino, libc::O_RDWR as u32).await.unwrap();
+    assert_eq!(reply_open.fh, file_ino);
+    assert_eq!(reply_open.flags, 0);
+
+    // 3. Open directory
+    let reply_opendir = fs.opendir(req, dir_ino, libc::O_RDONLY as u32).await.unwrap();
+    assert_eq!(reply_opendir.fh, dir_ino);
+    assert_eq!(reply_opendir.flags, 0);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuse_setattr_truncation_clears_data() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => return,
+    };
+
+    let redis_url = "redis://127.0.0.1:6379/";
+    let dlm = DlmClient::new(redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    ).unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    let req = Request { unique: 1, uid: 1000, gid: 1000, pid: 1234 };
+    fs.init(req).await.unwrap();
+
+    let file_name = OsStr::new("truncate_test.txt");
+    let reply_create = fs.create(req, 1, file_name, 0o644, 0).await.unwrap();
+    let ino = reply_create.attr.ino;
+    let fh = reply_create.fh;
+
+    // Write some data
+    let write_data = vec![0xAAu8; 100];
+    fs.write(req, ino, fh, 0, &write_data, 0, 0).await.unwrap();
+    fs.fsync(req, ino, fh, false).await.unwrap();
+
+    // Verify it is there
+    let read_reply = fs.read(req, ino, fh, 0, 100).await.unwrap();
+    assert_eq!(read_reply.data.len(), 100);
+
+    // Truncate
+    use fuse3::raw::SetAttr;
+    use fuse3::Timestamp;
+    let set_attr = SetAttr {
+        mode: None, uid: None, gid: None,
+        size: Some(0), // Truncate to 0
+        atime: None, mtime: None, fh: None,
+        crtime: None, chgtime: None, bkuptime: None, flags: None,
+    };
+    fs.setattr(req, ino, None, set_attr).await.unwrap();
+
+    // Write again but less data
+    let new_write_data = vec![0xBBu8; 10];
+    fs.write(req, ino, fh, 0, &new_write_data, 0, 0).await.unwrap();
+    fs.fsync(req, ino, fh, false).await.unwrap();
+
+    // Read it back. It should be only 10 bytes, NOT 100 bytes!
+    let read_reply2 = fs.read(req, ino, fh, 0, 100).await.unwrap();
+    assert_eq!(read_reply2.data.len(), 10, "Truncation did not clear old data!");
+    assert_eq!(&read_reply2.data[..], &new_write_data[..]);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuse_fallocate_fsyncdir_forget() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => return,
+    };
+
+    let redis_url = "redis://127.0.0.1:6379/";
+    let dlm = DlmClient::new(redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    ).unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    let req = Request { unique: 1, uid: 1000, gid: 1000, pid: 1234 };
+    fs.init(req).await.unwrap();
+
+    let file_name = OsStr::new("misc_ops_test.txt");
+    let reply_create = fs.create(req, 1, file_name, 0o644, 0).await.unwrap();
+    let ino = reply_create.attr.ino;
+    let fh = reply_create.fh;
+
+    // fallocate - should succeed and do nothing or return Ok
+    let res = fs.fallocate(req, ino, fh, 0, 1024, 0).await;
+    assert!(res.is_ok(), "fallocate should be implemented and return Ok");
+
+    // fsyncdir - should succeed and do nothing
+    let res_fsync = fs.fsyncdir(req, 1, 1, false).await;
+    assert!(res_fsync.is_ok(), "fsyncdir should be implemented and return Ok");
+
+    // forget - should not crash
+    fs.forget(req, ino, 1).await;
+}

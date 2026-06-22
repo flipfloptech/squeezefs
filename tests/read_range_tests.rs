@@ -1,3 +1,4 @@
+use redis::AsyncCommands;
 use squeezefs::backend::RustFsClient;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
@@ -68,6 +69,25 @@ async fn test_block_level_read_range_striped() {
         .write_file(file_path, 0, &data, 301)
         .await
         .expect("Should write large file");
+
+    // Verify physical storage writes to S3 mock/real backend
+    let client = redis::Client::open(get_redis_url()).unwrap();
+    let mut con = client.get_multiplexed_tokio_connection().await.unwrap();
+    let meta_key = format!("metadata:{}", file_path);
+    let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await.unwrap();
+    assert!(block_map_id.is_some());
+    let map_key = format!("block_map:{}", block_map_id.unwrap());
+    let block_keys: Vec<String> = con.hvals(&map_key).await.unwrap();
+    assert!(!block_keys.is_empty());
+    for bk in &block_keys {
+        let (be_id, real_key) = squeezefs::backend::parse_backend_and_key(bk);
+        let block_data = router
+            .backend
+            .get_object(&be_id, &real_key)
+            .await
+            .expect("Block must exist in storage");
+        assert!(!block_data.is_empty());
+    }
 
     // Clear System RAM cache first to force reading from S3/NVMe Block Cache
     router.cache().lru.remove(file_path);

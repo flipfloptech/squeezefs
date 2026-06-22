@@ -257,7 +257,7 @@ async fn test_stale_mount_warning_only() {
 
 #[tokio::test]
 async fn test_three_tiered_writeback_and_lease_cache() {
-    let _con = match clean_db().await {
+    let mut con = match clean_db().await {
         Some(c) => c,
         None => {
             println!("Skipping test: Garnet/Redis not available");
@@ -333,6 +333,25 @@ async fn test_three_tiered_writeback_and_lease_cache() {
         !active_dir.exists(),
         "Local active writes directory must be cleaned up post-flush"
     );
+
+    // Retrieve block map id from redis to verify block keys and contents in S3
+    let block_map_id: Option<String> = con
+        .hget(format!("inode:{}", ino), "block_map_id")
+        .await
+        .unwrap();
+    assert!(block_map_id.is_some());
+    let map_key = format!("block_map:{}", block_map_id.unwrap());
+    let block_keys: Vec<String> = con.hvals(&map_key).await.unwrap();
+    assert!(!block_keys.is_empty());
+    for bk in &block_keys {
+        let (be_id, real_key) = squeezefs::backend::parse_backend_and_key(bk);
+        assert_eq!(be_id, "backend_0");
+        let data = backend
+            .get_object(&real_key)
+            .await
+            .expect("Block must exist in S3");
+        assert!(!data.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -475,6 +494,20 @@ async fn test_multi_backend_routing() {
             "Block key should start with backend_1 prefix: {}",
             bk
         );
+        let (be_id, real_key) = squeezefs::backend::parse_backend_and_key(bk);
+        assert_eq!(be_id, "backend_1");
+        // Verify S3 backend indeed contains the block!
+        let data = backend_1
+            .get_object(&real_key)
+            .await
+            .expect("Block must exist in backend_1 storage");
+        assert!(!data.is_empty());
+        // Verify default backend does NOT contain it
+        let default_res = backend_0.get_object(&real_key).await;
+        assert!(
+            default_res.is_err(),
+            "Block should not exist in backend_0 storage"
+        );
     }
 
     // Now let's change the active backend to backend_0
@@ -491,4 +524,15 @@ async fn test_multi_backend_routing() {
     // Confirm that the block mapping is deleted from Garnet/Redis
     let mapping_exists: bool = con.exists(&map_key).await.unwrap();
     assert!(!mapping_exists, "Block mapping should be deleted");
+
+    // Also assert that the block itself was physically deleted from backend_1!
+    for bk in &block_keys {
+        let (_, real_key) = squeezefs::backend::parse_backend_and_key(bk);
+        let check_res = backend_1.get_object(&real_key).await;
+        assert!(
+            check_res.is_err(),
+            "Block should have been physically deleted from backend_1: {}",
+            real_key
+        );
+    }
 }

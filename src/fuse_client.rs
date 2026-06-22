@@ -2445,8 +2445,6 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     // fuse3 Mount parameters
     options.custom_options("max_read=1048576");
-    options.custom_options("max_write=1048576");
-    options.custom_options("async_dio=yes");
 
     info!(
         "FUSE Daemon: Mounting squeezefs at {:?}...",

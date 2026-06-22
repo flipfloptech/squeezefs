@@ -81,25 +81,35 @@ Clone and compile the repository with optimizations:
 cargo build --release
 ```
 
-### Step 3: Run Mount and Benchmarks
-1. Set up connection environment variables:
+### Step 3: Format and Mount Squeezefs
+
+1. **Set up connection environment variables** (so the CLI/daemon knows where Microsoft Garnet is running):
    ```bash
    export GARNET_URL="redis://127.0.0.1:6379"
-   export RUSTFS_ENDPOINT="http://127.0.0.1:9000"
-   export RUSTFS_ACCESS_KEY="admin"
-   export RUSTFS_SECRET_KEY="password"
-   export RUSTFS_BUCKET="squeezefs-data"
    ```
-2. Create filesystem mount and local staging directories:
+
+2. **Format the filesystem volume** (this registers S3 configuration in Garnet and dynamically initializes the target bucket in the S3 object store):
+   ```bash
+   ./target/release/squeezefs format squeezefs-volume \
+     --s3-endpoint http://127.0.0.1:9000 \
+     --s3-access-key admin \
+     --s3-secret-key password \
+     --s3-bucket squeezefs-data
+   ```
+
+3. **Create the mount point and local staging directories**:
    ```bash
    mkdir -p /mnt/squeezefs
    mkdir -p /tmp/squeezefs_staging
    ```
-3. Run the FUSE daemon:
+
+4. **Mount the FUSE daemon** (it automatically fetches the S3 configuration from the Garnet metadata registry):
    ```bash
    sudo ./target/release/squeezefs mount /mnt/squeezefs --disk-cache-paths /tmp/squeezefs_staging
    ```
-4. Run the benchmark tool in a separate terminal:
+   *Note: If needed, you can override any S3 parameter at mount time by passing `--s3-endpoint`, `--s3-access-key`, `--s3-secret-key`, or `--s3-bucket` flags.*
+
+5. **Run the benchmark tool** in a separate terminal:
    ```bash
    ./target/release/squeezefs bench --path /mnt/squeezefs --threads 8 --size 128
    ```

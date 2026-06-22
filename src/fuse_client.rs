@@ -1640,7 +1640,7 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options)
-        .mount_with_unprivileged(fs, mount_path)
+        .mount(fs, mount_path)
         .await?;
 
     session.await?;

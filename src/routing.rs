@@ -213,7 +213,7 @@ impl DataRouter {
                     "blocks/{}/block_{}_{}",
                     file_uuid, block_count, block_write_uuid
                 );
-                let active_be = self.backend.active_backend_id();
+                let active_be = self.backend.get_backend_for_key(&block_key);
                 let stored_block_key = format!("{}:{}", active_be, block_key);
 
                 block_mappings.push((block_count.to_string(), stored_block_key));
@@ -439,7 +439,7 @@ impl DataRouter {
                     .put_object(&new_block_key, block_data, fencing_token)
                     .await?;
 
-                let active_be = backend_clone.active_backend_id();
+                let active_be = backend_clone.get_backend_for_key(&new_block_key);
                 let stored_new_block_key = format!("{}:{}", active_be, new_block_key);
 
                 Ok::<_, SqueezefsError>((b, old_block_key, stored_new_block_key))

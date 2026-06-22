@@ -881,32 +881,32 @@ pub struct fuse_bmap_out {
     pub block: u64,
 }
 
-//#[derive(Debug, Deserialize)]
-//#[allow(non_camel_case_types)]
-//pub struct fuse_ioctl_in {
-//pub fh: u64,
-//pub flags: u32,
-//pub cmd: u32,
-//pub arg: u64,
-//pub in_size: u32,
-//pub out_size: u32,
-//}
+#[derive(Debug, Deserialize)]
+#[allow(non_camel_case_types)]
+pub struct fuse_ioctl_in {
+    pub fh: u64,
+    pub flags: u32,
+    pub cmd: u32,
+    pub arg: u64,
+    pub in_size: u32,
+    pub out_size: u32,
+}
 
-//#[derive(Debug)]
-//#[allow(non_camel_case_types)]
-//pub struct fuse_ioctl_iovec {
-//pub base: u64,
-//pub len: u64,
-//}
+#[derive(Debug)]
+#[allow(non_camel_case_types)]
+pub struct fuse_ioctl_iovec {
+    pub base: u64,
+    pub len: u64,
+}
 
-//#[derive(Debug)]
-//#[allow(non_camel_case_types)]
-//pub struct fuse_ioctl_out {
-//pub result: i32,
-//pub flags: u32,
-//pub in_iovs: u32,
-//pub out_iovs: u32,
-//}
+#[derive(Debug, Serialize)]
+#[allow(non_camel_case_types)]
+pub struct fuse_ioctl_out {
+    pub result: i32,
+    pub flags: u32,
+    pub in_iovs: u32,
+    pub out_iovs: u32,
+}
 
 #[derive(Debug, Deserialize)]
 #[allow(non_camel_case_types)]

@@ -97,13 +97,18 @@ async fn setup_router() -> Option<(DataRouter, tempfile::TempDir)> {
     let redis_url = get_redis_url();
     let dlm = DlmClient::new(&redis_url).ok()?;
 
-    let con_res = redis::Client::open(redis_url.clone())
+    let mut con = match redis::Client::open(redis_url.clone())
         .ok()?
         .get_multiplexed_tokio_connection()
-        .await;
-    if con_res.is_err() {
-        return None;
-    }
+        .await
+    {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let _: () = redis::cmd("FLUSHALL")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
 
     let backend = RustFsClient::new().await;
     let temp_dir = tempdir().unwrap();
@@ -261,6 +266,16 @@ async fn test_copy_file_range_refclone() {
     cleanup_keys(src, dest).await;
 
     let redis_url = get_redis_url();
+    let mut con = redis::Client::open(redis_url.clone())
+        .unwrap()
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("FLUSHALL")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
+
     let dlm = DlmClient::new(&redis_url).unwrap();
     let backend = RustFsClient::new().await;
     let temp_dir = tempdir().unwrap();

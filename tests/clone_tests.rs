@@ -258,7 +258,7 @@ async fn test_copy_file_range_refclone() {
     )
     .unwrap();
     let router = DataRouter::new(dlm.clone(), backend, cache);
-    let fs = squeezefs::fuse_client::SqueezefsFilesystem::new(router, dlm);
+    let fs = squeezefs::fuse_client::SqueezefsFilesystem::new(router, dlm, 1000, 1000);
 
     let req = Request {
         unique: 501,
@@ -318,7 +318,7 @@ async fn test_clone_path_full() {
     )
     .unwrap();
     let router = DataRouter::new(dlm.clone(), backend, cache);
-    let fs = squeezefs::fuse_client::SqueezefsFilesystem::new(router.clone(), dlm);
+    let fs = squeezefs::fuse_client::SqueezefsFilesystem::new(router.clone(), dlm, 1000, 1000);
 
     let req = Request {
         unique: 601,

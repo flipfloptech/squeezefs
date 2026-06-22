@@ -42,11 +42,18 @@ fn map_squeezefs_err(e: SqueezefsError) -> Errno {
 pub struct SqueezefsFilesystem {
     router: DataRouter,
     dlm: DlmClient,
+    uid: u32,
+    gid: u32,
 }
 
 impl SqueezefsFilesystem {
-    pub fn new(router: DataRouter, dlm: DlmClient) -> Self {
-        Self { router, dlm }
+    pub fn new(router: DataRouter, dlm: DlmClient, uid: u32, gid: u32) -> Self {
+        Self {
+            router,
+            dlm,
+            uid,
+            gid,
+        }
     }
 
     async fn init_root_inode(&self) -> Result<(), SqueezefsError> {
@@ -66,8 +73,8 @@ impl SqueezefsFilesystem {
                 .hset("squeezefs:attr:1", "kind", 2) // Directory
                 .hset("squeezefs:attr:1", "perm", 0o777)
                 .hset("squeezefs:attr:1", "nlink", 2)
-                .hset("squeezefs:attr:1", "uid", 1000)
-                .hset("squeezefs:attr:1", "gid", 1000)
+                .hset("squeezefs:attr:1", "uid", self.uid)
+                .hset("squeezefs:attr:1", "gid", self.gid)
                 .hset("squeezefs:attr:1", "atime_sec", sec)
                 .hset("squeezefs:attr:1", "atime_nsec", nsec)
                 .hset("squeezefs:attr:1", "mtime_sec", sec)
@@ -1609,10 +1616,13 @@ pub fn start_io_uring_polling_loop(
 pub async fn start_mount<P: AsRef<Path>>(
     mountpoint: P,
     fs: SqueezefsFilesystem,
+    uid: u32,
+    gid: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = MountOptions::default();
-    options.uid(1000);
-    options.gid(1000);
+    options.uid(uid);
+    options.gid(gid);
+    options.allow_other(true);
 
     // fuse3 Mount parameters
     options.custom_options("max_read=1048576");

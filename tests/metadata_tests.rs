@@ -41,7 +41,7 @@ async fn setup_fs() -> Option<(SqueezefsFilesystem, tempfile::TempDir)> {
     .ok()?;
 
     let router = DataRouter::new(dlm.clone(), backend, cache);
-    let fs = SqueezefsFilesystem::new(router, dlm);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
     let req = Request {
         unique: 0,
         uid: 1000,

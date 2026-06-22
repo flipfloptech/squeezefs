@@ -111,10 +111,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dlm.meta_client().clone(),
             )?;
             let router = DataRouter::new(dlm.clone(), backend, cache);
-            let fs_engine = SqueezefsFilesystem::new(router, dlm);
+            let uid = std::env::var("SUDO_UID")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or_else(|| unsafe { libc::getuid() });
+            let gid = std::env::var("SUDO_GID")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or_else(|| unsafe { libc::getgid() });
+
+            let fs_engine = SqueezefsFilesystem::new(router, dlm, uid, gid);
 
             println!("Mounting Squeezefs at {:?}...", mountpoint);
-            start_mount(mountpoint, fs_engine).await?;
+            start_mount(mountpoint, fs_engine, uid, gid).await?;
         }
         Commands::Bench {
             path,

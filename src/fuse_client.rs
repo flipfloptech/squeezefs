@@ -1638,6 +1638,39 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     let mount_path = mountpoint.as_ref().to_path_buf();
 
+    // Check for stale FUSE mount (ENOTCONN or EIO)
+    #[cfg(target_os = "linux")]
+    {
+        let check_metadata = std::fs::metadata(&mount_path);
+        let is_stale = match check_metadata {
+            Err(e) => {
+                let os_err = e.raw_os_error();
+                os_err == Some(107) || os_err == Some(5) || e.kind() == std::io::ErrorKind::NotConnected
+            }
+            _ => false,
+        };
+
+        if is_stale {
+            info!(
+                "Stale mount point detected at {:?}. Attempting lazy unmount before remounting...",
+                mount_path
+            );
+            let status = std::process::Command::new("umount")
+                .arg("-l")
+                .arg(&mount_path)
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    info!("Successfully unmounted stale mount point {:?}", mount_path);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                other => {
+                    log::warn!("Failed to unmount stale mount point: {:?}", other);
+                }
+            }
+        }
+    }
+
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options)
         .mount(fs, mount_path)

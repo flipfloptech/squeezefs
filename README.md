@@ -77,6 +77,10 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
   - `--s3-access-key <key>`: Overrides S3 access key stored in Garnet metadata.
   - `--s3-secret-key <key>`: Overrides S3 secret key stored in Garnet metadata.
   - `--s3-bucket <bucket>`: Overrides S3 bucket name stored in Garnet metadata.
+  - `--daemon`: Run FUSE daemon in the background (detach from terminal).
+  - `--uid <id>`: Custom UID owner for the mount (default: current user or SUDO_UID).
+  - `--gid <id>`: Custom GID owner for the mount (default: current group or SUDO_GID).
+  - `--log-file <path>`: Path to write daemon logs to when running in background.
 
 * **Show filesystem Status:**
   ```bash

@@ -2363,15 +2363,6 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
 
-        let path = match self.get_path_from_ino(inode).await {
-            Ok(p) => p,
-            Err(e) => return Err(map_squeezefs_err(e)),
-        };
-
-        if path.ends_with(".swp") || path.ends_with(".swx") {
-            return Err(Errno::from(libc::ENOSYS));
-        }
-
         debug!(
             "FUSE setlk: inode = {}, owner = {}, start = {}, end = {}, type = {}, block = {}",
             inode, _lock_owner, _start, _end, _type, _block

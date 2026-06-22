@@ -318,12 +318,9 @@ async fn test_vim_swap_lifecycle() {
         _ => panic!("Expected EEXIST for second O_EXCL create, got {:?}", reply_create2),
     }
 
-    // 3. setlk should return ENOSYS for .swp files
+    // 3. setlk should succeed via the DLM for .swp files
     let setlk_res = fs.setlk(req, ino, fh, 123, 0, 100, libc::F_WRLCK as u32, 1234, false).await;
-    match setlk_res {
-        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {},
-        _ => panic!("Expected ENOSYS for setlk on swap file, got {:?}", setlk_res),
-    }
+    assert!(setlk_res.is_ok(), "setlk should succeed via DLM");
 
     // 4. fsync should succeed silently
     let fsync_res = fs.fsync(req, ino, fh, false).await;

@@ -217,3 +217,119 @@ async fn test_fuse_fallocate_fsyncdir_forget() {
     // forget - should not crash
     fs.forget(req, ino, 1).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuse_xattr() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => return,
+    };
+
+    let redis_url = "redis://127.0.0.1:6379/";
+    let dlm = DlmClient::new(redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    ).unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    let req = Request { unique: 1, uid: 1000, gid: 1000, pid: 1234 };
+    fs.init(req).await.unwrap();
+
+    let file_name = OsStr::new("xattr_test.txt");
+    let reply_create = fs.create(req, 1, file_name, 0o644, 0).await.unwrap();
+    let ino = reply_create.attr.ino;
+
+    // Set xattr
+    let xattr_name = OsStr::new("user.test_attr");
+    let xattr_val = b"hello_xattr";
+    fs.setxattr(req, ino, xattr_name, xattr_val, 0, 0).await.unwrap();
+
+    // Get xattr size
+    let reply_size = fs.getxattr(req, ino, xattr_name, 0).await.unwrap();
+    match reply_size {
+        fuse3::raw::reply::ReplyXAttr::Size(s) => assert_eq!(s as usize, xattr_val.len()),
+        _ => panic!("Expected ReplyXAttr::Size"),
+    }
+
+    // Get xattr data
+    let reply_data = fs.getxattr(req, ino, xattr_name, xattr_val.len() as u32).await.unwrap();
+    match reply_data {
+        fuse3::raw::reply::ReplyXAttr::Data(d) => assert_eq!(d, xattr_val),
+        _ => panic!("Expected ReplyXAttr::Data"),
+    }
+
+    // List xattr
+    let reply_list = fs.listxattr(req, ino, 0).await.unwrap();
+    match reply_list {
+        fuse3::raw::reply::ReplyXAttr::Size(s) => assert!(s > 0),
+        _ => panic!("Expected ReplyXAttr::Size"),
+    }
+    // Remove xattr
+    fs.removexattr(req, ino, xattr_name).await.unwrap();
+
+    // Verify it is gone
+    let reply_gone = fs.getxattr(req, ino, xattr_name, 0).await;
+    assert!(reply_gone.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_vim_swap_lifecycle() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => return,
+    };
+
+    let redis_url = "redis://127.0.0.1:6379/";
+    let dlm = DlmClient::new(redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    ).unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    let req = Request { unique: 1, uid: 1000, gid: 1000, pid: 1234 };
+    fs.init(req).await.unwrap();
+
+    let file_name = OsStr::new(".test.txt.swp");
+    
+    // 1. Create with O_EXCL should succeed atomically
+    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY;
+    let reply_create = fs.create(req, 1, file_name, 0o644, flags as u32).await.unwrap();
+    let ino = reply_create.attr.ino;
+    let fh = reply_create.fh;
+
+    // 2. Second create with O_EXCL should fail with EEXIST
+    let reply_create2 = fs.create(req, 1, file_name, 0o644, flags as u32).await;
+    match reply_create2 {
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {},
+        _ => panic!("Expected EEXIST for second O_EXCL create, got {:?}", reply_create2),
+    }
+
+    // 3. setlk should return ENOSYS for .swp files
+    let setlk_res = fs.setlk(req, ino, fh, 123, 0, 100, libc::F_WRLCK as u32, 1234, false).await;
+    match setlk_res {
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {},
+        _ => panic!("Expected ENOSYS for setlk on swap file, got {:?}", setlk_res),
+    }
+
+    // 4. fsync should succeed silently
+    let fsync_res = fs.fsync(req, ino, fh, false).await;
+    assert!(fsync_res.is_ok(), "fsync should return Ok");
+
+    // 5. flush should succeed silently
+    let flush_res = fs.flush(req, ino, fh, 123).await;
+    assert!(flush_res.is_ok(), "flush should return Ok");
+}

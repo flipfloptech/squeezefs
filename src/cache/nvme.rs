@@ -6,6 +6,56 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
+use std::io::{Read, Write};
+
+fn write_aligned_direct(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
+    let align = 4096;
+    let padded_size = (data.len() + align - 1) & !(align - 1);
+    let mut buf = Vec::with_capacity(padded_size + align);
+    let ptr = buf.as_ptr() as usize;
+    let offset = (align - (ptr % align)) % align;
+    buf.resize(offset + padded_size, 0);
+    buf[offset..offset + data.len()].copy_from_slice(data);
+    let aligned_data = &buf[offset..offset + padded_size];
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECT);
+    }
+    
+    let mut file = options.open(path)?;
+    file.write_all(aligned_data)?;
+    Ok(())
+}
+
+fn read_aligned_direct(path: &PathBuf, actual_size: usize) -> std::io::Result<Vec<u8>> {
+    let align = 4096;
+    let padded_size = (actual_size + align - 1) & !(align - 1);
+    let mut buf = Vec::with_capacity(padded_size + align);
+    let ptr = buf.as_ptr() as usize;
+    let offset = (align - (ptr % align)) % align;
+    buf.resize(offset + padded_size, 0);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECT);
+    }
+    
+    let mut file = options.open(path)?;
+    file.read_exact(&mut buf[offset..offset + padded_size])?;
+    
+    let mut out = vec![0; actual_size];
+    out.copy_from_slice(&buf[offset..offset + actual_size]);
+    Ok(out)
+}
 
 #[derive(Clone)]
 pub struct NvmeStaging {
@@ -117,14 +167,22 @@ impl NvmeStaging {
         let data_path = target_dir.join(format!("{}.data", file_id));
         let meta_path = target_dir.join(format!("{}.meta", file_id));
 
-        // Write the data and metadata to NVMe staging asynchronously
-        tokio::fs::write(&data_path, data).await?;
+        let data_clone = data.to_vec();
+        let file_path_clone = file_path.to_string();
+        let data_len = data.len();
 
-        let meta_content = serde_json::json!({
-            "file_path": file_path,
-            "fencing_token": fencing_token
-        });
-        tokio::fs::write(&meta_path, serde_json::to_vec(&meta_content).unwrap()).await?;
+        tokio::task::spawn_blocking(move || -> std::result::Result<(), SqueezefsError> {
+            write_aligned_direct(&data_path, &data_clone).map_err(|e| SqueezefsError::Io(e))?;
+            
+            let meta_content = serde_json::json!({
+                "file_path": file_path_clone,
+                "fencing_token": fencing_token,
+                "original_size": data_len
+            });
+            std::fs::write(&meta_path, serde_json::to_vec(&meta_content).unwrap())
+                .map_err(|e| SqueezefsError::Io(e))?;
+            Ok(())
+        }).await.unwrap()?;
 
         self.current_staged_bytes.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
@@ -154,11 +212,20 @@ impl NvmeStaging {
     pub fn read_staged(&self, file_id: &str) -> Option<Vec<u8>> {
         let target_dir = self.get_staged_path(file_id);
         let data_path = target_dir.join(format!("{}.data", file_id));
-        if data_path.exists() {
-            fs::read(data_path).ok()
-        } else {
-            None
+        let meta_path = target_dir.join(format!("{}.meta", file_id));
+        
+        if data_path.exists() && meta_path.exists() {
+            if let Ok(meta_bytes) = fs::read(&meta_path) {
+                if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&meta_bytes) {
+                    if let Some(size) = meta_json.get("original_size").and_then(|v| v.as_u64()) {
+                        return read_aligned_direct(&data_path, size as usize).ok();
+                    } else {
+                        return fs::read(&data_path).ok();
+                    }
+                }
+            }
         }
+        None
     }
 
     /// Start background merge worker.
@@ -182,8 +249,14 @@ impl NvmeStaging {
                     Some(pending) = write_rx.recv() => {
                         let idx = get_dir_index(&pending.file_id, staging_dirs.len());
                         let local_path = staging_dirs[idx].join(format!("{}.data", pending.file_id));
-                        if let Ok(metadata) = fs::metadata(&local_path) {
-                            current_bytes += metadata.len();
+                        let (meta_len, ok) = tokio::task::spawn_blocking(move || {
+                            if let Ok(metadata) = fs::metadata(&local_path) {
+                                (metadata.len(), true)
+                            } else { (0, false) }
+                        }).await.unwrap();
+                        
+                        if ok {
+                            current_bytes += meta_len;
                             batch.push(pending);
                         }
 
@@ -231,7 +304,23 @@ impl NvmeStaging {
         for item in batch.iter() {
             let idx = get_dir_index(&item.file_id, staging_dirs.len());
             let local_path = staging_dirs[idx].join(format!("{}.data", item.file_id));
-            if let Ok(data) = fs::read(&local_path) {
+            let meta_path = staging_dirs[idx].join(format!("{}.meta", item.file_id));
+            
+            let data_res = tokio::task::spawn_blocking(move || {
+                let size = if let Ok(meta_bytes) = fs::read(&meta_path) {
+                    if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&meta_bytes) {
+                        meta_json.get("original_size").and_then(|v| v.as_u64())
+                    } else { None }
+                } else { None };
+                
+                if let Some(s) = size {
+                    read_aligned_direct(&local_path, s as usize).ok()
+                } else {
+                    fs::read(&local_path).ok()
+                }
+            }).await.unwrap();
+
+            if let Some(data) = data_res {
                 let offset = packed_payload.len() as u64;
                 let size = data.len() as u64;
                 packed_payload.extend_from_slice(&data);

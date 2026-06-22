@@ -345,14 +345,29 @@ impl MultiBackendClient {
         }
     }
 
-    pub fn active_backend_id(&self) -> String {
-        self.active_backend_id.read().unwrap().clone()
+    pub fn get_backend_for_key(&self, key: &str) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut max_score: u64 = 0;
+        let mut best_node = "backend_0".to_string();
+
+        for entry in self.backends.iter() {
+            let node_id = entry.key();
+            let mut hasher = DefaultHasher::new();
+            node_id.hash(&mut hasher);
+            key.hash(&mut hasher);
+            let score = hasher.finish();
+            if score > max_score {
+                max_score = score;
+                best_node = node_id.clone();
+            }
+        }
+        best_node
     }
 
-    pub fn set_active_backend_id(&self, id: String) {
-        if let Ok(mut writer) = self.active_backend_id.write() {
-            *writer = id;
-        }
+    pub fn set_active_backend_id(&self, _id: String) {
+        // Deprecated: Kept for compatibility with tests, but routing is now dynamic.
     }
 
     pub fn register_backend(&self, id: &str, client: RustFsClient) {
@@ -368,7 +383,7 @@ impl MultiBackendClient {
     }
 
     pub async fn put_object(&self, key: &str, data: Vec<u8>, fencing_token: u64) -> Result<()> {
-        let active_id = self.active_backend_id();
+        let active_id = self.get_backend_for_key(key);
         self.put_object_on_backend(&active_id, key, data, fencing_token)
             .await
     }

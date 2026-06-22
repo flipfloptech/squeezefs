@@ -867,25 +867,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     self.handle_bmap(request, in_header, data_ref, &fs).await;
                 }
 
-                /*fuse_opcode::FUSE_IOCTL => {
-                    let mut resp_sender = self.response_sender.clone();
-
-                    let ioctl_in = match get_bincode_config().deserialize::<fuse_ioctl_in>(data) {
-                        Err(err) => {
-                            error!("deserialize fuse_ioctl_in failed {}", err);
-
-                             reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
-
-                            continue;
-                        }
-
-                        Ok(ioctl_in) => ioctl_in,
-                    };
-
-                    let ioctl_data = (&data[FUSE_IOCTL_IN_SIZE..]).to_vec();
-
-                    let fs = fs.clone();
-                }*/
+                fuse_opcode::FUSE_IOCTL => {
+                    self.handle_ioctl(request, in_header, data_ref, &fs).await;
+                }
                 fuse_opcode::FUSE_POLL => {
                     self.handle_poll(request, in_header, data_ref, &fs).await;
                 }
@@ -1044,15 +1028,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         }
 
         // posix lock used, maybe we don't need bsd lock
-        /*if init_in.flags&FUSE_FLOCK_LOCKS>0 {
+        if init_in.flags & FUSE_FLOCK_LOCKS > 0 {
             reply_flags |= FUSE_FLOCK_LOCKS;
-        }*/
+        }
 
-        /*if init_in.flags & FUSE_HAS_IOCTL_DIR > 0 {
+        if init_in.flags & FUSE_HAS_IOCTL_DIR > 0 {
             debug!("enable FUSE_HAS_IOCTL_DIR");
 
             reply_flags |= FUSE_HAS_IOCTL_DIR;
-        }*/
+        }
 
         if init_in.flags & FUSE_AUTO_INVAL_DATA > 0 {
             debug!("enable FUSE_AUTO_INVAL_DATA");
@@ -3541,6 +3525,76 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .serialize_into(&mut data, &bmap_out)
                 .expect("won't happened");
 
+            let _ = resp_sender.send(Either::Left(data)).await;
+        });
+    }
+
+    #[instrument(skip(self, data, fs))]
+    async fn handle_ioctl(
+        &mut self,
+        request: Request,
+        in_header: fuse_in_header,
+        data: &[u8],
+        fs: &Arc<FS>,
+    ) {
+        let ioctl_in = match get_bincode_config().deserialize::<fuse_ioctl_in>(data) {
+            Err(err) => {
+                error!("deserialize fuse_ioctl_in failed {}", err);
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
+                return;
+            }
+            Ok(ioctl_in) => ioctl_in,
+        };
+
+        let mut resp_sender = self.response_sender.clone();
+        let fs = fs.clone();
+
+        spawn(debug_span!("fuse_ioctl"), async move {
+            debug!(
+                "ioctl unique {} inode {} cmd {}",
+                request.unique, in_header.nodeid, ioctl_in.cmd
+            );
+
+            let res = fs
+                .ioctl(
+                    request,
+                    in_header.nodeid,
+                    ioctl_in.fh,
+                    ioctl_in.flags,
+                    ioctl_in.cmd,
+                    ioctl_in.arg,
+                    ioctl_in.in_size,
+                    ioctl_in.out_size,
+                )
+                .await;
+
+            let data = match res {
+                Err(err) => {
+                    let out_header = fuse_out_header {
+                        len: FUSE_OUT_HEADER_SIZE as u32,
+                        error: err.into(),
+                        unique: request.unique,
+                    };
+                    get_bincode_config().serialize(&out_header).expect("won't happened")
+                }
+                Ok(reply) => {
+                    let out_header = fuse_out_header {
+                        len: (FUSE_OUT_HEADER_SIZE + mem::size_of::<fuse_ioctl_out>()) as u32,
+                        error: 0,
+                        unique: request.unique,
+                    };
+                    let ioctl_out = fuse_ioctl_out {
+                        result: reply.result,
+                        flags: reply.flags,
+                        in_iovs: reply.in_iovs,
+                        out_iovs: reply.out_iovs,
+                    };
+                    let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + mem::size_of::<fuse_ioctl_out>());
+                    get_bincode_config().serialize_into(&mut data, &out_header).expect("won't happened");
+                    get_bincode_config().serialize_into(&mut data, &ioctl_out).expect("won't happened");
+                    data
+                }
+            };
             let _ = resp_sender.send(Either::Left(data)).await;
         });
     }

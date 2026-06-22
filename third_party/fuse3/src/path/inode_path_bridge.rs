@@ -947,6 +947,23 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn ioctl(
+        &self,
+        req: Request,
+        inode: u64,
+        fh: u64,
+        flags: u32,
+        cmd: u32,
+        arg: u64,
+        in_size: u32,
+        out_size: u32,
+    ) -> Result<raw::ReplyIoctl> {
+        self.path_filesystem
+            .ioctl(req, inode, fh, flags, cmd, arg, in_size, out_size)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn poll(
         &self,
         req: Request,

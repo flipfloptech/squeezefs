@@ -103,11 +103,16 @@ cargo build --release
    mkdir -p /tmp/squeezefs_staging
    ```
 
-4. **Mount the FUSE daemon** (it automatically fetches the S3 configuration from the Garnet metadata registry):
+4. **Mount the FUSE daemon** (run in background with daemon mode, specify log file destination, and optionally override default mount owners):
    ```bash
-   sudo ./target/release/squeezefs mount /mnt/squeezefs --disk-cache-paths /tmp/squeezefs_staging
+   sudo ./target/release/squeezefs mount /mnt/squeezefs \
+     --disk-cache-paths /tmp/squeezefs_staging \
+     --daemon \
+     --log-file /tmp/squeezefs.log \
+     --uid 1000 \
+     --gid 1000
    ```
-   *Note: If needed, you can override any S3 parameter at mount time by passing `--s3-endpoint`, `--s3-access-key`, `--s3-secret-key`, or `--s3-bucket` flags.*
+   *Note: If needed, you can override S3 parameters at mount time by passing `--s3-endpoint`, `--s3-access-key`, `--s3-secret-key`, or `--s3-bucket` flags.*
 
 5. **Run the benchmark tool** in a separate terminal:
    ```bash

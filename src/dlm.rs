@@ -502,29 +502,31 @@ impl Drop for LockLease {
         let range = self.range;
         let meta_client = self.meta_client.clone();
 
-        tokio::spawn(async move {
-            let lock_key = if let Some((start, end)) = range {
-                format!("lock:{}:range:{}-{}", file_path, start, end)
-            } else {
-                format!("lock:{}", file_path)
-            };
-            if let Ok(mut con) = meta_client.get_connection().await {
-                let script = redis::Script::new(
-                    r#"
-                    if redis.call("get", KEYS[1]) == ARGV[1] then
-                        return redis.call("del", KEYS[1])
-                    else
-                        return 0
-                    end
-                    "#,
-                );
-                let _: Result<i32> = script
-                    .key(&lock_key)
-                    .arg(&client_id)
-                    .invoke_async(&mut con)
-                    .await
-                    .map_err(|e| e.into());
-            }
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let lock_key = if let Some((start, end)) = range {
+                    format!("lock:{}:range:{}-{}", file_path, start, end)
+                } else {
+                    format!("lock:{}", file_path)
+                };
+                if let Ok(mut con) = meta_client.get_connection().await {
+                    let script = redis::Script::new(
+                        r#"
+                        if redis.call("get", KEYS[1]) == ARGV[1] then
+                            return redis.call("del", KEYS[1])
+                        else
+                            return 0
+                        end
+                        "#,
+                    );
+                    let _: Result<i32> = script
+                        .key(&lock_key)
+                        .arg(&client_id)
+                        .invoke_async(&mut con)
+                        .await
+                        .map_err(|e| e.into());
+                }
+            });
+        }
     }
 }

@@ -66,6 +66,9 @@ enum Commands {
         /// S3 compatible object store bucket name
         #[arg(long)]
         s3_bucket: Option<String>,
+        /// Force formatting even if a squeezefs volume is already detected
+        #[arg(long, short = 'f')]
+        force: bool,
     },
     /// Show filesystem status
     Status,
@@ -243,8 +246,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             s3_access_key,
             s3_secret_key,
             s3_bucket,
+            force,
         } => {
             let redis_url = &cli.garnet_url;
+
+            // Check if squeezefs volume is already formatted on the database
+            if !force {
+                if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+                    if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                        let exists_format: bool =
+                            con.exists("squeezefs:format").await.unwrap_or(false);
+                        if exists_format {
+                            println!(
+                                "{}",
+                                "WARNING: A squeezefs volume is already formatted on this database."
+                                    .yellow()
+                                    .bold()
+                            );
+                            println!(
+                                "{}",
+                                "Formatting will delete all existing metadata and files!"
+                                    .yellow()
+                                    .bold()
+                            );
+                            print!("Are you sure you want to proceed? [y/N]: ");
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+                            let mut input = String::new();
+                            let _ = std::io::stdin().read_line(&mut input);
+                            let trimmed = input.trim().to_lowercase();
+                            if trimmed != "y" && trimmed != "yes" {
+                                println!("Format aborted.");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
             squeezefs::fuse_client::format_volume(
                 redis_url,
                 &name,

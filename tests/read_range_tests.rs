@@ -117,6 +117,9 @@ async fn test_block_level_read_range_striped() {
     );
 
     // 2. Perform the exact same read again (should hit local NVMe block cache)
+    // Wait a brief moment to ensure asynchronous cache write has finished
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
     let read_range_again = router
         .read_file_range(file_path, range_offset, range_size)
         .await

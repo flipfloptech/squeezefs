@@ -29,6 +29,8 @@ async fn setup_fs() -> Option<(SqueezefsFilesystem, tempfile::TempDir)> {
         .await
         .unwrap_or(());
 
+    let _ = std::fs::remove_dir_all("/tmp/squeezefs_staging");
+
     let backend = RustFsClient::new().await;
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(

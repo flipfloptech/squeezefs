@@ -170,6 +170,9 @@ impl RustFsClient {
     }
 
     pub async fn init_bucket(&self) -> Result<()> {
+        if self.mock_store.is_some() {
+            return Ok(());
+        }
         if let Some(s3) = self.s3_clients.first() {
             let exists = s3.head_bucket().bucket(&self.bucket).send().await;
             if exists.is_err() {

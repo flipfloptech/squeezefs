@@ -250,6 +250,7 @@ async fn test_clone_striped_cow() {
 
 #[tokio::test]
 async fn test_copy_file_range_refclone() {
+    let _ = env_logger::builder().is_test(true).try_init();
     if !is_db_available().await {
         println!("Skipping test: Redis/Garnet not available");
         return;
@@ -302,6 +303,10 @@ async fn test_copy_file_range_refclone() {
     fs.write(req, src_ino, 101, 0, &src_data, 0, 0)
         .await
         .unwrap();
+    fs.flush(req, src_ino, 0, 0).await.unwrap();
+
+    // Release the lease so copy_file_range can lock the file
+    fs.release(req, src_ino, 101, 0, 0, false).await.unwrap();
 
     // 4. Call copy_file_range (whole file clone)
     let reply_copy = fs
@@ -362,6 +367,10 @@ async fn test_clone_path_full() {
     fs.write(req, src_ino, 201, 0, &src_data, 0, 0)
         .await
         .unwrap();
+    fs.flush(req, src_ino, 0, 0).await.unwrap();
+
+    // Release the lease so clone_path can lock the file
+    fs.release(req, src_ino, 201, 0, 0, false).await.unwrap();
 
     // 3. Call clone_path using logical paths
     router

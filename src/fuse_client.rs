@@ -4,10 +4,10 @@ use crate::error::SqueezefsError;
 use crate::routing::DataRouter;
 use fuse3::raw::{
     prelude::*,
-    reply::{DirectoryEntry, FileAttr, ReplyCopyFileRange},
+    reply::{DirectoryEntry, FileAttr, ReplyCopyFileRange, ReplyLock},
     Request,
 };
-use fuse3::{Errno, MountOptions, Result as FuseResult, Timestamp};
+use fuse3::{Errno, Inode, MountOptions, Result as FuseResult, Timestamp};
 use log::{debug, error, info};
 use once_cell::sync::Lazy;
 use redis::AsyncCommands;
@@ -326,6 +326,9 @@ impl SqueezefsFilesystem {
                                 .put_object(&new_block_key, block_data, fencing_token)
                                 .await?;
 
+                            let active_be = backend_clone.active_backend_id();
+                            let stored_block_key = format!("{}:{}", active_be, new_block_key);
+
                             let mut con = dlm_clone.get_connection().await?;
                             let block_map_key = format!("block_map:{}", block_map_id_clone);
                             let refcounts_key = "squeezefs:block_refcounts";
@@ -334,17 +337,17 @@ impl SqueezefsFilesystem {
                                 con.hget(&block_map_key, b.to_string()).await?;
 
                             let mut pipe = redis::pipe();
-                            pipe.hset(refcounts_key, &new_block_key, 1).hset(
+                            pipe.hset(refcounts_key, &stored_block_key, 1).hset(
                                 &block_map_key,
                                 b.to_string(),
-                                &new_block_key,
+                                &stored_block_key,
                             );
                             let _: () = pipe.query_async(&mut con).await?;
 
                             // Update local block_map_cache
                             router_clone.block_map_cache.insert(
                                 (block_map_id_clone.clone(), b),
-                                (new_block_key.clone(), std::time::Instant::now()),
+                                (stored_block_key.clone(), std::time::Instant::now()),
                             );
 
                             if let Some(bk) = old_block_key {
@@ -536,7 +539,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         if !format_exists {
             let default_block_size = 4 * 1024 * 1024;
-            let default_capacity = 1024 * 1024 * 1024 * 1024 * 1024;
+            let default_capacity: u64 = 1024u64 * 1024 * 1024 * 1024 * 1024;
             info!("Volume not formatted. Performing auto-format on mount...");
             let _: () = redis::pipe()
                 .hset("squeezefs:format", "name", "squeezefs")
@@ -740,8 +743,8 @@ impl Filesystem for SqueezefsFilesystem {
         let attr_key = format!("squeezefs:attr:{}", new_ino);
 
         // Add to parent, set attributes, and save
-        let _: () = redis::pipe()
-            .hset(&dir_key, &*name_str, new_ino)
+        let mut pipe = redis::pipe();
+        pipe.hset(&dir_key, &*name_str, new_ino)
             .hset(&attr_key, "ino", new_ino)
             .hset(&attr_key, "size", 0)
             .hset(&attr_key, "blocks", 0)
@@ -756,15 +759,22 @@ impl Filesystem for SqueezefsFilesystem {
             .hset(&attr_key, "mtime_sec", sec)
             .hset(&attr_key, "mtime_nsec", nsec)
             .hset(&attr_key, "ctime_sec", sec)
-            .hset(&attr_key, "ctime_nsec", nsec)
-            .query_async(&mut con)
-            .await
-            .map_err(map_err)?;
+            .hset(&attr_key, "ctime_nsec", nsec);
+
+        if kind_num == 1 {
+            let meta_key = format!("metadata:inode_{}", new_ino);
+            pipe.hset(&meta_key, "type", "inline")
+                .hset(&meta_key, "size", 0);
+        }
+
+        let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
 
         // Update parent directory timestamps!
         self.update_parent_timestamps(&mut con, parent)
             .await
             .map_err(map_err)?;
+
+        self.attr_cache.remove(&parent);
 
         let attr = self
             .get_attr_internal(new_ino)
@@ -817,6 +827,8 @@ impl Filesystem for SqueezefsFilesystem {
 
         let attr_key = format!("squeezefs:attr:{}", new_ino);
 
+        let meta_key = format!("metadata:inode_{}", new_ino);
+
         // Add to parent directory, set attributes, and save
         let _: () = redis::pipe()
             .hset(&dir_key, &*name_str, new_ino)
@@ -834,6 +846,8 @@ impl Filesystem for SqueezefsFilesystem {
             .hset(&attr_key, "mtime_nsec", nsec)
             .hset(&attr_key, "ctime_sec", sec)
             .hset(&attr_key, "ctime_nsec", nsec)
+            .hset(&meta_key, "type", "inline")
+            .hset(&meta_key, "size", 0)
             .query_async(&mut con)
             .await
             .map_err(map_err)?;
@@ -842,6 +856,8 @@ impl Filesystem for SqueezefsFilesystem {
         self.update_parent_timestamps(&mut con, parent)
             .await
             .map_err(map_err)?;
+
+        self.attr_cache.remove(&parent);
 
         let attr = self
             .get_attr_internal(new_ino)
@@ -872,20 +888,69 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         let file_path = format!("inode_{}", ino);
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
 
-        // Timeout protection (fail fast within 2 seconds to prevent kernel hang)
-        let read_future = self.router.read_file_range(&file_path, offset, size);
-        let read_result = match tokio::time::timeout(Duration::from_secs(2), read_future).await {
-            Ok(Ok(data)) => data,
-            Ok(Err(e)) => {
-                error!("FUSE Read failed: {:?}", e);
-                return Err(Errno::from(libc::EIO));
-            }
-            Err(_) => {
-                error!("FUSE Read timed out!");
-                return Err(Errno::from(libc::ETIMEDOUT));
-            }
+        // Get file size to bound the read
+        let file_size = if let Some(entry) = self.attr_cache.get(&ino) {
+            entry.value().0.size
+        } else {
+            let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+            let attr_key = format!("squeezefs:attr:{}", ino);
+            let size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
+            size_opt.unwrap_or(0)
         };
+
+        if offset >= file_size {
+            return Ok(ReplyData {
+                data: Vec::new().into(),
+            });
+        }
+
+        let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
+        let mut read_result = vec![0u8; read_len];
+
+        // 1. Try to read from committed storage
+        let read_future = self
+            .router
+            .read_file_range(&file_path, offset, read_len as u32);
+        if let Ok(Ok(committed_data)) =
+            tokio::time::timeout(Duration::from_secs(2), read_future).await
+        {
+            let copy_len = std::cmp::min(read_result.len(), committed_data.len());
+            read_result[..copy_len].copy_from_slice(&committed_data[..copy_len]);
+        }
+
+        // 2. Overlay any staging blocks in active_writes
+        let active_dir = std::path::PathBuf::from("/tmp/squeezefs_staging")
+            .join("active_writes")
+            .join(format!("inode_{}", ino));
+
+        if active_dir.exists() {
+            let start_block = offset / block_size;
+            let end_block = (offset + read_len as u64 - 1) / block_size;
+
+            for b in start_block..=end_block {
+                let block_file_path = active_dir.join(format!("block_{}", b));
+                if let Ok(block_data) = tokio::fs::read(&block_file_path).await {
+                    let b_start_offset = b * block_size;
+                    let b_end_offset = b_start_offset + block_data.len() as u64;
+
+                    let overlap_start = std::cmp::max(offset, b_start_offset);
+                    let overlap_end = std::cmp::min(offset + read_len as u64, b_end_offset);
+
+                    if overlap_start < overlap_end {
+                        let src_start = (overlap_start - b_start_offset) as usize;
+                        let src_end = (overlap_end - b_start_offset) as usize;
+                        let dest_start = (overlap_start - offset) as usize;
+                        let dest_end = (overlap_end - offset) as usize;
+
+                        let dest_slice = &mut read_result[dest_start..dest_end];
+                        let src_slice = &block_data[src_start..src_end];
+                        dest_slice.copy_from_slice(src_slice);
+                    }
+                }
+            }
+        }
 
         Ok(ReplyData {
             data: read_result.into(),
@@ -914,15 +979,27 @@ impl Filesystem for SqueezefsFilesystem {
             .await
             .map_err(map_squeezefs_err)?;
 
-        // 3. Write data to local NVMe staging blocks
-        self.write_file_staged(ino, offset, data, fencing_token)
-            .await
-            .map_err(map_squeezefs_err)?;
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+
+        // 3. Write data using progressive layout routing if not striped
+        let meta_key = format!("metadata:inode_{}", ino);
+        let file_type: Option<String> = con.hget(&meta_key, "type").await.map_err(map_err)?;
+
+        if file_type.as_deref() == Some("striped") {
+            self.write_file_staged(ino, offset, data, fencing_token)
+                .await
+                .map_err(map_squeezefs_err)?;
+        } else {
+            let file_path = format!("inode_{}", ino);
+            self.router
+                .write_file(&file_path, offset, data, fencing_token)
+                .await
+                .map_err(map_squeezefs_err)?;
+        }
 
         let bytes_written = data.len() as u32;
 
         // 4. Update file attributes and used bytes
-        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let attr_key = format!("squeezefs:attr:{}", ino);
 
         let old_size = if let Some(entry) = self.attr_cache.get(&ino) {
@@ -940,11 +1017,13 @@ impl Filesystem for SqueezefsFilesystem {
         let nsec = now.subsec_nanos();
 
         let mut pipe = redis::pipe();
+        let meta_key = format!("metadata:inode_{}", ino);
         pipe.hset(&attr_key, "size", new_size)
             .hset(&attr_key, "mtime_sec", sec)
             .hset(&attr_key, "mtime_nsec", nsec)
             .hset(&attr_key, "ctime_sec", sec)
-            .hset(&attr_key, "ctime_nsec", nsec);
+            .hset(&attr_key, "ctime_nsec", nsec)
+            .hset(&meta_key, "size", new_size);
 
         if new_size > old_size {
             let diff = new_size - old_size;
@@ -1040,6 +1119,8 @@ impl Filesystem for SqueezefsFilesystem {
         self.update_parent_timestamps(&mut con, parent)
             .await
             .map_err(map_err)?;
+
+        self.attr_cache.remove(&parent);
 
         let attr = self
             .get_attr_internal(new_ino)
@@ -1257,6 +1338,8 @@ impl Filesystem for SqueezefsFilesystem {
             .await
             .map_err(map_err)?;
 
+        self.attr_cache.remove(&parent);
+
         let attr = self
             .get_attr_internal(new_ino)
             .await
@@ -1351,6 +1434,9 @@ impl Filesystem for SqueezefsFilesystem {
         self.update_parent_timestamps(&mut con, new_parent)
             .await
             .map_err(map_err)?;
+
+        self.attr_cache.remove(&ino);
+        self.attr_cache.remove(&new_parent);
 
         let mut attr = self
             .get_attr_internal(ino)
@@ -1824,7 +1910,13 @@ impl Filesystem for SqueezefsFilesystem {
             .await
         {
             Ok(l) => l,
-            Err(_) => return Err(Errno::from(libc::EAGAIN)),
+            Err(e) => {
+                error!(
+                    "copy_file_range: failed to acquire lock on src_path {}: {:?}",
+                    src_path, e
+                );
+                return Err(Errno::from(libc::EAGAIN));
+            }
         };
         let dest_lease = match self
             .dlm
@@ -1832,7 +1924,13 @@ impl Filesystem for SqueezefsFilesystem {
             .await
         {
             Ok(l) => l,
-            Err(_) => return Err(Errno::from(libc::EAGAIN)),
+            Err(e) => {
+                error!(
+                    "copy_file_range: failed to acquire lock on dest_path {}: {:?}",
+                    dest_path, e
+                );
+                return Err(Errno::from(libc::EAGAIN));
+            }
         };
 
         // 2. Read sizes to check if we can perform metadata clone
@@ -1870,6 +1968,8 @@ impl Filesystem for SqueezefsFilesystem {
                     .query_async(&mut con)
                     .await;
             }
+
+            self.attr_cache.remove(&inode_out);
 
             return Ok(ReplyCopyFileRange { copied: src_size });
         }
@@ -1918,6 +2018,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .query_async(&mut con)
                 .await;
         }
+
+        self.attr_cache.remove(&inode_out);
 
         Ok(ReplyCopyFileRange { copied: copied_len })
     }
@@ -2004,6 +2106,44 @@ impl Filesystem for SqueezefsFilesystem {
         // Also clean up local inode lock if no longer needed
         self.active_inode_locks.remove(&ino);
 
+        Ok(())
+    }
+
+    async fn getlk(
+        &self,
+        _req: Request,
+        inode: Inode,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _type: u32,
+        _pid: u32,
+    ) -> FuseResult<ReplyLock> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE getlk: inode = {}", inode);
+        Ok(ReplyLock {
+            start: 0,
+            end: 0,
+            r#type: libc::F_UNLCK as u32,
+            pid: 0,
+        })
+    }
+
+    async fn setlk(
+        &self,
+        _req: Request,
+        inode: Inode,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _type: u32,
+        _pid: u32,
+        _block: bool,
+    ) -> FuseResult<()> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE setlk: inode = {}, type = {}", inode, _type);
         Ok(())
     }
 }
@@ -2132,7 +2272,49 @@ pub async fn start_mount<P: AsRef<Path>>(
         .mount(fs, mount_path)
         .await?;
 
-    session.await?;
+    let handle = session;
+
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            let sigterm_opt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+            let sigint_opt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+            if let (Ok(mut sigterm), Ok(mut sigint)) = (sigterm_opt, sigint_opt) {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Received Ctrl+C, unmounting filesystem...");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM, unmounting filesystem...");
+                    }
+                    _ = sigint.recv() => {
+                        info!("Received SIGINT, unmounting filesystem...");
+                    }
+                }
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("Received Ctrl+C, unmounting filesystem...");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Received Ctrl+C, unmounting filesystem...");
+        }
+    };
+
+    tokio::select! {
+        res = handle => {
+            if let Err(e) = res {
+                error!("FUSE session loop ended with error: {:?}", e);
+            } else {
+                info!("FUSE session loop ended successfully.");
+            }
+        }
+        _ = shutdown => {}
+    }
 
     Ok(())
 }

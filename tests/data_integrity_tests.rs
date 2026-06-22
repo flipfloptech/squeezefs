@@ -116,6 +116,8 @@ async fn test_data_integrity_various_sizes() {
 
         // Write file
         fs.write(req, ino, 0, 0, &data, 0, 0).await.unwrap();
+        fs.flush(req, ino, 0, 0).await.unwrap();
+        fs.release(req, ino, 0, 0, 0, false).await.unwrap();
 
         file_infos.push((ino, size, checksum));
     }
@@ -139,7 +141,7 @@ async fn test_data_integrity_various_sizes() {
     fs_recreate.init(req).await.unwrap();
 
     for (ino, size, expected_checksum) in file_infos {
-        let reply_read = fs_recreate.read(req, ino, 0, size as u64, 0).await.unwrap();
+        let reply_read = fs_recreate.read(req, ino, 0, 0, size as u32).await.unwrap();
         assert_eq!(reply_read.data.len(), size);
         let checksum = calculate_sha256(&reply_read.data);
         assert_eq!(

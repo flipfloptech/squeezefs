@@ -379,3 +379,37 @@ async fn test_parallel_reads() {
     assert_eq!(read_result.data.len(), 12 * 1024 * 1024);
     assert_eq!(read_result.data[..], initial_data[..]);
 }
+
+#[tokio::test]
+async fn test_multi_backend_routing() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = get_redis_url();
+    // 1. Format volume with S3 config
+    format_volume(
+        &redis_url,
+        "multibackend",
+        4 * 1024 * 1024,
+        100 * 1024 * 1024,
+        None,
+        None,
+        None,
+        Some("http://127.0.0.1:9000"),
+        Some("minioadmin"),
+        Some("minioadmin"),
+        Some("test-bucket"),
+    )
+    .await
+    .expect("Format volume should succeed");
+
+    // 2. Query status to ensure it contains S3 configs
+    let status = get_volume_status(&redis_url).await.unwrap();
+    assert_eq!(status["Setting"]["S3Endpoint"], "http://127.0.0.1:9000");
+    assert_eq!(status["Setting"]["S3Bucket"], "test-bucket");
+}

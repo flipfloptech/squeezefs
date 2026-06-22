@@ -1,5 +1,3 @@
-use redis::AsyncCommands;
-use squeezefs::backend::{MultiBackendClient, RustFsClient};
 use squeezefs::fuse_client::format_volume;
 use squeezefs::dlm::DlmClient;
 use std::fs;
@@ -36,7 +34,7 @@ async fn setup_test_volume(name: &str) -> Option<DlmClient> {
 
 #[tokio::test]
 async fn test_diskcache_lifecycle() {
-    let dlm = match setup_test_volume("vol_cache_test").await {
+    let _dlm = match setup_test_volume("vol_cache_test").await {
         Some(d) => d,
         None => {
             println!("Skipping test: Redis/Garnet not available");
@@ -103,7 +101,7 @@ async fn test_diskcache_lifecycle() {
 
 #[tokio::test]
 async fn test_backend_lifecycle() {
-    let dlm = match setup_test_volume("vol_backend_test").await {
+    let _dlm = match setup_test_volume("vol_backend_test").await {
         Some(d) => d,
         None => {
             println!("Skipping test: Redis/Garnet not available");

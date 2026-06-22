@@ -46,6 +46,7 @@ pub struct SqueezefsFilesystem {
     uid: u32,
     gid: u32,
     active_leases: dashmap::DashMap<u64, crate::dlm::LockLease>,
+    active_posix_locks: dashmap::DashMap<(Inode, u64, u64, u64), crate::dlm::LockLease>,
     active_inode_locks: dashmap::DashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>,
     pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant)>,
 }
@@ -58,6 +59,7 @@ impl SqueezefsFilesystem {
             uid,
             gid,
             active_leases: dashmap::DashMap::new(),
+            active_posix_locks: dashmap::DashMap::new(),
             active_inode_locks: dashmap::DashMap::new(),
             attr_cache: dashmap::DashMap::new(),
         }
@@ -2121,10 +2123,73 @@ impl Filesystem for SqueezefsFilesystem {
         _pid: u32,
     ) -> FuseResult<ReplyLock> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        debug!("FUSE getlk: inode = {}", inode);
+        debug!(
+            "FUSE getlk: inode = {}, owner = {}, start = {}, end = {}, type = {}",
+            inode, _lock_owner, _start, _end, _type
+        );
+
+        // 1. Check local conflicts
+        for entry in self.active_posix_locks.iter() {
+            let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
+            if lock_ino == inode
+                && lock_owner != _lock_owner
+                && std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
+            {
+                debug!(
+                    "FUSE getlk: conflict found locally with owner {} on range {}-{}",
+                    lock_owner, lock_start, lock_end
+                );
+                return Ok(ReplyLock {
+                    start: lock_start,
+                    end: lock_end,
+                    r#type: libc::F_WRLCK as u32,
+                    pid: lock_owner as u32,
+                });
+            }
+        }
+
+        // 2. Check global conflicts in Redis
+        if let Ok(mut con) = self.dlm.get_connection().await {
+            let pattern = format!("lock:inode_{}:range:*", inode);
+            if let Ok(keys) = redis::cmd("KEYS")
+                .arg(&pattern)
+                .query_async::<_, Vec<String>>(&mut con)
+                .await
+            {
+                for key in keys {
+                    if let Some(suffix) = key.strip_prefix(&format!("lock:inode_{}:range:", inode))
+                    {
+                        let parts: Vec<&str> = suffix.split('-').collect();
+                        if parts.len() == 2 {
+                            if let (Ok(r_start), Ok(r_end)) =
+                                (parts[0].parse::<u64>(), parts[1].parse::<u64>())
+                            {
+                                if std::cmp::max(r_start, _start) <= std::cmp::min(r_end, _end) {
+                                    if let Ok(Some(client_id)) =
+                                        con.get::<_, Option<String>>(&key).await
+                                    {
+                                        if client_id != self.dlm.client_id() {
+                                            debug!("FUSE getlk: conflict found globally (client_id: {}) on range {}-{}", client_id, r_start, r_end);
+                                            return Ok(ReplyLock {
+                                                start: r_start,
+                                                end: r_end,
+                                                r#type: libc::F_WRLCK as u32,
+                                                pid: 0,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("FUSE getlk: no conflict found, range unlocked");
         Ok(ReplyLock {
-            start: 0,
-            end: 0,
+            start: _start,
+            end: _end,
             r#type: libc::F_UNLCK as u32,
             pid: 0,
         })
@@ -2143,8 +2208,130 @@ impl Filesystem for SqueezefsFilesystem {
         _block: bool,
     ) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        debug!("FUSE setlk: inode = {}, type = {}", inode, _type);
-        Ok(())
+        debug!(
+            "FUSE setlk: inode = {}, owner = {}, start = {}, end = {}, type = {}, block = {}",
+            inode, _lock_owner, _start, _end, _type, _block
+        );
+
+        if _type == libc::F_UNLCK as u32 {
+            let mut to_remove = Vec::new();
+            for entry in self.active_posix_locks.iter() {
+                let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
+                if lock_ino == inode
+                    && lock_owner == _lock_owner
+                    && std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
+                {
+                    to_remove.push((lock_ino, lock_owner, lock_start, lock_end));
+                }
+            }
+            for key in to_remove {
+                if let Some((_, lease)) = self.active_posix_locks.remove(&key) {
+                    if let Err(e) = lease.release().await {
+                        error!("Failed to explicitly release lock lease: {:?}", e);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // If we already hold a lock on this exact range, release it first
+        if let Some((_, old_lease)) =
+            self.active_posix_locks
+                .remove(&(inode, _lock_owner, _start, _end))
+        {
+            let _ = old_lease.release().await;
+        }
+
+        let file_path = format!("inode_{}", inode);
+        let mut attempts = 0;
+        let max_attempts = if _block { 20 } else { 1 };
+
+        loop {
+            // 1. Check local conflicts (different owners)
+            let mut conflict = false;
+            for entry in self.active_posix_locks.iter() {
+                let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
+                if lock_ino == inode
+                    && lock_owner != _lock_owner
+                    && std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
+                {
+                    conflict = true;
+                    break;
+                }
+            }
+
+            if !conflict {
+                // 2. Check global conflicts in Redis
+                if let Ok(mut con) = self.dlm.get_connection().await {
+                    let pattern = format!("lock:inode_{}:range:*", inode);
+                    if let Ok(keys) = redis::cmd("KEYS")
+                        .arg(&pattern)
+                        .query_async::<_, Vec<String>>(&mut con)
+                        .await
+                    {
+                        for key in keys {
+                            if let Some(suffix) =
+                                key.strip_prefix(&format!("lock:inode_{}:range:", inode))
+                            {
+                                let parts: Vec<&str> = suffix.split('-').collect();
+                                if parts.len() == 2 {
+                                    if let (Ok(r_start), Ok(r_end)) =
+                                        (parts[0].parse::<u64>(), parts[1].parse::<u64>())
+                                    {
+                                        if std::cmp::max(r_start, _start)
+                                            <= std::cmp::min(r_end, _end)
+                                        {
+                                            if let Ok(Some(client_id)) =
+                                                con.get::<_, Option<String>>(&key).await
+                                            {
+                                                if client_id != self.dlm.client_id() {
+                                                    conflict = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        conflict = true;
+                    }
+                } else {
+                    conflict = true;
+                }
+            }
+
+            if !conflict {
+                // Try to acquire the lock via DLM
+                match self
+                    .dlm
+                    .acquire_lock(&file_path, Some((_start, _end)), Duration::from_secs(5))
+                    .await
+                {
+                    Ok(lease) => {
+                        debug!(
+                            "FUSE setlk: successfully acquired lock range {}-{} for owner {}",
+                            _start, _end, _lock_owner
+                        );
+                        self.active_posix_locks
+                            .insert((inode, _lock_owner, _start, _end), lease);
+                        return Ok(());
+                    }
+                    Err(SqueezefsError::LockFailed { .. }) => {}
+                    Err(e) => {
+                        return Err(map_squeezefs_err(e));
+                    }
+                }
+            }
+
+            attempts += 1;
+            if attempts >= max_attempts {
+                debug!("FUSE setlk: lock acquisition failed/timed out, returning EAGAIN");
+                return Err(Errno::from(libc::EAGAIN));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 

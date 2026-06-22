@@ -327,6 +327,10 @@ impl DlmClient {
         &self.meta_client
     }
 
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
     pub async fn get_connection(&self) -> Result<MetaConnection> {
         self.meta_client.get_connection().await
     }

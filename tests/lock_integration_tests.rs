@@ -1,7 +1,5 @@
 use fuse3::raw::Filesystem;
-use fuse3::raw::reply::ReplyLock;
 use fuse3::raw::Request;
-use redis::AsyncCommands;
 use squeezefs::backend::RustFsClient;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
@@ -43,7 +41,7 @@ async fn setup_fs() -> Option<(SqueezefsFilesystem, tempfile::TempDir)> {
 
     let router = DataRouter::new(dlm.clone(), backend, cache);
     let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
-    
+
     // Call init on fs
     let req = Request {
         unique: 1,
@@ -81,16 +79,30 @@ async fn test_fuse_posix_lock_acquisition_and_release() {
     let ino = reply_created.attr.ino;
 
     // 2. Process A (owner 1001) locks range [0, 100]
-    fs.setlk(req, ino, 101, 1001, 0, 100, libc::F_WRLCK as u32, 1234, false)
-        .await
-        .expect("Lock acquisition by Process A should succeed");
+    fs.setlk(
+        req,
+        ino,
+        101,
+        1001,
+        0,
+        100,
+        libc::F_WRLCK as u32,
+        1234,
+        false,
+    )
+    .await
+    .expect("Lock acquisition by Process A should succeed");
 
     // 3. Process B (owner 1002) checks range [50, 150] (overlaps [0, 100])
     let reply_get = fs
         .getlk(req, ino, 102, 1002, 50, 150, libc::F_WRLCK as u32, 5678)
         .await
         .expect("Getlk should succeed");
-    assert_eq!(reply_get.r#type, libc::F_WRLCK as u32, "Should return that lock is held");
+    assert_eq!(
+        reply_get.r#type,
+        libc::F_WRLCK as u32,
+        "Should return that lock is held"
+    );
 
     // 4. Process B checks range [101, 200] (does not overlap [0, 100])
     let reply_get_non_overlap = fs
@@ -104,9 +116,19 @@ async fn test_fuse_posix_lock_acquisition_and_release() {
     );
 
     // 5. Process A unlocks range [0, 100]
-    fs.setlk(req, ino, 101, 1001, 0, 100, libc::F_UNLCK as u32, 1234, false)
-        .await
-        .expect("Unlock by Process A should succeed");
+    fs.setlk(
+        req,
+        ino,
+        101,
+        1001,
+        0,
+        100,
+        libc::F_UNLCK as u32,
+        1234,
+        false,
+    )
+    .await
+    .expect("Unlock by Process A should succeed");
 
     // 6. Process B checks range [50, 150] again, should now be unlocked
     let reply_get_after = fs
@@ -144,17 +166,40 @@ async fn test_fuse_posix_lock_blocking() {
     let ino = reply_created.attr.ino;
 
     // Process A locks range [0, 100]
-    fs.setlk(req, ino, 101, 1001, 0, 100, libc::F_WRLCK as u32, 1234, false)
-        .await
-        .expect("Lock A should succeed");
+    fs.setlk(
+        req,
+        ino,
+        101,
+        1001,
+        0,
+        100,
+        libc::F_WRLCK as u32,
+        1234,
+        false,
+    )
+    .await
+    .expect("Lock A should succeed");
 
     // Process B tries to acquire lock on range [50, 150] in blocking mode
     let start_time = std::time::Instant::now();
     let res = fs
-        .setlk(req, ino, 102, 1002, 50, 150, libc::F_WRLCK as u32, 5678, true)
+        .setlk(
+            req,
+            ino,
+            102,
+            1002,
+            50,
+            150,
+            libc::F_WRLCK as u32,
+            5678,
+            true,
+        )
         .await;
 
-    assert!(res.is_err(), "Blocking lock on held range should fail after timeout");
+    assert!(
+        res.is_err(),
+        "Blocking lock on held range should fail after timeout"
+    );
     let elapsed = start_time.elapsed();
     assert!(
         elapsed >= Duration::from_millis(1500),

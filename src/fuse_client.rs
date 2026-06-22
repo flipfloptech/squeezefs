@@ -40,10 +40,13 @@ fn map_squeezefs_err(e: SqueezefsError) -> Errno {
 }
 
 pub struct SqueezefsFilesystem {
-    router: DataRouter,
+    pub router: DataRouter,
     dlm: DlmClient,
     uid: u32,
     gid: u32,
+    active_leases: dashmap::DashMap<u64, crate::dlm::LockLease>,
+    active_inode_locks: dashmap::DashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant)>,
 }
 
 impl SqueezefsFilesystem {
@@ -53,6 +56,9 @@ impl SqueezefsFilesystem {
             dlm,
             uid,
             gid,
+            active_leases: dashmap::DashMap::new(),
+            active_inode_locks: dashmap::DashMap::new(),
+            attr_cache: dashmap::DashMap::new(),
         }
     }
 
@@ -88,7 +94,308 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
+    fn get_inode_lock(&self, ino: u64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.active_inode_locks
+            .entry(ino)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    async fn get_or_acquire_lease(&self, ino: u64) -> Result<u64, SqueezefsError> {
+        if let Some(lease) = self.active_leases.get(&ino) {
+            return Ok(lease.fencing_token());
+        }
+        let file_path = format!("inode_{}", ino);
+        let lease = self
+            .dlm
+            .acquire_lock(&file_path, None, Duration::from_secs(5))
+            .await?;
+        let token = lease.fencing_token();
+        self.active_leases.insert(ino, lease);
+        Ok(token)
+    }
+
+    async fn write_file_staged(
+        &self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+        _fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let start_block = offset / block_size;
+        let end_block = (offset + data.len() as u64 - 1) / block_size;
+
+        let active_dir = std::path::PathBuf::from("/tmp/squeezefs_staging")
+            .join("active_writes")
+            .join(format!("inode_{}", ino));
+
+        tokio::fs::create_dir_all(&active_dir).await.map_err(|e| {
+            SqueezefsError::Io(std::io::Error::other(format!(
+                "Failed to create active writes dir: {:?}",
+                e
+            )))
+        })?;
+
+        let mut data_cursor = 0usize;
+        for b in start_block..=end_block {
+            let b_start_offset = b * block_size;
+            let b_end_offset = b_start_offset + block_size;
+
+            let write_start = std::cmp::max(offset, b_start_offset);
+            let write_end = std::cmp::min(offset + data.len() as u64, b_end_offset);
+            let slice_len = (write_end - write_start) as usize;
+
+            let file_data_slice = &data[data_cursor..data_cursor + slice_len];
+            data_cursor += slice_len;
+
+            let block_file_path = active_dir.join(format!("block_{}", b));
+
+            // 1. Initialize block file on disk if it doesn't exist
+            if !block_file_path.exists() {
+                let file_path = format!("inode_{}", ino);
+
+                // Try cache first
+                let mut block_map_id_opt = None;
+                if let Some(entry) = self.router.metadata_cache.get(&file_path) {
+                    if entry.cached_at.elapsed() < Duration::from_secs(1) {
+                        block_map_id_opt = entry.block_map_id.clone();
+                    }
+                }
+
+                // If miss, query Garnet
+                let block_map_id = match block_map_id_opt {
+                    Some(id) => Some(id),
+                    None => {
+                        let meta_key = format!("metadata:{}", file_path);
+                        let mut con = self.dlm.get_connection().await?;
+                        let id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+                        id_opt
+                    }
+                };
+
+                let mut existing_block_data = Vec::new();
+                if let Some(block_map_id) = block_map_id {
+                    let mut old_block_key = None;
+
+                    // Try block_map_cache first
+                    let cache_key = (block_map_id.clone(), b as u32);
+                    if let Some(entry) = self.router.block_map_cache.get(&cache_key) {
+                        let (bk, cached_at) = entry.value();
+                        if cached_at.elapsed() < Duration::from_secs(1) {
+                            old_block_key = Some(bk.clone());
+                        }
+                    }
+
+                    // If miss, query Garnet
+                    let old_block_key = match old_block_key {
+                        Some(key) => Some(key),
+                        None => {
+                            let block_map_key = format!("block_map:{}", block_map_id);
+                            let mut con = self.dlm.get_connection().await?;
+                            let key_opt: Option<String> =
+                                con.hget(&block_map_key, b.to_string()).await?;
+                            key_opt
+                        }
+                    };
+
+                    if let Some(bk) = old_block_key {
+                        existing_block_data = if let Some(cached) =
+                            self.router.cache.nvme.get_cached_read_block(&bk)
+                        {
+                            cached
+                        } else {
+                            self.router.backend.get_object(&bk).await?
+                        };
+                    }
+                }
+
+                tokio::fs::write(&block_file_path, &existing_block_data)
+                    .await
+                    .map_err(|e| {
+                        SqueezefsError::Io(std::io::Error::other(format!(
+                            "Failed to initialize staging block file: {:?}",
+                            e
+                        )))
+                    })?;
+            }
+
+            // 2. Perform seek and write range directly on disk
+            use tokio::fs::OpenOptions;
+            use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&block_file_path)
+                .await
+                .map_err(|e| {
+                    SqueezefsError::Io(std::io::Error::other(format!(
+                        "Failed to open staging block file for write: {:?}",
+                        e
+                    )))
+                })?;
+
+            let rel_start = write_start - b_start_offset;
+            file.seek(SeekFrom::Start(rel_start)).await.map_err(|e| {
+                SqueezefsError::Io(std::io::Error::other(format!(
+                    "Failed to seek staging block file: {:?}",
+                    e
+                )))
+            })?;
+
+            file.write_all(file_data_slice).await.map_err(|e| {
+                SqueezefsError::Io(std::io::Error::other(format!(
+                    "Failed to write staging block file slice: {:?}",
+                    e
+                )))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    async fn flush_active_blocks(
+        &self,
+        ino: u64,
+        fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        let active_dir = std::path::PathBuf::from("/tmp/squeezefs_staging")
+            .join("active_writes")
+            .join(format!("inode_{}", ino));
+
+        if !active_dir.exists() {
+            return Ok(());
+        }
+
+        let mut entries = tokio::fs::read_dir(&active_dir).await.map_err(|e| {
+            SqueezefsError::Io(std::io::Error::other(format!(
+                "Failed to read active writes dir: {:?}",
+                e
+            )))
+        })?;
+
+        let mut tasks = Vec::new();
+        let file_path = format!("inode_{}", ino);
+        let meta_key = format!("metadata:{}", file_path);
+
+        let mut con = self.dlm.get_connection().await?;
+        let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+        let mut block_map_id = block_map_id_opt.unwrap_or_default();
+        if block_map_id.is_empty() {
+            block_map_id = uuid::Uuid::new_v4().to_string();
+            let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
+        }
+
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            SqueezefsError::Io(std::io::Error::other(format!(
+                "Failed to read entry: {:?}",
+                e
+            )))
+        })? {
+            let path = entry.path();
+            if path.is_file() {
+                let file_name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if file_name.starts_with("block_") {
+                    let b_str = file_name.trim_start_matches("block_");
+                    if let Ok(b) = b_str.parse::<u32>() {
+                        let block_data = tokio::fs::read(&path).await.map_err(|e| {
+                            SqueezefsError::Io(std::io::Error::other(format!(
+                                "Failed to read block file for upload: {:?}",
+                                e
+                            )))
+                        })?;
+
+                        let backend_clone = self.router.backend.clone();
+                        let dlm_clone = self.dlm.clone();
+                        let block_map_id_clone = block_map_id.clone();
+                        let router_clone = self.router.clone();
+
+                        tasks.push(tokio::spawn(async move {
+                            let file_uuid = uuid::Uuid::new_v4().to_string();
+                            let block_write_uuid = uuid::Uuid::new_v4().to_string();
+                            let new_block_key =
+                                format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
+
+                            backend_clone
+                                .put_object(&new_block_key, block_data, fencing_token)
+                                .await?;
+
+                            let mut con = dlm_clone.get_connection().await?;
+                            let block_map_key = format!("block_map:{}", block_map_id_clone);
+                            let refcounts_key = "squeezefs:block_refcounts";
+
+                            let old_block_key: Option<String> =
+                                con.hget(&block_map_key, b.to_string()).await?;
+
+                            let mut pipe = redis::pipe();
+                            pipe.hset(refcounts_key, &new_block_key, 1).hset(
+                                &block_map_key,
+                                b.to_string(),
+                                &new_block_key,
+                            );
+                            let _: () = pipe.query_async(&mut con).await?;
+
+                            // Update local block_map_cache
+                            router_clone.block_map_cache.insert(
+                                (block_map_id_clone.clone(), b),
+                                (new_block_key.clone(), std::time::Instant::now()),
+                            );
+
+                            if let Some(bk) = old_block_key {
+                                let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+                                if let Some(mut r) = old_ref {
+                                    r -= 1;
+                                    if r <= 0 {
+                                        let _: () = redis::pipe()
+                                            .hdel(refcounts_key, &bk)
+                                            .query_async(&mut con)
+                                            .await?;
+                                        let _ = backend_clone.delete_object(&bk).await;
+                                    } else {
+                                        let _: () = con.hset(refcounts_key, &bk, r).await?;
+                                    }
+                                } else {
+                                    let _ = backend_clone.delete_object(&bk).await;
+                                }
+                            }
+                            Ok::<_, SqueezefsError>(())
+                        }));
+                    }
+                }
+            }
+        }
+
+        for task in tasks {
+            task.await.map_err(|e| {
+                SqueezefsError::Io(std::io::Error::other(format!(
+                    "Parallel block upload task panicked: {:?}",
+                    e
+                )))
+            })??;
+        }
+
+        tokio::fs::remove_dir_all(&active_dir).await.map_err(|e| {
+            SqueezefsError::Io(std::io::Error::other(format!(
+                "Failed to remove active writes dir: {:?}",
+                e
+            )))
+        })?;
+
+        Ok(())
+    }
+
     async fn get_attr_internal(&self, ino: u64) -> Result<FileAttr, SqueezefsError> {
+        if let Some(entry) = self.attr_cache.get(&ino) {
+            let (attr, cached_at) = entry.value();
+            if cached_at.elapsed() < Duration::from_secs(1) {
+                return Ok(*attr);
+            }
+        }
+
         let mut con = self.dlm.get_connection().await?;
         let attr_key = format!("squeezefs:attr:{}", ino);
         let fields: std::collections::HashMap<String, String> = con.hgetall(&attr_key).await?;
@@ -166,7 +473,7 @@ impl SqueezefsFilesystem {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-        Ok(FileAttr {
+        let attr = FileAttr {
             ino,
             size,
             blocks,
@@ -180,7 +487,10 @@ impl SqueezefsFilesystem {
             gid,
             rdev,
             blksize,
-        })
+        };
+        self.attr_cache
+            .insert(ino, (attr, std::time::Instant::now()));
+        Ok(attr)
     }
 
     async fn update_parent_timestamps(
@@ -213,6 +523,45 @@ impl Filesystem for SqueezefsFilesystem {
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         info!("FUSE Daemon: Initialized Squeezefs Filesystem mount.");
+
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+        let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
+
+        if !format_exists {
+            let default_block_size = 4 * 1024 * 1024;
+            let default_capacity = 1024 * 1024 * 1024 * 1024 * 1024;
+            info!("Volume not formatted. Performing auto-format on mount...");
+            let _: () = redis::pipe()
+                .hset("squeezefs:format", "name", "squeezefs")
+                .hset("squeezefs:format", "block_size", default_block_size)
+                .hset("squeezefs:format", "capacity", default_capacity)
+                .hset("squeezefs:format", "version", 1) // ABI version
+                .hset("squeezefs:format", "mem_cache_size", "1GB")
+                .hset("squeezefs:format", "disk_cache_size", "10GB")
+                .hset("squeezefs:format", "disk_cache_paths", "")
+                .query_async(&mut con)
+                .await
+                .map_err(map_err)?;
+        }
+
+        let version_str: Option<String> = con
+            .hget("squeezefs:format", "version")
+            .await
+            .map_err(map_err)?;
+        let version: u64 = version_str.and_then(|v| v.parse().ok()).unwrap_or(1);
+        if version > 1 {
+            error!("Database ABI version ({}) is higher than client supported version (1). Rejecting mount.", version);
+            return Err(Errno::from(libc::EPROTO));
+        }
+
+        let block_size_str: Option<String> = con
+            .hget("squeezefs:format", "block_size")
+            .await
+            .map_err(map_err)?;
+        let block_size: u64 = block_size_str
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4 * 1024 * 1024);
+        self.router.set_block_size(block_size);
 
         // Initialize root directory attributes in Garnet if not present
         if let Err(e) = self.init_root_inode().await {
@@ -540,102 +889,77 @@ impl Filesystem for SqueezefsFilesystem {
         &self,
         _req: Request,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: u64,
         data: &[u8],
-        write_flags: u32,
-        flags: u32,
+        _write_flags: u32,
+        _flags: u32,
     ) -> FuseResult<ReplyWrite> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        debug!(
-            "FUSE Write: ino = {}, fh = {}, offset = {}, size = {}, write_flags = {}, flags = {}",
-            ino,
-            fh,
-            offset,
-            data.len(),
-            write_flags,
-            flags
-        );
 
-        let file_path = format!("inode_{}", ino);
+        // 1. Acquire local inode lock
+        let lock = self.get_inode_lock(ino);
+        let _guard = lock.lock().await;
 
-        // 1. Acquire distributed lock & fencing token (TTL 5 seconds)
-        let lease = match self
-            .dlm
-            .acquire_lock(&file_path, None, Duration::from_secs(5))
+        // 2. Get or acquire lease (fencing token)
+        let fencing_token = self
+            .get_or_acquire_lease(ino)
             .await
-        {
-            Ok(l) => l,
-            Err(e) => {
-                error!("FUSE Write: Lock acquisition failed: {:?}", e);
-                return Err(Errno::from(libc::EAGAIN)); // EAGAIN for busy resource
-            }
+            .map_err(map_squeezefs_err)?;
+
+        // 3. Write data to local NVMe staging blocks
+        self.write_file_staged(ino, offset, data, fencing_token)
+            .await
+            .map_err(map_squeezefs_err)?;
+
+        let bytes_written = data.len() as u32;
+
+        // 4. Update file attributes and used bytes
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+        let attr_key = format!("squeezefs:attr:{}", ino);
+
+        let old_size = if let Some(entry) = self.attr_cache.get(&ino) {
+            entry.value().0.size
+        } else {
+            let old_size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
+            old_size_opt.unwrap_or(0)
         };
 
-        // 2. Perform progressive routed write with fencing token
-        let write_future = self
-            .router
-            .write_file(&file_path, offset, data, lease.fencing_token());
+        let new_size = std::cmp::max(old_size, offset + bytes_written as u64);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        let sec = now.as_secs() as i64;
+        let nsec = now.subsec_nanos();
 
-        // Timeout protection (fail fast within 2 seconds)
-        let res = match tokio::time::timeout(Duration::from_secs(2), write_future).await {
-            Ok(Ok(())) => {
-                let bytes_written = data.len() as u32;
+        let mut pipe = redis::pipe();
+        pipe.hset(&attr_key, "size", new_size)
+            .hset(&attr_key, "mtime_sec", sec)
+            .hset(&attr_key, "mtime_nsec", nsec)
+            .hset(&attr_key, "ctime_sec", sec)
+            .hset(&attr_key, "ctime_nsec", nsec);
 
-                // Update size in inode attributes in Garnet
-                if let Ok(mut con) = self.dlm.get_connection().await {
-                    let attr_key = format!("squeezefs:attr:{}", ino);
-                    let now = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or(Duration::ZERO);
-                    let sec = now.as_secs() as i64;
-                    let nsec = now.subsec_nanos();
-                    let _: Result<(), redis::RedisError> = redis::pipe()
-                        .hset(&attr_key, "size", offset + bytes_written as u64)
-                        .hset(&attr_key, "mtime_sec", sec)
-                        .hset(&attr_key, "mtime_nsec", nsec)
-                        .hset(&attr_key, "ctime_sec", sec)
-                        .hset(&attr_key, "ctime_nsec", nsec)
-                        .query_async(&mut con)
-                        .await;
-                }
+        if new_size > old_size {
+            let diff = new_size - old_size;
+            pipe.incr("squeezefs:used_bytes", diff);
+        }
+        let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
 
-                Ok(ReplyWrite {
-                    written: bytes_written,
-                })
-            }
-            Ok(Err(SqueezefsError::FencingTokenExpired { token, expected })) => {
-                error!("FUSE Write: Stale write rejected due to expired fencing token {} (expected >= {}). Discarding local transaction.", token, expected);
-                Err(Errno::from(libc::EIO))
-            }
-            Ok(Err(e)) => {
-                error!("FUSE Write failed: {:?}", e);
-                Err(Errno::from(libc::EIO))
-            }
-            Err(_) => {
-                error!("FUSE Write timed out! Falling back to local NVMe staging disk.");
-                // If it timed out, try to force stage it on NVMe directly as fallback
-                let file_id = uuid::Uuid::new_v4().to_string();
-                match self
-                    .router
-                    .cache()
-                    .nvme
-                    .stage_write(&file_path, &file_id, data, lease.fencing_token())
-                    .await
-                {
-                    Ok(()) => Ok(ReplyWrite {
-                        written: data.len() as u32,
-                    }),
-                    Err(stage_err) => {
-                        error!("NVMe staging fallback write also failed: {:?}", stage_err);
-                        Err(Errno::from(libc::EIO))
-                    }
-                }
-            }
-        };
+        // Update local attr_cache
+        if let Some(mut entry) = self.attr_cache.get_mut(&ino) {
+            entry.value_mut().0.size = new_size;
+            entry.value_mut().0.mtime = Timestamp::new(sec, nsec);
+            entry.value_mut().0.ctime = Timestamp::new(sec, nsec);
+            entry.value_mut().1 = std::time::Instant::now();
+        }
 
-        let _ = lease.release().await;
-        res
+        // Invalidate router metadata_cache to force reload of the new size on next read
+        let file_path = format!("inode_{}", ino);
+        self.router.metadata_cache.remove(&file_path);
+
+        Ok(ReplyWrite {
+            written: bytes_written,
+        })
     }
 
     async fn mkdir(
@@ -765,6 +1089,12 @@ impl Filesystem for SqueezefsFilesystem {
             .await
             .map_err(map_err)?;
 
+        // Invalidate caches
+        self.attr_cache.remove(&ino);
+        self.attr_cache.remove(&parent);
+        let file_path = format!("inode_{}", ino);
+        self.router.metadata_cache.remove(&file_path);
+
         Ok(())
     }
 
@@ -784,6 +1114,12 @@ impl Filesystem for SqueezefsFilesystem {
         let exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
         if !exists {
             return Err(Errno::from(libc::ENOENT));
+        }
+
+        let mut old_size = 0u64;
+        if set_attr.size.is_some() {
+            let old_size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
+            old_size = old_size_opt.unwrap_or(0);
         }
 
         let now = SystemTime::now()
@@ -808,6 +1144,13 @@ impl Filesystem for SqueezefsFilesystem {
             // Also update the physical/routing size in the metadata block?
             let meta_key = format!("metadata:inode_{}", ino);
             pipe.hset(&meta_key, "size", size);
+            if size > old_size {
+                let diff = size - old_size;
+                pipe.incr("squeezefs:used_bytes", diff);
+            } else if size < old_size {
+                let diff = old_size - size;
+                pipe.decr("squeezefs:used_bytes", diff);
+            }
         }
 
         // Handle timestamps
@@ -825,6 +1168,11 @@ impl Filesystem for SqueezefsFilesystem {
         pipe.hset(&attr_key, "ctime_nsec", nsec);
 
         let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
+
+        // Invalidate cached attributes and router metadata
+        self.attr_cache.remove(&ino);
+        let file_path = format!("inode_{}", ino);
+        self.router.metadata_cache.remove(&file_path);
 
         let attr = self
             .get_attr_internal(ino)
@@ -1063,6 +1411,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_err)?;
         } else {
             // Delete metadata and data completely
+            let file_size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
+            let file_size = file_size_opt.unwrap_or(0);
             let file_path = format!("inode_{}", ino);
             let inline_key = format!("inline_data:{}", file_path);
             let meta_key = format!("metadata:{}", file_path);
@@ -1078,10 +1428,17 @@ impl Filesystem for SqueezefsFilesystem {
                 .del(&inline_key)
                 .del(&meta_key)
                 .del(&symlink_key)
+                .decr("squeezefs:used_bytes", file_size)
                 .query_async(&mut con)
                 .await
                 .map_err(map_err)?;
         }
+
+        // Invalidate attr_cache and router metadata_cache
+        self.attr_cache.remove(&ino);
+        self.attr_cache.remove(&parent);
+        let file_path = format!("inode_{}", ino);
+        self.router.metadata_cache.remove(&file_path);
 
         Ok(())
     }
@@ -1232,6 +1589,20 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_err)?;
         }
+
+        // Invalidate caches
+        self.attr_cache.remove(&ino);
+        self.attr_cache.remove(&parent);
+        if parent != new_parent {
+            self.attr_cache.remove(&new_parent);
+        }
+        if let Some(dest_ino) = dest_ino_opt {
+            self.attr_cache.remove(&dest_ino);
+            let dest_file_path = format!("inode_{}", dest_ino);
+            self.router.metadata_cache.remove(&dest_file_path);
+        }
+        let file_path = format!("inode_{}", ino);
+        self.router.metadata_cache.remove(&file_path);
 
         Ok(())
     }
@@ -1543,6 +1914,91 @@ impl Filesystem for SqueezefsFilesystem {
 
         Ok(ReplyCopyFileRange { copied: copied_len })
     }
+
+    async fn statfs(&self, _req: Request, _ino: u64) -> FuseResult<ReplyStatFs> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+        let used_bytes_opt: Option<u64> = con.get("squeezefs:used_bytes").await.map_err(map_err)?;
+        let used_bytes = used_bytes_opt.unwrap_or(0);
+
+        let bsize = 4096;
+        let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
+        let capacity = if format_exists {
+            let cap_str: Option<String> = con
+                .hget("squeezefs:format", "capacity")
+                .await
+                .map_err(map_err)?;
+            cap_str
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1024 * 1024 * 1024 * 1024 * 1024) // 1PB
+        } else {
+            1024 * 1024 * 1024 * 1024 * 1024 // 1PB
+        };
+
+        let total_blocks = capacity / bsize as u64;
+        let used_blocks = used_bytes.div_ceil(bsize as u64);
+        let bfree = total_blocks.saturating_sub(used_blocks);
+
+        Ok(ReplyStatFs {
+            blocks: total_blocks,
+            bfree,
+            bavail: bfree,
+            files: 1_000_000_000,
+            ffree: 999_999_000,
+            bsize,
+            namelen: 255,
+            frsize: bsize,
+        })
+    }
+
+    async fn flush(&self, _req: Request, ino: u64, _fh: u64, _lock_owner: u64) -> FuseResult<()> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE Flush: ino = {}", ino);
+
+        // 1. Acquire local inode lock
+        let lock = self.get_inode_lock(ino);
+        let _guard = lock.lock().await;
+
+        // 2. Get or acquire lease (fencing token)
+        let fencing_token = self
+            .get_or_acquire_lease(ino)
+            .await
+            .map_err(map_squeezefs_err)?;
+
+        // 3. Flush the staging blocks concurrently to backend (S3/RustFS)
+        self.flush_active_blocks(ino, fencing_token)
+            .await
+            .map_err(map_squeezefs_err)?;
+
+        Ok(())
+    }
+
+    async fn release(
+        &self,
+        _req: Request,
+        ino: u64,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+    ) -> FuseResult<()> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE Release: ino = {}", ino);
+
+        // Acquire local inode lock
+        let lock = self.get_inode_lock(ino);
+        let _guard = lock.lock().await;
+
+        // If there's a cached lease, release it and remove it from our active_leases map
+        if let Some((_, lease)) = self.active_leases.remove(&ino) {
+            let _ = lease.release().await;
+        }
+
+        // Also clean up local inode lock if no longer needed
+        self.active_inode_locks.remove(&ino);
+
+        Ok(())
+    }
 }
 
 /// Initialize the multi-threaded work-stealing tokio runtime
@@ -1645,29 +2101,22 @@ pub async fn start_mount<P: AsRef<Path>>(
         let is_stale = match check_metadata {
             Err(e) => {
                 let os_err = e.raw_os_error();
-                os_err == Some(107) || os_err == Some(5) || e.kind() == std::io::ErrorKind::NotConnected
+                os_err == Some(107)
+                    || os_err == Some(5)
+                    || e.kind() == std::io::ErrorKind::NotConnected
             }
             _ => false,
         };
 
         if is_stale {
-            info!(
-                "Stale mount point detected at {:?}. Attempting lazy unmount before remounting...",
-                mount_path
+            error!(
+                "Stale mount point detected at {:?}.\nTo resolve this, please manually unmount it by running:\n    sudo umount -l {:?}",
+                mount_path, mount_path
             );
-            let status = std::process::Command::new("umount")
-                .arg("-l")
-                .arg(&mount_path)
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    info!("Successfully unmounted stale mount point {:?}", mount_path);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                }
-                other => {
-                    log::warn!("Failed to unmount stale mount point: {:?}", other);
-                }
-            }
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Transport endpoint is not connected",
+            )));
         }
     }
 
@@ -1679,4 +2128,89 @@ pub async fn start_mount<P: AsRef<Path>>(
     session.await?;
 
     Ok(())
+}
+
+pub async fn format_volume(
+    redis_url: &str,
+    name: &str,
+    block_size: u64,
+    capacity: u64,
+    mem_cache_size: Option<&str>,
+    disk_cache_size: Option<&str>,
+    disk_cache_paths: Option<&[std::path::PathBuf]>,
+) -> Result<(), SqueezefsError> {
+    let client = redis::Client::open(redis_url)?;
+    let mut con = client.get_multiplexed_tokio_connection().await?;
+    let _: () = redis::cmd("FLUSHALL")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
+
+    let mem_size = mem_cache_size.unwrap_or("1GB").to_string();
+    let disk_size = disk_cache_size.unwrap_or("10GB").to_string();
+    let paths_str = disk_cache_paths
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+
+    let _: () = redis::pipe()
+        .hset("squeezefs:format", "name", name)
+        .hset("squeezefs:format", "block_size", block_size)
+        .hset("squeezefs:format", "capacity", capacity)
+        .hset("squeezefs:format", "version", 1) // ABI version
+        .hset("squeezefs:format", "mem_cache_size", mem_size)
+        .hset("squeezefs:format", "disk_cache_size", disk_size)
+        .hset("squeezefs:format", "disk_cache_paths", paths_str)
+        .query_async(&mut con)
+        .await?;
+
+    Ok(())
+}
+
+pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, SqueezefsError> {
+    let client = redis::Client::open(redis_url)?;
+    let mut con = client.get_multiplexed_tokio_connection().await?;
+    let fields: std::collections::HashMap<String, String> = con.hgetall("squeezefs:format").await?;
+    if fields.is_empty() {
+        return Err(SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Volume not formatted",
+        )));
+    }
+    let name = fields.get("name").cloned().unwrap_or_default();
+    let block_size: u64 = fields
+        .get("block_size")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
+    let capacity: u64 = fields
+        .get("capacity")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mem_cache_size = fields.get("mem_cache_size").cloned().unwrap_or_default();
+    let disk_cache_size = fields.get("disk_cache_size").cloned().unwrap_or_default();
+    let disk_cache_paths_str = fields.get("disk_cache_paths").cloned().unwrap_or_default();
+    let disk_cache_paths: Vec<String> = if disk_cache_paths_str.is_empty() {
+        vec![]
+    } else {
+        disk_cache_paths_str
+            .split(',')
+            .map(|s| s.to_string())
+            .collect()
+    };
+
+    Ok(serde_json::json!({
+        "Setting": {
+            "Name": name,
+            "BlockSize": block_size,
+            "Capacity": capacity,
+            "MemCacheSize": mem_cache_size,
+            "DiskCacheSize": disk_cache_size,
+            "DiskCachePaths": disk_cache_paths,
+        }
+    }))
 }

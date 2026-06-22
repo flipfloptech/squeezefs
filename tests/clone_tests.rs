@@ -84,6 +84,15 @@ async fn cleanup_keys(src: &str, dest: &str) {
     let _: () = pipe.query_async(&mut con).await.unwrap_or(());
 }
 
+async fn is_db_available() -> bool {
+    let redis_url = get_redis_url();
+    let client = match redis::Client::open(redis_url) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client.get_multiplexed_tokio_connection().await.is_ok()
+}
+
 async fn setup_router() -> Option<(DataRouter, tempfile::TempDir)> {
     let redis_url = get_redis_url();
     let dlm = DlmClient::new(&redis_url).ok()?;
@@ -241,6 +250,11 @@ async fn test_clone_striped_cow() {
 
 #[tokio::test]
 async fn test_copy_file_range_refclone() {
+    if !is_db_available().await {
+        println!("Skipping test: Redis/Garnet not available");
+        return;
+    }
+
     let src = "src_range.bin";
     let dest = "dest_range.bin";
     cleanup_keys(src, dest).await;
@@ -266,6 +280,8 @@ async fn test_copy_file_range_refclone() {
         gid: 1000,
         pid: 1234,
     };
+
+    fs.init(req).await.unwrap();
 
     // 1. Create source file
     let reply_src = fs
@@ -301,6 +317,11 @@ async fn test_copy_file_range_refclone() {
 
 #[tokio::test]
 async fn test_clone_path_full() {
+    if !is_db_available().await {
+        println!("Skipping test: Redis/Garnet not available");
+        return;
+    }
+
     let src = "src_path_clone.bin";
     let dest = "dest_path_clone.bin";
     cleanup_keys(src, dest).await;
@@ -326,6 +347,8 @@ async fn test_clone_path_full() {
         gid: 1000,
         pid: 1234,
     };
+
+    fs.init(req).await.unwrap();
 
     // 1. Create source file inside the FUSE mount namespace (parent root inode 1)
     let reply_src = fs

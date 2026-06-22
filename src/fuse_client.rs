@@ -2272,7 +2272,7 @@ pub async fn start_mount<P: AsRef<Path>>(
         .mount(fs, mount_path)
         .await?;
 
-    let handle = session;
+    let mut handle = session;
 
     let shutdown = async {
         #[cfg(unix)]
@@ -2306,14 +2306,20 @@ pub async fn start_mount<P: AsRef<Path>>(
     };
 
     tokio::select! {
-        res = handle => {
+        res = &mut handle => {
             if let Err(e) = res {
                 error!("FUSE session loop ended with error: {:?}", e);
             } else {
                 info!("FUSE session loop ended successfully.");
             }
         }
-        _ = shutdown => {}
+        _ = shutdown => {
+            if let Err(e) = handle.unmount().await {
+                error!("Failed to unmount filesystem: {:?}", e);
+            } else {
+                info!("Filesystem unmounted successfully.");
+            }
+        }
     }
 
     Ok(())

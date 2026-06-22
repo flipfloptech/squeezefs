@@ -83,12 +83,12 @@ impl NvmeStaging {
         data: &[u8],
         fencing_token: u64,
     ) -> Result<()> {
-        // Enforce max bytes capacity constraint
+        // Enforce max bytes capacity constraint asynchronously
         let mut total_staged_bytes = 0u64;
         for dir in &self.staging_dirs {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata() {
+            if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if let Ok(meta) = entry.metadata().await {
                         if meta.is_file()
                             && entry
                                 .path()
@@ -116,14 +116,14 @@ impl NvmeStaging {
         let data_path = target_dir.join(format!("{}.data", file_id));
         let meta_path = target_dir.join(format!("{}.meta", file_id));
 
-        // Write the data and metadata to NVMe staging synchronously
-        fs::write(&data_path, data)?;
+        // Write the data and metadata to NVMe staging asynchronously
+        tokio::fs::write(&data_path, data).await?;
 
         let meta_content = serde_json::json!({
             "file_path": file_path,
             "fencing_token": fencing_token
         });
-        fs::write(&meta_path, serde_json::to_vec(&meta_content).unwrap())?;
+        tokio::fs::write(&meta_path, serde_json::to_vec(&meta_content).unwrap()).await?;
 
         info!(
             "NVMe Staging: Staged write for file {} (ID: {}) size = {} bytes. Acknowledging write to OS.",
@@ -298,6 +298,16 @@ impl NvmeStaging {
 
     /// Cache a block of read data on local NVMe, performing eviction if capacity is reached.
     pub fn cache_read_block(&self, block_key: &str, data: &[u8]) -> Result<()> {
+        let this = self.clone();
+        let block_key = block_key.to_string();
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let _ = this.cache_read_block_sync(&block_key, &data);
+        });
+        Ok(())
+    }
+
+    fn cache_read_block_sync(&self, block_key: &str, data: &[u8]) -> Result<()> {
         // Enforce max bytes capacity check
         let mut total_bytes = 0u64;
         let mut block_files = Vec::new();
@@ -374,6 +384,37 @@ impl NvmeStaging {
         let block_path = target_dir.join(format!("{}.block", safe_name));
         if block_path.exists() {
             fs::read(block_path).ok()
+        } else {
+            None
+        }
+    }
+
+    /// Retrieve a range of bytes from a cached block file if it exists locally.
+    pub fn get_cached_read_block_range(
+        &self,
+        block_key: &str,
+        offset: u64,
+        size: u32,
+    ) -> Option<Vec<u8>> {
+        let safe_name = block_key.replace('/', "_");
+        let idx = get_dir_index(&safe_name, self.staging_dirs.len());
+        let target_dir = &self.staging_dirs[idx];
+        let block_path = target_dir.join(format!("{}.block", safe_name));
+        if block_path.exists() {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = fs::File::open(block_path).ok()?;
+            let metadata = file.metadata().ok()?;
+            let file_len = metadata.len();
+
+            if offset >= file_len {
+                return Some(Vec::new());
+            }
+            let read_len = std::cmp::min(size as u64, file_len - offset) as usize;
+
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            let mut buf = vec![0u8; read_len];
+            file.read_exact(&mut buf).ok()?;
+            Some(buf)
         } else {
             None
         }

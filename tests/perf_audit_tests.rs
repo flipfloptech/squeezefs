@@ -1,10 +1,11 @@
+use fuse3::raw::Filesystem;
+use redis::AsyncCommands;
 use squeezefs::backend::RustFsClient;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
-use squeezefs::routing::DataRouter;
 use squeezefs::fuse_client::SqueezefsFilesystem;
+use squeezefs::routing::DataRouter;
 use tempfile::tempdir;
-use redis::AsyncCommands;
 
 fn get_redis_url() -> String {
     std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
@@ -59,7 +60,7 @@ async fn test_metadata_cache_effectiveness() {
     let meta_key = format!("metadata:{}", file_path);
     let file_id: String = con.hget(&meta_key, "file_id").await.unwrap();
     let mapping_key = format!("mapping:{}", file_id);
-    
+
     let _: () = con.del(&[&meta_key, &mapping_key]).await.unwrap();
 
     // 2. Second read range (should succeed using cached metadata/mappings)
@@ -126,34 +127,33 @@ async fn test_attr_cache_effectiveness() {
 async fn test_get_cached_read_block_range() {
     let temp_dir = tempdir().unwrap();
     let dir_path = temp_dir.path().to_path_buf();
-    
+
     // Write a dummy block file of 1MB
     let block_size = 1024 * 1024;
     let block_data: Vec<u8> = (0..block_size).map(|i| (i % 256) as u8).collect();
-    
+
     let block_key = "test/block/key";
     let safe_name = block_key.replace('/', "_");
     let block_file_path = dir_path.join(format!("{}.block", safe_name));
-    
+
     std::fs::write(&block_file_path, &block_data).unwrap();
 
     let backend = RustFsClient::new_mock();
     let redis_client = squeezefs::dlm::MetaClient::new("redis://127.0.0.1:6379").unwrap();
-    
-    let cache = TieredCache::new(
-        vec![dir_path],
-        None,
-        None,
-        backend,
-        redis_client,
-    )
-    .unwrap();
+
+    let cache = TieredCache::new(vec![dir_path], None, None, backend, redis_client).unwrap();
 
     // Call get_cached_read_block_range
     let offset = 500000u64;
     let size = 10000u32;
-    let res = cache.nvme.get_cached_read_block_range(block_key, offset, size).unwrap();
-    
+    let res = cache
+        .nvme
+        .get_cached_read_block_range(block_key, offset, size)
+        .unwrap();
+
     assert_eq!(res.len(), size as usize);
-    assert_eq!(res, block_data[offset as usize..(offset + size as u64) as usize]);
+    assert_eq!(
+        res,
+        block_data[offset as usize..(offset + size as u64) as usize]
+    );
 }

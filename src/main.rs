@@ -23,6 +23,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Format Garnet database to initialize squeezefs volume
+    Format {
+        /// Volume name
+        name: String,
+        /// Block size in bytes (default: 4MB)
+        #[arg(long, default_value_t = 4194304)]
+        block_size: u64,
+        /// Maximum capacity of the volume in bytes (default: 1PB)
+        #[arg(long, default_value_t = 1024 * 1024 * 1024 * 1024 * 1024)]
+        capacity: u64,
+        /// Memory cache limit (default: "1GB")
+        #[arg(long)]
+        mem_cache_size: Option<String>,
+        /// Disk cache limit (default: "10GB")
+        #[arg(long)]
+        disk_cache_size: Option<String>,
+        /// Comma-separated paths to local staging/cache directories
+        #[arg(long, value_delimiter = ',')]
+        disk_cache_paths: Option<Vec<PathBuf>>,
+    },
+    /// Show filesystem status
+    Status,
     /// Mount squeezefs at a target path
     Mount {
         /// Path to mount the filesystem at
@@ -72,6 +94,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Format {
+            name,
+            block_size,
+            capacity,
+            mem_cache_size,
+            disk_cache_size,
+            disk_cache_paths,
+        } => {
+            let redis_url = std::env::var("GARNET_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            squeezefs::fuse_client::format_volume(
+                &redis_url,
+                &name,
+                block_size,
+                capacity,
+                mem_cache_size.as_deref(),
+                disk_cache_size.as_deref(),
+                disk_cache_paths.as_deref(),
+            )
+            .await?;
+            println!("Volume '{}' formatted successfully.", name);
+        }
+        Commands::Status => {
+            let redis_url = std::env::var("GARNET_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            let status = squeezefs::fuse_client::get_volume_status(&redis_url).await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
         Commands::Mount {
             mountpoint,
             mem_cache_size,
@@ -371,15 +421,37 @@ async fn run_benchmark(
     pb_stat_small.finish_with_message("Done");
     let d_stat = t_start.elapsed();
 
-    // --- CLEANUP FILES ---
-    println!("Cleaning up benchmark files...");
+    // --- DELETE FILES ---
+    println!("Deleting small files...");
+    let pb_delete_small = mp.add(ProgressBar::new((threads * small_files_count) as u64));
+    pb_delete_small.set_style(pb_style.clone());
+    pb_delete_small.set_message("Delete Files");
+
+    let t_start = Instant::now();
+    let mut delete_tasks = Vec::new();
+    for t_id in 0..threads {
+        let path_clone = path.to_path_buf();
+        let pb = pb_delete_small.clone();
+        delete_tasks.push(tokio::spawn(async move {
+            for f_id in 0..small_files_count {
+                let file_path = path_clone.join(format!("bench_small_{}_{}.bin", t_id, f_id));
+                let _ = fs::remove_file(&file_path).await;
+                pb.inc(1);
+            }
+            Ok::<_, std::io::Error>(())
+        }));
+    }
+
+    for task in delete_tasks {
+        task.await??;
+    }
+    pb_delete_small.finish_with_message("Done");
+    let d_delete = t_start.elapsed();
+
+    // Clean up big files
     for t_id in 0..threads {
         let file_path = path.join(format!("bench_big_{}.bin", t_id));
         let _ = fs::remove_file(file_path).await;
-        for f_id in 0..small_files_count {
-            let file_path = path.join(format!("bench_small_{}_{}.bin", t_id, f_id));
-            let _ = fs::remove_file(file_path).await;
-        }
     }
 
     // 2. Fetch post-benchmark metrics
@@ -403,6 +475,9 @@ async fn run_benchmark(
     let stat_rate = total_small_files / d_stat.as_secs_f64();
     let stat_cost = (d_stat.as_secs_f64() * 1000.0) / total_small_files;
 
+    let delete_rate = total_small_files / d_delete.as_secs_f64();
+    let delete_cost = (d_delete.as_secs_f64() * 1000.0) / total_small_files;
+
     // --- COLOR THRESHOLDS ---
     let format_big_val = |val: f64| {
         let s = format!("{:>12.2} MiB/s", val);
@@ -415,7 +490,7 @@ async fn run_benchmark(
         }
     };
     let format_small_val = |val: f64| {
-        let s = format!("{:>12.2} files/s", val);
+        let s = format!("{:>12.2} ops/s", val);
         if val > 200.0 {
             s.green()
         } else if val > 100.0 {
@@ -473,6 +548,12 @@ async fn run_benchmark(
         "Stat files",
         format_stat_val(stat_rate),
         stat_cost
+    );
+    println!(
+        "| {:<18} | {} | {:>14.2} ms/op |",
+        "Delete files",
+        format_stat_val(delete_rate),
+        delete_cost
     );
     println!(
         "{}",

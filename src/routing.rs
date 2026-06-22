@@ -10,10 +10,24 @@ use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 #[derive(Clone)]
+pub struct CachedMetadata {
+    pub file_type: String,
+    pub size: u64,
+    pub block_map_id: Option<String>,
+    pub block_prefix: Option<String>,
+    pub file_id: Option<String>,
+    pub cached_at: std::time::Instant,
+}
+
+#[derive(Clone)]
 pub struct DataRouter {
     dlm: DlmClient,
-    backend: RustFsClient,
-    cache: TieredCache,
+    pub backend: RustFsClient,
+    pub cache: TieredCache,
+    pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub metadata_cache: std::sync::Arc<dashmap::DashMap<String, CachedMetadata>>,
+    pub block_map_cache:
+        std::sync::Arc<dashmap::DashMap<(String, u32), (String, std::time::Instant)>>,
 }
 
 impl DataRouter {
@@ -22,7 +36,15 @@ impl DataRouter {
             dlm,
             backend,
             cache,
+            block_size: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024)),
+            metadata_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            block_map_cache: std::sync::Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    pub fn set_block_size(&self, block_size: u64) {
+        self.block_size
+            .store(block_size, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Write file data using progressive data layout routing with offset support (POSIX random-access RMW).
@@ -176,7 +198,7 @@ impl DataRouter {
             // Layout: striped
             let file_uuid = Uuid::new_v4().to_string();
             let block_map_id = Uuid::new_v4().to_string();
-            let block_size = 4 * 1024 * 1024;
+            let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
             let mut futures = Vec::new();
             let mut offset_cursor = 0;
             let mut block_count = 0;
@@ -329,7 +351,7 @@ impl DataRouter {
         let size_opt: Option<u64> = con.hget(meta_key, "size").await?;
         let existing_size = size_opt.unwrap_or(0);
 
-        let block_size = 4 * 1024 * 1024; // 4MB
+        let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
         let end_pos = offset + data.len() as u64;
 
         let start_block = (offset / block_size) as u32;
@@ -363,8 +385,18 @@ impl DataRouter {
                 .await?;
         }
 
-        // 2. Modify only affected blocks
+        // 2. Fetch all old block keys in a single pipeline
+        let mut pipe = redis::pipe();
         for b in start_block..=end_block {
+            pipe.hget(&block_map_key, b.to_string());
+        }
+        let old_block_keys: Vec<Option<String>> = pipe.query_async(con).await?;
+
+        // 3. Spawn tasks to modify affected blocks concurrently
+        let mut tasks = Vec::new();
+        for (idx, b) in (start_block..=end_block).enumerate() {
+            let old_block_key = old_block_keys[idx].clone();
+
             let block_start_file_offset = b as u64 * block_size;
             let block_end_file_offset = block_start_file_offset + block_size;
 
@@ -375,55 +407,76 @@ impl DataRouter {
             let rel_end = (overlap_end - block_start_file_offset) as usize;
 
             let data_slice =
-                &data[(overlap_start - offset) as usize..(overlap_end - offset) as usize];
+                data[(overlap_start - offset) as usize..(overlap_end - offset) as usize].to_vec();
 
-            let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
+            let backend_clone = self.backend.clone();
 
-            let mut block_data = if let Some(ref bk) = old_block_key {
-                self.backend.get_object(bk).await?
-            } else {
-                vec![0; rel_end]
-            };
+            tasks.push(tokio::spawn(async move {
+                let mut block_data = if let Some(ref bk) = old_block_key {
+                    backend_clone.get_object(bk).await?
+                } else {
+                    vec![0; rel_end]
+                };
 
-            if block_data.len() < rel_end {
-                block_data.resize(rel_end, 0);
-            }
+                if block_data.len() < rel_end {
+                    block_data.resize(rel_end, 0);
+                }
 
-            block_data[rel_start..rel_end].copy_from_slice(data_slice);
+                block_data[rel_start..rel_end].copy_from_slice(&data_slice);
 
-            // Copy-on-Write: write to a NEW block key!
-            let file_uuid = Uuid::new_v4().to_string();
-            let block_write_uuid = Uuid::new_v4().to_string();
-            let new_block_key = format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
+                let file_uuid = Uuid::new_v4().to_string();
+                let block_write_uuid = Uuid::new_v4().to_string();
+                let new_block_key =
+                    format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
-            self.backend
-                .put_object(&new_block_key, block_data, fencing_token)
-                .await?;
+                backend_clone
+                    .put_object(&new_block_key, block_data, fencing_token)
+                    .await?;
 
-            let mut pipe = redis::pipe();
-            pipe.hset(refcounts_key, &new_block_key, 1).hset(
+                Ok::<_, SqueezefsError>((b, old_block_key, new_block_key))
+            }));
+        }
+
+        let results = futures::future::try_join_all(tasks).await.map_err(|e| {
+            SqueezefsError::Io(std::io::Error::other(format!(
+                "Block write task panicked: {:?}",
+                e
+            )))
+        })?;
+
+        // 4. Build single Redis pipeline to update mappings
+        let mut pipe_update = redis::pipe();
+        let mut old_keys_to_clean = Vec::new();
+        for res in results {
+            let (b, old_block_key, new_block_key) = res?;
+            pipe_update.hset(refcounts_key, &new_block_key, 1).hset(
                 &block_map_key,
                 b.to_string(),
                 &new_block_key,
             );
-            let _: () = pipe.query_async(con).await?;
 
-            if let Some(ref bk) = old_block_key {
-                let old_ref: Option<i32> = con.hget(refcounts_key, bk).await?;
-                if let Some(mut r) = old_ref {
-                    r -= 1;
-                    if r <= 0 {
-                        let _: () = redis::pipe()
-                            .hdel(refcounts_key, bk)
-                            .query_async(con)
-                            .await?;
-                        let _ = self.backend.delete_object(bk).await;
-                    } else {
-                        let _: () = con.hset(refcounts_key, bk, r).await?;
-                    }
+            if let Some(bk) = old_block_key {
+                old_keys_to_clean.push(bk);
+            }
+        }
+        let _: () = pipe_update.query_async(con).await?;
+
+        // Clean up old block keys
+        for bk in old_keys_to_clean {
+            let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+            if let Some(mut r) = old_ref {
+                r -= 1;
+                if r <= 0 {
+                    let _: () = redis::pipe()
+                        .hdel(refcounts_key, &bk)
+                        .query_async(con)
+                        .await?;
+                    let _ = self.backend.delete_object(&bk).await;
                 } else {
-                    let _ = self.backend.delete_object(bk).await;
+                    let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
+            } else {
+                let _ = self.backend.delete_object(&bk).await;
             }
         }
 
@@ -621,20 +674,51 @@ impl DataRouter {
             return Ok(cached_data[start..end].to_vec());
         }
 
-        // Fetch file metadata from Garnet
-        let mut con = self.dlm.get_connection().await?;
-        let meta_key = format!("metadata:{}", file_path);
+        // Fetch file metadata from local cache or Garnet
+        let cached_meta = if let Some(entry) = self.metadata_cache.get(file_path) {
+            if entry.cached_at.elapsed() < Duration::from_secs(1) {
+                Some(entry.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        let file_type: Option<String> = con.hget(&meta_key, "type").await?;
-        let file_type = file_type.ok_or_else(|| {
-            SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("File not found: {}", file_path),
-            ))
-        })?;
+        let meta = match cached_meta {
+            Some(m) => m,
+            None => {
+                let mut con = self.dlm.get_connection().await?;
+                let meta_key = format!("metadata:{}", file_path);
+                let file_type: Option<String> = con.hget(&meta_key, "type").await?;
+                let file_type = file_type.ok_or_else(|| {
+                    SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("File not found: {}", file_path),
+                    ))
+                })?;
+                let size_val_opt: Option<u64> = con.hget(&meta_key, "size").await?;
+                let size_val = size_val_opt.unwrap_or(0);
+                let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+                let block_prefix: Option<String> = con.hget(&meta_key, "block_prefix").await?;
+                let file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
 
-        match file_type.as_str() {
+                let m = CachedMetadata {
+                    file_type,
+                    size: size_val,
+                    block_map_id,
+                    block_prefix,
+                    file_id,
+                    cached_at: std::time::Instant::now(),
+                };
+                self.metadata_cache.insert(file_path.to_string(), m.clone());
+                m
+            }
+        };
+
+        match meta.file_type.as_str() {
             "inline" => {
+                let mut con = self.dlm.get_connection().await?;
                 let inline_key = format!("inline_data:{}", file_path);
                 let bytes: Vec<u8> = con.get(&inline_key).await?;
                 let start = std::cmp::min(offset as usize, bytes.len());
@@ -642,8 +726,7 @@ impl DataRouter {
                 Ok(bytes[start..end].to_vec())
             }
             "staged" => {
-                let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;
-                let file_id = file_id_opt.ok_or_else(|| {
+                let file_id = meta.file_id.ok_or_else(|| {
                     SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
                 })?;
 
@@ -652,6 +735,7 @@ impl DataRouter {
                     staged_data
                 } else {
                     let mapping_key = format!("mapping:{}", file_id);
+                    let mut con = self.dlm.get_connection().await?;
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     let off_opt: Option<u64> = con.hget(&mapping_key, "offset").await?;
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
@@ -673,9 +757,8 @@ impl DataRouter {
                 Ok(data[start..end].to_vec())
             }
             "striped" => {
-                let block_size = 4 * 1024 * 1024;
-                let file_size_opt: Option<u64> = con.hget(&meta_key, "size").await?;
-                let file_size = file_size_opt.unwrap_or(0);
+                let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
+                let file_size = meta.size;
 
                 if offset >= file_size {
                     return Ok(Vec::new());
@@ -686,33 +769,49 @@ impl DataRouter {
                     return Ok(Vec::new());
                 }
 
-                let start_block = (offset / block_size as u64) as u32;
-                let end_block = ((end_offset - 1) / block_size as u64) as u32;
-
-                let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
-                let block_prefix_opt: Option<String> = con.hget(&meta_key, "block_prefix").await?;
+                let start_block = (offset / block_size) as u32;
+                let end_block = ((end_offset - 1) / block_size) as u32;
 
                 let mut block_keys = Vec::new();
-                if let Some(block_map_id) = block_map_id_opt {
+                if let Some(block_map_id) = &meta.block_map_id {
                     let block_map_key = format!("block_map:{}", block_map_id);
-                    let mut pipe = redis::pipe();
+
+                    let mut blocks_to_query = Vec::new();
                     for b in start_block..=end_block {
-                        pipe.hget(&block_map_key, b.to_string());
+                        let cache_key = (block_map_id.clone(), b);
+                        if let Some(entry) = self.block_map_cache.get(&cache_key) {
+                            let (bk, cached_at) = entry.value();
+                            if cached_at.elapsed() < Duration::from_secs(1) {
+                                block_keys.push((b, bk.clone()));
+                                continue;
+                            }
+                        }
+                        blocks_to_query.push(b);
                     }
-                    let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
-                    for (idx, key_opt) in res.into_iter().enumerate() {
-                        let bk = key_opt.ok_or_else(|| {
-                            SqueezefsError::Io(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!(
-                                    "Block {} mapping not found in Garnet",
-                                    start_block + idx as u32
-                                ),
-                            ))
-                        })?;
-                        block_keys.push((start_block + idx as u32, bk));
+
+                    if !blocks_to_query.is_empty() {
+                        let mut pipe = redis::pipe();
+                        for &b in &blocks_to_query {
+                            pipe.hget(&block_map_key, b.to_string());
+                        }
+                        let mut con = self.dlm.get_connection().await?;
+                        let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
+                        for (idx, key_opt) in res.into_iter().enumerate() {
+                            let b = blocks_to_query[idx];
+                            let bk = key_opt.ok_or_else(|| {
+                                SqueezefsError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    format!("Block {} mapping not found in Garnet", b),
+                                ))
+                            })?;
+                            self.block_map_cache.insert(
+                                (block_map_id.clone(), b),
+                                (bk.clone(), std::time::Instant::now()),
+                            );
+                            block_keys.push((b, bk));
+                        }
                     }
-                } else if let Some(block_prefix) = block_prefix_opt {
+                } else if let Some(block_prefix) = &meta.block_prefix {
                     for b in start_block..=end_block {
                         block_keys.push((b, format!("{}/part_{}", block_prefix, b)));
                     }
@@ -722,37 +821,63 @@ impl DataRouter {
                     ));
                 }
 
-                let mut range_data = Vec::new();
+                // Spawn concurrent tasks to download block data in parallel
+                let mut futures = Vec::new();
                 for (b_idx, b_key) in block_keys {
-                    let block_data =
-                        if let Some(cached) = self.cache.nvme.get_cached_read_block(&b_key) {
+                    let cache_ref = self.cache.nvme.clone();
+                    let backend_ref = self.backend.clone();
+
+                    let b_start_offset = b_idx as u64 * block_size;
+                    let b_end_offset = b_start_offset + block_size;
+                    let slice_start = std::cmp::max(offset, b_start_offset) - b_start_offset;
+                    let slice_end = std::cmp::min(end_offset, b_end_offset);
+                    let rel_end = slice_end - b_start_offset;
+                    let slice_len = (rel_end - slice_start) as u32;
+
+                    futures.push(tokio::spawn(async move {
+                        let block_data = if let Some(cached_range) =
+                            cache_ref.get_cached_read_block_range(&b_key, slice_start, slice_len)
+                        {
                             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                            cached
+                            cached_range
                         } else {
                             METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-                            let downloaded = self.backend.get_object(&b_key).await?;
-                            let _ = self.cache.nvme.cache_read_block(&b_key, &downloaded);
-                            downloaded
+                            let downloaded = backend_ref.get_object(&b_key).await?;
+                            let _ = cache_ref.cache_read_block(&b_key, &downloaded);
+                            let start = std::cmp::min(slice_start as usize, downloaded.len());
+                            let end = std::cmp::min(
+                                (slice_start + slice_len as u64) as usize,
+                                downloaded.len(),
+                            );
+                            downloaded[start..end].to_vec()
                         };
+                        Ok::<_, SqueezefsError>((b_idx, block_data))
+                    }));
+                }
 
-                    let b_start_offset = b_idx as u64 * block_size as u64;
-                    let b_end_offset = b_start_offset + block_data.len() as u64;
+                let results = futures::future::try_join_all(futures).await.map_err(|e| {
+                    SqueezefsError::Io(std::io::Error::other(format!(
+                        "Parallel block download task panicked: {:?}",
+                        e
+                    )))
+                })?;
 
-                    let slice_start = std::cmp::max(offset, b_start_offset) - b_start_offset;
-                    let slice_end = std::cmp::min(end_offset, b_end_offset) - b_start_offset;
+                let mut results_sorted = Vec::new();
+                for res in results {
+                    results_sorted.push(res?);
+                }
+                results_sorted.sort_by_key(|r| r.0);
 
-                    if slice_start < slice_end {
-                        range_data.extend_from_slice(
-                            &block_data[slice_start as usize..slice_end as usize],
-                        );
-                    }
+                let mut range_data = Vec::new();
+                for (_, block_data) in results_sorted {
+                    range_data.extend_from_slice(&block_data);
                 }
 
                 Ok(range_data)
             }
             _ => Err(SqueezefsError::InvalidOperation(format!(
                 "Unknown file type: {}",
-                file_type
+                meta.file_type
             ))),
         }
     }

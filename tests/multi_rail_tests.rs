@@ -20,8 +20,22 @@ async fn test_multi_rail_backend_initialization() {
     assert_eq!(backend.client_count(), 2);
 }
 
+async fn is_db_available() -> bool {
+    let redis_url = get_redis_url();
+    let client = match redis::Client::open(redis_url) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client.get_multiplexed_tokio_connection().await.is_ok()
+}
+
 #[tokio::test]
 async fn test_multi_rail_dlm_initialization() {
+    if !is_db_available().await {
+        println!("Skipping test: Redis/Garnet not available");
+        return;
+    }
+
     let redis_url = get_redis_url();
     let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
 
@@ -36,6 +50,11 @@ async fn test_multi_rail_dlm_initialization() {
 
 #[tokio::test]
 async fn test_multi_rail_dlm_rotation_and_failover() {
+    if !is_db_available().await {
+        println!("Skipping test: Redis/Garnet not available");
+        return;
+    }
+
     let redis_url = get_redis_url();
     let local_ips = vec![
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),

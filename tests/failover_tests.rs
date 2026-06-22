@@ -8,8 +8,23 @@ fn test_sentinel_url_parsing() {
     assert!(matches!(meta_client, MetaClient::Sentinel(_)));
 }
 
+async fn is_db_available() -> bool {
+    let redis_url =
+        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let client = match redis::Client::open(redis_url) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client.get_multiplexed_tokio_connection().await.is_ok()
+}
+
 #[tokio::test]
 async fn test_connection_resilience() -> Result<()> {
+    if !is_db_available().await {
+        println!("Skipping test: Redis/Garnet not available");
+        return Ok(());
+    }
+
     let redis_url =
         std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let client = MetaClient::new(&redis_url)?;

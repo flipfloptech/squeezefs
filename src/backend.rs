@@ -200,23 +200,8 @@ impl RustFsClient {
                 SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
             })?;
 
-            // 1. Fetch current object metadata to check fencing token
-            if let Ok(head_output) = s3.head_object().bucket(&self.bucket).key(key).send().await {
-                if let Some(metadata) = head_output.metadata() {
-                    if let Some(existing_token_str) = metadata.get("fencing-token") {
-                        if let Ok(existing_token) = existing_token_str.parse::<u64>() {
-                            if fencing_token <= existing_token {
-                                return Err(SqueezefsError::FencingTokenExpired {
-                                    token: fencing_token,
-                                    expected: existing_token + 1,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2. Perform write
+            // Perform write directly (fencing token is stored as metadata for tracking,
+            // but we avoid the redundant HEAD request check since block keys are unique).
             let body = ByteStream::from(data.clone());
             match s3
                 .put_object()

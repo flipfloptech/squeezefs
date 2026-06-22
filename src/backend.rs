@@ -21,17 +21,27 @@ impl RustFsClient {
     /// Create a new S3-compatible client.
     /// If environment variables are not set or connection fails, falls back to mock in-memory store.
     pub async fn new() -> Self {
-        Self::new_with_local_ips(Vec::new()).await
+        Self::new_with_local_ips(Vec::new(), None, None, None, None).await
     }
 
     /// Create a new S3-compatible client with multi-rail local IP bindings.
-    pub async fn new_with_local_ips(local_ips: Vec<IpAddr>) -> Self {
-        let endpoint = std::env::var("RUSTFS_ENDPOINT").ok();
-        let access_key = std::env::var("RUSTFS_ACCESS_KEY").unwrap_or_else(|_| "admin".to_string());
-        let secret_key =
-            std::env::var("RUSTFS_SECRET_KEY").unwrap_or_else(|_| "password".to_string());
-        let bucket =
-            std::env::var("RUSTFS_BUCKET").unwrap_or_else(|_| "squeezefs-data".to_string());
+    pub async fn new_with_local_ips(
+        local_ips: Vec<IpAddr>,
+        endpoint: Option<String>,
+        access_key: Option<String>,
+        secret_key: Option<String>,
+        bucket: Option<String>,
+    ) -> Self {
+        let endpoint = endpoint.or_else(|| std::env::var("RUSTFS_ENDPOINT").ok());
+        let access_key = access_key
+            .or_else(|| std::env::var("RUSTFS_ACCESS_KEY").ok())
+            .unwrap_or_else(|| "admin".to_string());
+        let secret_key = secret_key
+            .or_else(|| std::env::var("RUSTFS_SECRET_KEY").ok())
+            .unwrap_or_else(|| "password".to_string());
+        let bucket = bucket
+            .or_else(|| std::env::var("RUSTFS_BUCKET").ok())
+            .unwrap_or_else(|| "squeezefs-data".to_string());
 
         let mut s3_clients = Vec::new();
 
@@ -159,7 +169,7 @@ impl RustFsClient {
         }
     }
 
-    async fn init_bucket(&self) -> Result<()> {
+    pub async fn init_bucket(&self) -> Result<()> {
         if let Some(s3) = self.s3_clients.first() {
             let exists = s3.head_bucket().bucket(&self.bucket).send().await;
             if exists.is_err() {
@@ -309,5 +319,110 @@ impl RustFsClient {
             "S3 DELETE failed on all rails. Last error: {:?}",
             last_err
         )))
+    }
+}
+
+#[derive(Clone)]
+pub struct MultiBackendClient {
+    backends: Arc<dashmap::DashMap<String, RustFsClient>>,
+    active_backend_id: Arc<std::sync::RwLock<String>>,
+}
+
+impl Default for MultiBackendClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MultiBackendClient {
+    pub fn new() -> Self {
+        Self {
+            backends: Arc::new(dashmap::DashMap::new()),
+            active_backend_id: Arc::new(std::sync::RwLock::new("backend_0".to_string())),
+        }
+    }
+
+    pub fn active_backend_id(&self) -> String {
+        self.active_backend_id.read().unwrap().clone()
+    }
+
+    pub fn set_active_backend_id(&self, id: String) {
+        if let Ok(mut writer) = self.active_backend_id.write() {
+            *writer = id;
+        }
+    }
+
+    pub fn register_backend(&self, id: &str, client: RustFsClient) {
+        self.backends.insert(id.to_string(), client);
+    }
+
+    pub fn get_backend(&self, id: &str) -> Option<RustFsClient> {
+        self.backends.get(id).map(|r| r.value().clone())
+    }
+
+    pub fn has_backend(&self, id: &str) -> bool {
+        self.backends.contains_key(id)
+    }
+
+    pub async fn put_object(&self, key: &str, data: Vec<u8>, fencing_token: u64) -> Result<()> {
+        let active_id = self.active_backend_id();
+        self.put_object_on_backend(&active_id, key, data, fencing_token)
+            .await
+    }
+
+    pub async fn put_object_on_backend(
+        &self,
+        backend_id: &str,
+        key: &str,
+        data: Vec<u8>,
+        fencing_token: u64,
+    ) -> Result<()> {
+        if let Some(backend) = self.get_backend(backend_id) {
+            backend.put_object(key, data, fencing_token).await
+        } else {
+            Err(SqueezefsError::InvalidOperation(format!(
+                "Backend ID {} not registered",
+                backend_id
+            )))
+        }
+    }
+
+    pub async fn get_object(&self, backend_id: &str, key: &str) -> Result<Vec<u8>> {
+        if let Some(backend) = self.get_backend(backend_id) {
+            backend.get_object(key).await
+        } else {
+            Err(SqueezefsError::InvalidOperation(format!(
+                "Backend ID {} not registered",
+                backend_id
+            )))
+        }
+    }
+
+    pub async fn delete_object(&self, backend_id: &str, key: &str) -> Result<()> {
+        if let Some(backend) = self.get_backend(backend_id) {
+            backend.delete_object(key).await
+        } else {
+            Err(SqueezefsError::InvalidOperation(format!(
+                "Backend ID {} not registered",
+                backend_id
+            )))
+        }
+    }
+}
+
+pub fn parse_backend_and_key(val: &str) -> (String, String) {
+    if let Some(idx) = val.find(':') {
+        let (backend_id, key) = val.split_at(idx);
+        (backend_id.to_string(), key[1..].to_string())
+    } else {
+        ("backend_0".to_string(), val.to_string())
+    }
+}
+
+impl From<RustFsClient> for MultiBackendClient {
+    fn from(client: RustFsClient) -> Self {
+        let multi = Self::new();
+        multi.register_backend("backend_0", client);
+        multi
     }
 }

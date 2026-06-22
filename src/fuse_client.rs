@@ -1,3 +1,4 @@
+use crate::backend::RustFsClient;
 use crate::dlm::DlmClient;
 use crate::error::SqueezefsError;
 use crate::routing::DataRouter;
@@ -205,7 +206,8 @@ impl SqueezefsFilesystem {
                         {
                             cached
                         } else {
-                            self.router.backend.get_object(&bk).await?
+                            let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+                            self.router.backend.get_object(&be_id, &real_key).await?
                         };
                     }
                 }
@@ -354,12 +356,17 @@ impl SqueezefsFilesystem {
                                             .hdel(refcounts_key, &bk)
                                             .query_async(&mut con)
                                             .await?;
-                                        let _ = backend_clone.delete_object(&bk).await;
+                                        let (be_id, real_key) =
+                                            crate::backend::parse_backend_and_key(&bk);
+                                        let _ =
+                                            backend_clone.delete_object(&be_id, &real_key).await;
                                     } else {
                                         let _: () = con.hset(refcounts_key, &bk, r).await?;
                                     }
                                 } else {
-                                    let _ = backend_clone.delete_object(&bk).await;
+                                    let (be_id, real_key) =
+                                        crate::backend::parse_backend_and_key(&bk);
+                                    let _ = backend_clone.delete_object(&be_id, &real_key).await;
                                 }
                             }
                             Ok::<_, SqueezefsError>(())
@@ -2130,6 +2137,7 @@ pub async fn start_mount<P: AsRef<Path>>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn format_volume(
     redis_url: &str,
     name: &str,
@@ -2138,6 +2146,10 @@ pub async fn format_volume(
     mem_cache_size: Option<&str>,
     disk_cache_size: Option<&str>,
     disk_cache_paths: Option<&[std::path::PathBuf]>,
+    s3_endpoint: Option<&str>,
+    s3_access_key: Option<&str>,
+    s3_secret_key: Option<&str>,
+    s3_bucket: Option<&str>,
 ) -> Result<(), SqueezefsError> {
     let client = redis::Client::open(redis_url)?;
     let mut con = client.get_multiplexed_tokio_connection().await?;
@@ -2158,16 +2170,51 @@ pub async fn format_volume(
         })
         .unwrap_or_default();
 
-    let _: () = redis::pipe()
-        .hset("squeezefs:format", "name", name)
+    let mut pipe = redis::pipe();
+    pipe.hset("squeezefs:format", "name", name)
         .hset("squeezefs:format", "block_size", block_size)
         .hset("squeezefs:format", "capacity", capacity)
         .hset("squeezefs:format", "version", 1) // ABI version
         .hset("squeezefs:format", "mem_cache_size", mem_size)
         .hset("squeezefs:format", "disk_cache_size", disk_size)
         .hset("squeezefs:format", "disk_cache_paths", paths_str)
-        .query_async(&mut con)
-        .await?;
+        .hset("squeezefs:format", "active_write_backend", "backend_0");
+
+    let default_endpoint = s3_endpoint.unwrap_or("");
+    let default_access_key = s3_access_key.unwrap_or("admin");
+    let default_secret_key = s3_secret_key.unwrap_or("password");
+    let default_bucket = s3_bucket.unwrap_or("squeezefs-data");
+
+    let backend_json = serde_json::json!({
+        "endpoint": default_endpoint,
+        "access_key": default_access_key,
+        "secret_key": default_secret_key,
+        "bucket": default_bucket,
+    })
+    .to_string();
+
+    pipe.hset("squeezefs:backends", "backend_0", backend_json);
+
+    if !default_endpoint.is_empty() {
+        pipe.hset("squeezefs:format", "s3_endpoint", default_endpoint)
+            .hset("squeezefs:format", "s3_bucket", default_bucket);
+    }
+
+    let _: () = pipe.query_async(&mut con).await?;
+
+    // Create/initialize bucket on S3 if endpoint is provided
+    if !default_endpoint.is_empty() {
+        let backend_client = RustFsClient::new_with_local_ips(
+            Vec::new(),
+            Some(default_endpoint.to_string()),
+            Some(default_access_key.to_string()),
+            Some(default_secret_key.to_string()),
+            Some(default_bucket.to_string()),
+        )
+        .await;
+
+        backend_client.init_bucket().await?;
+    }
 
     Ok(())
 }
@@ -2203,6 +2250,13 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             .collect()
     };
 
+    let s3_endpoint = fields.get("s3_endpoint").cloned().unwrap_or_default();
+    let s3_bucket = fields.get("s3_bucket").cloned().unwrap_or_default();
+    let active_write_backend = fields
+        .get("active_write_backend")
+        .cloned()
+        .unwrap_or_default();
+
     Ok(serde_json::json!({
         "Setting": {
             "Name": name,
@@ -2211,6 +2265,9 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             "MemCacheSize": mem_cache_size,
             "DiskCacheSize": disk_cache_size,
             "DiskCachePaths": disk_cache_paths,
+            "S3Endpoint": s3_endpoint,
+            "S3Bucket": s3_bucket,
+            "ActiveWriteBackend": active_write_backend,
         }
     }))
 }

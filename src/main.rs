@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use redis::AsyncCommands;
-use squeezefs::backend::RustFsClient;
+use squeezefs::backend::{MultiBackendClient, RustFsClient};
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{start_mount, SqueezefsFilesystem};
@@ -42,6 +42,18 @@ enum Commands {
         /// Comma-separated paths to local staging/cache directories
         #[arg(long, value_delimiter = ',')]
         disk_cache_paths: Option<Vec<PathBuf>>,
+        /// S3 compatible object store endpoint url
+        #[arg(long)]
+        s3_endpoint: Option<String>,
+        /// S3 compatible object store access key
+        #[arg(long)]
+        s3_access_key: Option<String>,
+        /// S3 compatible object store secret key
+        #[arg(long)]
+        s3_secret_key: Option<String>,
+        /// S3 compatible object store bucket name
+        #[arg(long)]
+        s3_bucket: Option<String>,
     },
     /// Show filesystem status
     Status,
@@ -65,6 +77,19 @@ enum Commands {
         /// Comma-separated list of local source IP interfaces for multi-rail connection bonding
         #[arg(long, value_delimiter = ',')]
         local_ips: Option<Vec<std::net::IpAddr>>,
+
+        /// S3 compatible object store endpoint url (overrides stored configuration)
+        #[arg(long)]
+        s3_endpoint: Option<String>,
+        /// S3 compatible object store access key (overrides stored configuration)
+        #[arg(long)]
+        s3_access_key: Option<String>,
+        /// S3 compatible object store secret key (overrides stored configuration)
+        #[arg(long)]
+        s3_secret_key: Option<String>,
+        /// S3 compatible object store bucket name (overrides stored configuration)
+        #[arg(long)]
+        s3_bucket: Option<String>,
     },
     /// Benchmark performance of the filesystem
     Bench {
@@ -101,6 +126,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
+            s3_endpoint,
+            s3_access_key,
+            s3_secret_key,
+            s3_bucket,
         } => {
             let redis_url = std::env::var("GARNET_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -112,6 +141,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mem_cache_size.as_deref(),
                 disk_cache_size.as_deref(),
                 disk_cache_paths.as_deref(),
+                s3_endpoint.as_deref(),
+                s3_access_key.as_deref(),
+                s3_secret_key.as_deref(),
+                s3_bucket.as_deref(),
             )
             .await?;
             println!("Volume '{}' formatted successfully.", name);
@@ -128,14 +161,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             disk_cache_size,
             disk_cache_paths,
             local_ips,
+            s3_endpoint,
+            s3_access_key,
+            s3_secret_key,
+            s3_bucket,
         } => {
             let redis_url = std::env::var("GARNET_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+
+            println!("Initializing metadata client...");
+            let dlm =
+                DlmClient::new_with_local_ips(&redis_url, local_ips.clone().unwrap_or_default())
+                    .await?;
+
+            // Retrieve configuration settings from Garnet metadata if formatted
+            let format_fields: std::collections::HashMap<String, String> = {
+                if let Ok(mut con) = dlm.meta_client().get_connection().await {
+                    con.hgetall("squeezefs:format").await.unwrap_or_default()
+                } else {
+                    std::collections::HashMap::new()
+                }
+            };
+
+            // Resolve memory cache size: CLI override > Garnet setting > default "1GB"
+            let resolved_mem_cache_size = mem_cache_size
+                .or_else(|| format_fields.get("mem_cache_size").cloned())
+                .unwrap_or_else(|| "1GB".to_string());
+
+            // Resolve disk cache size: CLI override > Garnet setting > default "10GB"
+            let resolved_disk_cache_size = disk_cache_size
+                .or_else(|| format_fields.get("disk_cache_size").cloned())
+                .unwrap_or_else(|| "10GB".to_string());
+
+            // Resolve staging directories: CLI override > Garnet setting > default "/tmp/squeezefs_staging"
             let staging_dirs = if let Some(dirs) = disk_cache_paths {
                 if dirs.is_empty() {
                     vec![PathBuf::from("/tmp/squeezefs_staging")]
                 } else {
                     dirs
+                }
+            } else if let Some(paths_str) = format_fields.get("disk_cache_paths") {
+                if paths_str.is_empty() {
+                    vec![PathBuf::from("/tmp/squeezefs_staging")]
+                } else {
+                    paths_str.split(',').map(PathBuf::from).collect()
                 }
             } else {
                 vec![PathBuf::from("/tmp/squeezefs_staging")]
@@ -148,19 +217,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Tune host parameters automatically
             let _ = tune_system();
 
-            println!("Initializing distributed clients...");
-            let dlm =
-                DlmClient::new_with_local_ips(&redis_url, local_ips.clone().unwrap_or_default())
-                    .await?;
-            let backend = RustFsClient::new_with_local_ips(local_ips.unwrap_or_default()).await;
+            println!("Resolving backend object store configuration...");
+            // Load S3 settings: CLI override > Env variables > Garnet stored settings
+            let final_s3_endpoint = s3_endpoint
+                .or_else(|| std::env::var("RUSTFS_ENDPOINT").ok())
+                .or_else(|| format_fields.get("s3_endpoint").cloned());
+            let final_s3_access_key = s3_access_key
+                .or_else(|| std::env::var("RUSTFS_ACCESS_KEY").ok())
+                .or_else(|| format_fields.get("s3_access_key").cloned());
+            let final_s3_secret_key = s3_secret_key
+                .or_else(|| std::env::var("RUSTFS_SECRET_KEY").ok())
+                .or_else(|| format_fields.get("s3_secret_key").cloned());
+            let final_s3_bucket = s3_bucket
+                .or_else(|| std::env::var("RUSTFS_BUCKET").ok())
+                .or_else(|| format_fields.get("s3_bucket").cloned());
+
+            // Retrieve registered backends or initialize the default one
+            let multi_backend = MultiBackendClient::new();
+
+            // Read all registered backends from Garnet
+            if let Ok(mut con) = dlm.meta_client().get_connection().await {
+                let backends_map: std::collections::HashMap<String, String> =
+                    con.hgetall("squeezefs:backends").await.unwrap_or_default();
+
+                for (be_id, be_json) in backends_map {
+                    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
+                        let ep = config["endpoint"].as_str().map(|s| s.to_string());
+                        let ak = config["access_key"].as_str().map(|s| s.to_string());
+                        let sk = config["secret_key"].as_str().map(|s| s.to_string());
+                        let bu = config["bucket"].as_str().map(|s| s.to_string());
+
+                        let client = RustFsClient::new_with_local_ips(
+                            local_ips.clone().unwrap_or_default(),
+                            ep,
+                            ak,
+                            sk,
+                            bu,
+                        )
+                        .await;
+                        multi_backend.register_backend(&be_id, client);
+                    }
+                }
+            }
+
+            // Determine active write backend
+            let mut active_be_id = format_fields
+                .get("active_write_backend")
+                .cloned()
+                .unwrap_or_else(|| "backend_0".to_string());
+
+            // If we have CLI or env overrides for the backend, register it dynamically
+            if final_s3_endpoint.is_some()
+                || final_s3_access_key.is_some()
+                || final_s3_secret_key.is_some()
+                || final_s3_bucket.is_some()
+            {
+                // Generate a custom ID for this runtime backend, e.g. "backend_override"
+                active_be_id = "backend_override".to_string();
+                let override_client = RustFsClient::new_with_local_ips(
+                    local_ips.clone().unwrap_or_default(),
+                    final_s3_endpoint.clone(),
+                    final_s3_access_key.clone(),
+                    final_s3_secret_key.clone(),
+                    final_s3_bucket.clone(),
+                )
+                .await;
+
+                // Initialize bucket
+                if final_s3_endpoint.is_some() {
+                    let _ = override_client.init_bucket().await;
+                }
+
+                multi_backend.register_backend(&active_be_id, override_client);
+
+                // Save to Garnet registry so other mounting nodes can read it
+                if let Ok(mut con) = dlm.meta_client().get_connection().await {
+                    let backend_json = serde_json::json!({
+                        "endpoint": final_s3_endpoint.clone().unwrap_or_default(),
+                        "access_key": final_s3_access_key.clone().unwrap_or_else(|| "admin".to_string()),
+                        "secret_key": final_s3_secret_key.clone().unwrap_or_else(|| "password".to_string()),
+                        "bucket": final_s3_bucket.clone().unwrap_or_else(|| "squeezefs-data".to_string()),
+                    }).to_string();
+                    let _: () = redis::pipe()
+                        .hset("squeezefs:backends", &active_be_id, backend_json)
+                        .hset("squeezefs:format", "active_write_backend", &active_be_id)
+                        .query_async(&mut con)
+                        .await
+                        .unwrap_or(());
+                }
+            }
+
+            // Ensure we have at least backend_0 registered if no backends were found
+            if !multi_backend.has_backend("backend_0") {
+                let default_client = RustFsClient::new_with_local_ips(
+                    local_ips.clone().unwrap_or_default(),
+                    final_s3_endpoint.clone(),
+                    final_s3_access_key.clone(),
+                    final_s3_secret_key.clone(),
+                    final_s3_bucket.clone(),
+                )
+                .await;
+                multi_backend.register_backend("backend_0", default_client);
+            }
+
+            multi_backend.set_active_backend_id(active_be_id);
+
             let cache = TieredCache::new(
                 staging_dirs,
-                mem_cache_size.as_deref(),
-                disk_cache_size.as_deref(),
-                backend.clone(),
+                Some(&resolved_mem_cache_size),
+                Some(&resolved_disk_cache_size),
+                multi_backend.clone().get_backend("backend_0").unwrap(), // Cache uses default backend for staging
                 dlm.meta_client().clone(),
             )?;
-            let router = DataRouter::new(dlm.clone(), backend, cache);
+            let router = DataRouter::new(dlm.clone(), multi_backend, cache);
             let uid = std::env::var("SUDO_UID")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -189,14 +358,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let dlm = DlmClient::new(&redis_url)?;
             let backend = RustFsClient::new().await;
-            let cache = TieredCache::new(
-                staging_dirs,
-                None,
-                None,
-                backend.clone(),
-                dlm.meta_client().clone(),
-            )?;
-            let router = DataRouter::new(dlm, backend, cache);
+            let multi_backend = MultiBackendClient::new();
+            multi_backend.register_backend("backend_0", backend.clone());
+
+            let cache =
+                TieredCache::new(staging_dirs, None, None, backend, dlm.meta_client().clone())?;
+            let router = DataRouter::new(dlm, multi_backend, cache);
 
             println!("Cloning file from {} to {}...", src, dest);
             router.clone_path(&src, &dest).await?;

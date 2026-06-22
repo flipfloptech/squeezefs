@@ -331,6 +331,11 @@ async fn test_three_tiered_writeback_and_lease_cache() {
         .await
         .expect("Flush should succeed");
 
+    // Call FUSE release
+    fs.release(req, ino, 0, 0, 0, false)
+        .await
+        .expect("Release should succeed");
+
     // Verify local active writes directory has been cleaned up after flush
     assert!(
         !active_dir.exists(),
@@ -652,4 +657,68 @@ async fn test_fuse_create_write_read_cycle() {
         .await
         .unwrap();
     assert_eq!(read_result.data[..], initial_data[..]);
+}
+
+#[tokio::test]
+async fn test_vim_swap_file_simulation() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = get_redis_url();
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // 1. Create file
+    let file_name = OsStr::new(".test.swp");
+    let reply_create = fs.create(req, 1, file_name, 0o600, 0).await.unwrap();
+    let ino = reply_create.attr.ino;
+    let fh = reply_create.fh;
+
+    // 2. Write 1024 bytes (header) at offset 0
+    let header_data = vec![0x55u8; 1024];
+    let reply_write = fs.write(req, ino, fh, 0, &header_data, 0, 0).await.unwrap();
+    assert_eq!(reply_write.written, 1024);
+
+    // 3. Call fsync
+    fs.fsync(req, ino, fh, false).await.unwrap();
+
+    // 4. Call flush
+    fs.flush(req, ino, fh, 0).await.unwrap();
+
+    // 5. Call release
+    fs.release(req, ino, fh, 0, 0, false).await.unwrap();
+
+    // 5. Query attributes - size must be 1024!
+    let attr_reply = fs.getattr(req, ino, None, 0).await.unwrap();
+    assert_eq!(attr_reply.attr.size, 1024);
+
+    // 6. Read back data
+    let read_reply = fs.read(req, ino, fh, 0, 1024).await.unwrap();
+    assert_eq!(read_reply.data.len(), 1024);
+    assert_eq!(&read_reply.data[..], &header_data[..]);
 }

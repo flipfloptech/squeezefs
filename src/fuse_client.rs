@@ -2100,6 +2100,11 @@ impl Filesystem for SqueezefsFilesystem {
         let lock = self.get_inode_lock(ino);
         let _guard = lock.lock().await;
 
+        // Flush any remaining active staging blocks before releasing the lease
+        if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
+            let _ = self.flush_active_blocks(ino, fencing_token).await;
+        }
+
         // If there's a cached lease, release it and remove it from our active_leases map
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
@@ -2107,6 +2112,28 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Also clean up local inode lock if no longer needed
         self.active_inode_locks.remove(&ino);
+
+        Ok(())
+    }
+
+    async fn fsync(&self, _req: Request, ino: u64, _fh: u64, _datasync: bool) -> FuseResult<()> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE Fsync: ino = {}, datasync = {}", ino, _datasync);
+
+        // 1. Acquire local inode lock
+        let lock = self.get_inode_lock(ino);
+        let _guard = lock.lock().await;
+
+        // 2. Get or acquire lease (fencing token)
+        let fencing_token = self
+            .get_or_acquire_lease(ino)
+            .await
+            .map_err(map_squeezefs_err)?;
+
+        // 3. Flush the staging blocks concurrently to backend (S3/RustFS)
+        self.flush_active_blocks(ino, fencing_token)
+            .await
+            .map_err(map_squeezefs_err)?;
 
         Ok(())
     }
@@ -2413,13 +2440,13 @@ pub async fn start_mount<P: AsRef<Path>>(
     options.uid(uid);
     options.gid(gid);
     options.allow_other(true);
+    options.write_back(true);
+    options.default_permissions(true);
 
     // fuse3 Mount parameters
     options.custom_options("max_read=1048576");
     options.custom_options("max_write=1048576");
-    options.custom_options("writeback_cache=yes");
     options.custom_options("async_dio=yes");
-    options.custom_options("default_permissions"); // Kernel-level POSIX permission checking
 
     info!(
         "FUSE Daemon: Mounting squeezefs at {:?}...",

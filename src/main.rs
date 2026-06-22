@@ -20,7 +20,13 @@ struct Cli {
     #[arg(long, global = true)]
     log_file: Option<PathBuf>,
 
-    #[arg(long, short = 'g', global = true, env = "GARNET_URL", default_value = "redis://127.0.0.1:6379")]
+    #[arg(
+        long,
+        short = 'g',
+        global = true,
+        env = "GARNET_URL",
+        default_value = "redis://127.0.0.1:6379"
+    )]
     garnet_url: String,
 
     #[command(subcommand)]
@@ -320,11 +326,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut active_staging_dirs = Vec::new();
             if let Ok(mut con) = dlm.meta_client().get_connection().await {
-                let status_map: std::collections::HashMap<String, String> =
-                    con.hgetall("squeezefs:diskcache:status").await.unwrap_or_default();
+                let status_map: std::collections::HashMap<String, String> = con
+                    .hgetall("squeezefs:diskcache:status")
+                    .await
+                    .unwrap_or_default();
                 for dir in staging_dirs {
                     let dir_str = dir.to_string_lossy().to_string();
-                    let status = status_map.get(&dir_str).map(|s| s.as_str()).unwrap_or("enabled");
+                    let status = status_map
+                        .get(&dir_str)
+                        .map(|s| s.as_str())
+                        .unwrap_or("enabled");
                     if status != "disabled" {
                         active_staging_dirs.push(dir);
                     }
@@ -559,102 +570,144 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             garnet_url,
             fs_name,
             action,
-        } => {
-            match action {
-                ConfigActions::Add {
-                    category,
-                    value,
-                    s3_endpoint,
-                    s3_access_key,
-                    s3_secret_key,
-                    s3_bucket,
-                } => {
-                    if category == "diskcache" {
-                        squeezefs::config_ops::add_disk_cache_path(&garnet_url, &fs_name, Path::new(&value)).await?;
-                        println!("Disk cache path '{}' added successfully.", value);
-                    } else if category == "backend" {
-                        let ep = s3_endpoint.unwrap_or_default();
-                        let ak = s3_access_key.unwrap_or_else(|| "admin".to_string());
-                        let sk = s3_secret_key.unwrap_or_else(|| "password".to_string());
-                        let bu = s3_bucket.unwrap_or_else(|| "squeezefs-data".to_string());
-                        squeezefs::config_ops::add_storage_backend(
-                            &garnet_url,
-                            &fs_name,
-                            &value,
-                            &ep,
-                            &ak,
-                            &sk,
-                            &bu,
-                        )
-                        .await?;
-                        println!("Storage backend '{}' added successfully.", value);
-                    } else {
-                        eprintln!("Invalid category '{}'. Must be 'diskcache' or 'backend'.", category);
-                        std::process::exit(1);
-                    }
-                }
-                ConfigActions::Remove { category, value, force } => {
-                    if category == "diskcache" {
-                        squeezefs::config_ops::remove_disk_cache_path(&garnet_url, &fs_name, Path::new(&value), force).await?;
-                        println!("Disk cache path '{}' removed successfully.", value);
-                    } else if category == "backend" {
-                        squeezefs::config_ops::remove_storage_backend(&garnet_url, &fs_name, &value, force).await?;
-                        println!("Storage backend '{}' removed successfully.", value);
-                    } else {
-                        eprintln!("Invalid category '{}'. Must be 'diskcache' or 'backend'.", category);
-                        std::process::exit(1);
-                    }
-                }
-                ConfigActions::Enable { category, value } => {
-                    if category == "diskcache" {
-                        squeezefs::config_ops::enable_disk_cache_path(&garnet_url, &fs_name, Path::new(&value)).await?;
-                        println!("Disk cache path '{}' enabled successfully.", value);
-                    } else {
-                        eprintln!("Invalid category '{}'. Must be 'diskcache'.", category);
-                        std::process::exit(1);
-                    }
-                }
-                ConfigActions::Disable { category, value } => {
-                    if category == "diskcache" {
-                        squeezefs::config_ops::disable_disk_cache_path(&garnet_url, &fs_name, Path::new(&value)).await?;
-                        println!("Disk cache path '{}' disabled successfully.", value);
-                    } else {
-                        eprintln!("Invalid category '{}'. Must be 'diskcache'.", category);
-                        std::process::exit(1);
-                    }
-                }
-                ConfigActions::Flush { category, value } => {
-                    if category == "diskcache" {
-                        squeezefs::config_ops::flush_disk_cache_path(&garnet_url, &fs_name, Path::new(&value)).await?;
-                        println!("Disk cache path '{}' flushed successfully.", value);
-                    } else {
-                        eprintln!("Invalid category '{}'. Must be 'diskcache'.", category);
-                        std::process::exit(1);
-                    }
-                }
-                ConfigActions::SetActiveBackend { backend_id } => {
-                    squeezefs::config_ops::set_active_backend(&garnet_url, &fs_name, &backend_id).await?;
-                    println!("Active write backend set to '{}'.", backend_id);
-                }
-                ConfigActions::List => {
-                    let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                    println!("{}", serde_json::to_string_pretty(&list)?);
-                }
-                ConfigActions::Fsck => {
-                    println!("Running Squeezefs Metadata Consistency Check (FSCK)...");
-                    let issues = squeezefs::config_ops::run_metadata_fsck(&garnet_url, &fs_name).await?;
-                    if issues.is_empty() {
-                        println!("FSCK Completed: No consistency issues found.");
-                    } else {
-                        println!("FSCK Completed: Found {} issue(s):", issues.len());
-                        for issue in issues {
-                            println!("  - {}", issue);
-                        }
-                        std::process::exit(1);
-                    }
+        } => match action {
+            ConfigActions::Add {
+                category,
+                value,
+                s3_endpoint,
+                s3_access_key,
+                s3_secret_key,
+                s3_bucket,
+            } => {
+                if category == "diskcache" {
+                    squeezefs::config_ops::add_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&value),
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' added successfully.", value);
+                } else if category == "backend" {
+                    let ep = s3_endpoint.unwrap_or_default();
+                    let ak = s3_access_key.unwrap_or_else(|| "admin".to_string());
+                    let sk = s3_secret_key.unwrap_or_else(|| "password".to_string());
+                    let bu = s3_bucket.unwrap_or_else(|| "squeezefs-data".to_string());
+                    squeezefs::config_ops::add_storage_backend(
+                        &garnet_url,
+                        &fs_name,
+                        &value,
+                        &ep,
+                        &ak,
+                        &sk,
+                        &bu,
+                    )
+                    .await?;
+                    println!("Storage backend '{}' added successfully.", value);
+                } else {
+                    eprintln!(
+                        "Invalid category '{}'. Must be 'diskcache' or 'backend'.",
+                        category
+                    );
+                    std::process::exit(1);
                 }
             }
-        }
+            ConfigActions::Remove {
+                category,
+                value,
+                force,
+            } => {
+                if category == "diskcache" {
+                    squeezefs::config_ops::remove_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&value),
+                        force,
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' removed successfully.", value);
+                } else if category == "backend" {
+                    squeezefs::config_ops::remove_storage_backend(
+                        &garnet_url,
+                        &fs_name,
+                        &value,
+                        force,
+                    )
+                    .await?;
+                    println!("Storage backend '{}' removed successfully.", value);
+                } else {
+                    eprintln!(
+                        "Invalid category '{}'. Must be 'diskcache' or 'backend'.",
+                        category
+                    );
+                    std::process::exit(1);
+                }
+            }
+            ConfigActions::Enable { category, value } => {
+                if category == "diskcache" {
+                    squeezefs::config_ops::enable_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&value),
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' enabled successfully.", value);
+                } else {
+                    eprintln!("Invalid category '{}'. Must be 'diskcache'.", category);
+                    std::process::exit(1);
+                }
+            }
+            ConfigActions::Disable { category, value } => {
+                if category == "diskcache" {
+                    squeezefs::config_ops::disable_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&value),
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' disabled successfully.", value);
+                } else {
+                    eprintln!("Invalid category '{}'. Must be 'diskcache'.", category);
+                    std::process::exit(1);
+                }
+            }
+            ConfigActions::Flush { category, value } => {
+                if category == "diskcache" {
+                    squeezefs::config_ops::flush_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&value),
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' flushed successfully.", value);
+                } else {
+                    eprintln!("Invalid category '{}'. Must be 'diskcache'.", category);
+                    std::process::exit(1);
+                }
+            }
+            ConfigActions::SetActiveBackend { backend_id } => {
+                squeezefs::config_ops::set_active_backend(&garnet_url, &fs_name, &backend_id)
+                    .await?;
+                println!("Active write backend set to '{}'.", backend_id);
+            }
+            ConfigActions::List => {
+                let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                println!("{}", serde_json::to_string_pretty(&list)?);
+            }
+            ConfigActions::Fsck => {
+                println!("Running Squeezefs Metadata Consistency Check (FSCK)...");
+                let issues =
+                    squeezefs::config_ops::run_metadata_fsck(&garnet_url, &fs_name).await?;
+                if issues.is_empty() {
+                    println!("FSCK Completed: No consistency issues found.");
+                } else {
+                    println!("FSCK Completed: Found {} issue(s):", issues.len());
+                    for issue in issues {
+                        println!("  - {}", issue);
+                    }
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 
     Ok(())

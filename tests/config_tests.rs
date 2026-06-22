@@ -1,5 +1,5 @@
-use squeezefs::fuse_client::format_volume;
 use squeezefs::dlm::DlmClient;
+use squeezefs::fuse_client::format_volume;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -55,7 +55,10 @@ async fn test_diskcache_lifecycle() {
     let list = squeezefs::config_ops::list_config(&get_redis_url(), fs_name)
         .await
         .expect("Should list config");
-    assert!(list.diskcaches.iter().any(|c| c.path == cache_path && c.status == "enabled"));
+    assert!(list
+        .diskcaches
+        .iter()
+        .any(|c| c.path == cache_path && c.status == "enabled"));
 
     // 2. Disable diskcache path
     squeezefs::config_ops::disable_disk_cache_path(&get_redis_url(), fs_name, &cache_path)
@@ -65,7 +68,10 @@ async fn test_diskcache_lifecycle() {
     let list = squeezefs::config_ops::list_config(&get_redis_url(), fs_name)
         .await
         .expect("Should list config");
-    assert!(list.diskcaches.iter().any(|c| c.path == cache_path && c.status == "disabled"));
+    assert!(list
+        .diskcaches
+        .iter()
+        .any(|c| c.path == cache_path && c.status == "disabled"));
 
     // 3. Try to remove without flushing (with staged file simulated)
     // Create a fake staged file
@@ -74,8 +80,17 @@ async fn test_diskcache_lifecycle() {
     fs::write(&meta_file, b"{}").unwrap();
     fs::write(&data_file, b"data").unwrap();
 
-    let remove_res = squeezefs::config_ops::remove_disk_cache_path(&get_redis_url(), fs_name, &cache_path, false).await;
-    assert!(remove_res.is_err(), "Should fail to remove cache with staged files without force");
+    let remove_res = squeezefs::config_ops::remove_disk_cache_path(
+        &get_redis_url(),
+        fs_name,
+        &cache_path,
+        false,
+    )
+    .await;
+    assert!(
+        remove_res.is_err(),
+        "Should fail to remove cache with staged files without force"
+    );
 
     // 4. Flush the disabled cache path (which will process/upload the fake file, but since it is fake/untracked it might delete it or fail. Let's make sure flush completes successfully by cleaning up or let flush handle it).
     // Let's implement active flush to discard or upload. In our test, let's verify flush succeeds.
@@ -130,8 +145,17 @@ async fn test_backend_lifecycle() {
     assert!(list.backends.contains_key("backend_test_1"));
 
     // 2. Try to remove the active write backend (backend_0 by default) -> should fail
-    let remove_active = squeezefs::config_ops::remove_storage_backend(&get_redis_url(), fs_name, "backend_0", false).await;
-    assert!(remove_active.is_err(), "Should not allow removing active write backend");
+    let remove_active = squeezefs::config_ops::remove_storage_backend(
+        &get_redis_url(),
+        fs_name,
+        "backend_0",
+        false,
+    )
+    .await;
+    assert!(
+        remove_active.is_err(),
+        "Should not allow removing active write backend"
+    );
 
     // 3. Set active backend to backend_test_1
     squeezefs::config_ops::set_active_backend(&get_redis_url(), fs_name, "backend_test_1")
@@ -192,5 +216,10 @@ async fn test_fsck_detection() {
         .expect("Fsck should complete");
 
     assert!(!issues.is_empty(), "Fsck should detect issues");
-    assert!(issues.iter().any(|issue| issue.contains("non_existent_backend")), "Fsck should report missing backend reference");
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.contains("non_existent_backend")),
+        "Fsck should report missing backend reference"
+    );
 }

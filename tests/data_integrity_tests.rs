@@ -1,8 +1,8 @@
 use fuse3::raw::{prelude::*, Request};
-use sha2::{Digest, Sha256};
-use rand::SeedableRng;
 use rand::RngCore;
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use sha2::{Digest, Sha256};
 use squeezefs::backend::{MultiBackendClient, RustFsClient};
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
@@ -58,7 +58,7 @@ async fn test_data_integrity_various_sizes() {
     format_volume(
         &redis_url,
         fs_name,
-        4 * 1024 * 1024, // 4MB block size
+        4 * 1024 * 1024,          // 4MB block size
         100 * 1024 * 1024 * 1024, // 100GB capacity
         Some("128MB"),
         Some("500MB"),
@@ -142,6 +142,10 @@ async fn test_data_integrity_various_sizes() {
         let reply_read = fs_recreate.read(req, ino, 0, size as u64, 0).await.unwrap();
         assert_eq!(reply_read.data.len(), size);
         let checksum = calculate_sha256(&reply_read.data);
-        assert_eq!(checksum, expected_checksum, "Checksum mismatch for inode {}", ino);
+        assert_eq!(
+            checksum, expected_checksum,
+            "Checksum mismatch for inode {}",
+            ino
+        );
     }
 }

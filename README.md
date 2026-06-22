@@ -50,7 +50,19 @@ Includes built-in host auto-tuning (`squeezefs tune`) to optimize virtual memory
 
 ## Subcommands & CLI Usage
 
-Squeezefs exposes a clean CLI to manage mounts, run performance benchmarks, and optimize systems:
+Squeezefs exposes a clean CLI to manage formats, mounts, status, performance benchmarks, and optimize systems:
+
+* **Format squeezefs Volume:**
+  ```bash
+  squeezefs format <name> [options]
+  ```
+  *Options:*
+  - `--block-size <bytes>`: Block size in bytes (default: 4MB).
+  - `--capacity <bytes>`: Maximum capacity of the volume in bytes (default: 1PB).
+  - `--s3-endpoint <url>`: S3 compatible object store endpoint URL.
+  - `--s3-access-key <key>`: S3 compatible access key.
+  - `--s3-secret-key <key>`: S3 compatible secret key.
+  - `--s3-bucket <bucket>`: S3 compatible bucket name (automatically initialized/created on format).
 
 * **Mount Squeezefs:**
   ```bash
@@ -61,6 +73,15 @@ Squeezefs exposes a clean CLI to manage mounts, run performance benchmarks, and 
   - `--local-ips <ips>`: Comma-separated list of local source IP interfaces for multi-rail network load balancing.
   - `--mem-cache-size <size>`: System RAM cache size (e.g. `16GB` or `20%`).
   - `--disk-cache-size <size>`: NVMe cache capacity threshold.
+  - `--s3-endpoint <url>`: Overrides S3 endpoint URL stored in Garnet metadata.
+  - `--s3-access-key <key>`: Overrides S3 access key stored in Garnet metadata.
+  - `--s3-secret-key <key>`: Overrides S3 secret key stored in Garnet metadata.
+  - `--s3-bucket <bucket>`: Overrides S3 bucket name stored in Garnet metadata.
+
+* **Show filesystem Status:**
+  ```bash
+  squeezefs status
+  ```
 
 * **Benchmark Mountpoint:**
   ```bash

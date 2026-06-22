@@ -129,7 +129,16 @@ impl SqueezefsFilesystem {
         let start_block = offset / block_size;
         let end_block = (offset + data.len() as u64 - 1) / block_size;
 
-        let active_dir = std::path::PathBuf::from("/tmp/squeezefs_staging")
+        let staging_dir = self
+            .router
+            .cache
+            .nvme
+            .staging_dirs()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/squeezefs_staging"));
+
+        let active_dir = staging_dir
             .join("active_writes")
             .join(format!("inode_{}", ino));
 
@@ -263,7 +272,16 @@ impl SqueezefsFilesystem {
         ino: u64,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
-        let active_dir = std::path::PathBuf::from("/tmp/squeezefs_staging")
+        let staging_dir = self
+            .router
+            .cache
+            .nvme
+            .staging_dirs()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/squeezefs_staging"));
+
+        let active_dir = staging_dir
             .join("active_writes")
             .join(format!("inode_{}", ino));
 
@@ -2440,7 +2458,7 @@ pub async fn start_mount<P: AsRef<Path>>(
     options.uid(uid);
     options.gid(gid);
     options.allow_other(true);
-    options.write_back(true);
+    options.write_back(false);
     options.default_permissions(true);
 
     // fuse3 Mount parameters
@@ -2521,15 +2539,19 @@ pub async fn start_mount<P: AsRef<Path>>(
         res = &mut handle => {
             if let Err(e) = res {
                 error!("FUSE session loop ended with error: {:?}", e);
+                eprintln!("FUSE session loop ended with error: {:?}", e);
             } else {
                 info!("FUSE session loop ended successfully.");
+                println!("Filesystem unmounted by kernel or external tool.");
             }
         }
         _ = shutdown => {
             if let Err(e) = handle.unmount().await {
                 error!("Failed to unmount filesystem: {:?}", e);
+                eprintln!("Failed to unmount filesystem: {:?}", e);
             } else {
                 info!("Filesystem unmounted successfully.");
+                println!("Filesystem unmounted successfully.");
             }
         }
     }

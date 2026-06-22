@@ -313,8 +313,9 @@ async fn test_three_tiered_writeback_and_lease_cache() {
         .await
         .unwrap();
 
-    // Verify local staging directory `/tmp/squeezefs_staging/active_writes` exists and has dirty block files
-    let active_dir = std::path::PathBuf::from("/tmp/squeezefs_staging")
+    // Verify local staging directory under temp_dir/active_writes exists and has dirty block files
+    let active_dir = temp_dir
+        .path()
         .join("active_writes")
         .join(format!("inode_{}", ino));
     assert!(

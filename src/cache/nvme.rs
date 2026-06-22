@@ -15,6 +15,7 @@ pub struct NvmeStaging {
     redis_client: crate::dlm::MetaClient,
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
+    current_staged_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -55,6 +56,19 @@ impl NvmeStaging {
 
         let (write_tx, write_rx) = mpsc::channel::<PendingStagedWrite>(1000);
 
+        let mut initial_staged_bytes = 0u64;
+        for dir in &staging_dirs {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            initial_staged_bytes += meta.len();
+                        }
+                    }
+                }
+            }
+        }
+
         let staging = Self {
             staging_dirs: staging_dirs.clone(),
             max_bytes,
@@ -62,6 +76,7 @@ impl NvmeStaging {
             redis_client: redis_client.clone(),
             write_tx,
             p2p_addr: std::sync::Arc::new(std::sync::OnceLock::new()),
+            current_staged_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_staged_bytes)),
         };
 
         // Spawn the background merge worker
@@ -86,23 +101,7 @@ impl NvmeStaging {
         fencing_token: u64,
     ) -> Result<()> {
         // Enforce max bytes capacity constraint asynchronously
-        let mut total_staged_bytes = 0u64;
-        for dir in &self.staging_dirs {
-            if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    if let Ok(meta) = entry.metadata().await {
-                        if meta.is_file()
-                            && entry
-                                .path()
-                                .extension()
-                                .is_some_and(|ext| ext == "data" || ext == "block")
-                        {
-                            total_staged_bytes += meta.len();
-                        }
-                    }
-                }
-            }
-        }
+        let total_staged_bytes = self.current_staged_bytes.load(std::sync::atomic::Ordering::Relaxed);
 
         if total_staged_bytes + data.len() as u64 > self.max_bytes {
             return Err(SqueezefsError::Io(std::io::Error::new(
@@ -126,6 +125,8 @@ impl NvmeStaging {
             "fencing_token": fencing_token
         });
         tokio::fs::write(&meta_path, serde_json::to_vec(&meta_content).unwrap()).await?;
+
+        self.current_staged_bytes.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
         info!(
             "NVMe Staging: Staged write for file {} (ID: {}) size = {} bytes. Acknowledging write to OS.",
@@ -165,6 +166,7 @@ impl NvmeStaging {
         let staging_dirs = self.staging_dirs.clone();
         let backend = self.backend.clone();
         let redis_client = self.redis_client.clone();
+        let staged_bytes = self.current_staged_bytes.clone();
 
         tokio::spawn(async move {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
@@ -187,7 +189,7 @@ impl NvmeStaging {
 
                         if current_bytes >= max_batch_bytes {
                             info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes).await {
+                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes).await {
                                 error!("Failed to flush NVMe staging batch: {:?}", e);
                             }
                         }
@@ -195,7 +197,7 @@ impl NvmeStaging {
                     _ = &mut sleep => {
                         if !batch.is_empty() {
                             info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes).await {
+                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes).await {
                                 error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
                             }
                         }
@@ -212,6 +214,7 @@ impl NvmeStaging {
         redis_client: &crate::dlm::MetaClient,
         batch: &mut Vec<PendingStagedWrite>,
         current_bytes: &mut u64,
+        staged_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -272,6 +275,9 @@ impl NvmeStaging {
             let target_dir = &staging_dirs[idx];
             let local_path = target_dir.join(format!("{}.data", item.file_id));
             if local_path.exists() {
+                if let Ok(meta) = fs::metadata(&local_path) {
+                    staged_bytes.fetch_sub(meta.len(), std::sync::atomic::Ordering::Relaxed);
+                }
                 if let Err(e) = fs::remove_file(&local_path) {
                     error!("Failed to remove staged file {:?}: {:?}", local_path, e);
                 }

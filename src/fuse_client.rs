@@ -889,8 +889,23 @@ impl Filesystem for SqueezefsFilesystem {
             attr,
             generation: 1,
             fh: new_ino, // file handle
-            flags,
+            flags: 0,    // FOPEN flags (0 = default)
         })
+    }
+
+    async fn open(&self, _req: Request, inode: Inode, _flags: u32) -> FuseResult<ReplyOpen> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE Open: inode = {}", inode);
+
+        // File handle is just the inode number for simplicity in this design
+        Ok(ReplyOpen { fh: inode, flags: 0 })
+    }
+
+    async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> FuseResult<ReplyOpen> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE Opendir: inode = {}", inode);
+
+        Ok(ReplyOpen { fh: inode, flags: 0 })
     }
 
     async fn read(
@@ -1248,10 +1263,27 @@ impl Filesystem for SqueezefsFilesystem {
             pipe.hset(&attr_key, "gid", gid);
         }
         if let Some(size) = set_attr.size {
+            // Fix: Actually delete data when file is truncated to size 0
+            if size == 0 && old_size > 0 {
+                let file_path = format!("inode_{}", ino);
+                // 1. Physically delete blocks from NVMe/S3 via router
+                let _ = self.router.delete_file(&file_path, &mut con).await;
+                
+                // 2. Delete inline payload if any
+                let inline_key = format!("inline_data:{}", file_path);
+                let _: Result<(), _> = con.del(&inline_key).await;
+            }
+
             pipe.hset(&attr_key, "size", size);
             // Also update the physical/routing size in the metadata block?
             let meta_key = format!("metadata:inode_{}", ino);
             pipe.hset(&meta_key, "size", size);
+            
+            // Fix: If truncated to 0, reset type to inline so it doesn't look for deleted staged/striped blocks
+            if size == 0 && old_size > 0 {
+                pipe.hset(&meta_key, "type", "inline");
+            }
+
             if size > old_size {
                 let diff = size - old_size;
                 pipe.incr("squeezefs:used_bytes", diff);
@@ -2156,6 +2188,76 @@ impl Filesystem for SqueezefsFilesystem {
         Ok(())
     }
 
+    async fn fsyncdir(
+        &self,
+        _req: Request,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+    ) -> FuseResult<()> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE Fsyncdir: ino = {}", ino);
+        // Directories are updated synchronously in Garnet, so we just return Ok.
+        Ok(())
+    }
+
+    async fn fallocate(
+        &self,
+        _req: Request,
+        ino: u64,
+        _fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> FuseResult<()> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE Fallocate: ino = {}, offset = {}, length = {}, mode = {}", ino, offset, length, mode);
+
+        // Pre-allocation isn't strictly required to reserve physical space in our S3-backed store
+        // as S3 objects are sparse/dynamic by nature. We just update the size attribute if we are extending.
+        if mode & libc::FALLOC_FL_KEEP_SIZE as u32 == 0 {
+            let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+            let attr_key = format!("squeezefs:attr:{}", ino);
+            
+            // Check if inode exists first
+            let exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
+            if !exists {
+                return Err(Errno::from(libc::ENOENT));
+            }
+
+            let old_size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
+            let old_size = old_size_opt.unwrap_or(0);
+            
+            let target_size = offset + length;
+            if target_size > old_size {
+                let mut pipe = redis::pipe();
+                pipe.hset(&attr_key, "size", target_size);
+                
+                let meta_key = format!("metadata:inode_{}", ino);
+                pipe.hset(&meta_key, "size", target_size);
+                
+                let diff = target_size - old_size;
+                pipe.incr("squeezefs:used_bytes", diff);
+                
+                let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
+                
+                // Invalidate cached attributes
+                self.attr_cache.remove(&ino);
+                let file_path = format!("inode_{}", ino);
+                self.router.metadata_cache.remove(&file_path);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn forget(&self, _req: Request, ino: u64, count: u64) {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE Forget: ino = {}, count = {}", ino, count);
+        // We don't maintain local inode lookup references that need strict forgetting.
+        // The attr_cache naturally evicts old entries.
+    }
+
     async fn getlk(
         &self,
         _req: Request,
@@ -2542,7 +2644,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                 eprintln!("FUSE session loop ended with error: {:?}", e);
             } else {
                 info!("FUSE session loop ended successfully.");
-                println!("Filesystem unmounted by kernel or external tool.");
+                println!("\n[!] The FUSE filesystem was unmounted externally (e.g. via umount). Squeezefs is now shutting down safely.\n");
             }
         }
         _ = shutdown => {

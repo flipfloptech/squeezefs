@@ -6,7 +6,7 @@ This guide describes how to get Squeezefs up and running, execute its built-in m
 
 ## 1. Quick Start via Docker (Sandbox/Testing)
 
-Docker is the easiest way to spin up the metadata service (Microsoft Garnet), object storage (MinIO), and mount the FUSE daemon to execute automated tests.
+Docker is the easiest way to spin up the metadata service (Microsoft Garnet), object storage (RustFS), and mount the FUSE daemon to execute automated tests.
 
 > [!NOTE]
 > Running FUSE inside a container requires FUSE privileges on the host system. You must have `/dev/fuse` accessible and run with elevated capabilities.
@@ -19,9 +19,9 @@ docker compose up --build squeezefs-test
 
 ### Step 2: Interactive Benchmarking inside Docker
 To run benchmarks interactively within the Docker environment:
-1. Spin up the Garnet and MinIO backend services:
+1. Spin up the Garnet and RustFS backend services:
    ```bash
-   docker compose up -d garnet rustfs-mock
+   docker compose up -d garnet rustfs
    ```
 2. Run a shell in a container configured with FUSE access:
    ```bash
@@ -66,11 +66,13 @@ For performance evaluation, you can run the backend services in Docker on the ta
   ```
 * **RustFS / S3 Storage (Data Blocks):**
   ```bash
-  docker run -d --name squeezefs-s3 \
+  docker run -d --name squeezefs-rustfs \
     -p 9000:9000 -p 9001:9001 \
-    -e MINIO_ROOT_USER=admin \
-    -e MINIO_ROOT_PASSWORD=password \
-    minio/minio server /data --console-address ":9001"
+    -e RUSTFS_VOLUMES=/data \
+    -e RUSTFS_ADDRESS=0.0.0.0:9000 \
+    -e RUSTFS_ACCESS_KEY=admin \
+    -e RUSTFS_SECRET_KEY=password \
+    rustfs/rustfs:latest
   ```
 
 ### Step 2: Build Squeezefs Client

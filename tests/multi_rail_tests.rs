@@ -14,7 +14,7 @@ async fn test_multi_rail_backend_initialization() {
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
     ];
 
-    let backend = RustFsClient::new_with_local_ips(local_ips.clone()).await;
+    let backend = RustFsClient::new_with_local_ips(local_ips.clone(), None, None, None, None).await;
 
     // Check that we initialized two clients (or mock storage if S3 endpoint is not configured)
     assert_eq!(backend.client_count(), 2);

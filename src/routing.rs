@@ -1,4 +1,4 @@
-use crate::backend::RustFsClient;
+use crate::backend::{parse_backend_and_key, MultiBackendClient};
 use crate::cache::TieredCache;
 use crate::dlm::DlmClient;
 use crate::error::{Result, SqueezefsError};
@@ -22,7 +22,7 @@ pub struct CachedMetadata {
 #[derive(Clone)]
 pub struct DataRouter {
     dlm: DlmClient,
-    pub backend: RustFsClient,
+    pub backend: MultiBackendClient,
     pub cache: TieredCache,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub metadata_cache: std::sync::Arc<dashmap::DashMap<String, CachedMetadata>>,
@@ -31,10 +31,10 @@ pub struct DataRouter {
 }
 
 impl DataRouter {
-    pub fn new(dlm: DlmClient, backend: RustFsClient, cache: TieredCache) -> Self {
+    pub fn new(dlm: DlmClient, backend: impl Into<MultiBackendClient>, cache: TieredCache) -> Self {
         Self {
             dlm,
-            backend,
+            backend: backend.into(),
             cache,
             block_size: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024)),
             metadata_cache: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -88,7 +88,8 @@ impl DataRouter {
                         let sz_val: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                         if let (Some(bk), Some(off), Some(sz)) = (block_key, off_val, sz_val) {
-                            let packed_bytes = self.backend.get_object(&bk).await?;
+                            let (be_id, real_key) = parse_backend_and_key(&bk);
+                            let packed_bytes = self.backend.get_object(&be_id, &real_key).await?;
                             let start = off as usize;
                             let end = (off + sz) as usize;
                             packed_bytes[start..end].to_vec()
@@ -212,8 +213,10 @@ impl DataRouter {
                     "blocks/{}/block_{}_{}",
                     file_uuid, block_count, block_write_uuid
                 );
+                let active_be = self.backend.active_backend_id();
+                let stored_block_key = format!("{}:{}", active_be, block_key);
 
-                block_mappings.push((block_count.to_string(), block_key.clone()));
+                block_mappings.push((block_count.to_string(), stored_block_key));
 
                 let backend_clone = self.backend.clone();
                 let task = tokio::spawn(async move {
@@ -290,12 +293,14 @@ impl DataRouter {
                         r -= 1;
                         if r <= 0 {
                             let _: () = con.hdel(refcounts_key, &bk).await?;
-                            let _ = self.backend.delete_object(&bk).await;
+                            let (be_id, real_key) = parse_backend_and_key(&bk);
+                            let _ = self.backend.delete_object(&be_id, &real_key).await;
                         } else {
                             let _: () = con.hset(refcounts_key, &bk, r).await?;
                         }
                     } else {
-                        let _ = self.backend.delete_object(&bk).await;
+                        let (be_id, real_key) = parse_backend_and_key(&bk);
+                        let _ = self.backend.delete_object(&be_id, &real_key).await;
                     }
                 }
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
@@ -413,7 +418,8 @@ impl DataRouter {
 
             tasks.push(tokio::spawn(async move {
                 let mut block_data = if let Some(ref bk) = old_block_key {
-                    backend_clone.get_object(bk).await?
+                    let (be_id, real_key) = parse_backend_and_key(bk);
+                    backend_clone.get_object(&be_id, &real_key).await?
                 } else {
                     vec![0; rel_end]
                 };
@@ -433,7 +439,10 @@ impl DataRouter {
                     .put_object(&new_block_key, block_data, fencing_token)
                     .await?;
 
-                Ok::<_, SqueezefsError>((b, old_block_key, new_block_key))
+                let active_be = backend_clone.active_backend_id();
+                let stored_new_block_key = format!("{}:{}", active_be, new_block_key);
+
+                Ok::<_, SqueezefsError>((b, old_block_key, stored_new_block_key))
             }));
         }
 
@@ -471,12 +480,14 @@ impl DataRouter {
                         .hdel(refcounts_key, &bk)
                         .query_async(con)
                         .await?;
-                    let _ = self.backend.delete_object(&bk).await;
+                    let (be_id, real_key) = parse_backend_and_key(&bk);
+                    let _ = self.backend.delete_object(&be_id, &real_key).await;
                 } else {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
             } else {
-                let _ = self.backend.delete_object(&bk).await;
+                let (be_id, real_key) = parse_backend_and_key(&bk);
+                let _ = self.backend.delete_object(&be_id, &real_key).await;
             }
         }
 
@@ -565,7 +576,8 @@ impl DataRouter {
                     let size: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, offset, size) {
-                        let packed_bytes = self.backend.get_object(&bk).await?;
+                        let (be_id, real_key) = parse_backend_and_key(&bk);
+                        let packed_bytes = self.backend.get_object(&be_id, &real_key).await?;
                         let start = off as usize;
                         let end = (off + sz) as usize;
                         packed_bytes[start..end].to_vec()
@@ -628,8 +640,10 @@ impl DataRouter {
                 let mut futures = Vec::new();
                 for block_key in block_keys {
                     let backend_clone = self.backend.clone();
-                    let task =
-                        tokio::spawn(async move { backend_clone.get_object(&block_key).await });
+                    let task = tokio::spawn(async move {
+                        let (be_id, real_key) = parse_backend_and_key(&block_key);
+                        backend_clone.get_object(&be_id, &real_key).await
+                    });
                     futures.push(task);
                 }
 
@@ -741,7 +755,8 @@ impl DataRouter {
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
-                        let packed_bytes = self.backend.get_object(&bk).await?;
+                        let (be_id, real_key) = parse_backend_and_key(&bk);
+                        let packed_bytes = self.backend.get_object(&be_id, &real_key).await?;
                         let start = off as usize;
                         let end = (off + sz) as usize;
                         packed_bytes[start..end].to_vec()
@@ -842,7 +857,8 @@ impl DataRouter {
                             cached_range
                         } else {
                             METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-                            let downloaded = backend_ref.get_object(&b_key).await?;
+                            let (be_id, real_key) = parse_backend_and_key(&b_key);
+                            let downloaded = backend_ref.get_object(&be_id, &real_key).await?;
                             let _ = cache_ref.cache_read_block(&b_key, &downloaded);
                             let start = std::cmp::min(slice_start as usize, downloaded.len());
                             let end = std::cmp::min(
@@ -899,7 +915,7 @@ impl DataRouter {
         &self.cache
     }
 
-    pub fn backend(&self) -> &RustFsClient {
+    pub fn backend(&self) -> &MultiBackendClient {
         &self.backend
     }
 
@@ -1145,12 +1161,14 @@ impl DataRouter {
                             r -= 1;
                             if r <= 0 {
                                 let _: () = con.hdel(refcounts_key, &bk).await?;
-                                let _ = self.backend.delete_object(&bk).await;
+                                let (be_id, real_key) = parse_backend_and_key(&bk);
+                                let _ = self.backend.delete_object(&be_id, &real_key).await;
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
                         } else {
-                            let _ = self.backend.delete_object(&bk).await;
+                            let (be_id, real_key) = parse_backend_and_key(&bk);
+                            let _ = self.backend.delete_object(&be_id, &real_key).await;
                         }
                     }
                     let _: () = con.del(&block_map_key).await?;
@@ -1161,7 +1179,7 @@ impl DataRouter {
                     if let (Some(bp), Some(nb)) = (block_prefix_opt, num_blocks_opt) {
                         for i in 0..nb {
                             let block_key = format!("{}/part_{}", bp, i);
-                            let _ = self.backend.delete_object(&block_key).await;
+                            let _ = self.backend.delete_object("backend_0", &block_key).await;
                         }
                     }
                 }
@@ -1177,12 +1195,14 @@ impl DataRouter {
                             r -= 1;
                             if r <= 0 {
                                 let _: () = con.hdel(refcounts_key, &bk).await?;
-                                let _ = self.backend.delete_object(&bk).await;
+                                let (be_id, real_key) = parse_backend_and_key(&bk);
+                                let _ = self.backend.delete_object(&be_id, &real_key).await;
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
                         } else {
-                            let _ = self.backend.delete_object(&bk).await;
+                            let (be_id, real_key) = parse_backend_and_key(&bk);
+                            let _ = self.backend.delete_object(&be_id, &real_key).await;
                         }
                     }
                     let _: () = con.del(&mapping_key).await?;

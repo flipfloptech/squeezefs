@@ -1,6 +1,6 @@
 use fuse3::raw::{prelude::*, Request};
 use redis::AsyncCommands;
-use squeezefs::backend::RustFsClient;
+use squeezefs::backend::{MultiBackendClient, RustFsClient};
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{format_volume, get_volume_status, start_mount, SqueezefsFilesystem};
@@ -45,6 +45,10 @@ async fn test_cli_format_and_status() {
         Some("64GB"),
         Some("100GB"),
         Some(&[std::path::PathBuf::from("/tmp/test_staging_format")]),
+        None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("Format volume should succeed");
@@ -382,7 +386,7 @@ async fn test_parallel_reads() {
 
 #[tokio::test]
 async fn test_multi_backend_routing() {
-    let _con = match clean_db().await {
+    let mut con = match clean_db().await {
         Some(c) => c,
         None => {
             println!("Skipping test: Garnet/Redis not available");
@@ -412,4 +416,79 @@ async fn test_multi_backend_routing() {
     let status = get_volume_status(&redis_url).await.unwrap();
     assert_eq!(status["Setting"]["S3Endpoint"], "http://127.0.0.1:9000");
     assert_eq!(status["Setting"]["S3Bucket"], "test-bucket");
+
+    let dlm = DlmClient::new(&redis_url).unwrap();
+
+    // Create multi-backend client and register two distinct mock backends
+    let multi_backend = MultiBackendClient::new();
+    let backend_0 = RustFsClient::new_mock();
+    let backend_1 = RustFsClient::new_mock();
+
+    multi_backend.register_backend("backend_0", backend_0.clone());
+    multi_backend.register_backend("backend_1", backend_1.clone());
+
+    // Initially backend_1 is active for writing
+    multi_backend.set_active_backend_id("backend_1".to_string());
+
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend_0.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), multi_backend.clone(), cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // Create a file
+    let file_name = OsStr::new("multi_backend_routing_test.bin");
+    let reply_create = fs.create(req, 1, file_name, 0o644, 0).await.unwrap();
+    let ino = reply_create.attr.ino;
+
+    // Write 5MB (which triggers a striped write and bypasses KV inlining)
+    let write_data = vec![99u8; 5 * 1024 * 1024];
+    fs.write(req, ino, 0, 0, &write_data, 0, 0).await.unwrap();
+
+    // Retrieve block map id from redis to verify the key starts with "backend_1:"
+    let block_map_id: Option<String> = con
+        .hget(format!("inode:{}", ino), "block_map_id")
+        .await
+        .unwrap();
+    assert!(block_map_id.is_some());
+    let map_key = format!("block_map:{}", block_map_id.unwrap());
+    let block_keys: Vec<String> = con.hvals(&map_key).await.unwrap();
+    assert!(!block_keys.is_empty());
+    for bk in &block_keys {
+        assert!(
+            bk.starts_with("backend_1:"),
+            "Block key should start with backend_1 prefix: {}",
+            bk
+        );
+    }
+
+    // Now let's change the active backend to backend_0
+    multi_backend.set_active_backend_id("backend_0".to_string());
+
+    // Attempt to read the data back. It should successfully route to backend_1 and retrieve the data
+    let read_result = fs.read(req, ino, 0, 5 * 1024 * 1024, 0).await.unwrap();
+    assert_eq!(read_result.data.len(), 5 * 1024 * 1024);
+    assert_eq!(read_result.data, write_data);
+
+    // Delete the file. It should clean up the blocks from backend_1
+    fs.unlink(req, 1, file_name).await.unwrap();
+
+    // Confirm that the block mapping is deleted from Garnet/Redis
+    let mapping_exists: bool = con.exists(&map_key).await.unwrap();
+    assert!(!mapping_exists, "Block mapping should be deleted");
 }

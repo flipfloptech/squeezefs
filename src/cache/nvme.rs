@@ -363,7 +363,7 @@ impl NvmeStaging {
             }
         }
 
-        let safe_name = block_key.replace('/', "_");
+        let safe_name = block_key.replace(['/', ':'], "_");
         let idx = get_dir_index(&safe_name, self.staging_dirs.len());
         let target_dir = &self.staging_dirs[idx];
         let block_path = target_dir.join(format!("{}.block", safe_name));
@@ -378,7 +378,7 @@ impl NvmeStaging {
 
     /// Retrieve a cached block file if it exists locally.
     pub fn get_cached_read_block(&self, block_key: &str) -> Option<Vec<u8>> {
-        let safe_name = block_key.replace('/', "_");
+        let safe_name = block_key.replace(['/', ':'], "_");
         let idx = get_dir_index(&safe_name, self.staging_dirs.len());
         let target_dir = &self.staging_dirs[idx];
         let block_path = target_dir.join(format!("{}.block", safe_name));
@@ -396,7 +396,7 @@ impl NvmeStaging {
         offset: u64,
         size: u32,
     ) -> Option<Vec<u8>> {
-        let safe_name = block_key.replace('/', "_");
+        let safe_name = block_key.replace(['/', ':'], "_");
         let idx = get_dir_index(&safe_name, self.staging_dirs.len());
         let target_dir = &self.staging_dirs[idx];
         let block_path = target_dir.join(format!("{}.block", safe_name));

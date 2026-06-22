@@ -1,9 +1,9 @@
 pub mod backend;
 pub mod cache;
+pub mod config_ops;
 pub mod dlm;
 pub mod error;
 pub mod fuse_client;
 pub mod p2p;
 pub mod recovery;
 pub mod routing;
-pub mod config_ops;

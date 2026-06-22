@@ -536,3 +536,51 @@ async fn test_multi_backend_routing() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_mount_uid_gid_override() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = get_redis_url();
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+
+    // Instantiate filesystem with custom overridden UID 5001 and GID 5002
+    let fs = SqueezefsFilesystem::new(router, dlm, 5001, 5002);
+
+    let req = Request {
+        unique: 1,
+        uid: 5001,
+        gid: 5002,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // Query root directory attributes (inode 1)
+    let root_attr = fs.getattr(req, 1, None, 0).await.unwrap();
+    assert_eq!(
+        root_attr.attr.uid, 5001,
+        "Root directory UID must match overridden mount UID"
+    );
+    assert_eq!(
+        root_attr.attr.gid, 5002,
+        "Root directory GID must match overridden mount GID"
+    );
+}

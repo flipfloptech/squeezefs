@@ -444,11 +444,11 @@ impl SqueezefsFilesystem {
         let uid = fields
             .get("uid")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1000);
+            .unwrap_or(self.uid);
         let gid = fields
             .get("gid")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1000);
+            .unwrap_or(self.gid);
         let rdev = fields.get("rdev").and_then(|v| v.parse().ok()).unwrap_or(0);
         let blksize = fields
             .get("blksize")

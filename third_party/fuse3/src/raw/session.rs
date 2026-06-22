@@ -1,5 +1,6 @@
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use std::ffi::OsStr;
+use std::mem;
 use std::ffi::OsString;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;

@@ -123,13 +123,13 @@ pub struct ReplyDirectory<S: Stream<Item = Result<DirectoryEntry>>> {
     pub entries: S,
 }
 
-/*#[derive(Debug)]
+#[derive(Debug)]
 pub struct ReplyIoctl {
     pub result: i32,
     pub flags: u32,
     pub in_iovs: u32,
     pub out_iovs: u32,
-}*/
+}
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 /// directory entry with attribute

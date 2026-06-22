@@ -8,7 +8,7 @@ use fuse3::raw::{
     Request,
 };
 use fuse3::{Errno, Inode, MountOptions, Result as FuseResult, Timestamp};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use redis::AsyncCommands;
 use std::ffi::OsStr;
@@ -346,7 +346,7 @@ impl SqueezefsFilesystem {
                                 .put_object(&new_block_key, block_data, fencing_token)
                                 .await?;
 
-                            let active_be = backend_clone.active_backend_id();
+                            let active_be = backend_clone.get_backend_for_key(&new_block_key);
                             let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
                             let mut con = dlm_clone.get_connection().await?;
@@ -2503,12 +2503,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE ioctl: inode = {}, cmd = {}, flags = {}", inode, cmd, flags);
         
-        let path = match self.get_path_from_ino(inode).await {
-            Ok(p) => p,
-            Err(e) => return Err(map_squeezefs_err(e)),
-        };
-
-        match cmd {
+        match cmd as u64 {
             libc::FS_IOC_GETFLAGS => {
                 Err(Errno::from(libc::ENOTTY))
             }
@@ -2575,7 +2570,7 @@ impl Filesystem for SqueezefsFilesystem {
             if size < v.len() as u32 {
                 return Err(Errno::from(libc::ERANGE));
             }
-            Ok(fuse3::raw::reply::ReplyXAttr::Data(v))
+            Ok(fuse3::raw::reply::ReplyXAttr::Data(v.into()))
         } else {
             #[cfg(target_os = "macos")]
             return Err(Errno::from(libc::ENOATTR));
@@ -2606,7 +2601,7 @@ impl Filesystem for SqueezefsFilesystem {
         if size < data.len() as u32 {
             return Err(Errno::from(libc::ERANGE));
         }
-        Ok(fuse3::raw::reply::ReplyXAttr::Data(data))
+        Ok(fuse3::raw::reply::ReplyXAttr::Data(data.into()))
     }
 
     async fn removexattr(&self, _req: Request, inode: Inode, name: &OsStr) -> FuseResult<()> {

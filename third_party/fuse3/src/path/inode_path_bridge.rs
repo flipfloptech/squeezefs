@@ -957,10 +957,16 @@ where
         arg: u64,
         in_size: u32,
         out_size: u32,
-    ) -> Result<raw::ReplyIoctl> {
+    ) -> Result<ReplyIoctl> {
         self.path_filesystem
             .ioctl(req, inode, fh, flags, cmd, arg, in_size, out_size)
             .await
+            .map(|reply| ReplyIoctl {
+                result: reply.result,
+                flags: reply.flags,
+                in_iovs: reply.in_iovs,
+                out_iovs: reply.out_iovs,
+            })
     }
 
     #[allow(clippy::too_many_arguments)]

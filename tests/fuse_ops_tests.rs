@@ -153,6 +153,20 @@ async fn test_fuse_setattr_truncation_clears_data() {
     fs.fsync(req, ino, fh, false).await.unwrap();
 
     // Verify it is there
+    let read_reply = fs.read(req, ino, fh, 0, 100).await.unwrap();
+    assert_eq!(read_reply.data.len(), 100);
+
+    // Truncate to 0 bytes
+    use fuse3::SetAttr;
+    let set_attr = SetAttr {
+        size: Some(0), // Truncate to 0
+        ..Default::default()
+    };
+    fs.setattr(req, ino, None, set_attr).await.unwrap();
+
+    // Write again but less data
+    let new_write_data = vec![0xBBu8; 10];
+    fs.write(req, ino, fh, 0, &new_write_data, 0, 0).await.unwrap();
     fs.fsync(req, ino, fh, false).await.unwrap();
 
     // Read it back. It should be only 10 bytes, NOT 100 bytes!

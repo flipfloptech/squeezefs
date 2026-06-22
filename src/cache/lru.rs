@@ -2,11 +2,14 @@ use crate::error::Result;
 use log::info;
 use moka::sync::Cache;
 use sysinfo::System;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone)]
 pub struct LruCache {
     inner: Cache<String, Vec<u8>>,
     max_bytes: u64,
+    current_bytes: Arc<AtomicU64>,
 }
 
 impl LruCache {
@@ -24,26 +27,38 @@ impl LruCache {
             max_bytes / 1024 / 1024
         );
 
+        let current_bytes = Arc::new(AtomicU64::new(0));
+        let current_bytes_clone = current_bytes.clone();
+
         let inner = Cache::builder()
             .weigher(|_key, value: &Vec<u8>| -> u32 {
                 value.len().try_into().unwrap_or(u32::MAX)
             })
             .max_capacity(max_bytes)
+            .eviction_listener(move |_key, value: Vec<u8>, _cause| {
+                current_bytes_clone.fetch_sub(value.len() as u64, Ordering::SeqCst);
+            })
             .build();
 
-        Ok(Self { inner, max_bytes })
+        Ok(Self { inner, max_bytes, current_bytes })
     }
 
     /// Construct with a custom memory limit in bytes.
     pub fn with_capacity(max_bytes: u64) -> Self {
+        let current_bytes = Arc::new(AtomicU64::new(0));
+        let current_bytes_clone = current_bytes.clone();
+
         let inner = Cache::builder()
             .weigher(|_key, value: &Vec<u8>| -> u32 {
                 value.len().try_into().unwrap_or(u32::MAX)
             })
             .max_capacity(max_bytes)
+            .eviction_listener(move |_key, value: Vec<u8>, _cause| {
+                current_bytes_clone.fetch_sub(value.len() as u64, Ordering::SeqCst);
+            })
             .build();
 
-        Self { inner, max_bytes }
+        Self { inner, max_bytes, current_bytes }
     }
 
     /// Retrieve an entry from the cache, updating its LRU status.
@@ -54,19 +69,19 @@ impl LruCache {
     /// Insert an entry into the cache, executing LRU eviction if maximum capacity is exceeded.
     pub fn put(&self, key: &str, data: Vec<u8>) {
         if (data.len() as u64) <= self.max_bytes {
+            self.current_bytes.fetch_add(data.len() as u64, Ordering::SeqCst);
             self.inner.insert(key.to_string(), data);
+            self.inner.run_pending_tasks();
         }
     }
 
     pub fn remove(&self, key: &str) {
         self.inner.invalidate(key);
+        self.inner.run_pending_tasks();
     }
 
-    // moka doesn't explicitly expose the current aggregate weight directly in a lightweight way
-    // without using experimental counters. We just return 0 to satisfy trait signatures
-    // or previous testing setups, as moka handles eviction strictly and automatically.
     pub fn current_bytes(&self) -> u64 {
-        0
+        self.current_bytes.load(Ordering::SeqCst)
     }
 
     pub fn max_bytes(&self) -> u64 {

@@ -583,7 +583,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             threads,
             size,
         } => {
-            run_benchmark(&path, threads, size).await?;
+            let redis_url = &cli.garnet_url;
+            run_benchmark(&path, threads, size, redis_url).await?;
         }
         Commands::Clone { src, dest } => {
             let redis_url = &cli.garnet_url;
@@ -752,10 +753,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn get_daemon_metrics() -> Option<HashMap<String, u64>> {
-    let redis_url =
-        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let client = squeezefs::dlm::MetaClient::new(&redis_url).ok()?;
+async fn get_daemon_metrics(redis_url: &str) -> Option<HashMap<String, u64>> {
+    let client = squeezefs::dlm::MetaClient::new(redis_url).ok()?;
     let mut con = client.get_connection().await.ok()?;
     let metrics: HashMap<String, String> = con.hgetall("metrics:daemon").await.ok()?;
 
@@ -772,6 +771,7 @@ async fn run_benchmark(
     path: &Path,
     threads: usize,
     size_mb: usize,
+    redis_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !path.exists() {
         return Err(format!("Benchmark path {:?} does not exist", path).into());
@@ -791,7 +791,7 @@ async fn run_benchmark(
     );
 
     // 1. Fetch baseline metrics
-    let baseline_metrics = get_daemon_metrics().await;
+    let baseline_metrics = get_daemon_metrics(redis_url).await;
 
     let mp = MultiProgress::new();
     let pb_style = ProgressStyle::default_bar()
@@ -997,7 +997,7 @@ async fn run_benchmark(
     }
 
     // 2. Fetch post-benchmark metrics
-    let post_metrics = get_daemon_metrics().await;
+    let post_metrics = get_daemon_metrics(redis_url).await;
 
     // --- CALCULATE PERFORMANCE VALUES ---
     let total_big_bytes = (threads * big_file_bytes) as f64;

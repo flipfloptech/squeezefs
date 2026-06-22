@@ -328,6 +328,7 @@ impl RustFsClient {
 #[derive(Clone)]
 pub struct MultiBackendClient {
     backends: Arc<dashmap::DashMap<String, RustFsClient>>,
+    #[allow(dead_code)]
     active_backend_id: Arc<std::sync::RwLock<String>>,
 }
 

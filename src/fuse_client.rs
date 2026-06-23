@@ -202,6 +202,29 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
+    async fn check_capacity_quota(&self, con: &mut crate::dlm::MetaConnection, additional_bytes: u64) -> Result<(), Errno> {
+        let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
+        let capacity_limit = if format_exists {
+            let cap_str: Option<String> = con
+                .hget("squeezefs:format", "capacity")
+                .await
+                .map_err(map_err)?;
+            cap_str
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1024 * 1024 * 1024 * 1024 * 1024) // 1PB default
+        } else {
+            1024 * 1024 * 1024 * 1024 * 1024 // 1PB default
+        };
+
+        let used_bytes_opt: Option<u64> = con.get("squeezefs:used_bytes").await.map_err(map_err)?;
+        let used_bytes = used_bytes_opt.unwrap_or(0);
+        if used_bytes + additional_bytes > capacity_limit {
+            return Err(Errno::from(libc::ENOSPC));
+        }
+        Ok(())
+    }
+
+
     fn get_inode_lock(&self, ino: u64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         self.active_inode_locks
             .entry(ino)
@@ -1220,6 +1243,22 @@ impl Filesystem for SqueezefsFilesystem {
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
+        let attr_key = format!("squeezefs:attr:{}", ino);
+
+        let old_size = if let Some(entry) = self.attr_cache.get(&ino) {
+            entry.value().0.size
+        } else {
+            let old_size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
+            old_size_opt.unwrap_or(0)
+        };
+
+        let bytes_written = data.len() as u32;
+        let new_size = std::cmp::max(old_size, offset + bytes_written as u64);
+        if new_size > old_size {
+            let diff = new_size - old_size;
+            self.check_capacity_quota(&mut con, diff).await?;
+        }
+
         // 2. Write data using progressive layout routing if not striped
         let meta_key = format!("metadata:inode_{}", ino);
         let file_type: Option<String> = con.hget(&meta_key, "type").await.map_err(map_err)?;
@@ -1236,19 +1275,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
         }
 
-        let bytes_written = data.len() as u32;
-
         // 3. Update file attributes and used bytes
-        let attr_key = format!("squeezefs:attr:{}", ino);
 
-        let old_size = if let Some(entry) = self.attr_cache.get(&ino) {
-            entry.value().0.size
-        } else {
-            let old_size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
-            old_size_opt.unwrap_or(0)
-        };
-
-        let new_size = std::cmp::max(old_size, offset + bytes_written as u64);
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
@@ -1499,6 +1527,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             if size > old_size {
                 let diff = size - old_size;
+                self.check_capacity_quota(&mut con, diff).await?;
                 pipe.incr("squeezefs:used_bytes", diff);
             } else if size < old_size {
                 let diff = old_size - size;
@@ -2700,6 +2729,9 @@ impl Filesystem for SqueezefsFilesystem {
             
             let target_size = offset + length;
             if target_size > old_size {
+                let diff = target_size - old_size;
+                self.check_capacity_quota(&mut con, diff).await?;
+
                 let mut pipe = redis::pipe();
                 pipe.hset(&attr_key, "size", target_size);
                 

@@ -430,7 +430,10 @@ fn bench_nvme_combined(c: &mut Criterion) {
             let file_path = format!("/bench_staged_{}.bin", c);
             let file_id = format!("bench_id_{}", c);
             async move {
-                nvme_ref.stage_write(&file_path, &file_id, data_ref, 1).await.unwrap();
+                nvme_ref
+                    .stage_write(&file_path, &file_id, data_ref, 1)
+                    .await
+                    .unwrap();
             }
         });
     });
@@ -468,10 +471,58 @@ fn bench_dlm_centralized_heartbeat(c: &mut Criterion) {
             let c = counter_clone.fetch_add(1, Ordering::Relaxed);
             let path = format!("/bench_lock_{}", c);
             async move {
-                let lease = dlm_ref.acquire_lock(&path, None, Duration::from_secs(5)).await.unwrap();
+                let lease = dlm_ref
+                    .acquire_lock(&path, None, Duration::from_secs(5))
+                    .await
+                    .unwrap();
                 lease.release().await.unwrap();
             }
         });
+    });
+
+    group.finish();
+}
+
+fn bench_crypto_compress(c: &mut Criterion) {
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    use squeezefs::crypto_compress::CryptoCompressState;
+
+    let mut rng = rand::thread_rng();
+    let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let pem = priv_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
+
+    let state_none = CryptoCompressState::new("none".to_string(), "none".to_string(), None);
+    let state_lz4 = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    let state_zstd = CryptoCompressState::new("zstd".to_string(), "none".to_string(), None);
+    let state_enc =
+        CryptoCompressState::new("none".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
+    let state_both =
+        CryptoCompressState::new("lz4".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
+
+    let payload =
+        b"Hello World! This is a test of client-side encryption and compression. ".repeat(100); // ~7KB
+
+    let mut group = c.benchmark_group("crypto_compress");
+
+    group.bench_function("process_write_none", |b| {
+        b.iter(|| state_none.process_write(&payload).unwrap());
+    });
+    group.bench_function("process_write_lz4", |b| {
+        b.iter(|| state_lz4.process_write(&payload).unwrap());
+    });
+    group.bench_function("process_write_zstd", |b| {
+        b.iter(|| state_zstd.process_write(&payload).unwrap());
+    });
+    group.bench_function("process_write_aes256gcm", |b| {
+        b.iter(|| state_enc.process_write(&payload).unwrap());
+    });
+    group.bench_function("process_write_both", |b| {
+        b.iter(|| state_both.process_write(&payload).unwrap());
+    });
+
+    let encrypted = state_both.process_write(&payload).unwrap();
+    group.bench_function("process_read_both", |b| {
+        b.iter(|| state_both.process_read(&encrypted).unwrap());
     });
 
     group.finish();
@@ -493,6 +544,7 @@ criterion_group! {
         bench_squeezefs_metadata_ops,
         bench_squeezefs_data_io,
         bench_nvme_combined,
-        bench_dlm_centralized_heartbeat
+        bench_dlm_centralized_heartbeat,
+        bench_crypto_compress
 }
 criterion_main!(benches);

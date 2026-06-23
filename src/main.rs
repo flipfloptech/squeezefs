@@ -261,7 +261,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     #[cfg(unix)]
-    if let Commands::Mount { daemon: true, mountpoint, .. } = &cli.command {
+    if let Commands::Mount {
+        daemon: true,
+        mountpoint,
+        ..
+    } = &cli.command
+    {
         let mountpoint_path = mountpoint.clone();
         unsafe {
             let pid = libc::fork();
@@ -302,7 +307,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!();
                 if ready {
-                    println!("\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}", mountpoint_path);
+                    println!(
+                        "\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}",
+                        mountpoint_path
+                    );
                     std::process::exit(0);
                 } else {
                     eprintln!("The mount point is not ready in 10 seconds, exiting");
@@ -373,9 +381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .unwrap();
 
-    rt.block_on(async {
-        run_app(cli).await
-    })
+    rt.block_on(async { run_app(cli).await })
 }
 
 fn parse_human_readable_size(s: &str) -> Result<u64, String> {
@@ -383,10 +389,10 @@ fn parse_human_readable_size(s: &str) -> Result<u64, String> {
     if s.is_empty() {
         return Err("Empty size string".to_string());
     }
-    
+
     let mut num_str = s;
     let mut multiplier = 1u64;
-    
+
     if let Some(last_char) = s.chars().last() {
         if !last_char.is_ascii_digit() {
             num_str = &s[..s.len() - 1];
@@ -400,24 +406,27 @@ fn parse_human_readable_size(s: &str) -> Result<u64, String> {
             };
         }
     }
-    
-    let base_val: u64 = num_str.trim().parse().map_err(|e| format!("Invalid number '{}': {}", num_str, e))?;
+
+    let base_val: u64 = num_str
+        .trim()
+        .parse()
+        .map_err(|e| format!("Invalid number '{}': {}", num_str, e))?;
     Ok(base_val * multiplier)
 }
 
 async fn test_storage(client: &RustFsClient) -> Result<(), Box<dyn std::error::Error>> {
     let key = format!("testing/{}", uuid::Uuid::new_v4());
     let test_data = vec![42u8; 100];
-    
+
     // Put object
     client.put_object(&key, test_data.clone(), 1).await?;
-    
+
     // Get object
     let read_data = client.get_object(&key).await?;
     if read_data != test_data {
         return Err("Read data does not match written data".into());
     }
-    
+
     // Delete object
     client.delete_object(&key).await?;
     Ok(())
@@ -443,7 +452,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             encrypt_key,
         } => {
             let redis_url = &cli.garnet_url;
- 
+
             // Check if squeezefs volume is already formatted on the database
             if !force {
                 if let Ok(client) = redis::Client::open(redis_url.as_str()) {
@@ -470,14 +479,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = std::io::stdin().read_line(&mut input);
                             let trimmed = input.trim().to_lowercase();
                             if trimmed != "y" && trimmed != "yes" {
-                                  println!("Format aborted.");
-                                  return Ok(());
+                                println!("Format aborted.");
+                                return Ok(());
                             }
                         }
                     }
                 }
             }
- 
+
             let resolved_encrypt_key_pem = if encrypt_algo != "none" {
                 use rsa::pkcs1::EncodeRsaPrivateKey;
                 if let Some(ref path_str) = encrypt_key {
@@ -489,7 +498,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let mut rng = rand::thread_rng();
                     let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048)
                         .map_err(|e| format!("Failed to generate RSA key: {}", e))?;
-                    let pem = priv_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+                    let pem = priv_key
+                        .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
                         .map_err(|e| format!("Failed to format PEM: {}", e))?;
                     std::fs::write("squeezefs.key", &*pem)?;
                     println!("Successfully generated squeezefs.key file.");
@@ -498,10 +508,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
- 
+
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let parsed_capacity = parse_human_readable_size(&capacity)?;
- 
+
             squeezefs::fuse_client::format_volume(
                 redis_url,
                 &name,
@@ -747,10 +757,16 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             });
             let config_str = serde_json::to_string_pretty(&config_json).unwrap_or_default();
             log::info!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
-            log::info!("Data use {:?}", final_s3_bucket.as_deref().unwrap_or("mock"));
+            log::info!(
+                "Data use {:?}",
+                final_s3_bucket.as_deref().unwrap_or("mock")
+            );
             log::info!("SqueezeFS mount configuration:\n{}", config_str);
             println!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
-            println!("Data use {:?}", final_s3_bucket.as_deref().unwrap_or("mock"));
+            println!(
+                "Data use {:?}",
+                final_s3_bucket.as_deref().unwrap_or("mock")
+            );
             println!("SqueezeFS mount configuration:\n{}", config_str);
 
             let cache = TieredCache::new(

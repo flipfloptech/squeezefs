@@ -29,6 +29,8 @@ pub struct DataRouter {
     pub metadata_cache: std::sync::Arc<dashmap::DashMap<String, CachedMetadata>>,
     pub block_map_cache:
         std::sync::Arc<dashmap::DashMap<(String, u32), (String, std::time::Instant)>>,
+    pub crypto:
+        std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
 }
 
 impl DataRouter {
@@ -40,7 +42,24 @@ impl DataRouter {
             block_size: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024)),
             metadata_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             block_map_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
         }
+    }
+
+    pub fn set_crypto(&self, crypto: crate::crypto_compress::CryptoCompressState) {
+        let _ = self.crypto.set(crypto);
+    }
+
+    pub fn get_crypto(&self) -> &crate::crypto_compress::CryptoCompressState {
+        static DEFAULT_CRYPTO: once_cell::sync::Lazy<crate::crypto_compress::CryptoCompressState> =
+            once_cell::sync::Lazy::new(|| {
+                crate::crypto_compress::CryptoCompressState::new(
+                    "none".to_string(),
+                    "none".to_string(),
+                    None,
+                )
+            });
+        self.crypto.get().unwrap_or(&*DEFAULT_CRYPTO)
     }
 
     pub fn set_block_size(&self, block_size: u64) {
@@ -75,7 +94,11 @@ impl DataRouter {
             Some("inline") => {
                 let inline_key = format!("inline_data:{}", file_path);
                 let bytes: Option<Vec<u8>> = con.get(&inline_key).await?;
-                bytes.unwrap_or_default()
+                if let Some(b) = bytes {
+                    self.get_crypto().process_read(&b)?
+                } else {
+                    Vec::new()
+                }
             }
             Some("staged") => {
                 let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;
@@ -90,7 +113,11 @@ impl DataRouter {
 
                         if let (Some(bk), Some(off), Some(sz)) = (block_key, off_val, sz_val) {
                             let (be_id, real_key) = parse_backend_and_key(&bk);
-                            self.backend.get_object_range(&be_id, &real_key, off, off + sz).await?
+                            let raw = self
+                                .backend
+                                .get_object_range(&be_id, &real_key, off, off + sz)
+                                .await?;
+                            self.get_crypto().process_read(&raw)?
                         } else {
                             Vec::new()
                         }
@@ -114,8 +141,9 @@ impl DataRouter {
         if new_size < 64 * 1024 {
             // Layout: inline
             let inline_key = format!("inline_data:{}", file_path);
+            let processed_data = self.get_crypto().process_write(&existing_data)?;
             let mut pipe = redis::pipe();
-            pipe.set(&inline_key, &existing_data)
+            pipe.set(&inline_key, &processed_data)
                 .hset(&meta_key, "size", new_size)
                 .hset(&meta_key, "type", "inline")
                 .hset(&meta_key, "fencing_token", fencing_token);
@@ -205,9 +233,11 @@ impl DataRouter {
                 block_mappings.push((block_count.to_string(), stored_block_key));
 
                 let backend_clone = self.backend.clone();
+                let crypto = self.get_crypto().clone();
                 let task = tokio::spawn(async move {
+                    let processed = crypto.process_write(&chunk)?;
                     backend_clone
-                        .put_object(&block_key, chunk, fencing_token)
+                        .put_object(&block_key, processed, fencing_token)
                         .await
                 });
 
@@ -359,8 +389,9 @@ impl DataRouter {
             let file_uuid = Uuid::new_v4().to_string();
             let gap_key = format!("blocks/{}/block_{}_{}", file_uuid, b, gap_write_uuid);
             let gap_data = vec![0; block_size as usize];
+            let processed_gap = self.get_crypto().process_write(&gap_data)?;
             self.backend
-                .put_object(&gap_key, gap_data, fencing_token)
+                .put_object(&gap_key, processed_gap, fencing_token)
                 .await?;
 
             let _: () = redis::pipe()
@@ -395,11 +426,13 @@ impl DataRouter {
                 data[(overlap_start - offset) as usize..(overlap_end - offset) as usize].to_vec();
 
             let backend_clone = self.backend.clone();
+            let crypto = self.get_crypto().clone();
 
             tasks.push(tokio::spawn(async move {
                 let mut block_data = if let Some(ref bk) = old_block_key {
                     let (be_id, real_key) = parse_backend_and_key(bk);
-                    backend_clone.get_object(&be_id, &real_key).await?
+                    let raw = backend_clone.get_object(&be_id, &real_key).await?;
+                    crypto.process_read(&raw)?
                 } else {
                     vec![0; rel_end]
                 };
@@ -415,8 +448,10 @@ impl DataRouter {
                 let new_block_key =
                     format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
+                let processed_block = crypto.process_write(&block_data)?;
+
                 backend_clone
-                    .put_object(&new_block_key, block_data, fencing_token)
+                    .put_object(&new_block_key, processed_block, fencing_token)
                     .await?;
 
                 let active_be = backend_clone.get_backend_for_key(&new_block_key);
@@ -529,7 +564,7 @@ impl DataRouter {
                 );
                 let inline_key = format!("inline_data:{}", file_path);
                 let bytes: Vec<u8> = con.get(&inline_key).await?;
-                bytes
+                self.get_crypto().process_read(&bytes)?
             }
             "staged" => {
                 // Small File: check Tier 3 (NVMe Staging) first
@@ -558,7 +593,11 @@ impl DataRouter {
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, offset, size) {
                         let (be_id, real_key) = parse_backend_and_key(&bk);
-                        self.backend.get_object_range(&be_id, &real_key, off, off + sz).await?
+                        let raw = self
+                            .backend
+                            .get_object_range(&be_id, &real_key, off, off + sz)
+                            .await?;
+                        self.get_crypto().process_read(&raw)?
                     } else {
                         return Err(SqueezefsError::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
@@ -616,11 +655,14 @@ impl DataRouter {
                 };
 
                 let mut futures = Vec::new();
+                let crypto = self.get_crypto().clone();
                 for block_key in block_keys {
                     let backend_clone = self.backend.clone();
+                    let crypto_clone = crypto.clone();
                     let task = tokio::spawn(async move {
                         let (be_id, real_key) = parse_backend_and_key(&block_key);
-                        backend_clone.get_object(&be_id, &real_key).await
+                        let raw = backend_clone.get_object(&be_id, &real_key).await?;
+                        crypto_clone.process_read(&raw)
                     });
                     futures.push(task);
                 }
@@ -723,9 +765,10 @@ impl DataRouter {
                 let mut con = self.dlm.get_connection().await?;
                 let inline_key = format!("inline_data:{}", file_path);
                 let bytes: Vec<u8> = con.get(&inline_key).await?;
-                let start = std::cmp::min(offset as usize, bytes.len());
-                let end = std::cmp::min((offset + size as u64) as usize, bytes.len());
-                Ok(bytes[start..end].to_vec())
+                let decompressed = self.get_crypto().process_read(&bytes)?;
+                let start = std::cmp::min(offset as usize, decompressed.len());
+                let end = std::cmp::min((offset + size as u64) as usize, decompressed.len());
+                Ok(decompressed[start..end].to_vec())
             }
             "staged" => {
                 let file_id = meta.file_id.ok_or_else(|| {
@@ -745,20 +788,24 @@ impl DataRouter {
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
-                        if offset >= sz {
+                        let (be_id, real_key) = parse_backend_and_key(&bk);
+                        let packed_bytes = self
+                            .backend
+                            .get_object_range(&be_id, &real_key, off, off + sz)
+                            .await?;
+                        let decompressed = self.get_crypto().process_read(&packed_bytes)?;
+                        if offset >= decompressed.len() as u64 {
                             return Ok(Vec::new());
                         }
-                        let (be_id, real_key) = parse_backend_and_key(&bk);
-                        let read_len = std::cmp::min(size as u64, sz - offset);
-                        let req_start = off + offset;
-                        let req_end = req_start + read_len;
-                        let packed_bytes = self.backend.get_object_range(&be_id, &real_key, req_start, req_end).await?;
-                        Ok(packed_bytes)
+                        let start = offset as usize;
+                        let end =
+                            std::cmp::min((offset + size as u64) as usize, decompressed.len());
+                        Ok(decompressed[start..end].to_vec())
                     } else {
-                        return Err(SqueezefsError::Io(std::io::Error::new(
+                        Err(SqueezefsError::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             format!("Staged file ID {} mapping not found in Garnet", file_id),
-                        )));
+                        )))
                     }
                 }
             }
@@ -862,6 +909,7 @@ impl DataRouter {
 
                 // Spawn concurrent tasks to download block data in parallel
                 let mut futures = Vec::new();
+                let crypto = self.get_crypto().clone();
                 for (b_idx, b_key) in block_keys {
                     let cache_ref = self.cache.nvme.clone();
                     let backend_ref = self.backend.clone();
@@ -875,6 +923,7 @@ impl DataRouter {
                     let rel_end = slice_end - b_start_offset;
                     let slice_len = (rel_end - slice_start) as u32;
 
+                    let crypto_clone = crypto.clone();
                     futures.push(tokio::spawn(async move {
                         let block_data = if let Some(cached_range) =
                             cache_ref.get_cached_read_block_range(&b_key, slice_start, slice_len)
@@ -908,8 +957,9 @@ impl DataRouter {
                                     // Fallback to S3
                                     let (be_id, real_key) = parse_backend_and_key(&b_key);
                                     let data = backend_ref.get_object(&be_id, &real_key).await?;
-                                    let _ = cache_ref.cache_read_block(&b_key, &data);
-                                    data
+                                    let decompressed = crypto_clone.process_read(&data)?;
+                                    let _ = cache_ref.cache_read_block(&b_key, &decompressed);
+                                    decompressed
                                 }
                             };
 

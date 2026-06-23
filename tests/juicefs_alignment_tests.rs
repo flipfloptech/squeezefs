@@ -258,7 +258,16 @@ async fn test_stale_mount_warning_only() {
     // If we pass a nonexistent path or trigger an ENOTCONN, it should fail
     // We can simulate an ENOTCONN by checking if mounting on a stale directory returns standard error rather than unmounting it.
     // We check if start_mount returns standard IO error for invalid setups.
-    let res = start_mount("/nonexistent/mountpoint/path/here", fs, 1000, 1000, false, true, None).await;
+    let res = start_mount(
+        "/nonexistent/mountpoint/path/here",
+        fs,
+        1000,
+        1000,
+        false,
+        true,
+        None,
+    )
+    .await;
     assert!(res.is_err(), "Mount should fail on invalid path");
 }
 
@@ -433,10 +442,10 @@ async fn test_multi_backend_routing() {
         "multibackend",
         4 * 1024 * 1024,
         100 * 1024 * 1024,
-        0, // inodes limit
+        0,      // inodes limit
         "none", // compression
         "none", // encrypt_algo
-        None, // encrypt_key
+        None,   // encrypt_key
         None,
         None,
         None,
@@ -758,10 +767,10 @@ async fn test_config_sqz_virtual_file() {
         "testvolume_config",
         1024 * 1024,
         1000 * 1024 * 1024,
-        0, // inodes limit
+        0,      // inodes limit
         "none", // compression
         "none", // encrypt_algo
-        None, // encrypt_key
+        None,   // encrypt_key
         Some("64MB"),
         Some("100MB"),
         None,
@@ -818,7 +827,10 @@ async fn test_config_sqz_virtual_file() {
     assert!(parsed.get("client_version").is_some());
     assert_eq!(parsed["backends"]["backend_0"]["access_key"], "******");
     assert_eq!(parsed["backends"]["backend_0"]["secret_key"], "******");
-    assert_eq!(parsed["backends"]["backend_0"]["endpoint"], "http://s3.local");
+    assert_eq!(
+        parsed["backends"]["backend_0"]["endpoint"],
+        "http://s3.local"
+    );
 
     // 4. Try to write to CONFIG_INODE -> EACCES
     let write_res = fs.write(req, config_ino, 0, 0, b"data", 0, 0).await;
@@ -827,8 +839,10 @@ async fn test_config_sqz_virtual_file() {
     assert_eq!(err_code, fuse3::Errno::from(libc::EACCES));
 
     // 5. Try to setattr of CONFIG_INODE -> EACCES
-    let mut set_attr = SetAttr::default();
-    set_attr.size = Some(10);
+    let set_attr = SetAttr {
+        size: Some(10),
+        ..Default::default()
+    };
     let setattr_res = fs.setattr(req, config_ino, None, set_attr).await;
     assert!(setattr_res.is_err());
     assert_eq!(setattr_res.err().unwrap(), fuse3::Errno::from(libc::EACCES));
@@ -839,7 +853,15 @@ async fn test_config_sqz_virtual_file() {
     assert_eq!(unlink_res.err().unwrap(), fuse3::Errno::from(libc::EPERM));
 
     // 7. Try to rename ".config.sqz" -> EPERM
-    let rename_res = fs.rename(req, 1, OsStr::new(".config.sqz"), 1, OsStr::new("new.config.sqz")).await;
+    let rename_res = fs
+        .rename(
+            req,
+            1,
+            OsStr::new(".config.sqz"),
+            1,
+            OsStr::new("new.config.sqz"),
+        )
+        .await;
     assert!(rename_res.is_err());
     assert_eq!(rename_res.err().unwrap(), fuse3::Errno::from(libc::EPERM));
 
@@ -884,10 +906,10 @@ async fn test_inode_quota_enforcement() {
         "quota_vol",
         1024 * 1024,
         1000 * 1024 * 1024,
-        3, // inodes limit: 3. Root is 1, so we can create 2 more.
+        3,      // inodes limit: 3. Root is 1, so we can create 2 more.
         "none", // compression
         "none", // encrypt_algo
-        None, // encrypt_key
+        None,   // encrypt_key
         Some("64MB"),
         Some("100MB"),
         None,
@@ -928,14 +950,20 @@ async fn test_inode_quota_enforcement() {
     assert_eq!(stat1.ffree, 2); // 3 total - 1 (root directory) = 2 free
 
     // 1. Create first file (should succeed, inode 2)
-    let create1 = fs.create(req, 1, OsStr::new("file1"), 0o644, 0).await.unwrap();
+    let create1 = fs
+        .create(req, 1, OsStr::new("file1"), 0o644, 0)
+        .await
+        .unwrap();
     assert_eq!(create1.attr.ino, 2);
 
     let stat2 = fs.statfs(req, 1).await.unwrap();
     assert_eq!(stat2.ffree, 1);
 
     // 2. Create second file (should succeed, inode 3)
-    let create2 = fs.create(req, 1, OsStr::new("file2"), 0o644, 0).await.unwrap();
+    let create2 = fs
+        .create(req, 1, OsStr::new("file2"), 0o644, 0)
+        .await
+        .unwrap();
     assert_eq!(create2.attr.ino, 3);
 
     let stat3 = fs.statfs(req, 1).await.unwrap();
@@ -953,7 +981,10 @@ async fn test_inode_quota_enforcement() {
     assert_eq!(stat4.ffree, 1); // 1 free inode now
 
     // 5. Try creating again (should succeed now, allocating a new inode counter value e.g. 4)
-    let create4 = fs.create(req, 1, OsStr::new("file3"), 0o644, 0).await.unwrap();
+    let create4 = fs
+        .create(req, 1, OsStr::new("file3"), 0o644, 0)
+        .await
+        .unwrap();
     assert_eq!(create4.attr.ino, 4);
 
     let stat5 = fs.statfs(req, 1).await.unwrap();
@@ -976,11 +1007,11 @@ async fn test_capacity_quota_enforcement() {
         &redis_url,
         "capacity_vol",
         1024 * 1024,
-        100, // capacity limit: 100 bytes
-        0, // inodes limit: unlimited
+        100,    // capacity limit: 100 bytes
+        0,      // inodes limit: unlimited
         "none", // compression
         "none", // encrypt_algo
-        None, // encrypt_key
+        None,   // encrypt_key
         Some("64MB"),
         Some("100MB"),
         None,
@@ -1016,7 +1047,10 @@ async fn test_capacity_quota_enforcement() {
     fs.init(req).await.unwrap();
 
     // 1. Create file1 (inode 2)
-    let create1 = fs.create(req, 1, OsStr::new("file1"), 0o644, 0).await.unwrap();
+    let create1 = fs
+        .create(req, 1, OsStr::new("file1"), 0o644, 0)
+        .await
+        .unwrap();
     let ino = create1.attr.ino;
     assert_eq!(ino, 2);
 
@@ -1038,7 +1072,10 @@ async fn test_capacity_quota_enforcement() {
     };
     let setattr_large_res = fs.setattr(req, ino, None, set_attr_large).await;
     assert!(setattr_large_res.is_err());
-    assert_eq!(setattr_large_res.err().unwrap(), fuse3::Errno::from(libc::ENOSPC));
+    assert_eq!(
+        setattr_large_res.err().unwrap(),
+        fuse3::Errno::from(libc::ENOSPC)
+    );
 
     // 5. Shrink / truncate file size to 30 bytes (should succeed)
     let set_attr_small = SetAttr {
@@ -1062,6 +1099,7 @@ async fn test_capacity_quota_enforcement() {
 
 #[tokio::test]
 async fn test_compression_and_encryption_flow() {
+    let _ = env_logger::builder().is_test(true).try_init();
     let mut con = match clean_db().await {
         Some(c) => c,
         None => {
@@ -1070,6 +1108,11 @@ async fn test_compression_and_encryption_flow() {
         }
     };
 
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    let mut rng = rand::thread_rng();
+    let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let pem = priv_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
+
     let redis_url = get_redis_url();
     // Format volume with lz4 compression and aes256gcm-rsa encryption
     format_volume(
@@ -1077,10 +1120,10 @@ async fn test_compression_and_encryption_flow() {
         "crypto_vol",
         1024 * 1024,
         1000 * 1024 * 1024,
-        0, // inodes limit
-        "lz4", // compression
+        0,               // inodes limit
+        "lz4",           // compression
         "aes256gcm-rsa", // encrypt_algo
-        None, // encrypt_key (PEM string, auto-generate)
+        Some(&pem),      // encrypt_key (PEM string)
         Some("64MB"),
         Some("100MB"),
         None,
@@ -1116,17 +1159,24 @@ async fn test_compression_and_encryption_flow() {
     fs.init(req).await.unwrap();
 
     // 1. Create file (inode 2)
-    let create_res = fs.create(req, 1, OsStr::new("encrypted_file"), 0o644, 0).await.unwrap();
+    let create_res = fs
+        .create(req, 1, OsStr::new("encrypted_file"), 0o644, 0)
+        .await
+        .unwrap();
     let ino = create_res.attr.ino;
     assert_eq!(ino, 2);
 
     // 2. Write a compressible payload
-    let plaintext = b"Hello World! This is a test of client-side encryption and compression. ".repeat(10);
+    let plaintext =
+        b"Hello World! This is a test of client-side encryption and compression. ".repeat(10);
     let write_res = fs.write(req, ino, 0, 0, &plaintext, 0, 0).await.unwrap();
     assert_eq!(write_res.written as usize, plaintext.len());
 
     // 3. Read it back and verify it matches plaintext
-    let read_res = fs.read(req, ino, 0, 0, plaintext.len() as u32).await.unwrap();
+    let read_res = fs
+        .read(req, ino, 0, 0, plaintext.len() as u32)
+        .await
+        .unwrap();
     assert_eq!(read_res.data.as_ref(), plaintext.as_slice());
 
     // 4. Verify that the raw data stored in Garnet (since it's inline under 64KB)
@@ -1140,7 +1190,8 @@ async fn test_compression_and_encryption_flow() {
 
     assert_ne!(stored_bytes, plaintext);
     let contains_plaintext = stored_bytes.windows(12).any(|w| w == b"Hello World!");
-    assert!(!contains_plaintext, "Stored bytes should be encrypted and must not expose plaintext");
+    assert!(
+        !contains_plaintext,
+        "Stored bytes should be encrypted and must not expose plaintext"
+    );
 }
-
-

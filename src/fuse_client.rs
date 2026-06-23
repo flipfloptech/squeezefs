@@ -4,7 +4,7 @@ use crate::error::SqueezefsError;
 use crate::routing::DataRouter;
 use fuse3::raw::{
     prelude::*,
-    reply::{DirectoryEntry, FileAttr, ReplyCopyFileRange, ReplyLock, ReplyIoctl},
+    reply::{DirectoryEntry, FileAttr, ReplyCopyFileRange, ReplyIoctl, ReplyLock},
     Request,
 };
 use fuse3::{Errno, Inode, MountOptions, Result as FuseResult, Timestamp};
@@ -88,28 +88,36 @@ impl SqueezefsFilesystem {
 
     async fn generate_config_json(&self) -> String {
         let mut con_opt = self.dlm.get_connection().await.ok();
-        
-        let format_fields: std::collections::HashMap<String, String> = if let Some(ref mut con) = con_opt {
-            con.hgetall("squeezefs:format").await.unwrap_or_default()
-        } else {
-            std::collections::HashMap::new()
-        };
 
-        let backends_raw: std::collections::HashMap<String, String> = if let Some(ref mut con) = con_opt {
-            con.hgetall("squeezefs:backends").await.unwrap_or_default()
-        } else {
-            std::collections::HashMap::new()
-        };
+        let format_fields: std::collections::HashMap<String, String> =
+            if let Some(ref mut con) = con_opt {
+                con.hgetall("squeezefs:format").await.unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+
+        let backends_raw: std::collections::HashMap<String, String> =
+            if let Some(ref mut con) = con_opt {
+                con.hgetall("squeezefs:backends").await.unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
 
         let mut backends = serde_json::Map::new();
         for (be_id, be_json) in backends_raw {
             if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&be_json) {
                 if let Some(obj) = config.as_object_mut() {
                     if obj.contains_key("secret_key") {
-                        obj.insert("secret_key".to_string(), serde_json::Value::String("******".to_string()));
+                        obj.insert(
+                            "secret_key".to_string(),
+                            serde_json::Value::String("******".to_string()),
+                        );
                     }
                     if obj.contains_key("access_key") {
-                        obj.insert("access_key".to_string(), serde_json::Value::String("******".to_string()));
+                        obj.insert(
+                            "access_key".to_string(),
+                            serde_json::Value::String("******".to_string()),
+                        );
                     }
                 }
                 backends.insert(be_id, config);
@@ -134,11 +142,11 @@ impl SqueezefsFilesystem {
             .unwrap_or(Duration::ZERO);
         let sec = now.as_secs() as i64;
         let nsec = now.subsec_nanos();
-        
+
         FileAttr {
             ino: CONFIG_INODE,
             size,
-            blocks: (size + 511) / 512,
+            blocks: size.div_ceil(512),
             atime: Timestamp::new(sec, nsec),
             mtime: Timestamp::new(sec, nsec),
             ctime: Timestamp::new(sec, nsec),
@@ -202,7 +210,11 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
-    async fn check_capacity_quota(&self, con: &mut crate::dlm::MetaConnection, additional_bytes: u64) -> Result<(), Errno> {
+    async fn check_capacity_quota(
+        &self,
+        con: &mut crate::dlm::MetaConnection,
+        additional_bytes: u64,
+    ) -> Result<(), Errno> {
         let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
         let capacity_limit = if format_exists {
             let cap_str: Option<String> = con
@@ -223,7 +235,6 @@ impl SqueezefsFilesystem {
         }
         Ok(())
     }
-
 
     fn get_inode_lock(&self, ino: u64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         self.active_inode_locks
@@ -688,7 +699,7 @@ impl SqueezefsFilesystem {
                 .arg(100)
                 .query_async(con)
                 .await
-                .map_err(|e| SqueezefsError::from(e))?;
+                .map_err(SqueezefsError::from)?;
             all_keys.extend(keys);
             cursor = next_cursor;
             if cursor == 0 {
@@ -1119,14 +1130,20 @@ impl Filesystem for SqueezefsFilesystem {
         debug!("FUSE Open: inode = {}", inode);
 
         // File handle is just the inode number for simplicity in this design
-        Ok(ReplyOpen { fh: inode, flags: 0 })
+        Ok(ReplyOpen {
+            fh: inode,
+            flags: 0,
+        })
     }
 
     async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> FuseResult<ReplyOpen> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Opendir: inode = {}", inode);
 
-        Ok(ReplyOpen { fh: inode, flags: 0 })
+        Ok(ReplyOpen {
+            fh: inode,
+            flags: 0,
+        })
     }
 
     async fn read(
@@ -1534,7 +1551,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let file_path = format!("inode_{}", ino);
                 // 1. Physically delete blocks from NVMe/S3 via router
                 let _ = self.router.delete_file(&file_path, &mut con).await;
-                
+
                 // 2. Delete inline payload if any
                 let inline_key = format!("inline_data:{}", file_path);
                 let _: Result<(), _> = con.del(&inline_key).await;
@@ -1544,7 +1561,7 @@ impl Filesystem for SqueezefsFilesystem {
             // Also update the physical/routing size in the metadata block?
             let meta_key = format!("metadata:inode_{}", ino);
             pipe.hset(&meta_key, "size", size);
-            
+
             // Fix: If truncated to 0, reset type to inline so it doesn't look for deleted staged/striped blocks
             if size == 0 && old_size > 0 {
                 pipe.hset(&meta_key, "type", "inline");
@@ -1881,7 +1898,9 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, new_parent, new_name_str
         );
 
-        if (parent == 1 && name_str == ".config.sqz") || (new_parent == 1 && new_name_str == ".config.sqz") {
+        if (parent == 1 && name_str == ".config.sqz")
+            || (new_parent == 1 && new_name_str == ".config.sqz")
+        {
             return Err(Errno::from(libc::EPERM));
         }
 
@@ -2122,7 +2141,8 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             if !inos_to_fetch.is_empty() {
-                let kind_nums: Vec<Option<u8>> = pipe.query_async(&mut con).await.unwrap_or_default();
+                let kind_nums: Vec<Option<u8>> =
+                    pipe.query_async(&mut con).await.unwrap_or_default();
                 for (idx, child_ino) in inos_to_fetch.iter().enumerate() {
                     let kind_num = kind_nums.get(idx).and_then(|v| *v).unwrap_or(1);
                     let kind = match kind_num {
@@ -2144,7 +2164,10 @@ impl Filesystem for SqueezefsFilesystem {
             if name == "." || name == ".." {
                 continue;
             }
-            let kind = kind_map.get(&child_ino).cloned().unwrap_or(FileType::RegularFile);
+            let kind = kind_map
+                .get(&child_ino)
+                .cloned()
+                .unwrap_or(FileType::RegularFile);
 
             entries.push(DirectoryEntry {
                 name: name.into(),
@@ -2251,7 +2274,9 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             // Check if it's already in our local DashMap cache
-            let is_cached = self.attr_cache.get(child_ino)
+            let is_cached = self
+                .attr_cache
+                .get(child_ino)
                 .map(|e| e.value().1.elapsed() < Duration::from_secs(1))
                 .unwrap_or(false);
 
@@ -2267,11 +2292,11 @@ impl Filesystem for SqueezefsFilesystem {
                 pipe.query_async(&mut con).await.unwrap_or_default();
 
             // 3. Process the results and stick them into self.attr_cache
-            for (ino, fields) in inos_to_fetch.into_iter().zip(bulk_attrs.into_iter()) {
+            for (ino, fields) in inos_to_fetch.into_iter().zip(bulk_attrs) {
                 if fields.is_empty() {
                     continue;
                 }
-                
+
                 let ino_parsed = fields
                     .get("ino")
                     .and_then(|v| v.parse().ok())
@@ -2353,7 +2378,8 @@ impl Filesystem for SqueezefsFilesystem {
                     rdev,
                     blksize,
                 };
-                self.attr_cache.insert(ino, (attr, std::time::Instant::now()));
+                self.attr_cache
+                    .insert(ino, (attr, std::time::Instant::now()));
             }
         }
 
@@ -2544,7 +2570,12 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Perform write to destination
         self.router
-            .write_file(&dest_path, off_out, chunk, dest_lease.as_ref().unwrap().fencing_token())
+            .write_file(
+                &dest_path,
+                off_out,
+                chunk,
+                dest_lease.as_ref().unwrap().fencing_token(),
+            )
             .await
             .map_err(map_squeezefs_err)?;
 
@@ -2580,12 +2611,13 @@ impl Filesystem for SqueezefsFilesystem {
         let used_bytes_opt: Option<u64> = con.get("squeezefs:used_bytes").await.map_err(map_err)?;
         let used_bytes = used_bytes_opt.unwrap_or(0);
 
-        let used_inodes_opt: Option<u64> = con.get("squeezefs:used_inodes").await.map_err(map_err)?;
+        let used_inodes_opt: Option<u64> =
+            con.get("squeezefs:used_inodes").await.map_err(map_err)?;
         let used_inodes = used_inodes_opt.unwrap_or(0);
 
         let bsize = 4096;
         let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
-        
+
         let capacity = if format_exists {
             let cap_str: Option<String> = con
                 .hget("squeezefs:format", "capacity")
@@ -2603,9 +2635,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .hget("squeezefs:format", "inodes")
                 .await
                 .map_err(map_err)?;
-            limit_str
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
+            limit_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
         } else {
             0
         };
@@ -2649,7 +2679,10 @@ impl Filesystem for SqueezefsFilesystem {
 
         // 3. Flush the staging blocks concurrently to backend (S3/RustFS)
         if let Err(e) = self.flush_active_blocks(ino, fencing_token).await {
-            warn!("FUSE Flush failed for ino {}, but masking error for editor compatibility: {:?}", ino, e);
+            warn!(
+                "FUSE Flush failed for ino {}, but masking error for editor compatibility: {:?}",
+                ino, e
+            );
         }
 
         Ok(())
@@ -2706,19 +2739,16 @@ impl Filesystem for SqueezefsFilesystem {
 
         // 3. Flush the staging blocks concurrently to backend (S3/RustFS)
         if let Err(e) = self.flush_active_blocks(ino, fencing_token).await {
-            warn!("FUSE Fsync failed for ino {}, but masking error for editor compatibility: {:?}", ino, e);
+            warn!(
+                "FUSE Fsync failed for ino {}, but masking error for editor compatibility: {:?}",
+                ino, e
+            );
         }
 
         Ok(())
     }
 
-    async fn fsyncdir(
-        &self,
-        _req: Request,
-        ino: u64,
-        _fh: u64,
-        _datasync: bool,
-    ) -> FuseResult<()> {
+    async fn fsyncdir(&self, _req: Request, ino: u64, _fh: u64, _datasync: bool) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Fsyncdir: ino = {}", ino);
         // Directories are updated synchronously in Garnet, so we just return Ok.
@@ -2735,14 +2765,17 @@ impl Filesystem for SqueezefsFilesystem {
         mode: u32,
     ) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        debug!("FUSE Fallocate: ino = {}, offset = {}, length = {}, mode = {}", ino, offset, length, mode);
+        debug!(
+            "FUSE Fallocate: ino = {}, offset = {}, length = {}, mode = {}",
+            ino, offset, length, mode
+        );
 
         // Pre-allocation isn't strictly required to reserve physical space in our S3-backed store
         // as S3 objects are sparse/dynamic by nature. We just update the size attribute if we are extending.
         if mode & libc::FALLOC_FL_KEEP_SIZE as u32 == 0 {
             let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
             let attr_key = format!("squeezefs:attr:{}", ino);
-            
+
             // Check if inode exists first
             let exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
             if !exists {
@@ -2751,7 +2784,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             let old_size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
             let old_size = old_size_opt.unwrap_or(0);
-            
+
             let target_size = offset + length;
             if target_size > old_size {
                 let diff = target_size - old_size;
@@ -2759,15 +2792,15 @@ impl Filesystem for SqueezefsFilesystem {
 
                 let mut pipe = redis::pipe();
                 pipe.hset(&attr_key, "size", target_size);
-                
+
                 let meta_key = format!("metadata:inode_{}", ino);
                 pipe.hset(&meta_key, "size", target_size);
-                
+
                 let diff = target_size - old_size;
                 pipe.incr("squeezefs:used_bytes", diff);
-                
+
                 let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
-                
+
                 // Invalidate cached attributes
                 self.attr_cache.remove(&ino);
                 let file_path = format!("inode_{}", ino);
@@ -3013,15 +3046,14 @@ impl Filesystem for SqueezefsFilesystem {
         _out_size: u32,
     ) -> FuseResult<ReplyIoctl> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        debug!("FUSE ioctl: inode = {}, cmd = {}, flags = {}", inode, cmd, flags);
-        
+        debug!(
+            "FUSE ioctl: inode = {}, cmd = {}, flags = {}",
+            inode, cmd, flags
+        );
+
         match cmd as u64 {
-            libc::FS_IOC_GETFLAGS => {
-                Err(Errno::from(libc::ENOTTY))
-            }
-            libc::FS_IOC_SETFLAGS => {
-                Err(Errno::from(libc::ENOTTY))
-            }
+            libc::FS_IOC_GETFLAGS => Err(Errno::from(libc::ENOTTY)),
+            libc::FS_IOC_SETFLAGS => Err(Errno::from(libc::ENOTTY)),
             _ => Err(Errno::from(libc::ENOTTY)),
         }
     }
@@ -3040,9 +3072,13 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
-        let mut con = self.dlm.get_connection().await.map_err(|_| Errno::from(libc::EIO))?;
+        let mut con = self
+            .dlm
+            .get_connection()
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
         let xattr_key = format!("squeezefs:xattr:{}", inode);
-        
+
         let _: () = redis::cmd("HSET")
             .arg(&xattr_key)
             .arg(name_str)
@@ -3065,8 +3101,12 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
-        
-        let mut con = self.dlm.get_connection().await.map_err(|_| Errno::from(libc::EIO))?;
+
+        let mut con = self
+            .dlm
+            .get_connection()
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
         let xattr_key = format!("squeezefs:xattr:{}", inode);
         let value: Option<Vec<u8>> = redis::cmd("HGET")
             .arg(&xattr_key)
@@ -3091,22 +3131,31 @@ impl Filesystem for SqueezefsFilesystem {
         }
     }
 
-    async fn listxattr(&self, _req: Request, inode: Inode, size: u32) -> FuseResult<fuse3::raw::reply::ReplyXAttr> {
+    async fn listxattr(
+        &self,
+        _req: Request,
+        inode: Inode,
+        size: u32,
+    ) -> FuseResult<fuse3::raw::reply::ReplyXAttr> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        let mut con = self.dlm.get_connection().await.map_err(|_| Errno::from(libc::EIO))?;
+        let mut con = self
+            .dlm
+            .get_connection()
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
         let xattr_key = format!("squeezefs:xattr:{}", inode);
         let keys: Vec<String> = redis::cmd("HKEYS")
             .arg(&xattr_key)
             .query_async(&mut con)
             .await
             .map_err(|_| Errno::from(libc::EIO))?;
-            
+
         let mut data = Vec::new();
         for key in keys {
             data.extend_from_slice(key.as_bytes());
             data.push(0); // Null-terminated strings
         }
-        
+
         if size == 0 {
             return Ok(fuse3::raw::reply::ReplyXAttr::Size(data.len() as u32));
         }
@@ -3122,7 +3171,11 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
-        let mut con = self.dlm.get_connection().await.map_err(|_| Errno::from(libc::EIO))?;
+        let mut con = self
+            .dlm
+            .get_connection()
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
         let xattr_key = format!("squeezefs:xattr:{}", inode);
         let deleted: i32 = redis::cmd("HDEL")
             .arg(&xattr_key)
@@ -3130,7 +3183,7 @@ impl Filesystem for SqueezefsFilesystem {
             .query_async(&mut con)
             .await
             .map_err(|_| Errno::from(libc::EIO))?;
-            
+
         if deleted == 0 {
             #[cfg(target_os = "macos")]
             return Err(Errno::from(libc::ENOATTR));
@@ -3272,7 +3325,10 @@ pub async fn start_mount<P: AsRef<Path>>(
             }
         }
         if ready {
-            println!("\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}", mount_path_clone);
+            println!(
+                "\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}",
+                mount_path_clone
+            );
         }
     });
 
@@ -3496,8 +3552,14 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
         .get("active_write_backend")
         .cloned()
         .unwrap_or_default();
-    let compression = fields.get("compression").cloned().unwrap_or_else(|| "none".to_string());
-    let encrypt_algo = fields.get("encrypt_algo").cloned().unwrap_or_else(|| "none".to_string());
+    let compression = fields
+        .get("compression")
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
+    let encrypt_algo = fields
+        .get("encrypt_algo")
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
 
     Ok(serde_json::json!({
         "Setting": {

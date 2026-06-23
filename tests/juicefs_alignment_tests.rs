@@ -254,7 +254,7 @@ async fn test_stale_mount_warning_only() {
     // If we pass a nonexistent path or trigger an ENOTCONN, it should fail
     // We can simulate an ENOTCONN by checking if mounting on a stale directory returns standard error rather than unmounting it.
     // We check if start_mount returns standard IO error for invalid setups.
-    let res = start_mount("/nonexistent/mountpoint/path/here", fs, 1000, 1000).await;
+    let res = start_mount("/nonexistent/mountpoint/path/here", fs, 1000, 1000, false, true, None).await;
     assert!(res.is_err(), "Mount should fail on invalid path");
 }
 

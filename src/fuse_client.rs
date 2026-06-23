@@ -2940,23 +2940,67 @@ pub async fn start_mount<P: AsRef<Path>>(
     fs: SqueezefsFilesystem,
     uid: u32,
     gid: u32,
+    writeback: bool,
+    allow_other: bool,
+    custom_opts: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = MountOptions::default();
     options.uid(uid);
     options.gid(gid);
-    options.allow_other(true);
-    options.write_back(false);
+    options.allow_other(allow_other);
+    options.write_back(writeback);
     options.default_permissions(true);
 
-    // fuse3 Mount parameters
-    options.custom_options("max_read=1048576");
+    if let Some(opts) = custom_opts {
+        for opt in opts.split(',') {
+            let opt_trimmed = opt.trim();
+            if !opt_trimmed.is_empty() {
+                options.custom_options(opt_trimmed);
+            }
+        }
+    } else {
+        // default custom option
+        options.custom_options("max_read=1048576");
+    }
 
+    info!(
+        "SqueezeFS version {} initializing mount",
+        env!("CARGO_PKG_VERSION")
+    );
     info!(
         "FUSE Daemon: Mounting squeezefs at {:?}...",
         mountpoint.as_ref()
     );
 
     let mount_path = mountpoint.as_ref().to_path_buf();
+
+    // Spawn a background task to check mountpoint readiness (OK status print for foreground mounts)
+    let mount_path_clone = mount_path.clone();
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let mut ready = false;
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Ok(metadata) = std::fs::metadata(&mount_path_clone) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.ino() == 1 {
+                        ready = true;
+                        break;
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        if ready {
+            println!("\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}", mount_path_clone);
+        }
+    });
 
     // Check for stale FUSE mount (ENOTCONN or EIO)
     #[cfg(target_os = "linux")]
@@ -2986,7 +3030,7 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options)
-        .mount(fs, mount_path)
+        .mount(fs, mount_path.clone())
         .await?;
 
     let mut handle = session;
@@ -3001,24 +3045,24 @@ pub async fn start_mount<P: AsRef<Path>>(
             if let (Ok(mut sigterm), Ok(mut sigint)) = (sigterm_opt, sigint_opt) {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
-                        info!("Received Ctrl+C, unmounting filesystem...");
+                        info!("Received Ctrl+C, exiting...");
                     }
                     _ = sigterm.recv() => {
-                        info!("Received SIGTERM, unmounting filesystem...");
+                        info!("Received SIGTERM, exiting...");
                     }
                     _ = sigint.recv() => {
-                        info!("Received SIGINT, unmounting filesystem...");
+                        info!("Received SIGINT, exiting...");
                     }
                 }
             } else {
                 let _ = tokio::signal::ctrl_c().await;
-                info!("Received Ctrl+C, unmounting filesystem...");
+                info!("Received Ctrl+C, exiting...");
             }
         }
         #[cfg(not(unix))]
         {
             let _ = tokio::signal::ctrl_c().await;
-            info!("Received Ctrl+C, unmounting filesystem...");
+            info!("Received Ctrl+C, exiting...");
         }
     };
 
@@ -3037,8 +3081,8 @@ pub async fn start_mount<P: AsRef<Path>>(
                 error!("Failed to unmount filesystem: {:?}", e);
                 eprintln!("Failed to unmount filesystem: {:?}", e);
             } else {
-                info!("Filesystem unmounted successfully.");
-                println!("Filesystem unmounted successfully.");
+                info!("The squeezefs mount process exit successfully, mountpoint: {:?}", mount_path.to_string_lossy());
+                println!("The squeezefs mount process exit successfully, mountpoint: {:?}", mount_path.to_string_lossy());
             }
         }
     }

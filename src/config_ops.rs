@@ -567,3 +567,37 @@ pub async fn disable_storage_backend(
     Ok(())
 }
 
+pub async fn set_config_quota(
+    redis_url: &str,
+    _fs_name: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let mut con = connect_redis(redis_url).await?;
+
+    match key.to_lowercase().as_str() {
+        "capacity" => {
+            let bytes = crate::cache::parse_size_string(value, 0)?;
+            let _: () = con.hset("squeezefs:format", "capacity", bytes).await?;
+            println!("Configuration quota 'capacity' set to {} bytes.", bytes);
+        }
+        "inodes" => {
+            let limit: u64 = value.parse().map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "Invalid inodes value '{}': {:?}",
+                    value, e
+                ))
+            })?;
+            let _: () = con.hset("squeezefs:format", "inodes", limit).await?;
+            println!("Configuration quota 'inodes' set to {}.", limit);
+        }
+        _ => {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "Invalid config quota key '{}'. Supported keys: 'capacity', 'inodes'",
+                key
+            )));
+        }
+    }
+    Ok(())
+}
+

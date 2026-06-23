@@ -1,5 +1,6 @@
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::format_volume;
+use redis::AsyncCommands;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -368,4 +369,52 @@ async fn test_multi_backend_sharding_status_routing() {
     multi_backend.set_backend_status("backend_0", "disabled");
     let fallback_selected = multi_backend.get_backend_for_key(&target_key);
     assert!(fallback_selected == "backend_0" || fallback_selected == "backend_1");
+}
+
+#[tokio::test]
+async fn test_set_config_quotas() {
+    let dlm = match setup_test_volume("vol_quota_test").await {
+        Some(d) => d,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
+            return;
+        }
+    };
+
+    let fs_name = "vol_quota_test";
+    let redis_url = get_redis_url();
+    let mut con = dlm.meta_client().get_connection().await.unwrap();
+
+    // 1. Verify initial defaults (from format_volume)
+    let initial_cap: u64 = con.hget("squeezefs:format", "capacity").await.unwrap_or(0);
+    assert_eq!(initial_cap, 1024 * 1024); // formatted to 1MB in setup_test_volume
+
+    let initial_inodes: u64 = con.hget("squeezefs:format", "inodes").await.unwrap_or(0);
+    assert_eq!(initial_inodes, 0); // unlimited in setup_test_volume
+
+    // 2. Set capacity to "10G" and verify
+    squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "capacity", "10G")
+        .await
+        .expect("Should set capacity to 10G");
+    let updated_cap: u64 = con.hget("squeezefs:format", "capacity").await.unwrap();
+    assert_eq!(updated_cap, 10 * 1024 * 1024 * 1024);
+
+    // 3. Set capacity to "2T" and verify
+    squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "capacity", "2T")
+        .await
+        .expect("Should set capacity to 2T");
+    let updated_cap_p: u64 = con.hget("squeezefs:format", "capacity").await.unwrap();
+    assert_eq!(updated_cap_p, 2 * 1024 * 1024 * 1024 * 1024);
+
+    // 4. Set inodes to "5000000" and verify
+    squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "inodes", "5000000")
+        .await
+        .expect("Should set inodes to 5000000");
+    let updated_inodes: u64 = con.hget("squeezefs:format", "inodes").await.unwrap();
+    assert_eq!(updated_inodes, 5_000_000);
+
+    // 5. Try setting an invalid quota key -> should fail
+    let res_invalid = squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "invalid_quota_key", "10")
+        .await;
+    assert!(res_invalid.is_err());
 }

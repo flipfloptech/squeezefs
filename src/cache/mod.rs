@@ -9,15 +9,18 @@ use std::path::PathBuf;
 #[derive(Clone)]
 pub struct TieredCache {
     pub gds: gds::GdsCache,
-    pub lru: lru::LruCache,
+    pub read_lru: lru::LruCache,
+    pub write_lru: lru::LruCache,
     pub nvme: nvme::NvmeStaging,
 }
 
 impl TieredCache {
     pub fn new(
         staging_dirs: Vec<PathBuf>,
-        mem_cache_size: Option<&str>,
-        disk_cache_size: Option<&str>,
+        read_mem_cache_size: Option<&str>,
+        write_mem_cache_size: Option<&str>,
+        read_disk_cache_size: Option<&str>,
+        write_disk_cache_size: Option<&str>,
         backend: RustFsClient,
         redis_client: crate::dlm::MetaClient,
     ) -> Result<Self> {
@@ -27,25 +30,54 @@ impl TieredCache {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_memory = sys.total_memory(); // In bytes
-        let mem_limit = if let Some(mem_cfg) = mem_cache_size {
-            parse_size_string(mem_cfg, total_memory)?
+
+        let read_mem_limit = if let Some(cfg) = read_mem_cache_size {
+            parse_size_string(cfg, total_memory)?
         } else {
-            // Default 20% of system RAM
-            total_memory / 5
+            // Default 10% of system RAM
+            total_memory / 10
         };
-        let lru = lru::LruCache::with_capacity(mem_limit);
+
+        let write_mem_limit = if let Some(cfg) = write_mem_cache_size {
+            parse_size_string(cfg, total_memory)?
+        } else {
+            // Default 10% of system RAM
+            total_memory / 10
+        };
+
+        let read_lru = lru::LruCache::with_capacity(read_mem_limit);
+        let write_lru = lru::LruCache::with_capacity(write_mem_limit);
 
         // 2. Get disk size limit
         let aggregate_capacity = get_aggregate_disk_capacity(&staging_dirs);
-        let disk_limit = if let Some(disk_cfg) = disk_cache_size {
-            parse_size_string(disk_cfg, aggregate_capacity)?
+
+        let read_disk_limit = if let Some(cfg) = read_disk_cache_size {
+            parse_size_string(cfg, aggregate_capacity)?
         } else {
-            // Default 50% of aggregate capacity
-            aggregate_capacity / 2
+            // Default 25% of aggregate capacity
+            aggregate_capacity / 4
         };
 
-        let nvme = nvme::NvmeStaging::new(staging_dirs, disk_limit, backend, redis_client)?;
-        Ok(Self { gds, lru, nvme })
+        let write_disk_limit = if let Some(cfg) = write_disk_cache_size {
+            parse_size_string(cfg, aggregate_capacity)?
+        } else {
+            // Default 25% of aggregate capacity
+            aggregate_capacity / 4
+        };
+
+        let nvme = nvme::NvmeStaging::new(
+            staging_dirs,
+            write_disk_limit,
+            read_disk_limit,
+            backend,
+            redis_client,
+        )?;
+        Ok(Self {
+            gds,
+            read_lru,
+            write_lru,
+            nvme,
+        })
     }
 }
 

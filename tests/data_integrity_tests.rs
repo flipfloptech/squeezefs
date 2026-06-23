@@ -58,15 +58,25 @@ async fn test_data_integrity_various_sizes() {
     format_volume(
         &redis_url,
         fs_name,
-        4 * 1024 * 1024,          // 4MB block size
-        100 * 1024 * 1024 * 1024, // 100GB capacity
-        0,                        // inodes limit
-        "none",                   // compression
-        "none",                   // encrypt_algo
-        None,                     // encrypt_key
+        4 * 1024 * 1024,
+        // 4MB block size
+        100 * 1024 * 1024 * 1024,
+        // 100GB capacity
+        0,
+        // inodes limit
+        "none",
+        // compression
+        "none",
+        // encrypt_algo
+        None,
+        // encrypt_key
         Some("128MB"),
         Some("500MB"),
         Some(&[PathBuf::from("/tmp/squeezefs_staging_integrity")]),
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -84,6 +94,8 @@ async fn test_data_integrity_various_sizes() {
     let cache = TieredCache::new(
         vec![temp_staging.path().to_path_buf()],
         Some("128MB"),
+        Some("128MB"),
+        Some("500MB"),
         Some("500MB"),
         backend.clone(),
         dlm.meta_client().clone(),
@@ -134,6 +146,8 @@ async fn test_data_integrity_various_sizes() {
     let cache_recreate = TieredCache::new(
         vec![temp_staging.path().to_path_buf()],
         Some("128MB"),
+        Some("128MB"),
+        Some("500MB"),
         Some("500MB"),
         backend.clone(),
         dlm.meta_client().clone(),

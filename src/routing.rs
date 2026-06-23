@@ -168,7 +168,8 @@ impl DataRouter {
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
 
-            self.cache.lru.put(file_path, Arc::new(existing_data));
+            self.cache.write_lru.put(file_path, Arc::new(existing_data));
+            self.cache.read_lru.remove(file_path);
         } else if new_size <= 4 * 1024 * 1024 {
             // Layout: staged
             let new_file_id = Uuid::new_v4().to_string();
@@ -191,24 +192,69 @@ impl DataRouter {
 
             let _: () = pipe.query_async(&mut con).await?;
 
-            // Stage write locally
-            self.cache
+            // Stage write locally (fallback to direct S3 upload if staging is full)
+            let stage_res = self
+                .cache
                 .nvme
                 .stage_write(file_path, &new_file_id, &existing_data, fencing_token)
-                .await?;
+                .await;
 
-            if let Some(old_id) = old_file_id {
-                let old_staged_path = self
-                    .cache
-                    .nvme
-                    .get_staged_path(&old_id)
-                    .join(format!("{}.staged", old_id));
-                let _ = tokio::fs::remove_file(old_staged_path).await;
-                let mapping_key = format!("mapping:{}", old_id);
-                let _: () = con.del(&mapping_key).await.unwrap_or(());
+            match stage_res {
+                Ok(_) => {
+                    if let Some(old_id) = old_file_id {
+                        let old_staged_path = self
+                            .cache
+                            .nvme
+                            .get_staged_path(&old_id)
+                            .join(format!("{}.staged", old_id));
+                        let _ = tokio::fs::remove_file(old_staged_path).await;
+                        let mapping_key = format!("mapping:{}", old_id);
+                        let _: () = con.del(&mapping_key).await.unwrap_or(());
+                    }
+                }
+                Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
+                    log::warn!("NVMe write staging cache full. Falling back to direct synchronous S3 upload for: {}", file_path);
+
+                    // 1. Process data (encryption and compression)
+                    let processed_data = self.get_crypto().process_write(&existing_data)?;
+
+                    // 2. Upload block directly to S3
+                    let direct_block_uuid = uuid::Uuid::new_v4().to_string();
+                    let block_key = format!("blocks/direct/{}", direct_block_uuid);
+                    let active_be = self.backend.get_backend_for_key(&block_key);
+                    let stored_block_key = format!("{}:{}", active_be, block_key);
+
+                    self.backend
+                        .put_object(&block_key, processed_data.clone(), fencing_token)
+                        .await?;
+
+                    // 3. Register mapping:new_file_id -> block, offset=0, size=processed_len
+                    let mapping_key = format!("mapping:{}", new_file_id);
+                    let size = processed_data.len() as u64;
+                    let _: () = redis::pipe()
+                        .hset(&mapping_key, "block", &stored_block_key)
+                        .hset(&mapping_key, "offset", 0u64)
+                        .hset(&mapping_key, "size", size)
+                        .query_async(&mut con)
+                        .await?;
+
+                    // 4. Remove old staged files if any
+                    if let Some(old_id) = old_file_id {
+                        let old_staged_path = self
+                            .cache
+                            .nvme
+                            .get_staged_path(&old_id)
+                            .join(format!("{}.staged", old_id));
+                        let _ = tokio::fs::remove_file(old_staged_path).await;
+                        let old_mapping_key = format!("mapping:{}", old_id);
+                        let _: () = con.del(&old_mapping_key).await.unwrap_or(());
+                    }
+                }
+                Err(e) => return Err(e),
             }
 
-            self.cache.lru.put(file_path, Arc::new(existing_data));
+            self.cache.write_lru.put(file_path, Arc::new(existing_data));
+            self.cache.read_lru.remove(file_path);
         } else {
             // Layout: striped
             let file_uuid = Uuid::new_v4().to_string();
@@ -316,7 +362,8 @@ impl DataRouter {
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
 
-            self.cache.lru.put(file_path, Arc::new(existing_data));
+            self.cache.write_lru.put(file_path, Arc::new(existing_data));
+            self.cache.read_lru.remove(file_path);
         }
 
         Ok(())
@@ -516,15 +563,20 @@ impl DataRouter {
             .query_async(con)
             .await?;
 
-        // If file data is fully cached in unified RAM cache, patch it there too
-        if let Some(mut cached_data) = self.cache.lru.get(file_path) {
+        // If file data is fully cached in RAM, update/invalidate
+        let mut found_data = self.cache.write_lru.get(file_path);
+        if found_data.is_none() {
+            found_data = self.cache.read_lru.get(file_path);
+        }
+        if let Some(mut cached_data) = found_data {
             let end_offset = end_pos as usize;
             let data_vec = Arc::make_mut(&mut cached_data);
             if data_vec.len() < end_offset {
                 data_vec.resize(end_offset, 0);
             }
             data_vec[offset as usize..end_offset].copy_from_slice(data);
-            self.cache.lru.put(file_path, cached_data);
+            self.cache.write_lru.put(file_path, cached_data);
+            self.cache.read_lru.remove(file_path);
         }
 
         Ok(())
@@ -532,11 +584,15 @@ impl DataRouter {
 
     /// Read file data, attempting to satisfy the read via the fastest cache tier.
     pub async fn read_file(&self, file_path: &str) -> Result<Vec<u8>> {
-        // Tier 2 check: System RAM LRU Cache
-        if let Some(cached_data) = self.cache.lru.get(file_path) {
+        // Tier 2 check: System RAM LRU Caches
+        let mut cached_opt = self.cache.write_lru.get(file_path);
+        if cached_opt.is_none() {
+            cached_opt = self.cache.read_lru.get(file_path);
+        }
+        if let Some(cached_data) = cached_opt {
             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!(
-                "Routing: Cache hit (Tier 2 - Unified System RAM) for '{}'",
+                "Routing: Cache hit (Tier 2 - System RAM) for '{}'",
                 file_path
             );
             return Ok((*cached_data).clone());
@@ -687,8 +743,8 @@ impl DataRouter {
             }
         };
 
-        // Cache in Tier 2: System RAM
-        self.cache.lru.put(file_path, Arc::new(data.clone()));
+        // Cache in Tier 2: System RAM (Read Cache)
+        self.cache.read_lru.put(file_path, Arc::new(data.clone()));
 
         Ok(data)
     }
@@ -700,8 +756,12 @@ impl DataRouter {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>> {
-        // Tier 2 check: System RAM LRU Cache
-        if let Some(cached_data) = self.cache.lru.get(file_path) {
+        // Tier 2 check: System RAM LRU Caches
+        let mut cached_opt = self.cache.write_lru.get(file_path);
+        if cached_opt.is_none() {
+            cached_opt = self.cache.read_lru.get(file_path);
+        }
+        if let Some(cached_data) = cached_opt {
             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
             let start = std::cmp::min(offset as usize, cached_data.len());
             let end = std::cmp::min((offset + size as u64) as usize, cached_data.len());
@@ -1080,8 +1140,12 @@ impl DataRouter {
                 .hset(&dest_meta_key, "fencing_token", dest_lock.fencing_token());
             let _: () = pipe.query_async(&mut con).await?;
 
-            if let Some(cached) = self.cache.lru.get(src) {
-                self.cache.lru.put(dest, cached);
+            let mut cached_opt = self.cache.write_lru.get(src);
+            if cached_opt.is_none() {
+                cached_opt = self.cache.read_lru.get(src);
+            }
+            if let Some(cached) = cached_opt {
+                self.cache.write_lru.put(dest, cached);
             }
         } else if file_type == "staged" {
             let src_file_id_opt: Option<String> = con.hget(&src_meta_key, "file_id").await?;
@@ -1145,8 +1209,12 @@ impl DataRouter {
 
             let _: () = pipe.query_async(&mut con).await?;
 
-            if let Some(cached) = self.cache.lru.get(src) {
-                self.cache.lru.put(dest, cached);
+            let mut cached_opt = self.cache.write_lru.get(src);
+            if cached_opt.is_none() {
+                cached_opt = self.cache.read_lru.get(src);
+            }
+            if let Some(cached) = cached_opt {
+                self.cache.write_lru.put(dest, cached);
             }
         } else if file_type == "striped" {
             let src_block_map_id_opt: Option<String> =
@@ -1220,8 +1288,12 @@ impl DataRouter {
                 .hset(&dest_meta_key, "fencing_token", dest_lock.fencing_token());
             let _: () = pipe_meta.query_async(&mut con).await?;
 
-            if let Some(cached) = self.cache.lru.get(src) {
-                self.cache.lru.put(dest, cached);
+            let mut cached_opt = self.cache.write_lru.get(src);
+            if cached_opt.is_none() {
+                cached_opt = self.cache.read_lru.get(src);
+            }
+            if let Some(cached) = cached_opt {
+                self.cache.write_lru.put(dest, cached);
             }
         }
 
@@ -1307,7 +1379,8 @@ impl DataRouter {
                 }
             }
         }
-        self.cache.lru.remove(file_path);
+        self.cache.write_lru.remove(file_path);
+        self.cache.read_lru.remove(file_path);
         Ok(())
     }
 

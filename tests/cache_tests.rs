@@ -181,12 +181,13 @@ async fn test_nvme_cache_separation_limits() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify both are tracked independently in their respective fields
-    assert_eq!(nvme.current_staged_write_bytes(), 6 * 1024 + 4096); // staged uses aligned/padded length
+    assert_eq!(nvme.current_staged_write_bytes(), 8192); // staged uses aligned/padded length
     assert_eq!(nvme.current_read_cache_bytes(), 8 * 1024);
 
     // 3. Trying to write another 6KB should fail with StorageFull because 6KB + 6KB > 10KB
     let data_write_2 = vec![1u8; 6 * 1024];
-    let err = nvme.stage_write("test_write_2.txt", "file-id-write-2", &data_write_2, 101)
+    let err = nvme
+        .stage_write("test_write_2.txt", "file-id-write-2", &data_write_2, 101)
         .await;
     assert!(err.is_err());
     let err_unwrapped = err.err().unwrap();
@@ -204,10 +205,10 @@ async fn test_nvme_read_cache_eviction() {
     let mock_backend = RustFsClient::new_mock();
     let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
 
-    // 10KB write capacity, 5KB read capacity
+    // 20KB write capacity, 5KB read capacity
     let nvme = NvmeStaging::new(
         vec![temp_dir.path().to_path_buf()],
-        10 * 1024,
+        20 * 1024,
         5 * 1024,
         mock_backend,
         squeezefs::dlm::MetaClient::Single(redis_client),
@@ -232,9 +233,18 @@ async fn test_nvme_read_cache_eviction() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify block 1 was evicted, but block 2 is present
-    assert!(nvme.read_cached_block("blocks/b1").is_none(), "b1 should have been evicted");
-    assert!(nvme.read_cached_block("blocks/b2").is_some(), "b2 should be present");
+    assert!(
+        nvme.read_cached_block("blocks/b1").is_none(),
+        "b1 should have been evicted"
+    );
+    assert!(
+        nvme.read_cached_block("blocks/b2").is_some(),
+        "b2 should be present"
+    );
 
     // Verify staged write was NOT evicted
-    assert!(nvme.read_staged("staged-id").is_some(), "Staged write must never be evicted");
+    assert!(
+        nvme.read_staged("staged-id").is_some(),
+        "Staged write must never be evicted"
+    );
 }

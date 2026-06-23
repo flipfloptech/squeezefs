@@ -30,6 +30,8 @@ async fn setup_router() -> Option<(DataRouter, tempfile::TempDir)> {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -90,7 +92,8 @@ async fn test_block_level_read_range_striped() {
     }
 
     // Clear System RAM cache first to force reading from S3/NVMe Block Cache
-    router.cache().lru.remove(file_path);
+    router.cache().write_lru.remove(file_path);
+    router.cache().read_lru.remove(file_path);
 
     // Record initial metrics
     let hits_before = METRICS.cache_hits.load(Ordering::Relaxed);

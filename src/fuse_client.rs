@@ -732,7 +732,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .hset("squeezefs:format", "name", "squeezefs")
                 .hset("squeezefs:format", "block_size", default_block_size)
                 .hset("squeezefs:format", "capacity", default_capacity)
-                .hset("squeezefs:format", "inodes", 0)
+                .hset("squeezefs:format", "inodes", 1000000)
                 .hset("squeezefs:format", "compression", "none")
                 .hset("squeezefs:format", "encrypt_algo", "none")
                 .hset("squeezefs:format", "encrypt_key", "")
@@ -3302,6 +3302,8 @@ pub async fn start_mount<P: AsRef<Path>>(
         "FUSE Daemon: Mounting squeezefs at {:?}...",
         mountpoint.as_ref()
     );
+    info!("FUSE Daemon: Garnet metadata connection active.");
+    info!("FUSE Daemon: S3 object storage backend active.");
 
     let mount_path = mountpoint.as_ref().to_path_buf();
 

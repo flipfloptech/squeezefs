@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone)]
 pub struct LruCache {
-    inner: Cache<String, Vec<u8>>,
+    inner: Cache<String, Arc<Vec<u8>>>,
     max_bytes: u64,
     current_bytes: Arc<AtomicU64>,
 }
@@ -31,12 +31,12 @@ impl LruCache {
         let current_bytes_clone = current_bytes.clone();
 
         let inner = Cache::builder()
-            .weigher(|_key, value: &Vec<u8>| -> u32 {
+            .weigher(|_key, value: &Arc<Vec<u8>>| -> u32 {
                 value.len().try_into().unwrap_or(u32::MAX)
             })
             .max_capacity(max_bytes)
-            .eviction_listener(move |_key, value: Vec<u8>, _cause| {
-                current_bytes_clone.fetch_sub(value.len() as u64, Ordering::SeqCst);
+            .eviction_listener(move |_key, value: Arc<Vec<u8>>, _cause| {
+                current_bytes_clone.fetch_sub(value.len() as u64, Ordering::Relaxed);
             })
             .build();
 
@@ -49,12 +49,12 @@ impl LruCache {
         let current_bytes_clone = current_bytes.clone();
 
         let inner = Cache::builder()
-            .weigher(|_key, value: &Vec<u8>| -> u32 {
+            .weigher(|_key, value: &Arc<Vec<u8>>| -> u32 {
                 value.len().try_into().unwrap_or(u32::MAX)
             })
             .max_capacity(max_bytes)
-            .eviction_listener(move |_key, value: Vec<u8>, _cause| {
-                current_bytes_clone.fetch_sub(value.len() as u64, Ordering::SeqCst);
+            .eviction_listener(move |_key, value: Arc<Vec<u8>>, _cause| {
+                current_bytes_clone.fetch_sub(value.len() as u64, Ordering::Relaxed);
             })
             .build();
 
@@ -62,26 +62,24 @@ impl LruCache {
     }
 
     /// Retrieve an entry from the cache, updating its LRU status.
-    pub fn get(&self, key: &str) -> Option<Vec<u8>> {
+    pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         self.inner.get(key)
     }
 
     /// Insert an entry into the cache, executing LRU eviction if maximum capacity is exceeded.
-    pub fn put(&self, key: &str, data: Vec<u8>) {
+    pub fn put(&self, key: &str, data: Arc<Vec<u8>>) {
         if (data.len() as u64) <= self.max_bytes {
-            self.current_bytes.fetch_add(data.len() as u64, Ordering::SeqCst);
+            self.current_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
             self.inner.insert(key.to_string(), data);
-            self.inner.run_pending_tasks();
         }
     }
 
     pub fn remove(&self, key: &str) {
         self.inner.invalidate(key);
-        self.inner.run_pending_tasks();
     }
 
     pub fn current_bytes(&self) -> u64 {
-        self.current_bytes.load(Ordering::SeqCst)
+        self.current_bytes.load(Ordering::Relaxed)
     }
 
     pub fn max_bytes(&self) -> u64 {

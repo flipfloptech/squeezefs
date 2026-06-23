@@ -18,8 +18,27 @@ use std::time::{Duration, SystemTime};
 use tokio::runtime::Builder;
 
 #[derive(Default)]
+pub struct ProbabilisticAtomic {
+    inner: AtomicU64,
+}
+
+impl ProbabilisticAtomic {
+    pub fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
+        if fastrand::u8(..) < 3 {
+            self.inner.fetch_add(val * 100, order)
+        } else {
+            self.inner.load(order)
+        }
+    }
+
+    pub fn load(&self, order: Ordering) -> u64 {
+        self.inner.load(order)
+    }
+}
+
+#[derive(Default)]
 pub struct Metrics {
-    pub fuse_ops: AtomicU64,
+    pub fuse_ops: ProbabilisticAtomic,
     pub meta_updates: AtomicU64,
     pub put_obj: AtomicU64,
     pub get_obj: AtomicU64,
@@ -1803,23 +1822,55 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        let mut child_inos = Vec::new();
+        for (name, child_ino) in &entries_map {
+            if name == "." || name == ".." {
+                continue;
+            }
+            child_inos.push(*child_ino);
+        }
+
+        let mut kind_map = std::collections::HashMap::new();
+        if !child_inos.is_empty() {
+            let mut pipe = redis::pipe();
+            let mut inos_to_fetch = Vec::new();
+            for child_ino in &child_inos {
+                if let Some(entry) = self.attr_cache.get(child_ino) {
+                    let (attr, cached_at) = entry.value();
+                    if cached_at.elapsed() < Duration::from_secs(1) {
+                        kind_map.insert(*child_ino, attr.kind);
+                        continue;
+                    }
+                }
+                let child_attr_key = format!("squeezefs:attr:{}", child_ino);
+                pipe.hget(&child_attr_key, "kind");
+                inos_to_fetch.push(*child_ino);
+            }
+
+            if !inos_to_fetch.is_empty() {
+                let kind_nums: Vec<Option<u8>> = pipe.query_async(&mut con).await.unwrap_or_default();
+                for (idx, child_ino) in inos_to_fetch.iter().enumerate() {
+                    let kind_num = kind_nums.get(idx).and_then(|v| *v).unwrap_or(1);
+                    let kind = match kind_num {
+                        2 => FileType::Directory,
+                        3 => FileType::Symlink,
+                        4 => FileType::NamedPipe,
+                        5 => FileType::CharDevice,
+                        6 => FileType::BlockDevice,
+                        7 => FileType::Socket,
+                        _ => FileType::RegularFile,
+                    };
+                    kind_map.insert(*child_ino, kind);
+                }
+            }
+        }
+
         let mut current_offset = (entries.len() + 1) as i64;
         for (name, child_ino) in entries_map {
             if name == "." || name == ".." {
                 continue;
             }
-            // Retrieve kind of child_ino
-            let child_attr_key = format!("squeezefs:attr:{}", child_ino);
-            let kind_num: u8 = con.hget(&child_attr_key, "kind").await.unwrap_or(1);
-            let kind = match kind_num {
-                2 => FileType::Directory,
-                3 => FileType::Symlink,
-                4 => FileType::NamedPipe,
-                5 => FileType::CharDevice,
-                6 => FileType::BlockDevice,
-                7 => FileType::Socket,
-                _ => FileType::RegularFile,
-            };
+            let kind = kind_map.get(&child_ino).cloned().unwrap_or(FileType::RegularFile);
 
             entries.push(DirectoryEntry {
                 name: name.into(),
@@ -1898,6 +1949,122 @@ impl Filesystem for SqueezefsFilesystem {
                 attr_ttl: Duration::from_secs(1),
                 offset: 2,
             });
+        }
+
+        // 1. Gather all inodes we need attributes for that AREN'T in local cache
+        let mut pipe = redis::pipe();
+        let mut inos_to_fetch = Vec::new();
+
+        for (name, child_ino) in &entries_map {
+            if name == "." || name == ".." {
+                continue;
+            }
+
+            // Check if it's already in our local DashMap cache
+            let is_cached = self.attr_cache.get(child_ino)
+                .map(|e| e.value().1.elapsed() < Duration::from_secs(1))
+                .unwrap_or(false);
+
+            if !is_cached {
+                pipe.hgetall(format!("squeezefs:attr:{}", child_ino));
+                inos_to_fetch.push(*child_ino);
+            }
+        }
+
+        // 2. Fetch them ALL in exactly ONE network round-trip!
+        if !inos_to_fetch.is_empty() {
+            let bulk_attrs: Vec<std::collections::HashMap<String, String>> =
+                pipe.query_async(&mut con).await.unwrap_or_default();
+
+            // 3. Process the results and stick them into self.attr_cache
+            for (ino, fields) in inos_to_fetch.into_iter().zip(bulk_attrs.into_iter()) {
+                if fields.is_empty() {
+                    continue;
+                }
+                
+                let ino_parsed = fields
+                    .get("ino")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(ino);
+                let size = fields.get("size").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let blocks = fields
+                    .get("blocks")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let kind_num: u8 = fields.get("kind").and_then(|v| v.parse().ok()).unwrap_or(1);
+                let kind = match kind_num {
+                    2 => FileType::Directory,
+                    3 => FileType::Symlink,
+                    4 => FileType::NamedPipe,
+                    5 => FileType::CharDevice,
+                    6 => FileType::BlockDevice,
+                    7 => FileType::Socket,
+                    _ => FileType::RegularFile,
+                };
+                let perm = fields
+                    .get("perm")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0o644);
+                let nlink = fields
+                    .get("nlink")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                let uid = fields
+                    .get("uid")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(self.uid);
+                let gid = fields
+                    .get("gid")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(self.gid);
+                let rdev = fields.get("rdev").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let blksize = fields
+                    .get("blksize")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4096);
+
+                let atime_sec = fields
+                    .get("atime_sec")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let atime_nsec = fields
+                    .get("atime_nsec")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mtime_sec = fields
+                    .get("mtime_sec")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mtime_nsec = fields
+                    .get("mtime_nsec")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let ctime_sec = fields
+                    .get("ctime_sec")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let ctime_nsec = fields
+                    .get("ctime_nsec")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+
+                let attr = FileAttr {
+                    ino: ino_parsed,
+                    size,
+                    blocks,
+                    atime: Timestamp::new(atime_sec, atime_nsec),
+                    mtime: Timestamp::new(mtime_sec, mtime_nsec),
+                    ctime: Timestamp::new(ctime_sec, ctime_nsec),
+                    kind,
+                    perm,
+                    nlink,
+                    uid,
+                    gid,
+                    rdev,
+                    blksize,
+                };
+                self.attr_cache.insert(ino, (attr, std::time::Instant::now()));
+            }
         }
 
         let mut current_offset = (entries.len() + 1) as i64;

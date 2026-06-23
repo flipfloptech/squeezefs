@@ -218,9 +218,54 @@ enum ConfigActions {
     Fsck,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    #[cfg(unix)]
+    if let Commands::Mount { daemon: true, .. } = &cli.command {
+        unsafe {
+            let pid = libc::fork();
+            if pid < 0 {
+                eprintln!("Failed to fork daemon process");
+                std::process::exit(1);
+            } else if pid > 0 {
+                println!("Squeezefs daemon started (PID: {})", pid);
+                std::process::exit(0);
+            }
+            // Child process detaches
+            libc::setsid();
+            // Redirect stdin to /dev/null
+            if let Ok(null_file) = std::fs::File::open("/dev/null") {
+                use std::os::unix::io::AsRawFd;
+                libc::dup2(null_file.as_raw_fd(), 0);
+            }
+            // Redirect stdout/stderr to log_file if provided, else /dev/null
+            let output_file = if let Some(ref path) = cli.log_file {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            } else {
+                None
+            };
+            if let Some(out_f) = output_file {
+                use std::os::unix::io::AsRawFd;
+                let fd = out_f.as_raw_fd();
+                libc::dup2(fd, 1);
+                libc::dup2(fd, 2);
+            } else if let Ok(null_file) = std::fs::File::open("/dev/null") {
+                use std::os::unix::io::AsRawFd;
+                let fd = null_file.as_raw_fd();
+                libc::dup2(fd, 1);
+                libc::dup2(fd, 2);
+            }
+        }
+    }
 
     let mut builder = env_logger::Builder::from_default_env();
     if let Some(ref log_path) = cli.log_file {
@@ -234,6 +279,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     builder.init();
 
+    // NOW start the Tokio runtime in the surviving process
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(8192)
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        run_app(cli).await
+    })
+}
+
+async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Format {
             name,
@@ -315,7 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             s3_access_key,
             s3_secret_key,
             s3_bucket,
-            daemon,
+            daemon: _,
             uid,
             gid,
             p2p_addr,
@@ -523,46 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Mounting Squeezefs at {:?}...", mountpoint);
 
-            if daemon {
-                unsafe {
-                    let pid = libc::fork();
-                    if pid < 0 {
-                        eprintln!("Failed to fork daemon process");
-                        std::process::exit(1);
-                    } else if pid > 0 {
-                        println!("Squeezefs daemon started (PID: {})", pid);
-                        std::process::exit(0);
-                    }
-                    // Child process detaches
-                    libc::setsid();
-                    // Redirect stdin to /dev/null
-                    if let Ok(null_file) = std::fs::File::open("/dev/null") {
-                        use std::os::unix::io::AsRawFd;
-                        libc::dup2(null_file.as_raw_fd(), 0);
-                    }
-                    // Redirect stdout/stderr to log_file if provided, else /dev/null
-                    let output_file = if let Some(ref path) = cli.log_file {
-                        std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(path)
-                            .ok()
-                    } else {
-                        None
-                    };
-                    if let Some(out_f) = output_file {
-                        use std::os::unix::io::AsRawFd;
-                        let fd = out_f.as_raw_fd();
-                        libc::dup2(fd, 1);
-                        libc::dup2(fd, 2);
-                    } else if let Ok(null_file) = std::fs::File::open("/dev/null") {
-                        use std::os::unix::io::AsRawFd;
-                        let fd = null_file.as_raw_fd();
-                        libc::dup2(fd, 1);
-                        libc::dup2(fd, 2);
-                    }
-                }
-            }
+            // Daemonization has already happened at the start of main() prior to Tokio runtime initialization.
 
             if let Some(ref addr) = p2p_addr {
                 let server = squeezefs::p2p::P2pServer::new(

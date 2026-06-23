@@ -112,9 +112,26 @@ cargo build --release
      --uid 1000 \
      --gid 1000
    ```
-   *Note: If needed, you can override S3 parameters at mount time by passing `--s3-endpoint`, `--s3-access-key`, `--s3-secret-key`, or `--s3-bucket` flags.*
+    *Note: S3 backend configuration is managed exclusively via the `squeezefs config` registry to keep nodes synchronized. Mount-time backend overrides are disabled.*
 
-5. **Run the benchmark tool** in a separate terminal:
+5. **(Optional) Configure multiple backends and update quotas at runtime**:
+   To scale throughput, you can add and enable multiple sharded storage backend endpoints, or dynamically adjust size/inode quotas:
+   ```bash
+   # Add a new named storage backend
+   ./target/release/squeezefs config "redis://127.0.0.1:6379" squeezefs-volume \
+     backend add rustfs-east --endpoint http://127.0.0.1:9001 --bucket squeezefs-data-east
+
+   # List backends and their active/disabled write status
+   ./target/release/squeezefs config "redis://127.0.0.1:6379" squeezefs-volume backend list
+
+   # Disable a storage backend for new writes (existing blocks remain readable)
+   ./target/release/squeezefs config "redis://127.0.0.1:6379" squeezefs-volume backend disable rustfs-east
+
+   # Change filesystem capacity quota at runtime
+   ./target/release/squeezefs config "redis://127.0.0.1:6379" squeezefs-volume set capacity 10T
+   ```
+
+6. **Run the benchmark tool** in a separate terminal:
    ```bash
    ./target/release/squeezefs bench --path /mnt/squeezefs --threads 8 --size 128
    ```

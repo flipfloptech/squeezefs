@@ -235,3 +235,137 @@ async fn test_fsck_detection() {
         "Fsck should report missing backend reference"
     );
 }
+
+#[tokio::test]
+async fn test_backend_duplicate_and_status_checks() {
+    let _dlm = match setup_test_volume("vol_dup_status_test").await {
+        Some(d) => d,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
+            return;
+        }
+    };
+
+    let fs_name = "vol_dup_status_test";
+    let redis_url = get_redis_url();
+
+    // 1. Add storage backend "be_1"
+    squeezefs::config_ops::add_storage_backend(
+        &redis_url,
+        fs_name,
+        "be_1",
+        "http://127.0.0.1:9001",
+        "admin",
+        "password",
+        "dup-bucket",
+    )
+    .await
+    .expect("Should add first backend");
+
+    // 2. Try to add duplicate backend name "be_1" -> should fail
+    let add_dup_name = squeezefs::config_ops::add_storage_backend(
+        &redis_url,
+        fs_name,
+        "be_1",
+        "http://127.0.0.1:9002",
+        "admin",
+        "password",
+        "other-bucket",
+    )
+    .await;
+    assert!(
+        add_dup_name.is_err(),
+        "Should fail when adding duplicate backend name"
+    );
+
+    // 3. Try to add duplicate endpoint + bucket combination -> should fail
+    let add_dup_config = squeezefs::config_ops::add_storage_backend(
+        &redis_url,
+        fs_name,
+        "be_2",
+        "http://127.0.0.1:9001",
+        "admin",
+        "password",
+        "dup-bucket",
+    )
+    .await;
+    assert!(
+        add_dup_config.is_err(),
+        "Should fail when adding duplicate endpoint and bucket combination"
+    );
+
+    // 4. Test disable/enable transitions
+    squeezefs::config_ops::disable_storage_backend(&redis_url, fs_name, "be_1")
+        .await
+        .expect("Should disable be_1");
+
+    let list = squeezefs::config_ops::list_config(&redis_url, fs_name)
+        .await
+        .expect("Should list config");
+    assert_eq!(
+        list.backend_statuses.get("be_1").map(|s| s.as_str()),
+        Some("disabled")
+    );
+
+    // 5. Try to disable the last enabled backend
+    let disable_last = squeezefs::config_ops::disable_storage_backend(&redis_url, fs_name, "backend_0")
+        .await;
+    assert!(
+        disable_last.is_err(),
+        "Should fail to disable the last remaining enabled write backend"
+    );
+
+    // 6. Enable be_1 again
+    squeezefs::config_ops::enable_storage_backend(&redis_url, fs_name, "be_1")
+        .await
+        .expect("Should enable be_1");
+
+    let list = squeezefs::config_ops::list_config(&redis_url, fs_name)
+        .await
+        .expect("Should list config");
+    assert_eq!(
+        list.backend_statuses.get("be_1").map(|s| s.as_str()),
+        Some("enabled")
+    );
+}
+
+#[tokio::test]
+async fn test_multi_backend_sharding_status_routing() {
+    let multi_backend = squeezefs::backend::MultiBackendClient::new();
+    
+    // Register backend_0 and backend_1
+    let local_ips = Vec::new();
+    let backend_0 = squeezefs::backend::RustFsClient::new_with_local_ips(local_ips.clone(), None, None, None, None).await;
+    let backend_1 = squeezefs::backend::RustFsClient::new_with_local_ips(local_ips, None, None, None, None).await;
+    
+    multi_backend.register_backend("backend_0", backend_0);
+    multi_backend.register_backend("backend_1", backend_1);
+    
+    // Set both as enabled
+    multi_backend.set_backend_status("backend_0", "enabled");
+    multi_backend.set_backend_status("backend_1", "enabled");
+    
+    // Find a key that hashes/routes to backend_1 when both are enabled
+    let mut target_key = String::new();
+    for i in 0..1000 {
+        let key = format!("test_key_{}", i);
+        let selected = multi_backend.get_backend_for_key(&key);
+        if selected == "backend_1" {
+            target_key = key;
+            break;
+        }
+    }
+    assert!(!target_key.is_empty(), "Should find a key that routes to backend_1");
+    
+    // Now, disable backend_1
+    multi_backend.set_backend_status("backend_1", "disabled");
+    
+    // Since backend_1 is disabled, the same key should route to backend_0 instead
+    let new_selected = multi_backend.get_backend_for_key(&target_key);
+    assert_eq!(new_selected, "backend_0");
+    
+    // If all backends are disabled, it should fall back to any registered backend
+    multi_backend.set_backend_status("backend_0", "disabled");
+    let fallback_selected = multi_backend.get_backend_for_key(&target_key);
+    assert!(fallback_selected == "backend_0" || fallback_selected == "backend_1");
+}

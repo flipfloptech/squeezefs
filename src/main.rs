@@ -222,17 +222,20 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigActions,
     },
-    /// Manage storage backends
-    Backend {
-        /// Volume name (filesystem name)
-        fs_name: String,
-        #[command(subcommand)]
-        action: BackendActions,
-    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
 enum ConfigActions {
+    /// Manage storage backends
+    #[command(subcommand, alias = "backends")]
+    Backend(BackendActions),
+    /// Set runtime configuration quotas (capacity or inodes)
+    Set {
+        /// Quota key: "capacity" or "inodes"
+        key: String,
+        /// New value (e.g. "100G", "5P" for capacity or numeric value/0 for inodes)
+        value: String,
+    },
     /// Add a staging disk cache or storage backend
     Add {
         /// Category: must be "diskcache" or "backend"
@@ -1384,6 +1387,85 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fs_name,
             action,
         } => match action {
+            ConfigActions::Backend(action) => {
+                match action {
+                    BackendActions::Add {
+                        name,
+                        s3_endpoint,
+                        s3_access_key,
+                        s3_secret_key,
+                        s3_bucket,
+                    } => {
+                        squeezefs::config_ops::add_storage_backend(
+                            &garnet_url,
+                            &fs_name,
+                            &name,
+                            &s3_endpoint,
+                            &s3_access_key,
+                            &s3_secret_key,
+                            &s3_bucket,
+                        )
+                        .await?;
+                        println!("Storage backend '{}' added successfully.", name);
+                    }
+                    BackendActions::Remove { name, force } => {
+                        squeezefs::config_ops::remove_storage_backend(
+                            &garnet_url,
+                            &fs_name,
+                            &name,
+                            force,
+                        )
+                        .await?;
+                        println!("Storage backend '{}' removed successfully.", name);
+                    }
+                    BackendActions::Enable { name } => {
+                        squeezefs::config_ops::enable_storage_backend(
+                            &garnet_url,
+                            &fs_name,
+                            &name,
+                        )
+                        .await?;
+                        println!("Storage backend '{}' enabled successfully.", name);
+                    }
+                    BackendActions::Disable { name } => {
+                        squeezefs::config_ops::disable_storage_backend(
+                            &garnet_url,
+                            &fs_name,
+                            &name,
+                        )
+                        .await?;
+                        println!("Storage backend '{}' disabled successfully.", name);
+                    }
+                    BackendActions::List => {
+                        let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                        let mut output = serde_json::Map::new();
+                        for (be_id, be_json_str) in &list.backends {
+                            if let Ok(mut be_val) = serde_json::from_str::<serde_json::Value>(be_json_str) {
+                                let status = list.backend_statuses.get(be_id).cloned().unwrap_or_else(|| "enabled".to_string());
+                                if let Some(obj) = be_val.as_object_mut() {
+                                    obj.insert("status".to_string(), serde_json::Value::String(status));
+                                }
+                                output.insert(be_id.clone(), be_val);
+                            }
+                        }
+                        if !list.backends.contains_key("backend_0") {
+                            let status = list.backend_statuses.get("backend_0").cloned().unwrap_or_else(|| "enabled".to_string());
+                            let be_val = serde_json::json!({
+                                "endpoint": "",
+                                "access_key": "admin",
+                                "secret_key": "password",
+                                "bucket": "squeezefs-data",
+                                "status": status,
+                            });
+                            output.insert("backend_0".to_string(), be_val);
+                        }
+                        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(output))?);
+                    }
+                }
+            }
+            ConfigActions::Set { key, value } => {
+                squeezefs::config_ops::set_config_quota(&garnet_url, &fs_name, &key, &value).await?;
+            }
             ConfigActions::Add {
                 category,
                 value,
@@ -1518,86 +1600,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         println!("  - {}", issue);
                     }
                     std::process::exit(1);
-                }
-            }
-        },
-        Commands::Backend {
-            fs_name,
-            action,
-        } => {
-            let garnet_url = &cli.garnet_url;
-            match action {
-                BackendActions::Add {
-                    name,
-                    s3_endpoint,
-                    s3_access_key,
-                    s3_secret_key,
-                    s3_bucket,
-                } => {
-                    squeezefs::config_ops::add_storage_backend(
-                        garnet_url,
-                        &fs_name,
-                        &name,
-                        &s3_endpoint,
-                        &s3_access_key,
-                        &s3_secret_key,
-                        &s3_bucket,
-                    )
-                    .await?;
-                    println!("Storage backend '{}' added successfully.", name);
-                }
-                BackendActions::Remove { name, force } => {
-                    squeezefs::config_ops::remove_storage_backend(
-                        garnet_url,
-                        &fs_name,
-                        &name,
-                        force,
-                    )
-                    .await?;
-                    println!("Storage backend '{}' removed successfully.", name);
-                }
-                BackendActions::Enable { name } => {
-                    squeezefs::config_ops::enable_storage_backend(
-                        garnet_url,
-                        &fs_name,
-                        &name,
-                    )
-                    .await?;
-                    println!("Storage backend '{}' enabled successfully.", name);
-                }
-                BackendActions::Disable { name } => {
-                    squeezefs::config_ops::disable_storage_backend(
-                        garnet_url,
-                        &fs_name,
-                        &name,
-                    )
-                    .await?;
-                    println!("Storage backend '{}' disabled successfully.", name);
-                }
-                BackendActions::List => {
-                    let list = squeezefs::config_ops::list_config(garnet_url, &fs_name).await?;
-                    let mut output = serde_json::Map::new();
-                    for (be_id, be_json_str) in &list.backends {
-                        if let Ok(mut be_val) = serde_json::from_str::<serde_json::Value>(be_json_str) {
-                            let status = list.backend_statuses.get(be_id).cloned().unwrap_or_else(|| "enabled".to_string());
-                            if let Some(obj) = be_val.as_object_mut() {
-                                obj.insert("status".to_string(), serde_json::Value::String(status));
-                            }
-                            output.insert(be_id.clone(), be_val);
-                        }
-                    }
-                    if !list.backends.contains_key("backend_0") {
-                        let status = list.backend_statuses.get("backend_0").cloned().unwrap_or_else(|| "enabled".to_string());
-                        let be_val = serde_json::json!({
-                            "endpoint": "",
-                            "access_key": "admin",
-                            "secret_key": "password",
-                            "bucket": "squeezefs-data",
-                            "status": status,
-                        });
-                        output.insert("backend_0".to_string(), be_val);
-                    }
-                    println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(output))?);
                 }
             }
         },

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub struct ConfigList {
     pub diskcaches: Vec<DiskCacheInfo>,
     pub backends: HashMap<String, String>,
+    pub backend_statuses: HashMap<String, String>,
     pub active_write_backend: String,
 }
 
@@ -68,9 +69,21 @@ pub async fn list_config(redis_url: &str, _fs_name: &str) -> Result<ConfigList> 
     let backends: HashMap<String, String> =
         con.hgetall("squeezefs:backends").await.unwrap_or_default();
 
+    let mut backend_statuses: HashMap<String, String> = con
+        .hgetall("squeezefs:backend:status")
+        .await
+        .unwrap_or_default();
+
+    for be_id in backends.keys() {
+        backend_statuses
+            .entry(be_id.clone())
+            .or_insert_with(|| "enabled".to_string());
+    }
+
     Ok(ConfigList {
         diskcaches,
         backends,
+        backend_statuses,
         active_write_backend,
     })
 }
@@ -281,6 +294,29 @@ pub async fn add_storage_backend(
 ) -> Result<()> {
     let mut con = connect_redis(redis_url).await?;
 
+    let name_exists: bool = con.hexists("squeezefs:backends", backend_id).await?;
+    if name_exists {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Backend name '{}' already exists in registry",
+            backend_id
+        )));
+    }
+
+    let backends_map: std::collections::HashMap<String, String> =
+        con.hgetall("squeezefs:backends").await.unwrap_or_default();
+    for (be_id, be_json) in backends_map {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
+            let ep = config["endpoint"].as_str().unwrap_or("");
+            let bu = config["bucket"].as_str().unwrap_or("");
+            if ep == endpoint && bu == bucket {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "Duplicate backend configuration: S3 endpoint '{}' and bucket '{}' are already registered under name '{}'",
+                    endpoint, bucket, be_id
+                )));
+            }
+        }
+    }
+
     let backend_json = serde_json::json!({
         "endpoint": endpoint,
         "access_key": access_key,
@@ -289,8 +325,10 @@ pub async fn add_storage_backend(
     })
     .to_string();
 
-    let _: () = con
+    let _: () = redis::pipe()
         .hset("squeezefs:backends", backend_id, backend_json)
+        .hset("squeezefs:backend:status", backend_id, "enabled")
+        .query_async(&mut con)
         .await?;
     Ok(())
 }
@@ -460,3 +498,72 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
 
     Ok(issues)
 }
+
+pub async fn enable_storage_backend(
+    redis_url: &str,
+    _fs_name: &str,
+    backend_id: &str,
+) -> Result<()> {
+    let mut con = connect_redis(redis_url).await?;
+
+    let exists: bool = con.hexists("squeezefs:backends", backend_id).await?;
+    if !exists && backend_id != "backend_0" {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Backend '{}' does not exist in registry",
+            backend_id
+        )));
+    }
+
+    let _: () = con
+        .hset("squeezefs:backend:status", backend_id, "enabled")
+        .await?;
+    Ok(())
+}
+
+pub async fn disable_storage_backend(
+    redis_url: &str,
+    _fs_name: &str,
+    backend_id: &str,
+) -> Result<()> {
+    let mut con = connect_redis(redis_url).await?;
+
+    let exists: bool = con.hexists("squeezefs:backends", backend_id).await?;
+    if !exists && backend_id != "backend_0" {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Backend '{}' does not exist in registry",
+            backend_id
+        )));
+    }
+
+    let backends_map: std::collections::HashMap<String, String> =
+        con.hgetall("squeezefs:backends").await.unwrap_or_default();
+    let statuses: std::collections::HashMap<String, String> =
+        con.hgetall("squeezefs:backend:status").await.unwrap_or_default();
+
+    let mut enabled_count = 0;
+
+    for be_id in backends_map.keys() {
+        let status = statuses.get(be_id).map(|s| s.as_str()).unwrap_or("enabled");
+        if status == "enabled" {
+            enabled_count += 1;
+        }
+    }
+
+    let status_b0 = statuses.get("backend_0").map(|s| s.as_str()).unwrap_or("enabled");
+    if status_b0 == "enabled" && !backends_map.contains_key("backend_0") {
+        enabled_count += 1;
+    }
+
+    let target_status = statuses.get(backend_id).map(|s| s.as_str()).unwrap_or("enabled");
+    if target_status == "enabled" && enabled_count <= 1 {
+        return Err(SqueezefsError::InvalidOperation(
+            "Cannot disable backend: at least one storage backend must remain enabled for writes".to_string()
+        ));
+    }
+
+    let _: () = con
+        .hset("squeezefs:backend:status", backend_id, "disabled")
+        .await?;
+    Ok(())
+}
+

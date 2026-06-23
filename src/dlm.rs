@@ -590,6 +590,7 @@ impl DlmClient {
         range: Option<(u64, u64)>,
         ttl: Duration,
     ) -> Result<LockLease> {
+        crate::coz_progress!("dlm_acquire_lock");
         let lock_key = if let Some((start, end)) = range {
             format!("lock:{}:range:{}-{}", file_path, start, end)
         } else {

@@ -705,6 +705,7 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        crate::coz_progress!("fuse_lookup");
         let name_str = name.to_string_lossy();
         debug!("FUSE Lookup: parent = {}, name = {}", parent, name_str);
 
@@ -863,6 +864,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyCreated> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        crate::coz_progress!("fuse_create");
         let name_str = name.to_string_lossy();
         info!(
             "FUSE Create: parent = {}, name = {}, mode = {:o}, flags = {}",
@@ -969,6 +971,7 @@ impl Filesystem for SqueezefsFilesystem {
         size: u32,
     ) -> FuseResult<ReplyData> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        crate::coz_progress!("fuse_read");
         debug!(
             "FUSE Read: ino = {}, fh = {}, offset = {}, size = {}",
             ino, fh, offset, size
@@ -1064,6 +1067,7 @@ impl Filesystem for SqueezefsFilesystem {
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        crate::coz_progress!("fuse_write");
 
         // Acquire local inode lock for the ENTIRE write operation to serialize
         // concurrent/subsequent writes to the same file.
@@ -1568,6 +1572,7 @@ impl Filesystem for SqueezefsFilesystem {
     async fn unlink(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        crate::coz_progress!("fuse_unlink");
         let name_str = name.to_string_lossy();
         debug!("FUSE unlink: parent = {}, name = {}", parent, name_str);
 
@@ -1822,6 +1827,7 @@ impl Filesystem for SqueezefsFilesystem {
         offset: i64,
     ) -> FuseResult<ReplyDirectory<Self::DirEntryStream<'a>>> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        crate::coz_progress!("fuse_readdir");
         debug!("FUSE readdir: parent = {}, offset = {}", parent, offset);
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;

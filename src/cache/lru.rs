@@ -85,4 +85,8 @@ impl LruCache {
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
     }
+
+    pub fn run_pending_tasks(&self) {
+        self.inner.run_pending_tasks();
+    }
 }

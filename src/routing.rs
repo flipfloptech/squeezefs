@@ -90,10 +90,7 @@ impl DataRouter {
 
                         if let (Some(bk), Some(off), Some(sz)) = (block_key, off_val, sz_val) {
                             let (be_id, real_key) = parse_backend_and_key(&bk);
-                            let packed_bytes = self.backend.get_object(&be_id, &real_key).await?;
-                            let start = off as usize;
-                            let end = (off + sz) as usize;
-                            packed_bytes[start..end].to_vec()
+                            self.backend.get_object_range(&be_id, &real_key, off, off + sz).await?
                         } else {
                             Vec::new()
                         }
@@ -579,10 +576,7 @@ impl DataRouter {
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, offset, size) {
                         let (be_id, real_key) = parse_backend_and_key(&bk);
-                        let packed_bytes = self.backend.get_object(&be_id, &real_key).await?;
-                        let start = off as usize;
-                        let end = (off + sz) as usize;
-                        packed_bytes[start..end].to_vec()
+                        self.backend.get_object_range(&be_id, &real_key, off, off + sz).await?
                     } else {
                         return Err(SqueezefsError::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
@@ -756,9 +750,11 @@ impl DataRouter {
                     SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
                 })?;
 
-                let data = if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
+                if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    staged_data
+                    let start = std::cmp::min(offset as usize, staged_data.len());
+                    let end = std::cmp::min((offset + size as u64) as usize, staged_data.len());
+                    Ok(staged_data[start..end].to_vec())
                 } else {
                     let mapping_key = format!("mapping:{}", file_id);
                     let mut con = self.dlm.get_connection().await?;
@@ -767,21 +763,22 @@ impl DataRouter {
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
+                        if offset >= sz {
+                            return Ok(Vec::new());
+                        }
                         let (be_id, real_key) = parse_backend_and_key(&bk);
-                        let packed_bytes = self.backend.get_object(&be_id, &real_key).await?;
-                        let start = off as usize;
-                        let end = (off + sz) as usize;
-                        packed_bytes[start..end].to_vec()
+                        let read_len = std::cmp::min(size as u64, sz - offset);
+                        let req_start = off + offset;
+                        let req_end = req_start + read_len;
+                        let packed_bytes = self.backend.get_object_range(&be_id, &real_key, req_start, req_end).await?;
+                        Ok(packed_bytes)
                     } else {
                         return Err(SqueezefsError::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             format!("Staged file ID {} mapping not found in Garnet", file_id),
                         )));
                     }
-                };
-                let start = std::cmp::min(offset as usize, data.len());
-                let end = std::cmp::min((offset + size as u64) as usize, data.len());
-                Ok(data[start..end].to_vec())
+                }
             }
             "striped" => {
                 let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);

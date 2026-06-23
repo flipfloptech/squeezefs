@@ -362,7 +362,7 @@ impl DataRouter {
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
 
-            self.cache.write_lru.put(file_path, Arc::new(existing_data));
+            self.cache.write_lru.remove(file_path);
             self.cache.read_lru.remove(file_path);
         }
 

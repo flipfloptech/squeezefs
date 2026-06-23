@@ -644,4 +644,54 @@ impl NvmeStaging {
             None
         }
     }
+
+    pub fn list_staged_files(&self) -> Vec<String> {
+        let mut files = Vec::new();
+        for dir in &self.staging_dirs {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(ext) = path.extension() {
+                            if ext == "staged" {
+                                if let Some(stem) = path.file_stem() {
+                                    files.push(stem.to_string_lossy().into_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        files
+    }
+
+    pub fn list_cached_blocks(&self) -> Vec<String> {
+        let mut blocks = Vec::new();
+        for dir in &self.staging_dirs {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(ext) = path.extension() {
+                            if ext == "block" {
+                                if let Some(stem) = path.file_stem() {
+                                    blocks.push(stem.to_string_lossy().into_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        blocks
+    }
+
+    pub fn max_write_bytes(&self) -> u64 {
+        self.max_write_bytes
+    }
+
+    pub fn max_read_bytes(&self) -> u64 {
+        self.max_read_bytes
+    }
 }

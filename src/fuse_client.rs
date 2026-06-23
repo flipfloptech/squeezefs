@@ -720,6 +720,9 @@ impl Filesystem for SqueezefsFilesystem {
                 .hset("squeezefs:format", "block_size", default_block_size)
                 .hset("squeezefs:format", "capacity", default_capacity)
                 .hset("squeezefs:format", "inodes", 0)
+                .hset("squeezefs:format", "compression", "none")
+                .hset("squeezefs:format", "encrypt_algo", "none")
+                .hset("squeezefs:format", "encrypt_key", "")
                 .hset("squeezefs:format", "version", 1) // ABI version
                 .hset("squeezefs:format", "mem_cache_size", "1GB")
                 .hset("squeezefs:format", "disk_cache_size", "10GB")
@@ -728,6 +731,28 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_err)?;
         }
+
+        let compression: String = con
+            .hget("squeezefs:format", "compression")
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "none".to_string());
+        let encrypt_algo: String = con
+            .hget("squeezefs:format", "encrypt_algo")
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "none".to_string());
+        let encrypt_key: Option<String> = con
+            .hget("squeezefs:format", "encrypt_key")
+            .await
+            .unwrap_or(None);
+
+        let crypto_state = crate::crypto_compress::CryptoCompressState::new(
+            compression,
+            encrypt_algo,
+            encrypt_key.as_deref(),
+        );
+        self.router.set_crypto(crypto_state);
 
         let version_str: Option<String> = con
             .hget("squeezefs:format", "version")
@@ -3347,6 +3372,9 @@ pub async fn format_volume(
     block_size: u64,
     capacity: u64,
     inodes: u64,
+    compression: &str,
+    encrypt_algo: &str,
+    encrypt_key: Option<&str>,
     mem_cache_size: Option<&str>,
     disk_cache_size: Option<&str>,
     disk_cache_paths: Option<&[std::path::PathBuf]>,
@@ -3379,6 +3407,9 @@ pub async fn format_volume(
         .hset("squeezefs:format", "block_size", block_size)
         .hset("squeezefs:format", "capacity", capacity)
         .hset("squeezefs:format", "inodes", inodes)
+        .hset("squeezefs:format", "compression", compression)
+        .hset("squeezefs:format", "encrypt_algo", encrypt_algo)
+        .hset("squeezefs:format", "encrypt_key", encrypt_key.unwrap_or(""))
         .hset("squeezefs:format", "version", 1) // ABI version
         .hset("squeezefs:format", "mem_cache_size", mem_size)
         .hset("squeezefs:format", "disk_cache_size", disk_size)
@@ -3465,6 +3496,8 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
         .get("active_write_backend")
         .cloned()
         .unwrap_or_default();
+    let compression = fields.get("compression").cloned().unwrap_or_else(|| "none".to_string());
+    let encrypt_algo = fields.get("encrypt_algo").cloned().unwrap_or_else(|| "none".to_string());
 
     Ok(serde_json::json!({
         "Setting": {
@@ -3472,6 +3505,8 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             "BlockSize": block_size,
             "Capacity": capacity,
             "Inodes": inodes,
+            "Compression": compression,
+            "EncryptAlgo": encrypt_algo,
             "MemCacheSize": mem_cache_size,
             "DiskCacheSize": disk_cache_size,
             "DiskCachePaths": disk_cache_paths,

@@ -43,6 +43,9 @@ async fn test_cli_format_and_status() {
         8 * 1024 * 1024,                 // 8MB block size
         500 * 1024 * 1024 * 1024 * 1024, // 500TB capacity
         0,                               // inodes limit
+        "none",                          // compression
+        "none",                          // encrypt_algo
+        None,                            // encrypt_key
         Some("64GB"),
         Some("100GB"),
         Some(&[std::path::PathBuf::from("/tmp/test_staging_format")]),
@@ -431,6 +434,9 @@ async fn test_multi_backend_routing() {
         4 * 1024 * 1024,
         100 * 1024 * 1024,
         0, // inodes limit
+        "none", // compression
+        "none", // encrypt_algo
+        None, // encrypt_key
         None,
         None,
         None,
@@ -753,6 +759,9 @@ async fn test_config_sqz_virtual_file() {
         1024 * 1024,
         1000 * 1024 * 1024,
         0, // inodes limit
+        "none", // compression
+        "none", // encrypt_algo
+        None, // encrypt_key
         Some("64MB"),
         Some("100MB"),
         None,
@@ -876,6 +885,9 @@ async fn test_inode_quota_enforcement() {
         1024 * 1024,
         1000 * 1024 * 1024,
         3, // inodes limit: 3. Root is 1, so we can create 2 more.
+        "none", // compression
+        "none", // encrypt_algo
+        None, // encrypt_key
         Some("64MB"),
         Some("100MB"),
         None,
@@ -966,6 +978,9 @@ async fn test_capacity_quota_enforcement() {
         1024 * 1024,
         100, // capacity limit: 100 bytes
         0, // inodes limit: unlimited
+        "none", // compression
+        "none", // encrypt_algo
+        None, // encrypt_key
         Some("64MB"),
         Some("100MB"),
         None,
@@ -1044,4 +1059,88 @@ async fn test_capacity_quota_enforcement() {
     assert!(write4_res.is_err());
     assert_eq!(write4_res.err().unwrap(), fuse3::Errno::from(libc::ENOSPC));
 }
+
+#[tokio::test]
+async fn test_compression_and_encryption_flow() {
+    let mut con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = get_redis_url();
+    // Format volume with lz4 compression and aes256gcm-rsa encryption
+    format_volume(
+        &redis_url,
+        "crypto_vol",
+        1024 * 1024,
+        1000 * 1024 * 1024,
+        0, // inodes limit
+        "lz4", // compression
+        "aes256gcm-rsa", // encrypt_algo
+        None, // encrypt_key (PEM string, auto-generate)
+        Some("64MB"),
+        Some("100MB"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("Format volume should succeed");
+
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // 1. Create file (inode 2)
+    let create_res = fs.create(req, 1, OsStr::new("encrypted_file"), 0o644, 0).await.unwrap();
+    let ino = create_res.attr.ino;
+    assert_eq!(ino, 2);
+
+    // 2. Write a compressible payload
+    let plaintext = b"Hello World! This is a test of client-side encryption and compression. ".repeat(10);
+    let write_res = fs.write(req, ino, 0, 0, &plaintext, 0, 0).await.unwrap();
+    assert_eq!(write_res.written as usize, plaintext.len());
+
+    // 3. Read it back and verify it matches plaintext
+    let read_res = fs.read(req, ino, 0, 0, plaintext.len() as u32).await.unwrap();
+    assert_eq!(read_res.data.as_ref(), plaintext.as_slice());
+
+    // 4. Verify that the raw data stored in Garnet (since it's inline under 64KB)
+    // is encrypted and compressed (not equal to plaintext, and doesn't contain "Hello World!")
+    let inline_key = "inline_data:inode_2";
+    let stored_bytes: Vec<u8> = redis::cmd("GET")
+        .arg(inline_key)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    assert_ne!(stored_bytes, plaintext);
+    let contains_plaintext = stored_bytes.windows(12).any(|w| w == b"Hello World!");
+    assert!(!contains_plaintext, "Stored bytes should be encrypted and must not expose plaintext");
+}
+
 

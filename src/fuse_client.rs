@@ -562,6 +562,32 @@ impl SqueezefsFilesystem {
             .await?;
         Ok(())
     }
+
+    async fn scan_lock_keys(
+        &self,
+        con: &mut crate::dlm::MetaConnection,
+        pattern: &str,
+    ) -> Result<Vec<String>, SqueezefsError> {
+        let mut cursor: u64 = 0;
+        let mut all_keys = Vec::new();
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(con)
+                .await
+                .map_err(|e| SqueezefsError::from(e))?;
+            all_keys.extend(keys);
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        Ok(all_keys)
+    }
 }
 
 // Implement fuse3 Raw Filesystem interface
@@ -982,7 +1008,16 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // 2. Overlay any staging blocks in active_writes
-        let active_dir = std::path::PathBuf::from("/tmp/squeezefs_staging")
+        let staging_dir = self
+            .router
+            .cache
+            .nvme
+            .staging_dirs()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/squeezefs_staging"));
+
+        let active_dir = staging_dir
             .join("active_writes")
             .join(format!("inode_{}", ino));
 
@@ -1030,11 +1065,12 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyWrite> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
 
-        // 1. Acquire local inode lock
+        // Acquire local inode lock for the ENTIRE write operation to serialize
+        // concurrent/subsequent writes to the same file.
         let lock = self.get_inode_lock(ino);
         let _guard = lock.lock().await;
 
-        // 2. Get or acquire lease (fencing token)
+        // 1. Get or acquire lease (fencing token)
         let fencing_token = self
             .get_or_acquire_lease(ino)
             .await
@@ -1042,7 +1078,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
-        // 3. Write data using progressive layout routing if not striped
+        // 2. Write data using progressive layout routing if not striped
         let meta_key = format!("metadata:inode_{}", ino);
         let file_type: Option<String> = con.hget(&meta_key, "type").await.map_err(map_err)?;
 
@@ -1060,7 +1096,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         let bytes_written = data.len() as u32;
 
-        // 4. Update file attributes and used bytes
+        // 3. Update file attributes and used bytes
         let attr_key = format!("squeezefs:attr:{}", ino);
 
         let old_size = if let Some(entry) = self.attr_cache.get(&ino) {
@@ -2130,34 +2166,68 @@ impl Filesystem for SqueezefsFilesystem {
         let dest_path = format!("inode_{}", inode_out);
 
         // 1. Acquire locks on both files to ensure consistency
-        let _src_lease = match self
-            .dlm
-            .acquire_lock(&src_path, None, Duration::from_secs(5))
-            .await
-        {
-            Ok(l) => l,
-            Err(e) => {
-                error!(
-                    "copy_file_range: failed to acquire lock on src_path {}: {:?}",
-                    src_path, e
-                );
-                return Err(Errno::from(libc::EAGAIN));
+        // Sort paths lexicographically to prevent deadlocks under concurrent operations.
+        let (src_lease, dest_lease) = if inode == inode_out {
+            let lease = match self
+                .dlm
+                .acquire_lock(&src_path, None, Duration::from_secs(5))
+                .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(
+                        "copy_file_range: failed to acquire lock on src_path {}: {:?}",
+                        src_path, e
+                    );
+                    return Err(Errno::from(libc::EAGAIN));
+                }
+            };
+            (Some(lease), None)
+        } else {
+            let (first_path, second_path) = if src_path < dest_path {
+                (&src_path, &dest_path)
+            } else {
+                (&dest_path, &src_path)
+            };
+
+            let first_lease = match self
+                .dlm
+                .acquire_lock(first_path, None, Duration::from_secs(5))
+                .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(
+                        "copy_file_range: failed to acquire lock on first path {}: {:?}",
+                        first_path, e
+                    );
+                    return Err(Errno::from(libc::EAGAIN));
+                }
+            };
+
+            let second_lease = match self
+                .dlm
+                .acquire_lock(second_path, None, Duration::from_secs(5))
+                .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(
+                        "copy_file_range: failed to acquire lock on second path {}: {:?}",
+                        second_path, e
+                    );
+                    return Err(Errno::from(libc::EAGAIN));
+                }
+            };
+
+            if src_path < dest_path {
+                (Some(first_lease), Some(second_lease))
+            } else {
+                (Some(second_lease), Some(first_lease))
             }
         };
-        let dest_lease = match self
-            .dlm
-            .acquire_lock(&dest_path, None, Duration::from_secs(5))
-            .await
-        {
-            Ok(l) => l,
-            Err(e) => {
-                error!(
-                    "copy_file_range: failed to acquire lock on dest_path {}: {:?}",
-                    dest_path, e
-                );
-                return Err(Errno::from(libc::EAGAIN));
-            }
-        };
+
+        let _src_lease = src_lease;
 
         // 2. Read sizes to check if we can perform metadata clone
         let src_size = self
@@ -2220,7 +2290,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Perform write to destination
         self.router
-            .write_file(&dest_path, off_out, chunk, dest_lease.fencing_token())
+            .write_file(&dest_path, off_out, chunk, dest_lease.as_ref().unwrap().fencing_token())
             .await
             .map_err(map_squeezefs_err)?;
 
@@ -2334,8 +2404,11 @@ impl Filesystem for SqueezefsFilesystem {
             let _ = lease.release().await;
         }
 
-        // Also clean up local inode lock if no longer needed
-        self.active_inode_locks.remove(&ino);
+        // Also clean up local inode lock if no longer needed (only if strong_count <= 2)
+        drop(_guard);
+        if std::sync::Arc::strong_count(&lock) <= 2 {
+            self.active_inode_locks.remove(&ino);
+        }
 
         Ok(())
     }
@@ -2472,11 +2545,7 @@ impl Filesystem for SqueezefsFilesystem {
         // 2. Check global conflicts in Redis
         if let Ok(mut con) = self.dlm.get_connection().await {
             let pattern = format!("lock:inode_{}:range:*", inode);
-            if let Ok(keys) = redis::cmd("KEYS")
-                .arg(&pattern)
-                .query_async::<_, Vec<String>>(&mut con)
-                .await
-            {
+            if let Ok(keys) = self.scan_lock_keys(&mut con, &pattern).await {
                 for key in keys {
                     if let Some(suffix) = key.strip_prefix(&format!("lock:inode_{}:range:", inode))
                     {
@@ -2586,11 +2655,7 @@ impl Filesystem for SqueezefsFilesystem {
                 // 2. Check global conflicts in Redis
                 if let Ok(mut con) = self.dlm.get_connection().await {
                     let pattern = format!("lock:inode_{}:range:*", inode);
-                    if let Ok(keys) = redis::cmd("KEYS")
-                        .arg(&pattern)
-                        .query_async::<_, Vec<String>>(&mut con)
-                        .await
-                    {
+                    if let Ok(keys) = self.scan_lock_keys(&mut con, &pattern).await {
                         for key in keys {
                             if let Some(suffix) =
                                 key.strip_prefix(&format!("lock:inode_{}:range:", inode))

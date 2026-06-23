@@ -11,8 +11,9 @@ fn test_lru_eviction() {
 
     // Insert 40 blocks of 100 bytes (total 4000 bytes > 1000 bytes)
     for i in 0..40 {
-        cache.put(&format!("key{}", i), vec![i as u8; 100]);
+        cache.put(&format!("key{}", i), std::sync::Arc::new(vec![i as u8; 100]));
     }
+    cache.run_pending_tasks();
 
     // Verify cache size is within limits (moka evicts asynchronously but run_pending_tasks makes it synchronous)
     assert!(cache.current_bytes() <= 1000, "Cache size {} exceeded capacity 1000", cache.current_bytes());

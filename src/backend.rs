@@ -248,7 +248,7 @@ impl RustFsClient {
             } else {
                 return Err(SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!("object {} not found", key),
+                    format!("object {} not found in mock store", key),
                 )));
             }
         }
@@ -281,6 +281,55 @@ impl RustFsClient {
         Err(SqueezefsError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
             format!("S3 GET failed on all rails. Last error: {:?}", last_err),
+        )))
+    }
+
+    /// Download a range of data from S3.
+    pub async fn get_object_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+        METRICS.get_obj.fetch_add(1, Ordering::Relaxed);
+        if let Some(store) = &self.mock_store {
+            if let Some(val) = store.get(key) {
+                let data = &val.0;
+                let s = std::cmp::min(start as usize, data.len());
+                let e = std::cmp::min(end as usize, data.len());
+                return Ok(data[s..e].to_vec());
+            } else {
+                return Err(SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("object {} not found", key),
+                )));
+            }
+        }
+
+        let num_clients = self.s3_clients.len();
+        let mut last_err = None;
+        let range_header = format!("bytes={}-{}", start, end.saturating_sub(1));
+
+        for _ in 0..num_clients {
+            let s3 = self.get_s3_client().ok_or_else(|| {
+                SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
+            })?;
+
+            match s3.get_object().bucket(&self.bucket).key(key).range(range_header.clone()).send().await {
+                Ok(resp) => {
+                    let bytes = resp.body.collect().await.map_err(|e| {
+                        SqueezefsError::Io(std::io::Error::other(format!(
+                            "Failed to read body stream: {:?}",
+                            e
+                        )))
+                    })?;
+                    return Ok(bytes.to_vec());
+                }
+                Err(e) => {
+                    warn!("S3 GET range failed on current rail: {:?}. Retrying next...", e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!("S3 GET range failed on all rails. Last error: {:?}", last_err),
         )))
     }
 
@@ -330,6 +379,7 @@ pub struct MultiBackendClient {
     backends: Arc<dashmap::DashMap<String, RustFsClient>>,
     #[allow(dead_code)]
     active_backend_id: Arc<std::sync::RwLock<String>>,
+    backend_keys: Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 impl Default for MultiBackendClient {
@@ -343,6 +393,7 @@ impl MultiBackendClient {
         Self {
             backends: Arc::new(dashmap::DashMap::new()),
             active_backend_id: Arc::new(std::sync::RwLock::new("backend_0".to_string())),
+            backend_keys: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -353,15 +404,16 @@ impl MultiBackendClient {
         let mut max_score: u64 = 0;
         let mut best_node = "backend_0".to_string();
 
-        for entry in self.backends.iter() {
-            let node_id = entry.key();
-            let mut hasher = DefaultHasher::new();
-            node_id.hash(&mut hasher);
-            key.hash(&mut hasher);
-            let score = hasher.finish();
-            if score > max_score {
-                max_score = score;
-                best_node = node_id.clone();
+        if let Ok(keys) = self.backend_keys.read() {
+            for node_id in keys.iter() {
+                let mut hasher = DefaultHasher::new();
+                node_id.hash(&mut hasher);
+                key.hash(&mut hasher);
+                let score = hasher.finish();
+                if score > max_score {
+                    max_score = score;
+                    best_node = node_id.clone();
+                }
             }
         }
         best_node
@@ -373,6 +425,10 @@ impl MultiBackendClient {
 
     pub fn register_backend(&self, id: &str, client: RustFsClient) {
         self.backends.insert(id.to_string(), client);
+        let keys: Vec<String> = self.backends.iter().map(|e| e.key().clone()).collect();
+        if let Ok(mut guard) = self.backend_keys.write() {
+            *guard = keys;
+        }
     }
 
     pub fn get_backend(&self, id: &str) -> Option<RustFsClient> {
@@ -409,6 +465,23 @@ impl MultiBackendClient {
     pub async fn get_object(&self, backend_id: &str, key: &str) -> Result<Vec<u8>> {
         if let Some(backend) = self.get_backend(backend_id) {
             backend.get_object(key).await
+        } else {
+            Err(SqueezefsError::InvalidOperation(format!(
+                "Backend ID {} not registered",
+                backend_id
+            )))
+        }
+    }
+
+    pub async fn get_object_range(
+        &self,
+        backend_id: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>> {
+        if let Some(backend) = self.get_backend(backend_id) {
+            backend.get_object_range(key, start, end).await
         } else {
             Err(SqueezefsError::InvalidOperation(format!(
                 "Backend ID {} not registered",

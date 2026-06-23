@@ -1,7 +1,6 @@
 use crate::error::{Result, SqueezefsError};
 use log::{debug, error, warn};
 use redis::aio::ConnectionLike;
-use redis::AsyncCommands;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -9,6 +8,48 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time;
 use uuid::Uuid;
+use once_cell::sync::Lazy;
+
+static ACQUIRE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
+    redis::Script::new(
+        r#"
+        local acquired = redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2])
+        if acquired then
+            return redis.call("INCR", KEYS[2])
+        else
+            return nil
+        end
+        "#
+    )
+});
+
+static RENEW_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
+    redis::Script::new(
+        r#"
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("pexpire", KEYS[1], ARGV[2])
+        else
+            return 0
+        end
+        "#
+    )
+});
+
+static RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
+    redis::Script::new(
+        r#"
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        "#
+    )
+});
+
+static SINGLE_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection>> = Lazy::new(|| {
+    dashmap::DashMap::new()
+});
 
 #[derive(Clone)]
 pub enum MetaClient {
@@ -23,7 +64,10 @@ pub enum MetaClient {
 }
 
 pub enum MetaConnection {
-    Single(redis::aio::MultiplexedConnection),
+    Single {
+        conn: redis::aio::MultiplexedConnection,
+        client: Option<redis::Client>,
+    },
     Cluster(redis::cluster_async::ClusterConnection),
 }
 
@@ -33,7 +77,30 @@ impl ConnectionLike for MetaConnection {
         cmd: &'a redis::Cmd,
     ) -> redis::RedisFuture<'a, redis::Value> {
         match self {
-            MetaConnection::Single(c) => c.req_packed_command(cmd),
+            MetaConnection::Single { conn, client } => {
+                let client_opt = client.clone();
+                Box::pin(async move {
+                    let res = conn.req_packed_command(cmd).await;
+                    if let Err(ref e) = res {
+                        if (e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()) && client_opt.is_some() {
+                            let client_ref = client_opt.unwrap();
+                            warn!("Cached Redis connection broken: {:?}. Reconnecting...", e);
+                            let addr_str = format!("{:?}", client_ref.get_connection_info().addr);
+                            match client_ref.get_multiplexed_tokio_connection().await {
+                                Ok(new_conn) => {
+                                    SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
+                                    *conn = new_conn;
+                                    return conn.req_packed_command(cmd).await;
+                                }
+                                Err(reconnect_err) => {
+                                    error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                                }
+                            }
+                        }
+                    }
+                    res
+                })
+            }
             MetaConnection::Cluster(c) => c.req_packed_command(cmd),
         }
     }
@@ -45,14 +112,37 @@ impl ConnectionLike for MetaConnection {
         count: usize,
     ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
         match self {
-            MetaConnection::Single(c) => c.req_packed_commands(cmd, offset, count),
+            MetaConnection::Single { conn, client } => {
+                let client_opt = client.clone();
+                Box::pin(async move {
+                    let res = conn.req_packed_commands(cmd, offset, count).await;
+                    if let Err(ref e) = res {
+                        if (e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()) && client_opt.is_some() {
+                            let client_ref = client_opt.unwrap();
+                            warn!("Cached Redis connection broken in pipeline: {:?}. Reconnecting...", e);
+                            let addr_str = format!("{:?}", client_ref.get_connection_info().addr);
+                            match client_ref.get_multiplexed_tokio_connection().await {
+                                Ok(new_conn) => {
+                                    SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
+                                    *conn = new_conn;
+                                    return conn.req_packed_commands(cmd, offset, count).await;
+                                }
+                                Err(reconnect_err) => {
+                                    error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                                }
+                            }
+                        }
+                    }
+                    res
+                })
+            }
             MetaConnection::Cluster(c) => c.req_packed_commands(cmd, offset, count),
         }
     }
 
     fn get_db(&self) -> i64 {
         match self {
-            MetaConnection::Single(c) => c.get_db(),
+            MetaConnection::Single { conn, .. } => conn.get_db(),
             MetaConnection::Cluster(c) => c.get_db(),
         }
     }
@@ -249,19 +339,32 @@ impl MetaClient {
 
     pub async fn get_connection(&self) -> Result<MetaConnection> {
         match self {
-            Self::Single(c) => {
-                let conn = c.get_multiplexed_tokio_connection().await?;
-                Ok(MetaConnection::Single(conn))
+            Self::Single(client) => {
+                let addr_str = format!("{:?}", client.get_connection_info().addr);
+                let conn = if let Some(c) = SINGLE_CONN_POOL.get(&addr_str) {
+                    c.clone()
+                } else {
+                    let new_conn = client.get_multiplexed_tokio_connection().await?;
+                    SINGLE_CONN_POOL.insert(addr_str, new_conn.clone());
+                    new_conn
+                };
+                Ok(MetaConnection::Single {
+                    conn,
+                    client: Some(client.clone()),
+                })
             }
             Self::SingleBound {
+                client,
                 bound_conns,
                 current_idx,
-                ..
             } => {
                 if !bound_conns.is_empty() {
                     let idx = current_idx.fetch_add(1, Ordering::Relaxed);
                     let conn = bound_conns[idx % bound_conns.len()].clone();
-                    return Ok(MetaConnection::Single(conn));
+                    return Ok(MetaConnection::Single {
+                        conn,
+                        client: Some(client.clone()),
+                    });
                 }
                 Err(SqueezefsError::InvalidOperation(
                     "No bound connections available".to_string(),
@@ -274,7 +377,10 @@ impl MetaClient {
             Self::Sentinel(c) => {
                 let mut guard = c.lock().await;
                 let conn = guard.get_async_connection().await?;
-                Ok(MetaConnection::Single(conn))
+                Ok(MetaConnection::Single {
+                    conn,
+                    client: None,
+                })
             }
         }
     }
@@ -354,26 +460,26 @@ impl DlmClient {
         let mut con = self.meta_client.get_connection().await?;
         let ttl_ms = ttl.as_millis() as u64;
 
-        // Perform SET key client_id NX PX ttl_ms
-        let acquired: Option<String> = redis::Cmd::set_options(
-            &lock_key,
-            &self.client_id,
-            redis::SetOptions::default()
-                .conditional_set(redis::ExistenceCheck::NX)
-                .with_expiration(redis::SetExpiry::PX(ttl_ms.try_into().unwrap())),
-        )
-        .query_async(&mut con)
-        .await?;
-
-        if acquired.is_none() {
-            return Err(SqueezefsError::LockFailed {
-                reason: format!("Lock is already held on {}", lock_key),
-            });
-        }
-
-        // Generate a monotonic fencing token for this file
+        // Generate a monotonic fencing token key
         let fencing_gen_key = format!("fencing_generator:{}", file_path);
-        let fencing_token: u64 = con.incr(&fencing_gen_key, 1).await?;
+
+        // Perform atomic lock acquire + fencing token increment via Lua
+        let fencing_token: Option<u64> = ACQUIRE_SCRIPT
+            .key(&lock_key)
+            .key(&fencing_gen_key)
+            .arg(&self.client_id)
+            .arg(ttl_ms)
+            .invoke_async(&mut con)
+            .await?;
+
+        let fencing_token = match fencing_token {
+            Some(token) => token,
+            None => {
+                return Err(SqueezefsError::LockFailed {
+                    reason: format!("Lock is already held on {}", lock_key),
+                });
+            }
+        };
 
         // Start heartbeat renewal thread
         let (heartbeat_tx, mut heartbeat_rx) = oneshot::channel::<()>();
@@ -404,17 +510,7 @@ impl DlmClient {
                     _ = interval.tick() => {
                         // Lua script or SET command to renew ONLY if we still own it
                         // script: if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end
-                        let script = redis::Script::new(
-                            r#"
-                            if redis.call("get", KEYS[1]) == ARGV[1] then
-                                return redis.call("pexpire", KEYS[1], ARGV[2])
-                            else
-                                return 0
-                            end
-                            "#
-                        );
-
-                        match script.key(&lock_key_clone).arg(&client_id_clone).arg(ttl_ms).invoke_async::<_, i32>(&mut con).await {
+                        match RENEW_SCRIPT.key(&lock_key_clone).arg(&client_id_clone).arg(ttl_ms).invoke_async::<_, i32>(&mut con).await {
                             Ok(1) => {
                                 debug!("Successfully renewed lease for key: {} (client_id: {}, ttl: {}ms)", lock_key_clone, client_id_clone, ttl_ms);
                             }
@@ -468,16 +564,7 @@ impl LockLease {
 
         let mut con = self.meta_client.get_connection().await?;
         // Release ONLY if we still own it to avoid releasing other client's lock
-        let script = redis::Script::new(
-            r#"
-            if redis.call("get", KEYS[1]) == ARGV[1] then
-                return redis.call("del", KEYS[1])
-            else
-                return 0
-            end
-            "#,
-        );
-        let _res: i32 = script
+        let _res: i32 = RELEASE_SCRIPT
             .key(&lock_key)
             .arg(&self.client_id)
             .invoke_async(&mut con)
@@ -510,16 +597,7 @@ impl Drop for LockLease {
                     format!("lock:{}", file_path)
                 };
                 if let Ok(mut con) = meta_client.get_connection().await {
-                    let script = redis::Script::new(
-                        r#"
-                        if redis.call("get", KEYS[1]) == ARGV[1] then
-                            return redis.call("del", KEYS[1])
-                        else
-                            return 0
-                        end
-                        "#,
-                    );
-                    let _: Result<i32> = script
+                    let _: Result<i32> = RELEASE_SCRIPT
                         .key(&lock_key)
                         .arg(&client_id)
                         .invoke_async(&mut con)

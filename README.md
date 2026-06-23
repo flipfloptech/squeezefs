@@ -73,10 +73,6 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
   - `--local-ips <ips>`: Comma-separated list of local source IP interfaces for multi-rail network load balancing.
   - `--mem-cache-size <size>`: System RAM cache size (e.g. `16GB` or `20%`).
   - `--disk-cache-size <size>`: NVMe cache capacity threshold.
-  - `--s3-endpoint <url>`: Overrides S3 endpoint URL stored in Garnet metadata.
-  - `--s3-access-key <key>`: Overrides S3 access key stored in Garnet metadata.
-  - `--s3-secret-key <key>`: Overrides S3 secret key stored in Garnet metadata.
-  - `--s3-bucket <bucket>`: Overrides S3 bucket name stored in Garnet metadata.
   - `--daemon`: Run FUSE daemon in the background (detach from terminal).
   - `--uid <id>`: Custom UID owner for the mount (default: current user or SUDO_UID).
   - `--gid <id>`: Custom GID owner for the mount (default: current group or SUDO_GID).
@@ -101,6 +97,27 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
   ```bash
   squeezefs tune
   ```
+
+* **Runtime Configuration & Storage Backend Management:**
+  Configure limits, caches, and storage backends at runtime:
+  ```bash
+  squeezefs config <garnet_url> <fs_name> <action>
+  ```
+  *Actions:*
+  - `set <key> <value>`: Updates runtime format quotas. Supported keys are `capacity` (e.g. "100G", "2T") and `inodes` (e.g. "2000000").
+  - `backend <subcommand>` (alias: `backends`): Manages sharded storage backend endpoints.
+    * `add <name> --endpoint <url> [--access-key <key>] [--secret-key <secret>] [--bucket <bucket>]`
+    * `remove <name> [--force]`
+    * `enable <name>`
+    * `disable <name>`
+    * `list`
+  - `add diskcache <path>`: Adds an NVMe disk cache path.
+  - `remove diskcache <path> [--force]`: Removes a disk cache path.
+  - `enable diskcache <path>`: Enables a disk cache path.
+  - `disable diskcache <path>`: Disables a disk cache path.
+  - `flush diskcache <path>`: Drains staging write files to storage before removal.
+  - `list`: Lists current staging disk caches, backends, and active backend.
+  - `fsck`: Runs consistency checks on metadata and block references.
 
 ---
 

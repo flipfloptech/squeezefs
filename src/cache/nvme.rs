@@ -308,6 +308,8 @@ impl NvmeStaging {
             return Ok(());
         }
 
+        crate::coz_progress!("nvme_flush_batch");
+
         let packed_id = Uuid::new_v4().to_string();
         let packed_key = format!("packed/blocks/{}", packed_id);
 

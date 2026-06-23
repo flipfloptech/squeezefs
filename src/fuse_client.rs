@@ -178,8 +178,26 @@ impl SqueezefsFilesystem {
                 .hset("squeezefs:attr:1", "ctime_sec", sec)
                 .hset("squeezefs:attr:1", "ctime_nsec", nsec)
                 .set_nx("squeezefs:inode_counter", 1)
+                .incr("squeezefs:used_inodes", 1)
                 .query_async(&mut con)
                 .await?;
+        }
+        Ok(())
+    }
+
+    async fn check_inode_quota(&self, con: &mut crate::dlm::MetaConnection) -> Result<(), Errno> {
+        let inodes_limit_str: Option<String> = con
+            .hget("squeezefs:format", "inodes")
+            .await
+            .map_err(map_err)?;
+        let inodes_limit = inodes_limit_str
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if inodes_limit > 0 {
+            let used_inodes: u64 = con.get("squeezefs:used_inodes").await.unwrap_or(0);
+            if used_inodes >= inodes_limit {
+                return Err(Errno::from(libc::ENOSPC));
+            }
         }
         Ok(())
     }
@@ -678,6 +696,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .hset("squeezefs:format", "name", "squeezefs")
                 .hset("squeezefs:format", "block_size", default_block_size)
                 .hset("squeezefs:format", "capacity", default_capacity)
+                .hset("squeezefs:format", "inodes", 0)
                 .hset("squeezefs:format", "version", 1) // ABI version
                 .hset("squeezefs:format", "mem_cache_size", "1GB")
                 .hset("squeezefs:format", "disk_cache_size", "10GB")
@@ -863,6 +882,8 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EEXIST));
         }
 
+        self.check_inode_quota(&mut con).await?;
+
         // Determine FileType kind number
         let file_type_mask = mode & libc::S_IFMT;
         let kind_num = if file_type_mask == libc::S_IFIFO {
@@ -912,7 +933,8 @@ impl Filesystem for SqueezefsFilesystem {
             .hset(&attr_key, "mtime_sec", sec)
             .hset(&attr_key, "mtime_nsec", nsec)
             .hset(&attr_key, "ctime_sec", sec)
-            .hset(&attr_key, "ctime_nsec", nsec);
+            .hset(&attr_key, "ctime_nsec", nsec)
+            .incr("squeezefs:used_inodes", 1);
 
         if kind_num == 1 {
             let meta_key = format!("metadata:inode_{}", new_ino);
@@ -959,6 +981,15 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+
+        // Check if name already exists in parent
+        let dir_key = format!("squeezefs:dir:{}", parent);
+        let exists: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
+        if exists.is_some() {
+            return Err(Errno::from(libc::EEXIST));
+        }
+
+        self.check_inode_quota(&mut con).await?;
 
         // Allocate new inode
         let new_ino: u64 = con
@@ -1009,6 +1040,7 @@ impl Filesystem for SqueezefsFilesystem {
             .hset(&attr_key, "ctime_nsec", nsec)
             .hset(&meta_key, "type", "inline")
             .hset(&meta_key, "size", 0)
+            .incr("squeezefs:used_inodes", 1)
             .query_async(&mut con)
             .await
             .map_err(map_err)?;
@@ -1280,6 +1312,8 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EEXIST));
         }
 
+        self.check_inode_quota(&mut con).await?;
+
         // Allocate new inode
         let new_ino: u64 = con
             .incr("squeezefs:inode_counter", 1)
@@ -1314,6 +1348,7 @@ impl Filesystem for SqueezefsFilesystem {
             .hset(&attr_key, "ctime_nsec", nsec)
             .hset(&child_dir_key, ".", new_ino)
             .hset(&child_dir_key, "..", parent)
+            .incr("squeezefs:used_inodes", 1)
             .query_async(&mut con)
             .await
             .map_err(map_err)?;
@@ -1371,6 +1406,7 @@ impl Filesystem for SqueezefsFilesystem {
             .hdel(&dir_key, &*name_str)
             .del(&attr_key)
             .del(&child_dir_key)
+            .decr("squeezefs:used_inodes", 1)
             .query_async(&mut con)
             .await
             .map_err(map_err)?;
@@ -1526,6 +1562,8 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EEXIST));
         }
 
+        self.check_inode_quota(&mut con).await?;
+
         // Allocate new inode
         let new_ino: u64 = con
             .incr("squeezefs:inode_counter", 1)
@@ -1558,6 +1596,7 @@ impl Filesystem for SqueezefsFilesystem {
             .hset(&attr_key, "ctime_sec", sec)
             .hset(&attr_key, "ctime_nsec", nsec)
             .set(&symlink_key, &*link_str)
+            .incr("squeezefs:used_inodes", 1)
             .query_async(&mut con)
             .await
             .map_err(map_err)?;
@@ -1756,6 +1795,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .del(&meta_key)
                 .del(&symlink_key)
                 .decr("squeezefs:used_bytes", file_size)
+                .decr("squeezefs:used_inodes", 1)
                 .query_async(&mut con)
                 .await
                 .map_err(map_err)?;
@@ -1866,9 +1906,18 @@ impl Filesystem for SqueezefsFilesystem {
                         return Err(Errno::from(libc::ENOTEMPTY));
                     }
                 }
-                let _: () = con.del(&child_dest_dir_key).await.map_err(map_err)?;
+                let _: () = redis::pipe()
+                    .del(&child_dest_dir_key)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(map_err)?;
             }
-            let _: () = con.del(&dest_attr_key).await.map_err(map_err)?;
+            let _: () = redis::pipe()
+                .del(&dest_attr_key)
+                .decr("squeezefs:used_inodes", 1)
+                .query_async(&mut con)
+                .await
+                .map_err(map_err)?;
         }
 
         // Perform rename atomically
@@ -2477,8 +2526,12 @@ impl Filesystem for SqueezefsFilesystem {
         let used_bytes_opt: Option<u64> = con.get("squeezefs:used_bytes").await.map_err(map_err)?;
         let used_bytes = used_bytes_opt.unwrap_or(0);
 
+        let used_inodes_opt: Option<u64> = con.get("squeezefs:used_inodes").await.map_err(map_err)?;
+        let used_inodes = used_inodes_opt.unwrap_or(0);
+
         let bsize = 4096;
         let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
+        
         let capacity = if format_exists {
             let cap_str: Option<String> = con
                 .hget("squeezefs:format", "capacity")
@@ -2491,6 +2544,25 @@ impl Filesystem for SqueezefsFilesystem {
             1024 * 1024 * 1024 * 1024 * 1024 // 1PB
         };
 
+        let inodes_limit = if format_exists {
+            let limit_str: Option<String> = con
+                .hget("squeezefs:format", "inodes")
+                .await
+                .map_err(map_err)?;
+            limit_str
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let total_inodes = if inodes_limit > 0 {
+            inodes_limit
+        } else {
+            1_000_000_000
+        };
+
+        let ffree = total_inodes.saturating_sub(used_inodes);
         let total_blocks = capacity / bsize as u64;
         let used_blocks = used_bytes.div_ceil(bsize as u64);
         let bfree = total_blocks.saturating_sub(used_blocks);
@@ -2499,8 +2571,8 @@ impl Filesystem for SqueezefsFilesystem {
             blocks: total_blocks,
             bfree,
             bavail: bfree,
-            files: 1_000_000_000,
-            ffree: 999_999_000,
+            files: total_inodes,
+            ffree,
             bsize,
             namelen: 255,
             frsize: bsize,
@@ -3242,6 +3314,7 @@ pub async fn format_volume(
     name: &str,
     block_size: u64,
     capacity: u64,
+    inodes: u64,
     mem_cache_size: Option<&str>,
     disk_cache_size: Option<&str>,
     disk_cache_paths: Option<&[std::path::PathBuf]>,
@@ -3273,6 +3346,7 @@ pub async fn format_volume(
     pipe.hset("squeezefs:format", "name", name)
         .hset("squeezefs:format", "block_size", block_size)
         .hset("squeezefs:format", "capacity", capacity)
+        .hset("squeezefs:format", "inodes", inodes)
         .hset("squeezefs:format", "version", 1) // ABI version
         .hset("squeezefs:format", "mem_cache_size", mem_size)
         .hset("squeezefs:format", "disk_cache_size", disk_size)
@@ -3337,6 +3411,10 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
         .get("capacity")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let inodes: u64 = fields
+        .get("inodes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let mem_cache_size = fields.get("mem_cache_size").cloned().unwrap_or_default();
     let disk_cache_size = fields.get("disk_cache_size").cloned().unwrap_or_default();
     let disk_cache_paths_str = fields.get("disk_cache_paths").cloned().unwrap_or_default();
@@ -3361,6 +3439,7 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             "Name": name,
             "BlockSize": block_size,
             "Capacity": capacity,
+            "Inodes": inodes,
             "MemCacheSize": mem_cache_size,
             "DiskCacheSize": disk_cache_size,
             "DiskCachePaths": disk_cache_paths,

@@ -42,6 +42,7 @@ async fn test_cli_format_and_status() {
         "testvolume",
         8 * 1024 * 1024,                 // 8MB block size
         500 * 1024 * 1024 * 1024 * 1024, // 500TB capacity
+        0,                               // inodes limit
         Some("64GB"),
         Some("100GB"),
         Some(&[std::path::PathBuf::from("/tmp/test_staging_format")]),
@@ -429,6 +430,7 @@ async fn test_multi_backend_routing() {
         "multibackend",
         4 * 1024 * 1024,
         100 * 1024 * 1024,
+        0, // inodes limit
         None,
         None,
         None,
@@ -750,6 +752,7 @@ async fn test_config_sqz_virtual_file() {
         "testvolume_config",
         1024 * 1024,
         1000 * 1024 * 1024,
+        0, // inodes limit
         Some("64MB"),
         Some("100MB"),
         None,
@@ -853,4 +856,94 @@ async fn test_config_sqz_virtual_file() {
     assert_eq!(config_entry_plus.inode, config_ino);
     assert_eq!(config_entry_plus.attr.ino, config_ino);
     assert_eq!(config_entry_plus.attr.perm, 0o444);
+}
+
+#[tokio::test]
+async fn test_inode_quota_enforcement() {
+    let mut _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = get_redis_url();
+    // Format volume to populate squeezefs:format, max inodes set to 3
+    format_volume(
+        &redis_url,
+        "quota_vol",
+        1024 * 1024,
+        1000 * 1024 * 1024,
+        3, // inodes limit: 3. Root is 1, so we can create 2 more.
+        Some("64MB"),
+        Some("100MB"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("Format volume should succeed");
+
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // Verify initial statfs report
+    let stat1 = fs.statfs(req, 1).await.unwrap();
+    assert_eq!(stat1.files, 3);
+    assert_eq!(stat1.ffree, 2); // 3 total - 1 (root directory) = 2 free
+
+    // 1. Create first file (should succeed, inode 2)
+    let create1 = fs.create(req, 1, OsStr::new("file1"), 0o644, 0).await.unwrap();
+    assert_eq!(create1.attr.ino, 2);
+
+    let stat2 = fs.statfs(req, 1).await.unwrap();
+    assert_eq!(stat2.ffree, 1);
+
+    // 2. Create second file (should succeed, inode 3)
+    let create2 = fs.create(req, 1, OsStr::new("file2"), 0o644, 0).await.unwrap();
+    assert_eq!(create2.attr.ino, 3);
+
+    let stat3 = fs.statfs(req, 1).await.unwrap();
+    assert_eq!(stat3.ffree, 0); // No free inodes left
+
+    // 3. Create third file (should fail with ENOSPC)
+    let create3_res = fs.create(req, 1, OsStr::new("file3"), 0o644, 0).await;
+    assert!(create3_res.is_err());
+    assert_eq!(create3_res.err().unwrap(), fuse3::Errno::from(libc::ENOSPC));
+
+    // 4. Delete one file (file1)
+    fs.unlink(req, 1, OsStr::new("file1")).await.unwrap();
+
+    let stat4 = fs.statfs(req, 1).await.unwrap();
+    assert_eq!(stat4.ffree, 1); // 1 free inode now
+
+    // 5. Try creating again (should succeed now, allocating a new inode counter value e.g. 4)
+    let create4 = fs.create(req, 1, OsStr::new("file3"), 0o644, 0).await.unwrap();
+    assert_eq!(create4.attr.ino, 4);
+
+    let stat5 = fs.statfs(req, 1).await.unwrap();
+    assert_eq!(stat5.ffree, 0);
 }

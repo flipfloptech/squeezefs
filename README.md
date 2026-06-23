@@ -104,19 +104,21 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
   squeezefs config <garnet_url> <fs_name> <action>
   ```
   *Actions:*
-  - `set <key> <value>`: Updates runtime format quotas. Supported keys are `capacity` (e.g. "100G", "2T") and `inodes` (e.g. "2000000").
+  - `set <key> <value>`: Updates runtime format quotas and cache limits. Supported keys are `capacity` (e.g. "100G", "2T"), `inodes` (e.g. "2000000"), `mem_cache_size`, `read_mem_cache_size`, `write_mem_cache_size`, `disk_cache_size`, `read_cache_size`, and `write_cache_size`.
   - `backend <subcommand>` (alias: `backends`): Manages sharded storage backend endpoints.
     * `add <name> --endpoint <url> [--access-key <key>] [--secret-key <secret>] [--bucket <bucket>]`
     * `remove <name> [--force]`
     * `enable <name>`
     * `disable <name>`
     * `list`
-  - `add diskcache <path>`: Adds an NVMe disk cache path.
-  - `remove diskcache <path> [--force]`: Removes a disk cache path.
-  - `enable diskcache <path>`: Enables a disk cache path.
-  - `disable diskcache <path>`: Disables a disk cache path.
-  - `flush diskcache <path>`: Drains staging write files to storage before removal.
-  - `list`: Lists current staging disk caches, backends, and active backend.
+  - `diskcache <subcommand>` (alias: `diskcaches`): Manages staging disk cache paths.
+    * `add <path>`
+    * `remove <path> [--force]`
+    * `enable <path>`
+    * `disable <path>`
+    * `flush <path>`
+    * `list`
+  - `list`: Lists the entire unified configuration.
   - `fsck`: Runs consistency checks on metadata and block references.
 
 ---

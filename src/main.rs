@@ -530,7 +530,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 s3_bucket.as_deref(),
             )
             .await?;
-            println!("Volume '{}' formatted successfully.", name);
+            let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Commands::Status => {
             let redis_url = &cli.garnet_url;

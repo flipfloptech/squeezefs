@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Builder;
 
-const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
+const MIN_INTERNAL_INODE: u64 = 0x7fff_ffff_0000_0000;
+const CONFIG_INODE: u64 = MIN_INTERNAL_INODE + 4;
 
 #[derive(Default)]
 pub struct ProbabilisticAtomic {
@@ -855,7 +856,7 @@ impl Filesystem for SqueezefsFilesystem {
         let name_str = name.to_string_lossy();
         debug!("FUSE Lookup: parent = {}, name = {}", parent, name_str);
 
-        if parent == 1 && name_str == ".config.sqz" {
+        if parent == 1 && (name_str == ".config.sqz" || name_str == ".config") {
             let config_data = self.generate_config_json().await;
             let attr = self.get_config_attr(config_data.len() as u64);
             return Ok(ReplyEntry {
@@ -1797,7 +1798,7 @@ impl Filesystem for SqueezefsFilesystem {
         let name_str = name.to_string_lossy();
         debug!("FUSE unlink: parent = {}, name = {}", parent, name_str);
 
-        if parent == 1 && name_str == ".config.sqz" {
+        if parent == 1 && (name_str == ".config.sqz" || name_str == ".config") {
             return Err(Errno::from(libc::EPERM));
         }
 
@@ -1898,8 +1899,8 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, new_parent, new_name_str
         );
 
-        if (parent == 1 && name_str == ".config.sqz")
-            || (new_parent == 1 && new_name_str == ".config.sqz")
+        if (parent == 1 && (name_str == ".config.sqz" || name_str == ".config"))
+            || (new_parent == 1 && (new_name_str == ".config.sqz" || new_name_str == ".config"))
         {
             return Err(Errno::from(libc::EPERM));
         }
@@ -2115,6 +2116,16 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        if parent == 1 && !entries_map.contains_key(".config") {
+            let offset = (entries.len() + 1) as i64;
+            entries.push(DirectoryEntry {
+                name: ".config".into(),
+                kind: FileType::RegularFile,
+                inode: CONFIG_INODE,
+                offset,
+            });
+        }
+
         let mut child_inos = Vec::new();
         for (name, child_ino) in &entries_map {
             if name == "." || name == ".." {
@@ -2254,6 +2265,22 @@ impl Filesystem for SqueezefsFilesystem {
             let offset = (entries.len() + 1) as i64;
             entries.push(DirectoryEntryPlus {
                 name: ".config.sqz".into(),
+                kind: FileType::RegularFile,
+                inode: CONFIG_INODE,
+                generation: 1,
+                attr,
+                entry_ttl: Duration::from_secs(1),
+                attr_ttl: Duration::from_secs(1),
+                offset,
+            });
+        }
+
+        if parent == 1 && !entries_map.contains_key(".config") {
+            let config_data = self.generate_config_json().await;
+            let attr = self.get_config_attr(config_data.len() as u64);
+            let offset = (entries.len() + 1) as i64;
+            entries.push(DirectoryEntryPlus {
+                name: ".config".into(),
                 kind: FileType::RegularFile,
                 inode: CONFIG_INODE,
                 generation: 1,

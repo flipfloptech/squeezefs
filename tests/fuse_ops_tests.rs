@@ -397,3 +397,61 @@ async fn test_vim_swap_lifecycle() {
     let flush_res = fs.flush(req, ino, fh, 123).await;
     assert!(flush_res.is_ok(), "flush should return Ok");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuse_write_updates_blocks_cache() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => return,
+    };
+
+    let redis_url = "redis://127.0.0.1:6379/";
+    let dlm = DlmClient::new(redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    let file_name = OsStr::new("write_blocks_test.bin");
+    let flags = libc::O_CREAT | libc::O_RDWR;
+    let reply_create = fs
+        .create(req, 1, file_name, 0o644, flags as u32)
+        .await
+        .unwrap();
+    let ino = reply_create.attr.ino;
+    let fh = reply_create.fh;
+
+    // Verify initial state
+    let attr_pre = fs.getattr(req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(attr_pre.size, 0);
+    assert_eq!(attr_pre.blocks, 0);
+
+    // Write 1000 bytes
+    let data = vec![0u8; 1000];
+    let reply_write = fs.write(req, ino, fh, 0, &data, 0, 0).await.unwrap();
+    assert_eq!(reply_write.written, 1000);
+
+    // Call getattr immediately (should hit cached attributes)
+    let attr_post = fs.getattr(req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(attr_post.size, 1000);
+    assert_eq!(attr_post.blocks, 2, "Blocks attribute in cache must be updated to size.div_ceil(512)");
+}
+

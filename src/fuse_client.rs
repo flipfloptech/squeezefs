@@ -1392,6 +1392,7 @@ impl Filesystem for SqueezefsFilesystem {
         // Update local attr_cache
         if let Some(mut entry) = self.attr_cache.get_mut(&ino) {
             entry.value_mut().0.size = new_size;
+            entry.value_mut().0.blocks = new_size.div_ceil(512);
             entry.value_mut().0.mtime = Timestamp::new(sec, nsec);
             entry.value_mut().0.ctime = Timestamp::new(sec, nsec);
             entry.value_mut().1 = std::time::Instant::now();

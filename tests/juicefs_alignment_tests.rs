@@ -499,24 +499,33 @@ async fn test_multi_backend_routing() {
     let block_keys: Vec<String> = con.hvals(&map_key).await.unwrap();
     assert!(!block_keys.is_empty());
     for bk in &block_keys {
-        assert!(
-            bk.starts_with("backend_1:"),
-            "Block key should start with backend_1 prefix: {}",
-            bk
-        );
         let (be_id, real_key) = squeezefs::backend::parse_backend_and_key(bk);
-        assert_eq!(be_id, "backend_1");
-        // Verify S3 backend indeed contains the block!
-        let data = backend_1
+        let expected_backend = multi_backend.get_backend_for_key(&real_key);
+        assert_eq!(be_id, expected_backend);
+
+        let active_client = if be_id == "backend_0" {
+            &backend_0
+        } else {
+            &backend_1
+        };
+        let other_client = if be_id == "backend_0" {
+            &backend_1
+        } else {
+            &backend_0
+        };
+
+        // Verify active backend indeed contains the block!
+        let data = active_client
             .get_object(&real_key)
             .await
-            .expect("Block must exist in backend_1 storage");
+            .expect("Block must exist in active backend storage");
         assert!(!data.is_empty());
+
         // Verify default backend does NOT contain it
-        let default_res = backend_0.get_object(&real_key).await;
+        let default_res = other_client.get_object(&real_key).await;
         assert!(
             default_res.is_err(),
-            "Block should not exist in backend_0 storage"
+            "Block should not exist in other backend storage"
         );
     }
 

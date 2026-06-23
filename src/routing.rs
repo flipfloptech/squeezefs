@@ -22,7 +22,7 @@ pub struct CachedMetadata {
 
 #[derive(Clone)]
 pub struct DataRouter {
-    dlm: DlmClient,
+    pub dlm: DlmClient,
     pub backend: MultiBackendClient,
     pub cache: TieredCache,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -130,18 +130,12 @@ impl DataRouter {
             let _: () = pipe.query_async(&mut con).await?;
 
             if let Some(old_id) = old_file_id {
-                let old_data_path = self
+                let old_staged_path = self
                     .cache
                     .nvme
                     .get_staged_path(&old_id)
-                    .join(format!("{}.data", old_id));
-                let old_meta_path = self
-                    .cache
-                    .nvme
-                    .get_staged_path(&old_id)
-                    .join(format!("{}.meta", old_id));
-                let _ = tokio::fs::remove_file(old_data_path).await;
-                let _ = tokio::fs::remove_file(old_meta_path).await;
+                    .join(format!("{}.staged", old_id));
+                let _ = tokio::fs::remove_file(old_staged_path).await;
                 let mapping_key = format!("mapping:{}", old_id);
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
@@ -176,18 +170,12 @@ impl DataRouter {
                 .await?;
 
             if let Some(old_id) = old_file_id {
-                let old_data_path = self
+                let old_staged_path = self
                     .cache
                     .nvme
                     .get_staged_path(&old_id)
-                    .join(format!("{}.data", old_id));
-                let old_meta_path = self
-                    .cache
-                    .nvme
-                    .get_staged_path(&old_id)
-                    .join(format!("{}.meta", old_id));
-                let _ = tokio::fs::remove_file(old_data_path).await;
-                let _ = tokio::fs::remove_file(old_meta_path).await;
+                    .join(format!("{}.staged", old_id));
+                let _ = tokio::fs::remove_file(old_staged_path).await;
                 let mapping_key = format!("mapping:{}", old_id);
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
@@ -270,18 +258,12 @@ impl DataRouter {
             let _: () = pipe.query_async(&mut con).await?;
 
             if let Some(old_id) = old_file_id {
-                let old_data_path = self
+                let old_staged_path = self
                     .cache
                     .nvme
                     .get_staged_path(&old_id)
-                    .join(format!("{}.data", old_id));
-                let old_meta_path = self
-                    .cache
-                    .nvme
-                    .get_staged_path(&old_id)
-                    .join(format!("{}.meta", old_id));
-                let _ = tokio::fs::remove_file(old_data_path).await;
-                let _ = tokio::fs::remove_file(old_meta_path).await;
+                    .join(format!("{}.staged", old_id));
+                let _ = tokio::fs::remove_file(old_staged_path).await;
                 let mapping_key = format!("mapping:{}", old_id);
                 // Decrement refcount of old staged merged block if it exists
                 let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
@@ -1061,16 +1043,11 @@ impl DataRouter {
             let size = size_opt.unwrap_or(0);
             let new_file_id = Uuid::new_v4().to_string();
 
-            let src_data_path = self
+            let src_staged_path = self
                 .cache
                 .nvme
                 .get_staged_path(&src_file_id)
-                .join(format!("{}.data", src_file_id));
-            let src_meta_path = self
-                .cache
-                .nvme
-                .get_staged_path(&src_file_id)
-                .join(format!("{}.meta", src_file_id));
+                .join(format!("{}.staged", src_file_id));
 
             let dest_dir = self.cache.nvme.get_staged_path(&new_file_id);
             tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
@@ -1080,26 +1057,14 @@ impl DataRouter {
                 )))
             })?;
 
-            let dest_data_path = dest_dir.join(format!("{}.data", new_file_id));
-            let dest_meta_path = dest_dir.join(format!("{}.meta", new_file_id));
+            let dest_staged_path = dest_dir.join(format!("{}.staged", new_file_id));
 
-            if tokio::fs::metadata(&src_data_path).await.is_ok() {
-                tokio::fs::copy(&src_data_path, &dest_data_path)
+            if tokio::fs::metadata(&src_staged_path).await.is_ok() {
+                tokio::fs::copy(&src_staged_path, &dest_staged_path)
                     .await
                     .map_err(|e| {
                         SqueezefsError::Io(std::io::Error::other(format!(
                             "Failed to copy stage data: {:?}",
-                            e
-                        )))
-                    })?;
-            }
-
-            if tokio::fs::metadata(&src_meta_path).await.is_ok() {
-                tokio::fs::copy(&src_meta_path, &dest_meta_path)
-                    .await
-                    .map_err(|e| {
-                        SqueezefsError::Io(std::io::Error::other(format!(
-                            "Failed to copy stage meta: {:?}",
                             e
                         )))
                     })?;
@@ -1283,18 +1248,12 @@ impl DataRouter {
                     }
                     let _: () = con.del(&mapping_key).await?;
 
-                    let old_data_path = self
+                    let old_staged_path = self
                         .cache
                         .nvme
                         .get_staged_path(&fid)
-                        .join(format!("{}.data", fid));
-                    let old_meta_path = self
-                        .cache
-                        .nvme
-                        .get_staged_path(&fid)
-                        .join(format!("{}.meta", fid));
-                    let _ = tokio::fs::remove_file(old_data_path).await;
-                    let _ = tokio::fs::remove_file(old_meta_path).await;
+                        .join(format!("{}.staged", fid));
+                    let _ = tokio::fs::remove_file(old_staged_path).await;
                 }
             }
         }

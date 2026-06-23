@@ -33,16 +33,23 @@ async fn test_crash_recovery_flow() {
     let data = vec![8; 2000];
     let fencing_token = 500u64;
 
-    // 1. Manually write the local staging files to simulate a crash before flush
-    let data_path = temp_dir.path().join(format!("{}.data", file_id));
-    let meta_path = temp_dir.path().join(format!("{}.meta", file_id));
+    // 1. Manually write the local staging file to simulate a crash before flush
+    let staged_path = temp_dir.path().join(format!("{}.staged", file_id));
 
-    fs::write(&data_path, &data).unwrap();
     let meta_content = serde_json::json!({
         "file_path": file_path,
-        "fencing_token": fencing_token
+        "fencing_token": fencing_token,
+        "original_size": data.len()
     });
-    fs::write(&meta_path, serde_json::to_vec(&meta_content).unwrap()).unwrap();
+    let meta_json_bytes = serde_json::to_vec(&meta_content).unwrap();
+    let meta_len = meta_json_bytes.len() as u64;
+
+    let mut packed_payload = Vec::new();
+    packed_payload.extend_from_slice(&meta_len.to_be_bytes());
+    packed_payload.extend_from_slice(&meta_json_bytes);
+    packed_payload.extend_from_slice(&data);
+
+    fs::write(&staged_path, &packed_payload).unwrap();
 
     // 2. Set the metadata in Garnet matching the staging ID (simulating active write)
     let mut con = redis_client
@@ -68,8 +75,7 @@ async fn test_crash_recovery_flow() {
     assert_eq!(recovered, 1);
 
     // 4. Verify local staging files are cleaned up
-    assert!(!data_path.exists());
-    assert!(!meta_path.exists());
+    assert!(!staged_path.exists());
 
     // 5. Verify Garnet mapping has been recorded
     let mapping_key = format!("mapping:{}", file_id);
@@ -107,16 +113,23 @@ async fn test_stale_write_recovery_discard() {
     let data = vec![9; 1000];
     let fencing_token = 500u64;
 
-    // 1. Manually write the local staging files
-    let data_path = temp_dir.path().join(format!("{}.data", file_id));
-    let meta_path = temp_dir.path().join(format!("{}.meta", file_id));
+    // 1. Manually write the local staging file
+    let staged_path = temp_dir.path().join(format!("{}.staged", file_id));
 
-    fs::write(&data_path, &data).unwrap();
     let meta_content = serde_json::json!({
         "file_path": file_path,
-        "fencing_token": fencing_token
+        "fencing_token": fencing_token,
+        "original_size": data.len()
     });
-    fs::write(&meta_path, serde_json::to_vec(&meta_content).unwrap()).unwrap();
+    let meta_json_bytes = serde_json::to_vec(&meta_content).unwrap();
+    let meta_len = meta_json_bytes.len() as u64;
+
+    let mut packed_payload = Vec::new();
+    packed_payload.extend_from_slice(&meta_len.to_be_bytes());
+    packed_payload.extend_from_slice(&meta_json_bytes);
+    packed_payload.extend_from_slice(&data);
+
+    fs::write(&staged_path, &packed_payload).unwrap();
 
     // 2. Set the metadata in Garnet pointing to a DIFFERENT file_id (newer write occurred since crash)
     let mut con = redis_client
@@ -143,8 +156,7 @@ async fn test_stale_write_recovery_discard() {
     assert_eq!(recovered, 0);
 
     // 4. Stale local staging files should still be cleaned up to prevent disk leak
-    assert!(!data_path.exists());
-    assert!(!meta_path.exists());
+    assert!(!staged_path.exists());
 
     // 5. Verify Garnet mapping has NOT been recorded for this stale ID
     let mapping_key = format!("mapping:{}", file_id);

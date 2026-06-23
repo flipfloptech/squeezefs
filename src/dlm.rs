@@ -4,9 +4,6 @@ use redis::aio::ConnectionLike;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-use tokio::time;
 use uuid::Uuid;
 use once_cell::sync::Lazy;
 
@@ -23,17 +20,14 @@ static ACQUIRE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
     )
 });
 
-static RENEW_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
-    redis::Script::new(
-        r#"
+const RENEW_SCRIPT_CODE: &str = r#"
         if redis.call("get", KEYS[1]) == ARGV[1] then
             return redis.call("pexpire", KEYS[1], ARGV[2])
         else
             return 0
         end
-        "#
-    )
-});
+        "#;
+
 
 static RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
     redis::Script::new(
@@ -386,39 +380,184 @@ impl MetaClient {
     }
 }
 
+enum HeartbeatCommand {
+    Register {
+        lock_key: String,
+        client_id: String,
+        ttl_ms: u64,
+    },
+    Deregister {
+        lock_key: String,
+    },
+}
+
+struct ActiveLease {
+    lock_key: String,
+    client_id: String,
+    ttl_ms: u64,
+    next_renewal: tokio::time::Instant,
+}
+
+async fn run_heartbeat_manager(
+    meta_client: MetaClient,
+    mut rx: tokio::sync::mpsc::Receiver<HeartbeatCommand>,
+) {
+    use std::collections::HashMap;
+    use tokio::time::{interval, Instant, MissedTickBehavior};
+
+    let mut leases: HashMap<String, ActiveLease> = HashMap::new();
+    let mut interval = interval(Duration::from_millis(500));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut con_opt: Option<MetaConnection> = None;
+
+    loop {
+        tokio::select! {
+            cmd_opt = rx.recv() => {
+                match cmd_opt {
+                    Some(HeartbeatCommand::Register { lock_key, client_id, ttl_ms }) => {
+                        let interval_dur = Duration::from_millis(ttl_ms / 3);
+                        let next_renewal = Instant::now() + interval_dur;
+                        leases.insert(lock_key.clone(), ActiveLease {
+                            lock_key,
+                            client_id,
+                            ttl_ms,
+                            next_renewal,
+                        });
+                    }
+                    Some(HeartbeatCommand::Deregister { lock_key }) => {
+                        leases.remove(&lock_key);
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+            _ = interval.tick() => {
+                if leases.is_empty() {
+                    continue;
+                }
+
+                let now = Instant::now();
+                let mut keys_to_renew = Vec::new();
+                for (key, lease) in leases.iter_mut() {
+                    if now >= lease.next_renewal {
+                        keys_to_renew.push(key.clone());
+                    }
+                }
+
+                if keys_to_renew.is_empty() {
+                    continue;
+                }
+
+                let mut con = match con_opt.take() {
+                    Some(c) => c,
+                    None => {
+                        match meta_client.get_connection().await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("Heartbeat manager failed to connect to Redis: {:?}", e);
+                                for key in &keys_to_renew {
+                                    if let Some(lease) = leases.get_mut(key) {
+                                        lease.next_renewal = now + Duration::from_millis(500);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                let mut pipe = redis::pipe();
+                for key in &keys_to_renew {
+                    if let Some(lease) = leases.get(key) {
+                        pipe.cmd("EVAL")
+                            .arg(RENEW_SCRIPT_CODE)
+                            .arg(1)
+                            .arg(&lease.lock_key)
+                            .arg(&lease.client_id)
+                            .arg(lease.ttl_ms);
+                    }
+                }
+
+                match pipe.query_async::<_, Vec<i32>>(&mut con).await {
+                    Ok(results) => {
+                        con_opt = Some(con);
+                        for (i, key) in keys_to_renew.into_iter().enumerate() {
+                            if let Some(lease) = leases.get_mut(&key) {
+                                let res_val = results.get(i).copied().unwrap_or(0);
+                                if res_val == 1 {
+                                    debug!("Heartbeat manager: Successfully renewed lease for key: {}", key);
+                                    let interval_dur = Duration::from_millis(lease.ttl_ms / 3);
+                                    lease.next_renewal = Instant::now() + interval_dur;
+                                } else {
+                                    error!("Heartbeat manager: Failed to renew lease for key: {} - lock stolen or expired", key);
+                                    leases.remove(&key);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Heartbeat manager: Error executing renewal pipeline: {:?}", e);
+                        for key in keys_to_renew {
+                            if let Some(lease) = leases.get_mut(&key) {
+                                lease.next_renewal = now + Duration::from_millis(500);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DlmClient {
     client_id: String,
     meta_client: MetaClient,
+    heartbeat_tx: std::sync::Arc<once_cell::sync::OnceCell<tokio::sync::mpsc::Sender<HeartbeatCommand>>>,
 }
 
 pub struct LockLease {
     file_path: String,
     client_id: String,
     fencing_token: u64,
-    heartbeat_tx: Option<oneshot::Sender<()>>,
-    _heartbeat_handle: Option<JoinHandle<()>>,
+    lock_key: String,
+    heartbeat_tx: Option<tokio::sync::mpsc::Sender<HeartbeatCommand>>,
     meta_client: MetaClient,
     range: Option<(u64, u64)>,
 }
 
 impl DlmClient {
+    fn get_heartbeat_tx(&self) -> &tokio::sync::mpsc::Sender<HeartbeatCommand> {
+        self.heartbeat_tx.get_or_init(|| {
+            let (heartbeat_tx, heartbeat_rx) = tokio::sync::mpsc::channel(1024);
+            let meta_client_clone = self.meta_client.clone();
+            tokio::spawn(async move {
+                run_heartbeat_manager(meta_client_clone, heartbeat_rx).await;
+            });
+            heartbeat_tx
+        })
+    }
+
+    fn init_with_client(client_id: String, meta_client: MetaClient) -> Self {
+        Self {
+            client_id,
+            meta_client,
+            heartbeat_tx: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
+        }
+    }
+
     pub fn new(redis_url: &str) -> Result<Self> {
         let meta_client = MetaClient::new(redis_url)?;
         let client_id = Uuid::new_v4().to_string();
-        Ok(Self {
-            client_id,
-            meta_client,
-        })
+        Ok(Self::init_with_client(client_id, meta_client))
     }
 
     pub async fn new_with_local_ips(redis_url: &str, local_ips: Vec<IpAddr>) -> Result<Self> {
         let meta_client = MetaClient::new_with_local_ips(redis_url, local_ips).await?;
         let client_id = Uuid::new_v4().to_string();
-        Ok(Self {
-            client_id,
-            meta_client,
-        })
+        Ok(Self::init_with_client(client_id, meta_client))
     }
 
     pub fn connection_count(&self) -> usize {
@@ -481,58 +620,20 @@ impl DlmClient {
             }
         };
 
-        // Start heartbeat renewal thread
-        let (heartbeat_tx, mut heartbeat_rx) = oneshot::channel::<()>();
-        let client_id_clone = self.client_id.clone();
-        let lock_key_clone = lock_key.clone();
-        let meta_client_clone = self.meta_client.clone();
-        let interval_duration = ttl / 3; // Renew at 1/3 of TTL (e.g. every 1.6s for 5s TTL)
-
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut interval = time::interval(interval_duration);
-            // First tick is immediate, skip it
-            interval.tick().await;
-
-            let mut con = match meta_client_clone.get_connection().await {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Heartbeat failed to establish Redis connection: {:?}", e);
-                    return;
-                }
-            };
-
-            loop {
-                tokio::select! {
-                    _ = &mut heartbeat_rx => {
-                        debug!("Heartbeat task received cancellation signal for key: {}", lock_key_clone);
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        // Lua script or SET command to renew ONLY if we still own it
-                        // script: if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end
-                        match RENEW_SCRIPT.key(&lock_key_clone).arg(&client_id_clone).arg(ttl_ms).invoke_async::<_, i32>(&mut con).await {
-                            Ok(1) => {
-                                debug!("Successfully renewed lease for key: {} (client_id: {}, ttl: {}ms)", lock_key_clone, client_id_clone, ttl_ms);
-                            }
-                            Ok(_) => {
-                                error!("Failed to renew lease for key: {} (client_id: {}, ttl: {}ms) - lock was stolen or expired!", lock_key_clone, client_id_clone, ttl_ms);
-                                break;
-                            }
-                            Err(e) => {
-                                error!("Error executing lease renewal script for key {} (client_id: {}, ttl: {}ms): {:?}", lock_key_clone, client_id_clone, ttl_ms, e);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
+        // Register with manager
+        let tx = self.get_heartbeat_tx().clone();
+        let _ = tx.send(HeartbeatCommand::Register {
+            lock_key: lock_key.clone(),
+            client_id: self.client_id.clone(),
+            ttl_ms,
+        }).await;
+ 
         Ok(LockLease {
             file_path: file_path.to_string(),
             client_id: self.client_id.clone(),
             fencing_token,
-            heartbeat_tx: Some(heartbeat_tx),
-            _heartbeat_handle: Some(heartbeat_handle),
+            lock_key,
+            heartbeat_tx: Some(tx),
             meta_client: self.meta_client.clone(),
             range,
         })
@@ -556,16 +657,10 @@ impl LockLease {
     pub async fn release(mut self) -> Result<()> {
         self.stop_heartbeat();
 
-        let lock_key = if let Some((start, end)) = self.range {
-            format!("lock:{}:range:{}-{}", self.file_path, start, end)
-        } else {
-            format!("lock:{}", self.file_path)
-        };
-
         let mut con = self.meta_client.get_connection().await?;
         // Release ONLY if we still own it to avoid releasing other client's lock
         let _res: i32 = RELEASE_SCRIPT
-            .key(&lock_key)
+            .key(&self.lock_key)
             .arg(&self.client_id)
             .invoke_async(&mut con)
             .await?;
@@ -575,7 +670,12 @@ impl LockLease {
 
     fn stop_heartbeat(&mut self) {
         if let Some(tx) = self.heartbeat_tx.take() {
-            let _ = tx.send(());
+            let key = self.lock_key.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = tx.send(HeartbeatCommand::Deregister { lock_key: key }).await;
+                });
+            }
         }
     }
 }

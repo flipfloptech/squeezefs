@@ -133,7 +133,7 @@ async fn test_multi_disk_distribution() {
             .map(|res| res.unwrap().path())
             .collect();
         for path in entries {
-            if path.extension().is_some_and(|ext| ext == "data") {
+            if path.extension().is_some_and(|ext| ext == "staged") {
                 total_files += 1;
             }
         }

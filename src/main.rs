@@ -93,6 +93,9 @@ enum Commands {
         /// Path to RSA private key PEM file for client-side encryption
         #[arg(long)]
         encrypt_key: Option<String>,
+        /// Time in seconds to wait for staged writes to drain to S3 on dismount (default: 10)
+        #[arg(long)]
+        dismount_wait: Option<String>,
     },
     /// Show filesystem status
     Status,
@@ -174,9 +177,21 @@ enum Commands {
         #[arg(long)]
         check_storage: bool,
 
+        /// Time in seconds to wait for staged writes to drain to S3 on dismount (default: 10)
+        #[arg(long)]
+        dismount_wait: Option<String>,
+
         /// Custom FUSE options (comma-separated list, e.g. "ro,nonempty")
         #[arg(short = 'o', long)]
         options: Option<String>,
+    },
+    /// Cleanly unmount a squeezefs mountpoint, with options to cancel, wait, or force dismount
+    Umount {
+        /// Path to the mountpoint
+        mountpoint: PathBuf,
+        /// Force unmount immediately without prompting/waiting
+        #[arg(long, short = 'f')]
+        force: bool,
     },
     /// Benchmark performance of the filesystem
     Bench {
@@ -789,6 +804,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             write_cache_size,
             read_mem_cache_size,
             write_mem_cache_size,
+            dismount_wait,
         } => {
             let redis_url = &cli.garnet_url;
 
@@ -851,7 +867,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let parsed_capacity = parse_human_readable_size(&capacity)?;
 
-            squeezefs::fuse_client::format_volume(
+            squeezefs::fuse_client::format_volume_ext(
                 redis_url,
                 &name,
                 parsed_block_size,
@@ -871,6 +887,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 write_cache_size.as_deref(),
                 read_mem_cache_size.as_deref(),
                 write_mem_cache_size.as_deref(),
+                dismount_wait.as_deref(),
             )
             .await?;
             let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
@@ -903,6 +920,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             write_cache_size,
             read_mem_cache_size,
             write_mem_cache_size,
+            dismount_wait,
         } => {
             let redis_url = &cli.garnet_url;
 
@@ -928,6 +946,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let resolved_mem_cache_size = mem_cache_size
                 .or_else(|| format_fields.get("mem_cache_size").cloned())
                 .unwrap_or_else(|| "1GB".to_string());
+
+            // Resolve dismount wait time: CLI override > Garnet setting > default 10 seconds
+            let resolved_dismount_wait: u64 = dismount_wait
+                .or_else(|| format_fields.get("dismount_wait").cloned())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10);
 
             // Resolve disk cache size: CLI override > Garnet setting > default "10GB"
             let resolved_disk_cache_size = disk_cache_size
@@ -1223,6 +1247,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "read_cache_size": resolved_read_cache_size,
                 "write_cache_size": resolved_write_cache_size,
                 "disk_cache_paths": active_staging_dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
+                "dismount_wait_seconds": resolved_dismount_wait,
                 "endpoint": final_s3_endpoint.as_deref().unwrap_or(""),
                 "access_key": masked_access_key,
                 "secret_key": masked_secret_key,
@@ -1268,7 +1293,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|| unsafe { libc::getgid() })
             });
 
-            let fs_engine = SqueezefsFilesystem::new(router, dlm, resolved_uid, resolved_gid);
+            let mut fs_engine = SqueezefsFilesystem::new(
+                router,
+                dlm,
+                resolved_uid,
+                resolved_gid,
+            );
+            fs_engine.dismount_wait = resolved_dismount_wait;
 
             println!("Mounting Squeezefs at {:?}...", mountpoint);
 
@@ -1474,6 +1505,176 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+        Commands::Umount { mountpoint, force } => {
+            use std::io::IsTerminal;
+            use std::io::Write;
+
+            let redis_url = &cli.garnet_url;
+
+            // 1. Try to read mountpoint/.config to resolve staging directories
+            let mut staging_dirs = Vec::new();
+            let config_path = mountpoint.join(".config");
+            if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+                if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                    if let Some(paths_str) = config_json["format"]["disk_cache_paths"].as_str() {
+                        if !paths_str.is_empty() {
+                            staging_dirs = paths_str.split(',').map(PathBuf::from).collect();
+                        }
+                    }
+                }
+            }
+
+            // 2. Fall back to Garnet format defaults if config file wasn't readable
+            if staging_dirs.is_empty() {
+                if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+                    if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                        let paths_str: Option<String> = con.hget("squeezefs:format", "disk_cache_paths").await.unwrap_or(None);
+                        if let Some(s) = paths_str {
+                            if !s.is_empty() {
+                                staging_dirs = s.split(',').map(PathBuf::from).collect();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Fall back to default staging directory
+            if staging_dirs.is_empty() {
+                staging_dirs = vec![PathBuf::from("/tmp/squeezefs_staging")];
+            }
+
+            // 4. Resolve dismount_wait limit (default: 10)
+            let mut dismount_wait = 10;
+            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                    let wait_str: Option<String> = con.hget("squeezefs:format", "dismount_wait").await.unwrap_or(None);
+                    if let Some(s) = wait_str {
+                        if let Ok(w) = s.parse::<u64>() {
+                            dismount_wait = w;
+                        }
+                    }
+                }
+            }
+
+            // 5. Count staged files and active writes
+            let mut staged_count = 0;
+            let mut active_writes_count = 0;
+            for dir in &staging_dirs {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
+                            staged_count += 1;
+                        }
+                    }
+                }
+                let active_dir = dir.join("active_writes");
+                if active_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                        active_writes_count += entries.filter_map(|e| e.ok()).count();
+                    }
+                }
+            }
+
+            let has_unflushed = staged_count > 0 || active_writes_count > 0;
+            let mut choice = "continue"; // default non-interactive behavior
+
+            // 6. Prompt the user if not forced and stdin is a TTY
+            if has_unflushed && !force && std::io::stdin().is_terminal() {
+                println!("{}", "WARNING: There are unflushed staged writes on this node!".red().bold());
+                println!("Remaining local staged files: {}", staged_count);
+                println!("Active write transaction directories: {}", active_writes_count);
+                println!("Other nodes will NOT see this data if you unmount now.");
+                println!("\nChoose an option:");
+                println!("  [w] Wait for staged files to drain/flush to S3 (recommended)");
+                println!("  [c] Continue/force unmount immediately (unsafe - may lose data)");
+                println!("  [a] Abort unmount");
+                print!("Select option [w/c/a]: ");
+                let _ = std::io::stdout().flush();
+
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    let trimmed = input.trim().to_lowercase();
+                    if trimmed == "w" || trimmed == "wait" {
+                        choice = "wait";
+                    } else if trimmed == "c" || trimmed == "continue" {
+                        choice = "continue";
+                    } else {
+                        choice = "abort";
+                    }
+                } else {
+                    choice = "abort";
+                }
+            }
+
+            match choice {
+                "abort" => {
+                    println!("Unmount aborted.");
+                    return Ok(());
+                }
+                "wait" => {
+                    println!("Waiting for staged writes to drain (limit: {}s). Press Ctrl+C to abort wait.", dismount_wait);
+                    let start_wait = std::time::Instant::now();
+                    let max_wait = std::time::Duration::from_secs(dismount_wait);
+                    loop {
+                        let mut current_staged = 0;
+                        for dir in &staging_dirs {
+                            if let Ok(entries) = std::fs::read_dir(dir) {
+                                for entry in entries.flatten() {
+                                    let path = entry.path();
+                                    if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
+                                        current_staged += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if current_staged == 0 {
+                            println!("\nAll staged files drained cleanly!");
+                            break;
+                        }
+                        if start_wait.elapsed() >= max_wait {
+                            println!("\nWait limit expired. Dismounting with remaining staged files: {}", current_staged);
+                            break;
+                        }
+                        print!("\rRemaining staged files: {}... (elapsed: {}s / limit: {}s)", current_staged, start_wait.elapsed().as_secs(), dismount_wait);
+                        let _ = std::io::stdout().flush();
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+                _ => {
+                    if has_unflushed {
+                        println!("Continuing with unmount despite unflushed data.");
+                    }
+                }
+            }
+
+            // 7. Execute the unmount
+            println!("Unmounting squeezefs at {:?}...", mountpoint);
+            let status = std::process::Command::new("fusermount")
+                .arg("-u")
+                .arg(&mountpoint)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    println!("Successfully unmounted mountpoint {:?}", mountpoint);
+                }
+                _ => {
+                    let umount_status = std::process::Command::new("umount")
+                        .arg(&mountpoint)
+                        .status();
+                    match umount_status {
+                        Ok(s) if s.success() => {
+                            println!("Successfully unmounted mountpoint {:?}", mountpoint);
+                        }
+                        _ => {
+                            eprintln!("Error: Failed to unmount mountpoint {:?}. Try running with sudo.", mountpoint);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

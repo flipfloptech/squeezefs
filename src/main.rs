@@ -39,32 +39,32 @@ enum Commands {
     Format {
         /// Volume name
         name: String,
-        /// Block size in bytes (default: 4MB)
-        #[arg(long, default_value_t = 4194304)]
-        block_size: u64,
-        /// Maximum capacity of the volume in bytes (default: 1PB)
-        #[arg(long, default_value_t = 1024 * 1024 * 1024 * 1024 * 1024)]
-        capacity: u64,
+        /// Block size (e.g. "4M", "1M", default: 4MB)
+        #[arg(long, default_value = "4M")]
+        block_size: String,
+        /// Maximum capacity of the volume (e.g. "1P", "100G", default: 1PB)
+        #[arg(long, default_value = "1P")]
+        capacity: String,
         /// Memory cache limit (default: "1GB")
         #[arg(long)]
         mem_cache_size: Option<String>,
         /// Disk cache limit (default: "10GB")
-        #[arg(long)]
+        #[arg(long, alias = "cache-size")]
         disk_cache_size: Option<String>,
         /// Comma-separated paths to local staging/cache directories
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
         /// S3 compatible object store endpoint url
-        #[arg(long)]
+        #[arg(long, alias = "endpoint")]
         s3_endpoint: Option<String>,
         /// S3 compatible object store access key
-        #[arg(long)]
+        #[arg(long, alias = "access-key")]
         s3_access_key: Option<String>,
         /// S3 compatible object store secret key
-        #[arg(long)]
+        #[arg(long, alias = "secret-key")]
         s3_secret_key: Option<String>,
         /// S3 compatible object store bucket name
-        #[arg(long)]
+        #[arg(long, alias = "bucket")]
         s3_bucket: Option<String>,
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
@@ -82,11 +82,11 @@ enum Commands {
         mem_cache_size: Option<String>,
 
         /// Disk cache limit (e.g., "200GB" or "80%")
-        #[arg(long)]
+        #[arg(long, alias = "cache-size")]
         disk_cache_size: Option<String>,
 
         /// Comma-separated paths to local staging/cache directories
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
 
         /// Comma-separated list of local source IP interfaces for multi-rail connection bonding
@@ -94,16 +94,16 @@ enum Commands {
         local_ips: Option<Vec<std::net::IpAddr>>,
 
         /// S3 compatible object store endpoint url (overrides stored configuration)
-        #[arg(long)]
+        #[arg(long, alias = "endpoint")]
         s3_endpoint: Option<String>,
         /// S3 compatible object store access key (overrides stored configuration)
-        #[arg(long)]
+        #[arg(long, alias = "access-key")]
         s3_access_key: Option<String>,
         /// S3 compatible object store secret key (overrides stored configuration)
-        #[arg(long)]
+        #[arg(long, alias = "secret-key")]
         s3_secret_key: Option<String>,
         /// S3 compatible object store bucket name (overrides stored configuration)
-        #[arg(long)]
+        #[arg(long, alias = "bucket")]
         s3_bucket: Option<String>,
 
         /// Run FUSE daemon in the background (detach from terminal)
@@ -121,6 +121,22 @@ enum Commands {
         /// Peer-to-peer cache server address (e.g. 127.0.0.1:9099)
         #[arg(long)]
         p2p_addr: Option<String>,
+
+        /// Enable FUSE writeback cache
+        #[arg(long)]
+        writeback: bool,
+
+        /// Allow other users to access the mount (default: true)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        allow_other: bool,
+
+        /// Validate backend storage connectivity on startup
+        #[arg(long)]
+        check_storage: bool,
+
+        /// Custom FUSE options (comma-separated list, e.g. "ro,nonempty")
+        #[arg(short = 'o', long)]
+        options: Option<String>,
     },
     /// Benchmark performance of the filesystem
     Bench {
@@ -233,15 +249,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     #[cfg(unix)]
-    if let Commands::Mount { daemon: true, .. } = &cli.command {
+    if let Commands::Mount { daemon: true, mountpoint, .. } = &cli.command {
+        let mountpoint_path = mountpoint.clone();
         unsafe {
             let pid = libc::fork();
             if pid < 0 {
                 eprintln!("Failed to fork daemon process");
                 std::process::exit(1);
             } else if pid > 0 {
-                println!("Squeezefs daemon started (PID: {})", pid);
-                std::process::exit(0);
+                // Parent process waits for mount point to become ready
+                print!("Mounting Squeezefs at {:?}...", mountpoint_path);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+
+                let mut ready = false;
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+
+                    // Check if child is still running
+                    let mut status = 0;
+                    let wait_res = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                    if wait_res == pid {
+                        // Child exited!
+                        println!();
+                        eprintln!("Failed to start squeezefs daemon. Child process exited early.");
+                        std::process::exit(1);
+                    }
+
+                    // Check if mountpoint is ready
+                    if let Ok(metadata) = std::fs::metadata(&mountpoint_path) {
+                        use std::os::unix::fs::MetadataExt;
+                        if metadata.ino() == 1 {
+                            ready = true;
+                            break;
+                        }
+                    }
+                    print!(".");
+                    let _ = std::io::stdout().flush();
+                }
+                println!();
+                if ready {
+                    println!("\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}", mountpoint_path);
+                    std::process::exit(0);
+                } else {
+                    eprintln!("The mount point is not ready in 10 seconds, exiting");
+                    libc::kill(pid, libc::SIGKILL);
+                    std::process::exit(1);
+                }
             }
             // Child process detaches
             libc::setsid();
@@ -307,6 +362,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
+fn parse_human_readable_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("Empty size string".to_string());
+    }
+    
+    let mut num_str = s;
+    let mut multiplier = 1u64;
+    
+    if let Some(last_char) = s.chars().last() {
+        if !last_char.is_ascii_digit() {
+            num_str = &s[..s.len() - 1];
+            multiplier = match last_char.to_ascii_lowercase() {
+                'k' => 1024,
+                'm' => 1024 * 1024,
+                'g' => 1024 * 1024 * 1024,
+                't' => 1024 * 1024 * 1024 * 1024,
+                'p' => 1024 * 1024 * 1024 * 1024 * 1024,
+                _ => return Err(format!("Invalid size suffix '{}'", last_char)),
+            };
+        }
+    }
+    
+    let base_val: u64 = num_str.trim().parse().map_err(|e| format!("Invalid number '{}': {}", num_str, e))?;
+    Ok(base_val * multiplier)
+}
+
+async fn test_storage(client: &RustFsClient) -> Result<(), Box<dyn std::error::Error>> {
+    let key = format!("testing/{}", uuid::Uuid::new_v4());
+    let test_data = vec![42u8; 100];
+    
+    // Put object
+    client.put_object(&key, test_data.clone(), 1).await?;
+    
+    // Get object
+    let read_data = client.get_object(&key).await?;
+    if read_data != test_data {
+        return Err("Read data does not match written data".into());
+    }
+    
+    // Delete object
+    client.delete_object(&key).await?;
+    Ok(())
+}
+
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Format {
@@ -358,11 +458,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            let parsed_block_size = parse_human_readable_size(&block_size)?;
+            let parsed_capacity = parse_human_readable_size(&capacity)?;
+
             squeezefs::fuse_client::format_volume(
                 redis_url,
                 &name,
-                block_size,
-                capacity,
+                parsed_block_size,
+                parsed_capacity,
                 mem_cache_size.as_deref(),
                 disk_cache_size.as_deref(),
                 disk_cache_paths.as_deref(),
@@ -393,6 +496,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             uid,
             gid,
             p2p_addr,
+            writeback,
+            allow_other,
+            check_storage,
+            options,
         } => {
             let redis_url = &cli.garnet_url;
 
@@ -567,7 +674,23 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 multi_backend.register_backend("backend_0", default_client);
             }
 
-            multi_backend.set_active_backend_id(active_be_id);
+            multi_backend.set_active_backend_id(active_be_id.clone());
+
+            let active_client = multi_backend.get_backend(&active_be_id).unwrap();
+
+            if check_storage {
+                println!("Running storage connectivity check...");
+                let start = std::time::Instant::now();
+                if let Err(e) = test_storage(&active_client).await {
+                    eprintln!("Object storage check failed: {:?}", e);
+                    return Err(format!("Object storage check failed: {:?}", e).into());
+                } else {
+                    println!("Object storage check passed in {:?}", start.elapsed());
+                }
+            }
+
+            println!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
+            println!("Data use {:?}", final_s3_bucket.as_deref().unwrap_or("mock"));
 
             let cache = TieredCache::new(
                 active_staging_dirs,
@@ -611,7 +734,16 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            start_mount(mountpoint, fs_engine, resolved_uid, resolved_gid).await?;
+            start_mount(
+                mountpoint,
+                fs_engine,
+                resolved_uid,
+                resolved_gid,
+                writeback,
+                allow_other,
+                options,
+            )
+            .await?;
         }
         Commands::Bench {
             path,

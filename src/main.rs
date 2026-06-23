@@ -45,8 +45,8 @@ enum Commands {
         /// Maximum capacity of the volume (e.g. "1P", "100G", default: 1PB)
         #[arg(long, default_value = "1P")]
         capacity: String,
-        /// Hard quota limiting the number of inodes (default: 0, unlimited)
-        #[arg(long, default_value = "0")]
+        /// Hard quota limiting the number of inodes (default: 1000000)
+        #[arg(long, default_value = "1000000")]
         inodes: u64,
         /// Memory cache limit (default: "1GB")
         #[arg(long)]
@@ -262,13 +262,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     if let Commands::Mount {
-        daemon: true,
         mountpoint,
+        mem_cache_size,
+        disk_cache_size,
+        disk_cache_paths,
+        s3_endpoint,
+        s3_access_key,
+        s3_secret_key,
+        s3_bucket,
+        daemon,
+        writeback,
+        allow_other,
+        options,
         ..
     } = &cli.command
     {
-        let mountpoint_path = mountpoint.clone();
-        unsafe {
+        if let Err(e) = print_mount_diagnostics(
+            &cli.garnet_url,
+            mountpoint,
+            *daemon,
+            mem_cache_size.as_deref(),
+            disk_cache_size.as_deref(),
+            disk_cache_paths.as_deref(),
+            s3_endpoint.as_deref(),
+            s3_access_key.as_deref(),
+            s3_secret_key.as_deref(),
+            s3_bucket.as_deref(),
+            *writeback,
+            *allow_other,
+            options.as_deref(),
+        ) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+
+        if *daemon {
+            let mountpoint_path = mountpoint.clone();
+            unsafe {
             let pid = libc::fork();
             if pid < 0 {
                 eprintln!("Failed to fork daemon process");
@@ -352,6 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    }
 
     let mut builder = env_logger::Builder::from_default_env();
     if let Some(ref log_path) = cli.log_file {
@@ -383,6 +414,186 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     rt.block_on(async { run_app(cli).await })
 }
+
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    const TB: u64 = 1024 * 1024 * 1024 * 1024;
+    const PB: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
+
+    if bytes >= PB {
+        format!("{:.2} PB", bytes as f64 / PB as f64)
+    } else if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn print_mount_diagnostics(
+    garnet_url: &str,
+    mountpoint: &Path,
+    daemon: bool,
+    mem_cache_size: Option<&str>,
+    disk_cache_size: Option<&str>,
+    disk_cache_paths: Option<&[PathBuf]>,
+    s3_endpoint: Option<&str>,
+    s3_access_key: Option<&str>,
+    s3_secret_key: Option<&str>,
+    s3_bucket: Option<&str>,
+    writeback: bool,
+    allow_other: bool,
+    options: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use redis::Commands;
+    let client = redis::Client::open(garnet_url)?;
+    let mut con = client.get_connection()?;
+    let format_fields: std::collections::HashMap<String, String> = con.hgetall("squeezefs:format")?;
+    if format_fields.is_empty() {
+        return Err("Volume not formatted. Please run format command first.".into());
+    }
+
+    let name = format_fields.get("name").cloned().unwrap_or_else(|| "unnamed".to_string());
+    
+    let block_size_bytes: u64 = format_fields
+        .get("block_size")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4194304);
+    let block_size_str = format_size(block_size_bytes);
+
+    let capacity_bytes: u64 = format_fields
+        .get("capacity")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let capacity_str = if capacity_bytes == 0 {
+        "unlimited".to_string()
+    } else {
+        format_size(capacity_bytes)
+    };
+
+    let inodes_limit: u64 = format_fields
+        .get("inodes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let inodes_str = if inodes_limit == 0 {
+        "0 (unlimited)".to_string()
+    } else {
+        inodes_limit.to_string()
+    };
+
+    let resolved_mem_cache_size = mem_cache_size
+        .map(|s| s.to_string())
+        .or_else(|| format_fields.get("mem_cache_size").cloned())
+        .unwrap_or_else(|| "1GB".to_string());
+
+    let resolved_disk_cache_size = disk_cache_size
+        .map(|s| s.to_string())
+        .or_else(|| format_fields.get("disk_cache_size").cloned())
+        .unwrap_or_else(|| "10GB".to_string());
+
+    let staging_dirs = if let Some(dirs) = disk_cache_paths {
+        if dirs.is_empty() {
+            vec![PathBuf::from("/tmp/squeezefs_staging")]
+        } else {
+            dirs.to_vec()
+        }
+    } else if let Some(paths_str) = format_fields.get("disk_cache_paths") {
+        if paths_str.is_empty() {
+            vec![PathBuf::from("/tmp/squeezefs_staging")]
+        } else {
+            paths_str.split(',').map(PathBuf::from).collect()
+        }
+    } else {
+        vec![PathBuf::from("/tmp/squeezefs_staging")]
+    };
+
+    let final_s3_endpoint = s3_endpoint
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("RUSTFS_ENDPOINT").ok())
+        .or_else(|| format_fields.get("s3_endpoint").cloned());
+    let final_s3_access_key = s3_access_key
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("RUSTFS_ACCESS_KEY").ok())
+        .or_else(|| format_fields.get("s3_access_key").cloned());
+    let final_s3_secret_key = s3_secret_key
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("RUSTFS_SECRET_KEY").ok())
+        .or_else(|| format_fields.get("s3_secret_key").cloned());
+    let final_s3_bucket = s3_bucket
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("RUSTFS_BUCKET").ok())
+        .or_else(|| format_fields.get("s3_bucket").cloned());
+
+    let active_be_id = format_fields
+        .get("active_write_backend")
+        .cloned()
+        .unwrap_or_else(|| "backend_0".to_string());
+
+    let compression = format_fields
+        .get("compression")
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
+    let encrypt_algo = format_fields
+        .get("encrypt_algo")
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
+    let encrypt_key_present = format_fields
+        .get("encrypt_key")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    let masked_access_key = final_s3_access_key.as_ref().map(|s| {
+        if s.is_empty() { "none".to_string() } else { "******".to_string() }
+    }).unwrap_or_else(|| "none".to_string());
+    let masked_secret_key = final_s3_secret_key.as_ref().map(|s| {
+        if s.is_empty() { "none".to_string() } else { "******".to_string() }
+    }).unwrap_or_else(|| "none".to_string());
+    let masked_encrypt_key = if encrypt_key_present { "******".to_string() } else { "none".to_string() };
+
+    println!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
+    println!("===================================================");
+    println!("Mount Options:");
+    println!("  Mountpoint: {:?}", mountpoint);
+    println!("  Daemon: {}", daemon);
+    println!("  Writeback: {}", writeback);
+    println!("  Allow Other: {}", allow_other);
+    if let Some(opts) = options {
+        println!("  Custom Options: {:?}", opts);
+    } else {
+        println!("  Custom Options: \"max_read=1048576\"");
+    }
+    println!("Metadata Client:");
+    println!("  Garnet URL: {:?}", garnet_url);
+    println!("  Volume Name: {:?}", name);
+    println!("  Block Size: {}", block_size_str);
+    println!("  Capacity: {}", capacity_str);
+    println!("  Inodes Limit: {}", inodes_str);
+    println!("Cache Settings:");
+    println!("  Memory Cache Size: {}", resolved_mem_cache_size);
+    println!("  Disk Cache Size: {}", resolved_disk_cache_size);
+    println!("  Disk Cache Paths: {:?}", staging_dirs);
+    println!("Storage Backend:");
+    println!("  Active Backend: {:?}", active_be_id);
+    println!("  S3 Endpoint: {:?}", final_s3_endpoint.as_deref().unwrap_or(""));
+    println!("  S3 Access Key: {}", masked_access_key);
+    println!("  S3 Secret Key: {}", masked_secret_key);
+    println!("  S3 Bucket: {:?}", final_s3_bucket.as_deref().unwrap_or("squeezefs-data"));
+    println!("Security & Compression:");
+    println!("  Compression: {:?}", compression);
+    println!("  Encryption Algorithm: {:?}", encrypt_algo);
+    println!("  Encryption Key: {}", masked_encrypt_key);
+    println!("===================================================");
+
+    Ok(())
+}
+
 
 fn parse_human_readable_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -559,10 +770,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let redis_url = &cli.garnet_url;
 
-            println!("Initializing metadata client...");
+            log::info!("Connecting to Garnet (metadata database) at {}...", redis_url);
             let dlm =
                 DlmClient::new_with_local_ips(redis_url, local_ips.clone().unwrap_or_default())
                     .await?;
+            log::info!("Successfully connected to Garnet metadata database.");
 
             // Retrieve configuration settings from Garnet metadata if formatted
             let format_fields: std::collections::HashMap<String, String> = {
@@ -627,7 +839,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Tune host parameters automatically
             let _ = tune_system();
 
-            println!("Resolving backend object store configuration...");
+            log::info!("Resolving backend object store configuration...");
             // Load S3 settings: CLI override > Env variables > Garnet stored settings
             let final_s3_endpoint = s3_endpoint
                 .or_else(|| std::env::var("RUSTFS_ENDPOINT").ok())
@@ -657,6 +869,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let sk = config["secret_key"].as_str().map(|s| s.to_string());
                         let bu = config["bucket"].as_str().map(|s| s.to_string());
 
+                        log::info!(
+                            "Registering storage backend: {} (S3 endpoint: {:?}, bucket: {:?})",
+                            be_id,
+                            ep.as_deref().unwrap_or("default"),
+                            bu.as_deref().unwrap_or("squeezefs-data")
+                        );
+
                         let client = RustFsClient::new_with_local_ips(
                             local_ips.clone().unwrap_or_default(),
                             ep,
@@ -684,6 +903,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             {
                 // Generate a custom ID for this runtime backend, e.g. "backend_override"
                 active_be_id = "backend_override".to_string();
+                log::info!(
+                    "Registering overridden storage backend: backend_override (S3 endpoint: {:?}, bucket: {:?})",
+                    final_s3_endpoint,
+                    final_s3_bucket
+                );
                 let override_client = RustFsClient::new_with_local_ips(
                     local_ips.clone().unwrap_or_default(),
                     final_s3_endpoint.clone(),
@@ -719,6 +943,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Ensure we have at least backend_0 registered if no backends were found
             if !multi_backend.has_backend("backend_0") {
+                log::info!("Registering default storage backend: backend_0");
                 let default_client = RustFsClient::new_with_local_ips(
                     local_ips.clone().unwrap_or_default(),
                     final_s3_endpoint.clone(),
@@ -731,30 +956,74 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             multi_backend.set_active_backend_id(active_be_id.clone());
+            log::info!("Active write storage backend set to: {}", active_be_id);
 
             let active_client = multi_backend.get_backend(&active_be_id).unwrap();
 
             if check_storage {
-                println!("Running storage connectivity check...");
+                log::info!("Running storage connectivity check...");
                 let start = std::time::Instant::now();
                 if let Err(e) = test_storage(&active_client).await {
-                    eprintln!("Object storage check failed: {:?}", e);
+                    log::error!("Object storage check failed: {:?}", e);
                     return Err(format!("Object storage check failed: {:?}", e).into());
                 } else {
-                    println!("Object storage check passed in {:?}", start.elapsed());
+                    log::info!("Object storage check passed in {:?}", start.elapsed());
                 }
             }
 
+            // Read the full format values from Garnet for JSON logging
+            let block_size_bytes: u64 = format_fields
+                .get("block_size")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4194304);
+            let capacity_bytes: u64 = format_fields
+                .get("capacity")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let inodes_limit: u64 = format_fields
+                .get("inodes")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let compression = format_fields
+                .get("compression")
+                .cloned()
+                .unwrap_or_else(|| "none".to_string());
+            let encrypt_algo = format_fields
+                .get("encrypt_algo")
+                .cloned()
+                .unwrap_or_else(|| "none".to_string());
+            let encrypt_key_present = format_fields
+                .get("encrypt_key")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+
+            let masked_access_key = final_s3_access_key.as_ref().map(|s| {
+                if s.is_empty() { "none".to_string() } else { "******".to_string() }
+            }).unwrap_or_else(|| "none".to_string());
+            let masked_secret_key = final_s3_secret_key.as_ref().map(|s| {
+                if s.is_empty() { "none".to_string() } else { "******".to_string() }
+            }).unwrap_or_else(|| "none".to_string());
+            let masked_encrypt_key = if encrypt_key_present { "******".to_string() } else { "none".to_string() };
+
             let config_json = serde_json::json!({
                 "meta_url": redis_url,
+                "volume_name": format_fields.get("name").cloned().unwrap_or_else(|| "unnamed".to_string()),
+                "block_size": format_size(block_size_bytes),
+                "capacity": if capacity_bytes == 0 { "unlimited".to_string() } else { format_size(capacity_bytes) },
+                "inodes_limit": if inodes_limit == 0 { "0 (unlimited)".to_string() } else { inodes_limit.to_string() },
                 "mem_cache_size": resolved_mem_cache_size,
                 "disk_cache_size": resolved_disk_cache_size,
                 "disk_cache_paths": active_staging_dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
                 "endpoint": final_s3_endpoint.as_deref().unwrap_or(""),
+                "access_key": masked_access_key,
+                "secret_key": masked_secret_key,
                 "bucket": final_s3_bucket.as_deref().unwrap_or("squeezefs-data"),
                 "writeback": writeback,
                 "allow_other": allow_other,
                 "options": options,
+                "compression": compression,
+                "encrypt_algo": encrypt_algo,
+                "encrypt_key": masked_encrypt_key,
             });
             let config_str = serde_json::to_string_pretty(&config_json).unwrap_or_default();
             log::info!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
@@ -763,12 +1032,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 final_s3_bucket.as_deref().unwrap_or("mock")
             );
             log::info!("SqueezeFS mount configuration:\n{}", config_str);
-            println!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
-            println!(
-                "Data use {:?}",
-                final_s3_bucket.as_deref().unwrap_or("mock")
-            );
-            println!("SqueezeFS mount configuration:\n{}", config_str);
 
             let cache = TieredCache::new(
                 active_staging_dirs,

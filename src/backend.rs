@@ -310,7 +310,14 @@ impl RustFsClient {
                 SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
             })?;
 
-            match s3.get_object().bucket(&self.bucket).key(key).range(range_header.clone()).send().await {
+            match s3
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .range(range_header.clone())
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     let bytes = resp.body.collect().await.map_err(|e| {
                         SqueezefsError::Io(std::io::Error::other(format!(
@@ -321,7 +328,10 @@ impl RustFsClient {
                     return Ok(bytes.to_vec());
                 }
                 Err(e) => {
-                    warn!("S3 GET range failed on current rail: {:?}. Retrying next...", e);
+                    warn!(
+                        "S3 GET range failed on current rail: {:?}. Retrying next...",
+                        e
+                    );
                     last_err = Some(e);
                 }
             }
@@ -329,7 +339,10 @@ impl RustFsClient {
 
         Err(SqueezefsError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
-            format!("S3 GET range failed on all rails. Last error: {:?}", last_err),
+            format!(
+                "S3 GET range failed on all rails. Last error: {:?}",
+                last_err
+            ),
         )))
     }
 

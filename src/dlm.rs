@@ -1,11 +1,11 @@
 use crate::error::{Result, SqueezefsError};
 use log::{debug, error, warn};
+use once_cell::sync::Lazy;
 use redis::aio::ConnectionLike;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
-use once_cell::sync::Lazy;
 
 static ACQUIRE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
     redis::Script::new(
@@ -16,7 +16,7 @@ static ACQUIRE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
         else
             return nil
         end
-        "#
+        "#,
     )
 });
 
@@ -28,7 +28,6 @@ const RENEW_SCRIPT_CODE: &str = r#"
         end
         "#;
 
-
 static RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
     redis::Script::new(
         r#"
@@ -37,13 +36,12 @@ static RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
         else
             return 0
         end
-        "#
+        "#,
     )
 });
 
-static SINGLE_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection>> = Lazy::new(|| {
-    dashmap::DashMap::new()
-});
+static SINGLE_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection>> =
+    Lazy::new(|| dashmap::DashMap::new());
 
 #[derive(Clone)]
 pub enum MetaClient {
@@ -76,18 +74,21 @@ impl ConnectionLike for MetaConnection {
                 Box::pin(async move {
                     let res = conn.req_packed_command(cmd).await;
                     if let Err(ref e) = res {
-                        if (e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()) && client_opt.is_some() {
-                            let client_ref = client_opt.unwrap();
-                            warn!("Cached Redis connection broken: {:?}. Reconnecting...", e);
-                            let addr_str = format!("{:?}", client_ref.get_connection_info().addr);
-                            match client_ref.get_multiplexed_tokio_connection().await {
-                                Ok(new_conn) => {
-                                    SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
-                                    *conn = new_conn;
-                                    return conn.req_packed_command(cmd).await;
-                                }
-                                Err(reconnect_err) => {
-                                    error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                        if e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()
+                        {
+                            if let Some(client_ref) = &client_opt {
+                                warn!("Cached Redis connection broken: {:?}. Reconnecting...", e);
+                                let addr_str =
+                                    format!("{:?}", client_ref.get_connection_info().addr);
+                                match client_ref.get_multiplexed_tokio_connection().await {
+                                    Ok(new_conn) => {
+                                        SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
+                                        *conn = new_conn;
+                                        return conn.req_packed_command(cmd).await;
+                                    }
+                                    Err(reconnect_err) => {
+                                        error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                                    }
                                 }
                             }
                         }
@@ -111,18 +112,21 @@ impl ConnectionLike for MetaConnection {
                 Box::pin(async move {
                     let res = conn.req_packed_commands(cmd, offset, count).await;
                     if let Err(ref e) = res {
-                        if (e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()) && client_opt.is_some() {
-                            let client_ref = client_opt.unwrap();
-                            warn!("Cached Redis connection broken in pipeline: {:?}. Reconnecting...", e);
-                            let addr_str = format!("{:?}", client_ref.get_connection_info().addr);
-                            match client_ref.get_multiplexed_tokio_connection().await {
-                                Ok(new_conn) => {
-                                    SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
-                                    *conn = new_conn;
-                                    return conn.req_packed_commands(cmd, offset, count).await;
-                                }
-                                Err(reconnect_err) => {
-                                    error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                        if e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()
+                        {
+                            if let Some(client_ref) = &client_opt {
+                                warn!("Cached Redis connection broken in pipeline: {:?}. Reconnecting...", e);
+                                let addr_str =
+                                    format!("{:?}", client_ref.get_connection_info().addr);
+                                match client_ref.get_multiplexed_tokio_connection().await {
+                                    Ok(new_conn) => {
+                                        SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
+                                        *conn = new_conn;
+                                        return conn.req_packed_commands(cmd, offset, count).await;
+                                    }
+                                    Err(reconnect_err) => {
+                                        error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                                    }
                                 }
                             }
                         }
@@ -371,10 +375,7 @@ impl MetaClient {
             Self::Sentinel(c) => {
                 let mut guard = c.lock().await;
                 let conn = guard.get_async_connection().await?;
-                Ok(MetaConnection::Single {
-                    conn,
-                    client: None,
-                })
+                Ok(MetaConnection::Single { conn, client: None })
             }
         }
     }
@@ -515,7 +516,8 @@ async fn run_heartbeat_manager(
 pub struct DlmClient {
     client_id: String,
     meta_client: MetaClient,
-    heartbeat_tx: std::sync::Arc<once_cell::sync::OnceCell<tokio::sync::mpsc::Sender<HeartbeatCommand>>>,
+    heartbeat_tx:
+        std::sync::Arc<once_cell::sync::OnceCell<tokio::sync::mpsc::Sender<HeartbeatCommand>>>,
 }
 
 pub struct LockLease {
@@ -623,12 +625,14 @@ impl DlmClient {
 
         // Register with manager
         let tx = self.get_heartbeat_tx().clone();
-        let _ = tx.send(HeartbeatCommand::Register {
-            lock_key: lock_key.clone(),
-            client_id: self.client_id.clone(),
-            ttl_ms,
-        }).await;
- 
+        let _ = tx
+            .send(HeartbeatCommand::Register {
+                lock_key: lock_key.clone(),
+                client_id: self.client_id.clone(),
+                ttl_ms,
+            })
+            .await;
+
         Ok(LockLease {
             file_path: file_path.to_string(),
             client_id: self.client_id.clone(),
@@ -674,7 +678,9 @@ impl LockLease {
             let key = self.lock_key.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = tx.send(HeartbeatCommand::Deregister { lock_key: key }).await;
+                    let _ = tx
+                        .send(HeartbeatCommand::Deregister { lock_key: key })
+                        .await;
                 });
             }
         }

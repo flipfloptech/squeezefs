@@ -68,14 +68,20 @@ pub async fn recover_staging(
             };
 
             if bytes.len() < 8 {
-                error!("Crash Recovery: Staged file {:?} is truncated (size < 8 bytes)", staged_path);
+                error!(
+                    "Crash Recovery: Staged file {:?} is truncated (size < 8 bytes)",
+                    staged_path
+                );
                 let _ = fs::remove_file(staged_path);
                 continue;
             }
 
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() < 8 + meta_len {
-                error!("Crash Recovery: Staged file {:?} is truncated (size < 8 + meta_len)", staged_path);
+                error!(
+                    "Crash Recovery: Staged file {:?} is truncated (size < 8 + meta_len)",
+                    staged_path
+                );
                 let _ = fs::remove_file(staged_path);
                 continue;
             }
@@ -93,15 +99,22 @@ pub async fn recover_staging(
             };
 
             // Read the JSON to get original_size
-            let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
-                Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                Err(_) => 0,
-            };
+            let original_size =
+                match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                    Ok(json) => json
+                        .get("original_size")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                    Err(_) => 0,
+                };
 
             let data_start = 8 + meta_len;
             let data_end = data_start + original_size;
             if bytes.len() < data_end {
-                error!("Crash Recovery: Staged file {:?} data payload is truncated", staged_path);
+                error!(
+                    "Crash Recovery: Staged file {:?} data payload is truncated",
+                    staged_path
+                );
                 let _ = fs::remove_file(staged_path);
                 continue;
             }

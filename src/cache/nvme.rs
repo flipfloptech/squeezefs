@@ -2,11 +2,11 @@ use crate::backend::RustFsClient;
 use crate::error::{Result, SqueezefsError};
 use log::{debug, error, info, warn};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
-use std::io::{Read, Write};
 
 fn write_aligned_direct(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
     let align = 4096;
@@ -20,13 +20,13 @@ fn write_aligned_direct(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
 
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_DIRECT);
     }
-    
+
     let mut file = options.open(path)?;
     file.write_all(aligned_data)?;
     Ok(())
@@ -42,16 +42,16 @@ fn read_aligned_direct(path: &PathBuf, actual_size: usize) -> std::io::Result<Ve
 
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_DIRECT);
     }
-    
+
     let mut file = options.open(path)?;
     file.read_exact(&mut buf[offset..offset + padded_size])?;
-    
+
     let mut out = vec![0; actual_size];
     out.copy_from_slice(&buf[offset..offset + actual_size]);
     Ok(out)
@@ -126,7 +126,9 @@ impl NvmeStaging {
             redis_client: redis_client.clone(),
             write_tx,
             p2p_addr: std::sync::Arc::new(std::sync::OnceLock::new()),
-            current_staged_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_staged_bytes)),
+            current_staged_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                initial_staged_bytes,
+            )),
         };
 
         // Spawn the background merge worker
@@ -161,7 +163,9 @@ impl NvmeStaging {
         let padded_size = ((unpadded_len + align - 1) & !(align - 1)) as u64;
 
         // Enforce max bytes capacity constraint asynchronously using the exact padded file size
-        let total_staged_bytes = self.current_staged_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let total_staged_bytes = self
+            .current_staged_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         if total_staged_bytes + padded_size > self.max_bytes {
             return Err(SqueezefsError::Io(std::io::Error::new(
@@ -181,16 +185,20 @@ impl NvmeStaging {
         tokio::task::spawn_blocking(move || -> std::result::Result<(), SqueezefsError> {
             let meta_len = meta_json_bytes.len() as u64;
 
-            let mut packed_payload = Vec::with_capacity(8 + meta_json_bytes.len() + data_clone.len());
+            let mut packed_payload =
+                Vec::with_capacity(8 + meta_json_bytes.len() + data_clone.len());
             packed_payload.extend_from_slice(&meta_len.to_be_bytes());
             packed_payload.extend_from_slice(&meta_json_bytes);
             packed_payload.extend_from_slice(&data_clone);
 
-            write_aligned_direct(&staged_path, &packed_payload).map_err(|e| SqueezefsError::Io(e))?;
+            write_aligned_direct(&staged_path, &packed_payload).map_err(SqueezefsError::Io)?;
             Ok(())
-        }).await.unwrap()?;
+        })
+        .await
+        .unwrap()?;
 
-        self.current_staged_bytes.fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
+        self.current_staged_bytes
+            .fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
 
         info!(
             "NVMe Staging: Staged write for file {} (ID: {}) size = {} bytes. Acknowledging write to OS.",
@@ -218,16 +226,21 @@ impl NvmeStaging {
     pub fn read_staged(&self, file_id: &str) -> Option<Vec<u8>> {
         let target_dir = self.get_staged_path(file_id);
         let staged_path = target_dir.join(format!("{}.staged", file_id));
-        
+
         if staged_path.exists() {
             if let Ok(metadata) = fs::metadata(&staged_path) {
                 let file_len = metadata.len();
                 if let Ok(bytes) = read_aligned_direct(&staged_path, file_len as usize) {
                     if bytes.len() >= 8 {
-                        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                        let meta_len =
+                            u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
                         if bytes.len() >= 8 + meta_len {
-                            if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
-                                if let Some(orig_size) = meta_json.get("original_size").and_then(|v| v.as_u64()) {
+                            if let Ok(meta_json) =
+                                serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len])
+                            {
+                                if let Some(orig_size) =
+                                    meta_json.get("original_size").and_then(|v| v.as_u64())
+                                {
                                     let data_start = 8 + meta_len;
                                     let data_end = data_start + orig_size as usize;
                                     if bytes.len() >= data_end {
@@ -269,7 +282,7 @@ impl NvmeStaging {
                                 (metadata.len(), true)
                             } else { (0, false) }
                         }).await.unwrap();
-                        
+
                         if ok {
                             current_bytes += meta_len;
                             batch.push(pending);
@@ -310,6 +323,31 @@ impl NvmeStaging {
 
         crate::coz_progress!("nvme_flush_batch");
 
+        // Fetch format settings from Garnet/Redis for compression & encryption
+        let mut con = redis_client.get_connection().await?;
+        use redis::AsyncCommands;
+
+        let compression: String = con
+            .hget("squeezefs:format", "compression")
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "none".to_string());
+        let encrypt_algo: String = con
+            .hget("squeezefs:format", "encrypt_algo")
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "none".to_string());
+        let encrypt_key: Option<String> = con
+            .hget("squeezefs:format", "encrypt_key")
+            .await
+            .unwrap_or(None);
+
+        let crypto_state = crate::crypto_compress::CryptoCompressState::new(
+            compression,
+            encrypt_algo,
+            encrypt_key.as_deref(),
+        );
+
         let packed_id = Uuid::new_v4().to_string();
         let packed_key = format!("packed/blocks/{}", packed_id);
 
@@ -321,16 +359,22 @@ impl NvmeStaging {
         for item in batch.iter() {
             let idx = get_dir_index(&item.file_id, staging_dirs.len());
             let local_path = staging_dirs[idx].join(format!("{}.staged", item.file_id));
-            
+
             let data_res = tokio::task::spawn_blocking(move || {
                 if let Ok(metadata) = fs::metadata(&local_path) {
                     let file_len = metadata.len();
                     if let Ok(bytes) = read_aligned_direct(&local_path, file_len as usize) {
                         if bytes.len() >= 8 {
-                            let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                            let meta_len =
+                                u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]))
+                                    as usize;
                             if bytes.len() >= 8 + meta_len {
-                                if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
-                                    if let Some(orig_size) = meta_json.get("original_size").and_then(|v| v.as_u64()) {
+                                if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(
+                                    &bytes[8..8 + meta_len],
+                                ) {
+                                    if let Some(orig_size) =
+                                        meta_json.get("original_size").and_then(|v| v.as_u64())
+                                    {
                                         let data_start = 8 + meta_len;
                                         let data_end = data_start + orig_size as usize;
                                         if bytes.len() >= data_end {
@@ -343,12 +387,15 @@ impl NvmeStaging {
                     }
                 }
                 None
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             if let Some(data) = data_res {
+                let processed_data = crypto_state.process_write(&data)?;
                 let offset = packed_payload.len() as u64;
-                let size = data.len() as u64;
-                packed_payload.extend_from_slice(&data);
+                let size = processed_data.len() as u64;
+                packed_payload.extend_from_slice(&processed_data);
 
                 mappings.push((item.file_id.clone(), offset, size));
                 if item.fencing_token > highest_fencing_token {
@@ -422,7 +469,9 @@ impl NvmeStaging {
 
     fn cache_read_block_sync(&self, block_key: &str, data: &[u8]) -> Result<()> {
         let new_data_len = data.len() as u64;
-        let current = self.current_staged_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let current = self
+            .current_staged_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         if current + new_data_len > self.max_bytes {
             // Only perform directory walks for eviction if capacity is exceeded
@@ -476,12 +525,18 @@ impl NvmeStaging {
                         block_key
                     );
                     // Synchronize current_staged_bytes with actual remaining usage
-                    self.current_staged_bytes.store(total_bytes - freed_bytes, std::sync::atomic::Ordering::Relaxed);
+                    self.current_staged_bytes.store(
+                        total_bytes - freed_bytes,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     return Ok(()); // Fail silently as caching is opportunistic
                 }
 
                 // Synchronize current_staged_bytes with actual remaining usage
-                self.current_staged_bytes.store(total_bytes - freed_bytes, std::sync::atomic::Ordering::Relaxed);
+                self.current_staged_bytes.store(
+                    total_bytes - freed_bytes,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
 
@@ -491,7 +546,8 @@ impl NvmeStaging {
         let block_path = target_dir.join(format!("{}.block", safe_name));
 
         fs::write(&block_path, data)?;
-        self.current_staged_bytes.fetch_add(new_data_len, std::sync::atomic::Ordering::Relaxed);
+        self.current_staged_bytes
+            .fetch_add(new_data_len, std::sync::atomic::Ordering::Relaxed);
         debug!(
             "NVMe Staging: Cached block {} -> {:?}",
             block_key, block_path

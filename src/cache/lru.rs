@@ -1,9 +1,9 @@
 use crate::error::Result;
 use log::info;
 use moka::sync::Cache;
-use sysinfo::System;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use sysinfo::System;
 
 #[derive(Clone)]
 pub struct LruCache {
@@ -40,7 +40,11 @@ impl LruCache {
             })
             .build();
 
-        Ok(Self { inner, max_bytes, current_bytes })
+        Ok(Self {
+            inner,
+            max_bytes,
+            current_bytes,
+        })
     }
 
     /// Construct with a custom memory limit in bytes.
@@ -58,7 +62,11 @@ impl LruCache {
             })
             .build();
 
-        Self { inner, max_bytes, current_bytes }
+        Self {
+            inner,
+            max_bytes,
+            current_bytes,
+        }
     }
 
     /// Retrieve an entry from the cache, updating its LRU status.
@@ -69,7 +77,8 @@ impl LruCache {
     /// Insert an entry into the cache, executing LRU eviction if maximum capacity is exceeded.
     pub fn put(&self, key: &str, data: Arc<Vec<u8>>) {
         if (data.len() as u64) <= self.max_bytes {
-            self.current_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.current_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             self.inner.insert(key.to_string(), data);
         }
     }

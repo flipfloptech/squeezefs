@@ -390,6 +390,7 @@ impl RustFsClient {
 #[derive(Clone)]
 pub struct MultiBackendClient {
     backends: Arc<dashmap::DashMap<String, RustFsClient>>,
+    backend_status: Arc<dashmap::DashMap<String, String>>,
     #[allow(dead_code)]
     active_backend_id: Arc<std::sync::RwLock<String>>,
     backend_keys: Arc<std::sync::RwLock<Vec<String>>>,
@@ -405,9 +406,14 @@ impl MultiBackendClient {
     pub fn new() -> Self {
         Self {
             backends: Arc::new(dashmap::DashMap::new()),
+            backend_status: Arc::new(dashmap::DashMap::new()),
             active_backend_id: Arc::new(std::sync::RwLock::new("backend_0".to_string())),
             backend_keys: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    pub fn set_backend_status(&self, id: &str, status: &str) {
+        self.backend_status.insert(id.to_string(), status.to_string());
     }
 
     pub fn get_backend_for_key(&self, key: &str) -> String {
@@ -418,14 +424,31 @@ impl MultiBackendClient {
         let mut best_node = "backend_0".to_string();
 
         if let Ok(keys) = self.backend_keys.read() {
-            for node_id in keys.iter() {
+            let enabled_keys: Vec<&String> = keys
+                .iter()
+                .filter(|node_id| {
+                    if let Some(status) = self.backend_status.get(*node_id) {
+                        status.value() == "enabled"
+                    } else {
+                        true // default enabled
+                    }
+                })
+                .collect();
+
+            let target_keys = if enabled_keys.is_empty() {
+                keys.iter().collect::<Vec<_>>()
+            } else {
+                enabled_keys
+            };
+
+            for node_id in target_keys {
                 let mut hasher = DefaultHasher::new();
                 node_id.hash(&mut hasher);
                 key.hash(&mut hasher);
                 let score = hasher.finish();
                 if score > max_score {
                     max_score = score;
-                    best_node = node_id.clone();
+                    best_node = (*node_id).clone();
                 }
             }
         }

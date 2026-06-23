@@ -947,3 +947,101 @@ async fn test_inode_quota_enforcement() {
     let stat5 = fs.statfs(req, 1).await.unwrap();
     assert_eq!(stat5.ffree, 0);
 }
+
+#[tokio::test]
+async fn test_capacity_quota_enforcement() {
+    let mut _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = get_redis_url();
+    // Format volume to populate squeezefs:format, capacity limit set to 100 bytes
+    format_volume(
+        &redis_url,
+        "capacity_vol",
+        1024 * 1024,
+        100, // capacity limit: 100 bytes
+        0, // inodes limit: unlimited
+        Some("64MB"),
+        Some("100MB"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("Format volume should succeed");
+
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // 1. Create file1 (inode 2)
+    let create1 = fs.create(req, 1, OsStr::new("file1"), 0o644, 0).await.unwrap();
+    let ino = create1.attr.ino;
+    assert_eq!(ino, 2);
+
+    // 2. Write 60 bytes (should succeed)
+    let data1 = vec![42u8; 60];
+    let write1 = fs.write(req, ino, 0, 0, &data1, 0, 0).await.unwrap();
+    assert_eq!(write1.written, 60);
+
+    // 3. Write another 50 bytes at offset 60 (total would be 110, exceeds 100 capacity -> should fail with ENOSPC)
+    let data2 = vec![42u8; 50];
+    let write2_res = fs.write(req, ino, 0, 60, &data2, 0, 0).await;
+    assert!(write2_res.is_err());
+    assert_eq!(write2_res.err().unwrap(), fuse3::Errno::from(libc::ENOSPC));
+
+    // 4. Truncate / setattr to 120 bytes (exceeds capacity -> should fail with ENOSPC)
+    let set_attr_large = SetAttr {
+        size: Some(120),
+        ..Default::default()
+    };
+    let setattr_large_res = fs.setattr(req, ino, None, set_attr_large).await;
+    assert!(setattr_large_res.is_err());
+    assert_eq!(setattr_large_res.err().unwrap(), fuse3::Errno::from(libc::ENOSPC));
+
+    // 5. Shrink / truncate file size to 30 bytes (should succeed)
+    let set_attr_small = SetAttr {
+        size: Some(30),
+        ..Default::default()
+    };
+    let setattr_small_res = fs.setattr(req, ino, None, set_attr_small).await.unwrap();
+    assert_eq!(setattr_small_res.attr.size, 30);
+
+    // 6. Now we have 70 bytes free space. Write 50 bytes (should succeed now)
+    let data3 = vec![42u8; 50];
+    let write3 = fs.write(req, ino, 0, 30, &data3, 0, 0).await.unwrap();
+    assert_eq!(write3.written, 50);
+
+    // 7. Write 30 bytes (total 110 -> should fail with ENOSPC)
+    let data4 = vec![42u8; 30];
+    let write4_res = fs.write(req, ino, 0, 80, &data4, 0, 0).await;
+    assert!(write4_res.is_err());
+    assert_eq!(write4_res.err().unwrap(), fuse3::Errno::from(libc::ENOSPC));
+}
+

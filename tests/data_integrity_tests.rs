@@ -169,3 +169,248 @@ async fn test_data_integrity_various_sizes() {
         );
     }
 }
+
+fn calculate_sha512(data: &[u8]) -> String {
+    use sha2::Sha512;
+    let mut hasher = Sha512::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    format!("{:x}", result)
+}
+
+#[tokio::test]
+async fn test_data_integrity_chunked_writes_sha512() {
+    if clean_db().await.is_none() {
+        println!("Skipping test: Garnet/Redis not available");
+        return;
+    }
+
+    let redis_url = get_redis_url();
+    let fs_name = "integrity_test_vol_chunked";
+
+    // Format the volume
+    format_volume(
+        &redis_url,
+        fs_name,
+        4 * 1024 * 1024, // 4MB block size
+        100 * 1024 * 1024 * 1024,
+        0,
+        "none",
+        "none",
+        None,
+        Some("128MB"),
+        Some("500MB"),
+        Some(&[PathBuf::from("/tmp/squeezefs_staging_integrity_chunked")]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new_mock();
+    let multi_backend = MultiBackendClient::new();
+    multi_backend.register_backend("backend_0", backend.clone());
+
+    let temp_staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_staging.path().to_path_buf()],
+        Some("128MB"),
+        Some("128MB"),
+        Some("500MB"),
+        Some("500MB"),
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), multi_backend.clone(), cache.clone());
+    let fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // Generate 6MB of seeded data (crosses the 4MB block boundary)
+    let size = 6 * 1024 * 1024;
+    let data = generate_seeded_data(12345, size);
+    let expected_checksum = calculate_sha512(&data);
+
+    // Create file
+    let reply_create = fs.create(req, 1, OsStr::new("chunked_test.bin"), 0o644, 0).await.unwrap();
+    let ino = reply_create.attr.ino;
+
+    // Write file in 128KB chunks
+    let chunk_size = 128 * 1024;
+    let mut offset = 0;
+    while offset < size {
+        let end = std::cmp::min(offset + chunk_size, size);
+        let chunk = &data[offset..end];
+        fs.write(req, ino, 0, offset as u64, chunk, 0, 0).await.unwrap();
+        offset = end;
+    }
+
+    fs.flush(req, ino, 0, 0).await.unwrap();
+    
+    // Test immediate read from the active filesystem instance (cached data check)
+    let reply_read_immediate = fs.read(req, ino, 0, 0, size as u32).await.unwrap();
+    assert_eq!(reply_read_immediate.data.len(), size);
+    let checksum_immediate = calculate_sha512(&reply_read_immediate.data);
+    assert_eq!(checksum_immediate, expected_checksum, "Immediate read checksum mismatch");
+
+    fs.release(req, ino, 0, 0, 0, false).await.unwrap();
+
+    // Recreate filesystem to bypass RAM caches and force read from S3/Staging
+    drop(fs);
+
+    let cache_recreate = TieredCache::new(
+        vec![temp_staging.path().to_path_buf()],
+        Some("128MB"),
+        Some("128MB"),
+        Some("500MB"),
+        Some("500MB"),
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router_recreate = DataRouter::new(dlm.clone(), multi_backend.clone(), cache_recreate);
+    let fs_recreate = SqueezefsFilesystem::new(router_recreate, dlm.clone(), 1000, 1000);
+    fs_recreate.init(req).await.unwrap();
+
+    let reply_read = fs_recreate.read(req, ino, 0, 0, size as u32).await.unwrap();
+    assert_eq!(reply_read.data.len(), size);
+    let checksum = calculate_sha512(&reply_read.data);
+    assert_eq!(checksum, expected_checksum);
+}
+
+#[tokio::test]
+async fn test_striped_rmw_corruption_with_compression() {
+    if clean_db().await.is_none() {
+        println!("Skipping test: Garnet/Redis not available");
+        return;
+    }
+
+    let redis_url = get_redis_url();
+    let fs_name = "integrity_test_vol_lz4";
+
+    // Format the volume with lz4 compression!
+    format_volume(
+        &redis_url,
+        fs_name,
+        1 * 1024 * 1024, // 1MB block size to easily cross boundaries
+        100 * 1024 * 1024 * 1024,
+        0,
+        "lz4", // lz4 compression enabled!
+        "none",
+        None,
+        Some("128MB"),
+        Some("500MB"),
+        Some(&[PathBuf::from("/tmp/squeezefs_staging_integrity_lz4")]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new_mock();
+    let multi_backend = MultiBackendClient::new();
+    multi_backend.register_backend("backend_0", backend.clone());
+
+    let temp_staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_staging.path().to_path_buf()],
+        Some("128MB"),
+        Some("128MB"),
+        Some("500MB"),
+        Some("500MB"),
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), multi_backend.clone(), cache.clone());
+    
+    // Set format parameters on the router
+    let crypto = squeezefs::crypto_compress::CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    router.set_crypto(crypto);
+
+    let fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // 1. Create a 6MB file (will be striped because block size is 1MB and size > 4MB progressive layout threshold)
+    let size = 6 * 1024 * 1024;
+    let mut data = generate_seeded_data(54321, size);
+    
+    let reply_create = fs.create(req, 1, OsStr::new("striped_lz4.bin"), 0o644, 0).await.unwrap();
+    let ino = reply_create.attr.ino;
+
+    // Write file sequentially to make it striped
+    fs.write(req, ino, 0, 0, &data, 0, 0).await.unwrap();
+    fs.flush(req, ino, 0, 0).await.unwrap();
+    fs.release(req, ino, 0, 0, 0, false).await.unwrap();
+
+    // 2. Perform a partial write/seek (RMW) on the striped file
+    // Write 100 bytes at offset 1.5MB (block 1, which is offset 1MB to 2MB)
+    let patch_offset = 1500 * 1024;
+    let patch_data = vec![7u8; 100];
+    
+    // Update our reference data
+    data[patch_offset..patch_offset + 100].copy_from_slice(&patch_data);
+    let expected_checksum = calculate_sha512(&data);
+
+    let _reply_open = fs.open(req, ino, 0).await.unwrap();
+    fs.write(req, ino, 0, patch_offset as u64, &patch_data, 0, 0).await.unwrap();
+    fs.flush(req, ino, 0, 0).await.unwrap();
+    fs.release(req, ino, 0, 0, 0, false).await.unwrap();
+
+    // Recreate filesystem to clear memory caches and read back from storage
+    drop(fs);
+
+    let cache_recreate = TieredCache::new(
+        vec![temp_staging.path().to_path_buf()],
+        Some("128MB"),
+        Some("128MB"),
+        Some("500MB"),
+        Some("500MB"),
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router_recreate = DataRouter::new(dlm.clone(), multi_backend.clone(), cache_recreate);
+    let crypto_recreate = squeezefs::crypto_compress::CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    router_recreate.set_crypto(crypto_recreate);
+    
+    let fs_recreate = SqueezefsFilesystem::new(router_recreate, dlm.clone(), 1000, 1000);
+    fs_recreate.init(req).await.unwrap();
+
+    let reply_read = fs_recreate.read(req, ino, 0, 0, size as u32).await.unwrap();
+    assert_eq!(reply_read.data.len(), size);
+    let checksum = calculate_sha512(&reply_read.data);
+    assert_eq!(checksum, expected_checksum);
+}

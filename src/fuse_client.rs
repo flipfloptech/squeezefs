@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime};
 use tokio::runtime::Builder;
 
 const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
+const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
 #[derive(Default)]
 pub struct ProbabilisticAtomic {
@@ -136,6 +137,117 @@ impl SqueezefsFilesystem {
         });
 
         serde_json::to_string_pretty(&config_obj).unwrap_or_default()
+    }
+
+    fn get_stats_attr(&self, size: u64) -> FileAttr {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        let sec = now.as_secs() as i64;
+        let nsec = now.subsec_nanos();
+
+        FileAttr {
+            ino: STATS_INODE,
+            size,
+            blocks: size.div_ceil(512),
+            atime: Timestamp::new(sec, nsec),
+            mtime: Timestamp::new(sec, nsec),
+            ctime: Timestamp::new(sec, nsec),
+            kind: FileType::RegularFile,
+            perm: 0o444, // read-only by all
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
+        }
+    }
+
+    async fn generate_stats_json(&self) -> String {
+        let read_lru_keys = self.router.cache.read_lru.keys();
+        let write_lru_keys = self.router.cache.write_lru.keys();
+        let nvme_staged_write_file_ids = self.router.cache.nvme.list_staged_files();
+        let nvme_read_cache_block_keys = self.router.cache.nvme.list_cached_blocks();
+
+        // Scan active_writes
+        let mut active_writes = serde_json::Map::new();
+        let staging_dir = self
+            .router
+            .cache
+            .nvme
+            .staging_dirs()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/squeezefs_staging"));
+        let active_dir = staging_dir.join("active_writes");
+        if active_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(active_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(dir_name) = path.file_name() {
+                            let inode_name = dir_name.to_string_lossy().into_owned();
+                            let mut blocks = Vec::new();
+                            if let Ok(block_entries) = std::fs::read_dir(&path) {
+                                for block_entry in block_entries.flatten() {
+                                    let b_path = block_entry.path();
+                                    if b_path.is_file() {
+                                        if let Some(b_name) = b_path.file_name() {
+                                            blocks.push(serde_json::Value::String(b_name.to_string_lossy().into_owned()));
+                                        }
+                                    }
+                                }
+                            }
+                            active_writes.insert(inode_name, serde_json::Value::Array(blocks));
+                        }
+                    }
+                }
+            }
+        }
+
+        let hits = METRICS.cache_hits.load(Ordering::Relaxed);
+        let misses = METRICS.cache_misses.load(Ordering::Relaxed);
+        let ratio = if hits + misses > 0 {
+            hits as f64 / (hits + misses) as f64
+        } else {
+            0.0
+        };
+
+        let stats_obj = serde_json::json!({
+            "read_lru_keys": read_lru_keys,
+            "write_lru_keys": write_lru_keys,
+            "nvme_staged_write_file_ids": nvme_staged_write_file_ids,
+            "nvme_read_cache_block_keys": nvme_read_cache_block_keys,
+            "active_writes": active_writes,
+            "active_leases_count": self.active_leases.len(),
+            "active_posix_locks_count": self.active_posix_locks.len(),
+            "metrics": {
+                "fuse_ops": METRICS.fuse_ops.load(Ordering::Relaxed),
+                "meta_updates": METRICS.meta_updates.load(Ordering::Relaxed),
+                "put_obj": METRICS.put_obj.load(Ordering::Relaxed),
+                "get_obj": METRICS.get_obj.load(Ordering::Relaxed),
+                "del_obj": METRICS.del_obj.load(Ordering::Relaxed),
+                "cache_hits": hits,
+                "cache_misses": misses,
+                "cache_hit_ratio": ratio,
+            },
+            "cache_capacities": {
+                "read_lru_current_bytes": self.router.cache.read_lru.current_bytes(),
+                "read_lru_max_bytes": self.router.cache.read_lru.max_bytes(),
+                "write_lru_current_bytes": self.router.cache.write_lru.current_bytes(),
+                "write_lru_max_bytes": self.router.cache.write_lru.max_bytes(),
+                "nvme_staging_current_bytes": self.router.cache.nvme.current_staged_write_bytes(),
+                "nvme_staging_max_bytes": self.router.cache.nvme.max_write_bytes(),
+                "nvme_read_cache_current_bytes": self.router.cache.nvme.current_read_cache_bytes(),
+                "nvme_read_cache_max_bytes": self.router.cache.nvme.max_read_bytes(),
+            },
+            "internal_caches": {
+                "metadata_cache_size": self.router.metadata_cache.len(),
+                "block_map_cache_size": self.router.block_map_cache.len(),
+            }
+        });
+
+        serde_json::to_string_pretty(&stats_obj).unwrap_or_default()
     }
 
     fn get_config_attr(&self, size: u64) -> FileAttr {
@@ -359,7 +471,8 @@ impl SqueezefsFilesystem {
                             cached
                         } else {
                             let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
-                            self.router.backend.get_object(&be_id, &real_key).await?
+                            let raw = self.router.backend.get_object(&be_id, &real_key).await?;
+                            self.router.get_crypto().process_read(&raw)?
                         };
                     }
                 }
@@ -483,8 +596,9 @@ impl SqueezefsFilesystem {
                             let new_block_key =
                                 format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
+                            let processed_block = router_clone.get_crypto().process_write(&block_data)?;
                             backend_clone
-                                .put_object(&new_block_key, block_data, fencing_token)
+                                .put_object(&new_block_key, processed_block, fencing_token)
                                 .await?;
 
                             let active_be = backend_clone.get_backend_for_key(&new_block_key);
@@ -914,6 +1028,16 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        if parent == 1 && name_str == ".stats" {
+            let stats_data = self.generate_stats_json().await;
+            let attr = self.get_stats_attr(stats_data.len() as u64);
+            return Ok(ReplyEntry {
+                ttl: Duration::from_secs(0), // dynamic stats shouldn't be cached long
+                attr,
+                generation: 1,
+            });
+        }
+
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let dir_key = format!("squeezefs:dir:{}", parent);
         let child_ino_opt: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
@@ -950,6 +1074,15 @@ impl Filesystem for SqueezefsFilesystem {
             let attr = self.get_config_attr(config_data.len() as u64);
             return Ok(ReplyAttr {
                 ttl: Duration::from_secs(1),
+                attr,
+            });
+        }
+
+        if ino == STATS_INODE {
+            let stats_data = self.generate_stats_json().await;
+            let attr = self.get_stats_attr(stats_data.len() as u64);
+            return Ok(ReplyAttr {
+                ttl: Duration::from_secs(0),
                 attr,
             });
         }
@@ -1225,6 +1358,21 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        if ino == STATS_INODE {
+            let stats_data = self.generate_stats_json().await;
+            let bytes = stats_data.into_bytes();
+            if offset >= bytes.len() as u64 {
+                return Ok(ReplyData {
+                    data: Vec::new().into(),
+                });
+            }
+            let start = offset as usize;
+            let end = std::cmp::min(bytes.len(), start + size as usize);
+            return Ok(ReplyData {
+                data: bytes[start..end].to_vec().into(),
+            });
+        }
+
         let file_path = format!("inode_{}", ino);
         let block_size = self.router.block_size.load(Ordering::Relaxed);
 
@@ -1321,6 +1469,10 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EACCES));
         }
 
+        if ino == STATS_INODE {
+            return Err(Errno::from(libc::EACCES));
+        }
+
         // Acquire local inode lock for the ENTIRE write operation to serialize
         // concurrent/subsequent writes to the same file.
         let lock = self.get_inode_lock(ino);
@@ -1358,6 +1510,9 @@ impl Filesystem for SqueezefsFilesystem {
             self.write_file_staged(ino, offset, data, fencing_token)
                 .await
                 .map_err(map_squeezefs_err)?;
+            let file_path = format!("inode_{}", ino);
+            self.router.cache.write_lru.remove(&file_path);
+            self.router.cache.read_lru.remove(&file_path);
         } else {
             let file_path = format!("inode_{}", ino);
             self.router
@@ -2164,6 +2319,16 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        if parent == 1 && !entries_map.contains_key(".stats") {
+            let offset = (entries.len() + 1) as i64;
+            entries.push(DirectoryEntry {
+                name: ".stats".into(),
+                kind: FileType::RegularFile,
+                inode: STATS_INODE,
+                offset,
+            });
+        }
+
         let mut child_inos = Vec::new();
         for (name, child_ino) in &entries_map {
             if name == "." || name == ".." {
@@ -2309,6 +2474,22 @@ impl Filesystem for SqueezefsFilesystem {
                 attr,
                 entry_ttl: Duration::from_secs(1),
                 attr_ttl: Duration::from_secs(1),
+                offset,
+            });
+        }
+
+        if parent == 1 && !entries_map.contains_key(".stats") {
+            let stats_data = self.generate_stats_json().await;
+            let attr = self.get_stats_attr(stats_data.len() as u64);
+            let offset = (entries.len() + 1) as i64;
+            entries.push(DirectoryEntryPlus {
+                name: ".stats".into(),
+                kind: FileType::RegularFile,
+                inode: STATS_INODE,
+                generation: 1,
+                attr,
+                entry_ttl: Duration::from_secs(0),
+                attr_ttl: Duration::from_secs(0),
                 offset,
             });
         }

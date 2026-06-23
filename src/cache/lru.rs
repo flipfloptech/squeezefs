@@ -95,6 +95,10 @@ impl LruCache {
         self.max_bytes
     }
 
+    pub fn keys(&self) -> Vec<String> {
+        self.inner.iter().map(|(k, _)| k.as_ref().clone()).collect()
+    }
+
     pub fn run_pending_tasks(&self) {
         self.inner.run_pending_tasks();
     }

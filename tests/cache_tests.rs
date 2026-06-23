@@ -1,3 +1,4 @@
+use fuse3::raw::Filesystem;
 use squeezefs::backend::RustFsClient;
 use squeezefs::cache::lru::LruCache;
 use squeezefs::cache::nvme::NvmeStaging;
@@ -248,3 +249,70 @@ async fn test_nvme_read_cache_eviction() {
         "Staged write must never be evicted"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_virtual_stats_file() {
+    let _con = match clean_db_for_stats().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = "redis://127.0.0.1:6379/";
+    let dlm = squeezefs::dlm::DlmClient::new(redis_url).unwrap();
+    let backend = squeezefs::backend::RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = squeezefs::cache::TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = squeezefs::routing::DataRouter::new(dlm.clone(), backend, cache);
+    let fs = squeezefs::fuse_client::SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    
+    let req = fuse3::raw::Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // 1. Lookup ".stats" in root directory (parent = 1)
+    let reply_lookup = fs.lookup(req, 1, std::ffi::OsStr::new(".stats")).await.unwrap();
+    assert_eq!(reply_lookup.attr.ino, 0xffff_ffff_ffff_fffd);
+    assert_eq!(reply_lookup.attr.kind, fuse3::raw::prelude::FileType::RegularFile);
+
+    // 2. Getattr on stats inode
+    let reply_attr = fs.getattr(req, 0xffff_ffff_ffff_fffd, None, 0).await.unwrap();
+    assert_eq!(reply_attr.attr.ino, 0xffff_ffff_ffff_fffd);
+    assert!(reply_attr.attr.size > 0);
+
+    // 3. Read stats data
+    let reply_read = fs.read(req, 0xffff_ffff_ffff_fffd, 0, 0, 8192).await.unwrap();
+    let stats_str = String::from_utf8(reply_read.data.to_vec()).unwrap();
+    
+    // Parse stats JSON
+    let stats_val: serde_json::Value = serde_json::from_str(&stats_str).unwrap();
+    assert!(stats_val.get("read_lru_keys").is_some());
+    assert!(stats_val.get("write_lru_keys").is_some());
+    assert!(stats_val.get("metrics").is_some());
+    assert!(stats_val.get("cache_capacities").is_some());
+    assert!(stats_val.get("internal_caches").is_some());
+}
+
+async fn clean_db_for_stats() -> Option<redis::aio::MultiplexedConnection> {
+    let client = redis::Client::open("redis://127.0.0.1:6379/").ok()?;
+    let mut con = client.get_multiplexed_async_connection().await.ok()?;
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut con).await.ok()?;
+    Some(con)
+}
+

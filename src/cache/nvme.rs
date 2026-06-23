@@ -150,41 +150,47 @@ impl NvmeStaging {
         data: &[u8],
         fencing_token: u64,
     ) -> Result<()> {
-        // Enforce max bytes capacity constraint asynchronously
+        let meta_content = serde_json::json!({
+            "file_path": file_path,
+            "fencing_token": fencing_token,
+            "original_size": data.len()
+        });
+        let meta_json_bytes = serde_json::to_vec(&meta_content).unwrap();
+        let unpadded_len = 8 + meta_json_bytes.len() + data.len();
+        let align = 4096;
+        let padded_size = ((unpadded_len + align - 1) & !(align - 1)) as u64;
+
+        // Enforce max bytes capacity constraint asynchronously using the exact padded file size
         let total_staged_bytes = self.current_staged_bytes.load(std::sync::atomic::Ordering::Relaxed);
 
-        if total_staged_bytes + data.len() as u64 > self.max_bytes {
+        if total_staged_bytes + padded_size > self.max_bytes {
             return Err(SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 format!(
                     "Local NVMe staging cache capacity exceeded: current {} bytes, writing {} bytes, max capacity {} bytes",
-                    total_staged_bytes, data.len(), self.max_bytes
+                    total_staged_bytes, padded_size, self.max_bytes
                 )
             )));
         }
 
         let target_dir = self.get_staged_path(file_id);
-        let data_path = target_dir.join(format!("{}.data", file_id));
-        let meta_path = target_dir.join(format!("{}.meta", file_id));
+        let staged_path = target_dir.join(format!("{}.staged", file_id));
 
         let data_clone = data.to_vec();
-        let file_path_clone = file_path.to_string();
-        let data_len = data.len();
 
         tokio::task::spawn_blocking(move || -> std::result::Result<(), SqueezefsError> {
-            write_aligned_direct(&data_path, &data_clone).map_err(|e| SqueezefsError::Io(e))?;
-            
-            let meta_content = serde_json::json!({
-                "file_path": file_path_clone,
-                "fencing_token": fencing_token,
-                "original_size": data_len
-            });
-            std::fs::write(&meta_path, serde_json::to_vec(&meta_content).unwrap())
-                .map_err(|e| SqueezefsError::Io(e))?;
+            let meta_len = meta_json_bytes.len() as u64;
+
+            let mut packed_payload = Vec::with_capacity(8 + meta_json_bytes.len() + data_clone.len());
+            packed_payload.extend_from_slice(&meta_len.to_be_bytes());
+            packed_payload.extend_from_slice(&meta_json_bytes);
+            packed_payload.extend_from_slice(&data_clone);
+
+            write_aligned_direct(&staged_path, &packed_payload).map_err(|e| SqueezefsError::Io(e))?;
             Ok(())
         }).await.unwrap()?;
 
-        self.current_staged_bytes.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.current_staged_bytes.fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
 
         info!(
             "NVMe Staging: Staged write for file {} (ID: {}) size = {} bytes. Acknowledging write to OS.",
@@ -211,16 +217,25 @@ impl NvmeStaging {
     /// Read staged data directly from NVMe if it exists locally and has not yet been merged/cleared.
     pub fn read_staged(&self, file_id: &str) -> Option<Vec<u8>> {
         let target_dir = self.get_staged_path(file_id);
-        let data_path = target_dir.join(format!("{}.data", file_id));
-        let meta_path = target_dir.join(format!("{}.meta", file_id));
+        let staged_path = target_dir.join(format!("{}.staged", file_id));
         
-        if data_path.exists() && meta_path.exists() {
-            if let Ok(meta_bytes) = fs::read(&meta_path) {
-                if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&meta_bytes) {
-                    if let Some(size) = meta_json.get("original_size").and_then(|v| v.as_u64()) {
-                        return read_aligned_direct(&data_path, size as usize).ok();
-                    } else {
-                        return fs::read(&data_path).ok();
+        if staged_path.exists() {
+            if let Ok(metadata) = fs::metadata(&staged_path) {
+                let file_len = metadata.len();
+                if let Ok(bytes) = read_aligned_direct(&staged_path, file_len as usize) {
+                    if bytes.len() >= 8 {
+                        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                        if bytes.len() >= 8 + meta_len {
+                            if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                                if let Some(orig_size) = meta_json.get("original_size").and_then(|v| v.as_u64()) {
+                                    let data_start = 8 + meta_len;
+                                    let data_end = data_start + orig_size as usize;
+                                    if bytes.len() >= data_end {
+                                        return Some(bytes[data_start..data_end].to_vec());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -248,7 +263,7 @@ impl NvmeStaging {
                 tokio::select! {
                     Some(pending) = write_rx.recv() => {
                         let idx = get_dir_index(&pending.file_id, staging_dirs.len());
-                        let local_path = staging_dirs[idx].join(format!("{}.data", pending.file_id));
+                        let local_path = staging_dirs[idx].join(format!("{}.staged", pending.file_id));
                         let (meta_len, ok) = tokio::task::spawn_blocking(move || {
                             if let Ok(metadata) = fs::metadata(&local_path) {
                                 (metadata.len(), true)
@@ -303,21 +318,29 @@ impl NvmeStaging {
         // 1. Pack individual staged file bytes into one payload
         for item in batch.iter() {
             let idx = get_dir_index(&item.file_id, staging_dirs.len());
-            let local_path = staging_dirs[idx].join(format!("{}.data", item.file_id));
-            let meta_path = staging_dirs[idx].join(format!("{}.meta", item.file_id));
+            let local_path = staging_dirs[idx].join(format!("{}.staged", item.file_id));
             
             let data_res = tokio::task::spawn_blocking(move || {
-                let size = if let Ok(meta_bytes) = fs::read(&meta_path) {
-                    if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&meta_bytes) {
-                        meta_json.get("original_size").and_then(|v| v.as_u64())
-                    } else { None }
-                } else { None };
-                
-                if let Some(s) = size {
-                    read_aligned_direct(&local_path, s as usize).ok()
-                } else {
-                    fs::read(&local_path).ok()
+                if let Ok(metadata) = fs::metadata(&local_path) {
+                    let file_len = metadata.len();
+                    if let Ok(bytes) = read_aligned_direct(&local_path, file_len as usize) {
+                        if bytes.len() >= 8 {
+                            let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                            if bytes.len() >= 8 + meta_len {
+                                if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                                    if let Some(orig_size) = meta_json.get("original_size").and_then(|v| v.as_u64()) {
+                                        let data_start = 8 + meta_len;
+                                        let data_end = data_start + orig_size as usize;
+                                        if bytes.len() >= data_end {
+                                            return Some(bytes[data_start..data_end].to_vec());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+                None
             }).await.unwrap();
 
             if let Some(data) = data_res {
@@ -362,22 +385,13 @@ impl NvmeStaging {
         for item in batch.iter() {
             let idx = get_dir_index(&item.file_id, staging_dirs.len());
             let target_dir = &staging_dirs[idx];
-            let local_path = target_dir.join(format!("{}.data", item.file_id));
+            let local_path = target_dir.join(format!("{}.staged", item.file_id));
             if local_path.exists() {
                 if let Ok(meta) = fs::metadata(&local_path) {
                     staged_bytes.fetch_sub(meta.len(), std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Err(e) = fs::remove_file(&local_path) {
                     error!("Failed to remove staged file {:?}: {:?}", local_path, e);
-                }
-            }
-            let meta_path = target_dir.join(format!("{}.meta", item.file_id));
-            if meta_path.exists() {
-                if let Err(e) = fs::remove_file(&meta_path) {
-                    error!(
-                        "Failed to remove staged metadata file {:?}: {:?}",
-                        meta_path, e
-                    );
                 }
             }
         }

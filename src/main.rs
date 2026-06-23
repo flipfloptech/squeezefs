@@ -218,11 +218,18 @@ enum ConfigActions {
     Fsck,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(feature = "dhat-on")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+#[cfg(all(target_os = "linux", not(feature = "dhat-on")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "dhat-on")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let cli = Cli::parse();
 
     #[cfg(unix)]
@@ -280,9 +287,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder.init();
 
     // NOW start the Tokio runtime in the surviving process
+    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    let core_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(8192)
+        .on_thread_start(move || {
+            let idx = core_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if idx < core_ids.len() {
+                core_affinity::set_for_current(core_ids[idx]);
+            }
+        })
         .build()
         .unwrap();
 

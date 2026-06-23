@@ -408,6 +408,75 @@ fn bench_squeezefs_data_io(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_nvme_combined(c: &mut Criterion) {
+    let (fs, rt, _temp_dir) = match setup_fs_and_rt() {
+        Some(val) => val,
+        None => return,
+    };
+
+    let router = fs.router.clone();
+    let nvme = router.cache.nvme.clone();
+    let mut group = c.benchmark_group("bench_nvme_combined");
+
+    let test_data = vec![7u8; 64 * 1024]; // 64KB
+    let counter = Arc::new(AtomicU64::new(0));
+
+    group.bench_function("stage_write_64kb", |b| {
+        let counter_clone = counter.clone();
+        let data_ref = &test_data;
+        let nvme_ref = &nvme;
+        b.to_async(&rt).iter(|| {
+            let c = counter_clone.fetch_add(1, Ordering::Relaxed);
+            let file_path = format!("/bench_staged_{}.bin", c);
+            let file_id = format!("bench_id_{}", c);
+            async move {
+                nvme_ref.stage_write(&file_path, &file_id, data_ref, 1).await.unwrap();
+            }
+        });
+    });
+
+    group.bench_function("read_staged_64kb", |b| {
+        let counter_clone = counter.clone();
+        let nvme_ref = &nvme;
+        b.to_async(&rt).iter(|| {
+            let c = counter_clone.load(Ordering::Relaxed);
+            let file_id = format!("bench_id_{}", c.saturating_sub(1));
+            async move {
+                let _ = nvme_ref.read_staged(&file_id);
+            }
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_dlm_centralized_heartbeat(c: &mut Criterion) {
+    let (fs, rt, _temp_dir) = match setup_fs_and_rt() {
+        Some(val) => val,
+        None => return,
+    };
+
+    let dlm = fs.router.dlm.clone();
+    let mut group = c.benchmark_group("bench_dlm_centralized_heartbeat");
+
+    let counter = Arc::new(AtomicU64::new(0));
+
+    group.bench_function("acquire_and_release_lock", |b| {
+        let dlm_ref = &dlm;
+        let counter_clone = counter.clone();
+        b.to_async(&rt).iter(|| {
+            let c = counter_clone.fetch_add(1, Ordering::Relaxed);
+            let path = format!("/bench_lock_{}", c);
+            async move {
+                let lease = dlm_ref.acquire_lock(&path, None, Duration::from_secs(5)).await.unwrap();
+                lease.release().await.unwrap();
+            }
+        });
+    });
+
+    group.finish();
+}
+
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .measurement_time(Duration::from_secs(3))
@@ -422,6 +491,8 @@ criterion_group! {
         bench_squeezefs_routing,
         bench_squeezefs_posix_locks,
         bench_squeezefs_metadata_ops,
-        bench_squeezefs_data_io
+        bench_squeezefs_data_io,
+        bench_nvme_combined,
+        bench_dlm_centralized_heartbeat
 }
 criterion_main!(benches);

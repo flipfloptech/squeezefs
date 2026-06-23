@@ -36,8 +36,8 @@ pub async fn recover_staging(
         let entry = entry?;
         let path = entry.path();
 
-        // Only process metadata files (.meta)
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "meta") {
+        // Only process staged files (.staged)
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
             let file_id = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -48,39 +48,64 @@ pub async fn recover_staging(
                 continue;
             }
 
-            let meta_path = &path;
-            let data_path = staging_dir.join(format!("{}.data", file_id));
+            let staged_path = &path;
 
             debug!(
                 "Crash Recovery: Found staged write transaction ID: {}",
                 file_id
             );
 
-            // 1. Read metadata
-            let meta_bytes = match fs::read(meta_path) {
+            // 1. Read staged file bytes
+            let bytes = match fs::read(staged_path) {
                 Ok(b) => b,
                 Err(e) => {
                     error!(
-                        "Crash Recovery: Failed to read metadata file {:?}: {:?}",
-                        meta_path, e
+                        "Crash Recovery: Failed to read staged file {:?}: {:?}",
+                        staged_path, e
                     );
                     continue;
                 }
             };
 
-            let meta: StagedMetadata = match serde_json::from_slice(&meta_bytes) {
+            if bytes.len() < 8 {
+                error!("Crash Recovery: Staged file {:?} is truncated (size < 8 bytes)", staged_path);
+                let _ = fs::remove_file(staged_path);
+                continue;
+            }
+
+            let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+            if bytes.len() < 8 + meta_len {
+                error!("Crash Recovery: Staged file {:?} is truncated (size < 8 + meta_len)", staged_path);
+                let _ = fs::remove_file(staged_path);
+                continue;
+            }
+
+            let meta: StagedMetadata = match serde_json::from_slice(&bytes[8..8 + meta_len]) {
                 Ok(m) => m,
                 Err(e) => {
                     error!(
-                        "Crash Recovery: Failed to parse metadata file {:?}: {:?}",
-                        meta_path, e
+                        "Crash Recovery: Failed to parse metadata from staged file {:?}: {:?}",
+                        staged_path, e
                     );
-                    // Corrupted metadata, delete transaction files
-                    let _ = fs::remove_file(meta_path);
-                    let _ = fs::remove_file(&data_path);
+                    let _ = fs::remove_file(staged_path);
                     continue;
                 }
             };
+
+            // Read the JSON to get original_size
+            let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                Err(_) => 0,
+            };
+
+            let data_start = 8 + meta_len;
+            let data_end = data_start + original_size;
+            if bytes.len() < data_end {
+                error!("Crash Recovery: Staged file {:?} data payload is truncated", staged_path);
+                let _ = fs::remove_file(staged_path);
+                continue;
+            }
+            let data = bytes[data_start..data_end].to_vec();
 
             // 2. Cross-reference with Garnet
             let meta_key = format!("metadata:{}", meta.file_path);
@@ -91,49 +116,34 @@ pub async fn recover_staging(
                 && redis_file_id.as_deref() == Some(&file_id);
 
             if should_recover {
-                if data_path.exists() {
-                    let data = match fs::read(&data_path) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            error!(
-                                "Crash Recovery: Failed to read data block {:?}: {:?}",
-                                data_path, e
-                            );
-                            continue;
-                        }
-                    };
+                info!(
+                    "Crash Recovery: Recovering write for '{}' (ID: {}, size: {} bytes, fencing token: {})",
+                    meta.file_path, file_id, data.len(), meta.fencing_token
+                );
 
-                    info!(
-                        "Crash Recovery: Recovering write for '{}' (ID: {}, size: {} bytes, fencing token: {})",
-                        meta.file_path, file_id, data.len(), meta.fencing_token
+                // 3. Upload to RustFS S3
+                let recovered_key = format!("recovered/blocks/{}", file_id);
+                if let Err(e) = backend
+                    .put_object(&recovered_key, data.clone(), meta.fencing_token)
+                    .await
+                {
+                    error!(
+                        "Crash Recovery: Failed to upload recovered block to RustFS: {:?}",
+                        e
                     );
-
-                    // 3. Upload to RustFS S3
-                    let recovered_key = format!("recovered/blocks/{}", file_id);
-                    if let Err(e) = backend
-                        .put_object(&recovered_key, data.clone(), meta.fencing_token)
-                        .await
-                    {
-                        error!(
-                            "Crash Recovery: Failed to upload recovered block to RustFS: {:?}",
-                            e
-                        );
-                        continue;
-                    }
-
-                    // 4. Update Garnet mapping
-                    let mapping_key = format!("mapping:{}", file_id);
-                    let _: () = redis::pipe()
-                        .hset(&mapping_key, "block", &recovered_key)
-                        .hset(&mapping_key, "offset", 0u64)
-                        .hset(&mapping_key, "size", data.len() as u64)
-                        .query_async(&mut con)
-                        .await?;
-
-                    recovered_count += 1;
-                } else {
-                    warn!("Crash Recovery: Metadata exists for {} but data file {:?} is missing. Discarding transaction.", file_id, data_path);
+                    continue;
                 }
+
+                // 4. Update Garnet mapping
+                let mapping_key = format!("mapping:{}", file_id);
+                let _: () = redis::pipe()
+                    .hset(&mapping_key, "block", &recovered_key)
+                    .hset(&mapping_key, "offset", 0u64)
+                    .hset(&mapping_key, "size", data.len() as u64)
+                    .query_async(&mut con)
+                    .await?;
+
+                recovered_count += 1;
             } else {
                 warn!(
                     "Crash Recovery: Stale write detected for '{}' (ID: {}). Redis has type={:?} and file_id={:?}. Discarding stale local files.",
@@ -141,9 +151,8 @@ pub async fn recover_staging(
                 );
             }
 
-            // 5. Clean up local staging files
-            let _ = fs::remove_file(meta_path);
-            let _ = fs::remove_file(&data_path);
+            // 5. Clean up local staging file
+            let _ = fs::remove_file(staged_path);
         }
     }
 

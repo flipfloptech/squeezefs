@@ -7,7 +7,7 @@ edition = "2021"
 tokio = { version = "1.36", features = ["full"] }
 fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged", "file-lock"] }
 io-uring = "0.6"
-redis = { version = "0.24", features = ["tokio-comp", "cluster-async", "connection-manager", "sentinel"] }
+redis = { version = "0.24", features = ["tokio-comp", "cluster-async", "connection-manager", "sentinel", "script", "aio"] }
 aws-config = "1.1"
 aws-sdk-s3 = "1.17"
 dashmap = "5.5"
@@ -31,10 +31,13 @@ hyper-rustls-024 = { package = "hyper-rustls", version = "0.24", features = ["we
 aws-smithy-runtime = "1.1"
 moka = { version = "0.12.15", features = ["sync"] }
 fastrand = "2.0"
+core_affinity = "0.8"
+dhat = { version = "0.3.3", optional = true }
 
 [features]
 default = []
 gds = ["dep:libloading"]
+dhat-on = ["dep:dhat"]
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -44,7 +44,8 @@ async fn test_nvme_staging_and_merge() {
     let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
     let nvme = NvmeStaging::new(
         vec![temp_dir.path().to_path_buf()],
-        100 * 1024 * 1024,
+        100 * 1024 * 1024, // 100MB write limit
+        100 * 1024 * 1024, // 100MB read limit
         mock_backend.clone(),
         squeezefs::dlm::MetaClient::Single(redis_client),
     )
@@ -110,9 +111,10 @@ async fn test_multi_disk_distribution() {
     let mock_backend = RustFsClient::new_mock();
     let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
 
-    // Max capacity 100MB
+    // Max capacity 100MB for both
     let nvme = NvmeStaging::new(
         staging_dirs.clone(),
+        100 * 1024 * 1024,
         100 * 1024 * 1024,
         mock_backend,
         squeezefs::dlm::MetaClient::Single(redis_client),
@@ -146,4 +148,93 @@ async fn test_multi_disk_distribution() {
         }
     }
     assert_eq!(total_files, 6);
+}
+
+#[tokio::test]
+async fn test_nvme_cache_separation_limits() {
+    let temp_dir = tempdir().unwrap();
+    let mock_backend = RustFsClient::new_mock();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+
+    // Very small limits (10KB write capacity, 10KB read capacity)
+    let nvme = NvmeStaging::new(
+        vec![temp_dir.path().to_path_buf()],
+        10 * 1024,
+        10 * 1024,
+        mock_backend,
+        squeezefs::dlm::MetaClient::Single(redis_client),
+    )
+    .expect("Should construct NVMe staging");
+
+    // 1. Stage a write of 6KB
+    let data_write = vec![1u8; 6 * 1024];
+    nvme.stage_write("test_write.txt", "file-id-write", &data_write, 100)
+        .await
+        .expect("Should stage 6KB successfully");
+
+    // 2. Cache a read block of 8KB
+    let data_read = vec![2u8; 8 * 1024];
+    nvme.cache_read_block("blocks/b1", &data_read)
+        .expect("Should cache read block");
+
+    // Wait briefly for the async spawn_blocking of read caching to complete
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify both are tracked independently in their respective fields
+    assert_eq!(nvme.current_staged_write_bytes(), 6 * 1024 + 4096); // staged uses aligned/padded length
+    assert_eq!(nvme.current_read_cache_bytes(), 8 * 1024);
+
+    // 3. Trying to write another 6KB should fail with StorageFull because 6KB + 6KB > 10KB
+    let data_write_2 = vec![1u8; 6 * 1024];
+    let err = nvme.stage_write("test_write_2.txt", "file-id-write-2", &data_write_2, 101)
+        .await;
+    assert!(err.is_err());
+    let err_unwrapped = err.err().unwrap();
+    match err_unwrapped {
+        squeezefs::error::SqueezefsError::Io(ref e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::StorageFull);
+        }
+        _ => panic!("Expected std::io::ErrorKind::StorageFull error"),
+    }
+}
+
+#[tokio::test]
+async fn test_nvme_read_cache_eviction() {
+    let temp_dir = tempdir().unwrap();
+    let mock_backend = RustFsClient::new_mock();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+
+    // 10KB write capacity, 5KB read capacity
+    let nvme = NvmeStaging::new(
+        vec![temp_dir.path().to_path_buf()],
+        10 * 1024,
+        5 * 1024,
+        mock_backend,
+        squeezefs::dlm::MetaClient::Single(redis_client),
+    )
+    .expect("Should construct NVMe staging");
+
+    // Stage write of 8KB (consumes write capacity, does not touch read capacity)
+    let data_write = vec![1u8; 8 * 1024];
+    nvme.stage_write("staged_write.txt", "staged-id", &data_write, 100)
+        .await
+        .expect("Should stage write successfully");
+
+    // Cache read block 1 (3KB)
+    let b1 = vec![2u8; 3 * 1024];
+    nvme.cache_read_block("blocks/b1", &b1).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Cache read block 2 (3KB) -> total read cache is now 6KB > 5KB capacity.
+    // This should trigger eviction of block 1 to keep read cache under 5KB limit.
+    let b2 = vec![3u8; 3 * 1024];
+    nvme.cache_read_block("blocks/b2", &b2).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify block 1 was evicted, but block 2 is present
+    assert!(nvme.read_cached_block("blocks/b1").is_none(), "b1 should have been evicted");
+    assert!(nvme.read_cached_block("blocks/b2").is_some(), "b2 should be present");
+
+    // Verify staged write was NOT evicted
+    assert!(nvme.read_staged("staged-id").is_some(), "Staged write must never be evicted");
 }

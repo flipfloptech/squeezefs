@@ -34,6 +34,13 @@ fastrand = "2.0"
 core_affinity = "0.8"
 dhat = { version = "0.3.3", optional = true }
 coz = { version = "0.1", optional = true }
+lz4_flex = "0.11"
+zstd = "0.13"
+rsa = { version = "0.9", features = ["pem"] }
+ring = "0.17"
+rand = "0.8"
+
+
 
 [features]
 default = []

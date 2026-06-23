@@ -72,6 +72,15 @@ enum Commands {
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
         force: bool,
+        /// Compression algorithm (lz4, zstd, none, default: none)
+        #[arg(long, default_value = "none")]
+        compression: String,
+        /// Encryption algorithm (aes256gcm-rsa, chacha20-rsa, none, default: none)
+        #[arg(long, default_value = "none")]
+        encrypt_algo: String,
+        /// Path to RSA private key PEM file for client-side encryption
+        #[arg(long)]
+        encrypt_key: Option<String>,
     },
     /// Show filesystem status
     Status,
@@ -429,9 +438,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             s3_bucket,
             force,
             inodes,
+            compression,
+            encrypt_algo,
+            encrypt_key,
         } => {
             let redis_url = &cli.garnet_url;
-
+ 
             // Check if squeezefs volume is already formatted on the database
             if !force {
                 if let Ok(client) = redis::Client::open(redis_url.as_str()) {
@@ -458,23 +470,47 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = std::io::stdin().read_line(&mut input);
                             let trimmed = input.trim().to_lowercase();
                             if trimmed != "y" && trimmed != "yes" {
-                                println!("Format aborted.");
-                                return Ok(());
+                                  println!("Format aborted.");
+                                  return Ok(());
                             }
                         }
                     }
                 }
             }
-
+ 
+            let resolved_encrypt_key_pem = if encrypt_algo != "none" {
+                use rsa::pkcs1::EncodeRsaPrivateKey;
+                if let Some(ref path_str) = encrypt_key {
+                    let path = std::path::Path::new(path_str);
+                    let pem = std::fs::read_to_string(path)?;
+                    Some(pem)
+                } else {
+                    println!("No --encrypt-key provided. Automatically generating a new 2048-bit RSA key pair...");
+                    let mut rng = rand::thread_rng();
+                    let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048)
+                        .map_err(|e| format!("Failed to generate RSA key: {}", e))?;
+                    let pem = priv_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+                        .map_err(|e| format!("Failed to format PEM: {}", e))?;
+                    std::fs::write("squeezefs.key", &*pem)?;
+                    println!("Successfully generated squeezefs.key file.");
+                    Some((*pem).clone())
+                }
+            } else {
+                None
+            };
+ 
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let parsed_capacity = parse_human_readable_size(&capacity)?;
-
+ 
             squeezefs::fuse_client::format_volume(
                 redis_url,
                 &name,
                 parsed_block_size,
                 parsed_capacity,
                 inodes,
+                &compression,
+                &encrypt_algo,
+                resolved_encrypt_key_pem.as_deref(),
                 mem_cache_size.as_deref(),
                 disk_cache_size.as_deref(),
                 disk_cache_paths.as_deref(),

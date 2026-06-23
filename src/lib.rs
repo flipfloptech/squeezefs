@@ -7,6 +7,8 @@ pub mod fuse_client;
 pub mod p2p;
 pub mod recovery;
 pub mod routing;
+pub mod crypto_compress;
+
 
 #[macro_export]
 macro_rules! coz_progress {

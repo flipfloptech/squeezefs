@@ -61,6 +61,9 @@ async fn test_data_integrity_various_sizes() {
         4 * 1024 * 1024,          // 4MB block size
         100 * 1024 * 1024 * 1024, // 100GB capacity
         0,                        // inodes limit
+        "none",                   // compression
+        "none",                   // encrypt_algo
+        None,                     // encrypt_key
         Some("128MB"),
         Some("500MB"),
         Some(&[PathBuf::from("/tmp/squeezefs_staging_integrity")]),

@@ -30,6 +30,7 @@ hyper-014 = { package = "hyper", version = "0.14", features = ["full"] }
 hyper-rustls-024 = { package = "hyper-rustls", version = "0.24", features = ["webpki-roots", "tokio-runtime", "http1", "http2"] }
 aws-smithy-runtime = "1.1"
 moka = { version = "0.12.15", features = ["sync"] }
+fastrand = "2.0"
 
 [features]
 default = []
@@ -48,4 +49,7 @@ harness = false
 
 [patch.crates-io]
 fuse3 = { path = "third_party/fuse3" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.5"
 

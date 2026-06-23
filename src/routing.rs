@@ -6,6 +6,7 @@ use crate::fuse_client::METRICS;
 use log::debug;
 use redis::AsyncCommands;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
@@ -148,7 +149,7 @@ impl DataRouter {
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
 
-            self.cache.lru.put(file_path, existing_data);
+            self.cache.lru.put(file_path, Arc::new(existing_data));
         } else if new_size <= 4 * 1024 * 1024 {
             // Layout: staged
             let new_file_id = Uuid::new_v4().to_string();
@@ -194,7 +195,7 @@ impl DataRouter {
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
 
-            self.cache.lru.put(file_path, existing_data);
+            self.cache.lru.put(file_path, Arc::new(existing_data));
         } else {
             // Layout: striped
             let file_uuid = Uuid::new_v4().to_string();
@@ -306,7 +307,7 @@ impl DataRouter {
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
 
-            self.cache.lru.put(file_path, existing_data);
+            self.cache.lru.put(file_path, Arc::new(existing_data));
         }
 
         Ok(())
@@ -504,10 +505,11 @@ impl DataRouter {
         // If file data is fully cached in unified RAM cache, patch it there too
         if let Some(mut cached_data) = self.cache.lru.get(file_path) {
             let end_offset = end_pos as usize;
-            if cached_data.len() < end_offset {
-                cached_data.resize(end_offset, 0);
+            let data_vec = Arc::make_mut(&mut cached_data);
+            if data_vec.len() < end_offset {
+                data_vec.resize(end_offset, 0);
             }
-            cached_data[offset as usize..end_offset].copy_from_slice(data);
+            data_vec[offset as usize..end_offset].copy_from_slice(data);
             self.cache.lru.put(file_path, cached_data);
         }
 
@@ -523,7 +525,7 @@ impl DataRouter {
                 "Routing: Cache hit (Tier 2 - Unified System RAM) for '{}'",
                 file_path
             );
-            return Ok(cached_data);
+            return Ok((*cached_data).clone());
         }
         METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
 
@@ -668,7 +670,7 @@ impl DataRouter {
         };
 
         // Cache in Tier 2: System RAM
-        self.cache.lru.put(file_path, data.clone());
+        self.cache.lru.put(file_path, Arc::new(data.clone()));
 
         Ok(data)
     }

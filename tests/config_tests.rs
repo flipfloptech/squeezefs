@@ -12,7 +12,9 @@ fn get_redis_url() -> String {
 async fn setup_test_volume(name: &str) -> Option<DlmClient> {
     let redis_url = get_redis_url();
     let client = redis::Client::open(redis_url.clone()).ok()?;
-    let _con = client.get_multiplexed_tokio_connection().await.ok()?;
+    let mut con = client.get_multiplexed_tokio_connection().await.ok()?;
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut con).await.ok()?;
+
 
     // Format the volume to initialize metadata
     let _ = format_volume(
@@ -417,4 +419,51 @@ async fn test_set_config_quotas() {
     let res_invalid = squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "invalid_quota_key", "10")
         .await;
     assert!(res_invalid.is_err());
+
+    // 6. Set valid memory cache size limits and verify
+    squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "mem_cache_size", "2GB")
+        .await
+        .expect("Should set mem_cache_size to 2GB");
+    let val: String = con.hget("squeezefs:format", "mem_cache_size").await.unwrap();
+    assert_eq!(val, "2GB");
+
+    squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "read-mem-cache-size", "50%")
+        .await
+        .expect("Should set read_mem_cache_size to 50%");
+    let val: String = con.hget("squeezefs:format", "read_mem_cache_size").await.unwrap();
+    assert_eq!(val, "50%");
+
+    squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "write_mem_cache_size", "256MB")
+        .await
+        .expect("Should set write_mem_cache_size to 256MB");
+    let val: String = con.hget("squeezefs:format", "write_mem_cache_size").await.unwrap();
+    assert_eq!(val, "256MB");
+
+    // 7. Set valid disk cache size limits and verify
+    squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "disk_cache_size", "10GB")
+        .await
+        .expect("Should set disk_cache_size to 10GB");
+    let val: String = con.hget("squeezefs:format", "disk_cache_size").await.unwrap();
+    assert_eq!(val, "10GB");
+
+    squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "read_cache_size", "80%")
+        .await
+        .expect("Should set read_cache_size to 80%");
+    let val: String = con.hget("squeezefs:format", "read_cache_size").await.unwrap();
+    assert_eq!(val, "80%");
+
+    squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "write-cache-size", "5GB")
+        .await
+        .expect("Should set write_cache_size to 5GB");
+    let val: String = con.hget("squeezefs:format", "write_cache_size").await.unwrap();
+    assert_eq!(val, "5GB");
+
+    // 8. Try setting invalid cache sizes -> should fail validation
+    let res_invalid_size = squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "mem_cache_size", "invalid_size")
+        .await;
+    assert!(res_invalid_size.is_err(), "Should reject invalid size string");
+
+    let res_invalid_percent = squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "disk_cache_size", "150%")
+        .await;
+    assert!(res_invalid_percent.is_err(), "Should reject invalid percentage");
 }

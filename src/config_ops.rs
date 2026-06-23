@@ -591,9 +591,39 @@ pub async fn set_config_quota(
             let _: () = con.hset("squeezefs:format", "inodes", limit).await?;
             println!("Configuration quota 'inodes' set to {}.", limit);
         }
+        "mem_cache_size" | "mem-cache-size" => {
+            let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
+            let _: () = con.hset("squeezefs:format", "mem_cache_size", value).await?;
+            println!("Configuration quota 'mem_cache_size' set to '{}'.", value);
+        }
+        "read_mem_cache_size" | "read-mem-cache-size" => {
+            let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
+            let _: () = con.hset("squeezefs:format", "read_mem_cache_size", value).await?;
+            println!("Configuration quota 'read_mem_cache_size' set to '{}'.", value);
+        }
+        "write_mem_cache_size" | "write-mem-cache-size" => {
+            let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
+            let _: () = con.hset("squeezefs:format", "write_mem_cache_size", value).await?;
+            println!("Configuration quota 'write_mem_cache_size' set to '{}'.", value);
+        }
+        "disk_cache_size" | "disk-cache-size" => {
+            let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
+            let _: () = con.hset("squeezefs:format", "disk_cache_size", value).await?;
+            println!("Configuration quota 'disk_cache_size' set to '{}'.", value);
+        }
+        "read_cache_size" | "read-cache-size" => {
+            let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
+            let _: () = con.hset("squeezefs:format", "read_cache_size", value).await?;
+            println!("Configuration quota 'read_cache_size' set to '{}'.", value);
+        }
+        "write_cache_size" | "write-cache-size" => {
+            let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
+            let _: () = con.hset("squeezefs:format", "write_cache_size", value).await?;
+            println!("Configuration quota 'write_cache_size' set to '{}'.", value);
+        }
         _ => {
             return Err(SqueezefsError::InvalidOperation(format!(
-                "Invalid config quota key '{}'. Supported keys: 'capacity', 'inodes'",
+                "Invalid config quota key '{}'. Supported keys: 'capacity', 'inodes', 'mem_cache_size', 'read_mem_cache_size', 'write_mem_cache_size', 'disk_cache_size', 'read_cache_size', 'write_cache_size'",
                 key
             )));
         }

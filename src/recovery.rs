@@ -24,6 +24,19 @@ pub async fn recover_staging(
         return Ok(0);
     }
 
+    // Clean up any remaining active_writes directory from previous crashed mounts
+    let active_writes_dir = staging_dir.join("active_writes");
+    if active_writes_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(&active_writes_dir) {
+            warn!(
+                "Crash Recovery: Failed to remove stale active_writes directory: {:?}",
+                e
+            );
+        } else {
+            info!("Crash Recovery: Cleaned up stale active_writes directory.");
+        }
+    }
+
     info!(
         "Crash Recovery: Scanning local NVMe staging directory '{:?}' for pending writes.",
         staging_dir

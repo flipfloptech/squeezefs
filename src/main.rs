@@ -294,6 +294,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(0);
                 } else {
                     eprintln!("The mount point is not ready in 10 seconds, exiting");
+                    let _ = std::process::Command::new("umount")
+                        .arg("-l")
+                        .arg(&mountpoint_path)
+                        .output();
                     libc::kill(pid, libc::SIGKILL);
                     std::process::exit(1);
                 }
@@ -689,8 +693,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            let config_json = serde_json::json!({
+                "meta_url": redis_url,
+                "mem_cache_size": resolved_mem_cache_size,
+                "disk_cache_size": resolved_disk_cache_size,
+                "disk_cache_paths": active_staging_dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
+                "endpoint": final_s3_endpoint.as_deref().unwrap_or(""),
+                "bucket": final_s3_bucket.as_deref().unwrap_or("squeezefs-data"),
+                "writeback": writeback,
+                "allow_other": allow_other,
+                "options": options,
+            });
+            let config_str = serde_json::to_string_pretty(&config_json).unwrap_or_default();
+            log::info!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
+            log::info!("Data use {:?}", final_s3_bucket.as_deref().unwrap_or("mock"));
+            log::info!("SqueezeFS mount configuration:\n{}", config_str);
             println!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
             println!("Data use {:?}", final_s3_bucket.as_deref().unwrap_or("mock"));
+            println!("SqueezeFS mount configuration:\n{}", config_str);
 
             let cache = TieredCache::new(
                 active_staging_dirs,

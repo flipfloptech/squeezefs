@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Builder;
 
+const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
+
 #[derive(Default)]
 pub struct ProbabilisticAtomic {
     inner: AtomicU64,
@@ -81,6 +83,72 @@ impl SqueezefsFilesystem {
             active_posix_locks: dashmap::DashMap::new(),
             active_inode_locks: dashmap::DashMap::new(),
             attr_cache: dashmap::DashMap::new(),
+        }
+    }
+
+    async fn generate_config_json(&self) -> String {
+        let mut con_opt = self.dlm.get_connection().await.ok();
+        
+        let format_fields: std::collections::HashMap<String, String> = if let Some(ref mut con) = con_opt {
+            con.hgetall("squeezefs:format").await.unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        let backends_raw: std::collections::HashMap<String, String> = if let Some(ref mut con) = con_opt {
+            con.hgetall("squeezefs:backends").await.unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        let mut backends = serde_json::Map::new();
+        for (be_id, be_json) in backends_raw {
+            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&be_json) {
+                if let Some(obj) = config.as_object_mut() {
+                    if obj.contains_key("secret_key") {
+                        obj.insert("secret_key".to_string(), serde_json::Value::String("******".to_string()));
+                    }
+                    if obj.contains_key("access_key") {
+                        obj.insert("access_key".to_string(), serde_json::Value::String("******".to_string()));
+                    }
+                }
+                backends.insert(be_id, config);
+            }
+        }
+
+        let config_obj = serde_json::json!({
+            "client_version": env!("CARGO_PKG_VERSION"),
+            "format": format_fields,
+            "backends": backends,
+            "uid": self.uid,
+            "gid": self.gid,
+            "block_size": self.router.block_size.load(Ordering::Relaxed),
+        });
+
+        serde_json::to_string_pretty(&config_obj).unwrap_or_default()
+    }
+
+    fn get_config_attr(&self, size: u64) -> FileAttr {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        let sec = now.as_secs() as i64;
+        let nsec = now.subsec_nanos();
+        
+        FileAttr {
+            ino: CONFIG_INODE,
+            size,
+            blocks: (size + 511) / 512,
+            atime: Timestamp::new(sec, nsec),
+            mtime: Timestamp::new(sec, nsec),
+            ctime: Timestamp::new(sec, nsec),
+            kind: FileType::RegularFile,
+            perm: 0o444, // read-only by all
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
         }
     }
 
@@ -709,6 +777,16 @@ impl Filesystem for SqueezefsFilesystem {
         let name_str = name.to_string_lossy();
         debug!("FUSE Lookup: parent = {}, name = {}", parent, name_str);
 
+        if parent == 1 && name_str == ".config.sqz" {
+            let config_data = self.generate_config_json().await;
+            let attr = self.get_config_attr(config_data.len() as u64);
+            return Ok(ReplyEntry {
+                ttl: Duration::from_secs(1),
+                attr,
+                generation: 1,
+            });
+        }
+
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let dir_key = format!("squeezefs:dir:{}", parent);
         let child_ino_opt: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
@@ -739,6 +817,15 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyAttr> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE GetAttr: ino = {}", ino);
+
+        if ino == CONFIG_INODE {
+            let config_data = self.generate_config_json().await;
+            let attr = self.get_config_attr(config_data.len() as u64);
+            return Ok(ReplyAttr {
+                ttl: Duration::from_secs(1),
+                attr,
+            });
+        }
 
         let attr = self
             .get_attr_internal(ino)
@@ -977,6 +1064,21 @@ impl Filesystem for SqueezefsFilesystem {
             ino, fh, offset, size
         );
 
+        if ino == CONFIG_INODE {
+            let config_data = self.generate_config_json().await;
+            let bytes = config_data.into_bytes();
+            if offset >= bytes.len() as u64 {
+                return Ok(ReplyData {
+                    data: Vec::new().into(),
+                });
+            }
+            let start = offset as usize;
+            let end = std::cmp::min(bytes.len(), start + size as usize);
+            return Ok(ReplyData {
+                data: bytes[start..end].to_vec().into(),
+            });
+        }
+
         let file_path = format!("inode_{}", ino);
         let block_size = self.router.block_size.load(Ordering::Relaxed);
 
@@ -1068,6 +1170,10 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyWrite> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_write");
+
+        if ino == CONFIG_INODE {
+            return Err(Errno::from(libc::EACCES));
+        }
 
         // Acquire local inode lock for the ENTIRE write operation to serialize
         // concurrent/subsequent writes to the same file.
@@ -1296,6 +1402,11 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyAttr> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+
+        if ino == CONFIG_INODE {
+            return Err(Errno::from(libc::EACCES));
+        }
+
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let attr_key = format!("squeezefs:attr:{}", ino);
 
@@ -1576,6 +1687,10 @@ impl Filesystem for SqueezefsFilesystem {
         let name_str = name.to_string_lossy();
         debug!("FUSE unlink: parent = {}, name = {}", parent, name_str);
 
+        if parent == 1 && name_str == ".config.sqz" {
+            return Err(Errno::from(libc::EPERM));
+        }
+
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let dir_key = format!("squeezefs:dir:{}", parent);
@@ -1671,6 +1786,10 @@ impl Filesystem for SqueezefsFilesystem {
             "FUSE rename: parent = {}, name = {}, new_parent = {}, new_name = {}",
             parent, name_str, new_parent, new_name_str
         );
+
+        if (parent == 1 && name_str == ".config.sqz") || (new_parent == 1 && new_name_str == ".config.sqz") {
+            return Err(Errno::from(libc::EPERM));
+        }
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
@@ -1864,6 +1983,16 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        if parent == 1 && !entries_map.contains_key(".config.sqz") {
+            let offset = (entries.len() + 1) as i64;
+            entries.push(DirectoryEntry {
+                name: ".config.sqz".into(),
+                kind: FileType::RegularFile,
+                inode: CONFIG_INODE,
+                offset,
+            });
+        }
+
         let mut child_inos = Vec::new();
         for (name, child_ino) in &entries_map {
             if name == "." || name == ".." {
@@ -1990,6 +2119,22 @@ impl Filesystem for SqueezefsFilesystem {
                 entry_ttl: Duration::from_secs(1),
                 attr_ttl: Duration::from_secs(1),
                 offset: 2,
+            });
+        }
+
+        if parent == 1 && !entries_map.contains_key(".config.sqz") {
+            let config_data = self.generate_config_json().await;
+            let attr = self.get_config_attr(config_data.len() as u64);
+            let offset = (entries.len() + 1) as i64;
+            entries.push(DirectoryEntryPlus {
+                name: ".config.sqz".into(),
+                kind: FileType::RegularFile,
+                inode: CONFIG_INODE,
+                generation: 1,
+                attr,
+                entry_ttl: Duration::from_secs(1),
+                attr_ttl: Duration::from_secs(1),
+                offset,
             });
         }
 
@@ -3077,14 +3222,15 @@ pub async fn start_mount<P: AsRef<Path>>(
             }
         }
         _ = shutdown => {
-            if let Err(e) = handle.unmount().await {
-                error!("Failed to unmount filesystem: {:?}", e);
-                eprintln!("Failed to unmount filesystem: {:?}", e);
-            } else {
-                info!("The squeezefs mount process exit successfully, mountpoint: {:?}", mount_path.to_string_lossy());
-                println!("The squeezefs mount process exit successfully, mountpoint: {:?}", mount_path.to_string_lossy());
-            }
+            info!("Received shutdown signal, unmounting filesystem...");
         }
+    }
+
+    // Clean up the mount by unmounting the session if it hasn't been done already.
+    if let Err(e) = handle.unmount().await {
+        debug!("Unmount on exit status (may already be unmounted): {:?}", e);
+    } else {
+        info!("Cleanly unmounted filesystem on exit.");
     }
 
     Ok(())

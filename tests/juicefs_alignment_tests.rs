@@ -805,15 +805,11 @@ async fn test_config_sqz_virtual_file() {
     };
     fs.init(req).await.unwrap();
 
-    // 1. Lookup ".config.sqz" and ".config" under parent 1 (root)
-    let lookup_reply = fs.lookup(req, 1, OsStr::new(".config.sqz")).await.unwrap();
+    // 1. Lookup ".config" under parent 1 (root)
+    let lookup_reply = fs.lookup(req, 1, OsStr::new(".config")).await.unwrap();
     let config_ino = lookup_reply.attr.ino;
-    assert_eq!(config_ino, 0x7fff_ffff_0000_0004); // CONFIG_INODE
+    assert_eq!(config_ino, 0xffff_ffff_ffff_fffe); // CONFIG_INODE
     assert_eq!(lookup_reply.attr.perm, 0o444); // Read-only
-
-    let lookup_reply_compat = fs.lookup(req, 1, OsStr::new(".config")).await.unwrap();
-    assert_eq!(lookup_reply_compat.attr.ino, config_ino);
-    assert_eq!(lookup_reply_compat.attr.perm, 0o444);
 
     // 2. GetAttr CONFIG_INODE
     let attr_reply = fs.getattr(req, config_ino, None, 0).await.unwrap();
@@ -851,29 +847,13 @@ async fn test_config_sqz_virtual_file() {
     assert!(setattr_res.is_err());
     assert_eq!(setattr_res.err().unwrap(), fuse3::Errno::from(libc::EACCES));
 
-    // 6. Try to unlink -> EPERM
-    let unlink_res = fs.unlink(req, 1, OsStr::new(".config.sqz")).await;
+    // 6. Try to unlink ".config" -> EPERM
+    let unlink_res = fs.unlink(req, 1, OsStr::new(".config")).await;
     assert!(unlink_res.is_err());
     assert_eq!(unlink_res.err().unwrap(), fuse3::Errno::from(libc::EPERM));
 
-    let unlink_res_compat = fs.unlink(req, 1, OsStr::new(".config")).await;
-    assert!(unlink_res_compat.is_err());
-    assert_eq!(unlink_res_compat.err().unwrap(), fuse3::Errno::from(libc::EPERM));
-
-    // 7. Try to rename -> EPERM
+    // 7. Try to rename ".config" -> EPERM
     let rename_res = fs
-        .rename(
-            req,
-            1,
-            OsStr::new(".config.sqz"),
-            1,
-            OsStr::new("new.config.sqz"),
-        )
-        .await;
-    assert!(rename_res.is_err());
-    assert_eq!(rename_res.err().unwrap(), fuse3::Errno::from(libc::EPERM));
-
-    let rename_res_compat = fs
         .rename(
             req,
             1,
@@ -882,47 +862,31 @@ async fn test_config_sqz_virtual_file() {
             OsStr::new("new.config"),
         )
         .await;
-    assert!(rename_res_compat.is_err());
-    assert_eq!(rename_res_compat.err().unwrap(), fuse3::Errno::from(libc::EPERM));
+    assert!(rename_res.is_err());
+    assert_eq!(rename_res.err().unwrap(), fuse3::Errno::from(libc::EPERM));
 
-    // 8. Verify readdir contains both entries
+    // 8. Verify readdir contains ".config"
     let readdir_reply = fs.readdir(req, 1, 0, 0).await.unwrap();
     use futures::StreamExt;
     let entries: Vec<_> = readdir_reply.entries.collect().await;
     let config_entry = entries
         .iter()
         .map(|r| r.as_ref().unwrap())
-        .find(|e| e.name == ".config.sqz")
-        .expect("Readdir must contain .config.sqz entry");
-    assert_eq!(config_entry.inode, config_ino);
-
-    let config_entry_compat = entries
-        .iter()
-        .map(|r| r.as_ref().unwrap())
         .find(|e| e.name == ".config")
         .expect("Readdir must contain .config entry");
-    assert_eq!(config_entry_compat.inode, config_ino);
+    assert_eq!(config_entry.inode, config_ino);
 
-    // 9. Verify readdirplus contains both entries
+    // 9. Verify readdirplus contains ".config"
     let readdirplus_reply = fs.readdirplus(req, 1, 0, 0, 0).await.unwrap();
     let entries_plus: Vec<_> = readdirplus_reply.entries.collect().await;
     let config_entry_plus = entries_plus
         .iter()
         .map(|r| r.as_ref().unwrap())
-        .find(|e| e.name == ".config.sqz")
-        .expect("Readdirplus must contain .config.sqz entry");
+        .find(|e| e.name == ".config")
+        .expect("Readdirplus must contain .config entry");
     assert_eq!(config_entry_plus.inode, config_ino);
     assert_eq!(config_entry_plus.attr.ino, config_ino);
     assert_eq!(config_entry_plus.attr.perm, 0o444);
-
-    let config_entry_plus_compat = entries_plus
-        .iter()
-        .map(|r| r.as_ref().unwrap())
-        .find(|e| e.name == ".config")
-        .expect("Readdirplus must contain .config entry");
-    assert_eq!(config_entry_plus_compat.inode, config_ino);
-    assert_eq!(config_entry_plus_compat.attr.ino, config_ino);
-    assert_eq!(config_entry_plus_compat.attr.perm, 0o444);
 }
 
 #[tokio::test]

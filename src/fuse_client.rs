@@ -850,7 +850,50 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn destroy(&self, _req: Request) {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        info!("FUSE Daemon: Destroying mount.");
+        info!("FUSE Daemon: Destroying mount. Checking for pending staged writes...");
+
+        let staging_dirs = self.router.cache.nvme.staging_dirs();
+        let mut active_writes_count = 0;
+
+        // Gracefully wait up to 10 seconds for the background merge worker to drain staged writes to S3
+        let start_wait = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(10);
+        let staged_count = loop {
+            let mut current_staged = 0;
+            for dir in staging_dirs {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
+                            current_staged += 1;
+                        }
+                    }
+                }
+            }
+            if current_staged == 0 || start_wait.elapsed() >= max_wait {
+                break current_staged;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+
+        // Count any remaining active write transaction directories
+        for dir in staging_dirs {
+            let active_dir = dir.join("active_writes");
+            if active_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                    active_writes_count += entries.filter_map(|e| e.ok()).count();
+                }
+            }
+        }
+
+        if staged_count > 0 || active_writes_count > 0 {
+            warn!(
+                "WARNING: SqueezeFS dismounted with unflushed data! Remaining local staged files: {}, active write directories: {}. Other nodes may see inconsistent filesystem state until these are recovered or flushed.",
+                staged_count, active_writes_count
+            );
+        } else {
+            info!("FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.");
+        }
     }
 
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {

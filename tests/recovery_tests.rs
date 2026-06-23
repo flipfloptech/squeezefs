@@ -163,3 +163,48 @@ async fn test_stale_write_recovery_discard() {
     let block: Option<String> = con.hget(&mapping_key, "block").await.unwrap();
     assert!(block.is_none());
 }
+
+#[tokio::test]
+async fn test_recovery_cleans_active_writes() {
+    let redis_url = get_redis_url();
+    let redis_client = match redis::Client::open(redis_url.clone()) {
+        Ok(c) => {
+            if c.get_multiplexed_tokio_connection().await.is_err() {
+                println!("Skipping test: Redis/Garnet not available");
+                return;
+            }
+            c
+        }
+        Err(_) => {
+            println!("Skipping test: Redis/Garnet not available");
+            return;
+        }
+    };
+
+    let temp_dir = tempdir().unwrap();
+    let mock_backend = RustFsClient::new_mock();
+    let meta_client = squeezefs::dlm::MetaClient::Single(redis_client);
+
+    // Create a mock active_writes directory and some dummy block files
+    let active_writes_dir = temp_dir.path().join("active_writes");
+    let inode_dir = active_writes_dir.join("inode_10");
+    fs::create_dir_all(&inode_dir).unwrap();
+    fs::write(inode_dir.join("block_0"), b"partial block data").unwrap();
+    fs::write(inode_dir.join("block_1"), b"partial block data 2").unwrap();
+
+    // Verify they exist before recovery
+    assert!(inode_dir.join("block_0").exists());
+
+    // Run recovery
+    let recovered = recover_staging(temp_dir.path(), &mock_backend, &meta_client)
+        .await
+        .expect("Recovery should complete");
+
+    assert_eq!(recovered, 0);
+
+    // Verify active_writes has been completely cleaned up
+    assert!(
+        !active_writes_dir.exists(),
+        "active_writes directory should be deleted on boot recovery"
+    );
+}

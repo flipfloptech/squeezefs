@@ -45,6 +45,9 @@ enum Commands {
         /// Maximum capacity of the volume (e.g. "1P", "100G", default: 1PB)
         #[arg(long, default_value = "1P")]
         capacity: String,
+        /// Hard quota limiting the number of inodes (default: 0, unlimited)
+        #[arg(long, default_value = "0")]
+        inodes: u64,
         /// Memory cache limit (default: "1GB")
         #[arg(long)]
         mem_cache_size: Option<String>,
@@ -425,6 +428,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             s3_secret_key,
             s3_bucket,
             force,
+            inodes,
         } => {
             let redis_url = &cli.garnet_url;
 
@@ -470,6 +474,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &name,
                 parsed_block_size,
                 parsed_capacity,
+                inodes,
                 mem_cache_size.as_deref(),
                 disk_cache_size.as_deref(),
                 disk_cache_paths.as_deref(),

@@ -19,6 +19,7 @@ async fn setup_test_volume(name: &str) -> Option<DlmClient> {
         name,
         4096,
         1024 * 1024,
+        0, // inodes limit
         Some("1MB"),
         Some("10MB"),
         Some(&[PathBuf::from("/tmp/squeezefs_staging")]),

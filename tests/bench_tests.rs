@@ -38,10 +38,8 @@ fn test_cli_bench_local() {
 
 #[test]
 fn test_elbencho_if_installed() {
-    let elbencho_check = Command::new("which")
-        .arg("elbencho")
-        .output();
-    
+    let elbencho_check = Command::new("which").arg("elbencho").output();
+
     let elbencho_path = if let Ok(out) = elbencho_check {
         if out.status.success() {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -65,5 +63,9 @@ fn test_elbencho_if_installed() {
         .output()
         .expect("Failed to execute elbencho");
 
-    assert!(output.status.success(), "elbencho write failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "elbencho write failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

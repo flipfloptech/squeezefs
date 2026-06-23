@@ -41,7 +41,7 @@ static RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
 });
 
 static SINGLE_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection>> =
-    Lazy::new(|| dashmap::DashMap::new());
+    Lazy::new(dashmap::DashMap::new);
 
 #[derive(Clone)]
 pub enum MetaClient {

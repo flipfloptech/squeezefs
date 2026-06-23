@@ -39,6 +39,8 @@ async fn test_fuse_create_returns_zero_flags() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -87,6 +89,8 @@ async fn test_fuse_open_and_opendir_success() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -143,6 +147,8 @@ async fn test_fuse_setattr_truncation_clears_data() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -213,6 +219,8 @@ async fn test_fuse_fallocate_fsyncdir_forget() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -261,6 +269,8 @@ async fn test_fuse_xattr() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -333,6 +343,8 @@ async fn test_vim_swap_lifecycle() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),

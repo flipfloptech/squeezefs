@@ -35,6 +35,8 @@ async fn test_metadata_cache_effectiveness() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -49,7 +51,8 @@ async fn test_metadata_cache_effectiveness() {
     router.write_file(file_path, 0, &data, 401).await.unwrap();
 
     // Clear System RAM data cache to force reading
-    router.cache().lru.remove(file_path);
+    router.cache().write_lru.remove(file_path);
+    router.cache().read_lru.remove(file_path);
 
     // 1. First read range (should fetch and cache metadata/mappings from Garnet)
     let read1 = router.read_file_range(file_path, 0, 1000).await.unwrap();
@@ -81,6 +84,8 @@ async fn test_attr_cache_effectiveness() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -141,7 +146,16 @@ async fn test_get_cached_read_block_range() {
     let backend = RustFsClient::new_mock();
     let redis_client = squeezefs::dlm::MetaClient::new("redis://127.0.0.1:6379").unwrap();
 
-    let cache = TieredCache::new(vec![dir_path], None, None, backend, redis_client).unwrap();
+    let cache = TieredCache::new(
+        vec![dir_path],
+        None,
+        None,
+        None,
+        None,
+        backend,
+        redis_client,
+    )
+    .unwrap();
 
     // Call get_cached_read_block_range
     let offset = 500000u64;

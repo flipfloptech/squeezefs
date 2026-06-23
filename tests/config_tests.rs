@@ -19,13 +19,21 @@ async fn setup_test_volume(name: &str) -> Option<DlmClient> {
         name,
         4096,
         1024 * 1024,
-        0,      // inodes limit
-        "none", // compression
-        "none", // encrypt_algo
-        None,   // encrypt_key
+        0,
+        // inodes limit
+        "none",
+        // compression
+        "none",
+        // encrypt_algo
+        None,
+        // encrypt_key
         Some("1MB"),
         Some("10MB"),
         Some(&[PathBuf::from("/tmp/squeezefs_staging")]),
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         None,

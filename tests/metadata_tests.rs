@@ -37,6 +37,8 @@ async fn setup_fs() -> Option<(SqueezefsFilesystem, tempfile::TempDir)> {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )

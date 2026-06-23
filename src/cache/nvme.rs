@@ -60,12 +60,14 @@ fn read_aligned_direct(path: &PathBuf, actual_size: usize) -> std::io::Result<Ve
 #[derive(Clone)]
 pub struct NvmeStaging {
     staging_dirs: Vec<PathBuf>,
-    max_bytes: u64,
+    max_write_bytes: u64,
+    max_read_bytes: u64,
     backend: RustFsClient,
     redis_client: crate::dlm::MetaClient,
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
-    current_staged_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    current_read_cache_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -87,7 +89,8 @@ fn get_dir_index(file_id: &str, num_dirs: usize) -> usize {
 impl NvmeStaging {
     pub fn new(
         staging_dirs: Vec<PathBuf>,
-        max_bytes: u64,
+        max_write_bytes: u64,
+        max_read_bytes: u64,
         backend: RustFsClient,
         redis_client: crate::dlm::MetaClient,
     ) -> Result<Self> {
@@ -106,13 +109,21 @@ impl NvmeStaging {
 
         let (write_tx, write_rx) = mpsc::channel::<PendingStagedWrite>(1000);
 
-        let mut initial_staged_bytes = 0u64;
+        let mut initial_write_bytes = 0u64;
+        let mut initial_read_bytes = 0u64;
         for dir in &staging_dirs {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     if let Ok(meta) = entry.metadata() {
                         if meta.is_file() {
-                            initial_staged_bytes += meta.len();
+                            let path = entry.path();
+                            if let Some(ext) = path.extension() {
+                                if ext == "staged" {
+                                    initial_write_bytes += meta.len();
+                                } else if ext == "block" {
+                                    initial_read_bytes += meta.len();
+                                }
+                            }
                         }
                     }
                 }
@@ -121,13 +132,17 @@ impl NvmeStaging {
 
         let staging = Self {
             staging_dirs: staging_dirs.clone(),
-            max_bytes,
+            max_write_bytes,
+            max_read_bytes,
             backend: backend.clone(),
             redis_client: redis_client.clone(),
             write_tx,
             p2p_addr: std::sync::Arc::new(std::sync::OnceLock::new()),
-            current_staged_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                initial_staged_bytes,
+            current_staged_write_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                initial_write_bytes,
+            )),
+            current_read_cache_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                initial_read_bytes,
             )),
         };
 
@@ -164,15 +179,15 @@ impl NvmeStaging {
 
         // Enforce max bytes capacity constraint asynchronously using the exact padded file size
         let total_staged_bytes = self
-            .current_staged_bytes
+            .current_staged_write_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        if total_staged_bytes + padded_size > self.max_bytes {
+        if total_staged_bytes + padded_size > self.max_write_bytes {
             return Err(SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 format!(
                     "Local NVMe staging cache capacity exceeded: current {} bytes, writing {} bytes, max capacity {} bytes",
-                    total_staged_bytes, padded_size, self.max_bytes
+                    total_staged_bytes, padded_size, self.max_write_bytes
                 )
             )));
         }
@@ -197,7 +212,7 @@ impl NvmeStaging {
         .await
         .unwrap()?;
 
-        self.current_staged_bytes
+        self.current_staged_write_bytes
             .fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
 
         info!(
@@ -261,7 +276,7 @@ impl NvmeStaging {
         let staging_dirs = self.staging_dirs.clone();
         let backend = self.backend.clone();
         let redis_client = self.redis_client.clone();
-        let staged_bytes = self.current_staged_bytes.clone();
+        let staged_bytes = self.current_staged_write_bytes.clone();
 
         tokio::spawn(async move {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
@@ -470,10 +485,10 @@ impl NvmeStaging {
     fn cache_read_block_sync(&self, block_key: &str, data: &[u8]) -> Result<()> {
         let new_data_len = data.len() as u64;
         let current = self
-            .current_staged_bytes
+            .current_read_cache_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        if current + new_data_len > self.max_bytes {
+        if current + new_data_len > self.max_read_bytes {
             // Only perform directory walks for eviction if capacity is exceeded
             let mut total_bytes = 0u64;
             let mut block_files = Vec::new();
@@ -485,15 +500,13 @@ impl NvmeStaging {
                             if meta.is_file() {
                                 let path = entry.path();
                                 if let Some(ext) = path.extension() {
-                                    if ext == "data" || ext == "block" {
+                                    if ext == "block" {
                                         total_bytes += meta.len();
-                                        if ext == "block" {
-                                            let time = meta
-                                                .accessed()
-                                                .or_else(|_| meta.modified())
-                                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                                            block_files.push((path, meta.len(), time));
-                                        }
+                                        let time = meta
+                                            .accessed()
+                                            .or_else(|_| meta.modified())
+                                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                        block_files.push((path, meta.len(), time));
                                     }
                                 }
                             }
@@ -502,12 +515,13 @@ impl NvmeStaging {
                 }
             }
 
-            if total_bytes + new_data_len > self.max_bytes {
+            if total_bytes + new_data_len > self.max_read_bytes {
                 // Sort block files by accessed time (oldest first)
                 block_files.sort_by_key(|&(_, _, time)| time);
 
                 let mut freed_bytes = 0u64;
-                let target_to_free = (total_bytes + new_data_len).saturating_sub(self.max_bytes);
+                let target_to_free =
+                    (total_bytes + new_data_len).saturating_sub(self.max_read_bytes);
 
                 for (path, len, _) in block_files {
                     if freed_bytes >= target_to_free {
@@ -519,21 +533,21 @@ impl NvmeStaging {
                     }
                 }
 
-                if total_bytes - freed_bytes + new_data_len > self.max_bytes {
+                if total_bytes - freed_bytes + new_data_len > self.max_read_bytes {
                     warn!(
                         "NVMe Staging: Cannot cache block {} - local storage full of staging writes.",
                         block_key
                     );
-                    // Synchronize current_staged_bytes with actual remaining usage
-                    self.current_staged_bytes.store(
+                    // Synchronize current_read_cache_bytes with actual remaining usage
+                    self.current_read_cache_bytes.store(
                         total_bytes - freed_bytes,
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     return Ok(()); // Fail silently as caching is opportunistic
                 }
 
-                // Synchronize current_staged_bytes with actual remaining usage
-                self.current_staged_bytes.store(
+                // Synchronize current_read_cache_bytes with actual remaining usage
+                self.current_read_cache_bytes.store(
                     total_bytes - freed_bytes,
                     std::sync::atomic::Ordering::Relaxed,
                 );
@@ -546,7 +560,7 @@ impl NvmeStaging {
         let block_path = target_dir.join(format!("{}.block", safe_name));
 
         fs::write(&block_path, data)?;
-        self.current_staged_bytes
+        self.current_read_cache_bytes
             .fetch_add(new_data_len, std::sync::atomic::Ordering::Relaxed);
         debug!(
             "NVMe Staging: Cached block {} -> {:?}",
@@ -571,6 +585,20 @@ impl NvmeStaging {
         }
 
         Ok(())
+    }
+
+    pub fn current_staged_write_bytes(&self) -> u64 {
+        self.current_staged_write_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn current_read_cache_bytes(&self) -> u64 {
+        self.current_read_cache_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn read_cached_block(&self, block_key: &str) -> Option<Vec<u8>> {
+        self.get_cached_read_block(block_key)
     }
 
     /// Retrieve a cached block file if it exists locally.

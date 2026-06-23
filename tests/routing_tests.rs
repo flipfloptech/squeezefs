@@ -14,19 +14,44 @@ async fn setup_router() -> Option<(DataRouter, tempfile::TempDir)> {
     let redis_url = get_redis_url();
     let dlm = DlmClient::new(&redis_url).ok()?;
 
-    // Check if redis connection works
-    let con_res = redis::Client::open(redis_url.clone())
-        .ok()?
-        .get_multiplexed_tokio_connection()
-        .await;
-    if con_res.is_err() {
-        return None;
-    }
+    // Check if redis connection works and flush DB
+    let client = redis::Client::open(redis_url.clone()).ok()?;
+    let mut con = client.get_multiplexed_tokio_connection().await.ok()?;
+    let _: () = redis::cmd("FLUSHALL")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
+
+    // Format the volume to initialize metadata
+    let _ = squeezefs::fuse_client::format_volume(
+        &redis_url,
+        "routing_test_vol",
+        4 * 1024 * 1024,
+        100 * 1024 * 1024 * 1024,
+        0,
+        "none",
+        "none",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
 
     let backend = RustFsClient::new().await;
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -183,4 +208,92 @@ async fn test_route_large_file_striped() {
             .expect("Block must exist in storage");
         assert!(!block_data.is_empty());
     }
+}
+
+#[tokio::test]
+async fn test_write_fallback_on_cache_full() {
+    let redis_url = get_redis_url();
+    let dlm = match DlmClient::new(&redis_url) {
+        Ok(d) => d,
+        Err(_) => {
+            println!("Skipping test: Redis/Garnet not available");
+            return;
+        }
+    };
+    // Flush db to get a clean slate
+    let client = redis::Client::open(redis_url.clone()).unwrap();
+    let mut con = client.get_multiplexed_tokio_connection().await.unwrap();
+    let _: () = redis::cmd("FLUSHALL")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
+
+    // Format volume to initialize metadata settings
+    let _ = squeezefs::fuse_client::format_volume(
+        &redis_url,
+        "fallback_test_vol",
+        4 * 1024 * 1024,
+        100 * 1024 * 1024 * 1024,
+        0,
+        "none",
+        "none",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("10KB"),
+        Some("10KB"),
+        None,
+        None,
+    )
+    .await;
+
+    let backend = RustFsClient::new_mock();
+    let temp_dir = tempdir().unwrap();
+
+    // 10KB write staging limit, 10KB read cache limit
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        Some("10KB"),
+        Some("10KB"),
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm, backend, cache);
+
+    // 1. Write of 128KB (exceeds 10KB write capacity, triggers direct S3 upload fallback)
+    let file1 = "file1.bin";
+    let data1 = vec![1u8; 128 * 1024];
+    router
+        .write_file(file1, 0, &data1, 100)
+        .await
+        .expect("Write should succeed via direct fallback");
+
+    // 2. Read back and verify size of file1
+    let size1 = router.get_file_size(file1).await.expect("Should read size");
+    assert_eq!(size1, 128 * 1024);
+
+    let read_data1 = router.read_file(file1).await.expect("Should read file1");
+    assert_eq!(read_data1, data1);
+
+    // 3. Verify in Garnet that file1 has a direct-block mapping
+    let client = redis::Client::open(redis_url).unwrap();
+    let mut con = client.get_multiplexed_tokio_connection().await.unwrap();
+    let meta_key = format!("metadata:{}", file1);
+    let file_id: String = con.hget(&meta_key, "file_id").await.unwrap();
+    let mapping_key = format!("mapping:{}", file_id);
+    let block: String = con.hget(&mapping_key, "block").await.unwrap();
+    assert!(
+        block.contains("blocks/direct/"),
+        "Block path '{}' should contain 'blocks/direct/'",
+        block
+    );
 }

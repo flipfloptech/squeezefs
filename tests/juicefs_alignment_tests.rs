@@ -40,15 +40,25 @@ async fn test_cli_format_and_status() {
     format_volume(
         &redis_url,
         "testvolume",
-        8 * 1024 * 1024,                 // 8MB block size
-        500 * 1024 * 1024 * 1024 * 1024, // 500TB capacity
-        0,                               // inodes limit
-        "none",                          // compression
-        "none",                          // encrypt_algo
-        None,                            // encrypt_key
+        8 * 1024 * 1024,
+        // 8MB block size
+        500 * 1024 * 1024 * 1024 * 1024,
+        // 500TB capacity
+        0,
+        // inodes limit
+        "none",
+        // compression
+        "none",
+        // encrypt_algo
+        None,
+        // encrypt_key
         Some("64GB"),
         Some("100GB"),
         Some(&[std::path::PathBuf::from("/tmp/test_staging_format")]),
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -86,6 +96,8 @@ async fn test_mount_auto_format_and_abi_check() {
     // Auto-Format on Mount Check: verify that if we don't format, it automatically formats on initialization
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -126,6 +138,8 @@ async fn test_mount_auto_format_and_abi_check() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend2.clone(),
         dlm2.meta_client().clone(),
     )
@@ -159,6 +173,8 @@ async fn test_space_accounting_and_statfs() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -248,6 +264,8 @@ async fn test_stale_mount_warning_only() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -287,6 +305,8 @@ async fn test_three_tiered_writeback_and_lease_cache() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -394,6 +414,8 @@ async fn test_parallel_reads() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -442,10 +464,14 @@ async fn test_multi_backend_routing() {
         "multibackend",
         4 * 1024 * 1024,
         100 * 1024 * 1024,
-        0,      // inodes limit
-        "none", // compression
-        "none", // encrypt_algo
-        None,   // encrypt_key
+        0,
+        // inodes limit
+        "none",
+        // compression
+        "none",
+        // encrypt_algo
+        None,
+        // encrypt_key
         None,
         None,
         None,
@@ -453,6 +479,10 @@ async fn test_multi_backend_routing() {
         Some("minioadmin"),
         Some("minioadmin"),
         Some("test-bucket"),
+        None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("Format volume should succeed");
@@ -478,6 +508,8 @@ async fn test_multi_backend_routing() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend_0.clone(),
@@ -591,6 +623,8 @@ async fn test_mount_uid_gid_override() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -639,6 +673,8 @@ async fn test_fuse_create_write_read_cycle() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -676,7 +712,8 @@ async fn test_fuse_create_write_read_cycle() {
     fs.flush(req, ino, 0, 0).await.unwrap();
 
     // 4. Read back via FUSE without relying on LRU cache
-    fs.router.cache.lru.remove(&format!("inode_{}", ino));
+    fs.router.cache.write_lru.remove(&format!("inode_{}", ino));
+    fs.router.cache.read_lru.remove(&format!("inode_{}", ino));
     fs.router.metadata_cache.remove(&format!("inode_{}", ino));
 
     let read_result = fs
@@ -702,6 +739,8 @@ async fn test_vim_swap_file_simulation() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -767,10 +806,14 @@ async fn test_config_sqz_virtual_file() {
         "testvolume_config",
         1024 * 1024,
         1000 * 1024 * 1024,
-        0,      // inodes limit
-        "none", // compression
-        "none", // encrypt_algo
-        None,   // encrypt_key
+        0,
+        // inodes limit
+        "none",
+        // compression
+        "none",
+        // encrypt_algo
+        None,
+        // encrypt_key
         Some("64MB"),
         Some("100MB"),
         None,
@@ -778,6 +821,10 @@ async fn test_config_sqz_virtual_file() {
         Some("my-access-key"),
         Some("my-secret-key"),
         Some("my-bucket"),
+        None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("Format volume should succeed");
@@ -787,6 +834,8 @@ async fn test_config_sqz_virtual_file() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -854,13 +903,7 @@ async fn test_config_sqz_virtual_file() {
 
     // 7. Try to rename ".config" -> EPERM
     let rename_res = fs
-        .rename(
-            req,
-            1,
-            OsStr::new(".config"),
-            1,
-            OsStr::new("new.config"),
-        )
+        .rename(req, 1, OsStr::new(".config"), 1, OsStr::new("new.config"))
         .await;
     assert!(rename_res.is_err());
     assert_eq!(rename_res.err().unwrap(), fuse3::Errno::from(libc::EPERM));
@@ -906,12 +949,16 @@ async fn test_inode_quota_enforcement() {
         "quota_vol",
         1024 * 1024,
         1000 * 1024 * 1024,
-        3,      // inodes limit: 3. Root is 1, so we can create 2 more.
-        "none", // compression
-        "none", // encrypt_algo
-        None,   // encrypt_key
+        3,
+        "none",
+        "none",
+        None,
         Some("64MB"),
         Some("100MB"),
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -926,6 +973,8 @@ async fn test_inode_quota_enforcement() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -1007,13 +1056,22 @@ async fn test_capacity_quota_enforcement() {
         &redis_url,
         "capacity_vol",
         1024 * 1024,
-        100,    // capacity limit: 100 bytes
-        0,      // inodes limit: unlimited
-        "none", // compression
-        "none", // encrypt_algo
-        None,   // encrypt_key
+        100,
+        // capacity limit: 100 bytes
+        0,
+        // inodes limit: unlimited
+        "none",
+        // compression
+        "none",
+        // encrypt_algo
+        None,
+        // encrypt_key
         Some("64MB"),
         Some("100MB"),
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -1028,6 +1086,8 @@ async fn test_capacity_quota_enforcement() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),
@@ -1120,12 +1180,20 @@ async fn test_compression_and_encryption_flow() {
         "crypto_vol",
         1024 * 1024,
         1000 * 1024 * 1024,
-        0,               // inodes limit
-        "lz4",           // compression
-        "aes256gcm-rsa", // encrypt_algo
-        Some(&pem),      // encrypt_key (PEM string)
+        0,
+        // inodes limit
+        "lz4",
+        // compression
+        "aes256gcm-rsa",
+        // encrypt_algo
+        Some(&pem),
+        // encrypt_key (PEM string)
         Some("64MB"),
         Some("100MB"),
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -1140,6 +1208,8 @@ async fn test_compression_and_encryption_flow() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),

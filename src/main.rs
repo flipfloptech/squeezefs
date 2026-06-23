@@ -54,6 +54,18 @@ enum Commands {
         /// Disk cache limit (default: "10GB")
         #[arg(long, alias = "cache-size")]
         disk_cache_size: Option<String>,
+        /// Disk read cache size limit (default: 50% of disk_cache_size)
+        #[arg(long)]
+        read_cache_size: Option<String>,
+        /// Disk write staging size limit (default: 50% of disk_cache_size)
+        #[arg(long)]
+        write_cache_size: Option<String>,
+        /// Memory read cache size limit (default: 50% of mem_cache_size)
+        #[arg(long)]
+        read_mem_cache_size: Option<String>,
+        /// Memory write cache size limit (default: 50% of mem_cache_size)
+        #[arg(long)]
+        write_mem_cache_size: Option<String>,
         /// Comma-separated paths to local staging/cache directories
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
@@ -96,6 +108,22 @@ enum Commands {
         /// Disk cache limit (e.g., "200GB" or "80%")
         #[arg(long, alias = "cache-size")]
         disk_cache_size: Option<String>,
+
+        /// Disk read cache size limit
+        #[arg(long)]
+        read_cache_size: Option<String>,
+
+        /// Disk write staging size limit
+        #[arg(long)]
+        write_cache_size: Option<String>,
+
+        /// Memory read cache size limit
+        #[arg(long)]
+        read_mem_cache_size: Option<String>,
+
+        /// Memory write cache size limit
+        #[arg(long)]
+        write_mem_cache_size: Option<String>,
 
         /// Comma-separated paths to local staging/cache directories
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
@@ -274,6 +302,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writeback,
         allow_other,
         options,
+        read_cache_size,
+        write_cache_size,
+        read_mem_cache_size,
+        write_mem_cache_size,
         ..
     } = &cli.command
     {
@@ -283,6 +315,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             *daemon,
             mem_cache_size.as_deref(),
             disk_cache_size.as_deref(),
+            read_cache_size.as_deref(),
+            write_cache_size.as_deref(),
+            read_mem_cache_size.as_deref(),
+            write_mem_cache_size.as_deref(),
             disk_cache_paths.as_deref(),
             s3_endpoint.as_deref(),
             s3_access_key.as_deref(),
@@ -299,89 +335,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if *daemon {
             let mountpoint_path = mountpoint.clone();
             unsafe {
-            let pid = libc::fork();
-            if pid < 0 {
-                eprintln!("Failed to fork daemon process");
-                std::process::exit(1);
-            } else if pid > 0 {
-                // Parent process waits for mount point to become ready
-                print!("Mounting Squeezefs at {:?}...", mountpoint_path);
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
+                let pid = libc::fork();
+                if pid < 0 {
+                    eprintln!("Failed to fork daemon process");
+                    std::process::exit(1);
+                } else if pid > 0 {
+                    // Parent process waits for mount point to become ready
+                    print!("Mounting Squeezefs at {:?}...", mountpoint_path);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
 
-                let mut ready = false;
-                let start = std::time::Instant::now();
-                while start.elapsed() < std::time::Duration::from_secs(10) {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let mut ready = false;
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_secs(10) {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
 
-                    // Check if child is still running
-                    let mut status = 0;
-                    let wait_res = libc::waitpid(pid, &mut status, libc::WNOHANG);
-                    if wait_res == pid {
-                        // Child exited!
-                        println!();
-                        eprintln!("Failed to start squeezefs daemon. Child process exited early.");
+                        // Check if child is still running
+                        let mut status = 0;
+                        let wait_res = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                        if wait_res == pid {
+                            // Child exited!
+                            println!();
+                            eprintln!(
+                                "Failed to start squeezefs daemon. Child process exited early."
+                            );
+                            std::process::exit(1);
+                        }
+
+                        // Check if mountpoint is ready
+                        if let Ok(metadata) = std::fs::metadata(&mountpoint_path) {
+                            use std::os::unix::fs::MetadataExt;
+                            if metadata.ino() == 1 {
+                                ready = true;
+                                break;
+                            }
+                        }
+                        print!(".");
+                        let _ = std::io::stdout().flush();
+                    }
+                    println!();
+                    if ready {
+                        println!(
+                            "\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}",
+                            mountpoint_path
+                        );
+                        std::process::exit(0);
+                    } else {
+                        eprintln!("The mount point is not ready in 10 seconds, exiting");
+                        let _ = std::process::Command::new("umount")
+                            .arg("-l")
+                            .arg(&mountpoint_path)
+                            .output();
+                        libc::kill(pid, libc::SIGKILL);
                         std::process::exit(1);
                     }
-
-                    // Check if mountpoint is ready
-                    if let Ok(metadata) = std::fs::metadata(&mountpoint_path) {
-                        use std::os::unix::fs::MetadataExt;
-                        if metadata.ino() == 1 {
-                            ready = true;
-                            break;
-                        }
-                    }
-                    print!(".");
-                    let _ = std::io::stdout().flush();
                 }
-                println!();
-                if ready {
-                    println!(
-                        "\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}",
-                        mountpoint_path
-                    );
-                    std::process::exit(0);
+                // Child process detaches
+                libc::setsid();
+                // Redirect stdin to /dev/null
+                if let Ok(null_file) = std::fs::File::open("/dev/null") {
+                    use std::os::unix::io::AsRawFd;
+                    libc::dup2(null_file.as_raw_fd(), 0);
+                }
+                // Redirect stdout/stderr to log_file if provided, else /dev/null
+                let output_file = if let Some(ref path) = cli.log_file {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .ok()
                 } else {
-                    eprintln!("The mount point is not ready in 10 seconds, exiting");
-                    let _ = std::process::Command::new("umount")
-                        .arg("-l")
-                        .arg(&mountpoint_path)
-                        .output();
-                    libc::kill(pid, libc::SIGKILL);
-                    std::process::exit(1);
+                    None
+                };
+                if let Some(out_f) = output_file {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = out_f.as_raw_fd();
+                    libc::dup2(fd, 1);
+                    libc::dup2(fd, 2);
+                } else if let Ok(null_file) = std::fs::File::open("/dev/null") {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = null_file.as_raw_fd();
+                    libc::dup2(fd, 1);
+                    libc::dup2(fd, 2);
                 }
-            }
-            // Child process detaches
-            libc::setsid();
-            // Redirect stdin to /dev/null
-            if let Ok(null_file) = std::fs::File::open("/dev/null") {
-                use std::os::unix::io::AsRawFd;
-                libc::dup2(null_file.as_raw_fd(), 0);
-            }
-            // Redirect stdout/stderr to log_file if provided, else /dev/null
-            let output_file = if let Some(ref path) = cli.log_file {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .ok()
-            } else {
-                None
-            };
-            if let Some(out_f) = output_file {
-                use std::os::unix::io::AsRawFd;
-                let fd = out_f.as_raw_fd();
-                libc::dup2(fd, 1);
-                libc::dup2(fd, 2);
-            } else if let Ok(null_file) = std::fs::File::open("/dev/null") {
-                use std::os::unix::io::AsRawFd;
-                let fd = null_file.as_raw_fd();
-                libc::dup2(fd, 1);
-                libc::dup2(fd, 2);
             }
         }
-    }
     }
 
     let mut builder = env_logger::Builder::from_default_env();
@@ -437,12 +475,17 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_mount_diagnostics(
     garnet_url: &str,
     mountpoint: &Path,
     daemon: bool,
     mem_cache_size: Option<&str>,
     disk_cache_size: Option<&str>,
+    read_cache_size: Option<&str>,
+    write_cache_size: Option<&str>,
+    read_mem_cache_size: Option<&str>,
+    write_mem_cache_size: Option<&str>,
     disk_cache_paths: Option<&[PathBuf]>,
     s3_endpoint: Option<&str>,
     s3_access_key: Option<&str>,
@@ -455,13 +498,17 @@ fn print_mount_diagnostics(
     use redis::Commands;
     let client = redis::Client::open(garnet_url)?;
     let mut con = client.get_connection()?;
-    let format_fields: std::collections::HashMap<String, String> = con.hgetall("squeezefs:format")?;
+    let format_fields: std::collections::HashMap<String, String> =
+        con.hgetall("squeezefs:format")?;
     if format_fields.is_empty() {
         return Err("Volume not formatted. Please run format command first.".into());
     }
 
-    let name = format_fields.get("name").cloned().unwrap_or_else(|| "unnamed".to_string());
-    
+    let name = format_fields
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| "unnamed".to_string());
+
     let block_size_bytes: u64 = format_fields
         .get("block_size")
         .and_then(|v| v.parse().ok())
@@ -497,6 +544,50 @@ fn print_mount_diagnostics(
         .map(|s| s.to_string())
         .or_else(|| format_fields.get("disk_cache_size").cloned())
         .unwrap_or_else(|| "10GB".to_string());
+
+    let resolved_read_cache_size = read_cache_size
+        .map(|s| s.to_string())
+        .or_else(|| format_fields.get("read_cache_size").cloned())
+        .unwrap_or_else(|| {
+            if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0) {
+                format_size(bytes / 2)
+            } else {
+                "5GB".to_string()
+            }
+        });
+
+    let resolved_write_cache_size = write_cache_size
+        .map(|s| s.to_string())
+        .or_else(|| format_fields.get("write_cache_size").cloned())
+        .unwrap_or_else(|| {
+            if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0) {
+                format_size(bytes / 2)
+            } else {
+                "5GB".to_string()
+            }
+        });
+
+    let resolved_read_mem_cache_size = read_mem_cache_size
+        .map(|s| s.to_string())
+        .or_else(|| format_fields.get("read_mem_cache_size").cloned())
+        .unwrap_or_else(|| {
+            if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0) {
+                format_size(bytes / 2)
+            } else {
+                "512MB".to_string()
+            }
+        });
+
+    let resolved_write_mem_cache_size = write_mem_cache_size
+        .map(|s| s.to_string())
+        .or_else(|| format_fields.get("write_mem_cache_size").cloned())
+        .unwrap_or_else(|| {
+            if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0) {
+                format_size(bytes / 2)
+            } else {
+                "512MB".to_string()
+            }
+        });
 
     let staging_dirs = if let Some(dirs) = disk_cache_paths {
         if dirs.is_empty() {
@@ -549,13 +640,31 @@ fn print_mount_diagnostics(
         .map(|s| !s.is_empty())
         .unwrap_or(false);
 
-    let masked_access_key = final_s3_access_key.as_ref().map(|s| {
-        if s.is_empty() { "none".to_string() } else { "******".to_string() }
-    }).unwrap_or_else(|| "none".to_string());
-    let masked_secret_key = final_s3_secret_key.as_ref().map(|s| {
-        if s.is_empty() { "none".to_string() } else { "******".to_string() }
-    }).unwrap_or_else(|| "none".to_string());
-    let masked_encrypt_key = if encrypt_key_present { "******".to_string() } else { "none".to_string() };
+    let masked_access_key = final_s3_access_key
+        .as_ref()
+        .map(|s| {
+            if s.is_empty() {
+                "none".to_string()
+            } else {
+                "******".to_string()
+            }
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let masked_secret_key = final_s3_secret_key
+        .as_ref()
+        .map(|s| {
+            if s.is_empty() {
+                "none".to_string()
+            } else {
+                "******".to_string()
+            }
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let masked_encrypt_key = if encrypt_key_present {
+        "******".to_string()
+    } else {
+        "none".to_string()
+    };
 
     println!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
     println!("===================================================");
@@ -576,15 +685,31 @@ fn print_mount_diagnostics(
     println!("  Capacity: {}", capacity_str);
     println!("  Inodes Limit: {}", inodes_str);
     println!("Cache Settings:");
-    println!("  Memory Cache Size: {}", resolved_mem_cache_size);
-    println!("  Disk Cache Size: {}", resolved_disk_cache_size);
+    println!("  Memory Cache Size (Total): {}", resolved_mem_cache_size);
+    println!(
+        "    Read Memory Cache Size:  {}",
+        resolved_read_mem_cache_size
+    );
+    println!(
+        "    Write Memory Cache Size: {}",
+        resolved_write_mem_cache_size
+    );
+    println!("  Disk Cache Size (Total):   {}", resolved_disk_cache_size);
+    println!("    Read Disk Cache Size:    {}", resolved_read_cache_size);
+    println!("    Write Disk Cache Size:   {}", resolved_write_cache_size);
     println!("  Disk Cache Paths: {:?}", staging_dirs);
     println!("Storage Backend:");
     println!("  Active Backend: {:?}", active_be_id);
-    println!("  S3 Endpoint: {:?}", final_s3_endpoint.as_deref().unwrap_or(""));
+    println!(
+        "  S3 Endpoint: {:?}",
+        final_s3_endpoint.as_deref().unwrap_or("")
+    );
     println!("  S3 Access Key: {}", masked_access_key);
     println!("  S3 Secret Key: {}", masked_secret_key);
-    println!("  S3 Bucket: {:?}", final_s3_bucket.as_deref().unwrap_or("squeezefs-data"));
+    println!(
+        "  S3 Bucket: {:?}",
+        final_s3_bucket.as_deref().unwrap_or("squeezefs-data")
+    );
     println!("Security & Compression:");
     println!("  Compression: {:?}", compression);
     println!("  Encryption Algorithm: {:?}", encrypt_algo);
@@ -593,7 +718,6 @@ fn print_mount_diagnostics(
 
     Ok(())
 }
-
 
 fn parse_human_readable_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -661,6 +785,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             compression,
             encrypt_algo,
             encrypt_key,
+            read_cache_size,
+            write_cache_size,
+            read_mem_cache_size,
+            write_mem_cache_size,
         } => {
             let redis_url = &cli.garnet_url;
 
@@ -739,6 +867,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 s3_access_key.as_deref(),
                 s3_secret_key.as_deref(),
                 s3_bucket.as_deref(),
+                read_cache_size.as_deref(),
+                write_cache_size.as_deref(),
+                read_mem_cache_size.as_deref(),
+                write_mem_cache_size.as_deref(),
             )
             .await?;
             let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
@@ -767,10 +899,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             allow_other,
             check_storage,
             options,
+            read_cache_size,
+            write_cache_size,
+            read_mem_cache_size,
+            write_mem_cache_size,
         } => {
             let redis_url = &cli.garnet_url;
 
-            log::info!("Connecting to Garnet (metadata database) at {}...", redis_url);
+            log::info!(
+                "Connecting to Garnet (metadata database) at {}...",
+                redis_url
+            );
             let dlm =
                 DlmClient::new_with_local_ips(redis_url, local_ips.clone().unwrap_or_default())
                     .await?;
@@ -794,6 +933,54 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let resolved_disk_cache_size = disk_cache_size
                 .or_else(|| format_fields.get("disk_cache_size").cloned())
                 .unwrap_or_else(|| "10GB".to_string());
+
+            let resolved_read_cache_size = read_cache_size
+                .or_else(|| format_fields.get("read_cache_size").cloned())
+                .unwrap_or_else(|| {
+                    if let Ok(bytes) =
+                        squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0)
+                    {
+                        format_size(bytes / 2)
+                    } else {
+                        "5GB".to_string()
+                    }
+                });
+
+            let resolved_write_cache_size = write_cache_size
+                .or_else(|| format_fields.get("write_cache_size").cloned())
+                .unwrap_or_else(|| {
+                    if let Ok(bytes) =
+                        squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0)
+                    {
+                        format_size(bytes / 2)
+                    } else {
+                        "5GB".to_string()
+                    }
+                });
+
+            let resolved_read_mem_cache_size = read_mem_cache_size
+                .or_else(|| format_fields.get("read_mem_cache_size").cloned())
+                .unwrap_or_else(|| {
+                    if let Ok(bytes) =
+                        squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0)
+                    {
+                        format_size(bytes / 2)
+                    } else {
+                        "512MB".to_string()
+                    }
+                });
+
+            let resolved_write_mem_cache_size = write_mem_cache_size
+                .or_else(|| format_fields.get("write_mem_cache_size").cloned())
+                .unwrap_or_else(|| {
+                    if let Ok(bytes) =
+                        squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0)
+                    {
+                        format_size(bytes / 2)
+                    } else {
+                        "512MB".to_string()
+                    }
+                });
 
             // Resolve staging directories: CLI override > Garnet setting > default "/tmp/squeezefs_staging"
             let staging_dirs = if let Some(dirs) = disk_cache_paths {
@@ -997,13 +1184,31 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .map(|s| !s.is_empty())
                 .unwrap_or(false);
 
-            let masked_access_key = final_s3_access_key.as_ref().map(|s| {
-                if s.is_empty() { "none".to_string() } else { "******".to_string() }
-            }).unwrap_or_else(|| "none".to_string());
-            let masked_secret_key = final_s3_secret_key.as_ref().map(|s| {
-                if s.is_empty() { "none".to_string() } else { "******".to_string() }
-            }).unwrap_or_else(|| "none".to_string());
-            let masked_encrypt_key = if encrypt_key_present { "******".to_string() } else { "none".to_string() };
+            let masked_access_key = final_s3_access_key
+                .as_ref()
+                .map(|s| {
+                    if s.is_empty() {
+                        "none".to_string()
+                    } else {
+                        "******".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "none".to_string());
+            let masked_secret_key = final_s3_secret_key
+                .as_ref()
+                .map(|s| {
+                    if s.is_empty() {
+                        "none".to_string()
+                    } else {
+                        "******".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "none".to_string());
+            let masked_encrypt_key = if encrypt_key_present {
+                "******".to_string()
+            } else {
+                "none".to_string()
+            };
 
             let config_json = serde_json::json!({
                 "meta_url": redis_url,
@@ -1012,7 +1217,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "capacity": if capacity_bytes == 0 { "unlimited".to_string() } else { format_size(capacity_bytes) },
                 "inodes_limit": if inodes_limit == 0 { "0 (unlimited)".to_string() } else { inodes_limit.to_string() },
                 "mem_cache_size": resolved_mem_cache_size,
+                "read_mem_cache_size": resolved_read_mem_cache_size,
+                "write_mem_cache_size": resolved_write_mem_cache_size,
                 "disk_cache_size": resolved_disk_cache_size,
+                "read_cache_size": resolved_read_cache_size,
+                "write_cache_size": resolved_write_cache_size,
                 "disk_cache_paths": active_staging_dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
                 "endpoint": final_s3_endpoint.as_deref().unwrap_or(""),
                 "access_key": masked_access_key,
@@ -1035,8 +1244,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let cache = TieredCache::new(
                 active_staging_dirs,
-                Some(&resolved_mem_cache_size),
-                Some(&resolved_disk_cache_size),
+                Some(&resolved_read_mem_cache_size),
+                Some(&resolved_write_mem_cache_size),
+                Some(&resolved_read_cache_size),
+                Some(&resolved_write_cache_size),
                 multi_backend.clone().get_backend("backend_0").unwrap(), // Cache uses default backend for staging
                 dlm.meta_client().clone(),
             )?;
@@ -1103,8 +1314,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let multi_backend = MultiBackendClient::new();
             multi_backend.register_backend("backend_0", backend.clone());
 
-            let cache =
-                TieredCache::new(staging_dirs, None, None, backend, dlm.meta_client().clone())?;
+            let cache = TieredCache::new(
+                staging_dirs,
+                None,
+                None,
+                None,
+                None,
+                backend,
+                dlm.meta_client().clone(),
+            )?;
             let router = DataRouter::new(dlm, multi_backend, cache);
 
             println!("Cloning file from {} to {}...", src, dest);

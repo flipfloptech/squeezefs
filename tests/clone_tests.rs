@@ -116,6 +116,8 @@ async fn setup_router() -> Option<(DataRouter, tempfile::TempDir)> {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -283,6 +285,8 @@ async fn test_copy_file_range_refclone() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -352,6 +356,8 @@ async fn test_clone_path_full() {
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),

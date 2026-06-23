@@ -51,6 +51,8 @@ async fn test_p2p_happy_path() {
         vec![temp_dir_a.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend_a.clone(),
         dlm_a.meta_client().clone(),
     )
@@ -97,6 +99,8 @@ async fn test_p2p_happy_path() {
 
     let cache_b = TieredCache::new(
         vec![temp_dir_b.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend_b.clone(),
@@ -154,6 +158,8 @@ async fn test_p2p_fallback_path() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
+        None,
+        None,
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -208,6 +214,8 @@ async fn test_p2p_ttl_expiration() {
     let backend = RustFsClient::new_mock();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
         None,
         None,
         backend.clone(),

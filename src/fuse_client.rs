@@ -592,9 +592,7 @@ impl SqueezefsFilesystem {
             _ => FileType::RegularFile,
         };
         let blocks = match kind {
-            FileType::Directory | FileType::Symlink | FileType::RegularFile => {
-                size.div_ceil(512)
-            }
+            FileType::Directory | FileType::Symlink | FileType::RegularFile => size.div_ceil(512),
             _ => 0,
         };
         let perm = fields
@@ -739,6 +737,10 @@ impl Filesystem for SqueezefsFilesystem {
                 .hset("squeezefs:format", "version", 1) // ABI version
                 .hset("squeezefs:format", "mem_cache_size", "1GB")
                 .hset("squeezefs:format", "disk_cache_size", "10GB")
+                .hset("squeezefs:format", "read_cache_size", "")
+                .hset("squeezefs:format", "write_cache_size", "")
+                .hset("squeezefs:format", "read_mem_cache_size", "")
+                .hset("squeezefs:format", "write_mem_cache_size", "")
                 .hset("squeezefs:format", "disk_cache_paths", "")
                 .query_async(&mut con)
                 .await
@@ -1900,8 +1902,7 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, new_parent, new_name_str
         );
 
-        if (parent == 1 && name_str == ".config")
-            || (new_parent == 1 && new_name_str == ".config")
+        if (parent == 1 && name_str == ".config") || (new_parent == 1 && new_name_str == ".config")
         {
             return Err(Errno::from(libc::EPERM));
         }
@@ -3444,6 +3445,10 @@ pub async fn format_volume(
     s3_access_key: Option<&str>,
     s3_secret_key: Option<&str>,
     s3_bucket: Option<&str>,
+    read_cache_size: Option<&str>,
+    write_cache_size: Option<&str>,
+    read_mem_cache_size: Option<&str>,
+    write_mem_cache_size: Option<&str>,
 ) -> Result<(), SqueezefsError> {
     let client = redis::Client::open(redis_url)?;
     let mut con = client.get_multiplexed_tokio_connection().await?;
@@ -3454,6 +3459,10 @@ pub async fn format_volume(
 
     let mem_size = mem_cache_size.unwrap_or("1GB").to_string();
     let disk_size = disk_cache_size.unwrap_or("10GB").to_string();
+    let r_cache = read_cache_size.unwrap_or("").to_string();
+    let w_cache = write_cache_size.unwrap_or("").to_string();
+    let r_mem = read_mem_cache_size.unwrap_or("").to_string();
+    let w_mem = write_mem_cache_size.unwrap_or("").to_string();
     let paths_str = disk_cache_paths
         .map(|paths| {
             paths
@@ -3475,6 +3484,10 @@ pub async fn format_volume(
         .hset("squeezefs:format", "version", 1) // ABI version
         .hset("squeezefs:format", "mem_cache_size", mem_size)
         .hset("squeezefs:format", "disk_cache_size", disk_size)
+        .hset("squeezefs:format", "read_cache_size", r_cache)
+        .hset("squeezefs:format", "write_cache_size", w_cache)
+        .hset("squeezefs:format", "read_mem_cache_size", r_mem)
+        .hset("squeezefs:format", "write_mem_cache_size", w_mem)
         .hset("squeezefs:format", "disk_cache_paths", paths_str)
         .hset("squeezefs:format", "active_write_backend", "backend_0");
 

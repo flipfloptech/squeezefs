@@ -70,6 +70,7 @@ pub struct SqueezefsFilesystem {
     active_posix_locks: dashmap::DashMap<(Inode, u64, u64, u64), crate::dlm::LockLease>,
     active_inode_locks: dashmap::DashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>,
     pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant)>,
+    pub dismount_wait: u64,
 }
 
 impl SqueezefsFilesystem {
@@ -83,6 +84,7 @@ impl SqueezefsFilesystem {
             active_posix_locks: dashmap::DashMap::new(),
             active_inode_locks: dashmap::DashMap::new(),
             attr_cache: dashmap::DashMap::new(),
+            dismount_wait: 10,
         }
     }
 
@@ -855,9 +857,9 @@ impl Filesystem for SqueezefsFilesystem {
         let staging_dirs = self.router.cache.nvme.staging_dirs();
         let mut active_writes_count = 0;
 
-        // Gracefully wait up to 10 seconds for the background merge worker to drain staged writes to S3
+        // Gracefully wait up to self.dismount_wait seconds for the background merge worker to drain staged writes to S3
         let start_wait = std::time::Instant::now();
-        let max_wait = std::time::Duration::from_secs(10);
+        let max_wait = std::time::Duration::from_secs(self.dismount_wait);
         let staged_count = loop {
             let mut current_staged = 0;
             for dir in staging_dirs {
@@ -3408,6 +3410,9 @@ pub async fn start_mount<P: AsRef<Path>>(
         }
     }
 
+    let dismount_wait = fs.dismount_wait;
+    let staging_dirs = fs.router.cache.nvme.staging_dirs().to_vec();
+
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options)
         .mount(fs, mount_path.clone())
@@ -3415,49 +3420,132 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     let mut handle = session;
 
-    let shutdown = async {
-        #[cfg(unix)]
-        {
-            let sigterm_opt =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
-            let sigint_opt =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
-            if let (Ok(mut sigterm), Ok(mut sigint)) = (sigterm_opt, sigint_opt) {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("Received Ctrl+C, exiting...");
+    let mut should_exit = false;
+    while !should_exit {
+        let shutdown = async {
+            #[cfg(unix)]
+            {
+                let sigterm_opt =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+                let sigint_opt =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+                if let (Ok(mut sigterm), Ok(mut sigint)) = (sigterm_opt, sigint_opt) {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("Received Ctrl+C, exiting...");
+                        }
+                        _ = sigterm.recv() => {
+                            info!("Received SIGTERM, exiting...");
+                        }
+                        _ = sigint.recv() => {
+                            info!("Received SIGINT, exiting...");
+                        }
                     }
-                    _ = sigterm.recv() => {
-                        info!("Received SIGTERM, exiting...");
-                    }
-                    _ = sigint.recv() => {
-                        info!("Received SIGINT, exiting...");
-                    }
+                } else {
+                    let _ = tokio::signal::ctrl_c().await;
+                    info!("Received Ctrl+C, exiting...");
                 }
-            } else {
+            }
+            #[cfg(not(unix))]
+            {
                 let _ = tokio::signal::ctrl_c().await;
                 info!("Received Ctrl+C, exiting...");
             }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Received Ctrl+C, exiting...");
-        }
-    };
+        };
 
-    tokio::select! {
-        res = &mut handle => {
-            if let Err(e) = res {
-                error!("FUSE session loop ended with error: {:?}", e);
-                eprintln!("FUSE session loop ended with error: {:?}", e);
-            } else {
-                info!("FUSE session loop ended successfully.");
-                println!("\n[!] The FUSE filesystem was unmounted externally (e.g. via umount). Squeezefs is now shutting down safely.\n");
+        tokio::select! {
+            res = &mut handle => {
+                if let Err(e) = res {
+                    error!("FUSE session loop ended with error: {:?}", e);
+                    eprintln!("FUSE session loop ended with error: {:?}", e);
+                } else {
+                    info!("FUSE session loop ended successfully.");
+                    println!("\n[!] The FUSE filesystem was unmounted externally (e.g. via umount). Squeezefs is now shutting down safely.\n");
+                }
+                should_exit = true;
             }
-        }
-        _ = shutdown => {
-            info!("Received shutdown signal, unmounting filesystem...");
+            _ = shutdown => {
+                use colored::Colorize;
+                use std::io::Write;
+                use std::io::IsTerminal;
+
+                info!("Received shutdown signal. Checking staging status...");
+                let mut staged_count = 0;
+                let mut active_writes_count = 0;
+                for dir in &staging_dirs {
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
+                                staged_count += 1;
+                            }
+                        }
+                    }
+                    let active_dir = dir.join("active_writes");
+                    if active_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                            active_writes_count += entries.filter_map(|e| e.ok()).count();
+                        }
+                    }
+                }
+
+                let has_unflushed = staged_count > 0 || active_writes_count > 0;
+                if has_unflushed && std::io::stdin().is_terminal() {
+                    println!("\n{}", "WARNING: There are unflushed staged writes on this node!".red().bold());
+                    println!("Remaining local staged files: {}", staged_count);
+                    println!("Active write transaction directories: {}", active_writes_count);
+                    println!("If you unmount now, other nodes will not see this data.");
+                    println!("\nChoose an option:");
+                    println!("  [w] Wait for staged files to drain/flush to S3");
+                    println!("  [c] Continue/force unmount immediately (unsafe)");
+                    println!("  [a] Abort unmount and continue running mount");
+                    print!("Select option [w/c/a]: ");
+                    let _ = std::io::stdout().flush();
+
+                    let mut input = String::new();
+                    let choice = if std::io::stdin().read_line(&mut input).is_ok() {
+                        input.trim().to_lowercase()
+                    } else {
+                        "c".to_string()
+                    };
+
+                    if choice == "a" || choice == "abort" {
+                        println!("Aborting exit. Resuming squeezefs mount.");
+                        continue;
+                    } else if choice == "w" || choice == "wait" {
+                        println!("Waiting for staged writes to drain. Press Ctrl+C again to force exit.");
+                        let start_wait = std::time::Instant::now();
+                        let max_wait = std::time::Duration::from_secs(dismount_wait);
+                        loop {
+                            let mut current_staged = 0;
+                            for dir in &staging_dirs {
+                                if let Ok(entries) = std::fs::read_dir(dir) {
+                                    for entry in entries.flatten() {
+                                        let path = entry.path();
+                                        if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
+                                            current_staged += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            if current_staged == 0 {
+                                println!("\nAll staged files drained cleanly!");
+                                break;
+                            }
+                            if start_wait.elapsed() >= max_wait {
+                                println!("\nGrace period expired. Unmounting with remaining staged files: {}", current_staged);
+                                break;
+                            }
+                            print!("\rRemaining staged files: {}... (elapsed: {}s / limit: {}s)", current_staged, start_wait.elapsed().as_secs(), dismount_wait);
+                            let _ = std::io::stdout().flush();
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        }
+                    } else {
+                        println!("Continuing with unmount.");
+                    }
+                }
+                should_exit = true;
+            }
         }
     }
 
@@ -3493,6 +3581,54 @@ pub async fn format_volume(
     read_mem_cache_size: Option<&str>,
     write_mem_cache_size: Option<&str>,
 ) -> Result<(), SqueezefsError> {
+    format_volume_ext(
+        redis_url,
+        name,
+        block_size,
+        capacity,
+        inodes,
+        compression,
+        encrypt_algo,
+        encrypt_key,
+        mem_cache_size,
+        disk_cache_size,
+        disk_cache_paths,
+        s3_endpoint,
+        s3_access_key,
+        s3_secret_key,
+        s3_bucket,
+        read_cache_size,
+        write_cache_size,
+        read_mem_cache_size,
+        write_mem_cache_size,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn format_volume_ext(
+    redis_url: &str,
+    name: &str,
+    block_size: u64,
+    capacity: u64,
+    inodes: u64,
+    compression: &str,
+    encrypt_algo: &str,
+    encrypt_key: Option<&str>,
+    mem_cache_size: Option<&str>,
+    disk_cache_size: Option<&str>,
+    disk_cache_paths: Option<&[std::path::PathBuf]>,
+    s3_endpoint: Option<&str>,
+    s3_access_key: Option<&str>,
+    s3_secret_key: Option<&str>,
+    s3_bucket: Option<&str>,
+    read_cache_size: Option<&str>,
+    write_cache_size: Option<&str>,
+    read_mem_cache_size: Option<&str>,
+    write_mem_cache_size: Option<&str>,
+    dismount_wait: Option<&str>,
+) -> Result<(), SqueezefsError> {
     let client = redis::Client::open(redis_url)?;
     let mut con = client.get_multiplexed_tokio_connection().await?;
     let _: () = redis::cmd("FLUSHALL")
@@ -3506,6 +3642,7 @@ pub async fn format_volume(
     let w_cache = write_cache_size.unwrap_or("").to_string();
     let r_mem = read_mem_cache_size.unwrap_or("").to_string();
     let w_mem = write_mem_cache_size.unwrap_or("").to_string();
+    let d_wait = dismount_wait.unwrap_or("10").to_string();
     let paths_str = disk_cache_paths
         .map(|paths| {
             paths
@@ -3532,6 +3669,7 @@ pub async fn format_volume(
         .hset("squeezefs:format", "read_mem_cache_size", r_mem)
         .hset("squeezefs:format", "write_mem_cache_size", w_mem)
         .hset("squeezefs:format", "disk_cache_paths", paths_str)
+        .hset("squeezefs:format", "dismount_wait", d_wait)
         .hset("squeezefs:format", "active_write_backend", "backend_0");
 
     let default_endpoint = s3_endpoint.unwrap_or("");

@@ -229,74 +229,54 @@ enum ConfigActions {
     /// Manage storage backends
     #[command(subcommand, alias = "backends")]
     Backend(BackendActions),
-    /// Set runtime configuration quotas (capacity or inodes)
+    /// Manage staging disk caches
+    #[command(subcommand, alias = "diskcaches")]
+    DiskCache(DiskCacheActions),
+    /// Set runtime configuration quotas (capacity, inodes, or memory cache sizes)
     Set {
-        /// Quota key: "capacity" or "inodes"
+        /// Quota key (e.g. "capacity", "inodes", "mem_cache_size", "read_mem_cache_size", "write_mem_cache_size")
         key: String,
-        /// New value (e.g. "100G", "5P" for capacity or numeric value/0 for inodes)
+        /// New value (e.g. "100G", "2T" or numeric value/0)
         value: String,
-    },
-    /// Add a staging disk cache or storage backend
-    Add {
-        /// Category: must be "diskcache" or "backend"
-        category: String,
-        /// Value: path for diskcache, or backend_id for backend
-        value: String,
-
-        /// S3 compatible object store endpoint url (only for backend category)
-        #[arg(long)]
-        s3_endpoint: Option<String>,
-        /// S3 compatible object store access key (only for backend category)
-        #[arg(long)]
-        s3_access_key: Option<String>,
-        /// S3 compatible object store secret key (only for backend category)
-        #[arg(long)]
-        s3_secret_key: Option<String>,
-        /// S3 compatible object store bucket name (only for backend category)
-        #[arg(long)]
-        s3_bucket: Option<String>,
-    },
-    /// Remove a staging disk cache or storage backend
-    Remove {
-        /// Category: must be "diskcache" or "backend"
-        category: String,
-        /// Value: path for diskcache, or backend_id for backend
-        value: String,
-        /// Force removal ignoring safety checks
-        #[arg(long)]
-        force: bool,
-    },
-    /// Enable a staging disk cache
-    Enable {
-        /// Category: must be "diskcache"
-        category: String,
-        /// Path to enable
-        value: String,
-    },
-    /// Disable a staging disk cache
-    Disable {
-        /// Category: must be "diskcache"
-        category: String,
-        /// Path to disable
-        value: String,
-    },
-    /// Flush a disabled staging disk cache
-    Flush {
-        /// Category: must be "diskcache"
-        category: String,
-        /// Path to flush
-        value: String,
-    },
-    /// Set the active storage backend for writes
-    #[command(name = "set-active-backend")]
-    SetActiveBackend {
-        /// Backend ID to set active
-        backend_id: String,
     },
     /// List current configuration (diskcaches, backends, active backend)
     List,
     /// Consistency check on metadata and block references
     Fsck,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum DiskCacheActions {
+    /// Add a staging disk cache path
+    Add {
+        /// Path to add
+        path: String,
+    },
+    /// Remove a staging disk cache path
+    Remove {
+        /// Path to remove
+        path: String,
+        /// Force removal ignoring safety checks
+        #[arg(long)]
+        force: bool,
+    },
+    /// Enable a staging disk cache path
+    Enable {
+        /// Path to enable
+        path: String,
+    },
+    /// Disable a staging disk cache path
+    Disable {
+        /// Path to disable
+        path: String,
+    },
+    /// Flush a disabled staging disk cache path (drains staging writes)
+    Flush {
+        /// Path to flush
+        path: String,
+    },
+    /// List all staging disk caches and their status
+    List,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1466,123 +1446,59 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ConfigActions::Set { key, value } => {
                 squeezefs::config_ops::set_config_quota(&garnet_url, &fs_name, &key, &value).await?;
             }
-            ConfigActions::Add {
-                category,
-                value,
-                s3_endpoint,
-                s3_access_key,
-                s3_secret_key,
-                s3_bucket,
-            } => {
-                if category == "diskcache" {
-                    squeezefs::config_ops::add_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&value),
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' added successfully.", value);
-                } else if category == "backend" {
-                    let ep = s3_endpoint.unwrap_or_default();
-                    let ak = s3_access_key.unwrap_or_else(|| "admin".to_string());
-                    let sk = s3_secret_key.unwrap_or_else(|| "password".to_string());
-                    let bu = s3_bucket.unwrap_or_else(|| "squeezefs-data".to_string());
-                    squeezefs::config_ops::add_storage_backend(
-                        &garnet_url,
-                        &fs_name,
-                        &value,
-                        &ep,
-                        &ak,
-                        &sk,
-                        &bu,
-                    )
-                    .await?;
-                    println!("Storage backend '{}' added successfully.", value);
-                } else {
-                    eprintln!(
-                        "Invalid category '{}'. Must be 'diskcache' or 'backend'.",
-                        category
-                    );
-                    std::process::exit(1);
+            ConfigActions::DiskCache(action) => {
+                match action {
+                    DiskCacheActions::Add { path } => {
+                        squeezefs::config_ops::add_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' added successfully.", path);
+                    }
+                    DiskCacheActions::Remove { path, force } => {
+                        squeezefs::config_ops::remove_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                            force,
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' removed successfully.", path);
+                    }
+                    DiskCacheActions::Enable { path } => {
+                        squeezefs::config_ops::enable_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' enabled successfully.", path);
+                    }
+                    DiskCacheActions::Disable { path } => {
+                        squeezefs::config_ops::disable_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' disabled successfully.", path);
+                    }
+                    DiskCacheActions::Flush { path } => {
+                        squeezefs::config_ops::flush_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' flushed successfully.", path);
+                    }
+                    DiskCacheActions::List => {
+                        let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                        println!("{}", serde_json::to_string_pretty(&list.diskcaches)?);
+                    }
                 }
-            }
-            ConfigActions::Remove {
-                category,
-                value,
-                force,
-            } => {
-                if category == "diskcache" {
-                    squeezefs::config_ops::remove_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&value),
-                        force,
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' removed successfully.", value);
-                } else if category == "backend" {
-                    squeezefs::config_ops::remove_storage_backend(
-                        &garnet_url,
-                        &fs_name,
-                        &value,
-                        force,
-                    )
-                    .await?;
-                    println!("Storage backend '{}' removed successfully.", value);
-                } else {
-                    eprintln!(
-                        "Invalid category '{}'. Must be 'diskcache' or 'backend'.",
-                        category
-                    );
-                    std::process::exit(1);
-                }
-            }
-            ConfigActions::Enable { category, value } => {
-                if category == "diskcache" {
-                    squeezefs::config_ops::enable_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&value),
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' enabled successfully.", value);
-                } else {
-                    eprintln!("Invalid category '{}'. Must be 'diskcache'.", category);
-                    std::process::exit(1);
-                }
-            }
-            ConfigActions::Disable { category, value } => {
-                if category == "diskcache" {
-                    squeezefs::config_ops::disable_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&value),
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' disabled successfully.", value);
-                } else {
-                    eprintln!("Invalid category '{}'. Must be 'diskcache'.", category);
-                    std::process::exit(1);
-                }
-            }
-            ConfigActions::Flush { category, value } => {
-                if category == "diskcache" {
-                    squeezefs::config_ops::flush_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&value),
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' flushed successfully.", value);
-                } else {
-                    eprintln!("Invalid category '{}'. Must be 'diskcache'.", category);
-                    std::process::exit(1);
-                }
-            }
-            ConfigActions::SetActiveBackend { backend_id } => {
-                squeezefs::config_ops::set_active_backend(&garnet_url, &fs_name, &backend_id)
-                    .await?;
-                println!("Active write backend set to '{}'.", backend_id);
             }
             ConfigActions::List => {
                 let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;

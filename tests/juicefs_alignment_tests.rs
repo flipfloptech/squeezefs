@@ -732,3 +732,125 @@ async fn test_vim_swap_file_simulation() {
     assert_eq!(read_reply.data.len(), 1024);
     assert_eq!(&read_reply.data[..], &header_data[..]);
 }
+
+#[tokio::test]
+async fn test_config_sqz_virtual_file() {
+    let mut _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let redis_url = get_redis_url();
+    // Format volume to populate squeezefs:format and backends
+    format_volume(
+        &redis_url,
+        "testvolume_config",
+        1024 * 1024,
+        1000 * 1024 * 1024,
+        Some("64MB"),
+        Some("100MB"),
+        None,
+        Some("http://s3.local"),
+        Some("my-access-key"),
+        Some("my-secret-key"),
+        Some("my-bucket"),
+    )
+    .await
+    .expect("Format volume should succeed");
+
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // 1. Lookup ".config.sqz" under parent 1 (root)
+    let lookup_reply = fs.lookup(req, 1, OsStr::new(".config.sqz")).await.unwrap();
+    let config_ino = lookup_reply.attr.ino;
+    assert_eq!(config_ino, 0xffff_ffff_ffff_fffe); // CONFIG_INODE
+    assert_eq!(lookup_reply.attr.perm, 0o444); // Read-only
+
+    // 2. GetAttr CONFIG_INODE
+    let attr_reply = fs.getattr(req, config_ino, None, 0).await.unwrap();
+    assert_eq!(attr_reply.attr.ino, config_ino);
+    assert_eq!(attr_reply.attr.perm, 0o444);
+    let expected_size = attr_reply.attr.size;
+
+    // 3. Read config data
+    let read_reply = fs.read(req, config_ino, 0, 0, 8192).await.unwrap();
+    let config_json = String::from_utf8(read_reply.data.to_vec()).unwrap();
+    assert_eq!(config_json.len() as u64, expected_size);
+
+    // Verify config JSON content and masked credentials
+    let parsed: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+    assert!(parsed.get("client_version").is_some());
+    assert_eq!(parsed["backends"]["backend_0"]["access_key"], "******");
+    assert_eq!(parsed["backends"]["backend_0"]["secret_key"], "******");
+    assert_eq!(parsed["backends"]["backend_0"]["endpoint"], "http://s3.local");
+
+    // 4. Try to write to CONFIG_INODE -> EACCES
+    let write_res = fs.write(req, config_ino, 0, 0, b"data", 0, 0).await;
+    assert!(write_res.is_err());
+    let err_code = write_res.err().unwrap();
+    assert_eq!(err_code, fuse3::Errno::from(libc::EACCES));
+
+    // 5. Try to setattr of CONFIG_INODE -> EACCES
+    let mut set_attr = SetAttr::default();
+    set_attr.size = Some(10);
+    let setattr_res = fs.setattr(req, config_ino, None, set_attr).await;
+    assert!(setattr_res.is_err());
+    assert_eq!(setattr_res.err().unwrap(), fuse3::Errno::from(libc::EACCES));
+
+    // 6. Try to unlink ".config.sqz" -> EPERM
+    let unlink_res = fs.unlink(req, 1, OsStr::new(".config.sqz")).await;
+    assert!(unlink_res.is_err());
+    assert_eq!(unlink_res.err().unwrap(), fuse3::Errno::from(libc::EPERM));
+
+    // 7. Try to rename ".config.sqz" -> EPERM
+    let rename_res = fs.rename(req, 1, OsStr::new(".config.sqz"), 1, OsStr::new("new.config.sqz")).await;
+    assert!(rename_res.is_err());
+    assert_eq!(rename_res.err().unwrap(), fuse3::Errno::from(libc::EPERM));
+
+    // 8. Verify readdir contains ".config.sqz"
+    let readdir_reply = fs.readdir(req, 1, 0, 0).await.unwrap();
+    use futures::StreamExt;
+    let entries: Vec<_> = readdir_reply.entries.collect().await;
+    let config_entry = entries
+        .iter()
+        .map(|r| r.as_ref().unwrap())
+        .find(|e| e.name == ".config.sqz")
+        .expect("Readdir must contain .config.sqz entry");
+    assert_eq!(config_entry.inode, config_ino);
+
+    // 9. Verify readdirplus contains ".config.sqz"
+    let readdirplus_reply = fs.readdirplus(req, 1, 0, 0, 0).await.unwrap();
+    let entries_plus: Vec<_> = readdirplus_reply.entries.collect().await;
+    let config_entry_plus = entries_plus
+        .iter()
+        .map(|r| r.as_ref().unwrap())
+        .find(|e| e.name == ".config.sqz")
+        .expect("Readdirplus must contain .config.sqz entry");
+    assert_eq!(config_entry_plus.inode, config_ino);
+    assert_eq!(config_entry_plus.attr.ino, config_ino);
+    assert_eq!(config_entry_plus.attr.perm, 0o444);
+}

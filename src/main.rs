@@ -222,6 +222,13 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigActions,
     },
+    /// Manage storage backends
+    Backend {
+        /// Volume name (filesystem name)
+        fs_name: String,
+        #[command(subcommand)]
+        action: BackendActions,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -287,6 +294,47 @@ enum ConfigActions {
     List,
     /// Consistency check on metadata and block references
     Fsck,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum BackendActions {
+    /// Add a storage backend
+    Add {
+        /// Name/ID of the backend (e.g. backend_1, my-rustfs)
+        name: String,
+        /// S3 compatible object store endpoint url
+        #[arg(long, alias = "endpoint")]
+        s3_endpoint: String,
+        /// S3 compatible object store access key
+        #[arg(long, alias = "access-key", default_value = "admin")]
+        s3_access_key: String,
+        /// S3 compatible object store secret key
+        #[arg(long, alias = "secret-key", default_value = "password")]
+        s3_secret_key: String,
+        /// S3 compatible object store bucket name
+        #[arg(long, alias = "bucket", default_value = "squeezefs-data")]
+        s3_bucket: String,
+    },
+    /// Remove a storage backend
+    Remove {
+        /// Name of the backend
+        name: String,
+        /// Force removal ignoring safety checks
+        #[arg(long)]
+        force: bool,
+    },
+    /// Enable a storage backend for writes
+    Enable {
+        /// Name of the backend
+        name: String,
+    },
+    /// Disable a storage backend (no new writes, but existing blocks are still readable)
+    Disable {
+        /// Name of the backend
+        name: String,
+    },
+    /// List all storage backends and their status
+    List,
 }
 
 #[cfg(feature = "dhat-on")]
@@ -1051,27 +1099,30 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let _ = tune_system();
 
             log::info!("Resolving backend object store configuration...");
-            // Load S3 settings: CLI override > Env variables > Garnet stored settings
-            let final_s3_endpoint = s3_endpoint
-                .or_else(|| std::env::var("RUSTFS_ENDPOINT").ok())
+            if s3_endpoint.is_some() || s3_access_key.is_some() || s3_secret_key.is_some() || s3_bucket.is_some() {
+                return Err("Backend overrides on mount are not allowed. Please configure backends using 'squeezefs backend'.".into());
+            }
+
+            log::info!("Resolving backend object store configuration...");
+            // Load S3 settings: Env variables > Garnet stored settings
+            let final_s3_endpoint = std::env::var("RUSTFS_ENDPOINT").ok()
                 .or_else(|| format_fields.get("s3_endpoint").cloned());
-            let final_s3_access_key = s3_access_key
-                .or_else(|| std::env::var("RUSTFS_ACCESS_KEY").ok())
+            let final_s3_access_key = std::env::var("RUSTFS_ACCESS_KEY").ok()
                 .or_else(|| format_fields.get("s3_access_key").cloned());
-            let final_s3_secret_key = s3_secret_key
-                .or_else(|| std::env::var("RUSTFS_SECRET_KEY").ok())
+            let final_s3_secret_key = std::env::var("RUSTFS_SECRET_KEY").ok()
                 .or_else(|| format_fields.get("s3_secret_key").cloned());
-            let final_s3_bucket = s3_bucket
-                .or_else(|| std::env::var("RUSTFS_BUCKET").ok())
+            let final_s3_bucket = std::env::var("RUSTFS_BUCKET").ok()
                 .or_else(|| format_fields.get("s3_bucket").cloned());
 
             // Retrieve registered backends or initialize the default one
             let multi_backend = MultiBackendClient::new();
 
-            // Read all registered backends from Garnet
+            // Read all registered backends and their statuses from Garnet
             if let Ok(mut con) = dlm.meta_client().get_connection().await {
                 let backends_map: std::collections::HashMap<String, String> =
                     con.hgetall("squeezefs:backends").await.unwrap_or_default();
+                let statuses_map: std::collections::HashMap<String, String> =
+                    con.hgetall("squeezefs:backend:status").await.unwrap_or_default();
 
                 for (be_id, be_json) in backends_map {
                     if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
@@ -1096,61 +1147,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await;
                         multi_backend.register_backend(&be_id, client);
+
+                        if let Some(status) = statuses_map.get(&be_id) {
+                            multi_backend.set_backend_status(&be_id, status);
+                            log::info!("Set storage backend status: {} -> {}", be_id, status);
+                        }
                     }
+                }
+
+                for (be_id, status) in statuses_map {
+                    multi_backend.set_backend_status(&be_id, &status);
                 }
             }
 
             // Determine active write backend
-            let mut active_be_id = format_fields
+            let active_be_id = format_fields
                 .get("active_write_backend")
                 .cloned()
                 .unwrap_or_else(|| "backend_0".to_string());
-
-            // If we have CLI or env overrides for the backend, register it dynamically
-            if final_s3_endpoint.is_some()
-                || final_s3_access_key.is_some()
-                || final_s3_secret_key.is_some()
-                || final_s3_bucket.is_some()
-            {
-                // Generate a custom ID for this runtime backend, e.g. "backend_override"
-                active_be_id = "backend_override".to_string();
-                log::info!(
-                    "Registering overridden storage backend: backend_override (S3 endpoint: {:?}, bucket: {:?})",
-                    final_s3_endpoint,
-                    final_s3_bucket
-                );
-                let override_client = RustFsClient::new_with_local_ips(
-                    local_ips.clone().unwrap_or_default(),
-                    final_s3_endpoint.clone(),
-                    final_s3_access_key.clone(),
-                    final_s3_secret_key.clone(),
-                    final_s3_bucket.clone(),
-                )
-                .await;
-
-                // Initialize bucket
-                if final_s3_endpoint.is_some() {
-                    let _ = override_client.init_bucket().await;
-                }
-
-                multi_backend.register_backend(&active_be_id, override_client);
-
-                // Save to Garnet registry so other mounting nodes can read it
-                if let Ok(mut con) = dlm.meta_client().get_connection().await {
-                    let backend_json = serde_json::json!({
-                        "endpoint": final_s3_endpoint.clone().unwrap_or_default(),
-                        "access_key": final_s3_access_key.clone().unwrap_or_else(|| "admin".to_string()),
-                        "secret_key": final_s3_secret_key.clone().unwrap_or_else(|| "password".to_string()),
-                        "bucket": final_s3_bucket.clone().unwrap_or_else(|| "squeezefs-data".to_string()),
-                    }).to_string();
-                    let _: () = redis::pipe()
-                        .hset("squeezefs:backends", &active_be_id, backend_json)
-                        .hset("squeezefs:format", "active_write_backend", &active_be_id)
-                        .query_async(&mut con)
-                        .await
-                        .unwrap_or(());
-                }
-            }
 
             // Ensure we have at least backend_0 registered if no backends were found
             if !multi_backend.has_backend("backend_0") {
@@ -1169,7 +1183,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             multi_backend.set_active_backend_id(active_be_id.clone());
             log::info!("Active write storage backend set to: {}", active_be_id);
 
-            let active_client = multi_backend.get_backend(&active_be_id).unwrap();
+            let active_client = multi_backend.get_backend(&active_be_id)
+                .or_else(|| multi_backend.get_backend("backend_0"))
+                .ok_or("No storage backend client available")?;
 
             if check_storage {
                 log::info!("Running storage connectivity check...");
@@ -1502,6 +1518,86 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         println!("  - {}", issue);
                     }
                     std::process::exit(1);
+                }
+            }
+        },
+        Commands::Backend {
+            fs_name,
+            action,
+        } => {
+            let garnet_url = &cli.garnet_url;
+            match action {
+                BackendActions::Add {
+                    name,
+                    s3_endpoint,
+                    s3_access_key,
+                    s3_secret_key,
+                    s3_bucket,
+                } => {
+                    squeezefs::config_ops::add_storage_backend(
+                        garnet_url,
+                        &fs_name,
+                        &name,
+                        &s3_endpoint,
+                        &s3_access_key,
+                        &s3_secret_key,
+                        &s3_bucket,
+                    )
+                    .await?;
+                    println!("Storage backend '{}' added successfully.", name);
+                }
+                BackendActions::Remove { name, force } => {
+                    squeezefs::config_ops::remove_storage_backend(
+                        garnet_url,
+                        &fs_name,
+                        &name,
+                        force,
+                    )
+                    .await?;
+                    println!("Storage backend '{}' removed successfully.", name);
+                }
+                BackendActions::Enable { name } => {
+                    squeezefs::config_ops::enable_storage_backend(
+                        garnet_url,
+                        &fs_name,
+                        &name,
+                    )
+                    .await?;
+                    println!("Storage backend '{}' enabled successfully.", name);
+                }
+                BackendActions::Disable { name } => {
+                    squeezefs::config_ops::disable_storage_backend(
+                        garnet_url,
+                        &fs_name,
+                        &name,
+                    )
+                    .await?;
+                    println!("Storage backend '{}' disabled successfully.", name);
+                }
+                BackendActions::List => {
+                    let list = squeezefs::config_ops::list_config(garnet_url, &fs_name).await?;
+                    let mut output = serde_json::Map::new();
+                    for (be_id, be_json_str) in &list.backends {
+                        if let Ok(mut be_val) = serde_json::from_str::<serde_json::Value>(be_json_str) {
+                            let status = list.backend_statuses.get(be_id).cloned().unwrap_or_else(|| "enabled".to_string());
+                            if let Some(obj) = be_val.as_object_mut() {
+                                obj.insert("status".to_string(), serde_json::Value::String(status));
+                            }
+                            output.insert(be_id.clone(), be_val);
+                        }
+                    }
+                    if !list.backends.contains_key("backend_0") {
+                        let status = list.backend_statuses.get("backend_0").cloned().unwrap_or_else(|| "enabled".to_string());
+                        let be_val = serde_json::json!({
+                            "endpoint": "",
+                            "access_key": "admin",
+                            "secret_key": "password",
+                            "bucket": "squeezefs-data",
+                            "status": status,
+                        });
+                        output.insert("backend_0".to_string(), be_val);
+                    }
+                    println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(output))?);
                 }
             }
         },

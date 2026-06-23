@@ -580,11 +580,7 @@ impl SqueezefsFilesystem {
             .get("ino")
             .and_then(|v| v.parse().ok())
             .unwrap_or(ino);
-        let size = fields.get("size").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let blocks = fields
-            .get("blocks")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let size: u64 = fields.get("size").and_then(|v| v.parse().ok()).unwrap_or(0);
         let kind_num: u8 = fields.get("kind").and_then(|v| v.parse().ok()).unwrap_or(1);
         let kind = match kind_num {
             2 => FileType::Directory,
@@ -594,6 +590,12 @@ impl SqueezefsFilesystem {
             6 => FileType::BlockDevice,
             7 => FileType::Socket,
             _ => FileType::RegularFile,
+        };
+        let blocks = match kind {
+            FileType::Directory | FileType::Symlink | FileType::RegularFile => {
+                size.div_ceil(512)
+            }
+            _ => 0,
         };
         let perm = fields
             .get("perm")
@@ -2301,11 +2303,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .get("ino")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(ino);
-                let size = fields.get("size").and_then(|v| v.parse().ok()).unwrap_or(0);
-                let blocks = fields
-                    .get("blocks")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
+                let size: u64 = fields.get("size").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let kind_num: u8 = fields.get("kind").and_then(|v| v.parse().ok()).unwrap_or(1);
                 let kind = match kind_num {
                     2 => FileType::Directory,
@@ -2315,6 +2313,12 @@ impl Filesystem for SqueezefsFilesystem {
                     6 => FileType::BlockDevice,
                     7 => FileType::Socket,
                     _ => FileType::RegularFile,
+                };
+                let blocks = match kind {
+                    FileType::Directory | FileType::Symlink | FileType::RegularFile => {
+                        size.div_ceil(512)
+                    }
+                    _ => 0,
                 };
                 let perm = fields
                     .get("perm")

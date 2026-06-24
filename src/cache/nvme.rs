@@ -27,7 +27,16 @@ fn write_aligned_direct(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
         options.custom_flags(libc::O_DIRECT);
     }
 
-    let mut file = options.open(path)?;
+    let mut file = match options.open(path) {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            log::warn!("O_DIRECT write not supported on staging filesystem. Falling back to buffered I/O for: {:?}", path);
+            let mut fallback_opts = std::fs::OpenOptions::new();
+            fallback_opts.write(true).create(true).truncate(true);
+            fallback_opts.open(path)?
+        }
+        Err(e) => return Err(e),
+    };
     file.write_all(aligned_data)?;
     Ok(())
 }
@@ -49,7 +58,16 @@ fn read_aligned_direct(path: &PathBuf, actual_size: usize) -> std::io::Result<Ve
         options.custom_flags(libc::O_DIRECT);
     }
 
-    let mut file = options.open(path)?;
+    let mut file = match options.open(path) {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            log::warn!("O_DIRECT read not supported on staging filesystem. Falling back to buffered I/O for: {:?}", path);
+            let mut fallback_opts = std::fs::OpenOptions::new();
+            fallback_opts.read(true);
+            fallback_opts.open(path)?
+        }
+        Err(e) => return Err(e),
+    };
     file.read_exact(&mut buf[offset..offset + padded_size])?;
 
     let mut out = vec![0; actual_size];

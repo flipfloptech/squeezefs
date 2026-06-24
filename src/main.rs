@@ -96,6 +96,9 @@ enum Commands {
         /// Time in seconds to wait for staged writes to drain to S3 on dismount (default: 10)
         #[arg(long)]
         dismount_wait: Option<String>,
+        /// Delay/interval for background staging write uploads (e.g. "500ms", "5s", default: "500ms")
+        #[arg(long, default_value = "500ms")]
+        upload_delay: String,
     },
     /// Show filesystem status
     Status,
@@ -180,6 +183,9 @@ enum Commands {
         /// Time in seconds to wait for staged writes to drain to S3 on dismount (default: 10)
         #[arg(long)]
         dismount_wait: Option<String>,
+        /// Delay/interval for background staging write uploads (e.g. "500ms", "5s")
+        #[arg(long)]
+        upload_delay: Option<String>,
 
         /// Custom FUSE options (comma-separated list, e.g. "ro,nonempty")
         #[arg(short = 'o', long)]
@@ -836,6 +842,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             read_mem_cache_size,
             write_mem_cache_size,
             dismount_wait,
+            upload_delay,
         } => {
             let redis_url = &cli.garnet_url;
 
@@ -898,6 +905,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let parsed_capacity = parse_human_readable_size(&capacity)?;
 
+            squeezefs::cache::parse_duration(&upload_delay)?;
+
             squeezefs::fuse_client::format_volume_ext(
                 redis_url,
                 &name,
@@ -919,6 +928,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 read_mem_cache_size.as_deref(),
                 write_mem_cache_size.as_deref(),
                 dismount_wait.as_deref(),
+                Some(&upload_delay),
             )
             .await?;
             let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
@@ -952,6 +962,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             read_mem_cache_size,
             write_mem_cache_size,
             dismount_wait,
+            upload_delay,
         } => {
             let redis_url = &cli.garnet_url;
 
@@ -983,6 +994,27 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .or_else(|| format_fields.get("dismount_wait").cloned())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10);
+
+            // If upload_delay was specified as a CLI override, persist it in Garnet
+            if let Some(ref delay) = upload_delay {
+                squeezefs::cache::parse_duration(delay)?;
+                if let Ok(mut con) = dlm.meta_client().get_connection().await {
+                    let _: Result<(), redis::RedisError> = redis::cmd("HSET")
+                        .arg("squeezefs:format")
+                        .arg("upload_delay")
+                        .arg(delay)
+                        .query_async(&mut con)
+                        .await;
+                }
+            }
+
+            // Resolve upload delay: CLI override > Garnet setting > default "500ms"
+            let resolved_upload_delay = upload_delay
+                .or_else(|| format_fields.get("upload_delay").cloned())
+                .unwrap_or_else(|| "500ms".to_string());
+
+            // Validate resolved upload delay
+            squeezefs::cache::parse_duration(&resolved_upload_delay)?;
 
             // Resolve disk cache size: CLI override > Garnet setting > default "10GB"
             let resolved_disk_cache_size = disk_cache_size
@@ -1247,6 +1279,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "write_cache_size": resolved_write_cache_size,
                 "disk_cache_paths": active_staging_dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
                 "dismount_wait_seconds": resolved_dismount_wait,
+                "upload_delay": resolved_upload_delay,
                 "endpoint": final_s3_endpoint.as_deref().unwrap_or(""),
                 "access_key": masked_access_key,
                 "secret_key": masked_secret_key,

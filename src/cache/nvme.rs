@@ -303,9 +303,32 @@ impl NvmeStaging {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
             let mut current_bytes = 0u64;
             let max_batch_bytes = 4 * 1024 * 1024; // 4MB
-            let flush_timeout = Duration::from_millis(500);
+            let mut flush_timeout = Duration::from_millis(500);
+
+            let mut last_query = time::Instant::now() - Duration::from_secs(60);
+            let query_interval = Duration::from_secs(5);
 
             loop {
+                if last_query.elapsed() >= query_interval {
+                    if let Ok(mut con) = redis_client.get_connection().await {
+                        let delay_str: Option<String> = redis::cmd("HGET")
+                            .arg("squeezefs:format")
+                            .arg("upload_delay")
+                            .query_async(&mut con)
+                            .await
+                            .unwrap_or(None);
+                        if let Some(ds) = delay_str {
+                            if let Ok(parsed) = crate::cache::parse_duration(&ds) {
+                                if parsed != flush_timeout {
+                                    debug!("NVMe Staging: Dynamic upload_delay changed from {:?} to {:?}", flush_timeout, parsed);
+                                    flush_timeout = parsed;
+                                }
+                            }
+                        }
+                    }
+                    last_query = time::Instant::now();
+                }
+
                 let sleep = time::sleep(flush_timeout);
                 tokio::pin!(sleep);
 

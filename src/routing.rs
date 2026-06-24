@@ -987,6 +987,7 @@ impl DataRouter {
                 let crypto = self.get_crypto().clone();
                 for (b_idx, b_key_opt) in block_keys {
                     let cache_ref = self.cache.nvme.clone();
+                    let read_lru = self.cache.read_lru.clone();
                     let backend_ref = self.backend.clone();
                     let peers = if let Some(ref b_key) = b_key_opt {
                         peer_mappings.get(b_key).cloned().unwrap_or_default()
@@ -1005,11 +1006,23 @@ impl DataRouter {
                     let crypto_clone = crypto.clone();
                     futures.push(tokio::spawn(async move {
                         let block_data = if let Some(ref b_key) = b_key_opt {
-                            if let Some(cached_range) =
-                                cache_ref.get_cached_read_block_range(b_key, slice_start, slice_len)
-                            {
+                            if let Some(cached_block) = read_lru.get(b_key) {
                                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                cached_range
+                                let start = std::cmp::min(slice_start as usize, cached_block.len());
+                                let end = std::cmp::min(
+                                    (slice_start + slice_len as u64) as usize,
+                                    cached_block.len(),
+                                );
+                                cached_block[start..end].to_vec()
+                            } else if let Some(decompressed) = cache_ref.read_cached_block(b_key) {
+                                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                read_lru.put(b_key, Arc::new(decompressed.clone()));
+                                let start = std::cmp::min(slice_start as usize, decompressed.len());
+                                let end = std::cmp::min(
+                                    (slice_start + slice_len as u64) as usize,
+                                    decompressed.len(),
+                                );
+                                decompressed[start..end].to_vec()
                             } else {
                                 METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
 
@@ -1042,6 +1055,8 @@ impl DataRouter {
                                         decompressed
                                     }
                                 };
+
+                                read_lru.put(b_key, Arc::new(downloaded.clone()));
 
                                 let start = std::cmp::min(slice_start as usize, downloaded.len());
                                 let end = std::cmp::min(

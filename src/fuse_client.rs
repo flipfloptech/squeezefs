@@ -1398,17 +1398,13 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
-        let mut read_result = vec![0u8; read_len];
 
         // 1. Try to read from committed storage
         let read_future = self
             .router
             .read_file_range(&file_path, offset, read_len as u32);
-        match tokio::time::timeout(Duration::from_secs(2), read_future).await {
-            Ok(Ok(committed_data)) => {
-                let copy_len = std::cmp::min(read_result.len(), committed_data.len());
-                read_result[..copy_len].copy_from_slice(&committed_data[..copy_len]);
-            }
+        let committed_data = match tokio::time::timeout(Duration::from_secs(2), read_future).await {
+            Ok(Ok(data)) => data,
             Ok(Err(e)) => {
                 error!("FUSE Read error: {:?}", e);
                 return Err(map_squeezefs_err(e));
@@ -1417,9 +1413,9 @@ impl Filesystem for SqueezefsFilesystem {
                 error!("FUSE Read timeout");
                 return Err(Errno::from(libc::ETIMEDOUT));
             }
-        }
+        };
 
-        // 2. Overlay any staging blocks in active_writes
+        // 2. Overlay any staging blocks in active_writes if they exist
         let staging_dir = self
             .router
             .cache
@@ -1434,6 +1430,10 @@ impl Filesystem for SqueezefsFilesystem {
             .join(format!("inode_{}", ino));
 
         if active_dir.exists() {
+            let mut read_result = vec![0u8; read_len];
+            let copy_len = std::cmp::min(read_result.len(), committed_data.len());
+            read_result[..copy_len].copy_from_slice(&committed_data[..copy_len]);
+
             let start_block = offset / block_size;
             let end_block = (offset + read_len as u64 - 1) / block_size;
 
@@ -1458,11 +1458,16 @@ impl Filesystem for SqueezefsFilesystem {
                     }
                 }
             }
-        }
 
-        Ok(ReplyData {
-            data: read_result.into(),
-        })
+            Ok(ReplyData {
+                data: read_result.into(),
+            })
+        } else {
+            // Zero-copy path: return committed data directly without extra buffer allocation or copy
+            Ok(ReplyData {
+                data: committed_data.into(),
+            })
+        }
     }
 
     async fn write(

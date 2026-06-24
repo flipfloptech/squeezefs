@@ -646,9 +646,8 @@ impl SqueezefsFilesystem {
                             let active_be = backend_clone.get_backend_for_key(&new_block_key);
                             let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
-                            // Cache the flushed block in RAM (read_lru) and local NVMe
+                            // Cache the flushed block in RAM (read_lru) - dehydrated to NVMe on eviction
                             router_clone.cache.read_lru.put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
-                            let _ = router_clone.cache.nvme.cache_read_block(&stored_block_key, &block_data);
 
                             let mut con = dlm_clone.get_connection().await?;
                             let block_map_key = format!("block_map:{}", block_map_id_clone);
@@ -4335,9 +4334,8 @@ async fn flush_single_active_block(
     let active_be = router.backend.get_backend_for_key(&new_block_key);
     let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
-    // Cache in RAM and NVMe
+    // Cache in RAM - dehydrated to NVMe on eviction
     router.cache.read_lru.put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
-    let _ = router.cache.nvme.cache_read_block(&stored_block_key, &block_data);
 
     let block_map_key = format!("block_map:{}", block_map_id);
     let refcounts_key = "squeezefs:block_refcounts";

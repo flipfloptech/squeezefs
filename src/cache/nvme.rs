@@ -623,6 +623,14 @@ impl NvmeStaging {
         let idx = get_dir_index(&safe_name, self.staging_dirs.len());
         let target_dir = self.staging_dirs[idx].join("cache");
         let block_path = target_dir.join(format!("block_{}.block", safe_name));
+
+        if block_path.exists() {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
+                let _ = file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()).set_modified(std::time::SystemTime::now()));
+            }
+            return Ok(());
+        }
+
         let tmp_path = target_dir.join(format!("block_{}.{}.block.tmp", safe_name, Uuid::new_v4()));
 
         fs::write(&tmp_path, data)?;
@@ -678,6 +686,9 @@ impl NvmeStaging {
         let target_dir = self.staging_dirs[idx].join("cache");
         let block_path = target_dir.join(format!("block_{}.block", safe_name));
         if block_path.exists() {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
+                let _ = file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()).set_modified(std::time::SystemTime::now()));
+            }
             fs::read(block_path).ok()
         } else {
             None
@@ -696,8 +707,11 @@ impl NvmeStaging {
         let target_dir = self.staging_dirs[idx].join("cache");
         let block_path = target_dir.join(format!("block_{}.block", safe_name));
         if block_path.exists() {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
+                let _ = file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()).set_modified(std::time::SystemTime::now()));
+            }
             use std::io::{Read, Seek, SeekFrom};
-            let mut file = fs::File::open(block_path).ok()?;
+            let mut file = fs::File::open(&block_path).ok()?;
             let metadata = file.metadata().ok()?;
             let file_len = metadata.len();
 

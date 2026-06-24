@@ -167,9 +167,8 @@ impl DataRouter {
                     backend_clone
                         .put_object(&block_key, processed, fencing_token)
                         .await?;
-                    // Cache the newly written block in RAM and NVMe
+                    // Cache the newly written block in RAM - dehydrated to NVMe on eviction
                     read_lru.put(&stored_block_key_clone, Arc::new(chunk_clone.clone()));
-                    let _ = cache_ref.cache_read_block(&stored_block_key_clone, &chunk_clone);
                     Ok::<(), SqueezefsError>(())
                 });
 
@@ -408,9 +407,8 @@ impl DataRouter {
                     backend_clone
                         .put_object(&block_key, processed, fencing_token)
                         .await?;
-                    // Cache the newly written block in RAM and NVMe
+                    // Cache the newly written block in RAM - dehydrated to NVMe on eviction
                     read_lru.put(&stored_block_key_clone, Arc::new(chunk_clone.clone()));
-                    let _ = cache_ref.cache_read_block(&stored_block_key_clone, &chunk_clone);
                     Ok::<(), SqueezefsError>(())
                 });
 
@@ -626,9 +624,8 @@ impl DataRouter {
                 let active_be = backend_clone.get_backend_for_key(&new_block_key);
                 let stored_new_block_key = format!("{}:{}", active_be, new_block_key);
 
-                // Cache newly written block in both RAM and local NVMe immediately
+                // Cache newly written block in RAM - dehydrated to NVMe on eviction
                 read_lru.put(&stored_new_block_key, Arc::new(block_data.clone()));
-                let _ = cache_ref.cache_read_block(&stored_new_block_key, &block_data);
 
                 // Spawn S3 upload asynchronously in the background
                 let backend_clone_bg = backend_clone.clone();
@@ -1184,7 +1181,6 @@ impl DataRouter {
 
                                 let downloaded = match downloaded_data {
                                     Some(data) => {
-                                        let _ = cache_ref.cache_read_block(b_key, &data);
                                         data
                                     }
                                     None => {
@@ -1192,7 +1188,6 @@ impl DataRouter {
                                         let (be_id, real_key) = parse_backend_and_key(b_key);
                                         let data = backend_ref.get_object(&be_id, &real_key).await?;
                                         let decompressed = crypto_clone.process_read(&data)?;
-                                        let _ = cache_ref.cache_read_block(b_key, &decompressed);
                                         decompressed
                                     }
                                 };

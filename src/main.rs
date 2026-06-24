@@ -398,6 +398,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+
+            // Check if we are running in WSL and mounting under /mnt/ without allow_other
+            let is_wsl = std::env::var("WSL_DISTRO_NAME").is_ok()
+                || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                    .map(|s| s.to_lowercase().contains("microsoft"))
+                    .unwrap_or(false);
+            if is_wsl && mountpoint.starts_with("/mnt/") && !*allow_other {
+                eprintln!("\x1b[93mWARNING\x1b[0m: Mounting a FUSE filesystem under '/mnt/' in WSL without '--allow-other'");
+                eprintln!("         can cause the mount to hang or become unresponsive due to the WSL host file sharing service.");
+                eprintln!("         Consider mounting under '/tmp/' or your home directory, or pass '--allow-other'");
+                eprintln!("         (which requires uncommenting 'user_allow_other' in /etc/fuse.conf).");
+            }
         }
 
         if let Err(e) = print_mount_diagnostics(

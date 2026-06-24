@@ -100,11 +100,11 @@ impl NvmeStaging {
             ));
         }
 
-        // Ensure all staging directories exist
+        // Ensure all staging directories and their subdirectories exist
         for dir in &staging_dirs {
-            if !dir.exists() {
-                fs::create_dir_all(dir)?;
-            }
+            fs::create_dir_all(dir.join("active_writes"))?;
+            fs::create_dir_all(dir.join("staging"))?;
+            fs::create_dir_all(dir.join("cache"))?;
         }
 
         let (write_tx, write_rx) = mpsc::channel::<PendingStagedWrite>(1000);
@@ -112,16 +112,37 @@ impl NvmeStaging {
         let mut initial_write_bytes = 0u64;
         let mut initial_read_bytes = 0u64;
         for dir in &staging_dirs {
-            if let Ok(entries) = std::fs::read_dir(dir) {
+            // Scan staging subdirectory for staged files (file_*.staged)
+            let staging_dir = dir.join("staging");
+            if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                 for entry in entries.flatten() {
                     if let Ok(meta) = entry.metadata() {
                         if meta.is_file() {
                             let path = entry.path();
-                            if let Some(ext) = path.extension() {
-                                if ext == "staged" {
-                                    initial_write_bytes += meta.len();
-                                } else if ext == "block" {
-                                    initial_read_bytes += meta.len();
+                            if path.extension().is_some_and(|ext| ext == "staged") {
+                                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                                    if name.starts_with("file_") {
+                                        initial_write_bytes += meta.len();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Scan cache subdirectory for block cache files (block_*.block)
+            let cache_dir = dir.join("cache");
+            if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            let path = entry.path();
+                            if path.extension().is_some_and(|ext| ext == "block") {
+                                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                                    if name.starts_with("block_") {
+                                        initial_read_bytes += meta.len();
+                                    }
                                 }
                             }
                         }
@@ -155,7 +176,7 @@ impl NvmeStaging {
     /// Retrieve the staging directory for a specific file_id.
     pub fn get_staged_path(&self, file_id: &str) -> PathBuf {
         let idx = get_dir_index(file_id, self.staging_dirs.len());
-        self.staging_dirs[idx].clone()
+        self.staging_dirs[idx].join("staging")
     }
 
     /// Stage a write locally to NVMe staging, returning immediately.
@@ -193,7 +214,7 @@ impl NvmeStaging {
         }
 
         let target_dir = self.get_staged_path(file_id);
-        let staged_path = target_dir.join(format!("{}.staged", file_id));
+        let staged_path = target_dir.join(format!("file_{}.staged", file_id));
 
         let data_clone = data.to_vec();
 
@@ -240,7 +261,7 @@ impl NvmeStaging {
     /// Read staged data directly from NVMe if it exists locally and has not yet been merged/cleared.
     pub fn read_staged(&self, file_id: &str) -> Option<Vec<u8>> {
         let target_dir = self.get_staged_path(file_id);
-        let staged_path = target_dir.join(format!("{}.staged", file_id));
+        let staged_path = target_dir.join(format!("file_{}.staged", file_id));
 
         if staged_path.exists() {
             if let Ok(metadata) = fs::metadata(&staged_path) {
@@ -291,7 +312,7 @@ impl NvmeStaging {
                 tokio::select! {
                     Some(pending) = write_rx.recv() => {
                         let idx = get_dir_index(&pending.file_id, staging_dirs.len());
-                        let local_path = staging_dirs[idx].join(format!("{}.staged", pending.file_id));
+                        let local_path = staging_dirs[idx].join("staging").join(format!("file_{}.staged", pending.file_id));
                         let (meta_len, ok) = tokio::task::spawn_blocking(move || {
                             if let Ok(metadata) = fs::metadata(&local_path) {
                                 (metadata.len(), true)
@@ -373,7 +394,7 @@ impl NvmeStaging {
         // 1. Pack individual staged file bytes into one payload
         for item in batch.iter() {
             let idx = get_dir_index(&item.file_id, staging_dirs.len());
-            let local_path = staging_dirs[idx].join(format!("{}.staged", item.file_id));
+            let local_path = staging_dirs[idx].join("staging").join(format!("file_{}.staged", item.file_id));
 
             let data_res = tokio::task::spawn_blocking(move || {
                 if let Ok(metadata) = fs::metadata(&local_path) {
@@ -449,7 +470,7 @@ impl NvmeStaging {
         for item in batch.iter() {
             let idx = get_dir_index(&item.file_id, staging_dirs.len());
             let target_dir = &staging_dirs[idx];
-            let local_path = target_dir.join(format!("{}.staged", item.file_id));
+            let local_path = target_dir.join("staging").join(format!("file_{}.staged", item.file_id));
             if local_path.exists() {
                 if let Ok(meta) = fs::metadata(&local_path) {
                     staged_bytes.fetch_sub(meta.len(), std::sync::atomic::Ordering::Relaxed);
@@ -494,19 +515,22 @@ impl NvmeStaging {
             let mut block_files = Vec::new();
 
             for dir in &self.staging_dirs {
-                if let Ok(entries) = fs::read_dir(dir) {
+                let cache_dir = dir.join("cache");
+                if let Ok(entries) = fs::read_dir(&cache_dir) {
                     for entry in entries.flatten() {
                         if let Ok(meta) = entry.metadata() {
                             if meta.is_file() {
                                 let path = entry.path();
-                                if let Some(ext) = path.extension() {
-                                    if ext == "block" {
-                                        total_bytes += meta.len();
-                                        let time = meta
-                                            .accessed()
-                                            .or_else(|_| meta.modified())
-                                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                                        block_files.push((path, meta.len(), time));
+                                if path.extension().is_some_and(|ext| ext == "block") {
+                                    if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                                        if name.starts_with("block_") {
+                                            total_bytes += meta.len();
+                                            let time = meta
+                                                .accessed()
+                                                .or_else(|_| meta.modified())
+                                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                            block_files.push((path, meta.len(), time));
+                                        }
                                     }
                                 }
                             }
@@ -556,9 +580,9 @@ impl NvmeStaging {
 
         let safe_name = block_key.replace(['/', ':'], "_");
         let idx = get_dir_index(&safe_name, self.staging_dirs.len());
-        let target_dir = &self.staging_dirs[idx];
-        let block_path = target_dir.join(format!("{}.block", safe_name));
-        let tmp_path = target_dir.join(format!("{}.{}.block.tmp", safe_name, Uuid::new_v4()));
+        let target_dir = self.staging_dirs[idx].join("cache");
+        let block_path = target_dir.join(format!("block_{}.block", safe_name));
+        let tmp_path = target_dir.join(format!("block_{}.{}.block.tmp", safe_name, Uuid::new_v4()));
 
         fs::write(&tmp_path, data)?;
         if let Err(e) = fs::rename(&tmp_path, &block_path) {
@@ -610,8 +634,8 @@ impl NvmeStaging {
     pub fn get_cached_read_block(&self, block_key: &str) -> Option<Vec<u8>> {
         let safe_name = block_key.replace(['/', ':'], "_");
         let idx = get_dir_index(&safe_name, self.staging_dirs.len());
-        let target_dir = &self.staging_dirs[idx];
-        let block_path = target_dir.join(format!("{}.block", safe_name));
+        let target_dir = self.staging_dirs[idx].join("cache");
+        let block_path = target_dir.join(format!("block_{}.block", safe_name));
         if block_path.exists() {
             fs::read(block_path).ok()
         } else {
@@ -628,8 +652,8 @@ impl NvmeStaging {
     ) -> Option<Vec<u8>> {
         let safe_name = block_key.replace(['/', ':'], "_");
         let idx = get_dir_index(&safe_name, self.staging_dirs.len());
-        let target_dir = &self.staging_dirs[idx];
-        let block_path = target_dir.join(format!("{}.block", safe_name));
+        let target_dir = self.staging_dirs[idx].join("cache");
+        let block_path = target_dir.join(format!("block_{}.block", safe_name));
         if block_path.exists() {
             use std::io::{Read, Seek, SeekFrom};
             let mut file = fs::File::open(block_path).ok()?;
@@ -653,14 +677,16 @@ impl NvmeStaging {
     pub fn list_staged_files(&self) -> Vec<String> {
         let mut files = Vec::new();
         for dir in &self.staging_dirs {
-            if let Ok(entries) = std::fs::read_dir(dir) {
+            let staging_dir = dir.join("staging");
+            if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_file() {
-                        if let Some(ext) = path.extension() {
-                            if ext == "staged" {
-                                if let Some(stem) = path.file_stem() {
-                                    files.push(stem.to_string_lossy().into_owned());
+                        if path.extension().is_some_and(|ext| ext == "staged") {
+                            if let Some(stem) = path.file_stem() {
+                                let stem_str = stem.to_string_lossy();
+                                if stem_str.starts_with("file_") {
+                                    files.push(stem_str.trim_start_matches("file_").to_string());
                                 }
                             }
                         }
@@ -674,14 +700,16 @@ impl NvmeStaging {
     pub fn list_cached_blocks(&self) -> Vec<String> {
         let mut blocks = Vec::new();
         for dir in &self.staging_dirs {
-            if let Ok(entries) = std::fs::read_dir(dir) {
+            let cache_dir = dir.join("cache");
+            if let Ok(entries) = std::fs::read_dir(&cache_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_file() {
-                        if let Some(ext) = path.extension() {
-                            if ext == "block" {
-                                if let Some(stem) = path.file_stem() {
-                                    blocks.push(stem.to_string_lossy().into_owned());
+                        if path.extension().is_some_and(|ext| ext == "block") {
+                            if let Some(stem) = path.file_stem() {
+                                let stem_str = stem.to_string_lossy();
+                                if stem_str.starts_with("block_") {
+                                    blocks.push(stem_str.trim_start_matches("block_").to_string());
                                 }
                             }
                         }

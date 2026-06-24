@@ -139,7 +139,9 @@ async fn test_get_cached_read_block_range() {
 
     let block_key = "test/block/key";
     let safe_name = block_key.replace('/', "_");
-    let block_file_path = dir_path.join(format!("{}.block", safe_name));
+    let cache_dir = dir_path.join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let block_file_path = cache_dir.join(format!("block_{}.block", safe_name));
 
     std::fs::write(&block_file_path, &block_data).unwrap();
 

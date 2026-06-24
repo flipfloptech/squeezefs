@@ -34,7 +34,9 @@ async fn test_crash_recovery_flow() {
     let fencing_token = 500u64;
 
     // 1. Manually write the local staging file to simulate a crash before flush
-    let staged_path = temp_dir.path().join(format!("{}.staged", file_id));
+    let staging_dir = temp_dir.path().join("staging");
+    fs::create_dir_all(&staging_dir).unwrap();
+    let staged_path = staging_dir.join(format!("file_{}.staged", file_id));
 
     let meta_content = serde_json::json!({
         "file_path": file_path,
@@ -114,7 +116,9 @@ async fn test_stale_write_recovery_discard() {
     let fencing_token = 500u64;
 
     // 1. Manually write the local staging file
-    let staged_path = temp_dir.path().join(format!("{}.staged", file_id));
+    let staging_dir = temp_dir.path().join("staging");
+    fs::create_dir_all(&staging_dir).unwrap();
+    let staged_path = staging_dir.join(format!("file_{}.staged", file_id));
 
     let meta_content = serde_json::json!({
         "file_path": file_path,

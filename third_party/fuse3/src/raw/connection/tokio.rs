@@ -6,16 +6,7 @@ use std::io;
 #[cfg(target_os = "linux")]
 use io_uring::{opcode, types, IoUring};
 
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-struct UringFd(std::os::fd::RawFd);
 
-#[cfg(target_os = "linux")]
-impl std::os::fd::AsRawFd for UringFd {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.0
-    }
-}
 
 #[cfg(target_os = "linux")]
 #[derive(Copy, Clone)]
@@ -300,12 +291,12 @@ struct NonBlockFuseConnection {
     #[cfg(target_os = "linux")]
     read_ring: std::sync::Mutex<DebugUring>,
     #[cfg(target_os = "linux")]
-    read_ring_fd: AsyncFd<UringFd>,
+    read_ring_fd: AsyncFd<OwnedFd>,
 
     #[cfg(target_os = "linux")]
     write_ring: std::sync::Mutex<DebugUring>,
     #[cfg(target_os = "linux")]
-    write_ring_fd: AsyncFd<UringFd>,
+    write_ring_fd: AsyncFd<OwnedFd>,
 
     read: Mutex<()>,
     write: Mutex<()>,
@@ -426,8 +417,36 @@ impl NonBlockFuseConnection {
         {
             let read_ring = IoUring::new(256)?;
             let write_ring = IoUring::new(256)?;
-            let read_ring_fd = AsyncFd::new(UringFd(read_ring.as_raw_fd()))?;
-            let write_ring_fd = AsyncFd::new(UringFd(write_ring.as_raw_fd()))?;
+
+            let read_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if read_event_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let write_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if write_event_fd < 0 {
+                unsafe { libc::close(read_event_fd); }
+                return Err(io::Error::last_os_error());
+            }
+
+            if let Err(e) = read_ring.submitter().register_eventfd(read_event_fd) {
+                unsafe {
+                    libc::close(read_event_fd);
+                    libc::close(write_event_fd);
+                }
+                return Err(e);
+            }
+
+            if let Err(e) = write_ring.submitter().register_eventfd(write_event_fd) {
+                unsafe {
+                    libc::close(read_event_fd);
+                    libc::close(write_event_fd);
+                }
+                return Err(e);
+            }
+
+            let read_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(read_event_fd) })?;
+            let write_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(write_event_fd) })?;
 
             let read_ring = DebugUring(read_ring);
             let write_ring = DebugUring(write_ring);
@@ -527,6 +546,15 @@ impl NonBlockFuseConnection {
             let mut fd_guard = match self.read_ring_fd.ready(Interest::READABLE).await {
                 Err(err) => return ((header_buf, data_buf), Err(err)),
                 Ok(guard) => guard,
+            };
+
+            let mut buf = [0u8; 8];
+            let _ = unsafe {
+                libc::read(
+                    self.read_ring_fd.get_ref().as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    8,
+                )
             };
 
             fd_guard.clear_ready();
@@ -643,6 +671,15 @@ impl NonBlockFuseConnection {
             let mut fd_guard = match self.write_ring_fd.ready(Interest::READABLE).await {
                 Err(err) => return ((data, body_extend_data), Err(err)),
                 Ok(guard) => guard,
+            };
+
+            let mut buf = [0u8; 8];
+            let _ = unsafe {
+                libc::read(
+                    self.write_ring_fd.get_ref().as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    8,
+                )
             };
 
             fd_guard.clear_ready();

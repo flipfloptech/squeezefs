@@ -1012,6 +1012,14 @@ impl Filesystem for SqueezefsFilesystem {
             let active_dir = dir.join("active_writes");
             if active_dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            let _ = std::fs::remove_dir(&path);
+                        }
+                    }
+                }
+                if let Ok(entries) = std::fs::read_dir(&active_dir) {
                     active_writes_count += entries.filter_map(|e| e.ok()).count();
                 }
             }
@@ -3807,7 +3815,8 @@ pub async fn start_mount<P: AsRef<Path>>(
                 let mut staged_count = 0;
                 let mut active_writes_count = 0;
                 for dir in &staging_dirs {
-                    if let Ok(entries) = std::fs::read_dir(dir) {
+                    let staging_dir = dir.join("staging");
+                    if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                         for entry in entries.flatten() {
                             let path = entry.path();
                             if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
@@ -3817,6 +3826,14 @@ pub async fn start_mount<P: AsRef<Path>>(
                     }
                     let active_dir = dir.join("active_writes");
                     if active_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_dir() {
+                                    let _ = std::fs::remove_dir(&path);
+                                }
+                            }
+                        }
                         if let Ok(entries) = std::fs::read_dir(&active_dir) {
                             active_writes_count += entries.filter_map(|e| e.ok()).count();
                         }
@@ -3852,8 +3869,10 @@ pub async fn start_mount<P: AsRef<Path>>(
                         let max_wait = std::time::Duration::from_secs(dismount_wait);
                         loop {
                             let mut current_staged = 0;
+                            let mut current_active = 0;
                             for dir in &staging_dirs {
-                                if let Ok(entries) = std::fs::read_dir(dir) {
+                                let staging_dir = dir.join("staging");
+                                if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                                     for entry in entries.flatten() {
                                         let path = entry.path();
                                         if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
@@ -3861,16 +3880,30 @@ pub async fn start_mount<P: AsRef<Path>>(
                                         }
                                     }
                                 }
+                                let active_dir = dir.join("active_writes");
+                                if active_dir.exists() {
+                                    if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                                        for entry in entries.flatten() {
+                                            let path = entry.path();
+                                            if path.is_dir() {
+                                                let _ = std::fs::remove_dir(&path);
+                                            }
+                                        }
+                                    }
+                                    if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                                        current_active += entries.filter_map(|e| e.ok()).count();
+                                    }
+                                }
                             }
-                            if current_staged == 0 {
-                                println!("\nAll staged files drained cleanly!");
+                            if current_staged == 0 && current_active == 0 {
+                                println!("\nAll staged files and active writes drained cleanly!");
                                 break;
                             }
                             if start_wait.elapsed() >= max_wait {
-                                println!("\nGrace period expired. Unmounting with remaining staged files: {}", current_staged);
+                                println!("\nGrace period expired. Unmounting with remaining staged files: {}, active writes: {}", current_staged, current_active);
                                 break;
                             }
-                            print!("\rRemaining staged files: {}... (elapsed: {}s / limit: {}s)", current_staged, start_wait.elapsed().as_secs(), dismount_wait);
+                            print!("\rRemaining staged files: {}, active writes: {}... (elapsed: {}s / limit: {}s)", current_staged, current_active, start_wait.elapsed().as_secs(), dismount_wait);
                             let _ = std::io::stdout().flush();
                             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         }

@@ -1459,6 +1459,15 @@ impl DataRouter {
             .hdel(&meta_key, "file_id");
         let _: () = pipe.query_async(con).await.unwrap_or(());
 
+        // Physically delete any local active writes directory for this inode
+        let staging_dirs = self.cache.nvme.staging_dirs();
+        for dir in staging_dirs {
+            let active_dir = dir.join("active_writes").join(file_path);
+            if active_dir.exists() {
+                let _ = tokio::fs::remove_dir_all(&active_dir).await;
+            }
+        }
+
         self.cache.write_lru.remove(file_path);
         self.cache.read_lru.remove(file_path);
         self.metadata_cache.remove(file_path);

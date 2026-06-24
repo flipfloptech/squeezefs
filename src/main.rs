@@ -1621,6 +1621,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let active_dir = dir.join("active_writes");
                 if active_dir.exists() {
                     if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let _ = std::fs::remove_dir(&path);
+                            }
+                        }
+                    }
+                    if let Ok(entries) = std::fs::read_dir(&active_dir) {
                         active_writes_count += entries.filter_map(|e| e.ok()).count();
                     }
                 }
@@ -1683,6 +1691,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             let active_dir = dir.join("active_writes");
                             if active_dir.exists() {
+                                if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                                    for entry in entries.flatten() {
+                                        let path = entry.path();
+                                        if path.is_dir() {
+                                            let _ = std::fs::remove_dir(&path);
+                                        }
+                                    }
+                                }
                                 if let Ok(entries) = std::fs::read_dir(&active_dir) {
                                     current_active += entries.filter_map(|e| e.ok()).count();
                                 }

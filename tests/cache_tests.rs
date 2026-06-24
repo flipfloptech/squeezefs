@@ -433,4 +433,119 @@ async fn test_dynamic_upload_delay() {
         .unwrap_or(());
 }
 
+#[tokio::test]
+async fn test_active_writes_pruning_and_deletion() {
+    use std::fs::{create_dir_all, write, read_dir, remove_dir};
+    use squeezefs::routing::DataRouter;
 
+    let temp_dir = tempfile::tempdir().unwrap();
+    let staging_dirs = vec![temp_dir.path().to_path_buf()];
+
+    // 1. Create active writes directory structure
+    let active_dir = temp_dir.path().join("active_writes");
+    let empty_inode_dir = active_dir.join("inode_111");
+    let nonempty_inode_dir = active_dir.join("inode_222");
+
+    create_dir_all(&empty_inode_dir).unwrap();
+    create_dir_all(&nonempty_inode_dir).unwrap();
+
+    // Write a dummy block file inside nonempty_inode_dir
+    write(nonempty_inode_dir.join("block_0"), b"data").unwrap();
+
+    // Verify both directories exist before pruning
+    assert!(empty_inode_dir.exists());
+    assert!(nonempty_inode_dir.exists());
+
+    // 2. Perform the same pruning logic as in unmount/destroy
+    for dir in &staging_dirs {
+        let active_dir_path = dir.join("active_writes");
+        if active_dir_path.exists() {
+            if let Ok(entries) = read_dir(&active_dir_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let _ = remove_dir(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Verify empty_inode_dir was deleted, but nonempty_inode_dir still exists
+    assert!(!empty_inode_dir.exists(), "Empty inode directory should be pruned");
+    assert!(nonempty_inode_dir.exists(), "Non-empty inode directory should NOT be pruned");
+
+    // 4. Test Router's delete_file functionality deletes the active writes directory (even if non-empty)
+    let redis_url = std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    if let Ok(dlm) = squeezefs::dlm::DlmClient::new(&redis_url) {
+        if let Ok(client) = redis::Client::open(redis_url.clone()) {
+            if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                let _: () = redis::cmd("FLUSHALL")
+                    .query_async(&mut con)
+                    .await
+                    .unwrap_or(());
+
+                let _ = squeezefs::fuse_client::format_volume(
+                    &redis_url,
+                    "test_active_writes_vol",
+                    4 * 1024 * 1024,
+                    100 * 1024 * 1024 * 1024,
+                    0,
+                    "none",
+                    "none",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+
+                let backend = RustFsClient::new_mock();
+                let cache_dir = tempfile::tempdir().unwrap();
+                let cache = squeezefs::cache::TieredCache::new(
+                    vec![cache_dir.path().to_path_buf()],
+                    None,
+                    None,
+                    None,
+                    None,
+                    backend.clone(),
+                    dlm.meta_client().clone(),
+                )
+                .unwrap();
+
+                let router = DataRouter::new(dlm, backend, cache);
+
+                // Create an active write directory inside the router's staging dir
+                let router_active_dir = cache_dir.path().join("active_writes").join("inode_333");
+                create_dir_all(&router_active_dir).unwrap();
+                write(router_active_dir.join("block_0"), b"data").unwrap();
+                assert!(router_active_dir.exists());
+
+                // Set up basic metadata in Redis for inode_333 so delete_file works
+                let meta_key = "metadata:inode_333";
+                let mut conn = router.dlm.get_connection().await.unwrap();
+                let _: () = redis::cmd("HSET")
+                    .arg(meta_key)
+                    .arg("type")
+                    .arg("striped")
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap();
+
+                // Call delete_file
+                router.delete_file("inode_333", &mut conn).await.unwrap();
+
+                // Verify the active writes directory is completely gone!
+                assert!(!router_active_dir.exists(), "delete_file should delete the active_writes directory of the inode");
+            }
+        }
+    }
+}

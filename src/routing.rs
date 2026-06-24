@@ -160,7 +160,6 @@ impl DataRouter {
                 let backend_clone = self.backend.clone();
                 let crypto = self.get_crypto().clone();
                 let read_lru = self.cache.read_lru.clone();
-                let cache_ref = self.cache.nvme.clone();
                 let chunk_clone = chunk.clone();
                 let task = tokio::spawn(async move {
                     let processed = crypto.process_write(&chunk)?;
@@ -400,7 +399,6 @@ impl DataRouter {
                 let backend_clone = self.backend.clone();
                 let crypto = self.get_crypto().clone();
                 let read_lru = self.cache.read_lru.clone();
-                let cache_ref = self.cache.nvme.clone();
                 let chunk_clone = chunk.clone();
                 let task = tokio::spawn(async move {
                     let processed = crypto.process_write(&chunk)?;

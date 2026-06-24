@@ -36,7 +36,7 @@ impl LruCache {
         let evict_tx_clone = evict_tx.clone();
 
         let inner = Cache::builder()
-            .weigher(|_key, value: &Arc<Vec<u8>>| -> u32 {
+            .weigher(|_key: &String, value: &Arc<Vec<u8>>| -> u32 {
                 value.len().try_into().unwrap_or(u32::MAX)
             })
             .max_capacity(max_bytes)
@@ -66,7 +66,7 @@ impl LruCache {
         let evict_tx_clone = evict_tx.clone();
 
         let inner = Cache::builder()
-            .weigher(|_key, value: &Arc<Vec<u8>>| -> u32 {
+            .weigher(|_key: &String, value: &Arc<Vec<u8>>| -> u32 {
                 value.len().try_into().unwrap_or(u32::MAX)
             })
             .max_capacity(max_bytes)

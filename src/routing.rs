@@ -162,7 +162,7 @@ impl DataRouter {
                     .cache
                     .nvme
                     .get_staged_path(&old_id)
-                    .join(format!("{}.staged", old_id));
+                    .join(format!("file_{}.staged", old_id));
                 let _ = tokio::fs::remove_file(old_staged_path).await;
                 let mapping_key = format!("mapping:{}", old_id);
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
@@ -207,7 +207,7 @@ impl DataRouter {
                             .cache
                             .nvme
                             .get_staged_path(&old_id)
-                            .join(format!("{}.staged", old_id));
+                            .join(format!("file_{}.staged", old_id));
                         let _ = tokio::fs::remove_file(old_staged_path).await;
                         let mapping_key = format!("mapping:{}", old_id);
                         let _: () = con.del(&mapping_key).await.unwrap_or(());
@@ -257,7 +257,7 @@ impl DataRouter {
                             .cache
                             .nvme
                             .get_staged_path(&old_id)
-                            .join(format!("{}.staged", old_id));
+                            .join(format!("file_{}.staged", old_id));
                         let _ = tokio::fs::remove_file(old_staged_path).await;
                         let old_mapping_key = format!("mapping:{}", old_id);
                         let _: () = con.del(&old_mapping_key).await.unwrap_or(());
@@ -360,7 +360,7 @@ impl DataRouter {
                     .cache
                     .nvme
                     .get_staged_path(&old_id)
-                    .join(format!("{}.staged", old_id));
+                    .join(format!("file_{}.staged", old_id));
                 let _ = tokio::fs::remove_file(old_staged_path).await;
                 let mapping_key = format!("mapping:{}", old_id);
                 // Decrement refcount of old staged merged block if it exists
@@ -1229,7 +1229,7 @@ impl DataRouter {
                 .cache
                 .nvme
                 .get_staged_path(&src_file_id)
-                .join(format!("{}.staged", src_file_id));
+                .join(format!("file_{}.staged", src_file_id));
 
             let dest_dir = self.cache.nvme.get_staged_path(&new_file_id);
             tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
@@ -1239,7 +1239,7 @@ impl DataRouter {
                 )))
             })?;
 
-            let dest_staged_path = dest_dir.join(format!("{}.staged", new_file_id));
+            let dest_staged_path = dest_dir.join(format!("file_{}.staged", new_file_id));
 
             if tokio::fs::metadata(&src_staged_path).await.is_ok() {
                 tokio::fs::copy(&src_staged_path, &dest_staged_path)
@@ -1445,7 +1445,7 @@ impl DataRouter {
                         .cache
                         .nvme
                         .get_staged_path(&fid)
-                        .join(format!("{}.staged", fid));
+                        .join(format!("file_{}.staged", fid));
                     let _ = tokio::fs::remove_file(old_staged_path).await;
                 }
             }

@@ -37,25 +37,34 @@ pub async fn recover_staging(
         }
     }
 
+    let staging_subdir = staging_dir.join("staging");
+    if !staging_subdir.exists() {
+        return Ok(0);
+    }
+
     info!(
         "Crash Recovery: Scanning local NVMe staging directory '{:?}' for pending writes.",
-        staging_dir
+        staging_subdir
     );
     let mut recovered_count = 0;
     let mut con = redis_client.get_connection().await?;
 
-    let entries = fs::read_dir(staging_dir)?;
+    let entries = fs::read_dir(&staging_subdir)?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
 
         // Only process staged files (.staged)
         if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-            let file_id = path
+            let name = path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
+
+            if !name.starts_with("file_") {
+                continue;
+            }
+            let file_id = name.trim_start_matches("file_").to_string();
 
             if file_id.is_empty() {
                 continue;

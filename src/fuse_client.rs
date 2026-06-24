@@ -989,11 +989,14 @@ impl Filesystem for SqueezefsFilesystem {
         let staged_count = loop {
             let mut current_staged = 0;
             for dir in staging_dirs {
-                if let Ok(entries) = std::fs::read_dir(dir) {
+                let staging_dir = dir.join("staging");
+                if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-                            current_staged += 1;
+                            if path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_")) {
+                                current_staged += 1;
+                            }
                         }
                     }
                 }

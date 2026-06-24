@@ -98,7 +98,7 @@ async fn test_block_level_read_range_striped() {
         router.cache().read_lru.remove(bk);
         let safe_name = bk.replace(['/', ':'], "_");
         for dir in router.cache().nvme.staging_dirs() {
-            let block_path = dir.join(format!("{}.block", safe_name));
+            let block_path = dir.join("cache").join(format!("block_{}.block", safe_name));
             if block_path.exists() {
                 let _ = std::fs::remove_file(block_path);
             }

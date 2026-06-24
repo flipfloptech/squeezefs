@@ -138,13 +138,16 @@ async fn test_multi_disk_distribution() {
     // Verify files were actually placed in the respective directories
     let mut total_files = 0;
     for dir in &staging_dirs {
-        let entries: Vec<_> = std::fs::read_dir(dir)
+        let staging_dir = dir.join("staging");
+        let entries: Vec<_> = std::fs::read_dir(&staging_dir)
             .unwrap()
             .map(|res| res.unwrap().path())
             .collect();
         for path in entries {
             if path.extension().is_some_and(|ext| ext == "staged") {
-                total_files += 1;
+                if path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_")) {
+                    total_files += 1;
+                }
             }
         }
     }

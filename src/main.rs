@@ -1574,11 +1574,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut staged_count = 0;
             let mut active_writes_count = 0;
             for dir in &staging_dirs {
-                if let Ok(entries) = std::fs::read_dir(dir) {
+                let staging_dir = dir.join("staging");
+                if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-                            staged_count += 1;
+                            if path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_")) {
+                                staged_count += 1;
+                            }
                         }
                     }
                 }
@@ -1634,11 +1637,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let mut current_staged = 0;
                         let mut current_active = 0;
                         for dir in &staging_dirs {
-                            if let Ok(entries) = std::fs::read_dir(dir) {
+                            let staging_dir = dir.join("staging");
+                            if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                                 for entry in entries.flatten() {
                                     let path = entry.path();
                                     if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-                                        current_staged += 1;
+                                        if path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_")) {
+                                            current_staged += 1;
+                                        }
                                     }
                                 }
                             }

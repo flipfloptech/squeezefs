@@ -297,3 +297,43 @@ async fn test_write_fallback_on_cache_full() {
         block
     );
 }
+
+#[tokio::test]
+async fn test_route_sparse_large_file_striped() {
+    let (router, _temp_dir) = match setup_router().await {
+        Some(r) => r,
+        None => {
+            println!("Skipping test: Redis/Garnet or S3 not available");
+            return;
+        }
+    };
+
+    let file_path = "sparse_large_file.bin";
+    let data = vec![7; 4096]; // 4KB
+
+    // Write at 50MB offset (exceeds 4MB striped layout threshold)
+    router
+        .write_file(file_path, 50 * 1024 * 1024, &data, 102)
+        .await
+        .expect("Should write sparse file");
+
+    let size = router
+        .get_file_size(file_path)
+        .await
+        .expect("Should read size");
+    assert_eq!(size, 50 * 1024 * 1024 + 4096);
+
+    // Read back a range before the write (should be zeros)
+    let zero_range = router
+        .read_file_range(file_path, 10 * 1024 * 1024, 4096)
+        .await
+        .expect("Should read zero range");
+    assert_eq!(zero_range, vec![0; 4096]);
+
+    // Read back the written range
+    let written_range = router
+        .read_file_range(file_path, 50 * 1024 * 1024, 4096)
+        .await
+        .expect("Should read written range");
+    assert_eq!(written_range, data);
+}

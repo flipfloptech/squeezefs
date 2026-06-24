@@ -20,6 +20,15 @@ use tokio::runtime::Builder;
 const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
+fn get_default_staging_dir() -> std::path::PathBuf {
+    let uid = unsafe { libc::getuid() };
+    if uid == 0 {
+        std::path::PathBuf::from("/tmp/squeezefs_staging")
+    } else {
+        std::path::PathBuf::from(format!("/tmp/squeezefs_staging_{}", uid))
+    }
+}
+
 #[derive(Default)]
 pub struct ProbabilisticAtomic {
     inner: AtomicU64,
@@ -187,7 +196,7 @@ impl SqueezefsFilesystem {
             .staging_dirs()
             .first()
             .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/squeezefs_staging"));
+            .unwrap_or_else(get_default_staging_dir);
         let active_dir = staging_dir.join("active_writes");
         if active_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(active_dir) {
@@ -398,7 +407,7 @@ impl SqueezefsFilesystem {
             .staging_dirs()
             .first()
             .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/squeezefs_staging"));
+            .unwrap_or_else(get_default_staging_dir);
 
         let active_dir = staging_dir
             .join("active_writes")
@@ -547,7 +556,7 @@ impl SqueezefsFilesystem {
             .staging_dirs()
             .first()
             .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/squeezefs_staging"));
+            .unwrap_or_else(get_default_staging_dir);
 
         let active_dir = staging_dir
             .join("active_writes")
@@ -1453,7 +1462,7 @@ impl Filesystem for SqueezefsFilesystem {
             .staging_dirs()
             .first()
             .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/squeezefs_staging"));
+            .unwrap_or_else(get_default_staging_dir);
 
         let active_dir = staging_dir
             .join("active_writes")
@@ -3775,11 +3784,17 @@ pub async fn start_mount<P: AsRef<Path>>(
     let staging_dirs = fs.router.cache.nvme.staging_dirs().to_vec();
 
     // Spawns the mount loop using fuse3 Session
-    let session = fuse3::raw::Session::new(options)
-        .mount(fs, mount_path.clone())
-        .await?;
+    let session = fuse3::raw::Session::new(options);
 
-    let mut handle = session;
+    #[cfg(target_os = "linux")]
+    let mut handle = if unsafe { libc::getuid() } == 0 {
+        session.mount(fs, mount_path.clone()).await?
+    } else {
+        session.mount_with_unprivileged(fs, mount_path.clone()).await?
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let mut handle = session.mount(fs, mount_path.clone()).await?;
 
     let mut should_exit = false;
     while !should_exit {

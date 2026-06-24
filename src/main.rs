@@ -334,6 +334,18 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(unix)]
+static DAEMON_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn get_default_staging_dir() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    if uid == 0 {
+        PathBuf::from("/tmp/squeezefs_staging")
+    } else {
+        PathBuf::from(format!("/tmp/squeezefs_staging_{}", uid))
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dhat-on")]
     let _profiler = dhat::Profiler::new_heap();
@@ -361,6 +373,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..
     } = &cli.command
     {
+        let uid = unsafe { libc::getuid() };
+        if uid != 0 {
+            if !mountpoint.exists() {
+                eprintln!("Error: Mountpoint {:?} does not exist.", mountpoint);
+                std::process::exit(1);
+            }
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata(mountpoint) {
+                Ok(meta) => {
+                    if meta.uid() != uid {
+                        eprintln!(
+                            "Error: Mountpoint {:?} is owned by UID {}, but current user is UID {}.",
+                            mountpoint,
+                            meta.uid(),
+                            uid
+                        );
+                        eprintln!("Please use a mountpoint owned by you, or run with sudo.");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to read metadata of mountpoint {:?}: {}", mountpoint, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         if let Err(e) = print_mount_diagnostics(
             &cli.garnet_url,
             mountpoint,
@@ -386,12 +425,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if *daemon {
             let mountpoint_path = mountpoint.clone();
+            let mut pipefd = [0; 2];
             unsafe {
+                if libc::pipe(pipefd.as_mut_ptr()) < 0 {
+                    eprintln!("Failed to create daemon pipe");
+                    std::process::exit(1);
+                }
                 let pid = libc::fork();
                 if pid < 0 {
                     eprintln!("Failed to fork daemon process");
                     std::process::exit(1);
                 } else if pid > 0 {
+                    // Close the write end of the pipe in the parent process
+                    libc::close(pipefd[1]);
+
+                    // Set read end of the pipe to non-blocking
+                    let flags = libc::fcntl(pipefd[0], libc::F_GETFL);
+                    if flags >= 0 {
+                        libc::fcntl(pipefd[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+
+                    let mut child_error = String::new();
+
                     // Parent process waits for mount point to become ready
                     print!("Mounting Squeezefs at {:?}...", mountpoint_path);
                     use std::io::Write;
@@ -402,15 +457,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     while start.elapsed() < std::time::Duration::from_secs(10) {
                         std::thread::sleep(std::time::Duration::from_millis(500));
 
+                        // Read from pipe to check for errors/panics from child
+                        let mut buf = [0u8; 1024];
+                        let n = libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                        if n > 0 {
+                            if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                                child_error.push_str(s);
+                            }
+                        }
+
                         // Check if child is still running
                         let mut status = 0;
                         let wait_res = libc::waitpid(pid, &mut status, libc::WNOHANG);
                         if wait_res == pid {
-                            // Child exited!
+                            // Child exited! Read any remaining output from pipe
+                            loop {
+                                let n = libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                                if n <= 0 {
+                                    break;
+                                }
+                                if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                                    child_error.push_str(s);
+                                }
+                            }
                             println!();
-                            eprintln!(
-                                "Failed to start squeezefs daemon. Child process exited early."
-                            );
+                            if !child_error.is_empty() {
+                                eprintln!(
+                                    "Failed to start squeezefs daemon. Child error:\n{}",
+                                    child_error
+                                );
+                            } else {
+                                eprintln!(
+                                    "Failed to start squeezefs daemon. Child process exited early."
+                                );
+                            }
+                            libc::close(pipefd[0]);
                             std::process::exit(1);
                         }
 
@@ -447,6 +528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}",
                             mountpoint_path
                         );
+                        libc::close(pipefd[0]);
                         std::process::exit(0);
                     } else {
                         eprintln!("The mount point is not ready in 10 seconds, exiting");
@@ -455,10 +537,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .arg(&mountpoint_path)
                             .output();
                         libc::kill(pid, libc::SIGKILL);
+                        libc::close(pipefd[0]);
                         std::process::exit(1);
                     }
                 }
                 // Child process detaches
+                libc::close(pipefd[0]);
+                DAEMON_PIPE.store(pipefd[1], std::sync::atomic::Ordering::Relaxed);
+
+                // Register panic hook in child process
+                std::panic::set_hook(Box::new(|panic_info| {
+                    let fd = DAEMON_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+                    if fd >= 0 {
+                        let msg = format!("Panic: {}\n", panic_info);
+                        let _ = unsafe {
+                            libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
+                        };
+                        let _ = unsafe { libc::close(fd) };
+                    }
+                }));
+
                 libc::setsid();
                 // Redirect stdin to /dev/null
                 if let Ok(null_file) = std::fs::File::open("/dev/null") {
@@ -518,7 +616,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .unwrap();
 
-    rt.block_on(async { run_app(cli).await })
+    let res = rt.block_on(async { run_app(cli).await });
+    if let Err(ref e) = res {
+        #[cfg(unix)]
+        {
+            let fd = DAEMON_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+            if fd >= 0 {
+                let msg = format!("Error: {}\n", e);
+                let _ = unsafe {
+                    libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
+                };
+                let _ = unsafe { libc::close(fd) };
+            }
+        }
+    }
+    res
 }
 
 fn format_size(bytes: u64) -> String {
@@ -659,18 +771,18 @@ fn print_mount_diagnostics(
 
     let staging_dirs = if let Some(dirs) = disk_cache_paths {
         if dirs.is_empty() {
-            vec![PathBuf::from("/tmp/squeezefs_staging")]
+            vec![get_default_staging_dir()]
         } else {
             dirs.to_vec()
         }
     } else if let Some(paths_str) = format_fields.get("disk_cache_paths") {
         if paths_str.is_empty() {
-            vec![PathBuf::from("/tmp/squeezefs_staging")]
+            vec![get_default_staging_dir()]
         } else {
             paths_str.split(',').map(PathBuf::from).collect()
         }
     } else {
-        vec![PathBuf::from("/tmp/squeezefs_staging")]
+        vec![get_default_staging_dir()]
     };
 
     let final_s3_endpoint = s3_endpoint
@@ -1088,18 +1200,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Resolve staging directories: CLI override > Garnet setting > default "/tmp/squeezefs_staging"
             let staging_dirs = if let Some(dirs) = disk_cache_paths {
                 if dirs.is_empty() {
-                    vec![PathBuf::from("/tmp/squeezefs_staging")]
+                    vec![get_default_staging_dir()]
                 } else {
                     dirs
                 }
             } else if let Some(paths_str) = format_fields.get("disk_cache_paths") {
                 if paths_str.is_empty() {
-                    vec![PathBuf::from("/tmp/squeezefs_staging")]
+                    vec![get_default_staging_dir()]
                 } else {
                     paths_str.split(',').map(PathBuf::from).collect()
                 }
             } else {
-                vec![PathBuf::from("/tmp/squeezefs_staging")]
+                vec![get_default_staging_dir()]
             };
 
             let mut active_staging_dirs = Vec::new();
@@ -1439,7 +1551,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Clone { src, dest } => {
             let redis_url = &cli.garnet_url;
-            let staging_dirs = vec![PathBuf::from("/tmp/squeezefs_staging")];
+            let staging_dirs = vec![get_default_staging_dir()];
 
             let dlm = DlmClient::new(redis_url)?;
             let backend = RustFsClient::new().await;
@@ -1656,7 +1768,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // 3. Fall back to default staging directory
             if staging_dirs.is_empty() {
-                staging_dirs = vec![PathBuf::from("/tmp/squeezefs_staging")];
+                staging_dirs = vec![get_default_staging_dir()];
             }
 
             // 4. Resolve dismount_wait limit (default: 10)

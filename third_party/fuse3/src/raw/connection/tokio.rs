@@ -548,16 +548,33 @@ impl NonBlockFuseConnection {
                 Ok(guard) => guard,
             };
 
-            let mut buf = [0u8; 8];
-            let _ = unsafe {
-                libc::read(
-                    self.read_ring_fd.get_ref().as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    8,
-                )
-            };
-
-            fd_guard.clear_ready();
+            // Loop reading eventfd until EAGAIN (WouldBlock) to ensure no lost wakeups
+            loop {
+                let mut buf = [0u8; 8];
+                let res = unsafe {
+                    libc::read(
+                        self.read_ring_fd.get_ref().as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        8,
+                    )
+                };
+                if res < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        fd_guard.clear_ready();
+                        break;
+                    } else {
+                        return ((header_buf, data_buf), Err(err));
+                    }
+                } else if res == 0 {
+                    break;
+                } else {
+                    continue;
+                }
+            }
         }
     }
 
@@ -673,16 +690,33 @@ impl NonBlockFuseConnection {
                 Ok(guard) => guard,
             };
 
-            let mut buf = [0u8; 8];
-            let _ = unsafe {
-                libc::read(
-                    self.write_ring_fd.get_ref().as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    8,
-                )
-            };
-
-            fd_guard.clear_ready();
+            // Loop reading eventfd until EAGAIN (WouldBlock) to ensure no lost wakeups
+            loop {
+                let mut buf = [0u8; 8];
+                let res = unsafe {
+                    libc::read(
+                        self.write_ring_fd.get_ref().as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        8,
+                    )
+                };
+                if res < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        fd_guard.clear_ready();
+                        break;
+                    } else {
+                        return ((data, body_extend_data), Err(err));
+                    }
+                } else if res == 0 {
+                    break;
+                } else {
+                    continue;
+                }
+            }
         }
     }
 

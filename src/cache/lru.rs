@@ -1,5 +1,6 @@
 use crate::error::Result;
 use log::info;
+use moka::notification::RemovalCause;
 use moka::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,6 +11,7 @@ pub struct LruCache {
     inner: Cache<String, Arc<Vec<u8>>>,
     max_bytes: u64,
     current_bytes: Arc<AtomicU64>,
+    evict_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(String, Arc<Vec<u8>>)>>>>,
 }
 
 impl LruCache {
@@ -30,13 +32,20 @@ impl LruCache {
         let current_bytes = Arc::new(AtomicU64::new(0));
         let current_bytes_clone = current_bytes.clone();
 
+        let (evict_tx, evict_rx) = tokio::sync::mpsc::unbounded_channel();
+        let evict_tx_clone = evict_tx.clone();
+
         let inner = Cache::builder()
             .weigher(|_key, value: &Arc<Vec<u8>>| -> u32 {
                 value.len().try_into().unwrap_or(u32::MAX)
             })
             .max_capacity(max_bytes)
-            .eviction_listener(move |_key, value: Arc<Vec<u8>>, _cause| {
+            .time_to_idle(std::time::Duration::from_secs(30))
+            .eviction_listener(move |key, value: Arc<Vec<u8>>, cause| {
                 current_bytes_clone.fetch_sub(value.len() as u64, Ordering::Relaxed);
+                if cause == RemovalCause::Expired || cause == RemovalCause::Size {
+                    let _ = evict_tx_clone.send(((*key).clone(), value));
+                }
             })
             .build();
 
@@ -44,6 +53,7 @@ impl LruCache {
             inner,
             max_bytes,
             current_bytes,
+            evict_rx: Arc::new(std::sync::Mutex::new(Some(evict_rx))),
         })
     }
 
@@ -52,13 +62,20 @@ impl LruCache {
         let current_bytes = Arc::new(AtomicU64::new(0));
         let current_bytes_clone = current_bytes.clone();
 
+        let (evict_tx, evict_rx) = tokio::sync::mpsc::unbounded_channel();
+        let evict_tx_clone = evict_tx.clone();
+
         let inner = Cache::builder()
             .weigher(|_key, value: &Arc<Vec<u8>>| -> u32 {
                 value.len().try_into().unwrap_or(u32::MAX)
             })
             .max_capacity(max_bytes)
-            .eviction_listener(move |_key, value: Arc<Vec<u8>>, _cause| {
+            .time_to_idle(std::time::Duration::from_secs(30))
+            .eviction_listener(move |key, value: Arc<Vec<u8>>, cause| {
                 current_bytes_clone.fetch_sub(value.len() as u64, Ordering::Relaxed);
+                if cause == RemovalCause::Expired || cause == RemovalCause::Size {
+                    let _ = evict_tx_clone.send(((*key).clone(), value));
+                }
             })
             .build();
 
@@ -66,7 +83,13 @@ impl LruCache {
             inner,
             max_bytes,
             current_bytes,
+            evict_rx: Arc::new(std::sync::Mutex::new(Some(evict_rx))),
         }
+    }
+
+    /// Retrieve the eviction receiver. Can only be taken once.
+    pub fn take_evict_rx(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<(String, Arc<Vec<u8>>)>> {
+        self.evict_rx.lock().ok()?.take()
     }
 
     /// Retrieve an entry from the cache, updating its LRU status.

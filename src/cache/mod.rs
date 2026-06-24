@@ -72,6 +72,21 @@ impl TieredCache {
             backend,
             redis_client,
         )?;
+
+        // Spawn background dehydration task to move evicted RAM blocks to NVMe
+        if let Some(mut evict_rx) = read_lru.take_evict_rx() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let nvme_clone = nvme.clone();
+                handle.spawn(async move {
+                    while let Some((key, data)) = evict_rx.recv().await {
+                        if key.contains("blocks/") {
+                            let _ = nvme_clone.cache_read_block(&key, &data);
+                        }
+                    }
+                });
+            }
+        }
+
         Ok(Self {
             gds,
             read_lru,

@@ -339,8 +339,8 @@ impl MetaClient {
         match self {
             Self::Single(client) => {
                 let addr_str = format!("{:?}", client.get_connection_info().addr);
-                let conn = if let Some(c) = SINGLE_CONN_POOL.get(&addr_str) {
-                    c.clone()
+                let conn = if let Some(conn) = SINGLE_CONN_POOL.get(&addr_str).map(|r| r.clone()) {
+                    conn
                 } else {
                     let new_conn = client.get_multiplexed_tokio_connection().await?;
                     SINGLE_CONN_POOL.insert(addr_str, new_conn.clone());

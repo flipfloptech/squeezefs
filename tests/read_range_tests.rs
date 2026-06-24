@@ -91,6 +91,9 @@ async fn test_block_level_read_range_striped() {
         assert!(!block_data.is_empty());
     }
 
+    // Wait a brief moment to ensure any asynchronous cache write tasks from write_file have finished writing to NVMe
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
     // Clear System RAM cache and NVMe block cache to force reading from S3
     router.cache().write_lru.remove(file_path);
     router.cache().read_lru.remove(file_path);

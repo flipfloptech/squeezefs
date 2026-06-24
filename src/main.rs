@@ -172,8 +172,8 @@ enum Commands {
         #[arg(long)]
         writeback: bool,
 
-        /// Allow other users to access the mount (default: true)
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        /// Allow other users to access the mount (default: false)
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         allow_other: bool,
 
         /// Validate backend storage connectivity on startup

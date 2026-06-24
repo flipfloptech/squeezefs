@@ -34,7 +34,22 @@ pub enum SqueezefsError {
 impl SqueezefsError {
     pub fn to_errno(&self) -> libc::c_int {
         match self {
-            SqueezefsError::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
+            SqueezefsError::Io(e) => {
+                if let Some(code) = e.raw_os_error() {
+                    code
+                } else {
+                    match e.kind() {
+                        io::ErrorKind::NotFound => libc::ENOENT,
+                        io::ErrorKind::PermissionDenied => libc::EACCES,
+                        io::ErrorKind::AlreadyExists => libc::EEXIST,
+                        io::ErrorKind::InvalidInput => libc::EINVAL,
+                        io::ErrorKind::WouldBlock => libc::EWOULDBLOCK,
+                        io::ErrorKind::TimedOut => libc::ETIMEDOUT,
+                        io::ErrorKind::Unsupported => libc::ENOTSUP,
+                        _ => libc::EIO,
+                    }
+                }
+            }
             SqueezefsError::Redis(_) => libc::ECOMM,
             SqueezefsError::S3(_) => libc::EIO,
             SqueezefsError::LockFailed { .. } => libc::EAGAIN,
@@ -48,3 +63,21 @@ impl SqueezefsError {
 }
 
 pub type Result<T> = std::result::Result<T, SqueezefsError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn test_to_errno_mapping() {
+        let err_not_found = SqueezefsError::Io(io::Error::new(io::ErrorKind::NotFound, "not found"));
+        assert_eq!(err_not_found.to_errno(), libc::ENOENT);
+
+        let err_permission = SqueezefsError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        assert_eq!(err_permission.to_errno(), libc::EACCES);
+
+        let err_other = SqueezefsError::Io(io::Error::new(io::ErrorKind::Other, "other"));
+        assert_eq!(err_other.to_errno(), libc::EIO);
+    }
+}

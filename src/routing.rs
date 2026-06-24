@@ -131,6 +131,111 @@ impl DataRouter {
 
         // 3. Patch the in-memory buffer
         let end_offset = (offset as usize) + data.len();
+
+        if end_offset > 4 * 1024 * 1024 && file_type.as_deref() != Some("striped") {
+            // Transition the existing data (which is at most 4MB) to striped layout
+            let file_uuid = Uuid::new_v4().to_string();
+            let block_map_id = Uuid::new_v4().to_string();
+            let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
+            let mut futures = Vec::new();
+            let mut offset_cursor = 0;
+            let mut block_count = 0;
+            let mut block_mappings = Vec::new();
+            let existing_size = existing_data.len();
+
+            while offset_cursor < existing_size {
+                let end = std::cmp::min(offset_cursor + block_size, existing_size);
+                let chunk = existing_data[offset_cursor..end].to_vec();
+                let block_write_uuid = Uuid::new_v4().to_string();
+                let block_key = format!(
+                    "blocks/{}/block_{}_{}",
+                    file_uuid, block_count, block_write_uuid
+                );
+                let active_be = self.backend.get_backend_for_key(&block_key);
+                let stored_block_key = format!("{}:{}", active_be, block_key);
+                let stored_block_key_clone = stored_block_key.clone();
+
+                block_mappings.push((block_count.to_string(), stored_block_key));
+
+                let backend_clone = self.backend.clone();
+                let crypto = self.get_crypto().clone();
+                let read_lru = self.cache.read_lru.clone();
+                let cache_ref = self.cache.nvme.clone();
+                let chunk_clone = chunk.clone();
+                let task = tokio::spawn(async move {
+                    let processed = crypto.process_write(&chunk)?;
+                    backend_clone
+                        .put_object(&block_key, processed, fencing_token)
+                        .await?;
+                    // Cache the newly written block in RAM and NVMe
+                    read_lru.put(&stored_block_key_clone, Arc::new(chunk_clone.clone()));
+                    let _ = cache_ref.cache_read_block(&stored_block_key_clone, &chunk_clone);
+                    Ok::<(), SqueezefsError>(())
+                });
+
+                futures.push(task);
+                offset_cursor = end;
+                block_count += 1;
+            }
+
+            for f in futures {
+                f.await.map_err(|e| {
+                    SqueezefsError::Io(std::io::Error::other(format!(
+                        "Stripe upload task failed: {:?}",
+                        e
+                    )))
+                })??;
+            }
+
+            // Register block mappings and reference counts in Garnet
+            let block_map_key = format!("block_map:{}", block_map_id);
+            let refcounts_key = "squeezefs:block_refcounts";
+            let mut pipe_map = redis::pipe();
+            for (idx_str, key) in &block_mappings {
+                pipe_map.hset(&block_map_key, idx_str, key);
+                pipe_map.hset(refcounts_key, key, 1);
+            }
+            let _: () = pipe_map.query_async(&mut con).await?;
+
+            let mut pipe = redis::pipe();
+            pipe.hset(&meta_key, "size", existing_size)
+                .hset(&meta_key, "type", "striped")
+                .hset(&meta_key, "block_prefix", format!("blocks/{}", file_uuid))
+                .hset(&meta_key, "block_map_id", &block_map_id)
+                .hset(&meta_key, "num_blocks", block_count)
+                .hset(&meta_key, "fencing_token", fencing_token);
+
+            if file_type.as_deref() == Some("inline") {
+                let inline_key = format!("inline_data:{}", file_path);
+                pipe.del(&inline_key);
+            }
+
+            let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
+                pipe.hdel(&meta_key, "file_id");
+                con.hget(&meta_key, "file_id").await?
+            } else {
+                None
+            };
+
+            let _: () = pipe.query_async(&mut con).await?;
+
+            if let Some(old_id) = old_file_id {
+                let old_staged_path = self
+                    .cache
+                    .nvme
+                    .get_staged_path(&old_id)
+                    .join(format!("file_{}.staged", old_id));
+                let _ = tokio::fs::remove_file(old_staged_path).await;
+                let mapping_key = format!("mapping:{}", old_id);
+                let _: () = con.del(&mapping_key).await.unwrap_or(());
+            }
+
+            // Now that layout is transitioned to "striped", perform the write block-by-block
+            self.write_striped(file_path, &meta_key, offset, data, fencing_token, &mut con)
+                .await?;
+            return Ok(());
+        }
+
         if existing_data.len() < end_offset {
             existing_data.resize(end_offset, 0);
         }
@@ -454,23 +559,8 @@ impl DataRouter {
         let block_map_key = format!("block_map:{}", block_map_id);
         let refcounts_key = "squeezefs:block_refcounts";
 
-        // 1. Fill any block gaps if writing far past existing blocks
-        for b in num_blocks..start_block {
-            let gap_write_uuid = Uuid::new_v4().to_string();
-            let file_uuid = Uuid::new_v4().to_string();
-            let gap_key = format!("blocks/{}/block_{}_{}", file_uuid, b, gap_write_uuid);
-            let gap_data = vec![0; block_size as usize];
-            let processed_gap = self.get_crypto().process_write(&gap_data)?;
-            self.backend
-                .put_object(&gap_key, processed_gap, fencing_token)
-                .await?;
-
-            let _: () = redis::pipe()
-                .hset(refcounts_key, &gap_key, 1)
-                .hset(&block_map_key, b.to_string(), &gap_key)
-                .query_async(con)
-                .await?;
-        }
+        // 1. Fill any block gaps: gaps are now supported natively as sparse blocks
+        // (i.e. not written to S3 and mapped to None in block map), so no action is required here.
 
         // 2. Fetch all old block keys in a single pipeline
         let mut pipe = redis::pipe();
@@ -716,12 +806,16 @@ impl DataRouter {
                     "Routing: Striped file '{}' reading blocks in parallel.",
                     file_path
                 );
+                let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
                 let num_blocks_opt: Option<u32> = con.hget(&meta_key, "num_blocks").await?;
                 let num_blocks = num_blocks_opt.ok_or_else(|| {
                     SqueezefsError::InvalidOperation(
                         "Missing num_blocks for striped file".to_string(),
                     )
                 })?;
+
+                let size_opt: Option<u64> = con.hget(&meta_key, "size").await?;
+                let meta_size = size_opt.unwrap_or(0);
 
                 let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
 
@@ -733,14 +827,8 @@ impl DataRouter {
                         pipe.hget(&block_map_key, i.to_string());
                     }
                     let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
-                    for (i, key_opt) in res.into_iter().enumerate() {
-                        let bk = key_opt.ok_or_else(|| {
-                            SqueezefsError::Io(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!("Block {} mapping not found in Garnet", i),
-                            ))
-                        })?;
-                        keys.push(bk);
+                    for key_opt in res {
+                        keys.push(key_opt);
                     }
                     keys
                 } else {
@@ -753,20 +841,24 @@ impl DataRouter {
                     })?;
                     let mut keys = Vec::new();
                     for i in 0..num_blocks {
-                        keys.push(format!("{}/part_{}", block_prefix, i));
+                        keys.push(Some(format!("{}/part_{}", block_prefix, i)));
                     }
                     keys
                 };
 
                 let mut futures = Vec::new();
                 let crypto = self.get_crypto().clone();
-                for block_key in block_keys {
+                for block_key_opt in block_keys {
                     let backend_clone = self.backend.clone();
                     let crypto_clone = crypto.clone();
                     let task = tokio::spawn(async move {
-                        let (be_id, real_key) = parse_backend_and_key(&block_key);
-                        let raw = backend_clone.get_object(&be_id, &real_key).await?;
-                        crypto_clone.process_read(&raw)
+                        if let Some(block_key) = block_key_opt {
+                            let (be_id, real_key) = parse_backend_and_key(&block_key);
+                            let raw = backend_clone.get_object(&be_id, &real_key).await?;
+                            crypto_clone.process_read(&raw)
+                        } else {
+                            Ok(vec![0; block_size as usize])
+                        }
                     });
                     futures.push(task);
                 }
@@ -780,6 +872,9 @@ impl DataRouter {
                         )))
                     })??;
                     file_data.extend_from_slice(&block_data);
+                }
+                if file_data.len() > meta_size as usize {
+                    file_data.truncate(meta_size as usize);
                 }
                 file_data
             }

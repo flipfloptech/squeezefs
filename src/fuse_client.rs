@@ -465,14 +465,19 @@ impl SqueezefsFilesystem {
                     };
 
                     if let Some(bk) = old_block_key {
-                        existing_block_data = if let Some(cached) =
+                        existing_block_data = if let Some(cached_block) = self.router.cache.read_lru.get(&bk) {
+                            (*cached_block).clone()
+                        } else if let Some(cached) =
                             self.router.cache.nvme.get_cached_read_block(&bk)
                         {
+                            self.router.cache.read_lru.put(&bk, std::sync::Arc::new(cached.clone()));
                             cached
                         } else {
                             let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
                             let raw = self.router.backend.get_object(&be_id, &real_key).await?;
-                            self.router.get_crypto().process_read(&raw)?
+                            let decompressed = self.router.get_crypto().process_read(&raw)?;
+                            self.router.cache.read_lru.put(&bk, std::sync::Arc::new(decompressed.clone()));
+                            decompressed
                         };
                     }
                 }
@@ -604,6 +609,10 @@ impl SqueezefsFilesystem {
                             let active_be = backend_clone.get_backend_for_key(&new_block_key);
                             let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
+                            // Cache the flushed block in RAM (read_lru) and local NVMe
+                            router_clone.cache.read_lru.put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
+                            let _ = router_clone.cache.nvme.cache_read_block(&stored_block_key, &block_data);
+
                             let mut con = dlm_clone.get_connection().await?;
                             let block_map_key = format!("block_map:{}", block_map_id_clone);
                             let refcounts_key = "squeezefs:block_refcounts";
@@ -626,6 +635,7 @@ impl SqueezefsFilesystem {
                             );
 
                             if let Some(bk) = old_block_key {
+                                router_clone.cache.read_lru.remove(&bk);
                                 let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
                                 if let Some(mut r) = old_ref {
                                     r -= 1;

@@ -28,7 +28,7 @@ pub struct DataRouter {
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub metadata_cache: std::sync::Arc<dashmap::DashMap<String, CachedMetadata>>,
     pub block_map_cache:
-        std::sync::Arc<dashmap::DashMap<(String, u32), (String, std::time::Instant)>>,
+        std::sync::Arc<dashmap::DashMap<(String, u32), (Option<String>, std::time::Instant)>>,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
 }
@@ -173,24 +173,12 @@ impl DataRouter {
         } else if new_size <= 4 * 1024 * 1024 {
             // Layout: staged
             let new_file_id = Uuid::new_v4().to_string();
-            let mut pipe = redis::pipe();
-            pipe.hset(&meta_key, "size", new_size)
-                .hset(&meta_key, "type", "staged")
-                .hset(&meta_key, "file_id", &new_file_id)
-                .hset(&meta_key, "fencing_token", fencing_token);
-
-            if file_type.as_deref() == Some("inline") {
-                let inline_key = format!("inline_data:{}", file_path);
-                pipe.del(&inline_key);
-            }
 
             let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
                 con.hget(&meta_key, "file_id").await?
             } else {
                 None
             };
-
-            let _: () = pipe.query_async(&mut con).await?;
 
             // Stage write locally (fallback to direct S3 upload if staging is full)
             let stage_res = self
@@ -201,6 +189,18 @@ impl DataRouter {
 
             match stage_res {
                 Ok(_) => {
+                    let mut pipe = redis::pipe();
+                    pipe.hset(&meta_key, "size", new_size)
+                        .hset(&meta_key, "type", "staged")
+                        .hset(&meta_key, "file_id", &new_file_id)
+                        .hset(&meta_key, "fencing_token", fencing_token);
+
+                    if file_type.as_deref() == Some("inline") {
+                        let inline_key = format!("inline_data:{}", file_path);
+                        pipe.del(&inline_key);
+                    }
+                    let _: () = pipe.query_async(&mut con).await?;
+
                     if let Some(old_id) = old_file_id {
                         let old_staged_path = self
                             .cache
@@ -228,7 +228,19 @@ impl DataRouter {
                         .put_object(&block_key, processed_data.clone(), fencing_token)
                         .await?;
 
-                    // 3. Register mapping:new_file_id -> block, offset=0, size=processed_len
+                    // 3. Register type as staged, file_id, and mapping in Garnet
+                    let mut pipe = redis::pipe();
+                    pipe.hset(&meta_key, "size", new_size)
+                        .hset(&meta_key, "type", "staged")
+                        .hset(&meta_key, "file_id", &new_file_id)
+                        .hset(&meta_key, "fencing_token", fencing_token);
+
+                    if file_type.as_deref() == Some("inline") {
+                        let inline_key = format!("inline_data:{}", file_path);
+                        pipe.del(&inline_key);
+                    }
+                    let _: () = pipe.query_async(&mut con).await?;
+
                     let mapping_key = format!("mapping:{}", new_file_id);
                     let size = processed_data.len() as u64;
                     let _: () = redis::pipe()
@@ -911,22 +923,16 @@ impl DataRouter {
                         let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
                         for (idx, key_opt) in res.into_iter().enumerate() {
                             let b = blocks_to_query[idx];
-                            let bk = key_opt.ok_or_else(|| {
-                                SqueezefsError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::NotFound,
-                                    format!("Block {} mapping not found in Garnet", b),
-                                ))
-                            })?;
                             self.block_map_cache.insert(
                                 (block_map_id.clone(), b),
-                                (bk.clone(), std::time::Instant::now()),
+                                (key_opt.clone(), std::time::Instant::now()),
                             );
-                            block_keys.push((b, bk));
+                            block_keys.push((b, key_opt));
                         }
                     }
                 } else if let Some(block_prefix) = &meta.block_prefix {
                     for b in start_block..=end_block {
-                        block_keys.push((b, format!("{}/part_{}", block_prefix, b)));
+                        block_keys.push((b, Some(format!("{}/part_{}", block_prefix, b))));
                     }
                 } else {
                     return Err(SqueezefsError::InvalidOperation(
@@ -936,16 +942,18 @@ impl DataRouter {
 
                 // Pipelined discovery of block peers for cache misses
                 let mut cache_misses = Vec::new();
-                for (_, b_key) in &block_keys {
-                    let safe_name = b_key.replace(['/', ':'], "_");
-                    let exists = self
-                        .cache
-                        .nvme
-                        .staging_dirs()
-                        .iter()
-                        .any(|dir| dir.join(format!("{}.block", safe_name)).exists());
-                    if !exists {
-                        cache_misses.push(b_key.clone());
+                for (_, b_key_opt) in &block_keys {
+                    if let Some(b_key) = b_key_opt {
+                        let safe_name = b_key.replace(['/', ':'], "_");
+                        let exists = self
+                            .cache
+                            .nvme
+                            .staging_dirs()
+                            .iter()
+                            .any(|dir| dir.join(format!("{}.block", safe_name)).exists());
+                        if !exists {
+                            cache_misses.push(b_key.clone());
+                        }
                     }
                 }
 
@@ -970,10 +978,14 @@ impl DataRouter {
                 // Spawn concurrent tasks to download block data in parallel
                 let mut futures = Vec::new();
                 let crypto = self.get_crypto().clone();
-                for (b_idx, b_key) in block_keys {
+                for (b_idx, b_key_opt) in block_keys {
                     let cache_ref = self.cache.nvme.clone();
                     let backend_ref = self.backend.clone();
-                    let peers = peer_mappings.get(&b_key).cloned().unwrap_or_default();
+                    let peers = if let Some(ref b_key) = b_key_opt {
+                        peer_mappings.get(b_key).cloned().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let own_p2p_addr = self.cache.nvme.p2p_addr.clone();
 
                     let b_start_offset = b_idx as u64 * block_size;
@@ -985,50 +997,55 @@ impl DataRouter {
 
                     let crypto_clone = crypto.clone();
                     futures.push(tokio::spawn(async move {
-                        let block_data = if let Some(cached_range) =
-                            cache_ref.get_cached_read_block_range(&b_key, slice_start, slice_len)
-                        {
-                            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                            cached_range
-                        } else {
-                            METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+                        let block_data = if let Some(ref b_key) = b_key_opt {
+                            if let Some(cached_range) =
+                                cache_ref.get_cached_read_block_range(b_key, slice_start, slice_len)
+                            {
+                                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                cached_range
+                            } else {
+                                METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-                            // Try P2P download
-                            let mut downloaded_data = None;
-                            let client = crate::p2p::P2pClient::new();
-                            for peer in &peers {
-                                if Some(peer) == own_p2p_addr.get() {
-                                    continue;
+                                // Try P2P download
+                                let mut downloaded_data = None;
+                                let client = crate::p2p::P2pClient::new();
+                                for peer in &peers {
+                                    if Some(peer) == own_p2p_addr.get() {
+                                        continue;
+                                    }
+                                    if let Ok(data) =
+                                        client.download_block_from_peer(peer, b_key).await
+                                    {
+                                        downloaded_data = Some(data);
+                                        break;
+                                    }
                                 }
-                                if let Ok(data) =
-                                    client.download_block_from_peer(peer, &b_key).await
-                                {
-                                    downloaded_data = Some(data);
-                                    break;
-                                }
+
+                                let downloaded = match downloaded_data {
+                                    Some(data) => {
+                                        let _ = cache_ref.cache_read_block(b_key, &data);
+                                        data
+                                    }
+                                    None => {
+                                        // Fallback to S3
+                                        let (be_id, real_key) = parse_backend_and_key(b_key);
+                                        let data = backend_ref.get_object(&be_id, &real_key).await?;
+                                        let decompressed = crypto_clone.process_read(&data)?;
+                                        let _ = cache_ref.cache_read_block(b_key, &decompressed);
+                                        decompressed
+                                    }
+                                };
+
+                                let start = std::cmp::min(slice_start as usize, downloaded.len());
+                                let end = std::cmp::min(
+                                    (slice_start + slice_len as u64) as usize,
+                                    downloaded.len(),
+                                );
+                                downloaded[start..end].to_vec()
                             }
-
-                            let downloaded = match downloaded_data {
-                                Some(data) => {
-                                    let _ = cache_ref.cache_read_block(&b_key, &data);
-                                    data
-                                }
-                                None => {
-                                    // Fallback to S3
-                                    let (be_id, real_key) = parse_backend_and_key(&b_key);
-                                    let data = backend_ref.get_object(&be_id, &real_key).await?;
-                                    let decompressed = crypto_clone.process_read(&data)?;
-                                    let _ = cache_ref.cache_read_block(&b_key, &decompressed);
-                                    decompressed
-                                }
-                            };
-
-                            let start = std::cmp::min(slice_start as usize, downloaded.len());
-                            let end = std::cmp::min(
-                                (slice_start + slice_len as u64) as usize,
-                                downloaded.len(),
-                            );
-                            downloaded[start..end].to_vec()
+                        } else {
+                            // Hole support: return zero-filled block
+                            vec![0u8; slice_len as usize]
                         };
                         Ok::<_, SqueezefsError>((b_idx, block_data))
                     }));
@@ -1318,7 +1335,10 @@ impl DataRouter {
                     let block_mappings: std::collections::HashMap<String, String> =
                         con.hgetall(&block_map_key).await?;
 
-                    for (_, bk) in block_mappings {
+                    for (idx_str, bk) in block_mappings {
+                        if let Ok(idx) = idx_str.parse::<u32>() {
+                            self.block_map_cache.remove(&(block_map_id.clone(), idx));
+                        }
                         let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
                         if let Some(mut r) = current_ref {
                             r -= 1;
@@ -1379,8 +1399,18 @@ impl DataRouter {
                 }
             }
         }
+
+        // Explicitly clean up stale fields from the metadata key in Redis
+        let mut pipe = redis::pipe();
+        pipe.hdel(&meta_key, "block_map_id")
+            .hdel(&meta_key, "block_prefix")
+            .hdel(&meta_key, "num_blocks")
+            .hdel(&meta_key, "file_id");
+        let _: () = pipe.query_async(con).await.unwrap_or(());
+
         self.cache.write_lru.remove(file_path);
         self.cache.read_lru.remove(file_path);
+        self.metadata_cache.remove(file_path);
         Ok(())
     }
 

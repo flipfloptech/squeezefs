@@ -69,7 +69,7 @@ pub struct SqueezefsFilesystem {
     gid: u32,
     active_leases: dashmap::DashMap<u64, crate::dlm::LockLease>,
     active_posix_locks: dashmap::DashMap<(Inode, u64, u64, u64), crate::dlm::LockLease>,
-    active_inode_locks: dashmap::DashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    active_inode_locks: dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>,
     pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant)>,
     pub dismount_wait: u64,
 }
@@ -350,10 +350,10 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
-    fn get_inode_lock(&self, ino: u64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    fn get_inode_lock(&self, ino: u64) -> std::sync::Arc<tokio::sync::RwLock<()>> {
         self.active_inode_locks
             .entry(ino)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
             .clone()
     }
 
@@ -441,7 +441,7 @@ impl SqueezefsFilesystem {
 
                 let mut existing_block_data = Vec::new();
                 if let Some(block_map_id) = block_map_id {
-                    let mut old_block_key = None;
+                    let mut old_block_key: Option<Option<String>> = None;
 
                     // Try block_map_cache first
                     let cache_key = (block_map_id.clone(), b as u32);
@@ -454,7 +454,7 @@ impl SqueezefsFilesystem {
 
                     // If miss, query Garnet
                     let old_block_key = match old_block_key {
-                        Some(key) => Some(key),
+                        Some(key_opt) => key_opt,
                         None => {
                             let block_map_key = format!("block_map:{}", block_map_id);
                             let mut con = self.dlm.get_connection().await?;
@@ -622,7 +622,7 @@ impl SqueezefsFilesystem {
                             // Update local block_map_cache
                             router_clone.block_map_cache.insert(
                                 (block_map_id_clone.clone(), b),
-                                (stored_block_key.clone(), std::time::Instant::now()),
+                                (Some(stored_block_key.clone()), std::time::Instant::now()),
                             );
 
                             if let Some(bk) = old_block_key {
@@ -1373,6 +1373,9 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        let lock = self.get_inode_lock(ino);
+        let _guard = lock.read().await;
+
         let file_path = format!("inode_{}", ino);
         let block_size = self.router.block_size.load(Ordering::Relaxed);
 
@@ -1399,11 +1402,19 @@ impl Filesystem for SqueezefsFilesystem {
         let read_future = self
             .router
             .read_file_range(&file_path, offset, read_len as u32);
-        if let Ok(Ok(committed_data)) =
-            tokio::time::timeout(Duration::from_secs(2), read_future).await
-        {
-            let copy_len = std::cmp::min(read_result.len(), committed_data.len());
-            read_result[..copy_len].copy_from_slice(&committed_data[..copy_len]);
+        match tokio::time::timeout(Duration::from_secs(2), read_future).await {
+            Ok(Ok(committed_data)) => {
+                let copy_len = std::cmp::min(read_result.len(), committed_data.len());
+                read_result[..copy_len].copy_from_slice(&committed_data[..copy_len]);
+            }
+            Ok(Err(e)) => {
+                error!("FUSE Read error: {:?}", e);
+                return Err(map_squeezefs_err(e));
+            }
+            Err(_) => {
+                error!("FUSE Read timeout");
+                return Err(Errno::from(libc::ETIMEDOUT));
+            }
         }
 
         // 2. Overlay any staging blocks in active_writes
@@ -1476,7 +1487,7 @@ impl Filesystem for SqueezefsFilesystem {
         // Acquire local inode lock for the ENTIRE write operation to serialize
         // concurrent/subsequent writes to the same file.
         let lock = self.get_inode_lock(ino);
-        let _guard = lock.lock().await;
+        let _guard = lock.write().await;
 
         // 1. Get or acquire lease (fencing token)
         let fencing_token = self
@@ -1537,6 +1548,12 @@ impl Filesystem for SqueezefsFilesystem {
             .hset(&attr_key, "ctime_sec", sec)
             .hset(&attr_key, "ctime_nsec", nsec)
             .hset(&meta_key, "size", new_size);
+
+        if file_type.as_deref() == Some("striped") {
+            let block_size = self.router.block_size.load(Ordering::Relaxed);
+            let num_blocks = new_size.div_ceil(block_size);
+            pipe.hset(&meta_key, "num_blocks", num_blocks);
+        }
 
         if new_size > old_size {
             let diff = new_size - old_size;
@@ -1701,6 +1718,12 @@ impl Filesystem for SqueezefsFilesystem {
         let file_path = format!("inode_{}", ino);
         self.router.metadata_cache.remove(&file_path);
 
+        if let Some((_, lease)) = self.active_leases.remove(&ino) {
+            let _ = lease.release().await;
+        }
+        self.active_inode_locks.remove(&ino);
+        self.active_posix_locks.retain(|key, _| key.0 != ino);
+
         Ok(())
     }
 
@@ -1717,6 +1740,9 @@ impl Filesystem for SqueezefsFilesystem {
         if ino == CONFIG_INODE {
             return Err(Errno::from(libc::EACCES));
         }
+
+        let lock = self.get_inode_lock(ino);
+        let _guard = lock.write().await;
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let attr_key = format!("squeezefs:attr:{}", ino);
@@ -1807,6 +1833,12 @@ impl Filesystem for SqueezefsFilesystem {
             .get_attr_internal(ino)
             .await
             .map_err(map_squeezefs_err)?;
+
+        drop(_guard);
+        if std::sync::Arc::strong_count(&lock) <= 2 {
+            self.active_inode_locks.remove(&ino);
+        }
+
         Ok(ReplyAttr {
             ttl: Duration::from_secs(1),
             attr,
@@ -2075,6 +2107,12 @@ impl Filesystem for SqueezefsFilesystem {
                 .query_async(&mut con)
                 .await
                 .map_err(map_err)?;
+
+            if let Some((_, lease)) = self.active_leases.remove(&ino) {
+                let _ = lease.release().await;
+            }
+            self.active_inode_locks.remove(&ino);
+            self.active_posix_locks.retain(|key, _| key.0 != ino);
         }
 
         // Invalidate attr_cache and router metadata_cache
@@ -2174,6 +2212,7 @@ impl Filesystem for SqueezefsFilesystem {
                 return Err(Errno::from(libc::EISDIR));
             }
 
+            let dest_file_path = format!("inode_{}", dest_ino);
             if dest_kind == 2 {
                 // If it is a directory, it must be empty
                 let child_dest_dir_key = format!("squeezefs:dir:{}", dest_ino);
@@ -2188,13 +2227,41 @@ impl Filesystem for SqueezefsFilesystem {
                     .query_async(&mut con)
                     .await
                     .map_err(map_err)?;
+            } else {
+                // Delete data blocks via router
+                let _ = self.router.delete_file(&dest_file_path, &mut con).await;
             }
-            let _: () = redis::pipe()
-                .del(&dest_attr_key)
-                .decr("squeezefs:used_inodes", 1)
-                .query_async(&mut con)
-                .await
-                .map_err(map_err)?;
+
+            // Delete Redis keys
+            let inline_key = format!("inline_data:{}", dest_file_path);
+            let meta_key = format!("metadata:{}", dest_file_path);
+            let symlink_key = format!("squeezefs:symlink:{}", dest_ino);
+
+            // Fetch target size first to decrement used_bytes
+            let file_size_opt: Option<u64> = con.hget(&dest_attr_key, "size").await.map_err(map_err)?;
+            let file_size = file_size_opt.unwrap_or(0);
+
+            let mut pipe = redis::pipe();
+            pipe.del(&dest_attr_key)
+                .del(&inline_key)
+                .del(&meta_key)
+                .del(&symlink_key);
+            if dest_kind != 2 {
+                pipe.decr("squeezefs:used_bytes", file_size);
+            }
+            pipe.decr("squeezefs:used_inodes", 1);
+            let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
+
+            // Invalidate caches
+            self.attr_cache.remove(&dest_ino);
+            self.router.metadata_cache.remove(&dest_file_path);
+
+            // Clean up leases, inode locks, POSIX locks
+            if let Some((_, lease)) = self.active_leases.remove(&dest_ino) {
+                let _ = lease.release().await;
+            }
+            self.active_inode_locks.remove(&dest_ino);
+            self.active_posix_locks.retain(|key, _| key.0 != dest_ino);
         }
 
         // Perform rename atomically
@@ -2677,69 +2744,108 @@ impl Filesystem for SqueezefsFilesystem {
         let src_path = format!("inode_{}", inode);
         let dest_path = format!("inode_{}", inode_out);
 
-        // 1. Acquire locks on both files to ensure consistency
+        // 1. Acquire local locks on both inodes to ensure consistency and prevent deadlocks
+        let src_lock_arc = self.get_inode_lock(inode);
+        let dest_lock_arc = if inode != inode_out {
+            Some(self.get_inode_lock(inode_out))
+        } else {
+            None
+        };
+
+        let _src_read_guard;
+        let _src_write_guard;
+        let _dest_write_guard;
+        if inode == inode_out {
+            _src_write_guard = Some(src_lock_arc.write().await);
+            _src_read_guard = None;
+            _dest_write_guard = None;
+        } else if inode < inode_out {
+            _src_read_guard = Some(src_lock_arc.read().await);
+            _dest_write_guard = Some(dest_lock_arc.as_ref().unwrap().write().await);
+            _src_write_guard = None;
+        } else {
+            _dest_write_guard = Some(dest_lock_arc.as_ref().unwrap().write().await);
+            _src_read_guard = Some(src_lock_arc.read().await);
+            _src_write_guard = None;
+        }
+
         // Sort paths lexicographically to prevent deadlocks under concurrent operations.
         let (src_lease, dest_lease) = if inode == inode_out {
-            let lease = match self
-                .dlm
-                .acquire_lock(&src_path, None, Duration::from_secs(5))
-                .await
-            {
-                Ok(l) => l,
-                Err(e) => {
-                    error!(
-                        "copy_file_range: failed to acquire lock on src_path {}: {:?}",
-                        src_path, e
-                    );
-                    return Err(Errno::from(libc::EAGAIN));
-                }
-            };
-            (Some(lease), None)
+            if self.active_leases.contains_key(&inode) {
+                (None, None)
+            } else {
+                let lease = match self
+                    .dlm
+                    .acquire_lock(&src_path, None, Duration::from_secs(5))
+                    .await
+                {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!(
+                            "copy_file_range: failed to acquire lock on src_path {}: {:?}",
+                            src_path, e
+                        );
+                        return Err(Errno::from(libc::EAGAIN));
+                    }
+                };
+                (Some(lease), None)
+            }
         } else {
+            let src_already_held = self.active_leases.contains_key(&inode);
+            let dest_already_held = self.active_leases.contains_key(&inode_out);
+
             let (first_path, second_path) = if src_path < dest_path {
                 (&src_path, &dest_path)
             } else {
                 (&dest_path, &src_path)
             };
 
-            let first_lease = match self
-                .dlm
-                .acquire_lock(first_path, None, Duration::from_secs(5))
-                .await
-            {
-                Ok(l) => l,
-                Err(e) => {
-                    error!(
-                        "copy_file_range: failed to acquire lock on first path {}: {:?}",
-                        first_path, e
-                    );
-                    return Err(Errno::from(libc::EAGAIN));
-                }
+            let first_lease = if (src_path < dest_path && src_already_held) || (src_path >= dest_path && dest_already_held) {
+                None
+            } else {
+                let l = match self
+                    .dlm
+                    .acquire_lock(first_path, None, Duration::from_secs(5))
+                    .await
+                {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        error!(
+                            "copy_file_range: failed to acquire lock on first path {}: {:?}",
+                            first_path, e
+                        );
+                        return Err(Errno::from(libc::EAGAIN));
+                    }
+                };
+                l
             };
 
-            let second_lease = match self
-                .dlm
-                .acquire_lock(second_path, None, Duration::from_secs(5))
-                .await
-            {
-                Ok(l) => l,
-                Err(e) => {
-                    error!(
-                        "copy_file_range: failed to acquire lock on second path {}: {:?}",
-                        second_path, e
-                    );
-                    return Err(Errno::from(libc::EAGAIN));
-                }
+            let second_lease = if (src_path < dest_path && dest_already_held) || (src_path >= dest_path && src_already_held) {
+                None
+            } else {
+                let l = match self
+                    .dlm
+                    .acquire_lock(second_path, None, Duration::from_secs(5))
+                    .await
+                {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        error!(
+                            "copy_file_range: failed to acquire lock on second path {}: {:?}",
+                            second_path, e
+                        );
+                        return Err(Errno::from(libc::EAGAIN));
+                    }
+                };
+                l
             };
 
             if src_path < dest_path {
-                (Some(first_lease), Some(second_lease))
+                (first_lease, second_lease)
             } else {
-                (Some(second_lease), Some(first_lease))
+                (second_lease, first_lease)
             }
         };
-
-        let _src_lease = src_lease;
 
         // 2. Read sizes to check if we can perform metadata clone
         let src_size = self
@@ -2751,7 +2857,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         if off_in == 0 && off_out == 0 && length >= src_size && dest_size == 0 {
             // Drop locks before cloning, clone_file will re-acquire them.
-            drop(_src_lease);
+            drop(src_lease);
             drop(dest_lease);
 
             self.router
@@ -2801,12 +2907,24 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // Perform write to destination
+        let target_fencing_token = if let Some(ref dl) = dest_lease {
+            dl.fencing_token()
+        } else if let Some(ref sl) = src_lease {
+            sl.fencing_token()
+        } else if let Some(lease) = self.active_leases.get(&inode_out) {
+            lease.fencing_token()
+        } else if let Some(lease) = self.active_leases.get(&inode) {
+            lease.fencing_token()
+        } else {
+            0
+        };
+
         self.router
             .write_file(
                 &dest_path,
                 off_out,
                 chunk,
-                dest_lease.as_ref().unwrap().fencing_token(),
+                target_fencing_token,
             )
             .await
             .map_err(map_squeezefs_err)?;
@@ -2901,7 +3019,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         // 1. Acquire local inode lock
         let lock = self.get_inode_lock(ino);
-        let _guard = lock.lock().await;
+        let _guard = lock.write().await;
 
         // 2. Get or acquire lease (fencing token)
         let fencing_token = self
@@ -2934,7 +3052,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Acquire local inode lock
         let lock = self.get_inode_lock(ino);
-        let _guard = lock.lock().await;
+        let _guard = lock.write().await;
 
         // Flush any remaining active staging blocks before releasing the lease
         if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
@@ -2944,6 +3062,20 @@ impl Filesystem for SqueezefsFilesystem {
         // If there's a cached lease, release it and remove it from our active_leases map
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
+        }
+
+        // Release POSIX locks held by this lock owner on this inode
+        let mut posix_to_remove = Vec::new();
+        for entry in self.active_posix_locks.iter() {
+            let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
+            if lock_ino == ino && lock_owner == _lock_owner {
+                posix_to_remove.push((lock_ino, lock_owner, lock_start, lock_end));
+            }
+        }
+        for key in posix_to_remove {
+            if let Some((_, lease)) = self.active_posix_locks.remove(&key) {
+                let _ = lease.release().await;
+            }
         }
 
         // Also clean up local inode lock if no longer needed (only if strong_count <= 2)
@@ -2961,7 +3093,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         // 1. Acquire local inode lock
         let lock = self.get_inode_lock(ino);
-        let _guard = lock.lock().await;
+        let _guard = lock.write().await;
 
         // 2. Get or acquire lease (fencing token)
         let fencing_token = self

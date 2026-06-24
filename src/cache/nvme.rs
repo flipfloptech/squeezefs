@@ -545,6 +545,18 @@ impl NvmeStaging {
     }
 
     fn cache_read_block_sync(&self, block_key: &str, data: &[u8]) -> Result<()> {
+        let safe_name = block_key.replace(['/', ':'], "_");
+        let idx = get_dir_index(&safe_name, self.staging_dirs.len());
+        let target_dir = self.staging_dirs[idx].join("cache");
+        let block_path = target_dir.join(format!("block_{}.block", safe_name));
+
+        if block_path.exists() {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
+                let _ = file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()).set_modified(std::time::SystemTime::now()));
+            }
+            return Ok(());
+        }
+
         let new_data_len = data.len() as u64;
         let current = self
             .current_read_cache_bytes
@@ -585,8 +597,10 @@ impl NvmeStaging {
                 block_files.sort_by_key(|&(_, _, time)| time);
 
                 let mut freed_bytes = 0u64;
+                // Amortize eviction overhead: free needed space + extra margin (10% of max capacity, up to 100MB)
+                let extra_margin = std::cmp::min(100 * 1024 * 1024, self.max_read_bytes / 10);
                 let target_to_free =
-                    (total_bytes + new_data_len).saturating_sub(self.max_read_bytes);
+                    (total_bytes + new_data_len).saturating_sub(self.max_read_bytes) + extra_margin;
 
                 for (path, len, _) in block_files {
                     if freed_bytes >= target_to_free {
@@ -617,18 +631,6 @@ impl NvmeStaging {
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
-        }
-
-        let safe_name = block_key.replace(['/', ':'], "_");
-        let idx = get_dir_index(&safe_name, self.staging_dirs.len());
-        let target_dir = self.staging_dirs[idx].join("cache");
-        let block_path = target_dir.join(format!("block_{}.block", safe_name));
-
-        if block_path.exists() {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
-                let _ = file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()).set_modified(std::time::SystemTime::now()));
-            }
-            return Ok(());
         }
 
         let tmp_path = target_dir.join(format!("block_{}.{}.block.tmp", safe_name, Uuid::new_v4()));

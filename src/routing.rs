@@ -168,8 +168,9 @@ impl DataRouter {
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
 
-            self.cache.write_lru.put(file_path, Arc::new(existing_data));
-            self.cache.read_lru.remove(file_path);
+            let shared_data = Arc::new(existing_data);
+            self.cache.write_lru.put(file_path, shared_data.clone());
+            self.cache.read_lru.put(file_path, shared_data);
         } else if new_size <= 4 * 1024 * 1024 {
             // Layout: staged
             let new_file_id = Uuid::new_v4().to_string();
@@ -265,8 +266,9 @@ impl DataRouter {
                 Err(e) => return Err(e),
             }
 
-            self.cache.write_lru.put(file_path, Arc::new(existing_data));
-            self.cache.read_lru.remove(file_path);
+            let shared_data = Arc::new(existing_data);
+            self.cache.write_lru.put(file_path, shared_data.clone());
+            self.cache.read_lru.put(file_path, shared_data);
         } else {
             // Layout: striped
             let file_uuid = Uuid::new_v4().to_string();
@@ -287,16 +289,24 @@ impl DataRouter {
                 );
                 let active_be = self.backend.get_backend_for_key(&block_key);
                 let stored_block_key = format!("{}:{}", active_be, block_key);
+                let stored_block_key_clone = stored_block_key.clone();
 
                 block_mappings.push((block_count.to_string(), stored_block_key));
 
                 let backend_clone = self.backend.clone();
                 let crypto = self.get_crypto().clone();
+                let read_lru = self.cache.read_lru.clone();
+                let cache_ref = self.cache.nvme.clone();
+                let chunk_clone = chunk.clone();
                 let task = tokio::spawn(async move {
                     let processed = crypto.process_write(&chunk)?;
                     backend_clone
                         .put_object(&block_key, processed, fencing_token)
-                        .await
+                        .await?;
+                    // Cache the newly written block in RAM and NVMe
+                    read_lru.put(&stored_block_key_clone, Arc::new(chunk_clone.clone()));
+                    let _ = cache_ref.cache_read_block(&stored_block_key_clone, &chunk_clone);
+                    Ok::<(), SqueezefsError>(())
                 });
 
                 futures.push(task);
@@ -488,12 +498,26 @@ impl DataRouter {
 
             let backend_clone = self.backend.clone();
             let crypto = self.get_crypto().clone();
+            let read_lru = self.cache.read_lru.clone();
+            let cache_ref = self.cache.nvme.clone();
 
             tasks.push(tokio::spawn(async move {
                 let mut block_data = if let Some(ref bk) = old_block_key {
-                    let (be_id, real_key) = parse_backend_and_key(bk);
-                    let raw = backend_clone.get_object(&be_id, &real_key).await?;
-                    crypto.process_read(&raw)?
+                    if let Some(cached_block) = read_lru.get(bk) {
+                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        (*cached_block).clone()
+                    } else if let Some(decompressed) = cache_ref.read_cached_block(bk) {
+                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        read_lru.put(bk, Arc::new(decompressed.clone()));
+                        decompressed
+                    } else {
+                        METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+                        let (be_id, real_key) = parse_backend_and_key(bk);
+                        let raw = backend_clone.get_object(&be_id, &real_key).await?;
+                        let decompressed = crypto.process_read(&raw)?;
+                        read_lru.put(bk, Arc::new(decompressed.clone()));
+                        decompressed
+                    }
                 } else {
                     vec![0; rel_end]
                 };
@@ -517,6 +541,10 @@ impl DataRouter {
 
                 let active_be = backend_clone.get_backend_for_key(&new_block_key);
                 let stored_new_block_key = format!("{}:{}", active_be, new_block_key);
+
+                // Cache newly written block in both RAM and local NVMe
+                read_lru.put(&stored_new_block_key, Arc::new(block_data.clone()));
+                let _ = cache_ref.cache_read_block(&stored_new_block_key, &block_data);
 
                 Ok::<_, SqueezefsError>((b, old_block_key, stored_new_block_key))
             }));
@@ -548,6 +576,7 @@ impl DataRouter {
 
         // Clean up old block keys
         for bk in old_keys_to_clean {
+            self.cache.read_lru.remove(&bk);
             let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
             if let Some(mut r) = old_ref {
                 r -= 1;

@@ -91,9 +91,19 @@ async fn test_block_level_read_range_striped() {
         assert!(!block_data.is_empty());
     }
 
-    // Clear System RAM cache first to force reading from S3/NVMe Block Cache
+    // Clear System RAM cache and NVMe block cache to force reading from S3
     router.cache().write_lru.remove(file_path);
     router.cache().read_lru.remove(file_path);
+    for bk in &block_keys {
+        router.cache().read_lru.remove(bk);
+        let safe_name = bk.replace(['/', ':'], "_");
+        for dir in router.cache().nvme.staging_dirs() {
+            let block_path = dir.join(format!("{}.block", safe_name));
+            if block_path.exists() {
+                let _ = std::fs::remove_file(block_path);
+            }
+        }
+    }
 
     // Record initial metrics
     let hits_before = METRICS.cache_hits.load(Ordering::Relaxed);

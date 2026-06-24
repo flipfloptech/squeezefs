@@ -3796,6 +3796,8 @@ pub async fn start_mount<P: AsRef<Path>>(
     #[cfg(not(target_os = "linux"))]
     let mut handle = session.mount(fs, mount_path.clone()).await?;
 
+    println!("\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}", mount_path);
+
     let mut should_exit = false;
     while !should_exit {
         let shutdown = async {

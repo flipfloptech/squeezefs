@@ -623,18 +623,35 @@ impl DataRouter {
                 let new_block_key =
                     format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
-                let processed_block = crypto.process_write(&block_data)?;
-
-                backend_clone
-                    .put_object(&new_block_key, processed_block, fencing_token)
-                    .await?;
-
                 let active_be = backend_clone.get_backend_for_key(&new_block_key);
                 let stored_new_block_key = format!("{}:{}", active_be, new_block_key);
 
-                // Cache newly written block in both RAM and local NVMe
+                // Cache newly written block in both RAM and local NVMe immediately
                 read_lru.put(&stored_new_block_key, Arc::new(block_data.clone()));
                 let _ = cache_ref.cache_read_block(&stored_new_block_key, &block_data);
+
+                // Spawn S3 upload asynchronously in the background
+                let backend_clone_bg = backend_clone.clone();
+                let new_block_key_bg = new_block_key.clone();
+                let crypto_bg = crypto.clone();
+                let block_data_bg = block_data.clone();
+                tokio::spawn(async move {
+                    match crypto_bg.process_write(&block_data_bg) {
+                        Ok(processed_block) => {
+                            if let Err(e) = backend_clone_bg
+                                .put_object(&new_block_key_bg, processed_block, fencing_token)
+                                .await
+                            {
+                                log::error!("Async writeback: Failed to upload block {} to S3: {:?}", new_block_key_bg, e);
+                            } else {
+                                debug!("Async writeback: Successfully uploaded block {} to S3", new_block_key_bg);
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Async writeback: Encryption failed for block {}: {:?}", new_block_key_bg, e);
+                        }
+                    }
+                });
 
                 Ok::<_, SqueezefsError>((b, old_block_key, stored_new_block_key))
             }));

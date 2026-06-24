@@ -865,8 +865,11 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         info!("FUSE Daemon: Initialized Squeezefs Filesystem mount.");
 
+        info!("FUSE init: getting connection...");
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+        info!("FUSE init: connection obtained. Checking format existence...");
         let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
+        info!("FUSE init: format_exists = {}", format_exists);
 
         if !format_exists {
             let default_block_size = 4 * 1024 * 1024;
@@ -893,6 +896,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_err)?;
         }
 
+        info!("FUSE init: loading encryption and compression settings...");
         let compression: String = con
             .hget("squeezefs:format", "compression")
             .await
@@ -915,6 +919,7 @@ impl Filesystem for SqueezefsFilesystem {
         );
         self.router.set_crypto(crypto_state);
 
+        info!("FUSE init: checking database ABI version...");
         let version_str: Option<String> = con
             .hget("squeezefs:format", "version")
             .await
@@ -925,6 +930,7 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EPROTO));
         }
 
+        info!("FUSE init: loading block size...");
         let block_size_str: Option<String> = con
             .hget("squeezefs:format", "block_size")
             .await
@@ -935,10 +941,12 @@ impl Filesystem for SqueezefsFilesystem {
         self.router.set_block_size(block_size);
 
         // Initialize root directory attributes in Garnet if not present
+        info!("FUSE init: initializing root inode...");
         if let Err(e) = self.init_root_inode().await {
             error!("Failed to initialize root inode in Garnet: {:?}", e);
             return Err(Errno::from(libc::EIO));
         }
+        info!("FUSE init: root inode initialized successfully.");
 
         // Start background metrics publishing task
         let redis_client = self.dlm.meta_client().clone();

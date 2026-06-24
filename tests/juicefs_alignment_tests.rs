@@ -1265,3 +1265,134 @@ async fn test_compression_and_encryption_flow() {
         "Stored bytes should be encrypted and must not expose plaintext"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_real_mount_and_browseable() {
+    let _ = env_logger::try_init();
+
+    // 1. Check if /dev/fuse is accessible
+    if !std::path::Path::new("/dev/fuse").exists() {
+        println!("Skipping real FUSE mount test: /dev/fuse does not exist");
+        return;
+    }
+
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let temp_dir_cache = tempdir().unwrap();
+    let temp_dir_mount = tempdir().unwrap();
+    let mount_path = temp_dir_mount.path().to_path_buf();
+
+    let redis_url = get_redis_url();
+    format_volume(
+        &redis_url,
+        "mount_test_vol",
+        4 * 1024 * 1024,
+        1024 * 1024 * 1024 * 1024,
+        0,
+        "none",
+        "none",
+        None,
+        Some("1GB"),
+        Some("10GB"),
+        Some(&[temp_dir_cache.path().to_path_buf()]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("Format volume should succeed");
+
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+
+    let cache = TieredCache::new(
+        vec![temp_dir_cache.path().to_path_buf()],
+        None,
+        None,
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    // Spawn mount task in background
+    let mount_path_clone = mount_path.clone();
+    let mount_handle = tokio::spawn(async move {
+        let _ = start_mount(
+            mount_path_clone,
+            fs,
+            1000,
+            1000,
+            false,
+            false,
+            None,
+        )
+        .await;
+    });
+
+    // Wait for the mountpoint to become ready and check if browseable
+    let mut ready = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Ok(metadata) = std::fs::metadata(&mount_path) {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.ino() == 1 {
+                ready = true;
+                break;
+            }
+        }
+    }
+
+    if !ready {
+        // Unmount before failing to be clean
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg("-z")
+            .arg(&mount_path)
+            .output();
+        panic!("FUSE mount failed to become ready at {:?}", mount_path);
+    }
+
+    // Perform file operations to verify browseability
+    let test_file = mount_path.join("real_mount_test.txt");
+    std::fs::write(&test_file, "hello real mount").expect("Should write file to mountpoint");
+    let content = std::fs::read_to_string(&test_file).expect("Should read file from mountpoint");
+    assert_eq!(content, "hello real mount");
+
+    // Clean up mountpoint by running fusermount3 -u
+    let unmount_res = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mount_path)
+        .output();
+
+    if let Ok(output) = unmount_res {
+        if !output.status.success() {
+            // Lazy unmount as fallback
+            let _ = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg("-z")
+                .arg(&mount_path)
+                .output();
+        }
+    }
+
+    // Wait for the mount handle task to finish
+    let _ = mount_handle.await;
+}

@@ -144,32 +144,25 @@ pub fn parse_size_string(val: &str, system_total: u64) -> Result<u64> {
 
 /// Helper function to calculate aggregate capacity of disks mapped to staging paths.
 pub fn get_aggregate_disk_capacity(paths: &[PathBuf]) -> u64 {
-    use std::collections::HashSet;
-    use sysinfo::Disks;
-
-    let disks = Disks::new_with_refreshed_list();
-    let mut matched_disk_names = HashSet::new();
     let mut total_capacity = 0;
 
-    for path in paths {
-        let abs_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-        let path_str = abs_path.to_string_lossy();
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
 
-        let mut best_match: Option<(&sysinfo::Disk, usize)> = None;
-        for disk in &disks {
-            let mount_str = disk.mount_point().to_string_lossy();
-            if path_str.starts_with(&*mount_str) {
-                let len = mount_str.len();
-                if best_match.is_none() || len > best_match.unwrap().1 {
-                    best_match = Some((disk, len));
+        for path in paths {
+            let abs_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let c_path = match CString::new(abs_path.as_os_str().as_bytes()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            unsafe {
+                let mut stat: libc::statvfs = std::mem::zeroed();
+                if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                    total_capacity += stat.f_blocks as u64 * stat.f_frsize as u64;
                 }
-            }
-        }
-
-        if let Some((disk, _)) = best_match {
-            let disk_name = disk.name().to_string_lossy().to_string();
-            if matched_disk_names.insert(disk_name) {
-                total_capacity += disk.total_space();
             }
         }
     }

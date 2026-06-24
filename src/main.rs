@@ -550,10 +550,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let fd = DAEMON_PIPE.load(std::sync::atomic::Ordering::Relaxed);
                     if fd >= 0 {
                         let msg = format!("Panic: {}\n", panic_info);
-                        let _ = unsafe {
-                            libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
-                        };
-                        let _ = unsafe { libc::close(fd) };
+                        let _ = libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
+                        let _ = libc::close(fd);
                     }
                 }));
 

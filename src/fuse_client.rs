@@ -3664,8 +3664,10 @@ pub async fn start_mount<P: AsRef<Path>>(
     custom_opts: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = MountOptions::default();
-    options.uid(uid);
-    options.gid(gid);
+    if unsafe { libc::getuid() } == 0 {
+        options.uid(uid);
+        options.gid(gid);
+    }
     options.allow_other(allow_other);
     options.write_back(writeback);
     options.default_permissions(true);

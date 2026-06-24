@@ -9,7 +9,6 @@ use io_uring::{opcode, types, IoUring};
 
 
 #[cfg(target_os = "linux")]
-#[derive(Copy, Clone)]
 #[repr(transparent)]
 struct SendIovec(libc::iovec);
 
@@ -18,6 +17,11 @@ unsafe impl Send for SendIovec {}
 
 #[cfg(target_os = "linux")]
 unsafe impl Sync for SendIovec {}
+
+#[cfg(target_os = "linux")]
+impl Drop for SendIovec {
+    fn drop(&mut self) {}
+}
 
 #[cfg(target_os = "linux")]
 struct DebugUring(IoUring);
@@ -525,7 +529,7 @@ impl NonBlockFuseConnection {
             ring.submit().expect("Failed to submit readv to io_uring");
         }
 
-        loop {
+        let io_res = loop {
             let cqe = {
                 let mut guard = self.read_ring.lock().unwrap();
                 let x = guard.0.completion().next();
@@ -534,21 +538,21 @@ impl NonBlockFuseConnection {
             if let Some(cqe) = cqe {
                 if cqe.user_data() == 0x01 {
                     let res = cqe.result();
-                    let io_res = if res < 0 {
+                    break if res < 0 {
                         Err(io::Error::from_raw_os_error(-res))
                     } else {
                         Ok(res as usize)
                     };
-                    return ((header_buf, data_buf), io_res);
                 }
             }
 
             let mut fd_guard = match self.read_ring_fd.ready(Interest::READABLE).await {
-                Err(err) => return ((header_buf, data_buf), Err(err)),
+                Err(err) => break Err(err),
                 Ok(guard) => guard,
             };
 
             // Loop reading eventfd until EAGAIN (WouldBlock) to ensure no lost wakeups
+            let mut read_err = None;
             loop {
                 let mut buf = [0u8; 8];
                 let res = unsafe {
@@ -567,7 +571,8 @@ impl NonBlockFuseConnection {
                         fd_guard.clear_ready();
                         break;
                     } else {
-                        return ((header_buf, data_buf), Err(err));
+                        read_err = Some(err);
+                        break;
                     }
                 } else if res == 0 {
                     break;
@@ -575,7 +580,16 @@ impl NonBlockFuseConnection {
                     continue;
                 }
             }
-        }
+
+            if let Some(err) = read_err {
+                break Err(err);
+            }
+        };
+
+        // Explicitly keep iovecs alive until completion of the I/O
+        drop(iovecs);
+
+        ((header_buf, data_buf), io_res)
     }
 
     #[cfg(target_os = "freebsd")]
@@ -667,7 +681,7 @@ impl NonBlockFuseConnection {
             ring.submit().expect("Failed to submit writev to io_uring");
         }
 
-        loop {
+        let io_res = loop {
             let cqe = {
                 let mut guard = self.write_ring.lock().unwrap();
                 let x = guard.0.completion().next();
@@ -676,21 +690,21 @@ impl NonBlockFuseConnection {
             if let Some(cqe) = cqe {
                 if cqe.user_data() == 0x02 {
                     let res = cqe.result();
-                    let io_res = if res < 0 {
+                    break if res < 0 {
                         Err(io::Error::from_raw_os_error(-res))
                     } else {
                         Ok(res as usize)
                     };
-                    return ((data, body_extend_data), io_res);
                 }
             }
 
             let mut fd_guard = match self.write_ring_fd.ready(Interest::READABLE).await {
-                Err(err) => return ((data, body_extend_data), Err(err)),
+                Err(err) => break Err(err),
                 Ok(guard) => guard,
             };
 
             // Loop reading eventfd until EAGAIN (WouldBlock) to ensure no lost wakeups
+            let mut read_err = None;
             loop {
                 let mut buf = [0u8; 8];
                 let res = unsafe {
@@ -709,7 +723,8 @@ impl NonBlockFuseConnection {
                         fd_guard.clear_ready();
                         break;
                     } else {
-                        return ((data, body_extend_data), Err(err));
+                        read_err = Some(err);
+                        break;
                     }
                 } else if res == 0 {
                     break;
@@ -717,7 +732,16 @@ impl NonBlockFuseConnection {
                     continue;
                 }
             }
-        }
+
+            if let Some(err) = read_err {
+                break Err(err);
+            }
+        };
+
+        // Explicitly keep iovecs alive until completion of the I/O
+        drop(iovecs);
+
+        ((data, body_extend_data), io_res)
     }
 
     #[cfg(target_os = "freebsd")]

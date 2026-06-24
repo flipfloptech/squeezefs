@@ -558,8 +558,13 @@ impl NvmeStaging {
         let idx = get_dir_index(&safe_name, self.staging_dirs.len());
         let target_dir = &self.staging_dirs[idx];
         let block_path = target_dir.join(format!("{}.block", safe_name));
+        let tmp_path = target_dir.join(format!("{}.{}.block.tmp", safe_name, Uuid::new_v4()));
 
-        fs::write(&block_path, data)?;
+        fs::write(&tmp_path, data)?;
+        if let Err(e) = fs::rename(&tmp_path, &block_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(SqueezefsError::Io(e));
+        }
         self.current_read_cache_bytes
             .fetch_add(new_data_len, std::sync::atomic::Ordering::Relaxed);
         debug!(

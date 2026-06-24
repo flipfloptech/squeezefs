@@ -670,6 +670,8 @@ impl SqueezefsFilesystem {
             )))
         })?;
 
+        self.router.metadata_cache.remove(&file_path);
+
         Ok(())
     }
 

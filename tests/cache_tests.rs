@@ -316,3 +316,46 @@ async fn clean_db_for_stats() -> Option<redis::aio::MultiplexedConnection> {
     Some(con)
 }
 
+#[tokio::test]
+async fn test_atomic_cache_write_concurrency() {
+    let temp_dir = tempdir().unwrap();
+    let mock_backend = RustFsClient::new_mock();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let nvme = NvmeStaging::new(
+        vec![temp_dir.path().to_path_buf()],
+        10 * 1024 * 1024,
+        10 * 1024 * 1024,
+        mock_backend,
+        squeezefs::dlm::MetaClient::Single(redis_client),
+    )
+    .unwrap();
+
+    let block_key = "blocks/test_atomic_concurrency";
+    let block_data = vec![0xAB; 64 * 1024]; // 64KB block
+
+    // Spawn readers and writers to run concurrently
+    let nvme_clone = nvme.clone();
+    let block_data_clone = block_data.clone();
+    let writer_task = tokio::spawn(async move {
+        for _ in 0..100 {
+            nvme_clone.cache_read_block(block_key, &block_data_clone).unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    let nvme_clone2 = nvme.clone();
+    let block_data_clone2 = block_data.clone();
+    let reader_task = tokio::spawn(async move {
+        for _ in 0..500 {
+            if let Some(cached) = nvme_clone2.read_cached_block(block_key) {
+                // If it exists, it MUST be fully written (i.e. length must be exactly 64KB and content matching)
+                assert_eq!(cached.len(), block_data_clone2.len());
+                assert_eq!(cached, block_data_clone2);
+            }
+            tokio::time::sleep(Duration::from_millis(0)).await;
+        }
+    });
+
+    let _ = tokio::join!(writer_task, reader_task);
+}
+

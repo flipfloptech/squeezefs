@@ -3936,6 +3936,7 @@ pub async fn format_volume(
         read_mem_cache_size,
         write_mem_cache_size,
         None,
+        None,
     )
     .await
 }
@@ -3962,6 +3963,7 @@ pub async fn format_volume_ext(
     read_mem_cache_size: Option<&str>,
     write_mem_cache_size: Option<&str>,
     dismount_wait: Option<&str>,
+    upload_delay: Option<&str>,
 ) -> Result<(), SqueezefsError> {
     let client = redis::Client::open(redis_url)?;
     let mut con = client.get_multiplexed_tokio_connection().await?;
@@ -3977,6 +3979,7 @@ pub async fn format_volume_ext(
     let r_mem = read_mem_cache_size.unwrap_or("").to_string();
     let w_mem = write_mem_cache_size.unwrap_or("").to_string();
     let d_wait = dismount_wait.unwrap_or("10").to_string();
+    let u_delay = upload_delay.unwrap_or("500ms").to_string();
     let paths_str = disk_cache_paths
         .map(|paths| {
             paths
@@ -4004,6 +4007,7 @@ pub async fn format_volume_ext(
         .hset("squeezefs:format", "write_mem_cache_size", w_mem)
         .hset("squeezefs:format", "disk_cache_paths", paths_str)
         .hset("squeezefs:format", "dismount_wait", d_wait)
+        .hset("squeezefs:format", "upload_delay", u_delay)
         .hset("squeezefs:format", "active_write_backend", "backend_0");
 
     let default_endpoint = s3_endpoint.unwrap_or("");

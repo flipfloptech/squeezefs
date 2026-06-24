@@ -180,3 +180,27 @@ pub fn get_aggregate_disk_capacity(paths: &[PathBuf]) -> u64 {
         total_capacity
     }
 }
+
+/// Helper function to parse duration strings like "500ms", "5s", "1000" into a standard Duration.
+pub fn parse_duration(val: &str) -> Result<std::time::Duration> {
+    let s = val.trim().to_lowercase();
+    if s.ends_with("ms") {
+        let num_str = &s[..s.len() - 2];
+        let ms = num_str.parse::<u64>().map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("invalid duration number: {}", e))
+        })?;
+        Ok(std::time::Duration::from_millis(ms))
+    } else if s.ends_with('s') {
+        let num_str = &s[..s.len() - 1];
+        let secs = num_str.parse::<u64>().map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("invalid duration number: {}", e))
+        })?;
+        Ok(std::time::Duration::from_secs(secs))
+    } else {
+        let ms = s.parse::<u64>().map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("invalid duration number: {}", e))
+        })?;
+        Ok(std::time::Duration::from_millis(ms))
+    }
+}
+

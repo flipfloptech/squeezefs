@@ -43,6 +43,13 @@ async fn test_nvme_staging_and_merge() {
     let mock_backend = RustFsClient::new_mock();
 
     let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let mut con = redis_client.get_multiplexed_tokio_connection().await.unwrap();
+    let _: () = redis::cmd("DEL")
+        .arg("squeezefs:format")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
+
     let nvme = NvmeStaging::new(
         vec![temp_dir.path().to_path_buf()],
         100 * 1024 * 1024, // 100MB write limit
@@ -361,4 +368,69 @@ async fn test_atomic_cache_write_concurrency() {
 
     let _ = tokio::join!(writer_task, reader_task);
 }
+
+#[test]
+fn test_parse_duration() {
+    use squeezefs::cache::parse_duration;
+
+    assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+    assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+    assert_eq!(parse_duration("1000").unwrap(), Duration::from_millis(1000));
+    assert_eq!(parse_duration("  250Ms  ").unwrap(), Duration::from_millis(250));
+    assert_eq!(parse_duration("3S").unwrap(), Duration::from_secs(3));
+
+    assert!(parse_duration("invalid").is_err());
+    assert!(parse_duration("ms").is_err());
+    assert!(parse_duration("s").is_err());
+    assert!(parse_duration("100x").is_err());
+}
+
+#[tokio::test]
+async fn test_dynamic_upload_delay() {
+    let temp_dir = tempdir().unwrap();
+    let mock_backend = RustFsClient::new_mock();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+
+    let mut con = redis_client.get_multiplexed_tokio_connection().await.unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg("squeezefs:format")
+        .arg("upload_delay")
+        .arg("1500ms")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let nvme = NvmeStaging::new(
+        vec![temp_dir.path().to_path_buf()],
+        100 * 1024 * 1024,
+        100 * 1024 * 1024,
+        mock_backend,
+        squeezefs::dlm::MetaClient::Single(redis_client),
+    )
+    .unwrap();
+
+    // Sleep 6 seconds so the worker loop query-cache expires and it queries Garnet
+    // and applies the 1500ms timeout
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let file_id = "test-delay-file-id";
+    let data = vec![9; 100];
+    nvme.stage_write("test_delay.txt", file_id, &data, 100).await.unwrap();
+
+    // Check after 800ms. Since the delay is 1500ms, it should STILL be in NVMe staging!
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(nvme.read_staged(file_id).is_some(), "Staged file should still be present before timeout");
+
+    // Check after another 1200ms (total 2000ms > 1500ms). It should be flushed/deleted.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(nvme.read_staged(file_id).is_none(), "Staged file should be flushed and deleted after timeout");
+
+    // Clean up to prevent test pollution
+    let _: () = redis::cmd("DEL")
+        .arg("squeezefs:format")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
+}
+
 

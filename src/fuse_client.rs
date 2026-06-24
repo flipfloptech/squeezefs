@@ -554,7 +554,7 @@ impl SqueezefsFilesystem {
 
             let req = WritebackRequest {
                 ino,
-                block_idx: b,
+                block_idx: b as u32,
                 fencing_token: _fencing_token,
             };
             let _ = self.writeback_tx.send(req).await;

@@ -92,12 +92,21 @@ impl SqueezefsFilesystem {
     async fn generate_config_json(&self) -> String {
         let mut con_opt = self.dlm.get_connection().await.ok();
 
-        let format_fields: std::collections::HashMap<String, String> =
+        let mut format_fields: std::collections::HashMap<String, String> =
             if let Some(ref mut con) = con_opt {
                 con.hgetall("squeezefs:format").await.unwrap_or_default()
             } else {
                 std::collections::HashMap::new()
             };
+
+        // Override disk_cache_paths in virtual config with the actual active isolated staging directories
+        let active_dirs = self.router.cache.nvme.staging_dirs();
+        let active_dirs_str = active_dirs
+            .iter()
+            .map(|d| d.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format_fields.insert("disk_cache_paths".to_string(), active_dirs_str);
 
         let backends_raw: std::collections::HashMap<String, String> =
             if let Some(ref mut con) = con_opt {
@@ -3704,19 +3713,27 @@ pub async fn start_mount<P: AsRef<Path>>(
         let mut ready = false;
         while start.elapsed() < std::time::Duration::from_secs(10) {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if let Ok(metadata) = std::fs::metadata(&mount_path_clone) {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    if metadata.ino() == 1 {
+            match std::fs::metadata(&mount_path_clone) {
+                Ok(metadata) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        if metadata.ino() == 1 {
+                            ready = true;
+                            break;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
                         ready = true;
                         break;
                     }
                 }
-                #[cfg(not(unix))]
-                {
-                    ready = true;
-                    break;
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        ready = true;
+                        break;
+                    }
                 }
             }
         }

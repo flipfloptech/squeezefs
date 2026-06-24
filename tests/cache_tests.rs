@@ -549,3 +549,117 @@ async fn test_active_writes_pruning_and_deletion() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_concurrent_mounts_cache_sharing() {
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    let temp_root = tempfile::tempdir().unwrap();
+    let root_path = temp_root.path().to_path_buf();
+
+    let fs_name = "testvol_concurrent";
+
+    // Two mock mountpoints
+    let mnt1 = PathBuf::from("/mnt/data1");
+    let mnt2 = PathBuf::from("/mnt/data2");
+
+    // Helper closure to simulate the main.rs isolated directory mapping
+    let resolve_isolated = |mountpoint: &Path| {
+        let sanitized_mount = mountpoint
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect::<String>();
+        let mut sanitized_mount_clean = String::new();
+        let mut last_was_underscore = false;
+        for c in sanitized_mount.chars() {
+            if c == '_' {
+                if !last_was_underscore {
+                    sanitized_mount_clean.push(c);
+                    last_was_underscore = true;
+                }
+            } else {
+                sanitized_mount_clean.push(c);
+                last_was_underscore = false;
+            }
+        }
+        let sanitized_mount_clean = sanitized_mount_clean.trim_matches('_');
+        root_path.join(fs_name).join(sanitized_mount_clean)
+    };
+
+    let isolated_dir1 = resolve_isolated(&mnt1);
+    let isolated_dir2 = resolve_isolated(&mnt2);
+    let shared_cache_dir = root_path.join(fs_name).join("cache");
+
+    // Create directories
+    std::fs::create_dir_all(&isolated_dir1).unwrap();
+    std::fs::create_dir_all(&isolated_dir2).unwrap();
+    std::fs::create_dir_all(&shared_cache_dir).unwrap();
+
+    // Create symlinks
+    let symlink_path1 = isolated_dir1.join("cache");
+    let symlink_path2 = isolated_dir2.join("cache");
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../cache", &symlink_path1).unwrap();
+        std::os::unix::fs::symlink("../cache", &symlink_path2).unwrap();
+    }
+
+    // Now initialize TieredCache for both isolated directories
+    let backend = RustFsClient::new_mock();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+
+    let _cache1 = squeezefs::cache::TieredCache::new(
+        vec![isolated_dir1.clone()],
+        None,
+        None,
+        None,
+        None,
+        backend.clone(),
+        squeezefs::dlm::MetaClient::Single(redis_client.clone()),
+    )
+    .unwrap();
+
+    let _cache2 = squeezefs::cache::TieredCache::new(
+        vec![isolated_dir2.clone()],
+        None,
+        None,
+        None,
+        None,
+        backend.clone(),
+        squeezefs::dlm::MetaClient::Single(redis_client.clone()),
+    )
+    .unwrap();
+
+    // Verify subdirectories exist
+    assert!(isolated_dir1.join("active_writes").exists());
+    assert!(isolated_dir1.join("staging").exists());
+    assert!(symlink_path1.exists());
+
+    assert!(isolated_dir2.join("active_writes").exists());
+    assert!(isolated_dir2.join("staging").exists());
+    assert!(symlink_path2.exists());
+
+    // Verify that writing a block to cache1's cache is visible in cache2's cache (via sharing)
+    let block_name = "block_abc123.block";
+    let block_data = b"hello shared read cache";
+
+    #[cfg(unix)]
+    {
+        // Path in cache1's cache
+        let block_path1 = symlink_path1.join(block_name);
+        std::fs::write(&block_path1, block_data).unwrap();
+
+        // Should be readable from cache2's cache
+        let block_path2 = symlink_path2.join(block_name);
+        assert!(block_path2.exists());
+        let read_data = std::fs::read(block_path2).unwrap();
+        assert_eq!(read_data, block_data);
+
+        // Verify it was actually written to the shared cache dir
+        let block_path_shared = shared_cache_dir.join(block_name);
+        assert!(block_path_shared.exists());
+    }
+}

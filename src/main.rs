@@ -415,11 +415,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         // Check if mountpoint is ready
-                        if let Ok(metadata) = std::fs::metadata(&mountpoint_path) {
-                            use std::os::unix::fs::MetadataExt;
-                            if metadata.ino() == 1 {
-                                ready = true;
-                                break;
+                        match std::fs::metadata(&mountpoint_path) {
+                            Ok(metadata) => {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::MetadataExt;
+                                    if metadata.ino() == 1 {
+                                        ready = true;
+                                        break;
+                                    }
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    ready = true;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                    ready = true;
+                                    break;
+                                }
                             }
                         }
                         print!(".");
@@ -1106,9 +1122,62 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 active_staging_dirs = staging_dirs;
             }
 
-            for dir in &active_staging_dirs {
-                fs::create_dir_all(dir).await?;
+            let fs_name = format_fields
+                .get("name")
+                .cloned()
+                .unwrap_or_else(|| "squeezefs".to_string());
+
+            let sanitized_mount = mountpoint
+                .to_string_lossy()
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect::<String>();
+            // Clean up consecutive underscores
+            let mut sanitized_mount_clean = String::new();
+            let mut last_was_underscore = false;
+            for c in sanitized_mount.chars() {
+                if c == '_' {
+                    if !last_was_underscore {
+                        sanitized_mount_clean.push(c);
+                        last_was_underscore = true;
+                    }
+                } else {
+                    sanitized_mount_clean.push(c);
+                    last_was_underscore = false;
+                }
             }
+            let sanitized_mount_clean = sanitized_mount_clean.trim_matches('_');
+
+            let mut isolated_staging_dirs = Vec::new();
+            for dir in active_staging_dirs {
+                let isolated_dir = dir.join(&fs_name).join(sanitized_mount_clean);
+                let shared_cache_dir = dir.join(&fs_name).join("cache");
+
+                // Create the parent directory for the isolated staging dir
+                fs::create_dir_all(&isolated_dir).await?;
+                // Create the shared cache directory if not exists
+                fs::create_dir_all(&shared_cache_dir).await?;
+
+                let symlink_path = isolated_dir.join("cache");
+                // Remove pre-existing cache file/symlink/directory if any
+                let metadata = fs::symlink_metadata(&symlink_path).await;
+                if let Ok(meta) = metadata {
+                    if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                        fs::remove_dir_all(&symlink_path).await?;
+                    } else {
+                        fs::remove_file(&symlink_path).await?;
+                    }
+                }
+
+                // Create symbolic link pointing to ../cache
+                #[cfg(unix)]
+                {
+                    std::os::unix::fs::symlink("../cache", &symlink_path)?;
+                }
+
+                isolated_staging_dirs.push(isolated_dir);
+            }
+            active_staging_dirs = isolated_staging_dirs;
 
             // Tune host parameters automatically
             let _ = tune_system();

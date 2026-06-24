@@ -777,3 +777,105 @@ async fn test_data_integrity_known_sha512_hash() {
     assert_eq!(checksum, expected_hash);
 }
 
+#[tokio::test]
+async fn test_data_integrity_10mb_sha512_hash() {
+    if clean_db().await.is_none() {
+        println!("Skipping test: Garnet/Redis not available");
+        return;
+    }
+
+    let redis_url = get_redis_url();
+    let fs_name = "integrity_10mb_test";
+
+    format_volume(
+        &redis_url,
+        fs_name,
+        4 * 1024 * 1024,
+        100 * 1024 * 1024 * 1024,
+        0,
+        "none",
+        "none",
+        None,
+        Some("128MB"),
+        Some("500MB"),
+        Some(&[PathBuf::from("/tmp/squeezefs_staging_10mb")]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new_mock();
+    let multi_backend = MultiBackendClient::new();
+    multi_backend.register_backend("backend_0", backend.clone());
+
+    let temp_staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_staging.path().to_path_buf()],
+        Some("128MB"),
+        Some("128MB"),
+        Some("500MB"),
+        Some("500MB"),
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), multi_backend.clone(), cache.clone());
+    let fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    // Create striped file (~10.1MB)
+    let reply_create = fs.create(req, 1, OsStr::new("large_10mb.bin"), 0o644, 0).await.unwrap();
+    let ino = reply_create.attr.ino;
+
+    let base_pattern = b"SQUEEZEFS_SHA512_CORRUPTION_TEST_SEQUENCE_";
+    let mut data = Vec::with_capacity(base_pattern.len() * 240000);
+    for _ in 0..240000 {
+        data.extend_from_slice(base_pattern);
+    }
+    let expected_hash = calculate_sha512(&data);
+
+    // Write file
+    fs.write(req, ino, 0, 0, &data, 0, 0).await.unwrap();
+    fs.flush(req, ino, 0, 0).await.unwrap();
+    fs.release(req, ino, 0, 0, 0, false).await.unwrap();
+
+    // Recreate FS to bypass memory cache
+    drop(fs);
+
+    let cache_recreate = TieredCache::new(
+        vec![temp_staging.path().to_path_buf()],
+        Some("128MB"),
+        Some("128MB"),
+        Some("500MB"),
+        Some("500MB"),
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router_recreate = DataRouter::new(dlm.clone(), multi_backend.clone(), cache_recreate);
+    let fs_recreate = SqueezefsFilesystem::new(router_recreate, dlm.clone(), 1000, 1000);
+    fs_recreate.init(req).await.unwrap();
+
+    let reply_read = fs_recreate.read(req, ino, 0, 0, data.len() as u32).await.unwrap();
+    assert_eq!(reply_read.data.len(), data.len());
+    let checksum = calculate_sha512(&reply_read.data);
+    assert_eq!(checksum, expected_hash);
+}
+

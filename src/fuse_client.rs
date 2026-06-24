@@ -71,30 +71,42 @@ fn map_squeezefs_err(e: SqueezefsError) -> Errno {
     Errno::from(e.to_errno())
 }
 
+#[derive(Debug, Clone)]
+pub struct WritebackRequest {
+    pub ino: u64,
+    pub block_idx: u32,
+    pub fencing_token: u64,
+}
+
 pub struct SqueezefsFilesystem {
     pub router: DataRouter,
     dlm: DlmClient,
     uid: u32,
     gid: u32,
-    active_leases: dashmap::DashMap<u64, crate::dlm::LockLease>,
+    active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease>>,
     active_posix_locks: dashmap::DashMap<(Inode, u64, u64, u64), crate::dlm::LockLease>,
-    active_inode_locks: dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>,
+    active_inode_locks: std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>>,
     pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant)>,
     pub dismount_wait: u64,
+    writeback_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
+    writeback_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<WritebackRequest>>>,
 }
 
 impl SqueezefsFilesystem {
     pub fn new(router: DataRouter, dlm: DlmClient, uid: u32, gid: u32) -> Self {
+        let (writeback_tx, writeback_rx) = tokio::sync::mpsc::channel(10000);
         Self {
             router,
             dlm,
             uid,
             gid,
-            active_leases: dashmap::DashMap::new(),
+            active_leases: std::sync::Arc::new(dashmap::DashMap::new()),
             active_posix_locks: dashmap::DashMap::new(),
-            active_inode_locks: dashmap::DashMap::new(),
+            active_inode_locks: std::sync::Arc::new(dashmap::DashMap::new()),
             attr_cache: dashmap::DashMap::new(),
             dismount_wait: 10,
+            writeback_tx,
+            writeback_rx: std::sync::Mutex::new(Some(writeback_rx)),
         }
     }
 
@@ -539,6 +551,13 @@ impl SqueezefsFilesystem {
                     e
                 )))
             })?;
+
+            let req = WritebackRequest {
+                ino,
+                block_idx: b,
+                fencing_token: _fencing_token,
+            };
+            let _ = self.writeback_tx.send(req).await;
         }
 
         Ok(())
@@ -996,6 +1015,17 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             }
         });
+
+        // Start background active writes flusher task
+        let mut rx_guard = self.writeback_rx.lock().unwrap();
+        if let Some(writeback_rx) = rx_guard.take() {
+            let router = self.router.clone();
+            let dlm = self.dlm.clone();
+            let active_inode_locks = self.active_inode_locks.clone();
+            tokio::spawn(async move {
+                run_constant_writeback_worker(writeback_rx, router, dlm, active_inode_locks).await;
+            });
+        }
 
         Ok(ReplyInit {
             max_write: std::num::NonZeroU32::new(1048576).unwrap(), // 1MB absolute maximum write buffer size
@@ -4192,4 +4222,171 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             "ActiveWriteBackend": active_write_backend,
         }
     }))
+}
+
+async fn run_constant_writeback_worker(
+    mut rx: tokio::sync::mpsc::Receiver<WritebackRequest>,
+    router: DataRouter,
+    dlm: DlmClient,
+    active_inode_locks: std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>>,
+) {
+    use std::collections::HashMap;
+    use tokio::time::{self, Duration, Instant};
+
+    let mut pending: HashMap<(u64, u32), (Instant, u64)> = HashMap::new();
+    let debounce_duration = Duration::from_millis(200);
+
+    let mut tick_interval = time::interval(Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            Some(req) = rx.recv() => {
+                let key = (req.ino, req.block_idx);
+                let scheduled = Instant::now() + debounce_duration;
+                pending.insert(key, (scheduled, req.fencing_token));
+            }
+            _ = tick_interval.tick() => {
+                let now = Instant::now();
+                let mut to_flush = Vec::new();
+                for (key, (scheduled, token)) in &pending {
+                    if *scheduled <= now {
+                        to_flush.push((*key, *token));
+                    }
+                }
+
+                for ((ino, b), token) in to_flush {
+                    pending.remove(&(ino, b));
+                    let router_clone = router.clone();
+                    let dlm_clone = dlm.clone();
+                    let locks_clone = active_inode_locks.clone();
+                    
+                    tokio::spawn(async move {
+                        let _ = flush_single_active_block(
+                            ino,
+                            b,
+                            token,
+                            &router_clone,
+                            &dlm_clone,
+                            &locks_clone,
+                        ).await;
+                    });
+                }
+            }
+        }
+    }
+}
+
+async fn flush_single_active_block(
+    ino: u64,
+    b: u32,
+    fencing_token: u64,
+    router: &DataRouter,
+    dlm: &DlmClient,
+    active_inode_locks: &dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>,
+) -> Result<(), SqueezefsError> {
+    let staging_dir = router.cache.nvme.staging_dirs().first().cloned();
+    let staging_dir = match staging_dir {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    let active_dir = staging_dir.join("active_writes").join(format!("inode_{}", ino));
+    let block_path = active_dir.join(format!("block_{}", b));
+
+    if !block_path.exists() {
+        return Ok(());
+    }
+
+    // Acquire lock to avoid race conditions with active writes
+    let lock = active_inode_locks
+        .entry(ino)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
+        .clone();
+    let _guard = lock.write().await;
+
+    // Check again under lock
+    if !block_path.exists() {
+        return Ok(());
+    }
+
+    let block_data = match tokio::fs::read(&block_path).await {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+
+    let file_path = format!("inode_{}", ino);
+    let meta_key = format!("metadata:{}", file_path);
+    let mut con = dlm.get_connection().await?;
+    let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+    let mut block_map_id = block_map_id_opt.unwrap_or_default();
+    if block_map_id.is_empty() {
+        block_map_id = uuid::Uuid::new_v4().to_string();
+        let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
+    }
+
+    let file_uuid = uuid::Uuid::new_v4().to_string();
+    let block_write_uuid = uuid::Uuid::new_v4().to_string();
+    let new_block_key = format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
+
+    let processed_block = router.get_crypto().process_write(&block_data)?;
+    router.backend
+        .put_object(&new_block_key, processed_block, fencing_token)
+        .await?;
+
+    let active_be = router.backend.get_backend_for_key(&new_block_key);
+    let stored_block_key = format!("{}:{}", active_be, new_block_key);
+
+    // Cache in RAM and NVMe
+    router.cache.read_lru.put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
+    let _ = router.cache.nvme.cache_read_block(&stored_block_key, &block_data);
+
+    let block_map_key = format!("block_map:{}", block_map_id);
+    let refcounts_key = "squeezefs:block_refcounts";
+
+    let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
+
+    use redis::AsyncCommands;
+    let mut pipe = redis::pipe();
+    pipe.hset(refcounts_key, &stored_block_key, 1).hset(
+        &block_map_key,
+        b.to_string(),
+        &stored_block_key,
+    );
+    let _: () = pipe.query_async(&mut con).await?;
+
+    router.block_map_cache.insert(
+        (block_map_id.clone(), b),
+        (Some(stored_block_key.clone()), std::time::Instant::now()),
+    );
+
+    if let Some(bk) = old_block_key {
+        router.cache.read_lru.remove(&bk);
+        let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+        if let Some(mut r) = old_ref {
+            r -= 1;
+            if r <= 0 {
+                let _: () = redis::pipe()
+                    .hdel(refcounts_key, &bk)
+                    .query_async(&mut con)
+                    .await?;
+                let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+                let _ = router.backend.delete_object(&be_id, &real_key).await;
+            } else {
+                let _: () = con.hset(refcounts_key, &bk, r).await?;
+            }
+        } else {
+            let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+            let _ = router.backend.delete_object(&be_id, &real_key).await;
+        }
+    }
+
+    let _ = tokio::fs::remove_file(&block_path).await;
+
+    // If the directory is empty, remove it
+    if let Ok(mut entries) = tokio::fs::read_dir(&active_dir).await {
+        if entries.next_entry().await.unwrap_or(None).is_none() {
+            let _ = tokio::fs::remove_dir(&active_dir).await;
+        }
+    }
+
+    Ok(())
 }

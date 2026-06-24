@@ -1490,8 +1490,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             log::info!("SqueezeFS mount configuration:\n{}", config_str);
 
+            // Run staging / active write recovery on mount startup
+            for dir in &active_staging_dirs {
+                log::info!("Running staging recovery on: {:?}", dir);
+                let recovery_backend = multi_backend.get_backend("backend_0").unwrap();
+                if let Err(e) = squeezefs::recovery::recover_staging(dir, &recovery_backend, dlm.meta_client()).await {
+                    log::warn!("Staging recovery failed for {:?}: {:?}", dir, e);
+                }
+            }
+
             let cache = TieredCache::new(
-                active_staging_dirs,
+                active_staging_dirs.clone(),
                 Some(&resolved_read_mem_cache_size),
                 Some(&resolved_write_mem_cache_size),
                 Some(&resolved_read_cache_size),

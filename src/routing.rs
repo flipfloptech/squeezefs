@@ -378,6 +378,8 @@ impl DataRouter {
             self.cache.read_lru.remove(file_path);
         }
 
+        self.metadata_cache.remove(file_path);
+
         Ok(())
     }
 
@@ -589,6 +591,11 @@ impl DataRouter {
             data_vec[offset as usize..end_offset].copy_from_slice(data);
             self.cache.write_lru.put(file_path, cached_data);
             self.cache.read_lru.remove(file_path);
+        }
+
+        self.metadata_cache.remove(file_path);
+        for b in start_block..=end_block {
+            self.block_map_cache.remove(&(block_map_id.clone(), b));
         }
 
         Ok(())

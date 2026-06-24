@@ -245,3 +245,109 @@ async fn test_p2p_ttl_expiration() {
     // TTL should be positive (and <= 60 seconds)
     assert!(ttl > 0 && ttl <= 60);
 }
+
+#[tokio::test]
+async fn test_p2p_cooperative_read_after_write() {
+    let dlm_a = match get_dlm_client().await {
+        Some(d) => d,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
+            return;
+        }
+    };
+    clear_garnet_keys(&dlm_a).await;
+
+    // Set up Node A (Writer / Server)
+    let temp_dir_a = tempdir().unwrap();
+    let backend_a = RustFsClient::new_mock();
+    let p2p_addr_a = "127.0.0.1:29103".to_string();
+
+    let cache_a = TieredCache::new(
+        vec![temp_dir_a.path().to_path_buf()],
+        None,
+        None,
+        None,
+        None,
+        backend_a.clone(),
+        dlm_a.meta_client().clone(),
+    )
+    .expect("Should create cache A");
+    let _ = cache_a.nvme.p2p_addr.set(p2p_addr_a.clone());
+
+    let router_a = DataRouter::new(dlm_a.clone(), backend_a.clone(), cache_a);
+
+    // Start P2P server A
+    let server_a = P2pServer::new(p2p_addr_a.clone(), router_a.cache.nvme.clone());
+    let server_task = tokio::spawn(async move {
+        let _ = server_a.run().await;
+    });
+
+    // Seed the S3 mock store with empty default data for our test block
+    let block_key = "backend_0/part_coop_p2p/part_0";
+    let default_s3_data = vec![0u8; 1000];
+    backend_a
+        .put_object(block_key, default_s3_data.clone(), 0)
+        .await
+        .expect("Should seed mock S3 block");
+
+    // Node A writes actual data to the file, transitioning to striped layout
+    let file_path = "coop_striped.bin";
+    let mut con_meta = dlm_a.get_connection().await.unwrap();
+    let meta_key = format!("metadata:{}", file_path);
+    let _: () = redis::pipe()
+        .hset(&meta_key, "type", "striped")
+        .hset(&meta_key, "size", 1000u64)
+        .hset(&meta_key, "block_prefix", "backend_0/part_coop_p2p")
+        .query_async(&mut con_meta)
+        .await
+        .unwrap();
+
+    let write_data = vec![99u8; 1000];
+    // Node A writes the block. This caches it on Node A and registers it under block_peers
+    router_a
+        .cache
+        .nvme
+        .cache_read_block(block_key, &write_data)
+        .expect("Should cache write data on Node A");
+
+    // Wait a brief moment to ensure P2P server is ready and registered
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Set up Node B (Reader / Client)
+    let dlm_b = DlmClient::new(&get_redis_url()).unwrap();
+    let temp_dir_b = tempdir().unwrap();
+    let backend_b = RustFsClient::new_mock(); // Fresh S3 client with default_s3_data
+    backend_b
+        .put_object(block_key, default_s3_data.clone(), 0)
+        .await
+        .expect("Should seed mock S3 block on B");
+
+    let p2p_addr_b = "127.0.0.1:29104".to_string();
+
+    let cache_b = TieredCache::new(
+        vec![temp_dir_b.path().to_path_buf()],
+        None,
+        None,
+        None,
+        None,
+        backend_b.clone(),
+        dlm_b.meta_client().clone(),
+    )
+    .expect("Should create cache B");
+    let _ = cache_b.nvme.p2p_addr.set(p2p_addr_b.clone());
+
+    let router_b = DataRouter::new(dlm_b.clone(), backend_b, cache_b);
+
+    // Node B reads the file range.
+    // Since Node A has registered itself as a peer for this block, Node B should read it
+    // directly from Node A's cache (returning write_data: vec![99; 1000]) instead of S3 (which has vec![0; 1000]).
+    let read_res = router_b
+        .read_file_range(file_path, 0, 1000)
+        .await
+        .expect("Should read range via P2P");
+
+    assert_eq!(read_res, write_data);
+
+    // Clean up server
+    server_task.abort();
+}

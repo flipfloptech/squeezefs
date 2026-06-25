@@ -228,7 +228,7 @@ impl GdsCache {
             if !local_path.exists() {
                 // Download block from S3 to NVMe staging
                 let data = _backend.get_object(object_key).await?;
-                std::fs::write(&local_path, data)?;
+                tokio::fs::write(&local_path, data).await?;
             }
 
             // 2. Open file descriptor with O_DIRECT

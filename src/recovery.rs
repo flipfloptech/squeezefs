@@ -56,10 +56,7 @@ pub async fn recover_staging(
 
         // Only process staged files (.staged)
         if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
             if !name.starts_with("file_") {
                 continue;

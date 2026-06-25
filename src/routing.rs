@@ -28,8 +28,7 @@ pub struct DataRouter {
     pub cache: TieredCache,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
-    pub block_map_cache:
-        moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
+    pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
 }
@@ -636,7 +635,10 @@ impl DataRouter {
                 backend_clone
                     .put_object(&new_block_key, processed_block, fencing_token)
                     .await?;
-                debug!("Writeback: Successfully uploaded block {} to S3", new_block_key);
+                debug!(
+                    "Writeback: Successfully uploaded block {} to S3",
+                    new_block_key
+                );
 
                 Ok::<_, SqueezefsError>((b, old_block_key, stored_new_block_key))
             }));
@@ -1169,13 +1171,13 @@ impl DataRouter {
                                 }
 
                                 let downloaded = match downloaded_data {
-                                    Some(data) => {
-                                        data
-                                    }
+                                    Some(data) => data,
                                     None => {
                                         // Fallback to S3
                                         let (be_id, real_key) = parse_backend_and_key(b_key);
-                                        crypto_clone.process_read(&backend_ref.get_object(&be_id, &real_key).await?)?
+                                        crypto_clone.process_read(
+                                            &backend_ref.get_object(&be_id, &real_key).await?,
+                                        )?
                                     }
                                 };
 
@@ -1483,7 +1485,8 @@ impl DataRouter {
 
                     for (idx_str, bk) in block_mappings {
                         if let Ok(idx) = idx_str.parse::<u32>() {
-                            self.block_map_cache.invalidate(&(block_map_id.clone(), idx));
+                            self.block_map_cache
+                                .invalidate(&(block_map_id.clone(), idx));
                         }
                         let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
                         if let Some(mut r) = current_ref {

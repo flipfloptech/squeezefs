@@ -85,7 +85,8 @@ pub struct SqueezefsFilesystem {
     gid: u32,
     active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease>>,
     active_posix_locks: dashmap::DashMap<(Inode, u64, u64, u64), crate::dlm::LockLease>,
-    active_inode_locks: std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>>,
+    active_inode_locks:
+        std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>>,
     pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant)>,
     pub dismount_wait: u64,
     writeback_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
@@ -223,7 +224,9 @@ impl SqueezefsFilesystem {
                                     let b_path = block_entry.path();
                                     if b_path.is_file() {
                                         if let Some(b_name) = b_path.file_name() {
-                                            blocks.push(serde_json::Value::String(b_name.to_string_lossy().into_owned()));
+                                            blocks.push(serde_json::Value::String(
+                                                b_name.to_string_lossy().into_owned(),
+                                            ));
                                         }
                                     }
                                 }
@@ -495,20 +498,27 @@ impl SqueezefsFilesystem {
                     };
 
                     if let Some(bk) = old_block_key {
-                        existing_block_data = if let Some(cached_block) = self.router.cache.read_lru.get(&bk) {
-                            (*cached_block).clone()
-                        } else if let Some(cached) =
-                            self.router.cache.nvme.get_cached_read_block(&bk)
-                        {
-                            self.router.cache.read_lru.put(&bk, std::sync::Arc::new(cached.clone()));
-                            cached
-                        } else {
-                            let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
-                            let raw = self.router.backend.get_object(&be_id, &real_key).await?;
-                            let decompressed = self.router.get_crypto().process_read(&raw)?;
-                            self.router.cache.read_lru.put(&bk, std::sync::Arc::new(decompressed.clone()));
-                            decompressed
-                        };
+                        existing_block_data =
+                            if let Some(cached_block) = self.router.cache.read_lru.get(&bk) {
+                                (*cached_block).clone()
+                            } else if let Some(cached) =
+                                self.router.cache.nvme.get_cached_read_block(&bk)
+                            {
+                                self.router
+                                    .cache
+                                    .read_lru
+                                    .put(&bk, std::sync::Arc::new(cached.clone()));
+                                cached
+                            } else {
+                                let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+                                let raw = self.router.backend.get_object(&be_id, &real_key).await?;
+                                let decompressed = self.router.get_crypto().process_read(&raw)?;
+                                self.router
+                                    .cache
+                                    .read_lru
+                                    .put(&bk, std::sync::Arc::new(decompressed.clone()));
+                                decompressed
+                            };
                     }
                 }
 
@@ -638,7 +648,8 @@ impl SqueezefsFilesystem {
                             let new_block_key =
                                 format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
-                            let processed_block = router_clone.get_crypto().process_write(&block_data)?;
+                            let processed_block =
+                                router_clone.get_crypto().process_write(&block_data)?;
                             backend_clone
                                 .put_object(&new_block_key, processed_block, fencing_token)
                                 .await?;
@@ -647,7 +658,10 @@ impl SqueezefsFilesystem {
                             let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
                             // Cache the flushed block in RAM (read_lru) - dehydrated to NVMe on eviction
-                            router_clone.cache.read_lru.put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
+                            router_clone
+                                .cache
+                                .read_lru
+                                .put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
 
                             let mut con = dlm_clone.get_connection().await?;
                             let block_map_key = format!("block_map:{}", block_map_id_clone);
@@ -1050,7 +1064,10 @@ impl Filesystem for SqueezefsFilesystem {
                         let path = entry.path();
                         if path.is_file()
                             && path.extension().is_some_and(|ext| ext == "staged")
-                            && path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_"))
+                            && path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .is_some_and(|name| name.starts_with("file_"))
                         {
                             current_staged += 1;
                         }
@@ -2322,7 +2339,8 @@ impl Filesystem for SqueezefsFilesystem {
             let symlink_key = format!("squeezefs:symlink:{}", dest_ino);
 
             // Fetch target size first to decrement used_bytes
-            let file_size_opt: Option<u64> = con.hget(&dest_attr_key, "size").await.map_err(map_err)?;
+            let file_size_opt: Option<u64> =
+                con.hget(&dest_attr_key, "size").await.map_err(map_err)?;
             let file_size = file_size_opt.unwrap_or(0);
 
             let mut pipe = redis::pipe();
@@ -2884,7 +2902,9 @@ impl Filesystem for SqueezefsFilesystem {
                 (&dest_path, &src_path)
             };
 
-            let first_lease = if (src_path < dest_path && src_already_held) || (src_path >= dest_path && dest_already_held) {
+            let first_lease = if (src_path < dest_path && src_already_held)
+                || (src_path >= dest_path && dest_already_held)
+            {
                 None
             } else {
                 let l = match self
@@ -2904,7 +2924,9 @@ impl Filesystem for SqueezefsFilesystem {
                 l
             };
 
-            let second_lease = if (src_path < dest_path && dest_already_held) || (src_path >= dest_path && src_already_held) {
+            let second_lease = if (src_path < dest_path && dest_already_held)
+                || (src_path >= dest_path && src_already_held)
+            {
                 None
             } else {
                 let l = match self
@@ -3004,12 +3026,7 @@ impl Filesystem for SqueezefsFilesystem {
         };
 
         self.router
-            .write_file(
-                &dest_path,
-                off_out,
-                chunk,
-                target_fencing_token,
-            )
+            .write_file(&dest_path, off_out, chunk, target_fencing_token)
             .await
             .map_err(map_squeezefs_err)?;
 
@@ -3828,7 +3845,9 @@ pub async fn start_mount<P: AsRef<Path>>(
     let mut handle = if unsafe { libc::getuid() } == 0 {
         session.mount(fs, mount_path.clone()).await?
     } else {
-        session.mount_with_unprivileged(fs, mount_path.clone()).await?
+        session
+            .mount_with_unprivileged(fs, mount_path.clone())
+            .await?
     };
 
     #[cfg(not(target_os = "linux"))]
@@ -4228,7 +4247,9 @@ async fn run_constant_writeback_worker(
     mut rx: tokio::sync::mpsc::Receiver<WritebackRequest>,
     router: DataRouter,
     dlm: DlmClient,
-    active_inode_locks: std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>>,
+    active_inode_locks: std::sync::Arc<
+        dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>,
+    >,
 ) {
     use std::collections::HashMap;
     use tokio::time::{self, Duration, Instant};
@@ -4258,7 +4279,7 @@ async fn run_constant_writeback_worker(
                     let router_clone = router.clone();
                     let dlm_clone = dlm.clone();
                     let locks_clone = active_inode_locks.clone();
-                    
+
                     tokio::spawn(async move {
                         let _ = flush_single_active_block(
                             ino,
@@ -4289,7 +4310,9 @@ async fn flush_single_active_block(
         None => return Ok(()),
     };
 
-    let active_dir = staging_dir.join("active_writes").join(format!("inode_{}", ino));
+    let active_dir = staging_dir
+        .join("active_writes")
+        .join(format!("inode_{}", ino));
     let block_path = active_dir.join(format!("block_{}", b));
 
     if !block_path.exists() {
@@ -4328,7 +4351,8 @@ async fn flush_single_active_block(
     let new_block_key = format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
     let processed_block = router.get_crypto().process_write(&block_data)?;
-    router.backend
+    router
+        .backend
         .put_object(&new_block_key, processed_block, fencing_token)
         .await?;
 
@@ -4336,7 +4360,10 @@ async fn flush_single_active_block(
     let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
     // Cache in RAM - dehydrated to NVMe on eviction
-    router.cache.read_lru.put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
+    router
+        .cache
+        .read_lru
+        .put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
 
     let block_map_key = format!("block_map:{}", block_map_id);
     let refcounts_key = "squeezefs:block_refcounts";

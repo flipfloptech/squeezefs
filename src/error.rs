@@ -71,10 +71,12 @@ mod tests {
 
     #[test]
     fn test_to_errno_mapping() {
-        let err_not_found = SqueezefsError::Io(io::Error::new(io::ErrorKind::NotFound, "not found"));
+        let err_not_found =
+            SqueezefsError::Io(io::Error::new(io::ErrorKind::NotFound, "not found"));
         assert_eq!(err_not_found.to_errno(), libc::ENOENT);
 
-        let err_permission = SqueezefsError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        let err_permission =
+            SqueezefsError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
         assert_eq!(err_permission.to_errno(), libc::EACCES);
 
         let err_other = SqueezefsError::Io(io::Error::other("other"));

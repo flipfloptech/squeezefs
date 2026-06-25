@@ -394,7 +394,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: Failed to read metadata of mountpoint {:?}: {}", mountpoint, e);
+                    eprintln!(
+                        "Error: Failed to read metadata of mountpoint {:?}: {}",
+                        mountpoint, e
+                    );
                     std::process::exit(1);
                 }
             }
@@ -408,7 +411,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("\x1b[93mWARNING\x1b[0m: Mounting a FUSE filesystem under '/mnt/' in WSL without '--allow-other'");
                 eprintln!("         can cause the mount to hang or become unresponsive due to the WSL host file sharing service.");
                 eprintln!("         Consider mounting under '/tmp/' or your home directory, or pass '--allow-other'");
-                eprintln!("         (which requires uncommenting 'user_allow_other' in /etc/fuse.conf).");
+                eprintln!(
+                    "         (which requires uncommenting 'user_allow_other' in /etc/fuse.conf)."
+                );
             }
         }
 
@@ -471,7 +476,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Read from pipe to check for errors/panics from child
                         let mut buf = [0u8; 1024];
-                        let n = libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                        let n =
+                            libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len());
                         if n > 0 {
                             if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
                                 child_error.push_str(s);
@@ -484,7 +490,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if wait_res == pid {
                             // Child exited! Read any remaining output from pipe
                             loop {
-                                let n = libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                                let n = libc::read(
+                                    pipefd[0],
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    buf.len(),
+                                );
                                 if n <= 0 {
                                     break;
                                 }
@@ -633,9 +643,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fd = DAEMON_PIPE.load(std::sync::atomic::Ordering::Relaxed);
             if fd >= 0 {
                 let msg = format!("Error: {}\n", e);
-                let _ = unsafe {
-                    libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
-                };
+                let _ = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
                 let _ = unsafe { libc::close(fd) };
             }
         }
@@ -1305,19 +1313,27 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let _ = tune_system();
 
             log::info!("Resolving backend object store configuration...");
-            if s3_endpoint.is_some() || s3_access_key.is_some() || s3_secret_key.is_some() || s3_bucket.is_some() {
+            if s3_endpoint.is_some()
+                || s3_access_key.is_some()
+                || s3_secret_key.is_some()
+                || s3_bucket.is_some()
+            {
                 return Err("Backend overrides on mount are not allowed. Please configure backends using 'squeezefs backend'.".into());
             }
 
             log::info!("Resolving backend object store configuration...");
             // Load S3 settings: Env variables > Garnet stored settings
-            let final_s3_endpoint = std::env::var("RUSTFS_ENDPOINT").ok()
+            let final_s3_endpoint = std::env::var("RUSTFS_ENDPOINT")
+                .ok()
                 .or_else(|| format_fields.get("s3_endpoint").cloned());
-            let final_s3_access_key = std::env::var("RUSTFS_ACCESS_KEY").ok()
+            let final_s3_access_key = std::env::var("RUSTFS_ACCESS_KEY")
+                .ok()
                 .or_else(|| format_fields.get("s3_access_key").cloned());
-            let final_s3_secret_key = std::env::var("RUSTFS_SECRET_KEY").ok()
+            let final_s3_secret_key = std::env::var("RUSTFS_SECRET_KEY")
+                .ok()
                 .or_else(|| format_fields.get("s3_secret_key").cloned());
-            let final_s3_bucket = std::env::var("RUSTFS_BUCKET").ok()
+            let final_s3_bucket = std::env::var("RUSTFS_BUCKET")
+                .ok()
                 .or_else(|| format_fields.get("s3_bucket").cloned());
 
             // Retrieve registered backends or initialize the default one
@@ -1327,8 +1343,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(mut con) = dlm.meta_client().get_connection().await {
                 let backends_map: std::collections::HashMap<String, String> =
                     con.hgetall("squeezefs:backends").await.unwrap_or_default();
-                let statuses_map: std::collections::HashMap<String, String> =
-                    con.hgetall("squeezefs:backend:status").await.unwrap_or_default();
+                let statuses_map: std::collections::HashMap<String, String> = con
+                    .hgetall("squeezefs:backend:status")
+                    .await
+                    .unwrap_or_default();
 
                 for (be_id, be_json) in backends_map {
                     if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
@@ -1389,7 +1407,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             multi_backend.set_active_backend_id(active_be_id.clone());
             log::info!("Active write storage backend set to: {}", active_be_id);
 
-            let active_client = multi_backend.get_backend(&active_be_id)
+            let active_client = multi_backend
+                .get_backend(&active_be_id)
                 .or_else(|| multi_backend.get_backend("backend_0"))
                 .ok_or("No storage backend client available")?;
 
@@ -1494,7 +1513,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             for dir in &active_staging_dirs {
                 log::info!("Running staging recovery on: {:?}", dir);
                 let recovery_backend = multi_backend.get_backend("backend_0").unwrap();
-                if let Err(e) = squeezefs::recovery::recover_staging(dir, &recovery_backend, dlm.meta_client()).await {
+                if let Err(e) =
+                    squeezefs::recovery::recover_staging(dir, &recovery_backend, dlm.meta_client())
+                        .await
+                {
                     log::warn!("Staging recovery failed for {:?}: {:?}", dir, e);
                 }
             }
@@ -1525,12 +1547,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|| unsafe { libc::getgid() })
             });
 
-            let mut fs_engine = SqueezefsFilesystem::new(
-                router,
-                dlm,
-                resolved_uid,
-                resolved_gid,
-            );
+            let mut fs_engine = SqueezefsFilesystem::new(router, dlm, resolved_uid, resolved_gid);
             fs_engine.dismount_wait = resolved_dismount_wait;
 
             println!("Mounting Squeezefs at {:?}...", mountpoint);
@@ -1600,139 +1617,141 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fs_name,
             action,
         } => match action {
-            ConfigActions::Backend(action) => {
-                match action {
-                    BackendActions::Add {
-                        name,
-                        s3_endpoint,
-                        s3_access_key,
-                        s3_secret_key,
-                        s3_bucket,
-                    } => {
-                        squeezefs::config_ops::add_storage_backend(
-                            &garnet_url,
-                            &fs_name,
-                            &name,
-                            &s3_endpoint,
-                            &s3_access_key,
-                            &s3_secret_key,
-                            &s3_bucket,
-                        )
+            ConfigActions::Backend(action) => match action {
+                BackendActions::Add {
+                    name,
+                    s3_endpoint,
+                    s3_access_key,
+                    s3_secret_key,
+                    s3_bucket,
+                } => {
+                    squeezefs::config_ops::add_storage_backend(
+                        &garnet_url,
+                        &fs_name,
+                        &name,
+                        &s3_endpoint,
+                        &s3_access_key,
+                        &s3_secret_key,
+                        &s3_bucket,
+                    )
+                    .await?;
+                    println!("Storage backend '{}' added successfully.", name);
+                }
+                BackendActions::Remove { name, force } => {
+                    squeezefs::config_ops::remove_storage_backend(
+                        &garnet_url,
+                        &fs_name,
+                        &name,
+                        force,
+                    )
+                    .await?;
+                    println!("Storage backend '{}' removed successfully.", name);
+                }
+                BackendActions::Enable { name } => {
+                    squeezefs::config_ops::enable_storage_backend(&garnet_url, &fs_name, &name)
                         .await?;
-                        println!("Storage backend '{}' added successfully.", name);
-                    }
-                    BackendActions::Remove { name, force } => {
-                        squeezefs::config_ops::remove_storage_backend(
-                            &garnet_url,
-                            &fs_name,
-                            &name,
-                            force,
-                        )
+                    println!("Storage backend '{}' enabled successfully.", name);
+                }
+                BackendActions::Disable { name } => {
+                    squeezefs::config_ops::disable_storage_backend(&garnet_url, &fs_name, &name)
                         .await?;
-                        println!("Storage backend '{}' removed successfully.", name);
-                    }
-                    BackendActions::Enable { name } => {
-                        squeezefs::config_ops::enable_storage_backend(
-                            &garnet_url,
-                            &fs_name,
-                            &name,
-                        )
-                        .await?;
-                        println!("Storage backend '{}' enabled successfully.", name);
-                    }
-                    BackendActions::Disable { name } => {
-                        squeezefs::config_ops::disable_storage_backend(
-                            &garnet_url,
-                            &fs_name,
-                            &name,
-                        )
-                        .await?;
-                        println!("Storage backend '{}' disabled successfully.", name);
-                    }
-                    BackendActions::List => {
-                        let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                        let mut output = serde_json::Map::new();
-                        for (be_id, be_json_str) in &list.backends {
-                            if let Ok(mut be_val) = serde_json::from_str::<serde_json::Value>(be_json_str) {
-                                let status = list.backend_statuses.get(be_id).cloned().unwrap_or_else(|| "enabled".to_string());
-                                if let Some(obj) = be_val.as_object_mut() {
-                                    obj.insert("status".to_string(), serde_json::Value::String(status));
-                                }
-                                output.insert(be_id.clone(), be_val);
+                    println!("Storage backend '{}' disabled successfully.", name);
+                }
+                BackendActions::List => {
+                    let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                    let mut output = serde_json::Map::new();
+                    for (be_id, be_json_str) in &list.backends {
+                        if let Ok(mut be_val) =
+                            serde_json::from_str::<serde_json::Value>(be_json_str)
+                        {
+                            let status = list
+                                .backend_statuses
+                                .get(be_id)
+                                .cloned()
+                                .unwrap_or_else(|| "enabled".to_string());
+                            if let Some(obj) = be_val.as_object_mut() {
+                                obj.insert("status".to_string(), serde_json::Value::String(status));
                             }
+                            output.insert(be_id.clone(), be_val);
                         }
-                        if !list.backends.contains_key("backend_0") {
-                            let status = list.backend_statuses.get("backend_0").cloned().unwrap_or_else(|| "enabled".to_string());
-                            let be_val = serde_json::json!({
-                                "endpoint": "",
-                                "access_key": "admin",
-                                "secret_key": "password",
-                                "bucket": "squeezefs-data",
-                                "status": status,
-                            });
-                            output.insert("backend_0".to_string(), be_val);
-                        }
-                        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(output))?);
                     }
+                    if !list.backends.contains_key("backend_0") {
+                        let status = list
+                            .backend_statuses
+                            .get("backend_0")
+                            .cloned()
+                            .unwrap_or_else(|| "enabled".to_string());
+                        let be_val = serde_json::json!({
+                            "endpoint": "",
+                            "access_key": "admin",
+                            "secret_key": "password",
+                            "bucket": "squeezefs-data",
+                            "status": status,
+                        });
+                        output.insert("backend_0".to_string(), be_val);
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::Value::Object(output))?
+                    );
                 }
-            }
+            },
             ConfigActions::Set { key, value } => {
-                squeezefs::config_ops::set_config_quota(&garnet_url, &fs_name, &key, &value).await?;
+                squeezefs::config_ops::set_config_quota(&garnet_url, &fs_name, &key, &value)
+                    .await?;
             }
-            ConfigActions::DiskCache(action) => {
-                match action {
-                    DiskCacheActions::Add { path } => {
-                        squeezefs::config_ops::add_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' added successfully.", path);
-                    }
-                    DiskCacheActions::Remove { path, force } => {
-                        squeezefs::config_ops::remove_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                            force,
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' removed successfully.", path);
-                    }
-                    DiskCacheActions::Enable { path } => {
-                        squeezefs::config_ops::enable_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' enabled successfully.", path);
-                    }
-                    DiskCacheActions::Disable { path } => {
-                        squeezefs::config_ops::disable_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' disabled successfully.", path);
-                    }
-                    DiskCacheActions::Flush { path } => {
-                        squeezefs::config_ops::flush_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' flushed successfully.", path);
-                    }
-                    DiskCacheActions::List => {
-                        let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                        println!("{}", serde_json::to_string_pretty(&list.diskcaches)?);
-                    }
+            ConfigActions::DiskCache(action) => match action {
+                DiskCacheActions::Add { path } => {
+                    squeezefs::config_ops::add_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&path),
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' added successfully.", path);
                 }
-            }
+                DiskCacheActions::Remove { path, force } => {
+                    squeezefs::config_ops::remove_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&path),
+                        force,
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' removed successfully.", path);
+                }
+                DiskCacheActions::Enable { path } => {
+                    squeezefs::config_ops::enable_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&path),
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' enabled successfully.", path);
+                }
+                DiskCacheActions::Disable { path } => {
+                    squeezefs::config_ops::disable_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&path),
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' disabled successfully.", path);
+                }
+                DiskCacheActions::Flush { path } => {
+                    squeezefs::config_ops::flush_disk_cache_path(
+                        &garnet_url,
+                        &fs_name,
+                        Path::new(&path),
+                    )
+                    .await?;
+                    println!("Disk cache path '{}' flushed successfully.", path);
+                }
+                DiskCacheActions::List => {
+                    let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                    println!("{}", serde_json::to_string_pretty(&list.diskcaches)?);
+                }
+            },
             ConfigActions::List => {
                 let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
                 println!("{}", serde_json::to_string_pretty(&list)?);
@@ -1775,7 +1794,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if staging_dirs.is_empty() {
                 if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                     if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                        let paths_str: Option<String> = con.hget("squeezefs:format", "disk_cache_paths").await.unwrap_or(None);
+                        let paths_str: Option<String> = con
+                            .hget("squeezefs:format", "disk_cache_paths")
+                            .await
+                            .unwrap_or(None);
                         if let Some(s) = paths_str {
                             if !s.is_empty() {
                                 staging_dirs = s.split(',').map(PathBuf::from).collect();
@@ -1794,7 +1816,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut dismount_wait = 10;
             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                 if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                    let wait_str: Option<String> = con.hget("squeezefs:format", "dismount_wait").await.unwrap_or(None);
+                    let wait_str: Option<String> = con
+                        .hget("squeezefs:format", "dismount_wait")
+                        .await
+                        .unwrap_or(None);
                     if let Some(s) = wait_str {
                         if let Ok(w) = s.parse::<u64>() {
                             dismount_wait = w;
@@ -1813,7 +1838,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let path = entry.path();
                         if path.is_file()
                             && path.extension().is_some_and(|ext| ext == "staged")
-                            && path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_"))
+                            && path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .is_some_and(|name| name.starts_with("file_"))
                         {
                             staged_count += 1;
                         }
@@ -1840,9 +1868,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // 6. Prompt the user if not forced and stdin is a TTY
             if has_unflushed && !force && std::io::stdin().is_terminal() {
-                println!("{}", "WARNING: There are unflushed staged writes on this node!".red().bold());
+                println!(
+                    "{}",
+                    "WARNING: There are unflushed staged writes on this node!"
+                        .red()
+                        .bold()
+                );
                 println!("Remaining local staged files: {}", staged_count);
-                println!("Active write transaction directories: {}", active_writes_count);
+                println!(
+                    "Active write transaction directories: {}",
+                    active_writes_count
+                );
                 println!("Other nodes will NOT see this data if you unmount now.");
                 println!("\nChoose an option:");
                 println!("  [w] Wait for staged files to drain/flush to S3 (recommended)");
@@ -1885,7 +1921,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     let path = entry.path();
                                     if path.is_file()
                                         && path.extension().is_some_and(|ext| ext == "staged")
-                                        && path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_"))
+                                        && path
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .is_some_and(|name| name.starts_with("file_"))
                                     {
                                         current_staged += 1;
                                     }
@@ -1946,7 +1985,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             println!("Successfully unmounted mountpoint {:?}", mountpoint);
                         }
                         _ => {
-                            eprintln!("Error: Failed to unmount mountpoint {:?}. Try running with sudo.", mountpoint);
+                            eprintln!(
+                                "Error: Failed to unmount mountpoint {:?}. Try running with sudo.",
+                                mountpoint
+                            );
                             std::process::exit(1);
                         }
                     }

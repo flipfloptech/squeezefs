@@ -571,8 +571,10 @@ pub async fn disable_storage_backend(
 
     let backends_map: std::collections::HashMap<String, String> =
         con.hgetall("squeezefs:backends").await.unwrap_or_default();
-    let statuses: std::collections::HashMap<String, String> =
-        con.hgetall("squeezefs:backend:status").await.unwrap_or_default();
+    let statuses: std::collections::HashMap<String, String> = con
+        .hgetall("squeezefs:backend:status")
+        .await
+        .unwrap_or_default();
 
     let mut enabled_count = 0;
 
@@ -583,15 +585,22 @@ pub async fn disable_storage_backend(
         }
     }
 
-    let status_b0 = statuses.get("backend_0").map(|s| s.as_str()).unwrap_or("enabled");
+    let status_b0 = statuses
+        .get("backend_0")
+        .map(|s| s.as_str())
+        .unwrap_or("enabled");
     if status_b0 == "enabled" && !backends_map.contains_key("backend_0") {
         enabled_count += 1;
     }
 
-    let target_status = statuses.get(backend_id).map(|s| s.as_str()).unwrap_or("enabled");
+    let target_status = statuses
+        .get(backend_id)
+        .map(|s| s.as_str())
+        .unwrap_or("enabled");
     if target_status == "enabled" && enabled_count <= 1 {
         return Err(SqueezefsError::InvalidOperation(
-            "Cannot disable backend: at least one storage backend must remain enabled for writes".to_string()
+            "Cannot disable backend: at least one storage backend must remain enabled for writes"
+                .to_string(),
         ));
     }
 
@@ -627,32 +636,50 @@ pub async fn set_config_quota(
         }
         "mem_cache_size" | "mem-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
-            let _: () = con.hset("squeezefs:format", "mem_cache_size", value).await?;
+            let _: () = con
+                .hset("squeezefs:format", "mem_cache_size", value)
+                .await?;
             println!("Configuration quota 'mem_cache_size' set to '{}'.", value);
         }
         "read_mem_cache_size" | "read-mem-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
-            let _: () = con.hset("squeezefs:format", "read_mem_cache_size", value).await?;
-            println!("Configuration quota 'read_mem_cache_size' set to '{}'.", value);
+            let _: () = con
+                .hset("squeezefs:format", "read_mem_cache_size", value)
+                .await?;
+            println!(
+                "Configuration quota 'read_mem_cache_size' set to '{}'.",
+                value
+            );
         }
         "write_mem_cache_size" | "write-mem-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
-            let _: () = con.hset("squeezefs:format", "write_mem_cache_size", value).await?;
-            println!("Configuration quota 'write_mem_cache_size' set to '{}'.", value);
+            let _: () = con
+                .hset("squeezefs:format", "write_mem_cache_size", value)
+                .await?;
+            println!(
+                "Configuration quota 'write_mem_cache_size' set to '{}'.",
+                value
+            );
         }
         "disk_cache_size" | "disk-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
-            let _: () = con.hset("squeezefs:format", "disk_cache_size", value).await?;
+            let _: () = con
+                .hset("squeezefs:format", "disk_cache_size", value)
+                .await?;
             println!("Configuration quota 'disk_cache_size' set to '{}'.", value);
         }
         "read_cache_size" | "read-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
-            let _: () = con.hset("squeezefs:format", "read_cache_size", value).await?;
+            let _: () = con
+                .hset("squeezefs:format", "read_cache_size", value)
+                .await?;
             println!("Configuration quota 'read_cache_size' set to '{}'.", value);
         }
         "write_cache_size" | "write-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
-            let _: () = con.hset("squeezefs:format", "write_cache_size", value).await?;
+            let _: () = con
+                .hset("squeezefs:format", "write_cache_size", value)
+                .await?;
             println!("Configuration quota 'write_cache_size' set to '{}'.", value);
         }
         _ => {
@@ -664,4 +691,3 @@ pub async fn set_config_quota(
     }
     Ok(())
 }
-

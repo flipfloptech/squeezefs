@@ -435,7 +435,9 @@ impl NvmeStaging {
         // 1. Pack individual staged file bytes into one payload
         for item in batch.iter() {
             let idx = get_dir_index(&item.file_id, staging_dirs.len());
-            let local_path = staging_dirs[idx].join("staging").join(format!("file_{}.staged", item.file_id));
+            let local_path = staging_dirs[idx]
+                .join("staging")
+                .join(format!("file_{}.staged", item.file_id));
 
             let data_res = tokio::task::spawn_blocking(move || {
                 if let Ok(metadata) = fs::metadata(&local_path) {
@@ -511,7 +513,9 @@ impl NvmeStaging {
         for item in batch.iter() {
             let idx = get_dir_index(&item.file_id, staging_dirs.len());
             let target_dir = &staging_dirs[idx];
-            let local_path = target_dir.join("staging").join(format!("file_{}.staged", item.file_id));
+            let local_path = target_dir
+                .join("staging")
+                .join(format!("file_{}.staged", item.file_id));
             if local_path.exists() {
                 if let Ok(meta) = fs::metadata(&local_path) {
                     staged_bytes.fetch_sub(meta.len(), std::sync::atomic::Ordering::Relaxed);
@@ -552,7 +556,11 @@ impl NvmeStaging {
 
         if block_path.exists() {
             if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
-                let _ = file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()).set_modified(std::time::SystemTime::now()));
+                let _ = file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_accessed(std::time::SystemTime::now())
+                        .set_modified(std::time::SystemTime::now()),
+                );
             }
             return Ok(());
         }
@@ -689,7 +697,11 @@ impl NvmeStaging {
         let block_path = target_dir.join(format!("block_{}.block", safe_name));
         if block_path.exists() {
             if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
-                let _ = file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()).set_modified(std::time::SystemTime::now()));
+                let _ = file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_accessed(std::time::SystemTime::now())
+                        .set_modified(std::time::SystemTime::now()),
+                );
             }
             fs::read(block_path).ok()
         } else {
@@ -710,7 +722,11 @@ impl NvmeStaging {
         let block_path = target_dir.join(format!("block_{}.block", safe_name));
         if block_path.exists() {
             if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
-                let _ = file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()).set_modified(std::time::SystemTime::now()));
+                let _ = file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_accessed(std::time::SystemTime::now())
+                        .set_modified(std::time::SystemTime::now()),
+                );
             }
             use std::io::{Read, Seek, SeekFrom};
             let mut file = fs::File::open(&block_path).ok()?;

@@ -43,7 +43,10 @@ async fn test_nvme_staging_and_merge() {
     let mock_backend = RustFsClient::new_mock();
 
     let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
-    let mut con = redis_client.get_multiplexed_tokio_connection().await.unwrap();
+    let mut con = redis_client
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
     let _: () = redis::cmd("DEL")
         .arg("squeezefs:format")
         .query_async(&mut con)
@@ -152,7 +155,10 @@ async fn test_multi_disk_distribution() {
             .collect();
         for path in entries {
             if path.extension().is_some_and(|ext| ext == "staged")
-                && path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_"))
+                && path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.starts_with("file_"))
             {
                 total_files += 1;
             }
@@ -287,7 +293,7 @@ async fn test_virtual_stats_file() {
 
     let router = squeezefs::routing::DataRouter::new(dlm.clone(), backend, cache);
     let fs = squeezefs::fuse_client::SqueezefsFilesystem::new(router, dlm, 1000, 1000);
-    
+
     let req = fuse3::raw::Request {
         unique: 1,
         uid: 1000,
@@ -297,19 +303,31 @@ async fn test_virtual_stats_file() {
     fs.init(req).await.unwrap();
 
     // 1. Lookup ".stats" in root directory (parent = 1)
-    let reply_lookup = fs.lookup(req, 1, std::ffi::OsStr::new(".stats")).await.unwrap();
+    let reply_lookup = fs
+        .lookup(req, 1, std::ffi::OsStr::new(".stats"))
+        .await
+        .unwrap();
     assert_eq!(reply_lookup.attr.ino, 0xffff_ffff_ffff_fffd);
-    assert_eq!(reply_lookup.attr.kind, fuse3::raw::prelude::FileType::RegularFile);
+    assert_eq!(
+        reply_lookup.attr.kind,
+        fuse3::raw::prelude::FileType::RegularFile
+    );
 
     // 2. Getattr on stats inode
-    let reply_attr = fs.getattr(req, 0xffff_ffff_ffff_fffd, None, 0).await.unwrap();
+    let reply_attr = fs
+        .getattr(req, 0xffff_ffff_ffff_fffd, None, 0)
+        .await
+        .unwrap();
     assert_eq!(reply_attr.attr.ino, 0xffff_ffff_ffff_fffd);
     assert!(reply_attr.attr.size > 0);
 
     // 3. Read stats data
-    let reply_read = fs.read(req, 0xffff_ffff_ffff_fffd, 0, 0, 8192).await.unwrap();
+    let reply_read = fs
+        .read(req, 0xffff_ffff_ffff_fffd, 0, 0, 8192)
+        .await
+        .unwrap();
     let stats_str = String::from_utf8(reply_read.data.to_vec()).unwrap();
-    
+
     // Parse stats JSON
     let stats_val: serde_json::Value = serde_json::from_str(&stats_str).unwrap();
     assert!(stats_val.get("read_lru_keys").is_some());
@@ -348,7 +366,9 @@ async fn test_atomic_cache_write_concurrency() {
     let block_data_clone = block_data.clone();
     let writer_task = tokio::spawn(async move {
         for _ in 0..100 {
-            nvme_clone.cache_read_block(block_key, &block_data_clone).unwrap();
+            nvme_clone
+                .cache_read_block(block_key, &block_data_clone)
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
@@ -376,7 +396,10 @@ fn test_parse_duration() {
     assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
     assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
     assert_eq!(parse_duration("1000").unwrap(), Duration::from_millis(1000));
-    assert_eq!(parse_duration("  250Ms  ").unwrap(), Duration::from_millis(250));
+    assert_eq!(
+        parse_duration("  250Ms  ").unwrap(),
+        Duration::from_millis(250)
+    );
     assert_eq!(parse_duration("3S").unwrap(), Duration::from_secs(3));
 
     assert!(parse_duration("invalid").is_err());
@@ -391,7 +414,10 @@ async fn test_dynamic_upload_delay() {
     let mock_backend = RustFsClient::new_mock();
     let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
 
-    let mut con = redis_client.get_multiplexed_tokio_connection().await.unwrap();
+    let mut con = redis_client
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
     let _: () = redis::cmd("HSET")
         .arg("squeezefs:format")
         .arg("upload_delay")
@@ -415,15 +441,23 @@ async fn test_dynamic_upload_delay() {
 
     let file_id = "test-delay-file-id";
     let data = vec![9; 100];
-    nvme.stage_write("test_delay.txt", file_id, &data, 100).await.unwrap();
+    nvme.stage_write("test_delay.txt", file_id, &data, 100)
+        .await
+        .unwrap();
 
     // Check after 800ms. Since the delay is 1500ms, it should STILL be in NVMe staging!
     tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(nvme.read_staged(file_id).is_some(), "Staged file should still be present before timeout");
+    assert!(
+        nvme.read_staged(file_id).is_some(),
+        "Staged file should still be present before timeout"
+    );
 
     // Check after another 1200ms (total 2000ms > 1500ms). It should be flushed/deleted.
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert!(nvme.read_staged(file_id).is_none(), "Staged file should be flushed and deleted after timeout");
+    assert!(
+        nvme.read_staged(file_id).is_none(),
+        "Staged file should be flushed and deleted after timeout"
+    );
 
     // Clean up to prevent test pollution
     let _: () = redis::cmd("DEL")
@@ -435,8 +469,8 @@ async fn test_dynamic_upload_delay() {
 
 #[tokio::test]
 async fn test_active_writes_pruning_and_deletion() {
-    use std::fs::{create_dir_all, write, read_dir, remove_dir};
     use squeezefs::routing::DataRouter;
+    use std::fs::{create_dir_all, read_dir, remove_dir, write};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let staging_dirs = vec![temp_dir.path().to_path_buf()];
@@ -472,11 +506,18 @@ async fn test_active_writes_pruning_and_deletion() {
     }
 
     // 3. Verify empty_inode_dir was deleted, but nonempty_inode_dir still exists
-    assert!(!empty_inode_dir.exists(), "Empty inode directory should be pruned");
-    assert!(nonempty_inode_dir.exists(), "Non-empty inode directory should NOT be pruned");
+    assert!(
+        !empty_inode_dir.exists(),
+        "Empty inode directory should be pruned"
+    );
+    assert!(
+        nonempty_inode_dir.exists(),
+        "Non-empty inode directory should NOT be pruned"
+    );
 
     // 4. Test Router's delete_file functionality deletes the active writes directory (even if non-empty)
-    let redis_url = std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_url =
+        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     if let Ok(dlm) = squeezefs::dlm::DlmClient::new(&redis_url) {
         if let Ok(client) = redis::Client::open(redis_url.clone()) {
             if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
@@ -544,7 +585,10 @@ async fn test_active_writes_pruning_and_deletion() {
                 router.delete_file("inode_333", &mut conn).await.unwrap();
 
                 // Verify the active writes directory is completely gone!
-                assert!(!router_active_dir.exists(), "delete_file should delete the active_writes directory of the inode");
+                assert!(
+                    !router_active_dir.exists(),
+                    "delete_file should delete the active_writes directory of the inode"
+                );
             }
         }
     }
@@ -666,7 +710,8 @@ async fn test_concurrent_mounts_cache_sharing() {
 
 #[tokio::test]
 async fn test_router_cache_bounds() {
-    let redis_url = std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_url =
+        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let dlm = squeezefs::dlm::DlmClient::new(&redis_url).unwrap();
     let backend = squeezefs::backend::RustFsClient::new_mock();
     let temp_dir = tempfile::tempdir().unwrap();
@@ -678,7 +723,8 @@ async fn test_router_cache_bounds() {
         None,
         backend.clone(),
         dlm.meta_client().clone(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let router = squeezefs::routing::DataRouter::new(dlm, backend, cache);
 
@@ -696,6 +742,11 @@ async fn test_router_cache_bounds() {
     assert!(router.metadata_cache.get("test_key").is_some());
 
     let val = (Some("block_key".to_string()), std::time::Instant::now());
-    router.block_map_cache.insert(("map_id".to_string(), 0), val);
-    assert!(router.block_map_cache.get(&("map_id".to_string(), 0)).is_some());
+    router
+        .block_map_cache
+        .insert(("map_id".to_string(), 0), val);
+    assert!(router
+        .block_map_cache
+        .get(&("map_id".to_string(), 0))
+        .is_some());
 }

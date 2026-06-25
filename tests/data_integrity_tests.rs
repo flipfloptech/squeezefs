@@ -2,6 +2,7 @@ use fuse3::raw::{prelude::*, Request};
 use rand::RngCore;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use squeezefs::backend::{MultiBackendClient, RustFsClient};
 use squeezefs::cache::TieredCache;
@@ -11,7 +12,6 @@ use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use tempfile::tempdir;
-use redis::AsyncCommands;
 
 fn get_redis_url() -> String {
     std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
@@ -248,7 +248,10 @@ async fn test_data_integrity_chunked_writes_sha512() {
     let expected_checksum = calculate_sha512(&data);
 
     // Create file
-    let reply_create = fs.create(req, 1, OsStr::new("chunked_test.bin"), 0o644, 0).await.unwrap();
+    let reply_create = fs
+        .create(req, 1, OsStr::new("chunked_test.bin"), 0o644, 0)
+        .await
+        .unwrap();
     let ino = reply_create.attr.ino;
 
     // Write file in 128KB chunks
@@ -257,17 +260,22 @@ async fn test_data_integrity_chunked_writes_sha512() {
     while offset < size {
         let end = std::cmp::min(offset + chunk_size, size);
         let chunk = &data[offset..end];
-        fs.write(req, ino, 0, offset as u64, chunk, 0, 0).await.unwrap();
+        fs.write(req, ino, 0, offset as u64, chunk, 0, 0)
+            .await
+            .unwrap();
         offset = end;
     }
 
     fs.flush(req, ino, 0, 0).await.unwrap();
-    
+
     // Test immediate read from the active filesystem instance (cached data check)
     let reply_read_immediate = fs.read(req, ino, 0, 0, size as u32).await.unwrap();
     assert_eq!(reply_read_immediate.data.len(), size);
     let checksum_immediate = calculate_sha512(&reply_read_immediate.data);
-    assert_eq!(checksum_immediate, expected_checksum, "Immediate read checksum mismatch");
+    assert_eq!(
+        checksum_immediate, expected_checksum,
+        "Immediate read checksum mismatch"
+    );
 
     fs.release(req, ino, 0, 0, 0, false).await.unwrap();
 
@@ -348,9 +356,13 @@ async fn test_striped_rmw_corruption_with_compression() {
     .unwrap();
 
     let router = DataRouter::new(dlm.clone(), multi_backend.clone(), cache.clone());
-    
+
     // Set format parameters on the router
-    let crypto = squeezefs::crypto_compress::CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    let crypto = squeezefs::crypto_compress::CryptoCompressState::new(
+        "lz4".to_string(),
+        "none".to_string(),
+        None,
+    );
     router.set_crypto(crypto);
 
     let fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
@@ -366,8 +378,11 @@ async fn test_striped_rmw_corruption_with_compression() {
     // 1. Create a 6MB file (will be striped because block size is 1MB and size > 4MB progressive layout threshold)
     let size = 6 * 1024 * 1024;
     let mut data = generate_seeded_data(54321, size);
-    
-    let reply_create = fs.create(req, 1, OsStr::new("striped_lz4.bin"), 0o644, 0).await.unwrap();
+
+    let reply_create = fs
+        .create(req, 1, OsStr::new("striped_lz4.bin"), 0o644, 0)
+        .await
+        .unwrap();
     let ino = reply_create.attr.ino;
 
     // Write file sequentially to make it striped
@@ -379,13 +394,15 @@ async fn test_striped_rmw_corruption_with_compression() {
     // Write 100 bytes at offset 1.5MB (block 1, which is offset 1MB to 2MB)
     let patch_offset = 1500 * 1024;
     let patch_data = vec![7u8; 100];
-    
+
     // Update our reference data
     data[patch_offset..patch_offset + 100].copy_from_slice(&patch_data);
     let expected_checksum = calculate_sha512(&data);
 
     let _reply_open = fs.open(req, ino, 0).await.unwrap();
-    fs.write(req, ino, 0, patch_offset as u64, &patch_data, 0, 0).await.unwrap();
+    fs.write(req, ino, 0, patch_offset as u64, &patch_data, 0, 0)
+        .await
+        .unwrap();
     fs.flush(req, ino, 0, 0).await.unwrap();
     fs.release(req, ino, 0, 0, 0, false).await.unwrap();
 
@@ -404,9 +421,13 @@ async fn test_striped_rmw_corruption_with_compression() {
     .unwrap();
 
     let router_recreate = DataRouter::new(dlm.clone(), multi_backend.clone(), cache_recreate);
-    let crypto_recreate = squeezefs::crypto_compress::CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    let crypto_recreate = squeezefs::crypto_compress::CryptoCompressState::new(
+        "lz4".to_string(),
+        "none".to_string(),
+        None,
+    );
     router_recreate.set_crypto(crypto_recreate);
-    
+
     let fs_recreate = SqueezefsFilesystem::new(router_recreate, dlm.clone(), 1000, 1000);
     fs_recreate.init(req).await.unwrap();
 
@@ -479,14 +500,22 @@ async fn test_posix_locks_released_on_close() {
     fs.init(req).await.unwrap();
 
     // Create file
-    let reply_create = fs.create(req, 1, OsStr::new("lock_file.bin"), 0o644, 0).await.unwrap();
+    let reply_create = fs
+        .create(req, 1, OsStr::new("lock_file.bin"), 0o644, 0)
+        .await
+        .unwrap();
     let ino = reply_create.attr.ino;
 
     // Acquire POSIX range lock (owner = 5678)
-    fs.setlk(req, ino, 0, 5678, 0, 100, libc::F_WRLCK as u32, 1234, false).await.unwrap();
+    fs.setlk(req, ino, 0, 5678, 0, 100, libc::F_WRLCK as u32, 1234, false)
+        .await
+        .unwrap();
 
     // Verify lock is acquired by checking stats json
-    let reply_read = fs.read(req, 0xffff_ffff_ffff_fffd, 0, 0, 100000).await.unwrap();
+    let reply_read = fs
+        .read(req, 0xffff_ffff_ffff_fffd, 0, 0, 100000)
+        .await
+        .unwrap();
     let stats: serde_json::Value = serde_json::from_slice(&reply_read.data).unwrap();
     let count = stats["active_posix_locks_count"].as_u64().unwrap();
     assert_eq!(count, 1);
@@ -495,7 +524,10 @@ async fn test_posix_locks_released_on_close() {
     fs.release(req, ino, 0, 0, 5678, false).await.unwrap();
 
     // Verify lock is released
-    let reply_read2 = fs.read(req, 0xffff_ffff_ffff_fffd, 0, 0, 100000).await.unwrap();
+    let reply_read2 = fs
+        .read(req, 0xffff_ffff_ffff_fffd, 0, 0, 100000)
+        .await
+        .unwrap();
     let stats2: serde_json::Value = serde_json::from_slice(&reply_read2.data).unwrap();
     let count2 = stats2["active_posix_locks_count"].as_u64().unwrap();
     assert_eq!(count2, 0);
@@ -564,7 +596,10 @@ async fn test_copy_file_range_same_file_safety() {
     fs.init(req).await.unwrap();
 
     // Create file
-    let reply_create = fs.create(req, 1, OsStr::new("copy_self.bin"), 0o644, 0).await.unwrap();
+    let reply_create = fs
+        .create(req, 1, OsStr::new("copy_self.bin"), 0o644, 0)
+        .await
+        .unwrap();
     let ino = reply_create.attr.ino;
 
     // Write some data (striped, 6MB)
@@ -575,8 +610,14 @@ async fn test_copy_file_range_same_file_safety() {
 
     // Copy to self: copy first 1MB of file to offset 2MB of same file
     // This used to panic
-    let res = fs.copy_file_range(req, ino, 0, 0, ino, 0, 2 * 1024 * 1024, 1024 * 1024, 0).await;
-    assert!(res.is_ok(), "copy_file_range inside same file failed: {:?}", res.err());
+    let res = fs
+        .copy_file_range(req, ino, 0, 0, ino, 0, 2 * 1024 * 1024, 1024 * 1024, 0)
+        .await;
+    assert!(
+        res.is_ok(),
+        "copy_file_range inside same file failed: {:?}",
+        res.err()
+    );
 }
 
 #[tokio::test]
@@ -642,7 +683,10 @@ async fn test_rename_overwrite_resource_cleanup() {
     fs.init(req).await.unwrap();
 
     // 1. Create source file (striped, 5MB)
-    let reply_src = fs.create(req, 1, OsStr::new("src.bin"), 0o644, 0).await.unwrap();
+    let reply_src = fs
+        .create(req, 1, OsStr::new("src.bin"), 0o644, 0)
+        .await
+        .unwrap();
     let src_ino = reply_src.attr.ino;
     let src_data = generate_seeded_data(101, 5 * 1024 * 1024);
     fs.write(req, src_ino, 0, 0, &src_data, 0, 0).await.unwrap();
@@ -650,10 +694,15 @@ async fn test_rename_overwrite_resource_cleanup() {
     fs.release(req, src_ino, 0, 0, 0, false).await.unwrap();
 
     // 2. Create dest file (striped, 5MB)
-    let reply_dest = fs.create(req, 1, OsStr::new("dest.bin"), 0o644, 0).await.unwrap();
+    let reply_dest = fs
+        .create(req, 1, OsStr::new("dest.bin"), 0o644, 0)
+        .await
+        .unwrap();
     let dest_ino = reply_dest.attr.ino;
     let dest_data = generate_seeded_data(202, 5 * 1024 * 1024);
-    fs.write(req, dest_ino, 0, 0, &dest_data, 0, 0).await.unwrap();
+    fs.write(req, dest_ino, 0, 0, &dest_data, 0, 0)
+        .await
+        .unwrap();
     fs.flush(req, dest_ino, 0, 0).await.unwrap();
     fs.release(req, dest_ino, 0, 0, 0, false).await.unwrap();
 
@@ -668,11 +717,16 @@ async fn test_rename_overwrite_resource_cleanup() {
     assert!(exists_before);
 
     // Rename src to dest (which overwrites dest)
-    fs.rename(req, 1, OsStr::new("src.bin"), 1, OsStr::new("dest.bin")).await.unwrap();
+    fs.rename(req, 1, OsStr::new("src.bin"), 1, OsStr::new("dest.bin"))
+        .await
+        .unwrap();
 
     // Verify that the dest block map key has been deleted completely
     let exists_after: bool = con.exists(&dest_block_map_key).await.unwrap();
-    assert!(!exists_after, "Overwritten file block map key was not deleted!");
+    assert!(
+        !exists_after,
+        "Overwritten file block map key was not deleted!"
+    );
 }
 
 #[tokio::test]
@@ -738,7 +792,10 @@ async fn test_data_integrity_known_sha512_hash() {
     fs.init(req).await.unwrap();
 
     // Create striped file (4.2MB) with known data
-    let reply_create = fs.create(req, 1, OsStr::new("known_sha512.bin"), 0o644, 0).await.unwrap();
+    let reply_create = fs
+        .create(req, 1, OsStr::new("known_sha512.bin"), 0o644, 0)
+        .await
+        .unwrap();
     let ino = reply_create.attr.ino;
 
     let base_pattern = b"SQUEEZEFS_SHA512_CORRUPTION_TEST_SEQUENCE_";
@@ -771,7 +828,10 @@ async fn test_data_integrity_known_sha512_hash() {
     let fs_recreate = SqueezefsFilesystem::new(router_recreate, dlm.clone(), 1000, 1000);
     fs_recreate.init(req).await.unwrap();
 
-    let reply_read = fs_recreate.read(req, ino, 0, 0, data.len() as u32).await.unwrap();
+    let reply_read = fs_recreate
+        .read(req, ino, 0, 0, data.len() as u32)
+        .await
+        .unwrap();
     assert_eq!(reply_read.data.len(), data.len());
     let checksum = calculate_sha512(&reply_read.data);
     assert_eq!(checksum, expected_hash);
@@ -840,7 +900,10 @@ async fn test_data_integrity_10mb_sha512_hash() {
     fs.init(req).await.unwrap();
 
     // Create striped file (~10.1MB)
-    let reply_create = fs.create(req, 1, OsStr::new("large_10mb.bin"), 0o644, 0).await.unwrap();
+    let reply_create = fs
+        .create(req, 1, OsStr::new("large_10mb.bin"), 0o644, 0)
+        .await
+        .unwrap();
     let ino = reply_create.attr.ino;
 
     let base_pattern = b"SQUEEZEFS_SHA512_CORRUPTION_TEST_SEQUENCE_";
@@ -873,9 +936,11 @@ async fn test_data_integrity_10mb_sha512_hash() {
     let fs_recreate = SqueezefsFilesystem::new(router_recreate, dlm.clone(), 1000, 1000);
     fs_recreate.init(req).await.unwrap();
 
-    let reply_read = fs_recreate.read(req, ino, 0, 0, data.len() as u32).await.unwrap();
+    let reply_read = fs_recreate
+        .read(req, ino, 0, 0, data.len() as u32)
+        .await
+        .unwrap();
     assert_eq!(reply_read.data.len(), data.len());
     let checksum = calculate_sha512(&reply_read.data);
     assert_eq!(checksum, expected_hash);
 }
-

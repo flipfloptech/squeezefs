@@ -90,7 +90,9 @@ impl LruCache {
     }
 
     /// Retrieve the eviction receiver. Can only be taken once.
-    pub fn take_evict_rx(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<(String, Arc<Vec<u8>>)>> {
+    pub fn take_evict_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<(String, Arc<Vec<u8>>)>> {
         self.evict_rx.lock().ok()?.take()
     }
 

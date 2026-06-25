@@ -31,19 +31,21 @@ impl TieredCache {
         sys.refresh_memory();
         let total_memory = sys.total_memory(); // In bytes
 
-        let read_mem_limit = if let Some(cfg) = read_mem_cache_size.filter(|c| !c.is_empty() && *c != "none") {
-            parse_size_string(cfg, total_memory)?
-        } else {
-            // Default 10% of system RAM
-            total_memory / 10
-        };
+        let read_mem_limit =
+            if let Some(cfg) = read_mem_cache_size.filter(|c| !c.is_empty() && *c != "none") {
+                parse_size_string(cfg, total_memory)?
+            } else {
+                // Default 10% of system RAM
+                total_memory / 10
+            };
 
-        let write_mem_limit = if let Some(cfg) = write_mem_cache_size.filter(|c| !c.is_empty() && *c != "none") {
-            parse_size_string(cfg, total_memory)?
-        } else {
-            // Default 10% of system RAM
-            total_memory / 10
-        };
+        let write_mem_limit =
+            if let Some(cfg) = write_mem_cache_size.filter(|c| !c.is_empty() && *c != "none") {
+                parse_size_string(cfg, total_memory)?
+            } else {
+                // Default 10% of system RAM
+                total_memory / 10
+            };
 
         let read_lru = lru::LruCache::with_capacity(read_mem_limit);
         let write_lru = lru::LruCache::with_capacity(write_mem_limit);
@@ -51,19 +53,21 @@ impl TieredCache {
         // 2. Get disk size limit
         let aggregate_capacity = get_aggregate_disk_capacity(&staging_dirs);
 
-        let read_disk_limit = if let Some(cfg) = read_disk_cache_size.filter(|c| !c.is_empty() && *c != "none") {
-            parse_size_string(cfg, aggregate_capacity)?
-        } else {
-            // Default 25% of aggregate capacity
-            aggregate_capacity / 4
-        };
+        let read_disk_limit =
+            if let Some(cfg) = read_disk_cache_size.filter(|c| !c.is_empty() && *c != "none") {
+                parse_size_string(cfg, aggregate_capacity)?
+            } else {
+                // Default 25% of aggregate capacity
+                aggregate_capacity / 4
+            };
 
-        let write_disk_limit = if let Some(cfg) = write_disk_cache_size.filter(|c| !c.is_empty() && *c != "none") {
-            parse_size_string(cfg, aggregate_capacity)?
-        } else {
-            // Default 25% of aggregate capacity
-            aggregate_capacity / 4
-        };
+        let write_disk_limit =
+            if let Some(cfg) = write_disk_cache_size.filter(|c| !c.is_empty() && *c != "none") {
+                parse_size_string(cfg, aggregate_capacity)?
+            } else {
+                // Default 25% of aggregate capacity
+                aggregate_capacity / 4
+            };
 
         let nvme = nvme::NvmeStaging::new(
             staging_dirs,
@@ -211,4 +215,3 @@ pub fn parse_duration(val: &str) -> Result<std::time::Duration> {
         Ok(std::time::Duration::from_millis(ms))
     }
 }
-

@@ -1,6 +1,6 @@
+use redis::AsyncCommands;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::format_volume;
-use redis::AsyncCommands;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -14,7 +14,6 @@ async fn setup_test_volume(name: &str) -> Option<DlmClient> {
     let client = redis::Client::open(redis_url.clone()).ok()?;
     let mut con = client.get_multiplexed_tokio_connection().await.ok()?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut con).await.ok()?;
-
 
     // Format the volume to initialize metadata
     let _ = format_volume(
@@ -311,8 +310,8 @@ async fn test_backend_duplicate_and_status_checks() {
     );
 
     // 5. Try to disable the last enabled backend
-    let disable_last = squeezefs::config_ops::disable_storage_backend(&redis_url, fs_name, "backend_0")
-        .await;
+    let disable_last =
+        squeezefs::config_ops::disable_storage_backend(&redis_url, fs_name, "backend_0").await;
     assert!(
         disable_last.is_err(),
         "Should fail to disable the last remaining enabled write backend"
@@ -335,19 +334,28 @@ async fn test_backend_duplicate_and_status_checks() {
 #[tokio::test]
 async fn test_multi_backend_sharding_status_routing() {
     let multi_backend = squeezefs::backend::MultiBackendClient::new();
-    
+
     // Register backend_0 and backend_1
     let local_ips = Vec::new();
-    let backend_0 = squeezefs::backend::RustFsClient::new_with_local_ips(local_ips.clone(), None, None, None, None).await;
-    let backend_1 = squeezefs::backend::RustFsClient::new_with_local_ips(local_ips, None, None, None, None).await;
-    
+    let backend_0 = squeezefs::backend::RustFsClient::new_with_local_ips(
+        local_ips.clone(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let backend_1 =
+        squeezefs::backend::RustFsClient::new_with_local_ips(local_ips, None, None, None, None)
+            .await;
+
     multi_backend.register_backend("backend_0", backend_0);
     multi_backend.register_backend("backend_1", backend_1);
-    
+
     // Set both as enabled
     multi_backend.set_backend_status("backend_0", "enabled");
     multi_backend.set_backend_status("backend_1", "enabled");
-    
+
     // Find a key that hashes/routes to backend_1 when both are enabled
     let mut target_key = String::new();
     for i in 0..1000 {
@@ -358,15 +366,18 @@ async fn test_multi_backend_sharding_status_routing() {
             break;
         }
     }
-    assert!(!target_key.is_empty(), "Should find a key that routes to backend_1");
-    
+    assert!(
+        !target_key.is_empty(),
+        "Should find a key that routes to backend_1"
+    );
+
     // Now, disable backend_1
     multi_backend.set_backend_status("backend_1", "disabled");
-    
+
     // Since backend_1 is disabled, the same key should route to backend_0 instead
     let new_selected = multi_backend.get_backend_for_key(&target_key);
     assert_eq!(new_selected, "backend_0");
-    
+
     // If all backends are disabled, it should fall back to any registered backend
     multi_backend.set_backend_status("backend_0", "disabled");
     let fallback_selected = multi_backend.get_backend_for_key(&target_key);
@@ -416,54 +427,85 @@ async fn test_set_config_quotas() {
     assert_eq!(updated_inodes, 5_000_000);
 
     // 5. Try setting an invalid quota key -> should fail
-    let res_invalid = squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "invalid_quota_key", "10")
-        .await;
+    let res_invalid =
+        squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "invalid_quota_key", "10")
+            .await;
     assert!(res_invalid.is_err());
 
     // 6. Set valid memory cache size limits and verify
     squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "mem_cache_size", "2GB")
         .await
         .expect("Should set mem_cache_size to 2GB");
-    let val: String = con.hget("squeezefs:format", "mem_cache_size").await.unwrap();
+    let val: String = con
+        .hget("squeezefs:format", "mem_cache_size")
+        .await
+        .unwrap();
     assert_eq!(val, "2GB");
 
     squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "read-mem-cache-size", "50%")
         .await
         .expect("Should set read_mem_cache_size to 50%");
-    let val: String = con.hget("squeezefs:format", "read_mem_cache_size").await.unwrap();
+    let val: String = con
+        .hget("squeezefs:format", "read_mem_cache_size")
+        .await
+        .unwrap();
     assert_eq!(val, "50%");
 
     squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "write_mem_cache_size", "256MB")
         .await
         .expect("Should set write_mem_cache_size to 256MB");
-    let val: String = con.hget("squeezefs:format", "write_mem_cache_size").await.unwrap();
+    let val: String = con
+        .hget("squeezefs:format", "write_mem_cache_size")
+        .await
+        .unwrap();
     assert_eq!(val, "256MB");
 
     // 7. Set valid disk cache size limits and verify
     squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "disk_cache_size", "10GB")
         .await
         .expect("Should set disk_cache_size to 10GB");
-    let val: String = con.hget("squeezefs:format", "disk_cache_size").await.unwrap();
+    let val: String = con
+        .hget("squeezefs:format", "disk_cache_size")
+        .await
+        .unwrap();
     assert_eq!(val, "10GB");
 
     squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "read_cache_size", "80%")
         .await
         .expect("Should set read_cache_size to 80%");
-    let val: String = con.hget("squeezefs:format", "read_cache_size").await.unwrap();
+    let val: String = con
+        .hget("squeezefs:format", "read_cache_size")
+        .await
+        .unwrap();
     assert_eq!(val, "80%");
 
     squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "write-cache-size", "5GB")
         .await
         .expect("Should set write_cache_size to 5GB");
-    let val: String = con.hget("squeezefs:format", "write_cache_size").await.unwrap();
+    let val: String = con
+        .hget("squeezefs:format", "write_cache_size")
+        .await
+        .unwrap();
     assert_eq!(val, "5GB");
 
     // 8. Try setting invalid cache sizes -> should fail validation
-    let res_invalid_size = squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "mem_cache_size", "invalid_size")
-        .await;
-    assert!(res_invalid_size.is_err(), "Should reject invalid size string");
+    let res_invalid_size = squeezefs::config_ops::set_config_quota(
+        &redis_url,
+        fs_name,
+        "mem_cache_size",
+        "invalid_size",
+    )
+    .await;
+    assert!(
+        res_invalid_size.is_err(),
+        "Should reject invalid size string"
+    );
 
-    let res_invalid_percent = squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "disk_cache_size", "150%")
-        .await;
-    assert!(res_invalid_percent.is_err(), "Should reject invalid percentage");
+    let res_invalid_percent =
+        squeezefs::config_ops::set_config_quota(&redis_url, fs_name, "disk_cache_size", "150%")
+            .await;
+    assert!(
+        res_invalid_percent.is_err(),
+        "Should reject invalid percentage"
+    );
 }

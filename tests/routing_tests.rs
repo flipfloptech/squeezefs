@@ -337,3 +337,45 @@ async fn test_route_sparse_large_file_striped() {
         .expect("Should read written range");
     assert_eq!(written_range, data);
 }
+
+#[tokio::test]
+async fn test_striped_write_await_s3() {
+    let (router, _temp_dir) = match setup_router().await {
+        Some(r) => r,
+        None => {
+            println!("Skipping test: Redis/Garnet or S3 not available");
+            return;
+        }
+    };
+
+    let file_path = "striped_await.bin";
+    let data = vec![99; 5 * 1024 * 1024]; // 5MB (> 4MB block size, striped)
+
+    // Write file - if it returns, the blocks MUST be in S3 already
+    router
+        .write_file(file_path, 0, &data, 105)
+        .await
+        .expect("Should write large file");
+
+    // Clear RAM read cache
+    router.cache.read_lru.clear();
+
+    // Clear local NVMe read cache block files so that router is forced to pull from S3
+    for dir in router.cache.nvme.staging_dirs() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().map_or(false, |ext| ext == "block") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    // Read back - if the S3 upload was not awaited, this will fail or miss data!
+    let read_data = router
+        .read_file(file_path)
+        .await
+        .expect("Should read back large file from S3");
+
+    assert_eq!(read_data, data);
+}

@@ -509,3 +509,83 @@ async fn test_set_config_quotas() {
         "Should reject invalid percentage"
     );
 }
+
+#[tokio::test]
+async fn test_destroy_bucket_data_mock() {
+    let client = squeezefs::backend::RustFsClient::new_mock();
+    client.put_object("test_key", b"test_data".to_vec(), 0).await.unwrap();
+    assert_eq!(client.get_object("test_key").await.unwrap(), b"test_data");
+    
+    client.destroy_bucket_data().await.unwrap();
+    assert!(client.get_object("test_key").await.is_err());
+}
+
+#[tokio::test]
+async fn test_format_quick_vs_full() {
+    let redis_url = get_redis_url();
+    let client = match redis::Client::open(redis_url.clone()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut con = match client.get_multiplexed_tokio_connection().await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut con).await.unwrap_or(());
+
+    // Call format_volume_ext with quick = true
+    let res_quick = squeezefs::fuse_client::format_volume_ext(
+        &redis_url,
+        "test_vol_quick",
+        4096,
+        1024 * 1024,
+        1000,
+        "none",
+        "none",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        true, // quick
+    )
+    .await;
+    assert!(res_quick.is_ok());
+
+    // Call format_volume_ext with quick = false
+    let res_full = squeezefs::fuse_client::format_volume_ext(
+        &redis_url,
+        "test_vol_full",
+        4096,
+        1024 * 1024,
+        1000,
+        "none",
+        "none",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false, // quick = false
+    )
+    .await;
+    assert!(res_full.is_ok());
+}

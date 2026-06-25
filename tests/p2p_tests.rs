@@ -489,3 +489,128 @@ async fn test_p2p_random_subset_limit() {
         elapsed.as_millis()
     );
 }
+
+#[tokio::test]
+async fn test_leased_peer_keepalive_and_pruning() {
+    let dlm = match get_dlm_client().await {
+        Some(d) => d,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
+            return;
+        }
+    };
+    clear_garnet_keys(&dlm).await;
+
+    // Set up a mock NvmeStaging and P2pServer
+    let temp_dir = tempdir().unwrap();
+    let backend = RustFsClient::new_mock();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .expect("Should create cache");
+    
+    let p2p_addr = "127.0.0.1:29110".to_string();
+    let _ = cache.nvme.p2p_addr.set(p2p_addr.clone());
+
+    // Start P2pServer which will run the heartbeat and health checker loops
+    let server = P2pServer::new(p2p_addr.clone(), cache.nvme.clone());
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Wait 200ms to ensure the first heartbeat registers the client
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify registration in squeezefs:active_clients (Sorted Set)
+    let mut con = dlm.get_connection().await.unwrap();
+    let score: Option<f64> = redis::cmd("ZSCORE")
+        .arg("squeezefs:active_clients")
+        .arg(&p2p_addr)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    assert!(score.is_some(), "Client P2P address should be registered in squeezefs:active_clients");
+
+    // Verify that cache_read_block registers peer blocks correctly
+    let test_block_key = "backend_0/part_coop_test/part_1";
+    cache.nvme.cache_read_block(test_block_key, &[1, 2, 3]).unwrap();
+    
+    // Wait a brief moment for registration
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Check if test_block_key is added to squeezefs:peer_blocks:<p2p_addr>
+    let is_block_registered: bool = con.sismember(format!("squeezefs:peer_blocks:{}", p2p_addr), test_block_key).await.unwrap();
+    assert!(is_block_registered, "Block key should be added to peer_blocks set");
+
+    // Seed a dead peer in Garnet (in the health check schedule and block_peers)
+    let dead_peer = "127.0.0.1:29111".to_string();
+    let block_key = "backend_0/part_prune_test/part_0";
+    let safe_name = block_key.replace(['/', ':'], "_");
+
+    // Add dead peer to block_peers set
+    let _: () = con.sadd(format!("block_peers:{}", safe_name), &dead_peer).await.unwrap();
+    
+    // Add block mapping to squeezefs:peer_blocks:<dead_peer>
+    let _: () = con.sadd(format!("squeezefs:peer_blocks:{}", dead_peer), block_key).await.unwrap();
+
+    // Add dead peer to health check schedule with next check time = now (meaning it should be checked immediately)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let _: () = redis::cmd("ZADD")
+        .arg("squeezefs:peer_health_check_schedule")
+        .arg(now)
+        .arg(&dead_peer)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // Add dead peer to squeezefs:active_clients to simulate it was active
+    let _: () = redis::cmd("ZADD")
+        .arg("squeezefs:active_clients")
+        .arg(now + 30)
+        .arg(&dead_peer)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // Call the check and prune method directly
+    server.check_and_prune_peers().await.expect("Pruning should succeed");
+
+    // Verify dead peer is pruned from squeezefs:peer_health_check_schedule
+    let dead_score: Option<f64> = redis::cmd("ZSCORE")
+        .arg("squeezefs:peer_health_check_schedule")
+        .arg(&dead_peer)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(dead_score.is_none(), "Dead peer should be pruned from schedule");
+
+    // Verify dead peer is pruned from squeezefs:active_clients
+    let active_score: Option<f64> = redis::cmd("ZSCORE")
+        .arg("squeezefs:active_clients")
+        .arg(&dead_peer)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(active_score.is_none(), "Dead peer should be pruned from active clients");
+
+    // Verify dead peer is pruned from block_peers set
+    let is_member: bool = con.sismember(format!("block_peers:{}", safe_name), &dead_peer).await.unwrap();
+    assert!(!is_member, "Dead peer should be pruned from block_peers");
+
+    // Verify squeezefs:peer_blocks:<dead_peer> key is deleted
+    let exists: bool = con.exists(format!("squeezefs:peer_blocks:{}", dead_peer)).await.unwrap();
+    assert!(!exists, "peer_blocks list should be deleted");
+
+    server_task.abort();
+}
+

@@ -457,3 +457,59 @@ async fn test_fuse_write_updates_blocks_cache() {
         "Blocks attribute in cache must be updated to size.div_ceil(512)"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuse_forget_eviction() {
+    let _con = match clean_db().await {
+        Some(c) => c,
+        None => return,
+    };
+
+    let redis_url = "redis://127.0.0.1:6379/";
+    let dlm = DlmClient::new(redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+    fs.init(req).await.unwrap();
+
+    let file_name = OsStr::new("forget_test.txt");
+    let reply_mknod = fs
+        .mknod(req, 1, file_name, 0o644 | libc::S_IFREG, 0)
+        .await
+        .unwrap();
+    let ino = reply_mknod.attr.ino;
+
+    // Verify it is cached in attr_cache (mknod automatically caches it)
+    assert!(fs.attr_cache.contains_key(&ino));
+
+    // Manually insert a lock into active_inode_locks to simulate active lock reference
+    let lock_arc = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+    fs.active_inode_locks.insert(ino, lock_arc);
+    assert!(fs.active_inode_locks.contains_key(&ino));
+
+    // Call forget
+    fs.forget(req, ino, 1).await;
+
+    // Verify both caches are evicted/cleared for this inode
+    assert!(!fs.attr_cache.contains_key(&ino), "Forget should evict from attr_cache");
+    assert!(!fs.active_inode_locks.contains_key(&ino), "Forget should evict from active_inode_locks");
+}
+

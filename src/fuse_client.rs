@@ -85,7 +85,7 @@ pub struct SqueezefsFilesystem {
     gid: u32,
     active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease>>,
     active_posix_locks: dashmap::DashMap<(Inode, u64, u64, u64), crate::dlm::LockLease>,
-    active_inode_locks:
+    pub active_inode_locks:
         std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>>,
     pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant)>,
     pub dismount_wait: u64,

@@ -20,6 +20,187 @@ use tokio::runtime::Builder;
 const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
+static LUA_CREATE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
+    redis::Script::new(
+        r#"
+        if redis.call("HEXISTS", KEYS[1], ARGV[1]) == 1 then
+            return {1, 0}
+        end
+        local used = tonumber(redis.call("GET", "squeezefs:used_inodes") or "0")
+        if used >= tonumber(ARGV[6]) then
+            return {2, 0}
+        end
+        local new_ino = redis.call("INCR", "squeezefs:inode_counter")
+        if redis.call("HSETNX", KEYS[1], ARGV[1], new_ino) == 0 then
+            return {1, 0}
+        end
+        local attr_key = "squeezefs:attr:" .. new_ino
+        local meta_key = "metadata:inode_" .. new_ino
+        redis.call("HSET", attr_key,
+            "ino", new_ino,
+            "size", "0",
+            "blocks", "0",
+            "kind", "1",
+            "perm", ARGV[4],
+            "nlink", "1",
+            "uid", ARGV[2],
+            "gid", ARGV[3],
+            "atime_sec", ARGV[5],
+            "atime_nsec", "0",
+            "mtime_sec", ARGV[5],
+            "mtime_nsec", "0",
+            "ctime_sec", ARGV[5],
+            "ctime_nsec", "0"
+        )
+        redis.call("HSET", meta_key,
+            "type", "inline",
+            "size", "0"
+        )
+        redis.call("INCRBY", "squeezefs:used_inodes", 1)
+        local parent_attr_key = "squeezefs:attr:" .. KEYS[2]
+        redis.call("HSET", parent_attr_key,
+            "mtime_sec", ARGV[5],
+            "mtime_nsec", "0",
+            "ctime_sec", ARGV[5],
+            "ctime_nsec", "0"
+        )
+        return {0, new_ino}
+    "#,
+    )
+});
+
+static LUA_MKDIR_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
+    redis::Script::new(
+        r#"
+        if redis.call("HEXISTS", KEYS[1], ARGV[1]) == 1 then
+            return {1, 0}
+        end
+        local used = tonumber(redis.call("GET", "squeezefs:used_inodes") or "0")
+        if used >= tonumber(ARGV[6]) then
+            return {2, 0}
+        end
+        local new_ino = redis.call("INCR", "squeezefs:inode_counter")
+        if redis.call("HSETNX", KEYS[1], ARGV[1], new_ino) == 0 then
+            return {1, 0}
+        end
+        local attr_key = "squeezefs:attr:" .. new_ino
+        local meta_key = "metadata:inode_" .. new_ino
+        local child_dir_key = "squeezefs:dir:" .. new_ino
+        redis.call("HSET", attr_key,
+            "ino", new_ino,
+            "size", "4096",
+            "blocks", "8",
+            "kind", "2",
+            "perm", ARGV[4],
+            "nlink", "2",
+            "uid", ARGV[2],
+            "gid", ARGV[3],
+            "atime_sec", ARGV[5],
+            "atime_nsec", "0",
+            "mtime_sec", ARGV[5],
+            "mtime_nsec", "0",
+            "ctime_sec", ARGV[5],
+            "ctime_nsec", "0"
+        )
+        redis.call("HSET", meta_key,
+            "type", "inline",
+            "size", "0"
+        )
+        redis.call("HSET", child_dir_key,
+            ".", new_ino,
+            "..", KEYS[2]
+        )
+        local parent_attr_key = "squeezefs:attr:" .. KEYS[2]
+        local parent_nlink = tonumber(redis.call("HGET", parent_attr_key, "nlink") or "1")
+        redis.call("HSET", parent_attr_key,
+            "nlink", parent_nlink + 1,
+            "mtime_sec", ARGV[5],
+            "mtime_nsec", "0",
+            "ctime_sec", ARGV[5],
+            "ctime_nsec", "0"
+        )
+        redis.call("INCRBY", "squeezefs:used_inodes", 1)
+        return {0, new_ino}
+    "#,
+    )
+});
+
+static LUA_UNLINK_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
+    redis::Script::new(
+        r#"
+        local child_ino = redis.call("HGET", KEYS[1], ARGV[1])
+        if not child_ino then
+            return {-1, 0, 0, 0}
+        end
+        local child_attr_key = "squeezefs:attr:" .. child_ino
+        local kind = tonumber(redis.call("HGET", child_attr_key, "kind") or "1")
+        if kind == 2 then
+            return {1, tonumber(child_ino), 0, 0}
+        end
+        local nlink = tonumber(redis.call("HGET", child_attr_key, "nlink") or "1")
+        nlink = nlink - 1
+        if nlink < 0 then
+            nlink = 0
+        end
+        redis.call("HSET", child_attr_key, "nlink", nlink)
+        redis.call("HDEL", KEYS[1], ARGV[1])
+        local size = tonumber(redis.call("HGET", child_attr_key, "size") or "0")
+        local parent_attr_key = "squeezefs:attr:" .. KEYS[2]
+        redis.call("HSET", parent_attr_key,
+            "mtime_sec", ARGV[2],
+            "mtime_nsec", "0",
+            "ctime_sec", ARGV[2],
+            "ctime_nsec", "0"
+        )
+        return {0, tonumber(child_ino), nlink, size}
+    "#,
+    )
+});
+
+static LUA_RMDIR_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
+    redis::Script::new(
+        r#"
+        local child_ino = redis.call("HGET", KEYS[1], ARGV[1])
+        if not child_ino then
+            return {1, 0}
+        end
+        local child_dir_key = "squeezefs:dir:" .. child_ino
+        local keys = redis.call("HKEYS", child_dir_key)
+        local count = 0
+        for _, k in ipairs(keys) do
+            if k ~= "." and k ~= ".." then
+                count = count + 1
+            end
+        end
+        if count > 0 then
+            return {2, tonumber(child_ino)}
+        end
+        redis.call("HDEL", KEYS[1], ARGV[1])
+        redis.call("DEL", child_dir_key)
+        local child_attr_key = "squeezefs:attr:" .. child_ino
+        local child_meta_key = "metadata:inode_" .. child_ino
+        redis.call("DEL", child_attr_key)
+        redis.call("DEL", child_meta_key)
+        redis.call("DEL", "inline_data:inode_" .. child_ino)
+        redis.call("DECR", "squeezefs:used_inodes")
+        local parent_attr_key = "squeezefs:attr:" .. KEYS[2]
+        local parent_nlink = tonumber(redis.call("HGET", parent_attr_key, "nlink") or "2")
+        parent_nlink = parent_nlink - 1
+        if parent_nlink < 1 then
+            parent_nlink = 1
+        end
+        redis.call("HSET", parent_attr_key,
+            "nlink", parent_nlink,
+            "mtime_sec", ARGV[2],
+            "mtime_nsec", "0",
+            "ctime_sec", ARGV[2],
+            "ctime_nsec", "0"
+        )
+        return {0, tonumber(child_ino)}
+    "#,
+    )
+});
+
 fn get_default_staging_dir() -> std::path::PathBuf {
     let uid = unsafe { libc::getuid() };
     if uid == 0 {
@@ -88,6 +269,8 @@ pub struct SqueezefsFilesystem {
     pub active_inode_locks:
         std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>>,
     pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant)>,
+    pub dir_entry_cache:
+        moka::sync::Cache<u64, std::sync::Arc<std::collections::HashMap<String, u64>>>,
     pub dismount_wait: u64,
     writeback_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
     writeback_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<WritebackRequest>>>,
@@ -96,6 +279,10 @@ pub struct SqueezefsFilesystem {
 impl SqueezefsFilesystem {
     pub fn new(router: DataRouter, dlm: DlmClient, uid: u32, gid: u32) -> Self {
         let (writeback_tx, writeback_rx) = tokio::sync::mpsc::channel(10000);
+        let dir_entry_cache = moka::sync::Cache::builder()
+            .max_capacity(50000)
+            .time_to_live(Duration::from_secs(1))
+            .build();
         Self {
             router,
             dlm,
@@ -105,6 +292,7 @@ impl SqueezefsFilesystem {
             active_posix_locks: dashmap::DashMap::new(),
             active_inode_locks: std::sync::Arc::new(dashmap::DashMap::new()),
             attr_cache: dashmap::DashMap::new(),
+            dir_entry_cache,
             dismount_wait: 10,
             writeback_tx,
             writeback_rx: std::sync::Mutex::new(Some(writeback_rx)),
@@ -1151,13 +1339,24 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
-        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
-        let dir_key = format!("squeezefs:dir:{}", parent);
-        let child_ino_opt: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
-
-        let child_ino = match child_ino_opt {
-            Some(ino) => ino,
-            None => return Err(Errno::from(libc::ENOENT)),
+        let child_ino = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
+            if let Some(&ino) = cached_map.get(&*name_str) {
+                ino
+            } else {
+                return Err(Errno::from(libc::ENOENT));
+            }
+        } else {
+            let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+            let dir_key = format!("squeezefs:dir:{}", parent);
+            let entries_map: std::collections::HashMap<String, u64> =
+                con.hgetall(&dir_key).await.map_err(map_err)?;
+            let entries_arc = std::sync::Arc::new(entries_map);
+            self.dir_entry_cache.insert(parent, entries_arc.clone());
+            if let Some(&ino) = entries_arc.get(&*name_str) {
+                ino
+            } else {
+                return Err(Errno::from(libc::ENOENT));
+            }
         };
 
         let attr = self
@@ -1336,75 +1535,49 @@ impl Filesystem for SqueezefsFilesystem {
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
-        // Check if name already exists in parent
         let dir_key = format!("squeezefs:dir:{}", parent);
-        let exists: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
-        if exists.is_some() {
-            return Err(Errno::from(libc::EEXIST));
-        }
-
-        self.check_inode_quota(&mut con).await?;
-
-        // Allocate new inode
-        let new_ino: u64 = con
-            .incr("squeezefs:inode_counter", 1)
-            .await
-            .map_err(map_err)?;
-
-        // Atomically link to parent dir
-        let dir_key = format!("squeezefs:dir:{}", parent);
-        let setnx_res: u8 = redis::cmd("HSETNX")
-            .arg(&dir_key)
-            .arg(&*name_str)
-            .arg(new_ino)
-            .query_async(&mut con)
-            .await
-            .map_err(map_err)?;
-
-        if setnx_res == 0 {
-            return Err(Errno::from(libc::EEXIST));
-        }
-
-        let now = SystemTime::now()
+        let sec = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO);
-        let sec = now.as_secs() as i64;
-        let nsec = now.subsec_nanos();
+            .unwrap_or(Duration::ZERO)
+            .as_secs() as i64;
 
-        let attr_key = format!("squeezefs:attr:{}", new_ino);
+        let inodes_limit_str: Option<String> = con
+            .hget("squeezefs:format", "inodes")
+            .await
+            .map_err(map_err)?;
+        let max_inodes = inodes_limit_str
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let max_inodes_val = if max_inodes > 0 { max_inodes } else { u64::MAX };
 
-        let meta_key = format!("metadata:inode_{}", new_ino);
-
-        // Add to parent directory, set attributes, and save
-        let _: () = redis::pipe()
-            .hset(&dir_key, &*name_str, new_ino)
-            .hset(&attr_key, "ino", new_ino)
-            .hset(&attr_key, "size", 0)
-            .hset(&attr_key, "blocks", 0)
-            .hset(&attr_key, "kind", 1) // RegularFile
-            .hset(&attr_key, "perm", mode as u16 & 0o7777)
-            .hset(&attr_key, "nlink", 1)
-            .hset(&attr_key, "uid", req.uid)
-            .hset(&attr_key, "gid", req.gid)
-            .hset(&attr_key, "atime_sec", sec)
-            .hset(&attr_key, "atime_nsec", nsec)
-            .hset(&attr_key, "mtime_sec", sec)
-            .hset(&attr_key, "mtime_nsec", nsec)
-            .hset(&attr_key, "ctime_sec", sec)
-            .hset(&attr_key, "ctime_nsec", nsec)
-            .hset(&meta_key, "type", "inline")
-            .hset(&meta_key, "size", 0)
-            .incr("squeezefs:used_inodes", 1)
-            .query_async(&mut con)
+        // Execute LUA_CREATE_SCRIPT
+        // KEYS: [dir_key, parent]
+        // ARGV: [name, uid, gid, perm, sec, max_inodes]
+        let res: Vec<u64> = LUA_CREATE_SCRIPT
+            .key(&dir_key)
+            .key(parent)
+            .arg(&*name_str)
+            .arg(req.uid)
+            .arg(req.gid)
+            .arg(mode as u16 & 0o7777)
+            .arg(sec)
+            .arg(max_inodes_val)
+            .invoke_async(&mut con)
             .await
             .map_err(map_err)?;
 
-        // Update parent directory timestamps!
-        self.update_parent_timestamps(&mut con, parent)
-            .await
-            .map_err(map_err)?;
+        let status = res.first().copied().unwrap_or(1);
+        let new_ino = res.get(1).copied().unwrap_or(0);
+
+        match status {
+            0 => {}
+            1 => return Err(Errno::from(libc::EEXIST)),
+            2 => return Err(Errno::from(libc::ENOSPC)),
+            _ => return Err(Errno::from(libc::EIO)),
+        }
 
         self.attr_cache.remove(&parent);
+        self.dir_entry_cache.invalidate(&parent);
 
         let attr = self
             .get_attr_internal(new_ino)
@@ -1415,8 +1588,8 @@ impl Filesystem for SqueezefsFilesystem {
             ttl: Duration::from_secs(1),
             attr,
             generation: 1,
-            fh: new_ino, // file handle
-            flags: 0,    // FOPEN flags (0 = default)
+            fh: new_ino,
+            flags: 0,
         })
     }
 
@@ -1715,64 +1888,49 @@ impl Filesystem for SqueezefsFilesystem {
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
-        // Check if name already exists in parent
         let dir_key = format!("squeezefs:dir:{}", parent);
-        let exists: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
-        if exists.is_some() {
-            return Err(Errno::from(libc::EEXIST));
+        let sec = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs() as i64;
+
+        let inodes_limit_str: Option<String> = con
+            .hget("squeezefs:format", "inodes")
+            .await
+            .map_err(map_err)?;
+        let max_inodes = inodes_limit_str
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let max_inodes_val = if max_inodes > 0 { max_inodes } else { u64::MAX };
+
+        // Execute LUA_MKDIR_SCRIPT
+        // KEYS: [dir_key, parent]
+        // ARGV: [name, uid, gid, perm, sec, max_inodes]
+        let res: Vec<u64> = LUA_MKDIR_SCRIPT
+            .key(&dir_key)
+            .key(parent)
+            .arg(&*name_str)
+            .arg(req.uid)
+            .arg(req.gid)
+            .arg(mode as u16 & 0o7777)
+            .arg(sec)
+            .arg(max_inodes_val)
+            .invoke_async(&mut con)
+            .await
+            .map_err(map_err)?;
+
+        let status = res.first().copied().unwrap_or(1);
+        let new_ino = res.get(1).copied().unwrap_or(0);
+
+        match status {
+            0 => {}
+            1 => return Err(Errno::from(libc::EEXIST)),
+            2 => return Err(Errno::from(libc::ENOSPC)),
+            _ => return Err(Errno::from(libc::EIO)),
         }
 
-        self.check_inode_quota(&mut con).await?;
-
-        // Allocate new inode
-        let new_ino: u64 = con
-            .incr("squeezefs:inode_counter", 1)
-            .await
-            .map_err(map_err)?;
-
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO);
-        let sec = now.as_secs() as i64;
-        let nsec = now.subsec_nanos();
-
-        let attr_key = format!("squeezefs:attr:{}", new_ino);
-
-        // Add to parent, set directory attributes, and also keep track of parent directory for "." and ".."
-        let child_dir_key = format!("squeezefs:dir:{}", new_ino);
-        let _: () = redis::pipe()
-            .hset(&dir_key, &*name_str, new_ino)
-            .hset(&attr_key, "ino", new_ino)
-            .hset(&attr_key, "size", 0)
-            .hset(&attr_key, "blocks", 0)
-            .hset(&attr_key, "kind", 2) // Directory
-            .hset(&attr_key, "perm", mode as u16 & 0o7777)
-            .hset(&attr_key, "nlink", 2) // "." and parent entry
-            .hset(&attr_key, "uid", req.uid)
-            .hset(&attr_key, "gid", req.gid)
-            .hset(&attr_key, "atime_sec", sec)
-            .hset(&attr_key, "atime_nsec", nsec)
-            .hset(&attr_key, "mtime_sec", sec)
-            .hset(&attr_key, "mtime_nsec", nsec)
-            .hset(&attr_key, "ctime_sec", sec)
-            .hset(&attr_key, "ctime_nsec", nsec)
-            .hset(&child_dir_key, ".", new_ino)
-            .hset(&child_dir_key, "..", parent)
-            .incr("squeezefs:used_inodes", 1)
-            .query_async(&mut con)
-            .await
-            .map_err(map_err)?;
-
-        // Increment parent's nlink (directories have parent + children link count)
-        let parent_attr_key = format!("squeezefs:attr:{}", parent);
-        let _: Result<(), redis::RedisError> = con.hincr(&parent_attr_key, "nlink", 1).await;
-
-        // Update parent directory timestamps!
-        self.update_parent_timestamps(&mut con, parent)
-            .await
-            .map_err(map_err)?;
-
         self.attr_cache.remove(&parent);
+        self.dir_entry_cache.invalidate(&parent);
 
         let attr = self
             .get_attr_internal(new_ino)
@@ -1795,44 +1953,38 @@ impl Filesystem for SqueezefsFilesystem {
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let dir_key = format!("squeezefs:dir:{}", parent);
-        let ino_opt: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
-        let ino = match ino_opt {
-            Some(i) => i,
-            None => return Err(Errno::from(libc::ENOENT)),
-        };
+        let sec = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs() as i64;
 
-        // Check if directory is empty (only "." and ".." are allowed)
-        let child_dir_key = format!("squeezefs:dir:{}", ino);
-        let keys: Vec<String> = con.hkeys(&child_dir_key).await.map_err(map_err)?;
-        for k in keys {
-            if k != "." && k != ".." {
-                return Err(Errno::from(libc::ENOTEMPTY));
-            }
+        // Execute LUA_RMDIR_SCRIPT
+        // KEYS: [dir_key, parent]
+        // ARGV: [name, sec]
+        let res: Vec<u64> = LUA_RMDIR_SCRIPT
+            .key(&dir_key)
+            .key(parent)
+            .arg(&*name_str)
+            .arg(sec)
+            .invoke_async(&mut con)
+            .await
+            .map_err(map_err)?;
+
+        let status = res.first().copied().unwrap_or(1);
+        let ino = res.get(1).copied().unwrap_or(0);
+
+        match status {
+            0 => {}
+            1 => return Err(Errno::from(libc::ENOENT)),
+            2 => return Err(Errno::from(libc::ENOTEMPTY)),
+            _ => return Err(Errno::from(libc::EIO)),
         }
-
-        // Delete directory metadata and parent link
-        let attr_key = format!("squeezefs:attr:{}", ino);
-        let _: () = redis::pipe()
-            .hdel(&dir_key, &*name_str)
-            .del(&attr_key)
-            .del(&child_dir_key)
-            .decr("squeezefs:used_inodes", 1)
-            .query_async(&mut con)
-            .await
-            .map_err(map_err)?;
-
-        // Decrement parent's nlink
-        let parent_attr_key = format!("squeezefs:attr:{}", parent);
-        let _: Result<(), redis::RedisError> = con.hincr(&parent_attr_key, "nlink", -1).await;
-
-        // Update parent directory timestamps!
-        self.update_parent_timestamps(&mut con, parent)
-            .await
-            .map_err(map_err)?;
 
         // Invalidate caches
         self.attr_cache.remove(&ino);
         self.attr_cache.remove(&parent);
+        self.dir_entry_cache.invalidate(&parent);
+        self.dir_entry_cache.invalidate(&ino);
         let file_path = format!("inode_{}", ino);
         self.router.metadata_cache.remove(&file_path);
 
@@ -2159,52 +2311,39 @@ impl Filesystem for SqueezefsFilesystem {
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let dir_key = format!("squeezefs:dir:{}", parent);
-        let ino_opt: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
-        let ino = match ino_opt {
-            Some(i) => i,
-            None => return Err(Errno::from(libc::ENOENT)),
-        };
+        let sec = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs() as i64;
 
-        let attr_key = format!("squeezefs:attr:{}", ino);
-        let kind: u8 = con
-            .hget(&attr_key, "kind")
-            .await
-            .map_err(map_err)
-            .unwrap_or(1);
-        if kind == 2 {
-            // Directory
-            return Err(Errno::from(libc::EISDIR));
-        }
-
-        // Remove from parent directory
-        let _: () = con.hdel(&dir_key, &*name_str).await.map_err(map_err)?;
-
-        // Update parent directory timestamps!
-        self.update_parent_timestamps(&mut con, parent)
+        // Execute LUA_UNLINK_SCRIPT
+        // KEYS: [dir_key, parent]
+        // ARGV: [name, sec]
+        let res: Vec<i64> = LUA_UNLINK_SCRIPT
+            .key(&dir_key)
+            .key(parent)
+            .arg(&*name_str)
+            .arg(sec)
+            .invoke_async(&mut con)
             .await
             .map_err(map_err)?;
 
-        let current_nlink: u32 = con.hget(&attr_key, "nlink").await.map_err(map_err)?;
+        let status = res.first().copied().unwrap_or(-1);
+        let ino = res.get(1).copied().unwrap_or(0) as u64;
+        let new_nlink = res.get(2).copied().unwrap_or(0);
+        let file_size = res.get(3).copied().unwrap_or(0) as u64;
 
-        if current_nlink > 1 {
-            // Just decrement link count
-            let _: () = redis::pipe()
-                .hincr(&attr_key, "nlink", -1)
-                .hset(
-                    &attr_key,
-                    "ctime_sec",
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64,
-                )
-                .query_async(&mut con)
-                .await
-                .map_err(map_err)?;
-        } else {
+        match status {
+            -1 => return Err(Errno::from(libc::ENOENT)),
+            1 => return Err(Errno::from(libc::EISDIR)),
+            0 => {}
+            _ => return Err(Errno::from(libc::EIO)),
+        }
+
+        let attr_key = format!("squeezefs:attr:{}", ino);
+
+        if new_nlink == 0 {
             // Delete metadata and data completely
-            let file_size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
-            let file_size = file_size_opt.unwrap_or(0);
             let file_path = format!("inode_{}", ino);
             let inline_key = format!("inline_data:{}", file_path);
             let meta_key = format!("metadata:{}", file_path);
@@ -2233,9 +2372,10 @@ impl Filesystem for SqueezefsFilesystem {
             self.active_posix_locks.retain(|key, _| key.0 != ino);
         }
 
-        // Invalidate attr_cache and router metadata_cache
+        // Invalidate attr_cache, router metadata_cache, and dir_entry_cache
         self.attr_cache.remove(&ino);
         self.attr_cache.remove(&parent);
+        self.dir_entry_cache.invalidate(&parent);
         let file_path = format!("inode_{}", ino);
         self.router.metadata_cache.remove(&file_path);
 
@@ -2462,9 +2602,16 @@ impl Filesystem for SqueezefsFilesystem {
         debug!("FUSE readdir: parent = {}, offset = {}", parent, offset);
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
-        let dir_key = format!("squeezefs:dir:{}", parent);
-        let entries_map: std::collections::HashMap<String, u64> =
-            con.hgetall(&dir_key).await.map_err(map_err)?;
+        let entries_map = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
+            cached_map
+        } else {
+            let dir_key = format!("squeezefs:dir:{}", parent);
+            let map: std::collections::HashMap<String, u64> =
+                con.hgetall(&dir_key).await.map_err(map_err)?;
+            let map_arc = std::sync::Arc::new(map);
+            self.dir_entry_cache.insert(parent, map_arc.clone());
+            map_arc
+        };
 
         // Convert entries_map to a list of DirectoryEntry
         let mut entries = Vec::new();
@@ -2516,7 +2663,7 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let mut child_inos = Vec::new();
-        for (name, child_ino) in &entries_map {
+        for (name, child_ino) in entries_map.iter() {
             if name == "." || name == ".." {
                 continue;
             }
@@ -2560,19 +2707,19 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let mut current_offset = (entries.len() + 1) as i64;
-        for (name, child_ino) in entries_map {
+        for (name, child_ino) in entries_map.iter() {
             if name == "." || name == ".." {
                 continue;
             }
             let kind = kind_map
-                .get(&child_ino)
+                .get(child_ino)
                 .cloned()
                 .unwrap_or(FileType::RegularFile);
 
             entries.push(DirectoryEntry {
-                name: name.into(),
+                name: name.clone().into(),
                 kind,
-                inode: child_ino,
+                inode: *child_ino,
                 offset: current_offset,
             });
             current_offset += 1;
@@ -2601,9 +2748,16 @@ impl Filesystem for SqueezefsFilesystem {
         debug!("FUSE readdirplus: parent = {}, offset = {}", parent, offset);
 
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
-        let dir_key = format!("squeezefs:dir:{}", parent);
-        let entries_map: std::collections::HashMap<String, u64> =
-            con.hgetall(&dir_key).await.map_err(map_err)?;
+        let entries_map = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
+            cached_map
+        } else {
+            let dir_key = format!("squeezefs:dir:{}", parent);
+            let map: std::collections::HashMap<String, u64> =
+                con.hgetall(&dir_key).await.map_err(map_err)?;
+            let map_arc = std::sync::Arc::new(map);
+            self.dir_entry_cache.insert(parent, map_arc.clone());
+            map_arc
+        };
 
         let mut entries = Vec::new();
 
@@ -2684,7 +2838,7 @@ impl Filesystem for SqueezefsFilesystem {
         let mut pipe = redis::pipe();
         let mut inos_to_fetch = Vec::new();
 
-        for (name, child_ino) in &entries_map {
+        for (name, child_ino) in entries_map.iter() {
             if name == "." || name == ".." {
                 continue;
             }
@@ -2802,11 +2956,11 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let mut current_offset = (entries.len() + 1) as i64;
-        for (name, child_ino) in entries_map {
+        for (name, child_ino) in entries_map.iter() {
             if name == "." || name == ".." {
                 continue;
             }
-            let attr = match self.get_attr_internal(child_ino).await {
+            let attr = match self.get_attr_internal(*child_ino).await {
                 Ok(a) => a,
                 Err(e) => {
                     error!(
@@ -2819,9 +2973,9 @@ impl Filesystem for SqueezefsFilesystem {
             let kind = attr.kind;
 
             entries.push(DirectoryEntryPlus {
-                name: name.into(),
+                name: name.clone().into(),
                 kind,
-                inode: child_ino,
+                inode: *child_ino,
                 generation: 1,
                 attr,
                 entry_ttl: Duration::from_secs(1),
@@ -3743,6 +3897,24 @@ pub fn start_io_uring_polling_loop(
     }
 }
 
+pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {
+    let mut custom_opts = std::ffi::OsString::new();
+    for opt in opts.split(',') {
+        let opt_trimmed = opt.trim();
+        if !opt_trimmed.is_empty() {
+            let key = opt_trimmed.split('=').next().unwrap_or("").trim();
+            if key == "entry_timeout" || key == "attr_timeout" || key == "negative_timeout" {
+                continue;
+            }
+            if !custom_opts.is_empty() {
+                custom_opts.push(",");
+            }
+            custom_opts.push(opt_trimmed);
+        }
+    }
+    custom_opts
+}
+
 /// Start FUSE mount daemon using fuse3.
 pub async fn start_mount<P: AsRef<Path>>(
     mountpoint: P,
@@ -3763,12 +3935,8 @@ pub async fn start_mount<P: AsRef<Path>>(
     options.default_permissions(true);
 
     if let Some(opts) = custom_opts {
-        for opt in opts.split(',') {
-            let opt_trimmed = opt.trim();
-            if !opt_trimmed.is_empty() {
-                options.custom_options(opt_trimmed);
-            }
-        }
+        let parsed = parse_custom_options(&opts);
+        options.custom_options(parsed);
     } else {
         // default custom option
         options.custom_options("max_read=1048576");

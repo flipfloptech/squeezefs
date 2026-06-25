@@ -84,7 +84,8 @@ pub struct NvmeStaging {
     redis_client: crate::dlm::MetaClient,
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
-    current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub space_freed_notify: std::sync::Arc<tokio::sync::Notify>,
     current_read_cache_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     read_cache_lru: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(String, u64)>>>,
 }
@@ -214,6 +215,7 @@ impl NvmeStaging {
             current_staged_write_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 initial_write_bytes,
             )),
+            space_freed_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             current_read_cache_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 initial_read_bytes,
             )),
@@ -256,9 +258,23 @@ impl NvmeStaging {
         let padded_size = ((unpadded_len + align - 1) & !(align - 1)) as u64;
 
         // Enforce max bytes capacity constraint asynchronously using the exact padded file size
-        let total_staged_bytes = self
+        let mut total_staged_bytes = self
             .current_staged_write_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
+
+        if total_staged_bytes + padded_size > self.max_write_bytes {
+            let mut attempts = 0;
+            while total_staged_bytes + padded_size > self.max_write_bytes && attempts < 4 {
+                let notified = self.space_freed_notify.notified();
+                tokio::pin!(notified);
+                let wait_timeout = tokio::time::timeout(Duration::from_millis(500), notified);
+                let _ = wait_timeout.await;
+                attempts += 1;
+                total_staged_bytes = self
+                    .current_staged_write_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         if total_staged_bytes + padded_size > self.max_write_bytes {
             return Err(SqueezefsError::Io(std::io::Error::new(
@@ -355,6 +371,7 @@ impl NvmeStaging {
         let backend = self.backend.clone();
         let redis_client = self.redis_client.clone();
         let staged_bytes = self.current_staged_write_bytes.clone();
+        let space_freed_notify = self.space_freed_notify.clone();
 
         tokio::spawn(async move {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
@@ -406,7 +423,7 @@ impl NvmeStaging {
 
                         if current_bytes >= max_batch_bytes {
                             info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes).await {
+                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify).await {
                                 error!("Failed to flush NVMe staging batch: {:?}", e);
                             }
                         }
@@ -414,7 +431,7 @@ impl NvmeStaging {
                     _ = &mut sleep => {
                         if !batch.is_empty() {
                             info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes).await {
+                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify).await {
                                 error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
                             }
                         }
@@ -432,6 +449,7 @@ impl NvmeStaging {
         batch: &mut Vec<PendingStagedWrite>,
         current_bytes: &mut u64,
         staged_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+        space_freed_notify: &tokio::sync::Notify,
     ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -576,6 +594,9 @@ impl NvmeStaging {
         // Clear batch
         batch.clear();
         *current_bytes = 0;
+
+        // Notify waiters that space has been freed
+        space_freed_notify.notify_waiters();
 
         Ok(())
     }

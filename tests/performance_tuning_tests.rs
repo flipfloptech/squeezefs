@@ -6,8 +6,7 @@ use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -64,7 +63,10 @@ async fn test_client_directory_cache() {
     let file_name = OsStr::new("test_cache_file.txt");
     let _ = fs.lookup(req, 1, file_name).await; // Should ENOENT but parent cache will populate
 
-    assert!(fs.dir_entry_cache.get(&1).is_some(), "Parent directory entries should be cached after lookup");
+    assert!(
+        fs.dir_entry_cache.get(&1).is_some(),
+        "Parent directory entries should be cached after lookup"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -107,15 +109,21 @@ async fn test_directory_cache_invalidation() {
 
     // Create file - should invalidate cache
     let _reply = fs.create(req, 1, file_name, 0o644, 0).await.unwrap();
-    assert!(fs.dir_entry_cache.get(&1).is_none(), "Cache must be invalidated on create");
+    assert!(
+        fs.dir_entry_cache.get(&1).is_none(),
+        "Cache must be invalidated on create"
+    );
 
     // Re-populate
     let _ = fs.lookup(req, 1, file_name).await;
     assert!(fs.dir_entry_cache.get(&1).is_some());
 
     // Unlink file - should invalidate cache
-    let _ = fs.unlink(req, 1, file_name).await.unwrap();
-    assert!(fs.dir_entry_cache.get(&1).is_none(), "Cache must be invalidated on unlink");
+    fs.unlink(req, 1, file_name).await.unwrap();
+    assert!(
+        fs.dir_entry_cache.get(&1).is_none(),
+        "Cache must be invalidated on unlink"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -191,8 +199,8 @@ async fn test_staging_backpressure_wait() {
     // 5KB staging capacity limit
     let nvme = squeezefs::cache::NvmeStaging::new(
         vec![temp_dir.path().to_path_buf()],
-        100 * 1024 * 1024,
         5 * 1024,
+        100 * 1024 * 1024,
         mock_backend,
         squeezefs::dlm::MetaClient::Single(redis_client),
     )
@@ -209,7 +217,10 @@ async fn test_staging_backpressure_wait() {
         let start = std::time::Instant::now();
         let data2 = vec![2u8; 1000];
         // This stage_write should wait on backpressure
-        nvme_clone.stage_write("f2", "id2", &data2, 2).await.unwrap();
+        nvme_clone
+            .stage_write("f2", "id2", &data2, 2)
+            .await
+            .unwrap();
         start.elapsed()
     });
 
@@ -225,7 +236,11 @@ async fn test_staging_backpressure_wait() {
     nvme.space_freed_notify.notify_waiters();
 
     let elapsed = write_handle.await.unwrap();
-    assert!(elapsed >= Duration::from_millis(400), "Should wait at least until space is freed (elapsed: {:?})", elapsed);
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "Should wait at least until space is freed (elapsed: {:?})",
+        elapsed
+    );
 }
 
 #[test]

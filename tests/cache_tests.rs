@@ -172,6 +172,18 @@ async fn test_nvme_cache_separation_limits() {
     let temp_dir = tempdir().unwrap();
     let mock_backend = RustFsClient::new_mock();
     let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let mut con = redis_client
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut con).await.unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg("squeezefs:format")
+        .arg("upload_delay")
+        .arg("60s")
+        .query_async(&mut con)
+        .await
+        .unwrap();
 
     // Very small limits (10KB write capacity, 10KB read capacity)
     let nvme = NvmeStaging::new(

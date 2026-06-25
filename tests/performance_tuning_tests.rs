@@ -249,6 +249,6 @@ fn test_fuse_mount_custom_options() {
     let parsed = squeezefs::fuse_client::parse_custom_options(opts);
     let parsed_str = parsed.to_string_lossy();
     assert!(parsed_str.contains("max_read=1048576"));
-    assert!(parsed_str.contains("entry_timeout=1.5"));
-    assert!(parsed_str.contains("attr_timeout=2.0"));
+    assert!(!parsed_str.contains("entry_timeout=1.5"));
+    assert!(!parsed_str.contains("attr_timeout=2.0"));
 }

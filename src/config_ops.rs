@@ -358,11 +358,28 @@ pub async fn remove_storage_backend(
         }
 
         // Verification: scan Garnet metadata to verify backend is not referenced by block metadata
-        let metadata_keys: Vec<String> = con.keys("metadata:*").await?;
+        let mut metadata_keys = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let (next_cursor, chunk): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("metadata:*")
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut con)
+                .await?;
+            metadata_keys.extend(chunk);
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+
         for meta_key in metadata_keys {
             let meta_type: Option<String> = con.hget(&meta_key, "type").await?;
             if meta_type.as_deref() == Some("striped") {
-                let block_map_id: Option<String> = con.hget(&meta_key, "block_map").await?;
+                let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await?;
                 if let Some(bmid) = block_map_id {
                     let map_key = format!("block_map:{}", bmid);
                     let block_keys: Vec<String> = con.hvals(&map_key).await.unwrap_or_default();
@@ -429,7 +446,24 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
         con.hgetall("squeezefs:backends").await.unwrap_or_default();
 
     // 2. Scan all metadata
-    let metadata_keys: Vec<String> = con.keys("metadata:*").await?;
+    let mut metadata_keys = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let (next_cursor, chunk): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("metadata:*")
+            .arg("COUNT")
+            .arg(100)
+            .query_async(&mut con)
+            .await?;
+        metadata_keys.extend(chunk);
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
+
     for meta_key in metadata_keys {
         let file_path = meta_key
             .strip_prefix("metadata:")
@@ -439,7 +473,7 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
 
         match meta_type.as_deref() {
             Some("striped") => {
-                let block_map_id: Option<String> = con.hget(&meta_key, "block_map").await?;
+                let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await?;
                 if let Some(bmid) = block_map_id {
                     let map_key = format!("block_map:{}", bmid);
                     let block_keys: HashMap<String, String> =

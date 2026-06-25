@@ -44,11 +44,19 @@ static SINGLE_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedCo
     Lazy::new(dashmap::DashMap::new);
 
 #[derive(Clone)]
+pub struct BoundConnection {
+    pub conn: std::sync::Arc<std::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    pub local_ip: IpAddr,
+    pub remote_addr: SocketAddr,
+    pub conn_info: redis::ConnectionInfo,
+}
+
+#[derive(Clone)]
 pub enum MetaClient {
     Single(redis::Client),
     SingleBound {
         client: redis::Client,
-        bound_conns: Vec<redis::aio::MultiplexedConnection>,
+        bound_conns: Vec<BoundConnection>,
         current_idx: std::sync::Arc<AtomicUsize>,
     },
     Cluster(redis::cluster::ClusterClient),
@@ -59,8 +67,22 @@ pub enum MetaConnection {
     Single {
         conn: redis::aio::MultiplexedConnection,
         client: Option<redis::Client>,
+        bound_conn: Option<BoundConnection>,
     },
     Cluster(redis::cluster_async::ClusterConnection),
+}
+
+async fn reconnect_bound(bound: &BoundConnection) -> Result<redis::aio::MultiplexedConnection> {
+    let socket = match bound.local_ip {
+        IpAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    socket.bind(SocketAddr::new(bound.local_ip, 0))?;
+    let stream = socket.connect(bound.remote_addr).await?;
+    let (new_conn, driver) = redis::aio::MultiplexedConnection::new(&bound.conn_info.redis, stream).await?;
+    tokio::spawn(driver);
+    *bound.conn.lock().unwrap() = new_conn.clone();
+    Ok(new_conn)
 }
 
 impl ConnectionLike for MetaConnection {
@@ -69,14 +91,26 @@ impl ConnectionLike for MetaConnection {
         cmd: &'a redis::Cmd,
     ) -> redis::RedisFuture<'a, redis::Value> {
         match self {
-            MetaConnection::Single { conn, client } => {
+            MetaConnection::Single { conn, client, bound_conn } => {
                 let client_opt = client.clone();
+                let bound_conn_opt = bound_conn.clone();
                 Box::pin(async move {
                     let res = conn.req_packed_command(cmd).await;
                     if let Err(ref e) = res {
                         if e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()
                         {
-                            if let Some(client_ref) = &client_opt {
+                            if let Some(bound) = &bound_conn_opt {
+                                warn!("Cached SingleBound connection broken: {:?}. Reconnecting...", e);
+                                match reconnect_bound(bound).await {
+                                    Ok(new_conn) => {
+                                        *conn = new_conn;
+                                        return conn.req_packed_command(cmd).await;
+                                    }
+                                    Err(reconnect_err) => {
+                                        error!("Failed to reconnect SingleBound: {:?}", reconnect_err);
+                                    }
+                                }
+                            } else if let Some(client_ref) = &client_opt {
                                 warn!("Cached Redis connection broken: {:?}. Reconnecting...", e);
                                 let addr_str =
                                     format!("{:?}", client_ref.get_connection_info().addr);
@@ -107,14 +141,26 @@ impl ConnectionLike for MetaConnection {
         count: usize,
     ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
         match self {
-            MetaConnection::Single { conn, client } => {
+            MetaConnection::Single { conn, client, bound_conn } => {
                 let client_opt = client.clone();
+                let bound_conn_opt = bound_conn.clone();
                 Box::pin(async move {
                     let res = conn.req_packed_commands(cmd, offset, count).await;
                     if let Err(ref e) = res {
                         if e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()
                         {
-                            if let Some(client_ref) = &client_opt {
+                            if let Some(bound) = &bound_conn_opt {
+                                warn!("Cached SingleBound connection broken in pipeline: {:?}. Reconnecting...", e);
+                                match reconnect_bound(bound).await {
+                                    Ok(new_conn) => {
+                                        *conn = new_conn;
+                                        return conn.req_packed_commands(cmd, offset, count).await;
+                                    }
+                                    Err(reconnect_err) => {
+                                        error!("Failed to reconnect SingleBound: {:?}", reconnect_err);
+                                    }
+                                }
+                            } else if let Some(client_ref) = &client_opt {
                                 warn!("Cached Redis connection broken in pipeline: {:?}. Reconnecting...", e);
                                 let addr_str =
                                     format!("{:?}", client_ref.get_connection_info().addr);
@@ -308,7 +354,12 @@ impl MetaClient {
                             {
                                 Ok((conn, driver)) => {
                                     tokio::spawn(driver);
-                                    bound_conns.push(conn);
+                                    bound_conns.push(BoundConnection {
+                                        conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+                                        local_ip: ip,
+                                        remote_addr,
+                                        conn_info: conn_info.clone(),
+                                    });
                                 }
                                 Err(e) => {
                                     warn!("Failed to establish MultiplexedConnection on interface {}: {:?}", ip, e);
@@ -349,6 +400,7 @@ impl MetaClient {
                 Ok(MetaConnection::Single {
                     conn,
                     client: Some(client.clone()),
+                    bound_conn: None,
                 })
             }
             Self::SingleBound {
@@ -358,10 +410,12 @@ impl MetaClient {
             } => {
                 if !bound_conns.is_empty() {
                     let idx = current_idx.fetch_add(1, Ordering::Relaxed);
-                    let conn = bound_conns[idx % bound_conns.len()].clone();
+                    let bound = bound_conns[idx % bound_conns.len()].clone();
+                    let conn_val = bound.conn.lock().unwrap().clone();
                     return Ok(MetaConnection::Single {
-                        conn,
+                        conn: conn_val,
                         client: Some(client.clone()),
+                        bound_conn: Some(bound),
                     });
                 }
                 Err(SqueezefsError::InvalidOperation(
@@ -375,7 +429,7 @@ impl MetaClient {
             Self::Sentinel(c) => {
                 let mut guard = c.lock().await;
                 let conn = guard.get_async_connection().await?;
-                Ok(MetaConnection::Single { conn, client: None })
+                Ok(MetaConnection::Single { conn, client: None, bound_conn: None })
             }
         }
     }

@@ -5,7 +5,65 @@ use squeezefs::error::Result;
 fn test_sentinel_url_parsing() {
     let sentinel_url = "redis-sentinel://127.0.0.1:26379,127.0.0.1:26380/mymaster";
     let meta_client = MetaClient::new(sentinel_url).unwrap();
-    assert!(matches!(meta_client, MetaClient::Sentinel(_)));
+    assert!(matches!(meta_client, MetaClient::Sentinel { .. }));
+}
+
+#[tokio::test]
+async fn test_sentinel_connection_caching() -> Result<()> {
+    if !is_db_available().await {
+        println!("Skipping test: Redis/Garnet not available");
+        return Ok(());
+    }
+
+    let redis_url =
+        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let client = MetaClient::new(&redis_url)?;
+
+    // 1. Get a valid multiplexed connection to Garnet/Redis
+    let mut real_conn = client.get_connection().await?;
+    match redis::cmd("PING")
+        .query_async::<_, String>(&mut real_conn)
+        .await
+    {
+        Ok(pong) => println!("PING real_conn succeeded: {}", pong),
+        Err(e) => println!("PING real_conn failed: {:?}", e),
+    }
+
+    let conn_val = match &real_conn {
+        squeezefs::dlm::MetaConnection::Single { conn, .. } => conn.clone(),
+        _ => panic!("Expected MetaConnection::Single"),
+    };
+
+    // 2. Pre-populate SENTINEL_CONN_POOL with this valid connection under service name "fake_master"
+    squeezefs::dlm::SENTINEL_CONN_POOL.insert("fake_master".to_string(), conn_val);
+
+    // 3. Create a Sentinel MetaClient pointing to dummy sentinel servers but service name "fake_master"
+    let dummy_sentinel_url = "redis-sentinel://127.0.0.1:26379,127.0.0.1:26380/fake_master";
+    let sentinel_client = MetaClient::new(dummy_sentinel_url)?;
+
+    // 4. Call get_connection on the sentinel client. It should HIT the cache and succeed!
+    let mut sentinel_conn = sentinel_client.get_connection().await?;
+
+    // 5. Verify we can run operations
+    match redis::cmd("PING")
+        .query_async::<_, String>(&mut sentinel_conn)
+        .await
+    {
+        Ok(res) => {
+            println!("PING sentinel_conn succeeded: {}", res);
+            assert_eq!(res, "PONG");
+        }
+        Err(e) => {
+            println!("PING sentinel_conn failed: {:?}", e);
+            squeezefs::dlm::SENTINEL_CONN_POOL.remove("fake_master");
+            return Err(e.into());
+        }
+    }
+
+    // Clean up
+    squeezefs::dlm::SENTINEL_CONN_POOL.remove("fake_master");
+
+    Ok(())
 }
 
 async fn is_db_available() -> bool {

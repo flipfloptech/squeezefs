@@ -1334,16 +1334,7 @@ async fn test_real_mount_and_browseable() {
     // Spawn mount task in background
     let mount_path_clone = mount_path.clone();
     let mount_handle = tokio::spawn(async move {
-        let _ = start_mount(
-            mount_path_clone,
-            fs,
-            1000,
-            1000,
-            false,
-            false,
-            None,
-        )
-        .await;
+        let _ = start_mount(mount_path_clone, fs, 1000, 1000, false, false, None).await;
     });
 
     // Wait for the mountpoint to become ready and check if browseable

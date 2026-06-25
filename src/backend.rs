@@ -413,7 +413,8 @@ impl MultiBackendClient {
     }
 
     pub fn set_backend_status(&self, id: &str, status: &str) {
-        self.backend_status.insert(id.to_string(), status.to_string());
+        self.backend_status
+            .insert(id.to_string(), status.to_string());
     }
 
     pub fn get_backend_for_key(&self, key: &str) -> String {

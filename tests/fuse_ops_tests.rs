@@ -452,6 +452,8 @@ async fn test_fuse_write_updates_blocks_cache() {
     // Call getattr immediately (should hit cached attributes)
     let attr_post = fs.getattr(req, ino, None, 0).await.unwrap().attr;
     assert_eq!(attr_post.size, 1000);
-    assert_eq!(attr_post.blocks, 2, "Blocks attribute in cache must be updated to size.div_ceil(512)");
+    assert_eq!(
+        attr_post.blocks, 2,
+        "Blocks attribute in cache must be updated to size.div_ceil(512)"
+    );
 }
-

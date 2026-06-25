@@ -43,6 +43,9 @@ static RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
 static SINGLE_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection>> =
     Lazy::new(dashmap::DashMap::new);
 
+pub static SENTINEL_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection>> =
+    Lazy::new(dashmap::DashMap::new);
+
 #[derive(Clone)]
 pub struct BoundConnection {
     pub conn: std::sync::Arc<std::sync::Mutex<redis::aio::MultiplexedConnection>>,
@@ -60,7 +63,10 @@ pub enum MetaClient {
         current_idx: std::sync::Arc<AtomicUsize>,
     },
     Cluster(redis::cluster::ClusterClient),
-    Sentinel(std::sync::Arc<tokio::sync::Mutex<redis::sentinel::SentinelClient>>),
+    Sentinel {
+        client: std::sync::Arc<tokio::sync::Mutex<redis::sentinel::SentinelClient>>,
+        service_name: String,
+    },
 }
 
 pub enum MetaConnection {
@@ -68,6 +74,9 @@ pub enum MetaConnection {
         conn: redis::aio::MultiplexedConnection,
         client: Option<redis::Client>,
         bound_conn: Option<Box<BoundConnection>>,
+        sentinel_client:
+            Option<std::sync::Arc<tokio::sync::Mutex<redis::sentinel::SentinelClient>>>,
+        service_name: Option<String>,
     },
     Cluster(redis::cluster_async::ClusterConnection),
 }
@@ -79,7 +88,8 @@ async fn reconnect_bound(bound: &BoundConnection) -> Result<redis::aio::Multiple
     };
     socket.bind(SocketAddr::new(bound.local_ip, 0))?;
     let stream = socket.connect(bound.remote_addr).await?;
-    let (new_conn, driver) = redis::aio::MultiplexedConnection::new(&bound.conn_info.redis, stream).await?;
+    let (new_conn, driver) =
+        redis::aio::MultiplexedConnection::new(&bound.conn_info.redis, stream).await?;
     tokio::spawn(driver);
     *bound.conn.lock().unwrap() = new_conn.clone();
     Ok(new_conn)
@@ -91,23 +101,56 @@ impl ConnectionLike for MetaConnection {
         cmd: &'a redis::Cmd,
     ) -> redis::RedisFuture<'a, redis::Value> {
         match self {
-            MetaConnection::Single { conn, client, bound_conn } => {
+            MetaConnection::Single {
+                conn,
+                client,
+                bound_conn,
+                sentinel_client,
+                service_name,
+            } => {
                 let client_opt = client.clone();
                 let bound_conn_opt = bound_conn.clone();
+                let sentinel_opt = sentinel_client.clone();
+                let service_name_opt = service_name.clone();
                 Box::pin(async move {
                     let res = conn.req_packed_command(cmd).await;
                     if let Err(ref e) = res {
                         if e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()
                         {
                             if let Some(bound) = &bound_conn_opt {
-                                warn!("Cached SingleBound connection broken: {:?}. Reconnecting...", e);
+                                warn!(
+                                    "Cached SingleBound connection broken: {:?}. Reconnecting...",
+                                    e
+                                );
                                 match reconnect_bound(bound).await {
                                     Ok(new_conn) => {
                                         *conn = new_conn;
                                         return conn.req_packed_command(cmd).await;
                                     }
                                     Err(reconnect_err) => {
-                                        error!("Failed to reconnect SingleBound: {:?}", reconnect_err);
+                                        error!(
+                                            "Failed to reconnect SingleBound: {:?}",
+                                            reconnect_err
+                                        );
+                                    }
+                                }
+                            } else if let Some(sentinel) = &sentinel_opt {
+                                warn!(
+                                    "Cached Sentinel connection broken: {:?}. Reconnecting...",
+                                    e
+                                );
+                                let mut guard = sentinel.lock().await;
+                                match guard.get_async_connection().await {
+                                    Ok(new_conn) => {
+                                        if let Some(svc) = &service_name_opt {
+                                            SENTINEL_CONN_POOL
+                                                .insert(svc.clone(), new_conn.clone());
+                                        }
+                                        *conn = new_conn;
+                                        return conn.req_packed_command(cmd).await;
+                                    }
+                                    Err(reconnect_err) => {
+                                        error!("Failed to reconnect Sentinel: {:?}", reconnect_err);
                                     }
                                 }
                             } else if let Some(client_ref) = &client_opt {
@@ -141,9 +184,17 @@ impl ConnectionLike for MetaConnection {
         count: usize,
     ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
         match self {
-            MetaConnection::Single { conn, client, bound_conn } => {
+            MetaConnection::Single {
+                conn,
+                client,
+                bound_conn,
+                sentinel_client,
+                service_name,
+            } => {
                 let client_opt = client.clone();
                 let bound_conn_opt = bound_conn.clone();
+                let sentinel_opt = sentinel_client.clone();
+                let service_name_opt = service_name.clone();
                 Box::pin(async move {
                     let res = conn.req_packed_commands(cmd, offset, count).await;
                     if let Err(ref e) = res {
@@ -157,7 +208,26 @@ impl ConnectionLike for MetaConnection {
                                         return conn.req_packed_commands(cmd, offset, count).await;
                                     }
                                     Err(reconnect_err) => {
-                                        error!("Failed to reconnect SingleBound: {:?}", reconnect_err);
+                                        error!(
+                                            "Failed to reconnect SingleBound: {:?}",
+                                            reconnect_err
+                                        );
+                                    }
+                                }
+                            } else if let Some(sentinel) = &sentinel_opt {
+                                warn!("Cached Sentinel connection broken in pipeline: {:?}. Reconnecting...", e);
+                                let mut guard = sentinel.lock().await;
+                                match guard.get_async_connection().await {
+                                    Ok(new_conn) => {
+                                        if let Some(svc) = &service_name_opt {
+                                            SENTINEL_CONN_POOL
+                                                .insert(svc.clone(), new_conn.clone());
+                                        }
+                                        *conn = new_conn;
+                                        return conn.req_packed_commands(cmd, offset, count).await;
+                                    }
+                                    Err(reconnect_err) => {
+                                        error!("Failed to reconnect Sentinel: {:?}", reconnect_err);
                                     }
                                 }
                             } else if let Some(client_ref) = &client_opt {
@@ -264,13 +334,14 @@ impl MetaClient {
                 .collect();
             let client = redis::sentinel::SentinelClient::build(
                 nodes,
-                service_name,
+                service_name.clone(),
                 None,
                 redis::sentinel::SentinelServerType::Master,
             )?;
-            Ok(Self::Sentinel(std::sync::Arc::new(
-                tokio::sync::Mutex::new(client),
-            )))
+            Ok(Self::Sentinel {
+                client: std::sync::Arc::new(tokio::sync::Mutex::new(client)),
+                service_name,
+            })
         } else {
             let client = redis::Client::open(redis_url)?;
             Ok(Self::Single(client))
@@ -317,13 +388,14 @@ impl MetaClient {
                 .collect();
             let client = redis::sentinel::SentinelClient::build(
                 nodes,
-                service_name,
+                service_name.clone(),
                 None,
                 redis::sentinel::SentinelServerType::Master,
             )?;
-            Ok(Self::Sentinel(std::sync::Arc::new(
-                tokio::sync::Mutex::new(client),
-            )))
+            Ok(Self::Sentinel {
+                client: std::sync::Arc::new(tokio::sync::Mutex::new(client)),
+                service_name,
+            })
         } else {
             let client = redis::Client::open(redis_url)?;
             if local_ips.is_empty() {
@@ -401,6 +473,8 @@ impl MetaClient {
                     conn,
                     client: Some(client.clone()),
                     bound_conn: None,
+                    sentinel_client: None,
+                    service_name: None,
                 })
             }
             Self::SingleBound {
@@ -416,6 +490,8 @@ impl MetaClient {
                         conn: conn_val,
                         client: Some(client.clone()),
                         bound_conn: Some(Box::new(bound)),
+                        sentinel_client: None,
+                        service_name: None,
                     });
                 }
                 Err(SqueezefsError::InvalidOperation(
@@ -426,10 +502,26 @@ impl MetaClient {
                 let conn = c.get_async_connection().await?;
                 Ok(MetaConnection::Cluster(conn))
             }
-            Self::Sentinel(c) => {
-                let mut guard = c.lock().await;
-                let conn = guard.get_async_connection().await?;
-                Ok(MetaConnection::Single { conn, client: None, bound_conn: None })
+            Self::Sentinel {
+                client,
+                service_name,
+            } => {
+                let conn =
+                    if let Some(conn) = SENTINEL_CONN_POOL.get(service_name).map(|r| r.clone()) {
+                        conn
+                    } else {
+                        let mut guard = client.lock().await;
+                        let new_conn = guard.get_async_connection().await?;
+                        SENTINEL_CONN_POOL.insert(service_name.clone(), new_conn.clone());
+                        new_conn
+                    };
+                Ok(MetaConnection::Single {
+                    conn,
+                    client: None,
+                    bound_conn: None,
+                    sentinel_client: Some(client.clone()),
+                    service_name: Some(service_name.clone()),
+                })
             }
         }
     }

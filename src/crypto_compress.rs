@@ -173,8 +173,10 @@ impl CryptoCompressState {
                 .map_err(|e| {
                     SqueezefsError::InvalidOperation(format!("RSA key unwrap failed: {:?}", e))
                 })?;
-            self.unwrap_cache.insert(wrapped_key.to_vec(), decrypted_key.clone());
-            self.key_unwrap_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.unwrap_cache
+                .insert(wrapped_key.to_vec(), decrypted_key.clone());
+            self.key_unwrap_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             decrypted_key
         };
 
@@ -235,7 +237,8 @@ mod tests {
         let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let pem = priv_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
 
-        let state = CryptoCompressState::new("none".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
+        let state =
+            CryptoCompressState::new("none".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
         let data = b"some block payload";
 
         let encrypted = state.encrypt(data).unwrap();
@@ -243,11 +246,21 @@ mod tests {
         // First decryption: should miss cache and decrypt via RSA
         let decrypted1 = state.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted1, data);
-        assert_eq!(state.key_unwrap_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            state
+                .key_unwrap_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
 
         // Second decryption: should hit cache and bypass RSA decryption
         let decrypted2 = state.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted2, data);
-        assert_eq!(state.key_unwrap_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            state
+                .key_unwrap_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }

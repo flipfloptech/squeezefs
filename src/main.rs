@@ -974,6 +974,26 @@ async fn test_storage(client: &RustFsClient) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+fn get_file_path_from_staged(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    if let Ok(mut file) = std::fs::File::open(path) {
+        let mut header = vec![0u8; 4096];
+        if let Ok(n) = file.read(&mut header) {
+            if n >= 8 {
+                let meta_len = u64::from_be_bytes(header[0..8].try_into().unwrap_or([0; 8])) as usize;
+                if n >= 8 + meta_len {
+                    if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&header[8..8 + meta_len]) {
+                        if let Some(file_path) = meta_json.get("file_path").and_then(|v| v.as_str()) {
+                            return Some(file_path.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Format {
@@ -1922,12 +1942,58 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
                 "wait" => {
-                    println!("Waiting for staged writes to drain (limit: {}s). Press Ctrl+C to abort wait.", dismount_wait);
+                    let mut total_bytes_at_start = 0;
+                    for dir in &staging_dirs {
+                        let staging_dir = dir.join("staging");
+                        if let Ok(entries) = std::fs::read_dir(&staging_dir) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_file()
+                                    && path.extension().is_some_and(|ext| ext == "staged")
+                                    && path.file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .is_some_and(|name| name.starts_with("file_"))
+                                {
+                                    if let Ok(meta) = path.metadata() {
+                                        total_bytes_at_start += meta.len();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    println!("Waiting for staged writes to drain (limit: {}s). Press 's' and Enter to skip wait.", dismount_wait);
                     let start_wait = std::time::Instant::now();
                     let max_wait = std::time::Duration::from_secs(dismount_wait);
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+                    tokio::spawn(async move {
+                        let mut input = String::new();
+                        while std::io::stdin().read_line(&mut input).is_ok() {
+                            let trimmed = input.trim().to_lowercase().to_string();
+                            let _ = tx.send(trimmed).await;
+                            input.clear();
+                        }
+                    });
+
+                    let mut skipped = false;
+                    let mut current_staged = 0;
+                    let mut current_active = 0;
+
                     loop {
-                        let mut current_staged = 0;
-                        let mut current_active = 0;
+                        while let Ok(msg) = rx.try_recv() {
+                            if msg == "s" || msg == "skip" {
+                                skipped = true;
+                                break;
+                            }
+                        }
+                        if skipped {
+                            break;
+                        }
+
+                        current_staged = 0;
+                        let mut current_bytes = 0;
+                        current_active = 0;
+
                         for dir in &staging_dirs {
                             let staging_dir = dir.join("staging");
                             if let Ok(entries) = std::fs::read_dir(&staging_dir) {
@@ -1940,6 +2006,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                             .and_then(|s| s.to_str())
                                             .is_some_and(|name| name.starts_with("file_"))
                                     {
+                                        if let Ok(meta) = path.metadata() {
+                                            current_bytes += meta.len();
+                                        }
                                         current_staged += 1;
                                     }
                                 }
@@ -1959,17 +2028,117 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
+
                         if current_staged == 0 && current_active == 0 {
                             println!("\nAll staged files and active writes drained cleanly!");
                             break;
                         }
+
+                        let elapsed = start_wait.elapsed().as_secs_f64();
+                        let bytes_flushed = total_bytes_at_start.saturating_sub(current_bytes);
+                        let speed = if elapsed > 0.1 { bytes_flushed as f64 / elapsed } else { 0.0 };
+                        let speed_mb = speed / (1024.0 * 1024.0);
+                        
+                        let progress_pct = if total_bytes_at_start > 0 {
+                            100.0 * (total_bytes_at_start - current_bytes) as f64 / total_bytes_at_start as f64
+                        } else {
+                            100.0
+                        };
+
+                        print!(
+                            "\rProgress: {:.1}% | Remaining: {} files, {:.2} MB | Speed: {:.2} MB/s | Elapsed: {}s / Limit: {}s (Press 's' to skip)",
+                            progress_pct,
+                            current_staged,
+                            current_bytes as f64 / 1024.0 / 1024.0,
+                            speed_mb,
+                            elapsed.round(),
+                            dismount_wait
+                        );
+                        let _ = std::io::stdout().flush();
+
                         if start_wait.elapsed() >= max_wait {
-                            println!("\nWait limit expired. Dismounting with remaining staged: {}, active writes: {}", current_staged, current_active);
+                            println!("\nWait limit expired.");
                             break;
                         }
-                        print!("\rRemaining staged files: {}, active writes: {}... (elapsed: {}s / limit: {}s)", current_staged, current_active, start_wait.elapsed().as_secs(), dismount_wait);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+
+                    if skipped || current_staged > 0 || current_active > 0 {
+                        if skipped {
+                            println!("\nWait skipped by user.");
+                        }
+                        println!("{}", "WARNING: Dismounting with unflushed staged files or active writes will cause data loss!".red().bold());
+                        print!("Do you want to discard this data, clean up local cache, and remove incomplete metadata? [y/N]: ");
                         let _ = std::io::stdout().flush();
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+                        let mut confirmed = false;
+                        let timeout_fut = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv());
+                        if let Ok(Some(msg)) = timeout_fut.await {
+                            if msg == "y" || msg == "yes" {
+                                confirmed = true;
+                            }
+                        }
+
+                        if confirmed {
+                            println!("Discarding unflushed data and cleaning up Redis metadata/local staging...");
+                            
+                            // 1. Connect to Redis to clear metadata
+                            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+                                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                                    for dir in &staging_dirs {
+                                        let staging_dir = dir.join("staging");
+                                        if let Ok(entries) = std::fs::read_dir(&staging_dir) {
+                                            for entry in entries.flatten() {
+                                                let path = entry.path();
+                                                if path.is_file()
+                                                    && path.extension().is_some_and(|ext| ext == "staged")
+                                                {
+                                                    if let Some(file_path) = get_file_path_from_staged(&path) {
+                                                        let meta_key = format!("metadata:{}", file_path);
+                                                        let file_id: Option<String> = con.hget(&meta_key, "file_id").await.unwrap_or(None);
+                                                        let mut pipe = redis::pipe();
+                                                        pipe.del(&meta_key);
+                                                        if let Some(fid) = file_id {
+                                                            let mapping_key = format!("mapping:{}", fid);
+                                                            pipe.del(&mapping_key);
+                                                        }
+                                                        let _: () = pipe.query_async(&mut con).await.unwrap_or(());
+                                                        println!("Removed metadata for unflushed file: {}", file_path);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 2. Remove local staged and active write files
+                            for dir in &staging_dirs {
+                                let staging_dir = dir.join("staging");
+                                if let Ok(entries) = std::fs::read_dir(&staging_dir) {
+                                    for entry in entries.flatten() {
+                                        let path = entry.path();
+                                        if path.is_file() {
+                                            let _ = std::fs::remove_file(path);
+                                        }
+                                    }
+                                }
+                                let active_dir = dir.join("active_writes");
+                                if let Ok(entries) = std::fs::read_dir(&active_dir) {
+                                    for entry in entries.flatten() {
+                                        let path = entry.path();
+                                        if path.is_dir() {
+                                            let _ = std::fs::remove_dir_all(path);
+                                        } else {
+                                            let _ = std::fs::remove_file(path);
+                                        }
+                                    }
+                                }
+                            }
+                            println!("Local staging files and directories cleaned up successfully.");
+                        } else {
+                            println!("Unmount will continue, but staged files/metadata are left intact on disk/database.");
+                        }
                     }
                 }
                 _ => {

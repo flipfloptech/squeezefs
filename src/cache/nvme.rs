@@ -191,6 +191,10 @@ impl NvmeStaging {
         Ok(staging)
     }
 
+    pub fn redis_client(&self) -> &crate::dlm::MetaClient {
+        &self.redis_client
+    }
+
     /// Retrieve the staging directory for a specific file_id.
     pub fn get_staged_path(&self, file_id: &str) -> PathBuf {
         let idx = get_dir_index(file_id, self.staging_dirs.len());
@@ -661,11 +665,21 @@ impl NvmeStaging {
             let p2p_addr = p2p_addr.clone();
             tokio::spawn(async move {
                 if let Ok(mut con) = redis_client.get_connection().await {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
                     let safe_name = block_key.replace(['/', ':'], "_");
                     let peer_key = format!("block_peers:{}", safe_name);
+                    let peer_blocks_key = format!("squeezefs:peer_blocks:{}", p2p_addr);
                     let _: std::result::Result<(), redis::RedisError> = redis::pipe()
                         .sadd(&peer_key, &p2p_addr)
                         .expire(&peer_key, 60)
+                        .sadd(&peer_blocks_key, &block_key)
+                        .cmd("ZADD")
+                        .arg("squeezefs:peer_health_check_schedule")
+                        .arg(now + 60)
+                        .arg(&p2p_addr)
                         .query_async(&mut con)
                         .await;
                 }

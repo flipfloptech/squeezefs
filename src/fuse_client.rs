@@ -20,8 +20,8 @@ use tokio::runtime::Builder;
 const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
-static BLOCK_FLUSH_LOCKS: Lazy<dashmap::DashMap<(u64, u32), std::sync::Arc<tokio::sync::Mutex<()>>>> =
-    Lazy::new(dashmap::DashMap::new);
+static BLOCK_FLUSH_LOCKS: Lazy<dashmap::DashMap<(u64, u32), std::sync::Arc<tokio::sync::Mutex<()>>, ahash::RandomState>> =
+    Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
 struct BlockFlushGuard {
     key: (u64, u32),
@@ -277,11 +277,11 @@ pub struct SqueezefsFilesystem {
     dlm: DlmClient,
     uid: u32,
     gid: u32,
-    active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease>>,
-    active_posix_locks: dashmap::DashMap<(Inode, u64, u64, u64), crate::dlm::LockLease>,
+    active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease, ahash::RandomState>>,
+    active_posix_locks: dashmap::DashMap<(Inode, u64, u64, u64), crate::dlm::LockLease, ahash::RandomState>,
     pub active_inode_locks:
-        std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>>,
-    pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant)>,
+        std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>, ahash::RandomState>>,
+    pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant), ahash::RandomState>,
     pub dir_entry_cache:
         moka::sync::Cache<u64, std::sync::Arc<std::collections::HashMap<String, u64>>>,
     pub dismount_wait: u64,
@@ -301,10 +301,10 @@ impl SqueezefsFilesystem {
             dlm,
             uid,
             gid,
-            active_leases: std::sync::Arc::new(dashmap::DashMap::new()),
-            active_posix_locks: dashmap::DashMap::new(),
-            active_inode_locks: std::sync::Arc::new(dashmap::DashMap::new()),
-            attr_cache: dashmap::DashMap::new(),
+            active_leases: std::sync::Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
+            active_posix_locks: dashmap::DashMap::with_hasher(ahash::RandomState::new()),
+            active_inode_locks: std::sync::Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
+            attr_cache: dashmap::DashMap::with_hasher(ahash::RandomState::new()),
             dir_entry_cache,
             dismount_wait: 10,
             writeback_tx,
@@ -4455,7 +4455,7 @@ async fn run_constant_writeback_worker(
     router: DataRouter,
     dlm: DlmClient,
     active_inode_locks: std::sync::Arc<
-        dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>,
+        dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>, ahash::RandomState>,
     >,
 ) {
     use std::collections::HashMap;
@@ -4509,7 +4509,7 @@ async fn flush_single_active_block(
     fencing_token: u64,
     router: &DataRouter,
     dlm: &DlmClient,
-    active_inode_locks: &dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>,
+    active_inode_locks: &dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>, ahash::RandomState>,
 ) -> Result<(), SqueezefsError> {
     let block_lock = BLOCK_FLUSH_LOCKS
         .entry((ino, b))

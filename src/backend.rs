@@ -13,7 +13,7 @@ pub struct RustFsClient {
     s3_clients: Vec<S3Client>,
     bucket: String,
     #[allow(clippy::type_complexity)]
-    mock_store: Option<Arc<DashMap<String, (Vec<u8>, u64)>>>,
+    mock_store: Option<Arc<DashMap<String, (Vec<u8>, u64), ahash::RandomState>>>,
     current_idx: Arc<AtomicUsize>,
 }
 
@@ -137,7 +137,7 @@ impl RustFsClient {
         Self {
             s3_clients,
             bucket,
-            mock_store: Some(Arc::new(DashMap::new())),
+            mock_store: Some(Arc::new(DashMap::with_hasher(ahash::RandomState::new()))),
             current_idx: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -151,7 +151,7 @@ impl RustFsClient {
                     .build(),
             )],
             bucket: "mock-bucket".to_string(),
-            mock_store: Some(Arc::new(DashMap::new())),
+            mock_store: Some(Arc::new(DashMap::with_hasher(ahash::RandomState::new()))),
             current_idx: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -410,8 +410,8 @@ impl RustFsClient {
 
 #[derive(Clone)]
 pub struct MultiBackendClient {
-    backends: Arc<dashmap::DashMap<String, RustFsClient>>,
-    backend_status: Arc<dashmap::DashMap<String, String>>,
+    backends: Arc<dashmap::DashMap<String, RustFsClient, ahash::RandomState>>,
+    backend_status: Arc<dashmap::DashMap<String, String, ahash::RandomState>>,
     #[allow(dead_code)]
     active_backend_id: Arc<std::sync::RwLock<String>>,
     backend_keys: Arc<std::sync::RwLock<Vec<String>>>,
@@ -426,8 +426,8 @@ impl Default for MultiBackendClient {
 impl MultiBackendClient {
     pub fn new() -> Self {
         Self {
-            backends: Arc::new(dashmap::DashMap::new()),
-            backend_status: Arc::new(dashmap::DashMap::new()),
+            backends: Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
+            backend_status: Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
             active_backend_id: Arc::new(std::sync::RwLock::new("backend_0".to_string())),
             backend_keys: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
@@ -439,8 +439,8 @@ impl MultiBackendClient {
     }
 
     pub fn get_backend_for_key(&self, key: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
+        use twox_hash::XxHash64;
 
         let mut max_score: u64 = 0;
         let mut best_node = "backend_0".to_string();
@@ -464,7 +464,7 @@ impl MultiBackendClient {
             };
 
             for node_id in target_keys {
-                let mut hasher = DefaultHasher::new();
+                let mut hasher = XxHash64::default();
                 node_id.hash(&mut hasher);
                 key.hash(&mut hasher);
                 let score = hasher.finish();

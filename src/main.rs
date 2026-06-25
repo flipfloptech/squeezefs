@@ -84,6 +84,9 @@ enum Commands {
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
         force: bool,
+        /// Perform quick format (initialize metadata only, do not wipe object storage buckets)
+        #[arg(long)]
+        quick: bool,
         /// Compression algorithm (lz4, zstd, none, default: none)
         #[arg(long, default_value = "none")]
         compression: String,
@@ -985,6 +988,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             s3_secret_key,
             s3_bucket,
             force,
+            quick,
             inodes,
             compression,
             encrypt_algo,
@@ -1081,6 +1085,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 write_mem_cache_size.as_deref(),
                 dismount_wait.as_deref(),
                 Some(&upload_delay),
+                quick,
             )
             .await?;
             let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;

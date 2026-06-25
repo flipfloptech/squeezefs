@@ -4270,6 +4270,7 @@ pub async fn format_volume(
         write_mem_cache_size,
         None,
         None,
+        true,
     )
     .await
 }
@@ -4297,9 +4298,69 @@ pub async fn format_volume_ext(
     write_mem_cache_size: Option<&str>,
     dismount_wait: Option<&str>,
     upload_delay: Option<&str>,
+    quick: bool,
 ) -> Result<(), SqueezefsError> {
     let client = redis::Client::open(redis_url)?;
     let mut con = client.get_multiplexed_tokio_connection().await?;
+
+    if !quick {
+        // Read existing backends from Redis before doing FLUSHALL
+        let existing_backends: std::collections::HashMap<String, String> = con
+            .hgetall("squeezefs:backends")
+            .await
+            .unwrap_or_default();
+
+        let mut buckets_to_wipe = Vec::new();
+
+        // Add existing backends from DB
+        for (_, json_str) in existing_backends {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                let ep = val.get("endpoint").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let ak = val.get("access_key").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let sk = val.get("secret_key").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let bu = val.get("bucket").and_then(|v| v.as_str()).map(|s| s.to_string());
+                if let Some(bucket) = bu {
+                    buckets_to_wipe.push((ep, ak, sk, bucket));
+                }
+            }
+        }
+
+        // Also add the new S3 backend being configured in the parameters (if any)
+        let new_endpoint = s3_endpoint.unwrap_or("").to_string();
+        let new_access_key = s3_access_key.unwrap_or("admin").to_string();
+        let new_secret_key = s3_secret_key.unwrap_or("password").to_string();
+        let new_bucket = s3_bucket.unwrap_or("squeezefs-data").to_string();
+
+        if !new_endpoint.is_empty() {
+            buckets_to_wipe.push((
+                Some(new_endpoint),
+                Some(new_access_key),
+                Some(new_secret_key),
+                new_bucket,
+            ));
+        }
+
+        // De-duplicate buckets_to_wipe by (endpoint, bucket)
+        let mut unique_buckets = std::collections::HashSet::new();
+        for (ep, ak, sk, bu) in buckets_to_wipe {
+            let key = (ep.clone(), bu.clone());
+            if unique_buckets.insert(key) {
+                let backend_client = RustFsClient::new_with_local_ips(
+                    Vec::new(),
+                    ep,
+                    ak,
+                    sk,
+                    Some(bu),
+                )
+                .await;
+                
+                if let Err(e) = backend_client.destroy_bucket_data().await {
+                    log::warn!("Failed to destroy bucket data during format: {:?}", e);
+                }
+            }
+        }
+    }
+
     let _: () = redis::cmd("FLUSHALL")
         .query_async(&mut con)
         .await

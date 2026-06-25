@@ -406,6 +406,83 @@ impl RustFsClient {
             last_err
         )))
     }
+
+    /// Delete all objects in the configured S3 bucket.
+    pub async fn destroy_bucket_data(&self) -> Result<()> {
+        if let Some(store) = &self.mock_store {
+            store.clear();
+            return Ok(());
+        }
+
+        let num_clients = self.s3_clients.len();
+        if num_clients == 0 {
+            return Ok(());
+        }
+
+        let s3 = self.get_s3_client().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
+        })?;
+
+        info!("Wiping all object data in S3 bucket: {}", self.bucket);
+
+        let mut continuation_token = None;
+        loop {
+            let mut builder = s3.list_objects_v2().bucket(&self.bucket);
+            if let Some(token) = continuation_token {
+                builder = builder.continuation_token(token);
+            }
+
+            let res = builder.send().await.map_err(|e| {
+                SqueezefsError::S3(format!("Failed to list objects in bucket {}: {:?}", self.bucket, e))
+            })?;
+
+            let contents = res.contents();
+            if !contents.is_empty() {
+                let mut delete_builder = aws_sdk_s3::types::Delete::builder();
+                let mut count = 0;
+                for obj in contents {
+                    if let Some(key) = obj.key() {
+                        let obj_id = aws_sdk_s3::types::ObjectIdentifier::builder()
+                            .key(key)
+                            .build()
+                            .map_err(|e| {
+                                SqueezefsError::S3(format!("Failed to build ObjectIdentifier for key {}: {:?}", key, e))
+                            })?;
+                        delete_builder = delete_builder.objects(obj_id);
+                        count += 1;
+                    }
+                }
+
+                if count > 0 {
+                    let delete_request = delete_builder.build().map_err(|e| {
+                        SqueezefsError::S3(format!("Failed to build Delete request: {:?}", e))
+                    })?;
+
+                    s3.delete_objects()
+                        .bucket(&self.bucket)
+                        .delete(delete_request)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            SqueezefsError::S3(format!(
+                                "Failed to execute bulk delete in bucket {}: {:?}",
+                                self.bucket, e
+                            ))
+                        })?;
+                    
+                    info!("Deleted {} objects from bucket {}", count, self.bucket);
+                }
+            }
+
+            if res.is_truncated().unwrap_or(false) {
+                continuation_token = res.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

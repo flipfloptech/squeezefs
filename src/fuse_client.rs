@@ -500,38 +500,40 @@ impl SqueezefsFilesystem {
                     };
 
                     if let Some(bk) = old_block_key {
-                        existing_block_data =
-                            if let Some(cached_block) = self.router.cache.read_lru.get(&bk) {
-                                (*cached_block).clone()
-                            } else if let Some(cached) =
-                                self.router.cache.nvme.get_cached_read_block(&bk)
-                            {
-                                self.router
-                                    .cache
-                                    .read_lru
-                                    .put(&bk, std::sync::Arc::new(cached.clone()));
-                                cached
-                            } else {
-                                // S3 read path: release the lock!
-                                *guard = None;
+                        existing_block_data = if let Some(cached_block) =
+                            self.router.cache.read_lru.get(&bk)
+                        {
+                            (*cached_block).clone()
+                        } else if let Some(cached) =
+                            self.router.cache.nvme.get_cached_read_block(&bk)
+                        {
+                            self.router
+                                .cache
+                                .read_lru
+                                .put(&bk, std::sync::Arc::new(cached.clone()));
+                            cached
+                        } else {
+                            // S3 read path: release the lock!
+                            *guard = None;
 
-                                let get_res = async {
-                                    let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
-                                    let raw = self.router.backend.get_object(&be_id, &real_key).await?;
-                                    let decompressed = self.router.get_crypto().process_read(&raw)?;
-                                    Ok::<Vec<u8>, SqueezefsError>(decompressed)
-                                }.await;
+                            let get_res = async {
+                                let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+                                let raw = self.router.backend.get_object(&be_id, &real_key).await?;
+                                let decompressed = self.router.get_crypto().process_read(&raw)?;
+                                Ok::<Vec<u8>, SqueezefsError>(decompressed)
+                            }
+                            .await;
 
-                                // Re-acquire lock
-                                *guard = Some(lock.write().await);
+                            // Re-acquire lock
+                            *guard = Some(lock.write().await);
 
-                                let decompressed = get_res?;
-                                self.router
-                                    .cache
-                                    .read_lru
-                                    .put(&bk, std::sync::Arc::new(decompressed.clone()));
-                                decompressed
-                            };
+                            let decompressed = get_res?;
+                            self.router
+                                .cache
+                                .read_lru
+                                .put(&bk, std::sync::Arc::new(decompressed.clone()));
+                            decompressed
+                        };
                     }
                 }
 

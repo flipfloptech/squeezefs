@@ -266,7 +266,9 @@ async fn test_concurrent_writes_and_flush_lock_scope() {
             pid: 1234 + i as u32,
         };
         handles.push(tokio::spawn(async move {
-            fs_clone.write(req_clone, ino, 0, i * 100, &data, 0, 0).await
+            fs_clone
+                .write(req_clone, ino, 0, i * 100, &data, 0, 0)
+                .await
         }));
     }
 
@@ -276,6 +278,8 @@ async fn test_concurrent_writes_and_flush_lock_scope() {
     }
 
     // Force flush active blocks to S3 to verify consistency using public flush
-    fs_arc.flush(req, ino, 0, 0).await.expect("Flush should succeed");
+    fs_arc
+        .flush(req, ino, 0, 0)
+        .await
+        .expect("Flush should succeed");
 }
-

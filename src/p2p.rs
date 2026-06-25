@@ -185,8 +185,8 @@ impl P2pClient {
             }
         };
 
-        // Enforce 300ms fail-fast timeout
-        match tokio::time::timeout(Duration::from_millis(300), download_future).await {
+        // Enforce 50ms fail-fast timeout
+        match tokio::time::timeout(Duration::from_millis(50), download_future).await {
             Ok(res) => res,
             Err(_) => {
                 debug!("P2P Client: Download from peer {} timed out", log_addr);

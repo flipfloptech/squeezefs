@@ -67,7 +67,7 @@ pub enum MetaConnection {
     Single {
         conn: redis::aio::MultiplexedConnection,
         client: Option<redis::Client>,
-        bound_conn: Option<BoundConnection>,
+        bound_conn: Option<Box<BoundConnection>>,
     },
     Cluster(redis::cluster_async::ClusterConnection),
 }
@@ -415,7 +415,7 @@ impl MetaClient {
                     return Ok(MetaConnection::Single {
                         conn: conn_val,
                         client: Some(client.clone()),
-                        bound_conn: Some(bound),
+                        bound_conn: Some(Box::new(bound)),
                     });
                 }
                 Err(SqueezefsError::InvalidOperation(

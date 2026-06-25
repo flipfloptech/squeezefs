@@ -1811,10 +1811,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-                            if path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_")) {
-                                staged_count += 1;
-                            }
+                        if path.is_file()
+                            && path.extension().is_some_and(|ext| ext == "staged")
+                            && path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_"))
+                        {
+                            staged_count += 1;
                         }
                     }
                 }
@@ -1882,10 +1883,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                                 for entry in entries.flatten() {
                                     let path = entry.path();
-                                    if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-                                        if path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_")) {
-                                            current_staged += 1;
-                                        }
+                                    if path.is_file()
+                                        && path.extension().is_some_and(|ext| ext == "staged")
+                                        && path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_"))
+                                    {
+                                        current_staged += 1;
                                     }
                                 }
                             }

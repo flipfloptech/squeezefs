@@ -364,7 +364,7 @@ async fn test_striped_write_await_s3() {
     for dir in router.cache.nvme.staging_dirs() {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                if entry.path().extension().map_or(false, |ext| ext == "block") {
+                if entry.path().extension().is_some_and(|ext| ext == "block") {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }

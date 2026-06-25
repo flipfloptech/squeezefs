@@ -6,12 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use sysinfo::System;
 
+type EvictReceiver = tokio::sync::mpsc::UnboundedReceiver<(String, Arc<Vec<u8>>)>;
+
 #[derive(Clone)]
 pub struct LruCache {
     inner: Cache<String, Arc<Vec<u8>>>,
     max_bytes: u64,
     current_bytes: Arc<AtomicU64>,
-    evict_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(String, Arc<Vec<u8>>)>>>>,
+    evict_rx: Arc<std::sync::Mutex<Option<EvictReceiver>>>,
 }
 
 impl LruCache {

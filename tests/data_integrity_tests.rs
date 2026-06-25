@@ -309,7 +309,7 @@ async fn test_striped_rmw_corruption_with_compression() {
     format_volume(
         &redis_url,
         fs_name,
-        1 * 1024 * 1024, // 1MB block size to easily cross boundaries
+        1024 * 1024, // 1MB block size to easily cross boundaries
         100 * 1024 * 1024 * 1024,
         0,
         "lz4", // lz4 compression enabled!

@@ -77,7 +77,7 @@ mod tests {
         let err_permission = SqueezefsError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
         assert_eq!(err_permission.to_errno(), libc::EACCES);
 
-        let err_other = SqueezefsError::Io(io::Error::new(io::ErrorKind::Other, "other"));
+        let err_other = SqueezefsError::Io(io::Error::other("other"));
         assert_eq!(err_other.to_errno(), libc::EIO);
     }
 }

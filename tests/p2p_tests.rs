@@ -357,7 +357,7 @@ async fn test_p2p_fast_fail_timeout() {
     // Start a dummy TCP server that accepts connections but never responds
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    
+
     // Spawn task to accept connection but just hold/sleep
     let _handle = tokio::spawn(async move {
         if let Ok((_stream, _)) = listener.accept().await {
@@ -371,8 +371,16 @@ async fn test_p2p_fast_fail_timeout() {
     let elapsed = start.elapsed();
 
     assert!(res.is_err(), "Expected timeout error");
-    assert!(elapsed >= Duration::from_millis(50), "Should take at least 50ms, got {}ms", elapsed.as_millis());
-    assert!(elapsed < Duration::from_millis(150), "Should time out well before 300ms (timeout target is 50ms), got {}ms", elapsed.as_millis());
+    assert!(
+        elapsed >= Duration::from_millis(50),
+        "Should take at least 50ms, got {}ms",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "Should time out well before 300ms (timeout target is 50ms), got {}ms",
+        elapsed.as_millis()
+    );
 }
 
 #[tokio::test]
@@ -465,10 +473,14 @@ async fn test_p2p_random_subset_limit() {
     let elapsed = start.elapsed();
 
     assert_eq!(read_res, block_data);
-    
+
     // Assert we queried exactly 3 peers
     let count = connection_count.load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(count, 3, "Expected exactly 3 peers to be queried, got {}", count);
+    assert_eq!(
+        count, 3,
+        "Expected exactly 3 peers to be queried, got {}",
+        count
+    );
 
     // Assert the timing is reasonable (should be around 150ms, definitely < 240ms)
     assert!(
@@ -477,4 +489,3 @@ async fn test_p2p_random_subset_limit() {
         elapsed.as_millis()
     );
 }
-

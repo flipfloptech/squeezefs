@@ -1118,12 +1118,18 @@ impl DataRouter {
                     let cache_ref = self.cache.nvme.clone();
                     let read_lru = self.cache.read_lru.clone();
                     let backend_ref = self.backend.clone();
+                    let own_p2p_addr = self.cache.nvme.p2p_addr.clone();
                     let peers = if let Some(ref b_key) = b_key_opt {
-                        peer_mappings.get(b_key).cloned().unwrap_or_default()
+                        let mut p_list = peer_mappings.get(b_key).cloned().unwrap_or_default();
+                        if let Some(own_addr) = own_p2p_addr.get() {
+                            p_list.retain(|p| p != own_addr);
+                        }
+                        fastrand::shuffle(&mut p_list);
+                        p_list.truncate(3);
+                        p_list
                     } else {
                         Vec::new()
                     };
-                    let own_p2p_addr = self.cache.nvme.p2p_addr.clone();
 
                     let b_start_offset = b_idx as u64 * block_size;
                     let b_end_offset = b_start_offset + block_size;

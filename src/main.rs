@@ -738,17 +738,17 @@ fn print_mount_diagnostics(
 
     let resolved_mem_cache_size = mem_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("mem_cache_size").cloned())
+        .or_else(|| format_fields.get("mem_cache_size").filter(|s| !s.is_empty()).cloned())
         .unwrap_or_else(|| "1GB".to_string());
 
     let resolved_disk_cache_size = disk_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("disk_cache_size").cloned())
+        .or_else(|| format_fields.get("disk_cache_size").filter(|s| !s.is_empty()).cloned())
         .unwrap_or_else(|| "10GB".to_string());
 
     let resolved_read_cache_size = read_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("read_cache_size").cloned())
+        .or_else(|| format_fields.get("read_cache_size").filter(|s| !s.is_empty()).cloned())
         .unwrap_or_else(|| {
             if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0) {
                 format_size(bytes / 2)
@@ -759,7 +759,7 @@ fn print_mount_diagnostics(
 
     let resolved_write_cache_size = write_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("write_cache_size").cloned())
+        .or_else(|| format_fields.get("write_cache_size").filter(|s| !s.is_empty()).cloned())
         .unwrap_or_else(|| {
             if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0) {
                 format_size(bytes / 2)
@@ -770,7 +770,7 @@ fn print_mount_diagnostics(
 
     let resolved_read_mem_cache_size = read_mem_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("read_mem_cache_size").cloned())
+        .or_else(|| format_fields.get("read_mem_cache_size").filter(|s| !s.is_empty()).cloned())
         .unwrap_or_else(|| {
             if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0) {
                 format_size(bytes / 2)
@@ -781,7 +781,7 @@ fn print_mount_diagnostics(
 
     let resolved_write_mem_cache_size = write_mem_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("write_mem_cache_size").cloned())
+        .or_else(|| format_fields.get("write_mem_cache_size").filter(|s| !s.is_empty()).cloned())
         .unwrap_or_else(|| {
             if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0) {
                 format_size(bytes / 2)
@@ -809,19 +809,22 @@ fn print_mount_diagnostics(
     let final_s3_endpoint = s3_endpoint
         .map(|s| s.to_string())
         .or_else(|| std::env::var("RUSTFS_ENDPOINT").ok())
-        .or_else(|| format_fields.get("s3_endpoint").cloned());
+        .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
+        .or_else(|| format_fields.get("s3_endpoint").filter(|s| !s.is_empty()).cloned());
     let final_s3_access_key = s3_access_key
         .map(|s| s.to_string())
         .or_else(|| std::env::var("RUSTFS_ACCESS_KEY").ok())
-        .or_else(|| format_fields.get("s3_access_key").cloned());
+        .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
+        .or_else(|| format_fields.get("s3_access_key").filter(|s| !s.is_empty()).cloned());
     let final_s3_secret_key = s3_secret_key
         .map(|s| s.to_string())
         .or_else(|| std::env::var("RUSTFS_SECRET_KEY").ok())
-        .or_else(|| format_fields.get("s3_secret_key").cloned());
+        .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
+        .or_else(|| format_fields.get("s3_secret_key").filter(|s| !s.is_empty()).cloned());
     let final_s3_bucket = s3_bucket
         .map(|s| s.to_string())
         .or_else(|| std::env::var("RUSTFS_BUCKET").ok())
-        .or_else(|| format_fields.get("s3_bucket").cloned());
+        .or_else(|| format_fields.get("s3_bucket").filter(|s| !s.is_empty()).cloned());
 
     let active_be_id = format_fields
         .get("active_write_backend")
@@ -1135,12 +1138,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Resolve memory cache size: CLI override > Garnet setting > default "1GB"
             let resolved_mem_cache_size = mem_cache_size
-                .or_else(|| format_fields.get("mem_cache_size").cloned())
+                .or_else(|| format_fields.get("mem_cache_size").filter(|s| !s.is_empty()).cloned())
                 .unwrap_or_else(|| "1GB".to_string());
 
             // Resolve dismount wait time: CLI override > Garnet setting > default 10 seconds
             let resolved_dismount_wait: u64 = dismount_wait
-                .or_else(|| format_fields.get("dismount_wait").cloned())
+                .or_else(|| format_fields.get("dismount_wait").filter(|s| !s.is_empty()).cloned())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10);
 
@@ -1159,7 +1162,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Resolve upload delay: CLI override > Garnet setting > default "500ms"
             let resolved_upload_delay = upload_delay
-                .or_else(|| format_fields.get("upload_delay").cloned())
+                .or_else(|| format_fields.get("upload_delay").filter(|s| !s.is_empty()).cloned())
                 .unwrap_or_else(|| "500ms".to_string());
 
             // Validate resolved upload delay
@@ -1167,11 +1170,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Resolve disk cache size: CLI override > Garnet setting > default "10GB"
             let resolved_disk_cache_size = disk_cache_size
-                .or_else(|| format_fields.get("disk_cache_size").cloned())
+                .or_else(|| format_fields.get("disk_cache_size").filter(|s| !s.is_empty()).cloned())
                 .unwrap_or_else(|| "10GB".to_string());
 
             let resolved_read_cache_size = read_cache_size
-                .or_else(|| format_fields.get("read_cache_size").cloned())
+                .or_else(|| format_fields.get("read_cache_size").filter(|s| !s.is_empty()).cloned())
                 .unwrap_or_else(|| {
                     if let Ok(bytes) =
                         squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0)
@@ -1183,7 +1186,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 });
 
             let resolved_write_cache_size = write_cache_size
-                .or_else(|| format_fields.get("write_cache_size").cloned())
+                .or_else(|| format_fields.get("write_cache_size").filter(|s| !s.is_empty()).cloned())
                 .unwrap_or_else(|| {
                     if let Ok(bytes) =
                         squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0)
@@ -1195,7 +1198,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 });
 
             let resolved_read_mem_cache_size = read_mem_cache_size
-                .or_else(|| format_fields.get("read_mem_cache_size").cloned())
+                .or_else(|| format_fields.get("read_mem_cache_size").filter(|s| !s.is_empty()).cloned())
                 .unwrap_or_else(|| {
                     if let Ok(bytes) =
                         squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0)
@@ -1207,7 +1210,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 });
 
             let resolved_write_mem_cache_size = write_mem_cache_size
-                .or_else(|| format_fields.get("write_mem_cache_size").cloned())
+                .or_else(|| format_fields.get("write_mem_cache_size").filter(|s| !s.is_empty()).cloned())
                 .unwrap_or_else(|| {
                     if let Ok(bytes) =
                         squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0)
@@ -1328,16 +1331,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Load S3 settings: Env variables > Garnet stored settings
             let final_s3_endpoint = std::env::var("RUSTFS_ENDPOINT")
                 .ok()
-                .or_else(|| format_fields.get("s3_endpoint").cloned());
+                .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
+                .or_else(|| format_fields.get("s3_endpoint").filter(|s| !s.is_empty()).cloned());
             let final_s3_access_key = std::env::var("RUSTFS_ACCESS_KEY")
                 .ok()
-                .or_else(|| format_fields.get("s3_access_key").cloned());
+                .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
+                .or_else(|| format_fields.get("s3_access_key").filter(|s| !s.is_empty()).cloned());
             let final_s3_secret_key = std::env::var("RUSTFS_SECRET_KEY")
                 .ok()
-                .or_else(|| format_fields.get("s3_secret_key").cloned());
+                .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
+                .or_else(|| format_fields.get("s3_secret_key").filter(|s| !s.is_empty()).cloned());
             let final_s3_bucket = std::env::var("RUSTFS_BUCKET")
                 .ok()
-                .or_else(|| format_fields.get("s3_bucket").cloned());
+                .or_else(|| format_fields.get("s3_bucket").filter(|s| !s.is_empty()).cloned());
 
             // Retrieve registered backends or initialize the default one
             let multi_backend = MultiBackendClient::new();

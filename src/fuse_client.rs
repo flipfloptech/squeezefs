@@ -272,8 +272,8 @@ impl SqueezefsFilesystem {
                 "nvme_read_cache_max_bytes": self.router.cache.nvme.max_read_bytes(),
             },
             "internal_caches": {
-                "metadata_cache_size": self.router.metadata_cache.len(),
-                "block_map_cache_size": self.router.block_map_cache.len(),
+                "metadata_cache_size": self.router.metadata_cache.entry_count(),
+                "block_map_cache_size": self.router.block_map_cache.entry_count(),
             }
         });
 
@@ -476,7 +476,7 @@ impl SqueezefsFilesystem {
                     // Try block_map_cache first
                     let cache_key = (block_map_id.clone(), b as u32);
                     if let Some(entry) = self.router.block_map_cache.get(&cache_key) {
-                        let (bk, cached_at) = entry.value();
+                        let (bk, cached_at) = &entry;
                         if cached_at.elapsed() < Duration::from_secs(1) {
                             old_block_key = Some(bk.clone());
                         }
@@ -1048,10 +1048,11 @@ impl Filesystem for SqueezefsFilesystem {
                 if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-                            if path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_")) {
-                                current_staged += 1;
-                            }
+                        if path.is_file()
+                            && path.extension().is_some_and(|ext| ext == "staged")
+                            && path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| name.starts_with("file_"))
+                        {
+                            current_staged += 1;
                         }
                     }
                 }

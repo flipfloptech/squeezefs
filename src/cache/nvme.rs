@@ -738,13 +738,11 @@ impl NvmeStaging {
             if let Ok(entries) = std::fs::read_dir(&staging_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() {
-                        if path.extension().is_some_and(|ext| ext == "staged") {
-                            if let Some(stem) = path.file_stem() {
-                                let stem_str = stem.to_string_lossy();
-                                if stem_str.starts_with("file_") {
-                                    files.push(stem_str.trim_start_matches("file_").to_string());
-                                }
+                    if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
+                        if let Some(stem) = path.file_stem() {
+                            let stem_str = stem.to_string_lossy();
+                            if stem_str.starts_with("file_") {
+                                files.push(stem_str.trim_start_matches("file_").to_string());
                             }
                         }
                     }
@@ -761,13 +759,11 @@ impl NvmeStaging {
             if let Ok(entries) = std::fs::read_dir(&cache_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() {
-                        if path.extension().is_some_and(|ext| ext == "block") {
-                            if let Some(stem) = path.file_stem() {
-                                let stem_str = stem.to_string_lossy();
-                                if stem_str.starts_with("block_") {
-                                    blocks.push(stem_str.trim_start_matches("block_").to_string());
-                                }
+                    if path.is_file() && path.extension().is_some_and(|ext| ext == "block") {
+                        if let Some(stem) = path.file_stem() {
+                            let stem_str = stem.to_string_lossy();
+                            if stem_str.starts_with("block_") {
+                                blocks.push(stem_str.trim_start_matches("block_").to_string());
                             }
                         }
                     }

@@ -10,6 +10,8 @@ pub struct CryptoCompressState {
     pub compression: String,
     pub encrypt_algo: String,
     pub private_key: Option<Arc<RsaPrivateKey>>,
+    pub unwrap_cache: Arc<dashmap::DashMap<Vec<u8>, Vec<u8>>>,
+    pub key_unwrap_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CryptoCompressState {
@@ -31,6 +33,8 @@ impl CryptoCompressState {
             compression,
             encrypt_algo,
             private_key,
+            unwrap_cache: Arc::new(dashmap::DashMap::new()),
+            key_unwrap_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -156,16 +160,23 @@ impl CryptoCompressState {
         let nonce_bytes = &data[3 + wrapped_key_len..3 + wrapped_key_len + nonce_len];
         let ciphertext_payload = &data[3 + wrapped_key_len + nonce_len..];
 
-        let private_key = self.private_key.as_ref().ok_or_else(|| {
-            SqueezefsError::InvalidOperation(
-                "RSA Private Key is required for decryption but not configured".to_string(),
-            )
-        })?;
-        let key_bytes = private_key
-            .decrypt(rsa::Oaep::new::<sha2::Sha256>(), wrapped_key)
-            .map_err(|e| {
-                SqueezefsError::InvalidOperation(format!("RSA key unwrap failed: {:?}", e))
+        let key_bytes = if let Some(cached_key) = self.unwrap_cache.get(wrapped_key) {
+            cached_key.value().clone()
+        } else {
+            let private_key = self.private_key.as_ref().ok_or_else(|| {
+                SqueezefsError::InvalidOperation(
+                    "RSA Private Key is required for decryption but not configured".to_string(),
+                )
             })?;
+            let decrypted_key = private_key
+                .decrypt(rsa::Oaep::new::<sha2::Sha256>(), wrapped_key)
+                .map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!("RSA key unwrap failed: {:?}", e))
+                })?;
+            self.unwrap_cache.insert(wrapped_key.to_vec(), decrypted_key.clone());
+            self.key_unwrap_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            decrypted_key
+        };
 
         let algorithm = match self.encrypt_algo.as_str() {
             "aes256gcm-rsa" => &AES_256_GCM,

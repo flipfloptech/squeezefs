@@ -27,9 +27,9 @@ pub struct DataRouter {
     pub backend: MultiBackendClient,
     pub cache: TieredCache,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub metadata_cache: std::sync::Arc<dashmap::DashMap<String, CachedMetadata>>,
+    pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
     pub block_map_cache:
-        std::sync::Arc<dashmap::DashMap<(String, u32), (Option<String>, std::time::Instant)>>,
+        moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
 }
@@ -41,8 +41,14 @@ impl DataRouter {
             backend: backend.into(),
             cache,
             block_size: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024)),
-            metadata_cache: std::sync::Arc::new(dashmap::DashMap::new()),
-            block_map_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            metadata_cache: moka::sync::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
+            block_map_cache: moka::sync::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
             crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
         }
     }
@@ -490,7 +496,7 @@ impl DataRouter {
             self.cache.read_lru.remove(file_path);
         }
 
-        self.metadata_cache.remove(file_path);
+        self.metadata_cache.invalidate(file_path);
 
         Ok(())
     }
@@ -708,9 +714,9 @@ impl DataRouter {
             self.cache.read_lru.remove(file_path);
         }
 
-        self.metadata_cache.remove(file_path);
+        self.metadata_cache.invalidate(file_path);
         for b in start_block..=end_block {
-            self.block_map_cache.remove(&(block_map_id.clone(), b));
+            self.block_map_cache.invalidate(&(block_map_id.clone(), b));
         }
 
         Ok(())
@@ -1033,7 +1039,7 @@ impl DataRouter {
                     for b in start_block..=end_block {
                         let cache_key = (block_map_id.clone(), b);
                         if let Some(entry) = self.block_map_cache.get(&cache_key) {
-                            let (bk, cached_at) = entry.value();
+                            let (bk, cached_at) = &entry;
                             if cached_at.elapsed() < Duration::from_secs(1) {
                                 block_keys.push((b, bk.clone()));
                                 continue;
@@ -1169,9 +1175,7 @@ impl DataRouter {
                                     None => {
                                         // Fallback to S3
                                         let (be_id, real_key) = parse_backend_and_key(b_key);
-                                        let data = backend_ref.get_object(&be_id, &real_key).await?;
-                                        let decompressed = crypto_clone.process_read(&data)?;
-                                        decompressed
+                                        crypto_clone.process_read(&backend_ref.get_object(&be_id, &real_key).await?)?
                                     }
                                 };
 
@@ -1479,7 +1483,7 @@ impl DataRouter {
 
                     for (idx_str, bk) in block_mappings {
                         if let Ok(idx) = idx_str.parse::<u32>() {
-                            self.block_map_cache.remove(&(block_map_id.clone(), idx));
+                            self.block_map_cache.invalidate(&(block_map_id.clone(), idx));
                         }
                         let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
                         if let Some(mut r) = current_ref {
@@ -1561,7 +1565,7 @@ impl DataRouter {
 
         self.cache.write_lru.remove(file_path);
         self.cache.read_lru.remove(file_path);
-        self.metadata_cache.remove(file_path);
+        self.metadata_cache.invalidate(file_path);
         Ok(())
     }
 

@@ -351,3 +351,130 @@ async fn test_p2p_cooperative_read_after_write() {
     // Clean up server
     server_task.abort();
 }
+
+#[tokio::test]
+async fn test_p2p_fast_fail_timeout() {
+    // Start a dummy TCP server that accepts connections but never responds
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    
+    // Spawn task to accept connection but just hold/sleep
+    let _handle = tokio::spawn(async move {
+        if let Ok((_stream, _)) = listener.accept().await {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+
+    let client = P2pClient::new();
+    let start = std::time::Instant::now();
+    let res = client.download_block_from_peer(&addr, "test_block").await;
+    let elapsed = start.elapsed();
+
+    assert!(res.is_err(), "Expected timeout error");
+    assert!(elapsed >= Duration::from_millis(50), "Should take at least 50ms, got {}ms", elapsed.as_millis());
+    assert!(elapsed < Duration::from_millis(150), "Should time out well before 300ms (timeout target is 50ms), got {}ms", elapsed.as_millis());
+}
+
+#[tokio::test]
+async fn test_p2p_random_subset_limit() {
+    let dlm = match get_dlm_client().await {
+        Some(d) => d,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
+            return;
+        }
+    };
+    clear_garnet_keys(&dlm).await;
+
+    // S3 mock client prepopulated with block data
+    let backend = RustFsClient::new_mock();
+    let block_key = "backend_0/part_random_subset/part_0";
+    let block_data = vec![88u8; 1000];
+    backend
+        .put_object(block_key, block_data.clone(), 0)
+        .await
+        .expect("Should seed mock S3 block");
+
+    // Start 5 dummy listeners
+    let mut listeners = Vec::new();
+    let mut dead_peers = Vec::new();
+    for _ in 0..5 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        dead_peers.push(addr);
+        listeners.push(listener);
+    }
+
+    let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Accept connections but don't respond
+    for listener in listeners {
+        let conn_count = connection_count.clone();
+        tokio::spawn(async move {
+            if let Ok((_stream, _)) = listener.accept().await {
+                conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        });
+    }
+
+    // Register all 5 dead/non-responsive peers in Garnet
+    let safe_name = block_key.replace(['/', ':'], "_");
+    let mut con = dlm.get_connection().await.expect("Should connect");
+    for peer in &dead_peers {
+        let _: () = con
+            .sadd(format!("block_peers:{}", safe_name), peer)
+            .await
+            .expect("Should sadd");
+    }
+
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .expect("Should create cache");
+    // Ensure we don't match own address
+    let _ = cache.nvme.p2p_addr.set("127.0.0.1:29105".to_string());
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+
+    // Write metadata for striped file using this block
+    let file_path = "random_subset.bin";
+    let mut con_meta = dlm.get_connection().await.unwrap();
+    let meta_key = format!("metadata:{}", file_path);
+    let _: () = redis::pipe()
+        .hset(&meta_key, "type", "striped")
+        .hset(&meta_key, "size", 1000u64)
+        .hset(&meta_key, "block_prefix", "backend_0/part_random_subset")
+        .query_async(&mut con_meta)
+        .await
+        .unwrap();
+
+    // Read range: should try at most 3 peers, each timing out in 50ms, then fallback to S3.
+    let start = std::time::Instant::now();
+    let read_res = router
+        .read_file_range(file_path, 0, 1000)
+        .await
+        .expect("Should read range via S3 fallback");
+    let elapsed = start.elapsed();
+
+    assert_eq!(read_res, block_data);
+    
+    // Assert we queried exactly 3 peers
+    let count = connection_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(count, 3, "Expected exactly 3 peers to be queried, got {}", count);
+
+    // Assert the timing is reasonable (should be around 150ms, definitely < 240ms)
+    assert!(
+        elapsed < Duration::from_millis(240),
+        "Elapsed time {}ms is too high; queried too many peers?",
+        elapsed.as_millis()
+    );
+}
+

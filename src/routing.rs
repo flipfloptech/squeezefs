@@ -73,6 +73,33 @@ impl DataRouter {
             .store(block_size, std::sync::atomic::Ordering::Relaxed);
     }
 
+    async fn decrement_staged_block_refcount(
+        &self,
+        old_id: &str,
+        con: &mut crate::dlm::MetaConnection,
+    ) -> Result<()> {
+        let mapping_key = format!("mapping:{}", old_id);
+        let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
+        if let Some(bk) = block_key {
+            let refcounts_key = "squeezefs:block_refcounts";
+            let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+            if let Some(mut r) = current_ref {
+                r -= 1;
+                if r <= 0 {
+                    let _: () = con.hdel(refcounts_key, &bk).await?;
+                    let (be_id, real_key) = parse_backend_and_key(&bk);
+                    let _ = self.backend.delete_object(&be_id, &real_key).await;
+                } else {
+                    let _: () = con.hset(refcounts_key, &bk, r).await?;
+                }
+            } else {
+                let (be_id, real_key) = parse_backend_and_key(&bk);
+                let _ = self.backend.delete_object(&be_id, &real_key).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Write file data using progressive data layout routing with offset support (POSIX random-access RMW).
     pub async fn write_file(
         &self,
@@ -230,6 +257,9 @@ impl DataRouter {
                     .get_staged_path(&old_id)
                     .join(format!("file_{}.staged", old_id));
                 let _ = tokio::fs::remove_file(old_staged_path).await;
+                let _ = self
+                    .decrement_staged_block_refcount(&old_id, &mut con)
+                    .await;
                 let mapping_key = format!("mapping:{}", old_id);
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
@@ -273,6 +303,9 @@ impl DataRouter {
                     .get_staged_path(&old_id)
                     .join(format!("file_{}.staged", old_id));
                 let _ = tokio::fs::remove_file(old_staged_path).await;
+                let _ = self
+                    .decrement_staged_block_refcount(&old_id, &mut con)
+                    .await;
                 let mapping_key = format!("mapping:{}", old_id);
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
@@ -318,6 +351,9 @@ impl DataRouter {
                             .get_staged_path(&old_id)
                             .join(format!("file_{}.staged", old_id));
                         let _ = tokio::fs::remove_file(old_staged_path).await;
+                        let _ = self
+                            .decrement_staged_block_refcount(&old_id, &mut con)
+                            .await;
                         let mapping_key = format!("mapping:{}", old_id);
                         let _: () = con.del(&mapping_key).await.unwrap_or(());
                     }
@@ -368,6 +404,9 @@ impl DataRouter {
                             .get_staged_path(&old_id)
                             .join(format!("file_{}.staged", old_id));
                         let _ = tokio::fs::remove_file(old_staged_path).await;
+                        let _ = self
+                            .decrement_staged_block_refcount(&old_id, &mut con)
+                            .await;
                         let old_mapping_key = format!("mapping:{}", old_id);
                         let _: () = con.del(&old_mapping_key).await.unwrap_or(());
                     }

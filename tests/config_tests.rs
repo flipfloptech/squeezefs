@@ -212,7 +212,7 @@ async fn test_fsck_detection() {
     let _: () = redis::pipe()
         .hset(&meta_key, "type", "striped")
         .hset(&meta_key, "size", 4194304u64)
-        .hset(&meta_key, "block_map", "corrupted_block_map")
+        .hset(&meta_key, "block_map_id", "corrupted_block_map")
         .query_async(&mut con)
         .await
         .unwrap();

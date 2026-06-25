@@ -212,3 +212,31 @@ impl CryptoCompressState {
         self.decompress(&decrypted)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+
+    #[test]
+    fn test_crypto_unwrap_caching() {
+        let mut rng = rand::thread_rng();
+        let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem = priv_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
+
+        let state = CryptoCompressState::new("none".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
+        let data = b"some block payload";
+
+        let encrypted = state.encrypt(data).unwrap();
+
+        // First decryption: should miss cache and decrypt via RSA
+        let decrypted1 = state.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted1, data);
+        assert_eq!(state.key_unwrap_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Second decryption: should hit cache and bypass RSA decryption
+        let decrypted2 = state.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted2, data);
+        assert_eq!(state.key_unwrap_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+}

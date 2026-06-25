@@ -663,3 +663,39 @@ async fn test_concurrent_mounts_cache_sharing() {
         assert!(block_path_shared.exists());
     }
 }
+
+#[tokio::test]
+async fn test_router_cache_bounds() {
+    let redis_url = std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let dlm = squeezefs::dlm::DlmClient::new(&redis_url).unwrap();
+    let backend = squeezefs::backend::RustFsClient::new_mock();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache = squeezefs::cache::TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        None,
+        None,
+        backend.clone(),
+        dlm.meta_client().clone(),
+    ).unwrap();
+
+    let router = squeezefs::routing::DataRouter::new(dlm, backend, cache);
+
+    let meta = squeezefs::routing::CachedMetadata {
+        file_type: "inline".to_string(),
+        size: 100,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        cached_at: std::time::Instant::now(),
+        data_key: None,
+    };
+
+    router.metadata_cache.insert("test_key".to_string(), meta);
+    assert!(router.metadata_cache.get("test_key").is_some());
+
+    let val = (Some("block_key".to_string()), std::time::Instant::now());
+    router.block_map_cache.insert(("map_id".to_string(), 0), val);
+    assert!(router.block_map_cache.get(&("map_id".to_string(), 0)).is_some());
+}

@@ -1,13 +1,31 @@
 use crate::cache::nvme::NvmeStaging;
 use crate::error::{Result, SqueezefsError};
 use log::{debug, error, info};
+use redis::AsyncCommands;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+#[derive(Clone)]
 pub struct P2pServer {
     addr: String,
     cache: NvmeStaging,
+}
+
+impl Drop for P2pServer {
+    fn drop(&mut self) {
+        let redis_client = self.cache.redis_client().clone();
+        let addr = self.addr.clone();
+        tokio::spawn(async move {
+            if let Ok(mut con) = redis_client.get_connection().await {
+                let _: std::result::Result<(), redis::RedisError> = redis::cmd("ZREM")
+                    .arg("squeezefs:active_clients")
+                    .arg(&addr)
+                    .query_async(&mut con)
+                    .await;
+            }
+        });
+    }
 }
 
 impl P2pServer {
@@ -22,6 +40,40 @@ impl P2pServer {
         })?;
 
         info!("P2P Server: Listening on {}", self.addr);
+
+        // Start heartbeat loop
+        let redis_client = self.cache.redis_client().clone();
+        let p2p_addr = self.addr.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(mut con) = redis_client.get_connection().await {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let _: std::result::Result<(), redis::RedisError> = redis::cmd("ZADD")
+                        .arg("squeezefs:active_clients")
+                        .arg(now + 30)
+                        .arg(&p2p_addr)
+                        .query_async(&mut con)
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        });
+
+        // Start health checker loop
+        let cache_ref = self.cache.clone();
+        let p2p_addr_for_check = self.addr.clone();
+        let checker_server = Self::new(p2p_addr_for_check, cache_ref);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if let Err(e) = checker_server.check_and_prune_peers().await {
+                    debug!("P2P Server: Health check loop error: {:?}", e);
+                }
+            }
+        });
 
         loop {
             match listener.accept().await {
@@ -39,6 +91,110 @@ impl P2pServer {
                 }
             }
         }
+    }
+
+    pub async fn check_and_prune_peers(&self) -> Result<()> {
+        let redis_client = self.cache.redis_client();
+        let mut con = redis_client.get_connection().await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Lua script to atomically fetch and lease a batch of up to 10 peers
+        let lua_script = r#"
+            local peers = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+            if #peers > 0 then
+                for _, peer in ipairs(peers) do
+                    redis.call('ZADD', KEYS[1], ARGV[3], peer)
+                end
+            end
+            return peers
+        "#;
+
+        let script = redis::Script::new(lua_script);
+        let leased_peers: Vec<String> = script
+            .key("squeezefs:peer_health_check_schedule")
+            .arg(now)
+            .arg(10)
+            .arg(now + 60)
+            .invoke_async(&mut con)
+            .await
+            .map_err(SqueezefsError::Redis)?;
+
+        if leased_peers.is_empty() {
+            return Ok(());
+        }
+
+        debug!(
+            "P2P Server: Leased {} peers for health checks",
+            leased_peers.len()
+        );
+
+        let mut handles = Vec::new();
+        for peer in leased_peers {
+            let redis_client_clone = redis_client.clone();
+            let peer_addr = peer.clone();
+            handles.push(tokio::spawn(async move {
+                let is_alive = matches!(
+                    tokio::time::timeout(
+                        Duration::from_millis(50),
+                        TcpStream::connect(&peer_addr),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                );
+
+                if let Ok(mut con) = redis_client_clone.get_connection().await {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    if is_alive {
+                        debug!(
+                            "P2P Server: Peer {} is alive. Rescheduling check.",
+                            peer_addr
+                        );
+                        let _: std::result::Result<(), redis::RedisError> = redis::cmd("ZADD")
+                            .arg("squeezefs:peer_health_check_schedule")
+                            .arg(now + 120)
+                            .arg(&peer_addr)
+                            .query_async(&mut con)
+                            .await;
+                    } else {
+                        info!(
+                            "P2P Server: Peer {} is dead/unresponsive. Pruning references.",
+                            peer_addr
+                        );
+                        let mut pipe = redis::pipe();
+                        pipe.cmd("ZREM")
+                            .arg("squeezefs:peer_health_check_schedule")
+                            .arg(&peer_addr)
+                            .cmd("ZREM")
+                            .arg("squeezefs:active_clients")
+                            .arg(&peer_addr);
+
+                        let peer_blocks_key = format!("squeezefs:peer_blocks:{}", peer_addr);
+                        if let Ok(blocks) = con.smembers::<_, Vec<String>>(&peer_blocks_key).await {
+                            for block in blocks {
+                                let safe_name = block.replace(['/', ':'], "_");
+                                pipe.srem(format!("block_peers:{}", safe_name), &peer_addr);
+                            }
+                        }
+                        pipe.del(&peer_blocks_key);
+
+                        let _: std::result::Result<(), redis::RedisError> =
+                            pipe.query_async(&mut con).await;
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        Ok(())
     }
 
     async fn handle_connection(cache: NvmeStaging, mut stream: TcpStream) -> Result<()> {

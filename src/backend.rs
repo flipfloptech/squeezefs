@@ -216,19 +216,22 @@ impl RustFsClient {
             // Perform write directly (fencing token is stored as metadata for tracking,
             // but we avoid the redundant HEAD request check since block keys are unique).
             let body = ByteStream::from(data.clone());
-            match s3
+            let fut = s3
                 .put_object()
                 .bucket(&self.bucket)
                 .key(key)
                 .body(body)
                 .metadata("fencing-token", fencing_token.to_string())
-                .send()
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(e) => {
+                .send();
+            match tokio::time::timeout(std::time::Duration::from_secs(2), fut).await {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) => {
                     warn!("S3 PUT failed on current rail: {:?}. Retrying next...", e);
-                    last_err = Some(e);
+                    last_err = Some(format!("{:?}", e));
+                }
+                Err(_) => {
+                    warn!("S3 PUT timed out after 2s on current rail. Retrying next...");
+                    last_err = Some("Timeout".to_string());
                 }
             }
         }
@@ -261,19 +264,29 @@ impl RustFsClient {
                 SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
             })?;
 
-            match s3.get_object().bucket(&self.bucket).key(key).send().await {
-                Ok(resp) => {
-                    let bytes = resp.body.collect().await.map_err(|e| {
-                        SqueezefsError::Io(std::io::Error::other(format!(
-                            "Failed to read body stream: {:?}",
-                            e
-                        )))
-                    })?;
-                    return Ok(bytes.to_vec());
+            let fut = s3.get_object().bucket(&self.bucket).key(key).send();
+            match tokio::time::timeout(std::time::Duration::from_secs(2), fut).await {
+                Ok(Ok(resp)) => {
+                    let body_fut = resp.body.collect();
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), body_fut).await {
+                        Ok(Ok(bytes)) => return Ok(bytes.to_vec()),
+                        Ok(Err(e)) => {
+                            warn!("S3 GET body collection failed on current rail: {:?}. Retrying next...", e);
+                            last_err = Some(format!("Body stream read failed: {:?}", e));
+                        }
+                        Err(_) => {
+                            warn!("S3 GET body collection timed out after 2s on current rail. Retrying next...");
+                            last_err = Some("Body collection timeout".to_string());
+                        }
+                    }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!("S3 GET failed on current rail: {:?}. Retrying next...", e);
-                    last_err = Some(e);
+                    last_err = Some(format!("{:?}", e));
+                }
+                Err(_) => {
+                    warn!("S3 GET timed out after 2s on current rail. Retrying next...");
+                    last_err = Some("Timeout".to_string());
                 }
             }
         }
@@ -310,29 +323,34 @@ impl RustFsClient {
                 SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
             })?;
 
-            match s3
+            let fut = s3
                 .get_object()
                 .bucket(&self.bucket)
                 .key(key)
                 .range(range_header.clone())
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let bytes = resp.body.collect().await.map_err(|e| {
-                        SqueezefsError::Io(std::io::Error::other(format!(
-                            "Failed to read body stream: {:?}",
-                            e
-                        )))
-                    })?;
-                    return Ok(bytes.to_vec());
+                .send();
+            match tokio::time::timeout(std::time::Duration::from_secs(2), fut).await {
+                Ok(Ok(resp)) => {
+                    let body_fut = resp.body.collect();
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), body_fut).await {
+                        Ok(Ok(bytes)) => return Ok(bytes.to_vec()),
+                        Ok(Err(e)) => {
+                            warn!("S3 GET range body collection failed: {:?}. Retrying...", e);
+                            last_err = Some(format!("Body stream read failed: {:?}", e));
+                        }
+                        Err(_) => {
+                            warn!("S3 GET range body collection timed out. Retrying...");
+                            last_err = Some("Body collection timeout".to_string());
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "S3 GET range failed on current rail: {:?}. Retrying next...",
-                        e
-                    );
-                    last_err = Some(e);
+                Ok(Err(e)) => {
+                    warn!("S3 GET range failed on current rail: {:?}. Retrying next...", e);
+                    last_err = Some(format!("{:?}", e));
+                }
+                Err(_) => {
+                    warn!("S3 GET range timed out after 2s. Retrying next...");
+                    last_err = Some("Timeout".to_string());
                 }
             }
         }
@@ -362,20 +380,23 @@ impl RustFsClient {
                 SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
             })?;
 
-            match s3
+            let fut = s3
                 .delete_object()
                 .bucket(&self.bucket)
                 .key(key)
-                .send()
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(e) => {
+                .send();
+            match tokio::time::timeout(std::time::Duration::from_secs(2), fut).await {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) => {
                     warn!(
                         "S3 DELETE failed on current rail: {:?}. Retrying next...",
                         e
                     );
-                    last_err = Some(e);
+                    last_err = Some(format!("{:?}", e));
+                }
+                Err(_) => {
+                    warn!("S3 DELETE timed out after 2s. Retrying next...");
+                    last_err = Some("Timeout".to_string());
                 }
             }
         }

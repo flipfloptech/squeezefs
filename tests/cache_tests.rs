@@ -750,3 +750,55 @@ async fn test_router_cache_bounds() {
         .get(&("map_id".to_string(), 0))
         .is_some());
 }
+
+#[tokio::test]
+async fn test_nvme_read_cache_lru_in_memory() {
+    let temp_dir = tempdir().unwrap();
+    let mock_backend = RustFsClient::new_mock();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+
+    // 5KB read capacity limit
+    let nvme = NvmeStaging::new(
+        vec![temp_dir.path().to_path_buf()],
+        100 * 1024 * 1024,
+        5 * 1024,
+        mock_backend,
+        squeezefs::dlm::MetaClient::Single(redis_client),
+    )
+    .expect("Should construct NVMe staging");
+
+    // Cache b1 (2KB)
+    let b1 = vec![1u8; 2 * 1024];
+    nvme.cache_read_block("blocks/b1", &b1).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Cache b2 (2KB)
+    let b2 = vec![2u8; 2 * 1024];
+    nvme.cache_read_block("blocks/b2", &b2).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Read b1 again to promote it to MRU (most recently used)
+    let b1_read = nvme.read_cached_block("blocks/b1");
+    assert!(b1_read.is_some());
+
+    // Cache b3 (2KB) -> total capacity is now 6KB > 5KB limit.
+    // Since b1 was touched/read, the oldest block (LRU) is b2.
+    // Eviction should evict b2.
+    let b3 = vec![3u8; 2 * 1024];
+    nvme.cache_read_block("blocks/b3", &b3).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify b2 was evicted, but b1 and b3 are still present
+    assert!(
+        nvme.read_cached_block("blocks/b2").is_none(),
+        "b2 should have been evicted as it was the LRU block"
+    );
+    assert!(
+        nvme.read_cached_block("blocks/b1").is_some(),
+        "b1 should be present because it was promoted by being read"
+    );
+    assert!(
+        nvme.read_cached_block("blocks/b3").is_some(),
+        "b3 should be present as it is the newest block"
+    );
+}

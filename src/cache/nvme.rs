@@ -86,6 +86,7 @@ pub struct NvmeStaging {
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
     current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     current_read_cache_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    read_cache_lru: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(String, u64)>>>,
 }
 
 #[derive(Debug)]
@@ -169,6 +170,39 @@ impl NvmeStaging {
             }
         }
 
+        // Collect and sort initial block files by access time to populate LRU queue
+        let mut initial_blocks = Vec::new();
+        for dir in &staging_dirs {
+            let cache_dir = dir.join("cache");
+            if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            let path = entry.path();
+                            if path.extension().is_some_and(|ext| ext == "block") {
+                                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                                    if let Some(stripped) = name.strip_prefix("block_") {
+                                        let time = meta
+                                            .accessed()
+                                            .or_else(|_| meta.modified())
+                                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                        let safe_name = stripped.to_string();
+                                        initial_blocks.push((safe_name, meta.len(), time));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        initial_blocks.sort_by_key(|&(_, _, time)| time);
+
+        let mut read_cache_lru = std::collections::VecDeque::new();
+        for (safe_name, size, _) in initial_blocks {
+            read_cache_lru.push_back((safe_name, size));
+        }
+
         let staging = Self {
             staging_dirs: staging_dirs.clone(),
             max_write_bytes,
@@ -183,6 +217,7 @@ impl NvmeStaging {
             current_read_cache_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 initial_read_bytes,
             )),
+            read_cache_lru: std::sync::Arc::new(std::sync::Mutex::new(read_cache_lru)),
         };
 
         // Spawn the background merge worker
@@ -549,6 +584,23 @@ impl NvmeStaging {
         &self.staging_dirs
     }
 
+    fn touch_in_memory_lru(&self, safe_name: &str) {
+        let mut queue = self.read_cache_lru.lock().unwrap();
+        if let Some(pos) = queue.iter().position(|item| item.0 == safe_name) {
+            if let Some(item) = queue.remove(pos) {
+                queue.push_back(item);
+            }
+        }
+    }
+
+    fn add_to_in_memory_lru(&self, safe_name: String, size: u64) {
+        let mut queue = self.read_cache_lru.lock().unwrap();
+        if let Some(pos) = queue.iter().position(|item| item.0 == safe_name) {
+            queue.remove(pos);
+        }
+        queue.push_back((safe_name, size));
+    }
+
     /// Cache a block of read data on local NVMe, performing eviction if capacity is reached.
     pub fn cache_read_block(&self, block_key: &str, data: &[u8]) -> Result<()> {
         let this = self.clone();
@@ -567,6 +619,7 @@ impl NvmeStaging {
         let block_path = target_dir.join(format!("block_{}.block", safe_name));
 
         if block_path.exists() {
+            self.touch_in_memory_lru(&safe_name);
             if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
                 let _ = file.set_times(
                     std::fs::FileTimes::new()
@@ -583,73 +636,43 @@ impl NvmeStaging {
             .load(std::sync::atomic::Ordering::Relaxed);
 
         if current + new_data_len > self.max_read_bytes {
-            // Only perform directory walks for eviction if capacity is exceeded
-            let mut total_bytes = 0u64;
-            let mut block_files = Vec::new();
+            let mut queue = self.read_cache_lru.lock().unwrap();
+            let mut freed_bytes = 0u64;
+            let extra_margin = std::cmp::min(100 * 1024 * 1024, self.max_read_bytes / 10);
+            let target_to_free =
+                (current + new_data_len).saturating_sub(self.max_read_bytes) + extra_margin;
 
-            for dir in &self.staging_dirs {
-                let cache_dir = dir.join("cache");
-                if let Ok(entries) = fs::read_dir(&cache_dir) {
-                    for entry in entries.flatten() {
-                        if let Ok(meta) = entry.metadata() {
-                            if meta.is_file() {
-                                let path = entry.path();
-                                if path.extension().is_some_and(|ext| ext == "block") {
-                                    if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                                        if name.starts_with("block_") {
-                                            total_bytes += meta.len();
-                                            let time = meta
-                                                .accessed()
-                                                .or_else(|_| meta.modified())
-                                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                                            block_files.push((path, meta.len(), time));
-                                        }
-                                    }
-                                }
-                            }
+            while freed_bytes < target_to_free {
+                if let Some((old_safe_name, size)) = queue.pop_front() {
+                    let idx = get_dir_index(&old_safe_name, self.staging_dirs.len());
+                    let target_dir = self.staging_dirs[idx].join("cache");
+                    let old_block_path = target_dir.join(format!("block_{}.block", old_safe_name));
+                    if old_block_path.exists() {
+                        if std::fs::remove_file(&old_block_path).is_ok() {
+                            freed_bytes += size;
+                            debug!(
+                                "NVMe Staging: Evicted block cache file {:?}",
+                                old_block_path
+                            );
                         }
+                    } else {
+                        freed_bytes += size;
                     }
+                } else {
+                    break;
                 }
             }
 
-            if total_bytes + new_data_len > self.max_read_bytes {
-                // Sort block files by accessed time (oldest first)
-                block_files.sort_by_key(|&(_, _, time)| time);
+            let new_current = current.saturating_sub(freed_bytes);
+            self.current_read_cache_bytes
+                .store(new_current, std::sync::atomic::Ordering::Relaxed);
 
-                let mut freed_bytes = 0u64;
-                // Amortize eviction overhead: free needed space + extra margin (10% of max capacity, up to 100MB)
-                let extra_margin = std::cmp::min(100 * 1024 * 1024, self.max_read_bytes / 10);
-                let target_to_free =
-                    (total_bytes + new_data_len).saturating_sub(self.max_read_bytes) + extra_margin;
-
-                for (path, len, _) in block_files {
-                    if freed_bytes >= target_to_free {
-                        break;
-                    }
-                    if fs::remove_file(&path).is_ok() {
-                        freed_bytes += len;
-                        debug!("NVMe Staging: Evicted block cache file {:?}", path);
-                    }
-                }
-
-                if total_bytes - freed_bytes + new_data_len > self.max_read_bytes {
-                    warn!(
-                        "NVMe Staging: Cannot cache block {} - local storage full of staging writes.",
-                        block_key
-                    );
-                    // Synchronize current_read_cache_bytes with actual remaining usage
-                    self.current_read_cache_bytes.store(
-                        total_bytes - freed_bytes,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    return Ok(()); // Fail silently as caching is opportunistic
-                }
-
-                // Synchronize current_read_cache_bytes with actual remaining usage
-                self.current_read_cache_bytes.store(
-                    total_bytes - freed_bytes,
-                    std::sync::atomic::Ordering::Relaxed,
+            if new_current + new_data_len > self.max_read_bytes {
+                warn!(
+                    "NVMe Staging: Cannot cache block {} - local storage full.",
+                    block_key
                 );
+                return Ok(());
             }
         }
 
@@ -660,6 +683,7 @@ impl NvmeStaging {
             let _ = fs::remove_file(&tmp_path);
             return Err(SqueezefsError::Io(e));
         }
+        self.add_to_in_memory_lru(safe_name, new_data_len);
         self.current_read_cache_bytes
             .fetch_add(new_data_len, std::sync::atomic::Ordering::Relaxed);
         debug!(
@@ -718,6 +742,7 @@ impl NvmeStaging {
         let target_dir = self.staging_dirs[idx].join("cache");
         let block_path = target_dir.join(format!("block_{}.block", safe_name));
         if block_path.exists() {
+            self.touch_in_memory_lru(&safe_name);
             if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
                 let _ = file.set_times(
                     std::fs::FileTimes::new()
@@ -743,6 +768,7 @@ impl NvmeStaging {
         let target_dir = self.staging_dirs[idx].join("cache");
         let block_path = target_dir.join(format!("block_{}.block", safe_name));
         if block_path.exists() {
+            self.touch_in_memory_lru(&safe_name);
             if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
                 let _ = file.set_times(
                     std::fs::FileTimes::new()

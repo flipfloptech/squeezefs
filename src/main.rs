@@ -621,7 +621,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder.init();
 
     // NOW start the Tokio runtime in the surviving process
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    let mut core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    if !core_ids.is_empty() {
+        core_ids.remove(0); // Reserve Core 0 for OS kernel tasks
+    }
     let core_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let rt = tokio::runtime::Builder::new_multi_thread()

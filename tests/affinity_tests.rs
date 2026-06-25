@@ -41,7 +41,7 @@ fn test_cpu_affinity_pinning_reservation() {
 
     let pinned = pinned_cores.lock().unwrap();
     let first_core = core_ids[0];
-    
+
     // Core 0 must not be in the pinned cores list
     for &id in pinned.iter() {
         assert_ne!(

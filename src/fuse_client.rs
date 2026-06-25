@@ -20,6 +20,19 @@ use tokio::runtime::Builder;
 const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
+static BLOCK_FLUSH_LOCKS: Lazy<dashmap::DashMap<(u64, u32), std::sync::Arc<tokio::sync::Mutex<()>>>> =
+    Lazy::new(dashmap::DashMap::new);
+
+struct BlockFlushGuard {
+    key: (u64, u32),
+}
+
+impl Drop for BlockFlushGuard {
+    fn drop(&mut self) {
+        BLOCK_FLUSH_LOCKS.remove_if(&self.key, |_, arc| std::sync::Arc::strong_count(arc) <= 2);
+    }
+}
+
 static LUA_CREATE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
     redis::Script::new(
         r#"
@@ -720,6 +733,7 @@ impl SqueezefsFilesystem {
                                 .cache
                                 .read_lru
                                 .put(&bk, std::sync::Arc::new(decompressed.clone()));
+                            let _ = self.router.cache.nvme.cache_read_block(&bk, &decompressed);
                             decompressed
                         };
                     }
@@ -4497,6 +4511,14 @@ async fn flush_single_active_block(
     dlm: &DlmClient,
     active_inode_locks: &dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>>,
 ) -> Result<(), SqueezefsError> {
+    let block_lock = BLOCK_FLUSH_LOCKS
+        .entry((ino, b))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .value()
+        .clone();
+    let _block_guard = block_lock.lock().await;
+    let _cleanup_guard = BlockFlushGuard { key: (ino, b) };
+
     let staging_dir = router.cache.nvme.staging_dirs().first().cloned();
     let staging_dir = match staging_dir {
         Some(d) => d,
@@ -4513,7 +4535,7 @@ async fn flush_single_active_block(
     }
 
     // Acquire lock to avoid race conditions with active writes
-    let (block_data, block_map_id, old_block_key) = {
+    let (block_data, block_map_id, old_block_key, mtime_before) = {
         let lock = active_inode_locks
             .entry(ino)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
@@ -4530,6 +4552,11 @@ async fn flush_single_active_block(
             Err(_) => return Ok(()),
         };
 
+        let mtime_before = tokio::fs::metadata(&block_path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+
         let file_path = format!("inode_{}", ino);
         let meta_key = format!("metadata:{}", file_path);
         let mut con = dlm.get_connection().await?;
@@ -4543,10 +4570,7 @@ async fn flush_single_active_block(
         let block_map_key = format!("block_map:{}", block_map_id);
         let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
 
-        // Delete the block file under the first lock so subsequent writes start fresh
-        let _ = tokio::fs::remove_file(&block_path).await;
-
-        (block_data, block_map_id, old_block_key)
+        (block_data, block_map_id, old_block_key, mtime_before)
     };
 
     let file_uuid = uuid::Uuid::new_v4().to_string();
@@ -4619,6 +4643,17 @@ async fn flush_single_active_block(
         } else {
             let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
             let _ = router.backend.delete_object(&be_id, &real_key).await;
+        }
+    }
+
+    // Now, verify if mtime is unchanged before deleting the file!
+    if let Some(m_before) = mtime_before {
+        if let Ok(meta) = tokio::fs::metadata(&block_path).await {
+            if let Ok(m_after) = meta.modified() {
+                if m_after == m_before {
+                    let _ = tokio::fs::remove_file(&block_path).await;
+                }
+            }
         }
     }
 

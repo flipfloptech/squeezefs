@@ -1190,6 +1190,7 @@ impl DataRouter {
                                     }
                                 };
 
+                                let _ = cache_ref.cache_read_block(b_key, &downloaded);
                                 read_lru.put(b_key, Arc::new(downloaded.clone()));
 
                                 let start = std::cmp::min(slice_start as usize, downloaded.len());

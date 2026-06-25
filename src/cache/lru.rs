@@ -125,4 +125,8 @@ impl LruCache {
     pub fn run_pending_tasks(&self) {
         self.inner.run_pending_tasks();
     }
+
+    pub fn clear(&self) {
+        self.inner.invalidate_all();
+    }
 }

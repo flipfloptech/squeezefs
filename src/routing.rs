@@ -18,6 +18,7 @@ pub struct CachedMetadata {
     pub block_prefix: Option<String>,
     pub file_id: Option<String>,
     pub cached_at: std::time::Instant,
+    pub data_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -969,6 +970,7 @@ impl DataRouter {
                     block_prefix,
                     file_id,
                     cached_at: std::time::Instant::now(),
+                    data_key: None,
                 };
                 self.metadata_cache.insert(file_path.to_string(), m.clone());
                 m

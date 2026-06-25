@@ -37,3 +37,23 @@ async fn test_connection_resilience() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_single_bound_reconnection() -> Result<()> {
+    if !is_db_available().await {
+        println!("Skipping test: Redis/Garnet not available");
+        return Ok(());
+    }
+
+    let redis_url =
+        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let local_ip = "127.0.0.1".parse::<std::net::IpAddr>().unwrap();
+
+    let client = MetaClient::new_with_local_ips(&redis_url, vec![local_ip]).await?;
+
+    let mut conn = client.get_connection().await?;
+    let res: String = redis::cmd("PING").query_async(&mut conn).await?;
+    assert_eq!(res, "PONG");
+
+    Ok(())
+}

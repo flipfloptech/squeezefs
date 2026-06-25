@@ -495,6 +495,14 @@ impl NvmeStaging {
 
         // 3. Update Garnet metadata mapping for each individual file ID
         if let Ok(mut con) = redis_client.get_connection().await {
+            let refcounts_key = "squeezefs:block_refcounts";
+            let _: std::result::Result<(), redis::RedisError> = redis::cmd("HSET")
+                .arg(refcounts_key)
+                .arg(&packed_key)
+                .arg(mappings.len() as i32)
+                .query_async(&mut con)
+                .await;
+
             for (file_id, offset, size) in mappings.iter() {
                 let mapping_key = format!("mapping:{}", file_id);
                 let _: std::result::Result<(), redis::RedisError> = redis::pipe()

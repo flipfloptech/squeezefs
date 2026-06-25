@@ -379,3 +379,97 @@ async fn test_striped_write_await_s3() {
 
     assert_eq!(read_data, data);
 }
+
+#[tokio::test]
+async fn test_stage_overwrite_leak_routing() {
+    let (router, _temp_dir) = match setup_router().await {
+        Some(r) => r,
+        None => {
+            println!("Skipping test: Redis/Garnet or S3 not available");
+            return;
+        }
+    };
+
+    let file_path = "leak_overwrite_file.bin";
+    let data = vec![5; 128 * 1024]; // 128KB (staged)
+
+    // 1. Write the initial file (staged layout)
+    router
+        .write_file(file_path, 0, &data, 102)
+        .await
+        .expect("Should write initial staged file");
+
+    // Wait for the NVMe staging/merging flusher to upload the block and record mapping
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Retrieve and verify the initial block key and refcount
+    let client = redis::Client::open(get_redis_url()).unwrap();
+    let mut con = client.get_multiplexed_tokio_connection().await.unwrap();
+    let meta_key = format!("metadata:{}", file_path);
+    let file_id: String = con.hget(&meta_key, "file_id").await.unwrap();
+    let mapping_key = format!("mapping:{}", file_id);
+    let block_key: Option<String> = con.hget(&mapping_key, "block").await.unwrap();
+    assert!(block_key.is_some(), "Initial block mapping must exist");
+    let bk = block_key.unwrap();
+
+    let refcounts_key = "squeezefs:block_refcounts";
+    let refcount: Option<i32> = con.hget(refcounts_key, &bk).await.unwrap();
+    assert_eq!(refcount, Some(1), "Initial block refcount should be 1");
+
+    // Increment block refcount to 2 to test that it is NOT deleted when refcount > 0
+    let _: () = con.hset(refcounts_key, &bk, 2).await.unwrap();
+
+    // 2. Overwrite the file with another staged write (128KB)
+    router
+        .write_file(file_path, 0, &data, 103)
+        .await
+        .expect("Should overwrite staged file");
+
+    // Assert that the old block refcount is immediately decremented to 1 and NOT deleted from S3
+    let refcount_after_first: Option<i32> = con.hget(refcounts_key, &bk).await.unwrap();
+    assert_eq!(
+        refcount_after_first,
+        Some(1),
+        "Refcount should be decremented to 1"
+    );
+    let (be_id, real_key) = squeezefs::backend::parse_backend_and_key(&bk);
+    let block_exists = router.backend.get_object(&be_id, &real_key).await.is_ok();
+    assert!(
+        block_exists,
+        "Block object must still exist when refcount is 1"
+    );
+
+    // 3. Sleep to let the second staged write flush
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Retrieve and verify the second block key and refcount
+    let file_id2: String = con.hget(&meta_key, "file_id").await.unwrap();
+    let mapping_key2 = format!("mapping:{}", file_id2);
+    let block_key2: Option<String> = con.hget(&mapping_key2, "block").await.unwrap();
+    assert!(block_key2.is_some(), "Second block mapping must exist");
+    let bk2 = block_key2.unwrap();
+
+    let refcount2: Option<i32> = con.hget(refcounts_key, &bk2).await.unwrap();
+    assert_eq!(refcount2, Some(1), "Second block refcount should be 1");
+
+    // 4. Overwrite the file a third time
+    router
+        .write_file(file_path, 0, &data, 104)
+        .await
+        .expect("Should overwrite file a third time");
+
+    // Assert that the second block refcount is immediately deleted (since it was 1, now 0)
+    // and the block object is deleted from the backend
+    let refcount_after_third: Option<i32> = con.hget(refcounts_key, &bk2).await.unwrap();
+    assert!(
+        refcount_after_third.is_none() || refcount_after_third.unwrap() <= 0,
+        "Second block refcount should be deleted or <= 0"
+    );
+
+    let (be_id2, real_key2) = squeezefs::backend::parse_backend_and_key(&bk2);
+    let block2_exists = router.backend.get_object(&be_id2, &real_key2).await.is_ok();
+    assert!(
+        !block2_exists,
+        "Second block object must be deleted from backend when refcount drops to 0"
+    );
+}

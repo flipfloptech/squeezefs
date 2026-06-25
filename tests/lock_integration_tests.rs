@@ -256,7 +256,7 @@ async fn test_concurrent_writes_and_flush_lock_scope() {
     let fs_arc = std::sync::Arc::new(fs);
     let mut handles = Vec::new();
 
-    for i in 0..5 {
+    for i in 0u64..5 {
         let fs_clone = fs_arc.clone();
         let data = vec![i as u8; 100];
         let req_clone = Request {
@@ -266,7 +266,7 @@ async fn test_concurrent_writes_and_flush_lock_scope() {
             pid: 1234 + i as u32,
         };
         handles.push(tokio::spawn(async move {
-            fs_clone.write(req_clone, ino, 0, (i * 100) as u64, &data, 0, 0).await
+            fs_clone.write(req_clone, ino, 0, i * 100, &data, 0, 0).await
         }));
     }
 

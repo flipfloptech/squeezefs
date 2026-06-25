@@ -404,12 +404,14 @@ impl SqueezefsFilesystem {
         Ok(token)
     }
 
-    async fn write_file_staged(
+    async fn write_file_staged<'a>(
         &self,
         ino: u64,
         offset: u64,
         data: &[u8],
         _fencing_token: u64,
+        lock: &'a tokio::sync::RwLock<()>,
+        guard: &mut Option<tokio::sync::RwLockWriteGuard<'a, ()>>,
     ) -> Result<(), SqueezefsError> {
         let block_size = self.router.block_size.load(Ordering::Relaxed);
         let start_block = offset / block_size;
@@ -510,9 +512,20 @@ impl SqueezefsFilesystem {
                                     .put(&bk, std::sync::Arc::new(cached.clone()));
                                 cached
                             } else {
-                                let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
-                                let raw = self.router.backend.get_object(&be_id, &real_key).await?;
-                                let decompressed = self.router.get_crypto().process_read(&raw)?;
+                                // S3 read path: release the lock!
+                                *guard = None;
+
+                                let get_res = async {
+                                    let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+                                    let raw = self.router.backend.get_object(&be_id, &real_key).await?;
+                                    let decompressed = self.router.get_crypto().process_read(&raw)?;
+                                    Ok::<Vec<u8>, SqueezefsError>(decompressed)
+                                }.await;
+
+                                // Re-acquire lock
+                                *guard = Some(lock.write().await);
+
+                                let decompressed = get_res?;
                                 self.router
                                     .cache
                                     .read_lru
@@ -522,14 +535,16 @@ impl SqueezefsFilesystem {
                     }
                 }
 
-                tokio::fs::write(&block_file_path, &existing_block_data)
-                    .await
-                    .map_err(|e| {
-                        SqueezefsError::Io(std::io::Error::other(format!(
-                            "Failed to initialize staging block file: {:?}",
-                            e
-                        )))
-                    })?;
+                if !block_file_path.exists() {
+                    tokio::fs::write(&block_file_path, &existing_block_data)
+                        .await
+                        .map_err(|e| {
+                            SqueezefsError::Io(std::io::Error::other(format!(
+                                "Failed to initialize staging block file: {:?}",
+                                e
+                            )))
+                        })?;
+                }
             }
 
             // 2. Perform seek and write range directly on disk
@@ -1588,7 +1603,7 @@ impl Filesystem for SqueezefsFilesystem {
         // Acquire local inode lock for the ENTIRE write operation to serialize
         // concurrent/subsequent writes to the same file.
         let lock = self.get_inode_lock(ino);
-        let _guard = lock.write().await;
+        let mut guard = Some(lock.write().await);
 
         // 1. Get or acquire lease (fencing token)
         let fencing_token = self
@@ -1619,7 +1634,7 @@ impl Filesystem for SqueezefsFilesystem {
         let file_type: Option<String> = con.hget(&meta_key, "type").await.map_err(map_err)?;
 
         if file_type.as_deref() == Some("striped") {
-            self.write_file_staged(ino, offset, data, fencing_token)
+            self.write_file_staged(ino, offset, data, fencing_token, &lock, &mut guard)
                 .await
                 .map_err(map_squeezefs_err)?;
             let file_path = format!("inode_{}", ino);
@@ -4320,31 +4335,41 @@ async fn flush_single_active_block(
     }
 
     // Acquire lock to avoid race conditions with active writes
-    let lock = active_inode_locks
-        .entry(ino)
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
-        .clone();
-    let _guard = lock.write().await;
+    let (block_data, block_map_id, old_block_key) = {
+        let lock = active_inode_locks
+            .entry(ino)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
+            .clone();
+        let _guard = lock.write().await;
 
-    // Check again under lock
-    if !block_path.exists() {
-        return Ok(());
-    }
+        // Check again under lock
+        if !block_path.exists() {
+            return Ok(());
+        }
 
-    let block_data = match tokio::fs::read(&block_path).await {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
+        let block_data = match tokio::fs::read(&block_path).await {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+
+        let file_path = format!("inode_{}", ino);
+        let meta_key = format!("metadata:{}", file_path);
+        let mut con = dlm.get_connection().await?;
+        let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+        let mut block_map_id = block_map_id_opt.unwrap_or_default();
+        if block_map_id.is_empty() {
+            block_map_id = uuid::Uuid::new_v4().to_string();
+            let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
+        }
+
+        let block_map_key = format!("block_map:{}", block_map_id);
+        let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
+
+        // Delete the block file under the first lock so subsequent writes start fresh
+        let _ = tokio::fs::remove_file(&block_path).await;
+
+        (block_data, block_map_id, old_block_key)
     };
-
-    let file_path = format!("inode_{}", ino);
-    let meta_key = format!("metadata:{}", file_path);
-    let mut con = dlm.get_connection().await?;
-    let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
-    let mut block_map_id = block_map_id_opt.unwrap_or_default();
-    if block_map_id.is_empty() {
-        block_map_id = uuid::Uuid::new_v4().to_string();
-        let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
-    }
 
     let file_uuid = uuid::Uuid::new_v4().to_string();
     let block_write_uuid = uuid::Uuid::new_v4().to_string();
@@ -4359,17 +4384,25 @@ async fn flush_single_active_block(
     let active_be = router.backend.get_backend_for_key(&new_block_key);
     let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
-    // Cache in RAM - dehydrated to NVMe on eviction
-    router
-        .cache
-        .read_lru
-        .put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
+    // Re-acquire lock to verify consistency and finalize update
+    let lock = active_inode_locks
+        .entry(ino)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
+        .clone();
+    let _guard = lock.write().await;
 
+    let mut con = dlm.get_connection().await?;
     let block_map_key = format!("block_map:{}", block_map_id);
+
+    // If block key changed in Redis during S3 upload, delete stale S3 object and exit
+    let current_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
+    if current_block_key != old_block_key {
+        let (be_id, real_key) = crate::backend::parse_backend_and_key(&stored_block_key);
+        let _ = router.backend.delete_object(&be_id, &real_key).await;
+        return Ok(());
+    }
+
     let refcounts_key = "squeezefs:block_refcounts";
-
-    let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
-
     use redis::AsyncCommands;
     let mut pipe = redis::pipe();
     pipe.hset(refcounts_key, &stored_block_key, 1).hset(
@@ -4383,6 +4416,12 @@ async fn flush_single_active_block(
         (block_map_id.clone(), b),
         (Some(stored_block_key.clone()), std::time::Instant::now()),
     );
+
+    // Cache in RAM - dehydrated to NVMe on eviction
+    router
+        .cache
+        .read_lru
+        .put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
 
     if let Some(bk) = old_block_key {
         router.cache.read_lru.remove(&bk);
@@ -4404,8 +4443,6 @@ async fn flush_single_active_block(
             let _ = router.backend.delete_object(&be_id, &real_key).await;
         }
     }
-
-    let _ = tokio::fs::remove_file(&block_path).await;
 
     // If the directory is empty, remove it
     if let Ok(mut entries) = tokio::fs::read_dir(&active_dir).await {

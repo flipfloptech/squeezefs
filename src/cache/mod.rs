@@ -1,6 +1,7 @@
 pub mod gds;
 pub mod lru;
 pub mod nvme;
+pub use nvme::NvmeStaging;
 
 use crate::backend::RustFsClient;
 use crate::error::{Result, SqueezefsError};

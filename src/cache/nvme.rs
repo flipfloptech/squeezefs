@@ -8,6 +8,29 @@ use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
+fn check_disk_free_safeguard(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Ok(c_path) = CString::new(abs_path.as_os_str().as_bytes()) {
+            unsafe {
+                let mut stat: libc::statvfs = std::mem::zeroed();
+                if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 && stat.f_blocks > 0 {
+                    let free_fraction = stat.f_bavail as f64 / stat.f_blocks as f64;
+                    let free_bytes = stat.f_bavail as u64 * stat.f_frsize as u64;
+                    // Trigger safeguard if free space is < 100MB OR (< 1% and < 1GB)
+                    if free_bytes < 100 * 1024 * 1024 || (free_fraction < 0.01 && free_bytes < 1024 * 1024 * 1024) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 fn write_aligned_direct(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
     let align = 4096;
     let padded_size = (data.len() + align - 1) & !(align - 1);
@@ -257,6 +280,14 @@ impl NvmeStaging {
         let align = 4096;
         let padded_size = ((unpadded_len + align - 1) & !(align - 1)) as u64;
 
+        let target_dir = self.get_staged_path(file_id);
+        if !check_disk_free_safeguard(&target_dir) {
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "Local NVMe staging disk free space safeguard triggered (< 1% or < 100MB free)".to_string(),
+            )));
+        }
+
         // Enforce max bytes capacity constraint asynchronously using the exact padded file size
         let mut total_staged_bytes = self
             .current_staged_write_bytes
@@ -286,7 +317,6 @@ impl NvmeStaging {
             )));
         }
 
-        let target_dir = self.get_staged_path(file_id);
         let staged_path = target_dir.join(format!("file_{}.staged", file_id));
 
         let data_clone = data.to_vec();
@@ -656,18 +686,17 @@ impl NvmeStaging {
             .current_read_cache_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        if current + new_data_len > self.max_read_bytes {
+        if current + new_data_len > self.max_read_bytes || !check_disk_free_safeguard(&target_dir) {
             let mut queue = self.read_cache_lru.lock().unwrap();
             let mut freed_bytes = 0u64;
-            let extra_margin = std::cmp::min(100 * 1024 * 1024, self.max_read_bytes / 10);
-            let target_to_free =
-                (current + new_data_len).saturating_sub(self.max_read_bytes) + extra_margin;
 
-            while freed_bytes < target_to_free {
+            while (current + new_data_len).saturating_sub(freed_bytes) > self.max_read_bytes 
+                  || (!queue.is_empty() && !check_disk_free_safeguard(&target_dir)) 
+            {
                 if let Some((old_safe_name, size)) = queue.pop_front() {
                     let idx = get_dir_index(&old_safe_name, self.staging_dirs.len());
-                    let target_dir = self.staging_dirs[idx].join("cache");
-                    let old_block_path = target_dir.join(format!("block_{}.block", old_safe_name));
+                    let t_dir = self.staging_dirs[idx].join("cache");
+                    let old_block_path = t_dir.join(format!("block_{}.block", old_safe_name));
                     if old_block_path.exists() {
                         if std::fs::remove_file(&old_block_path).is_ok() {
                             freed_bytes += size;
@@ -688,9 +717,9 @@ impl NvmeStaging {
             self.current_read_cache_bytes
                 .store(new_current, std::sync::atomic::Ordering::Relaxed);
 
-            if new_current + new_data_len > self.max_read_bytes {
+            if new_current + new_data_len > self.max_read_bytes || !check_disk_free_safeguard(&target_dir) {
                 warn!(
-                    "NVMe Staging: Cannot cache block {} - local storage full.",
+                    "NVMe Staging: Cannot cache block {} - local storage full or safeguard active.",
                     block_key
                 );
                 return Ok(());
@@ -864,5 +893,20 @@ impl NvmeStaging {
 
     pub fn max_read_bytes(&self) -> u64 {
         self.max_read_bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_disk_free_safeguard_normal() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path();
+        // Under normal circumstances, the temp directory should have sufficient free space
+        // and return true. On Windows/non-Unix, it always returns true.
+        assert!(check_disk_free_safeguard(path));
     }
 }

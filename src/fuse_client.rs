@@ -46,11 +46,11 @@ static LUA_CREATE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
             "uid", ARGV[2],
             "gid", ARGV[3],
             "atime_sec", ARGV[5],
-            "atime_nsec", "0",
+            "atime_nsec", ARGV[7],
             "mtime_sec", ARGV[5],
-            "mtime_nsec", "0",
+            "mtime_nsec", ARGV[7],
             "ctime_sec", ARGV[5],
-            "ctime_nsec", "0"
+            "ctime_nsec", ARGV[7]
         )
         redis.call("HSET", meta_key,
             "type", "inline",
@@ -60,9 +60,9 @@ static LUA_CREATE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
         local parent_attr_key = "squeezefs:attr:" .. KEYS[2]
         redis.call("HSET", parent_attr_key,
             "mtime_sec", ARGV[5],
-            "mtime_nsec", "0",
+            "mtime_nsec", ARGV[7],
             "ctime_sec", ARGV[5],
-            "ctime_nsec", "0"
+            "ctime_nsec", ARGV[7]
         )
         return {0, new_ino}
     "#,
@@ -96,11 +96,11 @@ static LUA_MKDIR_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
             "uid", ARGV[2],
             "gid", ARGV[3],
             "atime_sec", ARGV[5],
-            "atime_nsec", "0",
+            "atime_nsec", ARGV[7],
             "mtime_sec", ARGV[5],
-            "mtime_nsec", "0",
+            "mtime_nsec", ARGV[7],
             "ctime_sec", ARGV[5],
-            "ctime_nsec", "0"
+            "ctime_nsec", ARGV[7]
         )
         redis.call("HSET", meta_key,
             "type", "inline",
@@ -115,9 +115,9 @@ static LUA_MKDIR_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
         redis.call("HSET", parent_attr_key,
             "nlink", parent_nlink + 1,
             "mtime_sec", ARGV[5],
-            "mtime_nsec", "0",
+            "mtime_nsec", ARGV[7],
             "ctime_sec", ARGV[5],
-            "ctime_nsec", "0"
+            "ctime_nsec", ARGV[7]
         )
         redis.call("INCRBY", "squeezefs:used_inodes", 1)
         return {0, new_ino}
@@ -148,9 +148,9 @@ static LUA_UNLINK_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
         local parent_attr_key = "squeezefs:attr:" .. KEYS[2]
         redis.call("HSET", parent_attr_key,
             "mtime_sec", ARGV[2],
-            "mtime_nsec", "0",
+            "mtime_nsec", ARGV[3],
             "ctime_sec", ARGV[2],
-            "ctime_nsec", "0"
+            "ctime_nsec", ARGV[3]
         )
         return {0, tonumber(child_ino), nlink, size}
     "#,
@@ -192,9 +192,9 @@ static LUA_RMDIR_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
         redis.call("HSET", parent_attr_key,
             "nlink", parent_nlink,
             "mtime_sec", ARGV[2],
-            "mtime_nsec", "0",
+            "mtime_nsec", ARGV[3],
             "ctime_sec", ARGV[2],
-            "ctime_nsec", "0"
+            "ctime_nsec", ARGV[3]
         )
         return {0, tonumber(child_ino)}
     "#,
@@ -1536,10 +1536,11 @@ impl Filesystem for SqueezefsFilesystem {
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let dir_key = format!("squeezefs:dir:{}", parent);
-        let sec = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
+            .unwrap_or(Duration::ZERO);
+        let sec = now.as_secs() as i64;
+        let nsec = now.subsec_nanos();
 
         let inodes_limit_str: Option<String> = con
             .hget("squeezefs:format", "inodes")
@@ -1552,7 +1553,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Execute LUA_CREATE_SCRIPT
         // KEYS: [dir_key, parent]
-        // ARGV: [name, uid, gid, perm, sec, max_inodes]
+        // ARGV: [name, uid, gid, perm, sec, max_inodes, nsec]
         let res: Vec<u64> = LUA_CREATE_SCRIPT
             .key(&dir_key)
             .key(parent)
@@ -1562,6 +1563,7 @@ impl Filesystem for SqueezefsFilesystem {
             .arg(mode as u16 & 0o7777)
             .arg(sec)
             .arg(max_inodes_val)
+            .arg(nsec)
             .invoke_async(&mut con)
             .await
             .map_err(map_err)?;
@@ -1889,10 +1891,11 @@ impl Filesystem for SqueezefsFilesystem {
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let dir_key = format!("squeezefs:dir:{}", parent);
-        let sec = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
+            .unwrap_or(Duration::ZERO);
+        let sec = now.as_secs() as i64;
+        let nsec = now.subsec_nanos();
 
         let inodes_limit_str: Option<String> = con
             .hget("squeezefs:format", "inodes")
@@ -1905,7 +1908,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Execute LUA_MKDIR_SCRIPT
         // KEYS: [dir_key, parent]
-        // ARGV: [name, uid, gid, perm, sec, max_inodes]
+        // ARGV: [name, uid, gid, perm, sec, max_inodes, nsec]
         let res: Vec<u64> = LUA_MKDIR_SCRIPT
             .key(&dir_key)
             .key(parent)
@@ -1915,6 +1918,7 @@ impl Filesystem for SqueezefsFilesystem {
             .arg(mode as u16 & 0o7777)
             .arg(sec)
             .arg(max_inodes_val)
+            .arg(nsec)
             .invoke_async(&mut con)
             .await
             .map_err(map_err)?;
@@ -1953,19 +1957,21 @@ impl Filesystem for SqueezefsFilesystem {
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let dir_key = format!("squeezefs:dir:{}", parent);
-        let sec = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
+            .unwrap_or(Duration::ZERO);
+        let sec = now.as_secs() as i64;
+        let nsec = now.subsec_nanos();
 
         // Execute LUA_RMDIR_SCRIPT
         // KEYS: [dir_key, parent]
-        // ARGV: [name, sec]
+        // ARGV: [name, sec, nsec]
         let res: Vec<u64> = LUA_RMDIR_SCRIPT
             .key(&dir_key)
             .key(parent)
             .arg(&*name_str)
             .arg(sec)
+            .arg(nsec)
             .invoke_async(&mut con)
             .await
             .map_err(map_err)?;
@@ -2311,19 +2317,21 @@ impl Filesystem for SqueezefsFilesystem {
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
         let dir_key = format!("squeezefs:dir:{}", parent);
-        let sec = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
+            .unwrap_or(Duration::ZERO);
+        let sec = now.as_secs() as i64;
+        let nsec = now.subsec_nanos();
 
         // Execute LUA_UNLINK_SCRIPT
         // KEYS: [dir_key, parent]
-        // ARGV: [name, sec]
+        // ARGV: [name, sec, nsec]
         let res: Vec<i64> = LUA_UNLINK_SCRIPT
             .key(&dir_key)
             .key(parent)
             .arg(&*name_str)
             .arg(sec)
+            .arg(nsec)
             .invoke_async(&mut con)
             .await
             .map_err(map_err)?;

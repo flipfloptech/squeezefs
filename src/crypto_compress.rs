@@ -10,7 +10,7 @@ pub struct CryptoCompressState {
     pub compression: String,
     pub encrypt_algo: String,
     pub private_key: Option<Arc<RsaPrivateKey>>,
-    pub unwrap_cache: Arc<dashmap::DashMap<Vec<u8>, Vec<u8>>>,
+    pub unwrap_cache: Arc<dashmap::DashMap<Vec<u8>, Vec<u8>, ahash::RandomState>>,
     pub key_unwrap_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -33,7 +33,7 @@ impl CryptoCompressState {
             compression,
             encrypt_algo,
             private_key,
-            unwrap_cache: Arc::new(dashmap::DashMap::new()),
+            unwrap_cache: Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
             key_unwrap_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }

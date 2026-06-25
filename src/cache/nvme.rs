@@ -98,10 +98,10 @@ pub struct PendingStagedWrite {
 }
 
 fn get_dir_index(file_id: &str, num_dirs: usize) -> usize {
-    use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use twox_hash::XxHash64;
 
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = XxHash64::default();
     file_id.hash(&mut hasher);
     (hasher.finish() as usize) % num_dirs
 }

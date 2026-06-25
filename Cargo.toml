@@ -40,8 +40,8 @@ rsa = { version = "0.9", features = ["pem"] }
 ring = "0.17"
 rand = "0.8"
 sha2 = "0.10"
-
-
+ahash = "0.8"
+twox-hash = "1.6"
 
 [features]
 default = []

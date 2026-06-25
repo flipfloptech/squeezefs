@@ -40,11 +40,11 @@ static RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
     )
 });
 
-static SINGLE_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection>> =
-    Lazy::new(dashmap::DashMap::new);
+static SINGLE_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>> =
+    Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
-pub static SENTINEL_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection>> =
-    Lazy::new(dashmap::DashMap::new);
+pub static SENTINEL_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>> =
+    Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
 #[derive(Clone)]
 pub struct BoundConnection {

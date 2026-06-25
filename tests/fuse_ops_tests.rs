@@ -509,7 +509,12 @@ async fn test_fuse_forget_eviction() {
     fs.forget(req, ino, 1).await;
 
     // Verify both caches are evicted/cleared for this inode
-    assert!(!fs.attr_cache.contains_key(&ino), "Forget should evict from attr_cache");
-    assert!(!fs.active_inode_locks.contains_key(&ino), "Forget should evict from active_inode_locks");
+    assert!(
+        !fs.attr_cache.contains_key(&ino),
+        "Forget should evict from attr_cache"
+    );
+    assert!(
+        !fs.active_inode_locks.contains_key(&ino),
+        "Forget should evict from active_inode_locks"
+    );
 }
-

@@ -3296,8 +3296,8 @@ impl Filesystem for SqueezefsFilesystem {
     async fn forget(&self, _req: Request, ino: u64, count: u64) {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Forget: ino = {}, count = {}", ino, count);
-        // We don't maintain local inode lookup references that need strict forgetting.
-        // The attr_cache naturally evicts old entries.
+        self.attr_cache.remove(&ino);
+        self.active_inode_locks.remove(&ino);
     }
 
     async fn getlk(

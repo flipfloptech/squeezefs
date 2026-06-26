@@ -606,7 +606,7 @@ impl MetaClient {
                         "Sharded client has no shards".to_string(),
                     ));
                 }
-                shards[0].get_connection().await
+                Box::pin(shards[0].get_connection()).await
             }
         }
     }

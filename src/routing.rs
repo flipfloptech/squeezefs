@@ -1866,7 +1866,7 @@ impl DataRouter {
                     }
                     let _: () = pipe.query_async(&mut con).await?;
 
-                    src_con.hset(&src_meta_key, "block_map_id", &new_id).await?;
+                    let _: () = src_con.hset(&src_meta_key, "block_map_id", &new_id).await?;
                     new_id
                 }
             };

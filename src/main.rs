@@ -1216,10 +1216,108 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
+            // 2. Compression algorithm check
+            let comp = compression.to_lowercase();
+            if comp != "none" && comp != "lz4" && comp != "zstd" && !comp.is_empty() {
+                return Err(format!(
+                    "Unsupported compression algorithm: '{}'. Supported options are: none, lz4, zstd.",
+                    compression
+                ).into());
+            }
+
+            // 3. Encryption algorithm check
+            let enc = encrypt_algo.to_lowercase();
+            if enc != "none" && enc != "aes256gcm-rsa" && enc != "chacha20-rsa" && !enc.is_empty() {
+                return Err(format!(
+                    "Unsupported encryption algorithm: '{}'. Supported options are: none, aes256gcm-rsa, chacha20-rsa.",
+                    encrypt_algo
+                ).into());
+            }
+
+            // 4. S3 parameters consistency
+            let has_s3_endpoint = s3_endpoint.is_some()
+                || std::env::var("RUSTFS_ENDPOINT").is_ok()
+                || std::env::var("AWS_ENDPOINT_URL").is_ok();
+
+            let has_other_s3_params = s3_access_key.is_some()
+                || s3_secret_key.is_some()
+                || s3_bucket.is_some()
+                || std::env::var("RUSTFS_ACCESS_KEY").is_ok()
+                || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+                || std::env::var("RUSTFS_SECRET_KEY").is_ok()
+                || std::env::var("AWS_SECRET_ACCESS_KEY").is_ok()
+                || std::env::var("RUSTFS_BUCKET").is_ok()
+                || std::env::var("AWS_BUCKET").is_ok();
+
+            if has_other_s3_params && !has_s3_endpoint {
+                return Err("S3 bucket or credential parameters were provided, but no S3 endpoint was specified. \
+                             If you want to use S3 storage, you must provide --s3-endpoint or set the RUSTFS_ENDPOINT environment variable. \
+                             If you intended to use the in-memory mock store, please omit all S3 parameters.".into());
+            }
+
+            // 5. Human readable size limits validation
+            if let Some(ref sz) = mem_cache_size
+                .as_ref()
+                .filter(|s| !s.is_empty() && *s != "none")
+            {
+                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
+                    .map_err(|e| format!("Invalid mem_cache_size '{}': {:?}", sz, e))?;
+            }
+            if let Some(ref sz) = disk_cache_size
+                .as_ref()
+                .filter(|s| !s.is_empty() && *s != "none")
+            {
+                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
+                    .map_err(|e| format!("Invalid disk_cache_size '{}': {:?}", sz, e))?;
+            }
+            if let Some(ref sz) = read_cache_size
+                .as_ref()
+                .filter(|s| !s.is_empty() && *s != "none")
+            {
+                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
+                    .map_err(|e| format!("Invalid read_cache_size '{}': {:?}", sz, e))?;
+            }
+            if let Some(ref sz) = write_cache_size
+                .as_ref()
+                .filter(|s| !s.is_empty() && *s != "none")
+            {
+                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
+                    .map_err(|e| format!("Invalid write_cache_size '{}': {:?}", sz, e))?;
+            }
+            if let Some(ref sz) = read_mem_cache_size
+                .as_ref()
+                .filter(|s| !s.is_empty() && *s != "none")
+            {
+                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
+                    .map_err(|e| format!("Invalid read_mem_cache_size '{}': {:?}", sz, e))?;
+            }
+            if let Some(ref sz) = write_mem_cache_size
+                .as_ref()
+                .filter(|s| !s.is_empty() && *s != "none")
+            {
+                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
+                    .map_err(|e| format!("Invalid write_mem_cache_size '{}': {:?}", sz, e))?;
+            }
+
+            // 6. Dismount wait validation
+            if let Some(ref wait) = dismount_wait.as_ref().filter(|s| !s.is_empty()) {
+                wait.parse::<u64>()
+                    .map_err(|e| format!("Invalid dismount_wait '{}': {:?}", wait, e))?;
+            }
+
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let parsed_capacity = parse_human_readable_size(&capacity)?;
 
             squeezefs::cache::parse_duration(&upload_delay)?;
+
+            if !has_s3_endpoint {
+                println!(
+                    "{} {}",
+                    "WARNING:".yellow().bold(),
+                    "No S3 endpoint provided. SqueezeFS will fall back to an IN-MEMORY mock store. ALL DATA WILL BE LOST when the mount daemon terminates."
+                        .yellow()
+                );
+            }
 
             squeezefs::fuse_client::format_volume_ext(
                 redis_url,

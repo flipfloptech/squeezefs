@@ -257,6 +257,25 @@ fn map_squeezefs_err(e: SqueezefsError) -> Errno {
     Errno::from(e.to_errno())
 }
 
+pub enum PosixLock {
+    Local,
+    Global(Box<crate::dlm::LockLease>),
+    Remote { client_id: String },
+}
+
+impl std::fmt::Debug for PosixLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PosixLock::Local => write!(f, "Local"),
+            PosixLock::Global(_) => write!(f, "Global"),
+            PosixLock::Remote { client_id } => f
+                .debug_struct("Remote")
+                .field("client_id", client_id)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WritebackRequest {
     pub ino: u64,
@@ -271,7 +290,9 @@ pub struct SqueezefsFilesystem {
     gid: u32,
     active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease, ahash::RandomState>>,
     active_posix_locks:
-        dashmap::DashMap<(Inode, u64, u64, u64), crate::dlm::LockLease, ahash::RandomState>,
+        std::sync::Arc<dashmap::DashMap<(Inode, u64, u64, u64), PosixLock, ahash::RandomState>>,
+    active_delegations:
+        std::sync::Arc<dashmap::DashMap<Inode, crate::dlm::DelegationLease, ahash::RandomState>>,
     pub active_inode_locks: std::sync::Arc<
         dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>, ahash::RandomState>,
     >,
@@ -298,7 +319,12 @@ impl SqueezefsFilesystem {
             active_leases: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
-            active_posix_locks: dashmap::DashMap::with_hasher(ahash::RandomState::new()),
+            active_posix_locks: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            active_delegations: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
             active_inode_locks: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
@@ -308,6 +334,42 @@ impl SqueezefsFilesystem {
             writeback_tx,
             writeback_rx: std::sync::Mutex::new(Some(writeback_rx)),
         }
+    }
+
+    pub fn dlm(&self) -> &DlmClient {
+        &self.dlm
+    }
+
+    pub fn active_posix_locks_count(&self) -> usize {
+        self.active_posix_locks.len()
+    }
+
+    pub fn has_local_posix_lock(&self, inode: Inode, owner: u64, start: u64, end: u64) -> bool {
+        if let Some(lock) = self.active_posix_locks.get(&(inode, owner, start, end)) {
+            matches!(*lock, PosixLock::Local)
+        } else {
+            false
+        }
+    }
+
+    pub fn has_global_posix_lock(&self, inode: Inode, owner: u64, start: u64, end: u64) -> bool {
+        if let Some(lock) = self.active_posix_locks.get(&(inode, owner, start, end)) {
+            matches!(*lock, PosixLock::Global(_))
+        } else {
+            false
+        }
+    }
+
+    pub fn has_remote_posix_lock(&self, inode: Inode, owner: u64, start: u64, end: u64) -> bool {
+        if let Some(lock) = self.active_posix_locks.get(&(inode, owner, start, end)) {
+            matches!(*lock, PosixLock::Remote { .. })
+        } else {
+            false
+        }
+    }
+
+    pub fn has_delegation(&self, inode: Inode) -> bool {
+        self.active_delegations.contains_key(&inode)
     }
 
     async fn generate_config_json(&self) -> String {
@@ -606,6 +668,59 @@ impl SqueezefsFilesystem {
         let token = lease.fencing_token();
         self.active_leases.insert(ino, lease);
         Ok(token)
+    }
+
+    async fn ensure_delegation_held(&self, inode: Inode) -> Result<(), SqueezefsError> {
+        if self.active_delegations.contains_key(&inode) {
+            return Ok(());
+        }
+
+        let mut attempts = 0;
+        let max_attempts = 40; // 2 seconds total timeout (40 * 50ms)
+
+        loop {
+            match self
+                .dlm
+                .acquire_delegation(inode, Duration::from_secs(5))
+                .await?
+            {
+                crate::dlm::DelegationResult::Acquired(lease) => {
+                    info!(
+                        "ensure_delegation_held: Acquired delegation on inode {}",
+                        inode
+                    );
+                    if let Err(e) =
+                        load_locks_from_redis(inode, &self.dlm, &self.active_posix_locks).await
+                    {
+                        error!(
+                            "ensure_delegation_held: Failed to load locks from Redis: {:?}",
+                            e
+                        );
+                        let _ = lease.release().await;
+                        return Err(e);
+                    }
+                    self.active_delegations.insert(inode, lease);
+                    return Ok(());
+                }
+                crate::dlm::DelegationResult::HeldBy(holder) => {
+                    info!("ensure_delegation_held: Inode {} delegation held by {}. Publishing recall...", inode, holder);
+                    if let Err(e) = self.dlm.publish_recall(&holder, inode).await {
+                        warn!(
+                            "ensure_delegation_held: Failed to publish recall to {}: {:?}",
+                            holder, e
+                        );
+                    }
+                }
+            }
+
+            attempts += 1;
+            if attempts >= max_attempts {
+                return Err(SqueezefsError::LockFailed {
+                    reason: format!("Timed out waiting to acquire delegation on inode {}", inode),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     fn block_write_needs_existing_data(
@@ -1038,32 +1153,6 @@ impl SqueezefsFilesystem {
             .await?;
         Ok(())
     }
-
-    async fn scan_lock_keys(
-        &self,
-        con: &mut crate::dlm::MetaConnection,
-        pattern: &str,
-    ) -> Result<Vec<String>, SqueezefsError> {
-        let mut cursor: u64 = 0;
-        let mut all_keys = Vec::new();
-        loop {
-            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg(pattern)
-                .arg("COUNT")
-                .arg(100)
-                .query_async(con)
-                .await
-                .map_err(SqueezefsError::from)?;
-            all_keys.extend(keys);
-            cursor = next_cursor;
-            if cursor == 0 {
-                break;
-            }
-        }
-        Ok(all_keys)
-    }
 }
 
 // Implement fuse3 Raw Filesystem interface
@@ -1218,6 +1307,60 @@ impl Filesystem for SqueezefsFilesystem {
                 run_constant_writeback_worker(writeback_rx, router, dlm, active_inode_locks).await;
             });
         }
+
+        // Start background recall listener task for POSIX lock delegations
+        let dlm_clone = self.dlm.clone();
+        let delegations_clone = self.active_delegations.clone();
+        let posix_locks_clone = self.active_posix_locks.clone();
+
+        tokio::spawn(async move {
+            info!("FUSE init: Starting background POSIX lock recall listener...");
+            match dlm_clone.get_pubsub_connection().await {
+                Ok(mut pubsub) => {
+                    let channel = format!("squeezefs:client:{}:recalls", dlm_clone.client_id());
+                    if let Err(e) = pubsub.subscribe(&channel).await {
+                        error!(
+                            "FUSE recall listener: Failed to subscribe to channel {}: {:?}",
+                            channel, e
+                        );
+                        return;
+                    }
+                    info!("FUSE recall listener: Subscribed to channel {}", channel);
+
+                    use futures::StreamExt;
+                    let mut message_stream = pubsub.on_message();
+                    while let Some(msg) = message_stream.next().await {
+                        let payload_res: Result<String, _> = msg.get_payload();
+                        if let Ok(payload) = payload_res {
+                            if let Ok(inode) = payload.parse::<u64>() {
+                                info!("FUSE recall listener: Received recall for inode {}", inode);
+                                let dlm_inner = dlm_clone.clone();
+                                let delegations_inner = delegations_clone.clone();
+                                let posix_locks_inner = posix_locks_clone.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_recall(
+                                        inode,
+                                        &dlm_inner,
+                                        &delegations_inner,
+                                        &posix_locks_inner,
+                                    )
+                                    .await
+                                    {
+                                        error!("FUSE recall listener: Failed to handle recall for inode {}: {:?}", inode, e);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "FUSE recall listener: Failed to get pub/sub connection: {:?}",
+                        e
+                    );
+                }
+            }
+        });
 
         Ok(ReplyInit {
             max_write: std::num::NonZeroU32::new(1048576).unwrap(), // 1MB absolute maximum write buffer size
@@ -3518,7 +3661,7 @@ impl Filesystem for SqueezefsFilesystem {
             }
         }
         for key in posix_to_remove {
-            if let Some((_, lease)) = self.active_posix_locks.remove(&key) {
+            if let Some((_, PosixLock::Global(lease))) = self.active_posix_locks.remove(&key) {
                 let _ = lease.release().await;
             }
         }
@@ -3644,56 +3787,44 @@ impl Filesystem for SqueezefsFilesystem {
             inode, _lock_owner, _start, _end, _type
         );
 
-        // 1. Check local conflicts
-        for entry in self.active_posix_locks.iter() {
-            let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
-            if lock_ino == inode
-                && lock_owner != _lock_owner
-                && std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
-            {
-                debug!(
-                    "FUSE getlk: conflict found locally with owner {} on range {}-{}",
-                    lock_owner, lock_start, lock_end
-                );
-                return Ok(ReplyLock {
-                    start: lock_start,
-                    end: lock_end,
-                    r#type: libc::F_WRLCK as u32,
-                    pid: lock_owner as u32,
-                });
-            }
+        if let Err(e) = self.ensure_delegation_held(inode).await {
+            error!(
+                "FUSE getlk: Failed to ensure delegation held for inode {}: {:?}",
+                inode, e
+            );
+            return Err(map_squeezefs_err(e));
         }
 
-        // 2. Check global conflicts in Redis
-        if let Ok(mut con) = self.dlm.get_connection().await {
-            let pattern = format!("lock:inode_{}:range:*", inode);
-            if let Ok(keys) = self.scan_lock_keys(&mut con, &pattern).await {
-                for key in keys {
-                    if let Some(suffix) = key.strip_prefix(&format!("lock:inode_{}:range:", inode))
-                    {
-                        let parts: Vec<&str> = suffix.split('-').collect();
-                        if parts.len() == 2 {
-                            if let (Ok(r_start), Ok(r_end)) =
-                                (parts[0].parse::<u64>(), parts[1].parse::<u64>())
-                            {
-                                if std::cmp::max(r_start, _start) <= std::cmp::min(r_end, _end) {
-                                    if let Ok(Some(client_id)) =
-                                        con.get::<_, Option<String>>(&key).await
-                                    {
-                                        if client_id != self.dlm.client_id() {
-                                            debug!("FUSE getlk: conflict found globally (client_id: {}) on range {}-{}", client_id, r_start, r_end);
-                                            return Ok(ReplyLock {
-                                                start: r_start,
-                                                end: r_end,
-                                                r#type: libc::F_WRLCK as u32,
-                                                pid: 0,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
+        // Check local conflicts
+        for entry in self.active_posix_locks.iter() {
+            let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
+            if lock_ino == inode {
+                let is_conflict = match entry.value() {
+                    PosixLock::Local | PosixLock::Global(_) => {
+                        lock_owner != _lock_owner
+                            && std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
                     }
+                    PosixLock::Remote { .. } => {
+                        std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
+                    }
+                };
+
+                if is_conflict {
+                    debug!(
+                        "FUSE getlk: conflict found locally with owner {} on range {}-{}",
+                        lock_owner, lock_start, lock_end
+                    );
+                    let conflict_pid = if lock_owner == u64::MAX {
+                        0
+                    } else {
+                        lock_owner as u32
+                    };
+                    return Ok(ReplyLock {
+                        start: lock_start,
+                        end: lock_end,
+                        r#type: libc::F_WRLCK as u32,
+                        pid: conflict_pid,
+                    });
                 }
             }
         }
@@ -3726,6 +3857,14 @@ impl Filesystem for SqueezefsFilesystem {
             inode, _lock_owner, _start, _end, _type, _block
         );
 
+        if let Err(e) = self.ensure_delegation_held(inode).await {
+            error!(
+                "FUSE setlk: Failed to ensure delegation held for inode {}: {:?}",
+                inode, e
+            );
+            return Err(map_squeezefs_err(e));
+        }
+
         if _type == libc::F_UNLCK as u32 {
             let mut to_remove = Vec::new();
             for entry in self.active_posix_locks.iter() {
@@ -3738,7 +3877,7 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             }
             for key in to_remove {
-                if let Some((_, lease)) = self.active_posix_locks.remove(&key) {
+                if let Some((_, PosixLock::Global(lease))) = self.active_posix_locks.remove(&key) {
                     if let Err(e) = lease.release().await {
                         error!("Failed to explicitly release lock lease: {:?}", e);
                     }
@@ -3748,90 +3887,47 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // If we already hold a lock on this exact range, release it first
-        if let Some((_, old_lease)) =
+        if let Some((_, PosixLock::Global(old_lease))) =
             self.active_posix_locks
                 .remove(&(inode, _lock_owner, _start, _end))
         {
             let _ = old_lease.release().await;
         }
 
-        let file_path = format!("inode_{}", inode);
         let mut attempts = 0;
         let max_attempts = if _block { 20 } else { 1 };
 
         loop {
-            // 1. Check local conflicts (different owners)
             let mut conflict = false;
             for entry in self.active_posix_locks.iter() {
                 let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
-                if lock_ino == inode
-                    && lock_owner != _lock_owner
-                    && std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
-                {
-                    conflict = true;
-                    break;
-                }
-            }
-
-            if !conflict {
-                // 2. Check global conflicts in Redis
-                if let Ok(mut con) = self.dlm.get_connection().await {
-                    let pattern = format!("lock:inode_{}:range:*", inode);
-                    if let Ok(keys) = self.scan_lock_keys(&mut con, &pattern).await {
-                        for key in keys {
-                            if let Some(suffix) =
-                                key.strip_prefix(&format!("lock:inode_{}:range:", inode))
-                            {
-                                let parts: Vec<&str> = suffix.split('-').collect();
-                                if parts.len() == 2 {
-                                    if let (Ok(r_start), Ok(r_end)) =
-                                        (parts[0].parse::<u64>(), parts[1].parse::<u64>())
-                                    {
-                                        if std::cmp::max(r_start, _start)
-                                            <= std::cmp::min(r_end, _end)
-                                        {
-                                            if let Ok(Some(client_id)) =
-                                                con.get::<_, Option<String>>(&key).await
-                                            {
-                                                if client_id != self.dlm.client_id() {
-                                                    conflict = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                if lock_ino == inode {
+                    let is_conflict = match entry.value() {
+                        PosixLock::Local | PosixLock::Global(_) => {
+                            lock_owner != _lock_owner
+                                && std::cmp::max(lock_start, _start)
+                                    <= std::cmp::min(lock_end, _end)
                         }
-                    } else {
+                        PosixLock::Remote { .. } => {
+                            std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
+                        }
+                    };
+
+                    if is_conflict {
                         conflict = true;
+                        break;
                     }
-                } else {
-                    conflict = true;
                 }
             }
 
             if !conflict {
-                // Try to acquire the lock via DLM
-                match self
-                    .dlm
-                    .acquire_lock(&file_path, Some((_start, _end)), Duration::from_secs(5))
-                    .await
-                {
-                    Ok(lease) => {
-                        debug!(
-                            "FUSE setlk: successfully acquired lock range {}-{} for owner {}",
-                            _start, _end, _lock_owner
-                        );
-                        self.active_posix_locks
-                            .insert((inode, _lock_owner, _start, _end), lease);
-                        return Ok(());
-                    }
-                    Err(SqueezefsError::LockFailed { .. }) => {}
-                    Err(e) => {
-                        return Err(map_squeezefs_err(e));
-                    }
-                }
+                debug!(
+                    "FUSE setlk: successfully acquired lock range {}-{} for owner {} locally",
+                    _start, _end, _lock_owner
+                );
+                self.active_posix_locks
+                    .insert((inode, _lock_owner, _start, _end), PosixLock::Local);
+                return Ok(());
             }
 
             attempts += 1;
@@ -4918,6 +5014,94 @@ async fn flush_single_active_block(
         }
     } else {
         router.cache.nvme.remove_active_block(&cache_key);
+    }
+
+    Ok(())
+}
+
+async fn handle_recall(
+    inode: Inode,
+    dlm: &DlmClient,
+    delegations: &dashmap::DashMap<Inode, crate::dlm::DelegationLease, ahash::RandomState>,
+    posix_locks: &dashmap::DashMap<(Inode, u64, u64, u64), PosixLock, ahash::RandomState>,
+) -> Result<(), SqueezefsError> {
+    info!("handle_recall: Recalling delegation for inode {}", inode);
+
+    if let Some((_, lease)) = delegations.remove(&inode) {
+        let mut to_promote = Vec::new();
+        for entry in posix_locks.iter() {
+            let &(lock_ino, owner, start, end) = entry.key();
+            if lock_ino == inode {
+                if let PosixLock::Local = entry.value() {
+                    to_promote.push((lock_ino, owner, start, end));
+                }
+            }
+        }
+
+        for key in to_promote {
+            info!("handle_recall: Flushing local lock {:?} to Redis", key);
+            let file_path = format!("inode_{}", key.0);
+            let lease = dlm
+                .acquire_lock(&file_path, Some((key.2, key.3)), Duration::from_secs(5))
+                .await?;
+            posix_locks.insert(key, PosixLock::Global(Box::new(lease)));
+        }
+
+        lease.release().await?;
+        info!(
+            "handle_recall: Delegation for inode {} successfully released",
+            inode
+        );
+    } else {
+        warn!(
+            "handle_recall: Received recall for inode {}, but delegation was not held locally",
+            inode
+        );
+    }
+
+    Ok(())
+}
+
+async fn load_locks_from_redis(
+    inode: Inode,
+    dlm: &DlmClient,
+    posix_locks: &dashmap::DashMap<(Inode, u64, u64, u64), PosixLock, ahash::RandomState>,
+) -> Result<(), SqueezefsError> {
+    use redis::AsyncCommands;
+    let mut con = dlm.get_connection().await?;
+    let pattern = format!("lock:inode_{}:range:*", inode);
+
+    let mut keys = Vec::new();
+    {
+        let mut iter: redis::AsyncIter<String> = con
+            .scan_match(&pattern)
+            .await
+            .map_err(|e| SqueezefsError::from(e))?;
+        while let Some(key) = iter.next_item().await {
+            keys.push(key);
+        }
+    }
+
+    for key in keys {
+        if let Some(suffix) = key.strip_prefix(&format!("lock:inode_{}:range:", inode)) {
+            let parts: Vec<&str> = suffix.split('-').collect();
+            if parts.len() == 2 {
+                if let (Ok(start), Ok(end)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                    let holder: Option<String> =
+                        con.get(&key).await.map_err(|e| SqueezefsError::from(e))?;
+                    if let Some(holder_id) = holder {
+                        if holder_id != dlm.client_id() {
+                            posix_locks.insert(
+                                (inode, u64::MAX, start, end),
+                                PosixLock::Remote {
+                                    client_id: holder_id,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

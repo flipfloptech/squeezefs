@@ -5110,8 +5110,6 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             "MemCacheSize": mem_cache_size,
             "DiskCacheSize": disk_cache_size,
             "DiskCachePaths": disk_cache_paths,
-            "S3Endpoint": s3_endpoint,
-            "S3Bucket": s3_bucket,
             "StorageBackends": storage_backends,
             "ActiveWriteBackend": active_write_backend,
         }

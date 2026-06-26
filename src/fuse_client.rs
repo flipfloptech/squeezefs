@@ -3843,26 +3843,33 @@ pub async fn start_mount<P: AsRef<Path>>(
         let mut ready = false;
         while start.elapsed() < std::time::Duration::from_secs(10) {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            match std::fs::metadata(&mount_path_clone) {
-                Ok(metadata) => {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        if metadata.ino() == 1 {
+            let path = mount_path_clone.clone();
+            let metadata_res = tokio::task::spawn_blocking(move || {
+                std::fs::metadata(path)
+            }).await;
+
+            if let Ok(res) = metadata_res {
+                match res {
+                    Ok(metadata) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            if metadata.ino() == 1 {
+                                ready = true;
+                                break;
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
                             ready = true;
                             break;
                         }
                     }
-                    #[cfg(not(unix))]
-                    {
-                        ready = true;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        ready = true;
-                        break;
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            ready = true;
+                            break;
+                        }
                     }
                 }
             }

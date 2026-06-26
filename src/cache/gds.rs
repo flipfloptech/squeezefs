@@ -123,7 +123,7 @@ pub struct GdsCache {
     staging_dirs: Vec<PathBuf>,
     #[cfg(all(feature = "gds", unix))]
     cufile_lib: Option<Arc<LibCuFile>>,
-    pub force_available: bool,
+    pub force_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GdsCache {
@@ -164,7 +164,7 @@ impl GdsCache {
                 gpu_detected,
                 staging_dirs,
                 cufile_lib,
-                force_available: false,
+                force_available: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -178,14 +178,17 @@ impl GdsCache {
             Self {
                 gpu_detected,
                 staging_dirs,
-                force_available: false,
+                force_available: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
     }
 
     /// Check if GPU Direct Storage is available.
     pub fn is_available(&self) -> bool {
-        if self.force_available {
+        if self
+            .force_available
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return true;
         }
 
@@ -205,14 +208,14 @@ impl GdsCache {
     /// - `vram_address`: The physical address pointer in VRAM.
     /// - `offset`: Offset within the object.
     /// - `size`: Number of bytes to transfer.
-    /// - `backend`: S3 client to download blocks if missing.
+    /// - `router`: DataRouter to load/fetch blocks if missing.
     pub async fn read_direct(
         &self,
         object_key: &str,
         vram_address: u64,
         offset: u64,
         size: usize,
-        _backend: &crate::backend::RustFsClient,
+        router: &crate::routing::DataRouter,
     ) -> Result<()> {
         if !self.is_available() {
             return Err(SqueezefsError::GdsError(
@@ -229,13 +232,13 @@ impl GdsCache {
                 SqueezefsError::GdsError("No staging directories configured".to_string())
             })?;
 
-            let safe_filename = object_key.replace('/', "_");
+            let safe_filename = object_key.replace(['/', ':'], "_");
             let local_path = staging_dir.join(format!("{}.gds_cache", safe_filename));
 
             if !local_path.exists() {
-                // Download block from S3 to NVMe staging
-                let data = _backend.get_object(object_key).await?;
-                tokio::fs::write(&local_path, data).await?;
+                // Fetch the block using the router (handles decompression, decryption, and caching layers)
+                let data = router.get_cached_or_fetch_block(object_key).await?;
+                tokio::fs::write(&local_path, &data[..]).await?;
             }
 
             // 2. Open file descriptor with O_DIRECT
@@ -297,7 +300,8 @@ impl GdsCache {
 
         #[cfg(not(all(feature = "gds", unix)))]
         {
-            // Bypassed/simulated mode (should not be reached if is_available() is correct, but kept for fallback compatibility)
+            // Fetch block to simulate the read flow and verify caching/backend access
+            let _data = router.get_cached_or_fetch_block(object_key).await?;
             info!(
                 "Orchestrating GPU Direct Storage RDMA transfer for {} (offset {}, size {}) directly to VRAM address 0x{:X} (Simulated)",
                 object_key, offset, size, vram_address

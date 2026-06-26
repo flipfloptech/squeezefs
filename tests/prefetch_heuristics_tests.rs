@@ -107,7 +107,7 @@ async fn test_prefetch_gds_aware_prefetch_triggered() {
     let backend = RustFsClient::new_mock();
 
     let temp_dir = tempdir().unwrap();
-    let mut cache = TieredCache::new(
+    let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
@@ -119,7 +119,10 @@ async fn test_prefetch_gds_aware_prefetch_triggered() {
     .unwrap();
 
     // Enable GDS for testing
-    cache.gds.force_available = true;
+    cache
+        .gds
+        .force_available
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     let router = DataRouter::new(dlm, backend.clone(), cache);
     let block_size = 1024u64;

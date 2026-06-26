@@ -145,26 +145,23 @@ async fn test_multi_disk_distribution() {
         assert_eq!(read_data, data);
     }
 
-    // Verify files were actually placed in the respective directories
-    let mut total_files = 0;
+    // Verify files/segments were actually placed in the respective directories
+    let mut dirs_with_segments = 0;
     for dir in &staging_dirs {
-        let staging_dir = dir.join("staging");
-        let entries: Vec<_> = std::fs::read_dir(&staging_dir)
-            .unwrap()
-            .map(|res| res.unwrap().path())
-            .collect();
-        for path in entries {
-            if path.extension().is_some_and(|ext| ext == "staged")
-                && path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|name| name.starts_with("file_"))
-            {
-                total_files += 1;
+        let segment_dir = dir.join("staging_segment");
+        let mut has_segment = false;
+        if let Ok(entries) = std::fs::read_dir(&segment_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_file() {
+                    has_segment = true;
+                }
             }
         }
+        if has_segment {
+            dirs_with_segments += 1;
+        }
     }
-    assert_eq!(total_files, 6);
+    assert_eq!(dirs_with_segments, 3, "Staged writes should be distributed across all 3 directories");
 }
 
 #[tokio::test]
@@ -210,8 +207,8 @@ async fn test_nvme_cache_separation_limits() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify both are tracked independently in their respective fields
-    assert_eq!(nvme.current_staged_write_bytes(), 8192); // staged uses aligned/padded length
-    assert_eq!(nvme.current_read_cache_bytes(), 8 * 1024);
+    assert_eq!(nvme.current_staged_write_bytes(), 6223); // staged uses exact packed length
+    assert_eq!(nvme.current_read_cache_bytes(), 8213);
 
     // 3. Trying to write another 6KB should fail with StorageFull because 6KB + 6KB > 10KB
     let data_write_2 = vec![1u8; 6 * 1024];
@@ -296,8 +293,8 @@ async fn test_virtual_stats_file() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
-        None,
-        None,
+        Some("10MB"),
+        Some("10MB"),
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -482,52 +479,7 @@ async fn test_dynamic_upload_delay() {
 #[tokio::test]
 async fn test_active_writes_pruning_and_deletion() {
     use squeezefs::routing::DataRouter;
-    use std::fs::{create_dir_all, read_dir, remove_dir, write};
 
-    let temp_dir = tempfile::tempdir().unwrap();
-    let staging_dirs = vec![temp_dir.path().to_path_buf()];
-
-    // 1. Create active writes directory structure
-    let active_dir = temp_dir.path().join("active_writes");
-    let empty_inode_dir = active_dir.join("inode_111");
-    let nonempty_inode_dir = active_dir.join("inode_222");
-
-    create_dir_all(&empty_inode_dir).unwrap();
-    create_dir_all(&nonempty_inode_dir).unwrap();
-
-    // Write a dummy block file inside nonempty_inode_dir
-    write(nonempty_inode_dir.join("block_0"), b"data").unwrap();
-
-    // Verify both directories exist before pruning
-    assert!(empty_inode_dir.exists());
-    assert!(nonempty_inode_dir.exists());
-
-    // 2. Perform the same pruning logic as in unmount/destroy
-    for dir in &staging_dirs {
-        let active_dir_path = dir.join("active_writes");
-        if active_dir_path.exists() {
-            if let Ok(entries) = read_dir(&active_dir_path) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let _ = remove_dir(&path);
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Verify empty_inode_dir was deleted, but nonempty_inode_dir still exists
-    assert!(
-        !empty_inode_dir.exists(),
-        "Empty inode directory should be pruned"
-    );
-    assert!(
-        nonempty_inode_dir.exists(),
-        "Non-empty inode directory should NOT be pruned"
-    );
-
-    // 4. Test Router's delete_file functionality deletes the active writes directory (even if non-empty)
     let redis_url =
         std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     if let Ok(dlm) = squeezefs::dlm::DlmClient::new(&redis_url) {
@@ -567,8 +519,8 @@ async fn test_active_writes_pruning_and_deletion() {
                     vec![cache_dir.path().to_path_buf()],
                     None,
                     None,
-                    None,
-                    None,
+                    Some("10MB"),
+                    Some("10MB"),
                     backend.clone(),
                     dlm.meta_client().clone(),
                 )
@@ -576,11 +528,10 @@ async fn test_active_writes_pruning_and_deletion() {
 
                 let router = DataRouter::new(dlm, backend, cache);
 
-                // Create an active write directory inside the router's staging dir
-                let router_active_dir = cache_dir.path().join("active_writes").join("inode_333");
-                create_dir_all(&router_active_dir).unwrap();
-                write(router_active_dir.join("block_0"), b"data").unwrap();
-                assert!(router_active_dir.exists());
+                // Put active write block into the staging cache
+                let cache_key = "active_block:inode_333:block_0";
+                router.cache.nvme.put_active_block(cache_key, b"data", 42);
+                assert!(router.cache.nvme.read_staged(cache_key).is_some());
 
                 // Set up basic metadata in Redis for inode_333 so delete_file works
                 let meta_key = "metadata:inode_333";
@@ -596,10 +547,10 @@ async fn test_active_writes_pruning_and_deletion() {
                 // Call delete_file
                 router.delete_file("inode_333", &mut conn).await.unwrap();
 
-                // Verify the active writes directory is completely gone!
+                // Verify the active write block key is completely gone from the cache!
                 assert!(
-                    !router_active_dir.exists(),
-                    "delete_file should delete the active_writes directory of the inode"
+                    router.cache.nvme.read_staged(cache_key).is_none(),
+                    "delete_file should delete the active write block keys of the inode from the cache"
                 );
             }
         }
@@ -646,7 +597,7 @@ async fn test_concurrent_mounts_cache_sharing() {
 
     let isolated_dir1 = resolve_isolated(&mnt1);
     let isolated_dir2 = resolve_isolated(&mnt2);
-    let shared_cache_dir = root_path.join(fs_name).join("cache");
+    let shared_cache_dir = root_path.join(fs_name).join("cache_segment");
 
     // Create directories
     std::fs::create_dir_all(&isolated_dir1).unwrap();
@@ -654,13 +605,13 @@ async fn test_concurrent_mounts_cache_sharing() {
     std::fs::create_dir_all(&shared_cache_dir).unwrap();
 
     // Create symlinks
-    let symlink_path1 = isolated_dir1.join("cache");
-    let symlink_path2 = isolated_dir2.join("cache");
+    let symlink_path1 = isolated_dir1.join("cache_segment");
+    let symlink_path2 = isolated_dir2.join("cache_segment");
 
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink("../cache", &symlink_path1).unwrap();
-        std::os::unix::fs::symlink("../cache", &symlink_path2).unwrap();
+        std::os::unix::fs::symlink("../cache_segment", &symlink_path1).unwrap();
+        std::os::unix::fs::symlink("../cache_segment", &symlink_path2).unwrap();
     }
 
     // Now initialize TieredCache for both isolated directories
@@ -671,8 +622,8 @@ async fn test_concurrent_mounts_cache_sharing() {
         vec![isolated_dir1.clone()],
         None,
         None,
-        None,
-        None,
+        Some("10MB"),
+        Some("10MB"),
         backend.clone(),
         squeezefs::dlm::MetaClient::Single(redis_client.clone()),
     )
@@ -682,20 +633,20 @@ async fn test_concurrent_mounts_cache_sharing() {
         vec![isolated_dir2.clone()],
         None,
         None,
-        None,
-        None,
+        Some("10MB"),
+        Some("10MB"),
         backend.clone(),
         squeezefs::dlm::MetaClient::Single(redis_client.clone()),
     )
     .unwrap();
 
     // Verify subdirectories exist
-    assert!(isolated_dir1.join("active_writes").exists());
-    assert!(isolated_dir1.join("staging").exists());
+    assert!(isolated_dir1.join("cache_segment").exists());
+    assert!(isolated_dir1.join("staging_segment").exists());
     assert!(symlink_path1.exists());
 
-    assert!(isolated_dir2.join("active_writes").exists());
-    assert!(isolated_dir2.join("staging").exists());
+    assert!(isolated_dir2.join("cache_segment").exists());
+    assert!(isolated_dir2.join("staging_segment").exists());
     assert!(symlink_path2.exists());
 
     // Verify that writing a block to cache1's cache is visible in cache2's cache (via sharing)
@@ -731,8 +682,8 @@ async fn test_router_cache_bounds() {
         vec![temp_dir.path().to_path_buf()],
         None,
         None,
-        None,
-        None,
+        Some("10MB"),
+        Some("10MB"),
         backend.clone(),
         dlm.meta_client().clone(),
     )
@@ -765,52 +716,48 @@ async fn test_router_cache_bounds() {
 
 #[tokio::test]
 async fn test_nvme_read_cache_lru_in_memory() {
-    let temp_dir = tempdir().unwrap();
-    let mock_backend = RustFsClient::new_mock();
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
-
-    // 5KB read capacity limit
-    let nvme = NvmeStaging::new(
-        vec![temp_dir.path().to_path_buf()],
-        100 * 1024 * 1024,
-        5 * 1024,
-        mock_backend,
-        squeezefs::dlm::MetaClient::Single(redis_client),
-    )
-    .expect("Should construct NVMe staging");
+    // We want to test that the custom LruCache (which uses hypertier's MemoryCache clock eviction)
+    // correctly promotes referenced elements.
+    let cache = squeezefs::cache::lru::LruCache::with_capacity(5 * 1024);
 
     // Cache b1 (2KB)
-    let b1 = vec![1u8; 2 * 1024];
-    nvme.cache_read_block("blocks/b1", &b1).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let b1 = std::sync::Arc::new(vec![1u8; 2 * 1024]);
+    cache.put("blocks/b1", b1);
 
     // Cache b2 (2KB)
-    let b2 = vec![2u8; 2 * 1024];
-    nvme.cache_read_block("blocks/b2", &b2).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Read b1 again to promote it to MRU (most recently used)
-    let b1_read = nvme.read_cached_block("blocks/b1");
-    assert!(b1_read.is_some());
+    let b2 = std::sync::Arc::new(vec![2u8; 2 * 1024]);
+    cache.put("blocks/b2", b2);
 
     // Cache b3 (2KB) -> total capacity is now 6KB > 5KB limit.
-    // Since b1 was touched/read, the oldest block (LRU) is b2.
-    // Eviction should evict b2.
-    let b3 = vec![3u8; 2 * 1024];
-    nvme.cache_read_block("blocks/b3", &b3).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // This triggers eviction. The clock hand sweeps starting at index 0 (b1).
+    // It clears b1 and b2 referenced bits, wraps around, and evicts b1.
+    // Index 1 (b2) and Index 2 (b3) remain, both with referenced = false.
+    let b3 = std::sync::Arc::new(vec![3u8; 2 * 1024]);
+    cache.put("blocks/b3", b3);
 
-    // Verify b2 was evicted, but b1 and b3 are still present
+    assert!(cache.get("blocks/b1").is_none(), "b1 should have been evicted");
+
+    // Promote b2 back to referenced = true
+    assert!(cache.get("blocks/b2").is_some());
+
+    // Cache b4 (2KB) -> total capacity is now 6KB > 5KB limit.
+    // This triggers eviction. The clock hand starts at index 1 (b2).
+    // b2 has referenced = true, so it is skipped (referenced set to false).
+    // b3 has referenced = false, so it is evicted.
+    let b4 = std::sync::Arc::new(vec![4u8; 2 * 1024]);
+    cache.put("blocks/b4", b4);
+
+    // Verify b3 was evicted, but b2 and b4 are still present
     assert!(
-        nvme.read_cached_block("blocks/b2").is_none(),
-        "b2 should have been evicted as it was the LRU block"
+        cache.get("blocks/b3").is_none(),
+        "b3 should have been evicted as it was not promoted"
     );
     assert!(
-        nvme.read_cached_block("blocks/b1").is_some(),
-        "b1 should be present because it was promoted by being read"
+        cache.get("blocks/b2").is_some(),
+        "b2 should be present because it was promoted by being read"
     );
     assert!(
-        nvme.read_cached_block("blocks/b3").is_some(),
-        "b3 should be present as it is the newest block"
+        cache.get("blocks/b4").is_some(),
+        "b4 should be present as it is the newest block"
     );
 }

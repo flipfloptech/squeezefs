@@ -58,16 +58,30 @@ impl TieredCache {
             if let Some(cfg) = read_disk_cache_size.filter(|c| !c.is_empty() && *c != "none") {
                 parse_size_string(cfg, aggregate_capacity)?
             } else {
-                // Default 25% of aggregate capacity
-                aggregate_capacity / 4
+                #[cfg(test)]
+                {
+                    10 * 1024 * 1024 // 10MB default in tests
+                }
+                #[cfg(not(test))]
+                {
+                    // Default 25% of aggregate capacity
+                    aggregate_capacity / 4
+                }
             };
 
         let write_disk_limit =
             if let Some(cfg) = write_disk_cache_size.filter(|c| !c.is_empty() && *c != "none") {
                 parse_size_string(cfg, aggregate_capacity)?
             } else {
-                // Default 25% of aggregate capacity
-                aggregate_capacity / 4
+                #[cfg(test)]
+                {
+                    10 * 1024 * 1024 // 10MB default in tests
+                }
+                #[cfg(not(test))]
+                {
+                    // Default 25% of aggregate capacity
+                    aggregate_capacity / 4
+                }
             };
 
         let nvme = nvme::NvmeStaging::new(

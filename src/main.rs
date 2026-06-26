@@ -1312,14 +1312,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut isolated_staging_dirs = Vec::new();
             for dir in active_staging_dirs {
                 let isolated_dir = dir.join(&fs_name).join(sanitized_mount_clean);
-                let shared_cache_dir = dir.join(&fs_name).join("cache");
+                let shared_cache_dir = dir.join(&fs_name).join("cache_segment");
 
                 // Create the parent directory for the isolated staging dir
                 fs::create_dir_all(&isolated_dir).await?;
                 // Create the shared cache directory if not exists
                 fs::create_dir_all(&shared_cache_dir).await?;
 
-                let symlink_path = isolated_dir.join("cache");
+                let symlink_path = isolated_dir.join("cache_segment");
                 // Remove pre-existing cache file/symlink/directory if any
                 let metadata = fs::symlink_metadata(&symlink_path).await;
                 if let Ok(meta) = metadata {
@@ -1330,10 +1330,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Create symbolic link pointing to ../cache
+                // Create symbolic link pointing to ../cache_segment
                 #[cfg(unix)]
                 {
-                    std::os::unix::fs::symlink("../cache", &symlink_path)?;
+                    std::os::unix::fs::symlink("../cache_segment", &symlink_path)?;
                 }
 
                 isolated_staging_dirs.push(isolated_dir);
@@ -1862,37 +1862,43 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // 5. Count staged files and active writes
-            let mut staged_count = 0;
-            let mut active_writes_count = 0;
-            for dir in &staging_dirs {
-                let staging_dir = dir.join("staging");
-                if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file()
-                            && path.extension().is_some_and(|ext| ext == "staged")
-                            && path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .is_some_and(|name| name.starts_with("file_"))
-                        {
-                            staged_count += 1;
-                        }
+            // 5. Count staged files and active writes from cache segments
+            let mut max_write_bytes = 100 * 1024 * 1024;
+            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                    let size_str: Option<String> = con.hget("squeezefs:format", "write_disk_limit").await.unwrap_or(None);
+                    if let Some(ref s) = size_str {
+                        max_write_bytes = squeezefs::cache::parse_size_string(s, 100 * 1024 * 1024 * 1024).unwrap_or(100 * 1024 * 1024);
                     }
                 }
-                let active_dir = dir.join("active_writes");
-                if active_dir.exists() {
-                    if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                let _ = std::fs::remove_dir(&path);
-                            }
-                        }
+            }
+
+            let mut caches = Vec::new();
+            for dir in &staging_dirs {
+                let staging_segment_dir = dir.join("staging_segment");
+                if staging_segment_dir.exists() {
+                    let write_cap = max_write_bytes as usize / staging_dirs.len();
+                    if let Ok(cache) = hypertier::nvme::NvmeCache::new(
+                        &[staging_segment_dir.as_path()],
+                        &[write_cap],
+                        16,
+                    ) {
+                        cache.recover_index();
+                        caches.push(cache);
                     }
-                    if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                        active_writes_count += entries.filter_map(|e| e.ok()).count();
+                }
+            }
+
+            let mut staged_count = 0;
+            let mut active_writes_count = 0;
+            for cache in &caches {
+                for key_bytes in cache.list_keys() {
+                    if let Ok(s) = String::from_utf8(key_bytes.to_vec()) {
+                        if s.starts_with("active_block:") {
+                            active_writes_count += 1;
+                        } else {
+                            staged_count += 1;
+                        }
                     }
                 }
             }
@@ -1943,19 +1949,25 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 "wait" => {
                     let mut total_bytes_at_start = 0;
-                    for dir in &staging_dirs {
-                        let staging_dir = dir.join("staging");
-                        if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                            for entry in entries.flatten() {
-                                let path = entry.path();
-                                if path.is_file()
-                                    && path.extension().is_some_and(|ext| ext == "staged")
-                                    && path.file_stem()
-                                        .and_then(|s| s.to_str())
-                                        .is_some_and(|name| name.starts_with("file_"))
-                                {
-                                    if let Ok(meta) = path.metadata() {
-                                        total_bytes_at_start += meta.len();
+                    for cache in &caches {
+                        for key_bytes in cache.list_keys() {
+                            let is_active = if let Ok(s) = String::from_utf8(key_bytes.to_vec()) {
+                                s.starts_with("active_block:")
+                            } else {
+                                false
+                            };
+                            if !is_active {
+                                if let Some(guard) = cache.get(&key_bytes) {
+                                    let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                                    if bytes.len() >= 8 {
+                                        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                                        if bytes.len() >= 8 + meta_len {
+                                            let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                                                Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                                Err(_) => 0,
+                                            };
+                                            total_bytes_at_start += original_size as u64;
+                                        }
                                     }
                                 }
                             }
@@ -1978,6 +1990,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let mut skipped = false;
                     let mut current_staged = 0;
                     let mut current_active = 0;
+                    let mut current_bytes = 0;
 
                     loop {
                         while let Ok(msg) = rx.try_recv() {
@@ -1991,40 +2004,33 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         current_staged = 0;
-                        let mut current_bytes = 0;
+                        current_bytes = 0;
                         current_active = 0;
 
-                        for dir in &staging_dirs {
-                            let staging_dir = dir.join("staging");
-                            if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                                for entry in entries.flatten() {
-                                    let path = entry.path();
-                                    if path.is_file()
-                                        && path.extension().is_some_and(|ext| ext == "staged")
-                                        && path
-                                            .file_stem()
-                                            .and_then(|s| s.to_str())
-                                            .is_some_and(|name| name.starts_with("file_"))
-                                    {
-                                        if let Ok(meta) = path.metadata() {
-                                            current_bytes += meta.len();
-                                        }
-                                        current_staged += 1;
-                                    }
-                                }
-                            }
-                            let active_dir = dir.join("active_writes");
-                            if active_dir.exists() {
-                                if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                                    for entry in entries.flatten() {
-                                        let path = entry.path();
-                                        if path.is_dir() {
-                                            let _ = std::fs::remove_dir(&path);
+                        for cache in &caches {
+                            for key_bytes in cache.list_keys() {
+                                let is_active = if let Ok(s) = String::from_utf8(key_bytes.to_vec()) {
+                                    s.starts_with("active_block:")
+                                } else {
+                                    false
+                                };
+                                if is_active {
+                                    current_active += 1;
+                                } else {
+                                    current_staged += 1;
+                                    if let Some(guard) = cache.get(&key_bytes) {
+                                        let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                                        if bytes.len() >= 8 {
+                                            let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                                            if bytes.len() >= 8 + meta_len {
+                                                let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                                                    Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                                    Err(_) => 0,
+                                                };
+                                                current_bytes += original_size as u64;
+                                            }
                                         }
                                     }
-                                }
-                                if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                                    current_active += entries.filter_map(|e| e.ok()).count();
                                 }
                             }
                         }
@@ -2085,25 +2091,35 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             // 1. Connect to Redis to clear metadata
                             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                                 if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                                    for dir in &staging_dirs {
-                                        let staging_dir = dir.join("staging");
-                                        if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                                            for entry in entries.flatten() {
-                                                let path = entry.path();
-                                                if path.is_file()
-                                                    && path.extension().is_some_and(|ext| ext == "staged")
-                                                {
-                                                    if let Some(file_path) = get_file_path_from_staged(&path) {
-                                                        let meta_key = format!("metadata:{}", file_path);
-                                                        let file_id: Option<String> = con.hget(&meta_key, "file_id").await.unwrap_or(None);
-                                                        let mut pipe = redis::pipe();
-                                                        pipe.del(&meta_key);
-                                                        if let Some(fid) = file_id {
-                                                            let mapping_key = format!("mapping:{}", fid);
-                                                            pipe.del(&mapping_key);
+                                    for cache in &caches {
+                                        for key_bytes in cache.list_keys() {
+                                            let is_active = if let Ok(s) = String::from_utf8(key_bytes.to_vec()) {
+                                                s.starts_with("active_block:")
+                                            } else {
+                                                false
+                                            };
+                                            if !is_active {
+                                                if let Some(guard) = cache.get(&key_bytes) {
+                                                    let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                                                    if bytes.len() >= 8 {
+                                                        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                                                        if bytes.len() >= 8 + meta_len {
+                                                            // Parse metadata to get file_path
+                                                            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                                                                if let Some(file_path) = meta.get("file_path").and_then(|v| v.as_str()) {
+                                                                    let meta_key = format!("metadata:{}", file_path);
+                                                                    let file_id: Option<String> = con.hget(&meta_key, "file_id").await.unwrap_or(None);
+                                                                    let mut pipe = redis::pipe();
+                                                                    pipe.del(&meta_key);
+                                                                    if let Some(fid) = file_id {
+                                                                        let mapping_key = format!("mapping:{}", fid);
+                                                                        pipe.del(&mapping_key);
+                                                                    }
+                                                                    let _: () = pipe.query_async(&mut con).await.unwrap_or(());
+                                                                    println!("Removed metadata for unflushed file: {}", file_path);
+                                                                }
+                                                            }
                                                         }
-                                                        let _: () = pipe.query_async(&mut con).await.unwrap_or(());
-                                                        println!("Removed metadata for unflushed file: {}", file_path);
                                                     }
                                                 }
                                             }
@@ -2112,30 +2128,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
-                            // 2. Remove local staged and active write files
-                            for dir in &staging_dirs {
-                                let staging_dir = dir.join("staging");
-                                if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                                    for entry in entries.flatten() {
-                                        let path = entry.path();
-                                        if path.is_file() {
-                                            let _ = std::fs::remove_file(path);
-                                        }
-                                    }
-                                }
-                                let active_dir = dir.join("active_writes");
-                                if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                                    for entry in entries.flatten() {
-                                        let path = entry.path();
-                                        if path.is_dir() {
-                                            let _ = std::fs::remove_dir_all(path);
-                                        } else {
-                                            let _ = std::fs::remove_file(path);
-                                        }
-                                    }
+                            // 2. Remove all keys from cache
+                            for cache in &caches {
+                                for key_bytes in cache.list_keys() {
+                                    cache.remove(&key_bytes);
                                 }
                             }
-                            println!("Local staging files and directories cleaned up successfully.");
+                            println!("Local staging cache cleared successfully.");
                         } else {
                             println!("Unmount will continue, but staged files/metadata are left intact on disk/database.");
                         }

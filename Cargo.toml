@@ -42,6 +42,9 @@ rand = "0.8"
 sha2 = "0.10"
 ahash = "0.8"
 twox-hash = "1.6"
+hypertier = { path = "../hypertier" }
+bytes = "1.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [features]
 default = []

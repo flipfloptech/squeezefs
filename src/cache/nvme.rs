@@ -2,11 +2,13 @@ use crate::backend::RustFsClient;
 use crate::error::{Result, SqueezefsError};
 use log::{debug, error, info, warn};
 use std::fs;
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
+use bytes::Bytes;
+use std::sync::Arc;
+use xxhash_rust::xxh3::xxh3_64;
 
 fn check_disk_free_safeguard(path: &std::path::Path) -> bool {
     #[cfg(unix)]
@@ -20,7 +22,6 @@ fn check_disk_free_safeguard(path: &std::path::Path) -> bool {
                 if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 && stat.f_blocks > 0 {
                     let free_fraction = stat.f_bavail as f64 / stat.f_blocks as f64;
                     let free_bytes = stat.f_bavail as u64 * stat.f_frsize as u64;
-                    // Trigger safeguard if free space is < 100MB OR (< 1% and < 1GB)
                     if free_bytes < 100 * 1024 * 1024 || (free_fraction < 0.01 && free_bytes < 1024 * 1024 * 1024) {
                         return false;
                     }
@@ -31,102 +32,30 @@ fn check_disk_free_safeguard(path: &std::path::Path) -> bool {
     true
 }
 
-fn write_aligned_direct(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
-    let align = 4096;
-    let padded_size = (data.len() + align - 1) & !(align - 1);
-    let mut buf = Vec::with_capacity(padded_size + align);
-    let ptr = buf.as_ptr() as usize;
-    let offset = (align - (ptr % align)) % align;
-    buf.resize(offset + padded_size, 0);
-    buf[offset..offset + data.len()].copy_from_slice(data);
-    let aligned_data = &buf[offset..offset + padded_size];
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECT);
-    }
-
-    let mut file = match options.open(path) {
-        Ok(f) => f,
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-            log::warn!("O_DIRECT write not supported on staging filesystem. Falling back to buffered I/O for: {:?}", path);
-            let mut fallback_opts = std::fs::OpenOptions::new();
-            fallback_opts.write(true).create(true).truncate(true);
-            fallback_opts.open(path)?
-        }
-        Err(e) => return Err(e),
-    };
-    file.write_all(aligned_data)?;
-    Ok(())
-}
-
-fn read_aligned_direct(path: &PathBuf, actual_size: usize) -> std::io::Result<Vec<u8>> {
-    let align = 4096;
-    let padded_size = (actual_size + align - 1) & !(align - 1);
-    let mut buf = Vec::with_capacity(padded_size + align);
-    let ptr = buf.as_ptr() as usize;
-    let offset = (align - (ptr % align)) % align;
-    buf.resize(offset + padded_size, 0);
-
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECT);
-    }
-
-    let mut file = match options.open(path) {
-        Ok(f) => f,
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-            log::warn!("O_DIRECT read not supported on staging filesystem. Falling back to buffered I/O for: {:?}", path);
-            let mut fallback_opts = std::fs::OpenOptions::new();
-            fallback_opts.read(true);
-            fallback_opts.open(path)?
-        }
-        Err(e) => return Err(e),
-    };
-    file.read_exact(&mut buf[offset..offset + padded_size])?;
-
-    let mut out = vec![0; actual_size];
-    out.copy_from_slice(&buf[offset..offset + actual_size]);
-    Ok(out)
-}
-
 #[derive(Clone)]
 pub struct NvmeStaging {
     staging_dirs: Vec<PathBuf>,
     max_write_bytes: u64,
     max_read_bytes: u64,
-    backend: RustFsClient,
+    pub backend: RustFsClient,
     redis_client: crate::dlm::MetaClient,
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
     pub current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub space_freed_notify: std::sync::Arc<tokio::sync::Notify>,
-    current_read_cache_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    read_cache_lru: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(String, u64)>>>,
+    
+    // Hypertier NVMe cache instances
+    pub read_nvme_cache: std::sync::Arc<hypertier::nvme::NvmeCache>,
+    pub staging_nvme_cache: std::sync::Arc<hypertier::nvme::NvmeCache>,
+    pub dht_node: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<hypertier::dht::DhtNode>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PendingStagedWrite {
     pub file_path: String,
     pub file_id: String,
     pub fencing_token: u64,
-}
-
-fn get_dir_index(file_id: &str, num_dirs: usize) -> usize {
-    use std::hash::{Hash, Hasher};
-    use twox_hash::XxHash64;
-
-    let mut hasher = XxHash64::default();
-    file_id.hash(&mut hasher);
-    (hasher.finish() as usize) % num_dirs
+    pub padded_size: u64,
 }
 
 impl NvmeStaging {
@@ -143,89 +72,45 @@ impl NvmeStaging {
             ));
         }
 
-        // Ensure all staging directories and their subdirectories exist
+        // Initialize directories for segments
+        let mut read_cache_dirs = Vec::new();
+        let mut staging_segment_dirs = Vec::new();
         for dir in &staging_dirs {
-            fs::create_dir_all(dir.join("active_writes"))?;
-            fs::create_dir_all(dir.join("staging"))?;
-            fs::create_dir_all(dir.join("cache"))?;
+            let rc_dir = dir.join("cache_segment");
+            let ss_dir = dir.join("staging_segment");
+            fs::create_dir_all(&rc_dir)?;
+            fs::create_dir_all(&ss_dir)?;
+            read_cache_dirs.push(rc_dir);
+            staging_segment_dirs.push(ss_dir);
         }
+
+        let read_cache_dirs_refs: Vec<&std::path::Path> = read_cache_dirs.iter().map(|p| p.as_path()).collect();
+        let read_cap = max_read_bytes as usize / staging_dirs.len();
+        let read_capacities = vec![read_cap; staging_dirs.len()];
+        let read_shards = if max_read_bytes < 10 * 1024 * 1024 { 1 } else { 16 };
+        let read_nvme_cache = Arc::new(hypertier::nvme::NvmeCache::new(
+            &read_cache_dirs_refs,
+            &read_capacities,
+            read_shards,
+        )?);
+
+        let staging_dirs_refs: Vec<&std::path::Path> = staging_segment_dirs.iter().map(|p| p.as_path()).collect();
+        let write_cap = max_write_bytes as usize / staging_dirs.len();
+        let write_capacities = vec![write_cap; staging_dirs.len()];
+        let write_shards = if max_write_bytes < 10 * 1024 * 1024 { 1 } else { 16 };
+        let staging_nvme_cache = Arc::new(hypertier::nvme::NvmeCache::new(
+            &staging_dirs_refs,
+            &write_capacities,
+            write_shards,
+        )?);
+
+        // Recover existing mapping indexes from persistent segments on startup
+        staging_nvme_cache.recover_index();
+        read_nvme_cache.recover_index();
+
+        let initial_write_bytes = staging_nvme_cache.current_bytes() as u64;
 
         let (write_tx, write_rx) = mpsc::channel::<PendingStagedWrite>(1000);
-
-        let mut initial_write_bytes = 0u64;
-        let mut initial_read_bytes = 0u64;
-        for dir in &staging_dirs {
-            // Scan staging subdirectory for staged files (file_*.staged)
-            let staging_dir = dir.join("staging");
-            if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.is_file() {
-                            let path = entry.path();
-                            if path.extension().is_some_and(|ext| ext == "staged") {
-                                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                                    if name.starts_with("file_") {
-                                        initial_write_bytes += meta.len();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Scan cache subdirectory for block cache files (block_*.block)
-            let cache_dir = dir.join("cache");
-            if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.is_file() {
-                            let path = entry.path();
-                            if path.extension().is_some_and(|ext| ext == "block") {
-                                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                                    if name.starts_with("block_") {
-                                        initial_read_bytes += meta.len();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Collect and sort initial block files by access time to populate LRU queue
-        let mut initial_blocks = Vec::new();
-        for dir in &staging_dirs {
-            let cache_dir = dir.join("cache");
-            if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.is_file() {
-                            let path = entry.path();
-                            if path.extension().is_some_and(|ext| ext == "block") {
-                                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                                    if let Some(stripped) = name.strip_prefix("block_") {
-                                        let time = meta
-                                            .accessed()
-                                            .or_else(|_| meta.modified())
-                                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                                        let safe_name = stripped.to_string();
-                                        initial_blocks.push((safe_name, meta.len(), time));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        initial_blocks.sort_by_key(|&(_, _, time)| time);
-
-        let mut read_cache_lru = std::collections::VecDeque::new();
-        for (safe_name, size, _) in initial_blocks {
-            read_cache_lru.push_back((safe_name, size));
-        }
 
         let staging = Self {
             staging_dirs: staging_dirs.clone(),
@@ -239,13 +124,12 @@ impl NvmeStaging {
                 initial_write_bytes,
             )),
             space_freed_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-            current_read_cache_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                initial_read_bytes,
-            )),
-            read_cache_lru: std::sync::Arc::new(std::sync::Mutex::new(read_cache_lru)),
+            read_nvme_cache,
+            staging_nvme_cache,
+            dht_node: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
-        // Spawn the background merge worker
+        // Spawn background merge worker
         staging.start_merge_worker(write_rx);
 
         Ok(staging)
@@ -255,14 +139,11 @@ impl NvmeStaging {
         &self.redis_client
     }
 
-    /// Retrieve the staging directory for a specific file_id.
-    pub fn get_staged_path(&self, file_id: &str) -> PathBuf {
-        let idx = get_dir_index(file_id, self.staging_dirs.len());
-        self.staging_dirs[idx].join("staging")
+    pub fn get_staged_path(&self, _file_id: &str) -> PathBuf {
+        self.staging_dirs.first().cloned().unwrap_or_default()
     }
 
-    /// Stage a write locally to NVMe staging, returning immediately.
-    /// The background worker will pack it and upload it asynchronously.
+    /// Stage a write locally into staging_nvme_cache using zero-copy memory-mapped segments.
     pub async fn stage_write(
         &self,
         file_path: &str,
@@ -277,18 +158,19 @@ impl NvmeStaging {
         });
         let meta_json_bytes = serde_json::to_vec(&meta_content).unwrap();
         let unpadded_len = 8 + meta_json_bytes.len() + data.len();
-        let align = 4096;
-        let padded_size = ((unpadded_len + align - 1) & !(align - 1)) as u64;
+        let padded_size = unpadded_len as u64;
 
-        let target_dir = self.get_staged_path(file_id);
-        if !check_disk_free_safeguard(&target_dir) {
+        let target_dir = self.staging_dirs.first().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("No staging directories configured".to_string())
+        })?;
+
+        if !check_disk_free_safeguard(target_dir) {
             return Err(SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 "Local NVMe staging disk free space safeguard triggered (< 1% or < 100MB free)".to_string(),
             )));
         }
 
-        // Enforce max bytes capacity constraint asynchronously using the exact padded file size
         let mut total_staged_bytes = self
             .current_staged_write_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -317,24 +199,18 @@ impl NvmeStaging {
             )));
         }
 
-        let staged_path = target_dir.join(format!("file_{}.staged", file_id));
+        let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
+        let meta_len = meta_json_bytes.len() as u64;
 
-        let data_clone = data.to_vec();
+        let mut packed_payload = Vec::with_capacity(unpadded_len);
+        packed_payload.extend_from_slice(&meta_len.to_be_bytes());
+        packed_payload.extend_from_slice(&meta_json_bytes);
+        packed_payload.extend_from_slice(data);
 
-        tokio::task::spawn_blocking(move || -> std::result::Result<(), SqueezefsError> {
-            let meta_len = meta_json_bytes.len() as u64;
+        let payload_bytes = Bytes::from(packed_payload);
 
-            let mut packed_payload =
-                Vec::with_capacity(8 + meta_json_bytes.len() + data_clone.len());
-            packed_payload.extend_from_slice(&meta_len.to_be_bytes());
-            packed_payload.extend_from_slice(&meta_json_bytes);
-            packed_payload.extend_from_slice(&data_clone);
-
-            write_aligned_direct(&staged_path, &packed_payload).map_err(SqueezefsError::Io)?;
-            Ok(())
-        })
-        .await
-        .unwrap()?;
+        // Memory-mapped copy (lock-free, zero disk syscall wait)
+        self.staging_nvme_cache.put(key_bytes, payload_bytes);
 
         self.current_staged_write_bytes
             .fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
@@ -344,11 +220,11 @@ impl NvmeStaging {
             file_path, file_id, data.len()
         );
 
-        // Notify background worker
         let pending = PendingStagedWrite {
             file_path: file_path.to_string(),
             file_id: file_id.to_string(),
             fencing_token,
+            padded_size,
         };
 
         self.write_tx.send(pending).await.map_err(|e| {
@@ -361,32 +237,49 @@ impl NvmeStaging {
         Ok(())
     }
 
-    /// Read staged data directly from NVMe if it exists locally and has not yet been merged/cleared.
-    pub fn read_staged(&self, file_id: &str) -> Option<Vec<u8>> {
-        let target_dir = self.get_staged_path(file_id);
-        let staged_path = target_dir.join(format!("file_{}.staged", file_id));
+    /// Put a packed active block write to staging_nvme_cache.
+    pub fn put_active_block(&self, key: &str, data: &[u8], fencing_token: u64) {
+        let meta_content = serde_json::json!({
+            "file_path": key,
+            "fencing_token": fencing_token,
+            "original_size": data.len()
+        });
+        let meta_json_bytes = serde_json::to_vec(&meta_content).unwrap();
+        let unpadded_len = 8 + meta_json_bytes.len() + data.len();
+        let mut packed_payload = Vec::with_capacity(unpadded_len);
+        let meta_len = meta_json_bytes.len() as u64;
+        packed_payload.extend_from_slice(&meta_len.to_be_bytes());
+        packed_payload.extend_from_slice(&meta_json_bytes);
+        packed_payload.extend_from_slice(data);
 
-        if staged_path.exists() {
-            if let Ok(metadata) = fs::metadata(&staged_path) {
-                let file_len = metadata.len();
-                if let Ok(bytes) = read_aligned_direct(&staged_path, file_len as usize) {
-                    if bytes.len() >= 8 {
-                        let meta_len =
-                            u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
-                        if bytes.len() >= 8 + meta_len {
-                            if let Ok(meta_json) =
-                                serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len])
-                            {
-                                if let Some(orig_size) =
-                                    meta_json.get("original_size").and_then(|v| v.as_u64())
-                                {
-                                    let data_start = 8 + meta_len;
-                                    let data_end = data_start + orig_size as usize;
-                                    if bytes.len() >= data_end {
-                                        return Some(bytes[data_start..data_end].to_vec());
-                                    }
-                                }
-                            }
+        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+        let payload_bytes = Bytes::from(packed_payload);
+
+        self.staging_nvme_cache.put(key_bytes, payload_bytes);
+    }
+
+    /// Remove a packed active block write from staging_nvme_cache.
+    pub fn remove_active_block(&self, key: &str) -> Option<Vec<u8>> {
+        let val = self.read_staged(key);
+        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+        self.staging_nvme_cache.remove(&key_bytes);
+        val
+    }
+
+    /// Read staged data directly from staging_nvme_cache memory-mapped segments.
+    pub fn read_staged(&self, file_id: &str) -> Option<Vec<u8>> {
+        let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
+        let guard = self.staging_nvme_cache.get(&key_bytes)?;
+        let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+        if bytes.len() >= 8 {
+            let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+            if bytes.len() >= 8 + meta_len {
+                if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                    if let Some(orig_size) = meta_json.get("original_size").and_then(|v| v.as_u64()) {
+                        let data_start = 8 + meta_len;
+                        let data_end = data_start + orig_size as usize;
+                        if bytes.len() >= data_end {
+                            return Some(bytes[data_start..data_end].to_vec());
                         }
                     }
                 }
@@ -395,18 +288,17 @@ impl NvmeStaging {
         None
     }
 
-    /// Start background merge worker.
     fn start_merge_worker(&self, mut write_rx: mpsc::Receiver<PendingStagedWrite>) {
-        let staging_dirs = self.staging_dirs.clone();
         let backend = self.backend.clone();
         let redis_client = self.redis_client.clone();
         let staged_bytes = self.current_staged_write_bytes.clone();
         let space_freed_notify = self.space_freed_notify.clone();
+        let staging_nvme_cache = self.staging_nvme_cache.clone();
 
         tokio::spawn(async move {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
             let mut current_bytes = 0u64;
-            let max_batch_bytes = 4 * 1024 * 1024; // 4MB
+            let max_batch_bytes = 4 * 1024 * 1024;
             let mut flush_timeout = Duration::from_millis(500);
 
             let mut last_query = time::Instant::now() - Duration::from_secs(60);
@@ -438,22 +330,12 @@ impl NvmeStaging {
 
                 tokio::select! {
                     Some(pending) = write_rx.recv() => {
-                        let idx = get_dir_index(&pending.file_id, staging_dirs.len());
-                        let local_path = staging_dirs[idx].join("staging").join(format!("file_{}.staged", pending.file_id));
-                        let (meta_len, ok) = tokio::task::spawn_blocking(move || {
-                            if let Ok(metadata) = fs::metadata(&local_path) {
-                                (metadata.len(), true)
-                            } else { (0, false) }
-                        }).await.unwrap();
-
-                        if ok {
-                            current_bytes += meta_len;
-                            batch.push(pending);
-                        }
+                        current_bytes += pending.padded_size;
+                        batch.push(pending);
 
                         if current_bytes >= max_batch_bytes {
                             info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify).await {
                                 error!("Failed to flush NVMe staging batch: {:?}", e);
                             }
                         }
@@ -461,7 +343,7 @@ impl NvmeStaging {
                     _ = &mut sleep => {
                         if !batch.is_empty() {
                             info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_dirs, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify).await {
                                 error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
                             }
                         }
@@ -471,9 +353,8 @@ impl NvmeStaging {
         });
     }
 
-    /// Merge the batch of NVMe files, upload to S3 (RustFS), and record mappings.
     async fn flush_batch(
-        staging_dirs: &[PathBuf],
+        staging_nvme_cache: &hypertier::nvme::NvmeCache,
         backend: &RustFsClient,
         redis_client: &crate::dlm::MetaClient,
         batch: &mut Vec<PendingStagedWrite>,
@@ -487,7 +368,6 @@ impl NvmeStaging {
 
         crate::coz_progress!("nvme_flush_batch");
 
-        // Fetch format settings from Garnet/Redis for compression & encryption
         let mut con = redis_client.get_connection().await?;
         use redis::AsyncCommands;
 
@@ -516,46 +396,28 @@ impl NvmeStaging {
         let packed_key = format!("packed/blocks/{}", packed_id);
 
         let mut packed_payload = Vec::new();
-        let mut mappings = Vec::new(); // Mappings: (file_id, offset, size)
+        let mut mappings = Vec::new();
         let mut highest_fencing_token = 0u64;
 
-        // 1. Pack individual staged file bytes into one payload
         for item in batch.iter() {
-            let idx = get_dir_index(&item.file_id, staging_dirs.len());
-            let local_path = staging_dirs[idx]
-                .join("staging")
-                .join(format!("file_{}.staged", item.file_id));
-
-            let data_res = tokio::task::spawn_blocking(move || {
-                if let Ok(metadata) = fs::metadata(&local_path) {
-                    let file_len = metadata.len();
-                    if let Ok(bytes) = read_aligned_direct(&local_path, file_len as usize) {
-                        if bytes.len() >= 8 {
-                            let meta_len =
-                                u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]))
-                                    as usize;
-                            if bytes.len() >= 8 + meta_len {
-                                if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(
-                                    &bytes[8..8 + meta_len],
-                                ) {
-                                    if let Some(orig_size) =
-                                        meta_json.get("original_size").and_then(|v| v.as_u64())
-                                    {
-                                        let data_start = 8 + meta_len;
-                                        let data_end = data_start + orig_size as usize;
-                                        if bytes.len() >= data_end {
-                                            return Some(bytes[data_start..data_end].to_vec());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                None
-            })
-            .await
-            .unwrap();
+            let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
+            let data_res = if let Some(guard) = staging_nvme_cache.get(&key_bytes) {
+                let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                if bytes.len() >= 8 {
+                    let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                    if bytes.len() >= 8 + meta_len {
+                        if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                            if let Some(orig_size) = meta_json.get("original_size").and_then(|v| v.as_u64()) {
+                                let data_start = 8 + meta_len;
+                                let data_end = data_start + orig_size as usize;
+                                if bytes.len() >= data_end {
+                                    Some(bytes[data_start..data_end].to_vec())
+                                } else { None }
+                            } else { None }
+                        } else { None }
+                    } else { None }
+                } else { None }
+            } else { None };
 
             if let Some(data) = data_res {
                 let processed_data = crypto_state.process_write(&data)?;
@@ -570,13 +432,11 @@ impl NvmeStaging {
             }
         }
 
-        // 2. Upload the packed payload to RustFS S3
         info!("NVMe Staging: Uploading packed block {} (size {} bytes) to RustFS with fencing token {}.", packed_key, packed_payload.len(), highest_fencing_token);
         backend
             .put_object(&packed_key, packed_payload, highest_fencing_token)
             .await?;
 
-        // 3. Update Garnet metadata mapping for each individual file ID
         if let Ok(mut con) = redis_client.get_connection().await {
             let refcounts_key = "squeezefs:block_refcounts";
             let _: std::result::Result<(), redis::RedisError> = redis::cmd("HSET")
@@ -604,28 +464,14 @@ impl NvmeStaging {
             warn!("NVMe Staging: Failed to connect to Redis/Garnet to register packed block mappings. Mappings will not be available in metadata.");
         }
 
-        // 4. Remove local NVMe staging files
         for item in batch.iter() {
-            let idx = get_dir_index(&item.file_id, staging_dirs.len());
-            let target_dir = &staging_dirs[idx];
-            let local_path = target_dir
-                .join("staging")
-                .join(format!("file_{}.staged", item.file_id));
-            if local_path.exists() {
-                if let Ok(meta) = fs::metadata(&local_path) {
-                    staged_bytes.fetch_sub(meta.len(), std::sync::atomic::Ordering::Relaxed);
-                }
-                if let Err(e) = fs::remove_file(&local_path) {
-                    error!("Failed to remove staged file {:?}: {:?}", local_path, e);
-                }
-            }
+            let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
+            staging_nvme_cache.remove(&key_bytes);
+            staged_bytes.fetch_sub(item.padded_size, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Clear batch
         batch.clear();
         *current_bytes = 0;
-
-        // Notify waiters that space has been freed
         space_freed_notify.notify_waiters();
 
         Ok(())
@@ -635,111 +481,19 @@ impl NvmeStaging {
         &self.staging_dirs
     }
 
-    fn touch_in_memory_lru(&self, safe_name: &str) {
-        let mut queue = self.read_cache_lru.lock().unwrap();
-        if let Some(pos) = queue.iter().position(|item| item.0 == safe_name) {
-            if let Some(item) = queue.remove(pos) {
-                queue.push_back(item);
-            }
-        }
-    }
-
-    fn add_to_in_memory_lru(&self, safe_name: String, size: u64) {
-        let mut queue = self.read_cache_lru.lock().unwrap();
-        if let Some(pos) = queue.iter().position(|item| item.0 == safe_name) {
-            queue.remove(pos);
-        }
-        queue.push_back((safe_name, size));
-    }
-
-    /// Cache a block of read data on local NVMe, performing eviction if capacity is reached.
+    /// Cache a block of read data on local NVMe using read_nvme_cache.
     pub fn cache_read_block(&self, block_key: &str, data: &[u8]) -> Result<()> {
-        let this = self.clone();
-        let block_key = block_key.to_string();
-        let data = data.to_vec();
-        tokio::task::spawn_blocking(move || {
-            let _ = this.cache_read_block_sync(&block_key, &data);
-        });
-        Ok(())
-    }
+        let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
+        let val_bytes = Bytes::copy_from_slice(data);
+        self.read_nvme_cache.put(key_bytes, val_bytes);
 
-    fn cache_read_block_sync(&self, block_key: &str, data: &[u8]) -> Result<()> {
-        let safe_name = block_key.replace(['/', ':'], "_");
-        let idx = get_dir_index(&safe_name, self.staging_dirs.len());
-        let target_dir = self.staging_dirs[idx].join("cache");
-        let block_path = target_dir.join(format!("block_{}.block", safe_name));
-
-        if block_path.exists() {
-            self.touch_in_memory_lru(&safe_name);
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
-                let _ = file.set_times(
-                    std::fs::FileTimes::new()
-                        .set_accessed(std::time::SystemTime::now())
-                        .set_modified(std::time::SystemTime::now()),
-                );
-            }
-            return Ok(());
+        if let Some(dht) = self.dht_node.get() {
+            let dht_clone = dht.clone();
+            let key_hash = xxh3_64(block_key.as_bytes());
+            tokio::spawn(async move {
+                let _ = dht_clone.register_provider(key_hash).await;
+            });
         }
-
-        let new_data_len = data.len() as u64;
-        let current = self
-            .current_read_cache_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        if current + new_data_len > self.max_read_bytes || !check_disk_free_safeguard(&target_dir) {
-            let mut queue = self.read_cache_lru.lock().unwrap();
-            let mut freed_bytes = 0u64;
-
-            while (current + new_data_len).saturating_sub(freed_bytes) > self.max_read_bytes 
-                  || (!queue.is_empty() && !check_disk_free_safeguard(&target_dir)) 
-            {
-                if let Some((old_safe_name, size)) = queue.pop_front() {
-                    let idx = get_dir_index(&old_safe_name, self.staging_dirs.len());
-                    let t_dir = self.staging_dirs[idx].join("cache");
-                    let old_block_path = t_dir.join(format!("block_{}.block", old_safe_name));
-                    if old_block_path.exists() {
-                        if std::fs::remove_file(&old_block_path).is_ok() {
-                            freed_bytes += size;
-                            debug!(
-                                "NVMe Staging: Evicted block cache file {:?}",
-                                old_block_path
-                            );
-                        }
-                    } else {
-                        freed_bytes += size;
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            let new_current = current.saturating_sub(freed_bytes);
-            self.current_read_cache_bytes
-                .store(new_current, std::sync::atomic::Ordering::Relaxed);
-
-            if new_current + new_data_len > self.max_read_bytes || !check_disk_free_safeguard(&target_dir) {
-                warn!(
-                    "NVMe Staging: Cannot cache block {} - local storage full or safeguard active.",
-                    block_key
-                );
-                return Ok(());
-            }
-        }
-
-        let tmp_path = target_dir.join(format!("block_{}.{}.block.tmp", safe_name, Uuid::new_v4()));
-
-        fs::write(&tmp_path, data)?;
-        if let Err(e) = fs::rename(&tmp_path, &block_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(SqueezefsError::Io(e));
-        }
-        self.add_to_in_memory_lru(safe_name, new_data_len);
-        self.current_read_cache_bytes
-            .fetch_add(new_data_len, std::sync::atomic::Ordering::Relaxed);
-        debug!(
-            "NVMe Staging: Cached block {} -> {:?}",
-            block_key, block_path
-        );
 
         if let Some(p2p_addr) = self.p2p_addr.get() {
             let redis_client = self.redis_client.clone();
@@ -777,114 +531,50 @@ impl NvmeStaging {
     }
 
     pub fn current_read_cache_bytes(&self) -> u64 {
-        self.current_read_cache_bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.read_nvme_cache.current_bytes() as u64
     }
 
     pub fn read_cached_block(&self, block_key: &str) -> Option<Vec<u8>> {
         self.get_cached_read_block(block_key)
     }
 
-    /// Retrieve a cached block file if it exists locally.
     pub fn get_cached_read_block(&self, block_key: &str) -> Option<Vec<u8>> {
-        let safe_name = block_key.replace(['/', ':'], "_");
-        let idx = get_dir_index(&safe_name, self.staging_dirs.len());
-        let target_dir = self.staging_dirs[idx].join("cache");
-        let block_path = target_dir.join(format!("block_{}.block", safe_name));
-        if block_path.exists() {
-            self.touch_in_memory_lru(&safe_name);
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
-                let _ = file.set_times(
-                    std::fs::FileTimes::new()
-                        .set_accessed(std::time::SystemTime::now())
-                        .set_modified(std::time::SystemTime::now()),
-                );
-            }
-            fs::read(block_path).ok()
-        } else {
-            None
-        }
+        let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
+        let guard = self.read_nvme_cache.get(&key_bytes)?;
+        Some(guard.guard.mmap[guard.offset..guard.offset + guard.len].to_vec())
     }
 
-    /// Retrieve a range of bytes from a cached block file if it exists locally.
     pub fn get_cached_read_block_range(
         &self,
         block_key: &str,
         offset: u64,
         size: u32,
     ) -> Option<Vec<u8>> {
-        let safe_name = block_key.replace(['/', ':'], "_");
-        let idx = get_dir_index(&safe_name, self.staging_dirs.len());
-        let target_dir = self.staging_dirs[idx].join("cache");
-        let block_path = target_dir.join(format!("block_{}.block", safe_name));
-        if block_path.exists() {
-            self.touch_in_memory_lru(&safe_name);
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&block_path) {
-                let _ = file.set_times(
-                    std::fs::FileTimes::new()
-                        .set_accessed(std::time::SystemTime::now())
-                        .set_modified(std::time::SystemTime::now()),
-                );
-            }
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = fs::File::open(&block_path).ok()?;
-            let metadata = file.metadata().ok()?;
-            let file_len = metadata.len();
-
-            if offset >= file_len {
-                return Some(Vec::new());
-            }
-            let read_len = std::cmp::min(size as u64, file_len - offset) as usize;
-
-            file.seek(SeekFrom::Start(offset)).ok()?;
-            let mut buf = vec![0u8; read_len];
-            file.read_exact(&mut buf).ok()?;
-            Some(buf)
-        } else {
-            None
+        let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
+        let guard = self.read_nvme_cache.get(&key_bytes)?;
+        let start = guard.offset + offset as usize;
+        if start >= guard.offset + guard.len {
+            return Some(Vec::new());
         }
+        let read_len = std::cmp::min(size as usize, guard.len - offset as usize);
+        let end = start + read_len;
+        Some(guard.guard.mmap[start..end].to_vec())
     }
 
     pub fn list_staged_files(&self) -> Vec<String> {
-        let mut files = Vec::new();
-        for dir in &self.staging_dirs {
-            let staging_dir = dir.join("staging");
-            if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-                        if let Some(stem) = path.file_stem() {
-                            let stem_str = stem.to_string_lossy();
-                            if stem_str.starts_with("file_") {
-                                files.push(stem_str.trim_start_matches("file_").to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        files
+        self.staging_nvme_cache
+            .list_keys()
+            .into_iter()
+            .filter_map(|k| String::from_utf8(k.to_vec()).ok())
+            .collect()
     }
 
     pub fn list_cached_blocks(&self) -> Vec<String> {
-        let mut blocks = Vec::new();
-        for dir in &self.staging_dirs {
-            let cache_dir = dir.join("cache");
-            if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() && path.extension().is_some_and(|ext| ext == "block") {
-                        if let Some(stem) = path.file_stem() {
-                            let stem_str = stem.to_string_lossy();
-                            if stem_str.starts_with("block_") {
-                                blocks.push(stem_str.trim_start_matches("block_").to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        blocks
+        self.read_nvme_cache
+            .list_keys()
+            .into_iter()
+            .filter_map(|k| String::from_utf8(k.to_vec()).ok())
+            .collect()
     }
 
     pub fn max_write_bytes(&self) -> u64 {
@@ -893,20 +583,5 @@ impl NvmeStaging {
 
     pub fn max_read_bytes(&self) -> u64 {
         self.max_read_bytes
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_disk_free_safeguard_normal() {
-        let temp_dir = tempdir().unwrap();
-        let path = temp_dir.path();
-        // Under normal circumstances, the temp directory should have sufficient free space
-        // and return true. On Windows/non-Unix, it always returns true.
-        assert!(check_disk_free_safeguard(path));
     }
 }

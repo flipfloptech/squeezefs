@@ -398,44 +398,26 @@ impl SqueezefsFilesystem {
     async fn generate_stats_json(&self) -> String {
         let read_lru_keys = self.router.cache.read_lru.keys();
         let write_lru_keys = self.router.cache.write_lru.keys();
-        let nvme_staged_write_file_ids = self.router.cache.nvme.list_staged_files();
         let nvme_read_cache_block_keys = self.router.cache.nvme.list_cached_blocks();
 
-        // Scan active_writes
+        let mut nvme_staged_write_file_ids = Vec::new();
         let mut active_writes = serde_json::Map::new();
-        let staging_dir = self
-            .router
-            .cache
-            .nvme
-            .staging_dirs()
-            .first()
-            .cloned()
-            .unwrap_or_else(get_default_staging_dir);
-        let active_dir = staging_dir.join("active_writes");
-        if active_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(active_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if let Some(dir_name) = path.file_name() {
-                            let inode_name = dir_name.to_string_lossy().into_owned();
-                            let mut blocks = Vec::new();
-                            if let Ok(block_entries) = std::fs::read_dir(&path) {
-                                for block_entry in block_entries.flatten() {
-                                    let b_path = block_entry.path();
-                                    if b_path.is_file() {
-                                        if let Some(b_name) = b_path.file_name() {
-                                            blocks.push(serde_json::Value::String(
-                                                b_name.to_string_lossy().into_owned(),
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                            active_writes.insert(inode_name, serde_json::Value::Array(blocks));
-                        }
-                    }
+
+        for key in self.router.cache.nvme.list_staged_files() {
+            if key.starts_with("active_block:") {
+                let parts: Vec<&str> = key.split(':').collect();
+                if parts.len() == 3 {
+                    let inode_name = parts[1].to_string();
+                    let block_name = parts[2].to_string();
+                    active_writes
+                        .entry(inode_name)
+                        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::Value::String(block_name));
                 }
+            } else {
+                nvme_staged_write_file_ids.push(key);
             }
         }
 
@@ -618,26 +600,6 @@ impl SqueezefsFilesystem {
         let start_block = offset / block_size;
         let end_block = (offset + data.len() as u64 - 1) / block_size;
 
-        let staging_dir = self
-            .router
-            .cache
-            .nvme
-            .staging_dirs()
-            .first()
-            .cloned()
-            .unwrap_or_else(get_default_staging_dir);
-
-        let active_dir = staging_dir
-            .join("active_writes")
-            .join(format!("inode_{}", ino));
-
-        tokio::fs::create_dir_all(&active_dir).await.map_err(|e| {
-            SqueezefsError::Io(std::io::Error::other(format!(
-                "Failed to create active writes dir: {:?}",
-                e
-            )))
-        })?;
-
         let mut data_cursor = 0usize;
         for b in start_block..=end_block {
             let b_start_offset = b * block_size;
@@ -650,10 +612,12 @@ impl SqueezefsFilesystem {
             let file_data_slice = &data[data_cursor..data_cursor + slice_len];
             data_cursor += slice_len;
 
-            let block_file_path = active_dir.join(format!("block_{}", b));
+            let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
 
-            // 1. Initialize block file on disk if it doesn't exist
-            if !block_file_path.exists() {
+            // 1. Get existing block data (either from staging_nvme_cache or read from S3/cache)
+            let mut block_data = if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
+                d
+            } else {
                 let file_path = format!("inode_{}", ino);
 
                 // Try cache first
@@ -680,8 +644,8 @@ impl SqueezefsFilesystem {
                     let mut old_block_key: Option<Option<String>> = None;
 
                     // Try block_map_cache first
-                    let cache_key = (block_map_id.clone(), b as u32);
-                    if let Some(entry) = self.router.block_map_cache.get(&cache_key) {
+                    let cache_key_tuple = (block_map_id.clone(), b as u32);
+                    if let Some(entry) = self.router.block_map_cache.get(&cache_key_tuple) {
                         let (bk, cached_at) = &entry;
                         if cached_at.elapsed() < Duration::from_secs(1) {
                             old_block_key = Some(bk.clone());
@@ -738,48 +702,18 @@ impl SqueezefsFilesystem {
                         };
                     }
                 }
+                existing_block_data
+            };
 
-                if !block_file_path.exists() {
-                    tokio::fs::write(&block_file_path, &existing_block_data)
-                        .await
-                        .map_err(|e| {
-                            SqueezefsError::Io(std::io::Error::other(format!(
-                                "Failed to initialize staging block file: {:?}",
-                                e
-                            )))
-                        })?;
-                }
+            // 2. Perform seek and write range directly in memory
+            let rel_start = (write_start - b_start_offset) as usize;
+            if block_data.len() < rel_start + slice_len {
+                block_data.resize(rel_start + slice_len, 0);
             }
+            block_data[rel_start..rel_start + slice_len].copy_from_slice(file_data_slice);
 
-            // 2. Perform seek and write range directly on disk
-            use tokio::fs::OpenOptions;
-            use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .open(&block_file_path)
-                .await
-                .map_err(|e| {
-                    SqueezefsError::Io(std::io::Error::other(format!(
-                        "Failed to open staging block file for write: {:?}",
-                        e
-                    )))
-                })?;
-
-            let rel_start = write_start - b_start_offset;
-            file.seek(SeekFrom::Start(rel_start)).await.map_err(|e| {
-                SqueezefsError::Io(std::io::Error::other(format!(
-                    "Failed to seek staging block file: {:?}",
-                    e
-                )))
-            })?;
-
-            file.write_all(file_data_slice).await.map_err(|e| {
-                SqueezefsError::Io(std::io::Error::other(format!(
-                    "Failed to write staging block file slice: {:?}",
-                    e
-                )))
-            })?;
+            // 3. Write back to staging_nvme_cache
+            self.router.cache.nvme.put_active_block(&cache_key, &block_data, _fencing_token);
 
             let req = WritebackRequest {
                 ino,
@@ -797,34 +731,23 @@ impl SqueezefsFilesystem {
         ino: u64,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
-        let staging_dir = self
-            .router
-            .cache
-            .nvme
-            .staging_dirs()
-            .first()
-            .cloned()
-            .unwrap_or_else(get_default_staging_dir);
+        let file_path = format!("inode_{}", ino);
+        let prefix = format!("active_block:inode_{}:", ino);
+        let keys = self.router.cache.nvme.staging_nvme_cache.list_keys();
 
-        let active_dir = staging_dir
-            .join("active_writes")
-            .join(format!("inode_{}", ino));
+        let mut active_keys = Vec::new();
+        for key_bytes in keys {
+            let key_str = String::from_utf8(key_bytes.to_vec()).unwrap_or_default();
+            if key_str.starts_with(&prefix) {
+                active_keys.push((key_str, key_bytes));
+            }
+        }
 
-        if !active_dir.exists() {
+        if active_keys.is_empty() {
             return Ok(());
         }
 
-        let mut entries = tokio::fs::read_dir(&active_dir).await.map_err(|e| {
-            SqueezefsError::Io(std::io::Error::other(format!(
-                "Failed to read active writes dir: {:?}",
-                e
-            )))
-        })?;
-
-        let mut tasks = Vec::new();
-        let file_path = format!("inode_{}", ino);
         let meta_key = format!("metadata:{}", file_path);
-
         let mut con = self.dlm.get_connection().await?;
         let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
         let mut block_map_id = block_map_id_opt.unwrap_or_default();
@@ -833,102 +756,90 @@ impl SqueezefsFilesystem {
             let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
         }
 
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            SqueezefsError::Io(std::io::Error::other(format!(
-                "Failed to read entry: {:?}",
-                e
-            )))
-        })? {
-            let path = entry.path();
-            if path.is_file() {
-                let file_name = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                if file_name.starts_with("block_") {
-                    let b_str = file_name.trim_start_matches("block_");
-                    if let Ok(b) = b_str.parse::<u32>() {
-                        let block_data = tokio::fs::read(&path).await.map_err(|e| {
-                            SqueezefsError::Io(std::io::Error::other(format!(
-                                "Failed to read block file for upload: {:?}",
-                                e
-                            )))
-                        })?;
+        let mut tasks = Vec::new();
 
-                        let backend_clone = self.router.backend.clone();
-                        let dlm_clone = self.dlm.clone();
-                        let block_map_id_clone = block_map_id.clone();
-                        let router_clone = self.router.clone();
+        for (key_str, _key_bytes) in active_keys {
+            let b_str = key_str.trim_start_matches(&prefix);
+            if let Ok(b) = b_str.parse::<u32>() {
+                let block_data_opt = self.router.cache.nvme.read_staged(&key_str);
+                if let Some(block_data) = block_data_opt {
+                    let backend_clone = self.router.backend.clone();
+                    let dlm_clone = self.dlm.clone();
+                    let block_map_id_clone = block_map_id.clone();
+                    let router_clone = self.router.clone();
+                    let nvme_clone = self.router.cache.nvme.clone();
 
-                        tasks.push(tokio::spawn(async move {
-                            let file_uuid = uuid::Uuid::new_v4().to_string();
-                            let block_write_uuid = uuid::Uuid::new_v4().to_string();
-                            let new_block_key =
-                                format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
+                    tasks.push(tokio::spawn(async move {
+                        let file_uuid = uuid::Uuid::new_v4().to_string();
+                        let block_write_uuid = uuid::Uuid::new_v4().to_string();
+                        let new_block_key =
+                            format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
-                            let processed_block =
-                                router_clone.get_crypto().process_write(&block_data)?;
-                            backend_clone
-                                .put_object(&new_block_key, processed_block, fencing_token)
-                                .await?;
+                        let processed_block =
+                            router_clone.get_crypto().process_write(&block_data)?;
+                        backend_clone
+                            .put_object(&new_block_key, processed_block, fencing_token)
+                            .await?;
 
-                            let active_be = backend_clone.get_backend_for_key(&new_block_key);
-                            let stored_block_key = format!("{}:{}", active_be, new_block_key);
+                        let active_be = backend_clone.get_backend_for_key(&new_block_key);
+                        let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
-                            // Cache the flushed block in RAM (read_lru) - dehydrated to NVMe on eviction
-                            router_clone
-                                .cache
-                                .read_lru
-                                .put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
+                        // Cache the flushed block in RAM (read_lru) - dehydrated to NVMe on eviction
+                        router_clone
+                            .cache
+                            .read_lru
+                            .put(&stored_block_key, std::sync::Arc::new(block_data.clone()));
 
-                            let mut con = dlm_clone.get_connection().await?;
-                            let block_map_key = format!("block_map:{}", block_map_id_clone);
-                            let refcounts_key = "squeezefs:block_refcounts";
+                        let mut con = dlm_clone.get_connection().await?;
+                        let block_map_key = format!("block_map:{}", block_map_id_clone);
+                        let refcounts_key = "squeezefs:block_refcounts";
 
-                            let old_block_key: Option<String> =
-                                con.hget(&block_map_key, b.to_string()).await?;
+                        let old_block_key: Option<String> =
+                            con.hget(&block_map_key, b.to_string()).await?;
 
-                            let mut pipe = redis::pipe();
-                            pipe.hset(refcounts_key, &stored_block_key, 1).hset(
-                                &block_map_key,
-                                b.to_string(),
-                                &stored_block_key,
-                            );
-                            let _: () = pipe.query_async(&mut con).await?;
+                        let mut pipe = redis::pipe();
+                        pipe.hset(refcounts_key, &stored_block_key, 1).hset(
+                            &block_map_key,
+                            b.to_string(),
+                            &stored_block_key,
+                        );
+                        let _: () = pipe.query_async(&mut con).await?;
 
-                            // Update local block_map_cache
-                            router_clone.block_map_cache.insert(
-                                (block_map_id_clone.clone(), b),
-                                (Some(stored_block_key.clone()), std::time::Instant::now()),
-                            );
+                        // Update local block_map_cache
+                        router_clone.block_map_cache.insert(
+                            (block_map_id_clone.clone(), b),
+                            (Some(stored_block_key.clone()), std::time::Instant::now()),
+                        );
 
-                            if let Some(bk) = old_block_key {
-                                router_clone.cache.read_lru.remove(&bk);
-                                let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
-                                if let Some(mut r) = old_ref {
-                                    r -= 1;
-                                    if r <= 0 {
-                                        let _: () = redis::pipe()
-                                            .hdel(refcounts_key, &bk)
-                                            .query_async(&mut con)
-                                            .await?;
-                                        let (be_id, real_key) =
-                                            crate::backend::parse_backend_and_key(&bk);
-                                        let _ =
-                                            backend_clone.delete_object(&be_id, &real_key).await;
-                                    } else {
-                                        let _: () = con.hset(refcounts_key, &bk, r).await?;
-                                    }
-                                } else {
+                        if let Some(bk) = old_block_key {
+                            router_clone.cache.read_lru.remove(&bk);
+                            let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+                            if let Some(mut r) = old_ref {
+                                r -= 1;
+                                if r <= 0 {
+                                    let _: () = redis::pipe()
+                                        .hdel(refcounts_key, &bk)
+                                        .query_async(&mut con)
+                                        .await?;
                                     let (be_id, real_key) =
                                         crate::backend::parse_backend_and_key(&bk);
-                                    let _ = backend_clone.delete_object(&be_id, &real_key).await;
+                                    let _ =
+                                        backend_clone.delete_object(&be_id, &real_key).await;
+                                } else {
+                                    let _: () = con.hset(refcounts_key, &bk, r).await?;
                                 }
+                            } else {
+                                let (be_id, real_key) =
+                                    crate::backend::parse_backend_and_key(&bk);
+                                let _ = backend_clone.delete_object(&be_id, &real_key).await;
                             }
-                            Ok::<_, SqueezefsError>(())
-                        }));
-                    }
+                        }
+
+                        // Remove active write block from cache
+                        nvme_clone.remove_active_block(&key_str);
+
+                        Ok::<_, SqueezefsError>(())
+                    }));
                 }
             }
         }
@@ -941,13 +852,6 @@ impl SqueezefsFilesystem {
                 )))
             })??;
         }
-
-        tokio::fs::remove_dir_all(&active_dir).await.map_err(|e| {
-            SqueezefsError::Io(std::io::Error::other(format!(
-                "Failed to remove active writes dir: {:?}",
-                e
-            )))
-        })?;
 
         self.router.metadata_cache.remove(&file_path);
 
@@ -1268,54 +1172,25 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         info!("FUSE Daemon: Destroying mount. Checking for pending staged writes...");
 
-        let staging_dirs = self.router.cache.nvme.staging_dirs();
-        let mut active_writes_count = 0;
-
-        // Gracefully wait up to self.dismount_wait seconds for the background merge worker to drain staged writes to S3
+        // Gracefully wait up to self.dismount_wait seconds for background workers to drain staged writes and active writes to S3
         let start_wait = std::time::Instant::now();
         let max_wait = std::time::Duration::from_secs(self.dismount_wait);
-        let staged_count = loop {
+        let (staged_count, active_writes_count) = loop {
+            let keys = self.router.cache.nvme.list_staged_files();
             let mut current_staged = 0;
-            for dir in staging_dirs {
-                let staging_dir = dir.join("staging");
-                if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file()
-                            && path.extension().is_some_and(|ext| ext == "staged")
-                            && path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .is_some_and(|name| name.starts_with("file_"))
-                        {
-                            current_staged += 1;
-                        }
-                    }
+            let mut current_active = 0;
+            for key in keys {
+                if key.starts_with("active_block:") {
+                    current_active += 1;
+                } else {
+                    current_staged += 1;
                 }
             }
-            if current_staged == 0 || start_wait.elapsed() >= max_wait {
-                break current_staged;
+            if (current_staged == 0 && current_active == 0) || start_wait.elapsed() >= max_wait {
+                break (current_staged, current_active);
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
-
-        // Count any remaining active write transaction directories
-        for dir in staging_dirs {
-            let active_dir = dir.join("active_writes");
-            if active_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            let _ = std::fs::remove_dir(&path);
-                        }
-                    }
-                }
-                if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                    active_writes_count += entries.filter_map(|e| e.ok()).count();
-                }
-            }
-        }
 
         if staged_count > 0 || active_writes_count > 0 {
             warn!(
@@ -1715,31 +1590,21 @@ impl Filesystem for SqueezefsFilesystem {
             }
         };
 
-        // 2. Overlay any staging blocks in active_writes if they exist
-        let staging_dir = self
-            .router
-            .cache
-            .nvme
-            .staging_dirs()
-            .first()
-            .cloned()
-            .unwrap_or_else(get_default_staging_dir);
+        // 2. Overlay any active write blocks in staging_nvme_cache if they exist
+        let mut read_result = None;
+        let start_block = offset / block_size;
+        let end_block = (offset + read_len as u64 - 1) / block_size;
 
-        let active_dir = staging_dir
-            .join("active_writes")
-            .join(format!("inode_{}", ino));
-
-        if active_dir.exists() {
-            let mut read_result = vec![0u8; read_len];
-            let copy_len = std::cmp::min(read_result.len(), committed_data.len());
-            read_result[..copy_len].copy_from_slice(&committed_data[..copy_len]);
-
-            let start_block = offset / block_size;
-            let end_block = (offset + read_len as u64 - 1) / block_size;
-
-            for b in start_block..=end_block {
-                let block_file_path = active_dir.join(format!("block_{}", b));
-                if let Ok(block_data) = tokio::fs::read(&block_file_path).await {
+        for b in start_block..=end_block {
+            let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
+            if let Some(block_data) = self.router.cache.nvme.read_staged(&cache_key) {
+                if read_result.is_none() {
+                    let mut res = vec![0u8; read_len];
+                    let copy_len = std::cmp::min(res.len(), committed_data.len());
+                    res[..copy_len].copy_from_slice(&committed_data[..copy_len]);
+                    read_result = Some(res);
+                }
+                if let Some(ref mut res_vec) = read_result {
                     let b_start_offset = b * block_size;
                     let b_end_offset = b_start_offset + block_data.len() as u64;
 
@@ -1752,15 +1617,17 @@ impl Filesystem for SqueezefsFilesystem {
                         let dest_start = (overlap_start - offset) as usize;
                         let dest_end = (overlap_end - offset) as usize;
 
-                        let dest_slice = &mut read_result[dest_start..dest_end];
+                        let dest_slice = &mut res_vec[dest_start..dest_end];
                         let src_slice = &block_data[src_start..src_end];
                         dest_slice.copy_from_slice(src_slice);
                     }
                 }
             }
+        }
 
+        if let Some(overlaid_data) = read_result {
             Ok(ReplyData {
-                data: read_result.into(),
+                data: overlaid_data.into(),
             })
         } else {
             // Zero-copy path: return committed data directly without extra buffer allocation or copy
@@ -4043,7 +3910,7 @@ pub async fn start_mount<P: AsRef<Path>>(
     }
 
     let dismount_wait = fs.dismount_wait;
-    let staging_dirs = fs.router.cache.nvme.staging_dirs().to_vec();
+    let nvme_cache = fs.router.cache.nvme.clone();
 
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options);
@@ -4114,29 +3981,11 @@ pub async fn start_mount<P: AsRef<Path>>(
                 info!("Received shutdown signal. Checking staging status...");
                 let mut staged_count = 0;
                 let mut active_writes_count = 0;
-                for dir in &staging_dirs {
-                    let staging_dir = dir.join("staging");
-                    if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-                                staged_count += 1;
-                            }
-                        }
-                    }
-                    let active_dir = dir.join("active_writes");
-                    if active_dir.exists() {
-                        if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                            for entry in entries.flatten() {
-                                let path = entry.path();
-                                if path.is_dir() {
-                                    let _ = std::fs::remove_dir(&path);
-                                }
-                            }
-                        }
-                        if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                            active_writes_count += entries.filter_map(|e| e.ok()).count();
-                        }
+                for key in nvme_cache.list_staged_files() {
+                    if key.starts_with("active_block:") {
+                        active_writes_count += 1;
+                    } else {
+                        staged_count += 1;
                     }
                 }
 
@@ -4170,29 +4019,11 @@ pub async fn start_mount<P: AsRef<Path>>(
                         loop {
                             let mut current_staged = 0;
                             let mut current_active = 0;
-                            for dir in &staging_dirs {
-                                let staging_dir = dir.join("staging");
-                                if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                                    for entry in entries.flatten() {
-                                        let path = entry.path();
-                                        if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-                                            current_staged += 1;
-                                        }
-                                    }
-                                }
-                                let active_dir = dir.join("active_writes");
-                                if active_dir.exists() {
-                                    if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                                        for entry in entries.flatten() {
-                                            let path = entry.path();
-                                            if path.is_dir() {
-                                                let _ = std::fs::remove_dir(&path);
-                                            }
-                                        }
-                                    }
-                                    if let Ok(entries) = std::fs::read_dir(&active_dir) {
-                                        current_active += entries.filter_map(|e| e.ok()).count();
-                                    }
+                            for key in nvme_cache.list_staged_files() {
+                                if key.starts_with("active_block:") {
+                                    current_active += 1;
+                                } else {
+                                    current_staged += 1;
                                 }
                             }
                             if current_staged == 0 && current_active == 0 {
@@ -4580,43 +4411,20 @@ async fn flush_single_active_block(
     let _block_guard = block_lock.lock().await;
     let _cleanup_guard = BlockFlushGuard { key: (ino, b) };
 
-    let staging_dir = router.cache.nvme.staging_dirs().first().cloned();
-    let staging_dir = match staging_dir {
-        Some(d) => d,
-        None => return Ok(()),
-    };
-
-    let active_dir = staging_dir
-        .join("active_writes")
-        .join(format!("inode_{}", ino));
-    let block_path = active_dir.join(format!("block_{}", b));
-
-    if !block_path.exists() {
-        return Ok(());
-    }
+    let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
 
     // Acquire lock to avoid race conditions with active writes
-    let (block_data, block_map_id, old_block_key, mtime_before) = {
+    let (block_data, block_map_id, old_block_key) = {
         let lock = active_inode_locks
             .entry(ino)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
             .clone();
         let _guard = lock.write().await;
 
-        // Check again under lock
-        if !block_path.exists() {
-            return Ok(());
-        }
-
-        let block_data = match tokio::fs::read(&block_path).await {
-            Ok(d) => d,
-            Err(_) => return Ok(()),
+        let block_data = match router.cache.nvme.read_staged(&cache_key) {
+            Some(d) => d,
+            None => return Ok(()),
         };
-
-        let mtime_before = tokio::fs::metadata(&block_path)
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok());
 
         let file_path = format!("inode_{}", ino);
         let meta_key = format!("metadata:{}", file_path);
@@ -4631,7 +4439,7 @@ async fn flush_single_active_block(
         let block_map_key = format!("block_map:{}", block_map_id);
         let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
 
-        (block_data, block_map_id, old_block_key, mtime_before)
+        (block_data, block_map_id, old_block_key)
     };
 
     let file_uuid = uuid::Uuid::new_v4().to_string();
@@ -4639,10 +4447,14 @@ async fn flush_single_active_block(
     let new_block_key = format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
     let processed_block = router.get_crypto().process_write(&block_data)?;
-    router
+    if let Err(e) = router
         .backend
         .put_object(&new_block_key, processed_block, fencing_token)
-        .await?;
+        .await
+    {
+        error!("flush_single_active_block: Failed to upload block {} of inode {} to S3: {:?}", b, ino, e);
+        return Err(e);
+    }
 
     let active_be = router.backend.get_backend_for_key(&new_block_key);
     let stored_block_key = format!("{}:{}", active_be, new_block_key);
@@ -4707,23 +4519,8 @@ async fn flush_single_active_block(
         }
     }
 
-    // Now, verify if mtime is unchanged before deleting the file!
-    if let Some(m_before) = mtime_before {
-        if let Ok(meta) = tokio::fs::metadata(&block_path).await {
-            if let Ok(m_after) = meta.modified() {
-                if m_after == m_before {
-                    let _ = tokio::fs::remove_file(&block_path).await;
-                }
-            }
-        }
-    }
-
-    // If the directory is empty, remove it
-    if let Ok(mut entries) = tokio::fs::read_dir(&active_dir).await {
-        if entries.next_entry().await.unwrap_or(None).is_none() {
-            let _ = tokio::fs::remove_dir(&active_dir).await;
-        }
-    }
+    // Remove active write block from cache
+    router.cache.nvme.remove_active_block(&cache_key);
 
     Ok(())
 }

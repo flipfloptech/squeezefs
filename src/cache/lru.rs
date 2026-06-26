@@ -1,90 +1,39 @@
 use crate::error::Result;
-use log::info;
-use moka::notification::RemovalCause;
-use moka::sync::Cache;
-use std::sync::atomic::{AtomicU64, Ordering};
+use bytes::Bytes;
 use std::sync::Arc;
-use sysinfo::System;
 
 type EvictReceiver = tokio::sync::mpsc::UnboundedReceiver<(String, Arc<Vec<u8>>)>;
 
 #[derive(Clone)]
 pub struct LruCache {
-    inner: Cache<String, Arc<Vec<u8>>>,
+    inner: Arc<hypertier::memory::MemoryCache>,
     max_bytes: u64,
-    current_bytes: Arc<AtomicU64>,
+    evict_tx: tokio::sync::mpsc::UnboundedSender<(String, Arc<Vec<u8>>)>,
     evict_rx: Arc<std::sync::Mutex<Option<EvictReceiver>>>,
 }
 
 impl LruCache {
     pub fn new() -> Result<Self> {
         // Query host system memory
-        let mut sys = System::new();
+        let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_memory = sys.total_memory(); // In bytes
 
         // Default to 20% of system RAM
         let max_bytes = total_memory / 5;
-        info!(
-            "Unified System RAM LRU Cache: total system RAM detected = {} MB. Reserving 20% ({} MB) for block caching.",
-            total_memory / 1024 / 1024,
-            max_bytes / 1024 / 1024
-        );
-
-        let current_bytes = Arc::new(AtomicU64::new(0));
-        let current_bytes_clone = current_bytes.clone();
-
-        let (evict_tx, evict_rx) = tokio::sync::mpsc::unbounded_channel();
-        let evict_tx_clone = evict_tx.clone();
-
-        let inner = Cache::builder()
-            .weigher(|_key: &String, value: &Arc<Vec<u8>>| -> u32 {
-                value.len().try_into().unwrap_or(u32::MAX)
-            })
-            .max_capacity(max_bytes)
-            .time_to_idle(std::time::Duration::from_secs(30))
-            .eviction_listener(move |key, value: Arc<Vec<u8>>, cause| {
-                current_bytes_clone.fetch_sub(value.len() as u64, Ordering::Relaxed);
-                if cause == RemovalCause::Expired || cause == RemovalCause::Size {
-                    let _ = evict_tx_clone.send(((*key).clone(), value));
-                }
-            })
-            .build();
-
-        Ok(Self {
-            inner,
-            max_bytes,
-            current_bytes,
-            evict_rx: Arc::new(std::sync::Mutex::new(Some(evict_rx))),
-        })
+        Ok(Self::with_capacity(max_bytes))
     }
 
     /// Construct with a custom memory limit in bytes.
     pub fn with_capacity(max_bytes: u64) -> Self {
-        let current_bytes = Arc::new(AtomicU64::new(0));
-        let current_bytes_clone = current_bytes.clone();
-
+        // 16 shards for high concurrency lock-free reads, scale down for small capacities
+        let num_shards = if max_bytes < 10 * 1024 * 1024 { 1 } else { 16 };
+        let inner = Arc::new(hypertier::memory::MemoryCache::new(max_bytes as usize, num_shards));
         let (evict_tx, evict_rx) = tokio::sync::mpsc::unbounded_channel();
-        let evict_tx_clone = evict_tx.clone();
-
-        let inner = Cache::builder()
-            .weigher(|_key: &String, value: &Arc<Vec<u8>>| -> u32 {
-                value.len().try_into().unwrap_or(u32::MAX)
-            })
-            .max_capacity(max_bytes)
-            .time_to_idle(std::time::Duration::from_secs(30))
-            .eviction_listener(move |key, value: Arc<Vec<u8>>, cause| {
-                current_bytes_clone.fetch_sub(value.len() as u64, Ordering::Relaxed);
-                if cause == RemovalCause::Expired || cause == RemovalCause::Size {
-                    let _ = evict_tx_clone.send(((*key).clone(), value));
-                }
-            })
-            .build();
-
         Self {
             inner,
             max_bytes,
-            current_bytes,
+            evict_tx,
             evict_rx: Arc::new(std::sync::Mutex::new(Some(evict_rx))),
         }
     }
@@ -92,30 +41,38 @@ impl LruCache {
     /// Retrieve the eviction receiver. Can only be taken once.
     pub fn take_evict_rx(
         &self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<(String, Arc<Vec<u8>>)>> {
+    ) -> Option<EvictReceiver> {
         self.evict_rx.lock().ok()?.take()
     }
 
-    /// Retrieve an entry from the cache, updating its LRU status.
+    /// Retrieve an entry from the cache, updating its clock status.
     pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
-        self.inner.get(key)
+        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+        let val = self.inner.get(&key_bytes)?;
+        Some(Arc::new(val.to_vec()))
     }
 
-    /// Insert an entry into the cache, executing LRU eviction if maximum capacity is exceeded.
+    /// Insert an entry into the cache, executing Clock eviction if maximum capacity is exceeded.
     pub fn put(&self, key: &str, data: Arc<Vec<u8>>) {
         if (data.len() as u64) <= self.max_bytes {
-            self.current_bytes
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-            self.inner.insert(key.to_string(), data);
+            let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+            let val_bytes = Bytes::copy_from_slice(&data);
+            let evicted = self.inner.put(key_bytes, val_bytes);
+            for (ek, ev) in evicted {
+                if let Ok(k_str) = String::from_utf8(ek.to_vec()) {
+                    let _ = self.evict_tx.send((k_str, Arc::new(ev.to_vec())));
+                }
+            }
         }
     }
 
     pub fn remove(&self, key: &str) {
-        self.inner.invalidate(key);
+        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+        self.inner.remove(&key_bytes);
     }
 
     pub fn current_bytes(&self) -> u64 {
-        self.current_bytes.load(Ordering::Relaxed)
+        self.inner.current_bytes() as u64
     }
 
     pub fn max_bytes(&self) -> u64 {
@@ -123,14 +80,18 @@ impl LruCache {
     }
 
     pub fn keys(&self) -> Vec<String> {
-        self.inner.iter().map(|(k, _)| k.as_ref().clone()).collect()
+        self.inner
+            .keys()
+            .into_iter()
+            .filter_map(|k| String::from_utf8(k.to_vec()).ok())
+            .collect()
     }
 
     pub fn run_pending_tasks(&self) {
-        self.inner.run_pending_tasks();
+        // MemoryCache operations are immediate, so this is a no-op kept for API compatibility.
     }
 
     pub fn clear(&self) {
-        self.inner.invalidate_all();
+        self.inner.clear();
     }
 }

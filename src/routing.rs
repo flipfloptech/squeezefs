@@ -106,12 +106,10 @@ impl DataRouter {
             if let Ok(data) = client.download_block_from_peer(dht, block_key).await {
                 data
             } else {
-                let (be_id, real_key) = parse_backend_and_key(block_key);
-                self.backend.get_object(&be_id, &real_key).await?
+                fetch_block_bytes(&self.backend, block_key).await?
             }
         } else {
-            let (be_id, real_key) = parse_backend_and_key(block_key);
-            self.backend.get_object(&be_id, &real_key).await?
+            fetch_block_bytes(&self.backend, block_key).await?
         };
 
         let decompressed = self.get_crypto().process_read(&raw)?;
@@ -121,7 +119,7 @@ impl DataRouter {
         Ok(pooled)
     }
 
-    async fn get_cached_or_fetch_block(&self, block_key: &str) -> Result<PooledBuf> {
+    pub async fn get_cached_or_fetch_block(&self, block_key: &str) -> Result<PooledBuf> {
         loop {
             if let Some(cached_block) = self.cache.read_lru.get(block_key) {
                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -2286,5 +2284,25 @@ impl IoUringPrefetcher {
 impl Default for IoUringPrefetcher {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub async fn fetch_block_bytes(
+    backend: &crate::backend::MultiBackendClient,
+    bk: &str,
+) -> Result<Vec<u8>> {
+    let (be_id, real_key) = crate::backend::parse_backend_and_key(bk);
+    if real_key.starts_with("s3_single:") {
+        let parts: Vec<&str> = real_key.split(':').collect();
+        if parts.len() == 4 {
+            let s3_key = parts[1];
+            let start: u64 = parts[2].parse().unwrap_or(0);
+            let end: u64 = parts[3].parse().unwrap_or(0);
+            Ok(backend.get_object_range(&be_id, s3_key, start, end).await?)
+        } else {
+            Ok(backend.get_object(&be_id, &real_key).await?)
+        }
+    } else {
+        Ok(backend.get_object(&be_id, &real_key).await?)
     }
 }

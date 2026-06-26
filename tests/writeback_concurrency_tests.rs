@@ -293,6 +293,11 @@ async fn test_delayed_deletion_under_concurrent_writes() {
         .await
         .expect("Second flush should succeed");
 
+    fs_arc
+        .release(req, ino, 0, 0, 0, false)
+        .await
+        .expect("Release should succeed");
+
     // Staging file should now be deleted because no other write changed mtime
     assert!(
         fs_arc.router.cache.nvme.read_staged(&cache_key).is_none(),
@@ -358,11 +363,15 @@ async fn test_rmw_cache_ingestion() {
         .collect();
     println!("NVMe keys before flush: {:?}", keys_before);
 
-    // 2. Flush to S3 (this registers it in S3 and deletes the staging block)
+    // 2. Flush to S3 and release (this registers it in S3 and deletes the staging block)
     fs_arc
         .flush(req, ino, 0, 0)
         .await
         .expect("Flush should succeed");
+    fs_arc
+        .release(req, ino, 0, 0, 0, false)
+        .await
+        .expect("Release should succeed");
 
     // Print keys after flush
     let keys_after: Vec<String> = fs_arc
@@ -575,26 +584,10 @@ async fn test_background_writeback_flushes_multi_block_inode_without_explicit_fl
     let active_prefix = format!("active_block:inode_{}:", ino);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let block_map_id = con
-                .hget::<_, _, Option<String>>(&meta_key, "block_map_id")
-                .await
-                .unwrap_or(None);
-            let block_count = if let Some(block_map_id) = block_map_id.as_deref() {
-                let block_map_key = format!("block_map:{}", block_map_id);
-                con.hlen::<_, usize>(&block_map_key).await.unwrap_or(0)
-            } else {
-                0
-            };
-            let remaining_active_blocks = fs
-                .router
-                .cache
-                .nvme
-                .list_staged_files()
-                .into_iter()
-                .filter(|key| key.starts_with(&active_prefix))
-                .count();
-
-            if block_count >= 2 && remaining_active_blocks == 0 {
+            // Check that background writeback worker has successfully uploaded the 2 parts
+            let parts_key = format!("squeezefs:multipart_parts:{}", ino);
+            let parts_count = con.hlen::<_, usize>(&parts_key).await.unwrap_or(0);
+            if parts_count >= 2 {
                 break;
             }
 
@@ -603,6 +596,31 @@ async fn test_background_writeback_flushes_multi_block_inode_without_explicit_fl
     })
     .await
     .expect("background writeback should flush both striped blocks without an explicit flush");
+
+    // Complete the multipart upload
+    fs.release(req, ino, 0, 0, 0, false).await.expect("Release should succeed");
+
+    let block_map_id = con
+        .hget::<_, _, Option<String>>(&meta_key, "block_map_id")
+        .await
+        .unwrap_or(None);
+    let block_count = if let Some(block_map_id) = block_map_id.as_deref() {
+        let block_map_key = format!("block_map:{}", block_map_id);
+        con.hlen::<_, usize>(&block_map_key).await.unwrap_or(0)
+    } else {
+        0
+    };
+    let remaining_active_blocks = fs
+        .router
+        .cache
+        .nvme
+        .list_staged_files()
+        .into_iter()
+        .filter(|key| key.starts_with(&active_prefix))
+        .count();
+
+    assert!(block_count >= 2);
+    assert_eq!(remaining_active_blocks, 0);
 
     assert_eq!(
         backend.mock_get_count(),

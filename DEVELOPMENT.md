@@ -10,7 +10,7 @@ Here is a comprehensive, senior-level architectural analysis and technical work 
 
 ## 0. Current Repository Snapshot
 
-*Overall Status*: Mixed. The repository already contains meaningful groundwork for allocator tuning, worker-core pinning, DHT-based P2P lookup, lease/fencing DLM, `/dev/fuse` `io_uring`, predictive striped-read prefetching, and several striped write-path optimizations. It does not yet satisfy the end-state described for a 20,000-node deployment, and several tasks below remain partial or unimplemented.
+*Overall Status*: Mixed. The repository already contains meaningful groundwork for allocator tuning, worker-core pinning, DHT-based P2P lookup, lease/fencing DLM, `/dev/fuse` `io_uring`, predictive striped-read prefetching, several striped write-path optimizations, and full format-based bucket/cache wiping. It does not yet satisfy the end-state described for a 20,000-node deployment, and several tasks below remain partial or unimplemented.
 
 ---
 
@@ -127,7 +127,9 @@ This section is divided into actionable Epics for the engineering team.
 * **Task 5.3: GPU Direct Storage (GDS) Hardening**
 * *Action*: Audit `src/cache/gds.rs` against NVIDIA's `libcufile`. Ensure DMA transfers from local NVMe flow directly to GPU VRAM over the PCIe bus, bypassing the host CPU and System RAM entirely.
 * *Status*: Partially implemented. `src/cache/gds.rs` can detect a GPU environment, load `libcufile.so`, register file handles, and issue `cuFileRead` calls directly into VRAM when the `gds` feature is enabled. The broader audit, operational hardening, and integration into the default read path remain incomplete.
-
+* **Task 5.4: Volume Formatting Cleanup Hardening**
+* *Action*: Ensure that formatting SqueezeFS (`format_volume_ext`) performs a complete destruction/reset of all existing metadata (flushing all Redis/Garnet nodes), all backend S3 object buckets, and all local client staging/cache directories (recursively deleting cached blocks and `.gds_cache` files).
+* *Status*: Fully implemented. Added automatic lookup and recursive deletion of existing local staging/cache directories using `tokio::fs::remove_dir_all` before recreating them empty during format. Verified with a new comprehensive integration test suite `tests/format_wipes_all_tests.rs`.
 
 
 ---

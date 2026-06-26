@@ -1,4 +1,19 @@
-use redis::AsyncCommands;
+/*
+ * SqueezeFS, Copyright 2026 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 use squeezefs::backend::RustFsClient;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
@@ -21,14 +36,11 @@ async fn get_dlm_client() -> Option<DlmClient> {
 
 async fn clear_garnet_keys(dlm: &DlmClient) {
     if let Ok(mut con) = dlm.meta_client().get_connection().await {
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg("block_peers:*")
+        let _: () = redis::cmd("DEL")
+            .arg("squeezefs:active_clients")
             .query_async(&mut con)
             .await
             .unwrap_or_default();
-        for key in keys {
-            let _: () = con.del(key).await.unwrap_or_default();
-        }
     }
 }
 
@@ -63,33 +75,9 @@ async fn test_p2p_happy_path() {
 
     // Start P2P server A
     let server_a = P2pServer::new(p2p_addr_a.clone(), router_a.cache.nvme.clone());
-    let server_task = tokio::spawn(async move {
+    let server_task_a = tokio::spawn(async move {
         let _ = server_a.run().await;
     });
-
-    // Write a block locally to A's cache and register it
-    let block_key = "backend_0/part_happy_p2p";
-    let block_data = vec![42u8; 1000];
-    router_a
-        .cache
-        .nvme
-        .cache_read_block(block_key, &block_data)
-        .expect("Should cache locally on A");
-
-    // Wait a brief moment to ensure registration and server startup
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Verify registration on Garnet
-    let mut con = dlm_a
-        .get_connection()
-        .await
-        .expect("Should connect to Garnet");
-    let safe_name = block_key.replace(['/', ':'], "_");
-    let peers: Vec<String> = con
-        .smembers(format!("block_peers:{}", safe_name))
-        .await
-        .expect("Should get members");
-    assert!(peers.contains(&p2p_addr_a));
 
     // Setup Node B (client)
     let dlm_b = DlmClient::new(&get_redis_url()).unwrap();
@@ -109,141 +97,49 @@ async fn test_p2p_happy_path() {
     .expect("Should create cache B");
     let _ = cache_b.nvme.p2p_addr.set(p2p_addr_b.clone());
 
-    let _router_b = DataRouter::new(dlm_b.clone(), backend_b, cache_b);
+    let router_b = DataRouter::new(dlm_b.clone(), backend_b, cache_b);
+
+    // Start P2P server B so B has a DHT node initialized
+    let server_b = P2pServer::new(p2p_addr_b.clone(), router_b.cache.nvme.clone());
+    let server_task_b = tokio::spawn(async move {
+        let _ = server_b.run().await;
+    });
+
+    // Wait a brief moment to ensure server startup
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Get the DHT nodes
+    let dht_a = router_a.cache.nvme.dht_node.get().expect("A's DHT Node should be set");
+    let dht_b = router_b.cache.nvme.dht_node.get().expect("B's DHT Node should be set");
+
+    // Link them manually
+    dht_a.add_peer(p2p_addr_b.clone());
+    dht_b.add_peer(p2p_addr_a.clone());
+
+    // Write a block locally to A's cache and register it in DHT
+    let block_key = "backend_0/part_happy_p2p";
+    let block_data = vec![42u8; 1000];
+    router_a
+        .cache
+        .nvme
+        .cache_read_block(block_key, &block_data)
+        .expect("Should cache locally on A");
+
+    // Wait for DHT registration to propagate locally
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Read the block from B using P2P client
     let client = P2pClient::new();
     let downloaded = client
-        .download_block_from_peer(&p2p_addr_a, block_key)
+        .download_block_from_peer(dht_b, block_key)
         .await
         .expect("Should download block from peer A");
 
     assert_eq!(downloaded, block_data);
 
-    // Clean up server
-    server_task.abort();
-}
-
-#[tokio::test]
-async fn test_p2p_fallback_path() {
-    let dlm = match get_dlm_client().await {
-        Some(d) => d,
-        None => {
-            println!("Skipping test: Redis/Garnet not available");
-            return;
-        }
-    };
-    clear_garnet_keys(&dlm).await;
-
-    // S3 mock client prepopulated with block data
-    let backend = RustFsClient::new_mock();
-    let block_key = "backend_0/part_fallback_p2p/part_0";
-    let block_data = vec![77u8; 1000];
-    backend
-        .put_object(block_key, block_data.clone(), 0)
-        .await
-        .expect("Should seed mock S3 block");
-
-    // Register a dead/non-responsive peer in Garnet for this block
-    let dead_peer = "127.0.0.1:29098".to_string();
-    let safe_name = block_key.replace(['/', ':'], "_");
-    let mut con = dlm.get_connection().await.expect("Should connect");
-    let _: () = con
-        .sadd(format!("block_peers:{}", safe_name), &dead_peer)
-        .await
-        .expect("Should sadd");
-
-    let temp_dir = tempdir().unwrap();
-    let cache = TieredCache::new(
-        vec![temp_dir.path().to_path_buf()],
-        None,
-        None,
-        None,
-        None,
-        backend.clone(),
-        dlm.meta_client().clone(),
-    )
-    .expect("Should create cache");
-    let _ = cache.nvme.p2p_addr.set("127.0.0.1:29101".to_string());
-
-    let router = DataRouter::new(dlm.clone(), backend, cache);
-
-    // Write metadata for striped file using this block
-    let file_path = "fallback_striped.bin";
-    let mut con_meta = dlm.get_connection().await.unwrap();
-    let meta_key = format!("metadata:{}", file_path);
-    let _: () = redis::pipe()
-        .hset(&meta_key, "type", "striped")
-        .hset(&meta_key, "size", 1000u64)
-        .hset(&meta_key, "block_prefix", "backend_0/part_fallback_p2p")
-        .query_async(&mut con_meta)
-        .await
-        .unwrap();
-
-    // Read range: should attempt dead peer, fail-fast (timeout), and successfully fallback to S3
-    let read_res = router
-        .read_file_range(file_path, 0, 1000)
-        .await
-        .expect("Should read range via S3 fallback");
-
-    assert_eq!(read_res, block_data);
-
-    // Wait a brief moment to ensure asynchronous registration has completed
-    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-
-    // Assert B registered itself in Garnet since it downloaded and cached the block
-    let peers: Vec<String> = con_meta
-        .smembers(format!("block_peers:{}", safe_name))
-        .await
-        .unwrap();
-    assert!(peers.contains(&"127.0.0.1:29101".to_string()));
-}
-
-#[tokio::test]
-async fn test_p2p_ttl_expiration() {
-    let dlm = match get_dlm_client().await {
-        Some(d) => d,
-        None => {
-            println!("Skipping test: Redis/Garnet not available");
-            return;
-        }
-    };
-    clear_garnet_keys(&dlm).await;
-
-    let temp_dir = tempdir().unwrap();
-    let backend = RustFsClient::new_mock();
-    let cache = TieredCache::new(
-        vec![temp_dir.path().to_path_buf()],
-        None,
-        None,
-        None,
-        None,
-        backend.clone(),
-        dlm.meta_client().clone(),
-    )
-    .expect("Should create cache");
-    let _ = cache.nvme.p2p_addr.set("127.0.0.1:29102".to_string());
-
-    let block_key = "backend_0/part_ttl_p2p";
-    // Directly cache block to trigger registration with expiration (we can mock local registration or just test the key expiration)
-    cache
-        .nvme
-        .cache_read_block(block_key, &[1, 2, 3])
-        .expect("Should cache");
-
-    // Wait a brief moment to make sure async task completes registration
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let mut con = dlm.get_connection().await.unwrap();
-    let safe_name = block_key.replace(['/', ':'], "_");
-    let ttl: i64 = redis::cmd("TTL")
-        .arg(format!("block_peers:{}", safe_name))
-        .query_async(&mut con)
-        .await
-        .unwrap_or(0);
-
-    // TTL should be positive (and <= 60 seconds)
-    assert!(ttl > 0 && ttl <= 60);
+    // Clean up
+    server_task_a.abort();
+    server_task_b.abort();
 }
 
 #[tokio::test]
@@ -278,7 +174,7 @@ async fn test_p2p_cooperative_read_after_write() {
 
     // Start P2P server A
     let server_a = P2pServer::new(p2p_addr_a.clone(), router_a.cache.nvme.clone());
-    let server_task = tokio::spawn(async move {
+    let server_task_a = tokio::spawn(async move {
         let _ = server_a.run().await;
     });
 
@@ -303,7 +199,7 @@ async fn test_p2p_cooperative_read_after_write() {
         .unwrap();
 
     let write_data = vec![99u8; 1000];
-    // Node A writes the block. This caches it on Node A and registers it under block_peers
+    // Node A writes the block. This caches it on Node A and registers it in DHT
     router_a
         .cache
         .nvme
@@ -338,8 +234,24 @@ async fn test_p2p_cooperative_read_after_write() {
 
     let router_b = DataRouter::new(dlm_b.clone(), backend_b, cache_b);
 
+    // Start P2P server B so B has a DHT node initialized
+    let server_b = P2pServer::new(p2p_addr_b.clone(), router_b.cache.nvme.clone());
+    let server_task_b = tokio::spawn(async move {
+        let _ = server_b.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Get the DHT nodes
+    let dht_a = router_a.cache.nvme.dht_node.get().expect("A's DHT Node should be set");
+    let dht_b = router_b.cache.nvme.dht_node.get().expect("B's DHT Node should be set");
+
+    // Link them manually
+    dht_a.add_peer(p2p_addr_b.clone());
+    dht_b.add_peer(p2p_addr_a.clone());
+
     // Node B reads the file range.
-    // Since Node A has registered itself as a peer for this block, Node B should read it
+    // Since Node A has registered itself as a peer for this block in the DHT, Node B should read it
     // directly from Node A's cache (returning write_data: vec![99; 1000]) instead of S3 (which has vec![0; 1000]).
     let read_res = router_b
         .read_file_range(file_path, 0, 1000)
@@ -348,43 +260,13 @@ async fn test_p2p_cooperative_read_after_write() {
 
     assert_eq!(read_res, write_data);
 
-    // Clean up server
-    server_task.abort();
+    // Clean up
+    server_task_a.abort();
+    server_task_b.abort();
 }
 
 #[tokio::test]
-async fn test_p2p_fast_fail_timeout() {
-    // Start a dummy TCP server that accepts connections but never responds
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-
-    // Spawn task to accept connection but just hold/sleep
-    let _handle = tokio::spawn(async move {
-        if let Ok((_stream, _)) = listener.accept().await {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    });
-
-    let client = P2pClient::new();
-    let start = std::time::Instant::now();
-    let res = client.download_block_from_peer(&addr, "test_block").await;
-    let elapsed = start.elapsed();
-
-    assert!(res.is_err(), "Expected timeout error");
-    assert!(
-        elapsed >= Duration::from_millis(50),
-        "Should take at least 50ms, got {}ms",
-        elapsed.as_millis()
-    );
-    assert!(
-        elapsed < Duration::from_millis(150),
-        "Should time out well before 300ms (timeout target is 50ms), got {}ms",
-        elapsed.as_millis()
-    );
-}
-
-#[tokio::test]
-async fn test_p2p_random_subset_limit() {
+async fn test_p2p_fallback_path() {
     let dlm = match get_dlm_client().await {
         Some(d) => d,
         None => {
@@ -396,46 +278,13 @@ async fn test_p2p_random_subset_limit() {
 
     // S3 mock client prepopulated with block data
     let backend = RustFsClient::new_mock();
-    let block_key = "backend_0/part_random_subset/part_0";
-    let block_data = vec![88u8; 1000];
+    let block_key = "backend_0/part_fallback_p2p/part_0";
+    let block_data = vec![77u8; 1000];
     backend
         .put_object(block_key, block_data.clone(), 0)
         .await
         .expect("Should seed mock S3 block");
 
-    // Start 5 dummy listeners
-    let mut listeners = Vec::new();
-    let mut dead_peers = Vec::new();
-    for _ in 0..5 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        dead_peers.push(addr);
-        listeners.push(listener);
-    }
-
-    let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    // Accept connections but don't respond
-    for listener in listeners {
-        let conn_count = connection_count.clone();
-        tokio::spawn(async move {
-            if let Ok((_stream, _)) = listener.accept().await {
-                conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-            }
-        });
-    }
-
-    // Register all 5 dead/non-responsive peers in Garnet
-    let safe_name = block_key.replace(['/', ':'], "_");
-    let mut con = dlm.get_connection().await.expect("Should connect");
-    for peer in &dead_peers {
-        let _: () = con
-            .sadd(format!("block_peers:{}", safe_name), peer)
-            .await
-            .expect("Should sadd");
-    }
-
     let temp_dir = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![temp_dir.path().to_path_buf()],
@@ -447,206 +296,58 @@ async fn test_p2p_random_subset_limit() {
         dlm.meta_client().clone(),
     )
     .expect("Should create cache");
-    // Ensure we don't match own address
-    let _ = cache.nvme.p2p_addr.set("127.0.0.1:29105".to_string());
+    let p2p_addr = "127.0.0.1:29101".to_string();
+    let _ = cache.nvme.p2p_addr.set(p2p_addr.clone());
 
     let router = DataRouter::new(dlm.clone(), backend, cache);
 
+    // Start P2P server so DHT node is initialized
+    let server = P2pServer::new(p2p_addr.clone(), router.cache.nvme.clone());
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let dht = router.cache.nvme.dht_node.get().expect("DHT Node should be set");
+    
+    // Add a dead peer to DHT routing table
+    dht.add_peer("127.0.0.1:29098".to_string());
+
+    // Register the dead peer as provider of this block key hash in the DHT.
+    // We send a RegisterProvider message to our own DHT node claiming that the dead peer is the provider.
+    let key_hash = xxhash_rust::xxh3::xxh3_64(block_key.as_bytes());
+    
+    // Send register message to our own listener
+    let mut stream = tokio::net::TcpStream::connect(&p2p_addr).await.unwrap();
+    let reg_msg = hypertier::dht::Message::RegisterProvider {
+        key_hash,
+        provider_addr: "127.0.0.1:29098".to_string(),
+    };
+    hypertier::dht::write_msg(&mut stream, &reg_msg).await.unwrap();
+    
+    // Wait for registration
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
     // Write metadata for striped file using this block
-    let file_path = "random_subset.bin";
+    let file_path = "fallback_striped.bin";
     let mut con_meta = dlm.get_connection().await.unwrap();
     let meta_key = format!("metadata:{}", file_path);
     let _: () = redis::pipe()
         .hset(&meta_key, "type", "striped")
         .hset(&meta_key, "size", 1000u64)
-        .hset(&meta_key, "block_prefix", "backend_0/part_random_subset")
+        .hset(&meta_key, "block_prefix", "backend_0/part_fallback_p2p")
         .query_async(&mut con_meta)
         .await
         .unwrap();
 
-    // Read range: should try at most 3 peers, each timing out in 50ms, then fallback to S3.
-    let start = std::time::Instant::now();
+    // Read range: should attempt dead peer, fail, and successfully fallback to S3
     let read_res = router
         .read_file_range(file_path, 0, 1000)
         .await
         .expect("Should read range via S3 fallback");
-    let elapsed = start.elapsed();
 
     assert_eq!(read_res, block_data);
-
-    // Assert we queried exactly 3 peers
-    let count = connection_count.load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(
-        count, 3,
-        "Expected exactly 3 peers to be queried, got {}",
-        count
-    );
-
-    // Assert the timing is reasonable (should be around 150ms, definitely < 240ms)
-    assert!(
-        elapsed < Duration::from_millis(240),
-        "Elapsed time {}ms is too high; queried too many peers?",
-        elapsed.as_millis()
-    );
-}
-
-#[tokio::test]
-async fn test_leased_peer_keepalive_and_pruning() {
-    let dlm = match get_dlm_client().await {
-        Some(d) => d,
-        None => {
-            println!("Skipping test: Redis/Garnet not available");
-            return;
-        }
-    };
-    clear_garnet_keys(&dlm).await;
-
-    // Set up a mock NvmeStaging and P2pServer
-    let temp_dir = tempdir().unwrap();
-    let backend = RustFsClient::new_mock();
-    let cache = TieredCache::new(
-        vec![temp_dir.path().to_path_buf()],
-        None,
-        None,
-        None,
-        None,
-        backend.clone(),
-        dlm.meta_client().clone(),
-    )
-    .expect("Should create cache");
-
-    let p2p_addr = "127.0.0.1:29110".to_string();
-    let _ = cache.nvme.p2p_addr.set(p2p_addr.clone());
-
-    // Start P2pServer which will run the heartbeat and health checker loops
-    let server = P2pServer::new(p2p_addr.clone(), cache.nvme.clone());
-    let server_clone = server.clone();
-    let server_task = tokio::spawn(async move {
-        let _ = server_clone.run().await;
-    });
-
-    // Wait 200ms to ensure the first heartbeat registers the client
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Verify registration in squeezefs:active_clients (Sorted Set)
-    let mut con = dlm.get_connection().await.unwrap();
-    let score: Option<f64> = redis::cmd("ZSCORE")
-        .arg("squeezefs:active_clients")
-        .arg(&p2p_addr)
-        .query_async(&mut con)
-        .await
-        .unwrap();
-
-    assert!(
-        score.is_some(),
-        "Client P2P address should be registered in squeezefs:active_clients"
-    );
-
-    // Verify that cache_read_block registers peer blocks correctly
-    let test_block_key = "backend_0/part_coop_test/part_1";
-    cache
-        .nvme
-        .cache_read_block(test_block_key, &[1, 2, 3])
-        .unwrap();
-
-    // Wait a brief moment for registration
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Check if test_block_key is added to squeezefs:peer_blocks:<p2p_addr>
-    let is_block_registered: bool = con
-        .sismember(
-            format!("squeezefs:peer_blocks:{}", p2p_addr),
-            test_block_key,
-        )
-        .await
-        .unwrap();
-    assert!(
-        is_block_registered,
-        "Block key should be added to peer_blocks set"
-    );
-
-    // Seed a dead peer in Garnet (in the health check schedule and block_peers)
-    let dead_peer = "127.0.0.1:29111".to_string();
-    let block_key = "backend_0/part_prune_test/part_0";
-    let safe_name = block_key.replace(['/', ':'], "_");
-
-    // Add dead peer to block_peers set
-    let _: () = con
-        .sadd(format!("block_peers:{}", safe_name), &dead_peer)
-        .await
-        .unwrap();
-
-    // Add block mapping to squeezefs:peer_blocks:<dead_peer>
-    let _: () = con
-        .sadd(format!("squeezefs:peer_blocks:{}", dead_peer), block_key)
-        .await
-        .unwrap();
-
-    // Add dead peer to health check schedule with next check time = now (meaning it should be checked immediately)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let _: () = redis::cmd("ZADD")
-        .arg("squeezefs:peer_health_check_schedule")
-        .arg(now)
-        .arg(&dead_peer)
-        .query_async(&mut con)
-        .await
-        .unwrap();
-
-    // Add dead peer to squeezefs:active_clients to simulate it was active
-    let _: () = redis::cmd("ZADD")
-        .arg("squeezefs:active_clients")
-        .arg(now + 30)
-        .arg(&dead_peer)
-        .query_async(&mut con)
-        .await
-        .unwrap();
-
-    // Call the check and prune method directly
-    server
-        .check_and_prune_peers()
-        .await
-        .expect("Pruning should succeed");
-
-    // Verify dead peer is pruned from squeezefs:peer_health_check_schedule
-    let dead_score: Option<f64> = redis::cmd("ZSCORE")
-        .arg("squeezefs:peer_health_check_schedule")
-        .arg(&dead_peer)
-        .query_async(&mut con)
-        .await
-        .unwrap();
-    assert!(
-        dead_score.is_none(),
-        "Dead peer should be pruned from schedule"
-    );
-
-    // Verify dead peer is pruned from squeezefs:active_clients
-    let active_score: Option<f64> = redis::cmd("ZSCORE")
-        .arg("squeezefs:active_clients")
-        .arg(&dead_peer)
-        .query_async(&mut con)
-        .await
-        .unwrap();
-    assert!(
-        active_score.is_none(),
-        "Dead peer should be pruned from active clients"
-    );
-
-    // Verify dead peer is pruned from block_peers set
-    let is_member: bool = con
-        .sismember(format!("block_peers:{}", safe_name), &dead_peer)
-        .await
-        .unwrap();
-    assert!(!is_member, "Dead peer should be pruned from block_peers");
-
-    // Verify squeezefs:peer_blocks:<dead_peer> key is deleted
-    let exists: bool = con
-        .exists(format!("squeezefs:peer_blocks:{}", dead_peer))
-        .await
-        .unwrap();
-    assert!(!exists, "peer_blocks list should be deleted");
 
     server_task.abort();
 }

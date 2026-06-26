@@ -1,3 +1,19 @@
+/*
+ * SqueezeFS, Copyright 2026 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 use redis::AsyncCommands;
 use squeezefs::backend::RustFsClient;
 use squeezefs::recovery::recover_staging;
@@ -8,18 +24,18 @@ fn get_redis_url() -> String {
     std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
 }
 
+async fn get_dlm_client() -> Option<redis::Client> {
+    let url = get_redis_url();
+    let client = redis::Client::open(url).ok()?;
+    let _con = client.get_multiplexed_tokio_connection().await.ok()?;
+    Some(client)
+}
+
 #[tokio::test]
 async fn test_crash_recovery_flow() {
-    let redis_url = get_redis_url();
-    let redis_client = match redis::Client::open(redis_url.clone()) {
-        Ok(c) => {
-            if c.get_multiplexed_tokio_connection().await.is_err() {
-                println!("Skipping test: Redis/Garnet not available");
-                return;
-            }
-            c
-        }
-        Err(_) => {
+    let redis_client = match get_dlm_client().await {
+        Some(c) => c,
+        None => {
             println!("Skipping test: Redis/Garnet not available");
             return;
         }
@@ -33,10 +49,16 @@ async fn test_crash_recovery_flow() {
     let data = vec![8; 2000];
     let fencing_token = 500u64;
 
-    // 1. Manually write the local staging file to simulate a crash before flush
-    let staging_dir = temp_dir.path().join("staging");
-    fs::create_dir_all(&staging_dir).unwrap();
-    let staged_path = staging_dir.join(format!("file_{}.staged", file_id));
+    // 1. Initialize NvmeCache and write a staged entry to simulate a crash before flush
+    let staging_segment_dir = temp_dir.path().join("staging_segment");
+    fs::create_dir_all(&staging_segment_dir).unwrap();
+
+    let cache = hypertier::nvme::NvmeCache::new(
+        &[staging_segment_dir.as_path()],
+        &[5 * 1024 * 1024],
+        1, // 1 shard for tests
+    )
+    .unwrap();
 
     let meta_content = serde_json::json!({
         "file_path": file_path,
@@ -51,7 +73,12 @@ async fn test_crash_recovery_flow() {
     packed_payload.extend_from_slice(&meta_json_bytes);
     packed_payload.extend_from_slice(&data);
 
-    fs::write(&staged_path, &packed_payload).unwrap();
+    let key_bytes = bytes::Bytes::copy_from_slice(file_id.as_bytes());
+    let val_bytes = bytes::Bytes::copy_from_slice(&packed_payload);
+    cache.put(key_bytes, val_bytes);
+
+    // Drop the cache to ensure all file handles are closed
+    drop(cache);
 
     // 2. Set the metadata in Garnet matching the staging ID (simulating active write)
     let mut con = redis_client
@@ -60,6 +87,7 @@ async fn test_crash_recovery_flow() {
         .unwrap();
     let meta_key = format!("metadata:{}", file_path);
     let _: () = redis::pipe()
+        .hset("squeezefs:format", "write_disk_limit", "5MB")
         .hset(&meta_key, "size", data.len())
         .hset(&meta_key, "type", "staged")
         .hset(&meta_key, "file_id", file_id)
@@ -69,15 +97,24 @@ async fn test_crash_recovery_flow() {
         .unwrap();
 
     let meta_client = squeezefs::dlm::MetaClient::Single(redis_client.clone());
-    // 3. Execute recovery
+    
+    // 3. Execute recovery (passing the parent staging directory which contains staging_segment)
     let recovered = recover_staging(temp_dir.path(), &mock_backend, &meta_client)
         .await
         .expect("Recovery should complete");
 
     assert_eq!(recovered, 1);
 
-    // 4. Verify local staging files are cleaned up
-    assert!(!staged_path.exists());
+    // 4. Verify local staging keys are cleaned up from NvmeCache
+    let cache_after = hypertier::nvme::NvmeCache::new(
+        &[staging_segment_dir.as_path()],
+        &[5 * 1024 * 1024],
+        1,
+    )
+    .unwrap();
+    cache_after.recover_index();
+    let check_key = bytes::Bytes::copy_from_slice(file_id.as_bytes());
+    assert!(cache_after.get(&check_key).is_none(), "Staged entry should be cleaned up from cache");
 
     // 5. Verify Garnet mapping has been recorded
     let mapping_key = format!("mapping:{}", file_id);
@@ -92,16 +129,9 @@ async fn test_crash_recovery_flow() {
 
 #[tokio::test]
 async fn test_stale_write_recovery_discard() {
-    let redis_url = get_redis_url();
-    let redis_client = match redis::Client::open(redis_url.clone()) {
-        Ok(c) => {
-            if c.get_multiplexed_tokio_connection().await.is_err() {
-                println!("Skipping test: Redis/Garnet not available");
-                return;
-            }
-            c
-        }
-        Err(_) => {
+    let redis_client = match get_dlm_client().await {
+        Some(c) => c,
+        None => {
             println!("Skipping test: Redis/Garnet not available");
             return;
         }
@@ -115,10 +145,16 @@ async fn test_stale_write_recovery_discard() {
     let data = vec![9; 1000];
     let fencing_token = 500u64;
 
-    // 1. Manually write the local staging file
-    let staging_dir = temp_dir.path().join("staging");
-    fs::create_dir_all(&staging_dir).unwrap();
-    let staged_path = staging_dir.join(format!("file_{}.staged", file_id));
+    // 1. Initialize NvmeCache and write a staged entry
+    let staging_segment_dir = temp_dir.path().join("staging_segment");
+    fs::create_dir_all(&staging_segment_dir).unwrap();
+
+    let cache = hypertier::nvme::NvmeCache::new(
+        &[staging_segment_dir.as_path()],
+        &[5 * 1024 * 1024],
+        1, // 1 shard for tests
+    )
+    .unwrap();
 
     let meta_content = serde_json::json!({
         "file_path": file_path,
@@ -133,7 +169,12 @@ async fn test_stale_write_recovery_discard() {
     packed_payload.extend_from_slice(&meta_json_bytes);
     packed_payload.extend_from_slice(&data);
 
-    fs::write(&staged_path, &packed_payload).unwrap();
+    let key_bytes = bytes::Bytes::copy_from_slice(file_id.as_bytes());
+    let val_bytes = bytes::Bytes::copy_from_slice(&packed_payload);
+    cache.put(key_bytes, val_bytes);
+
+    // Drop the cache to ensure all file handles are closed
+    drop(cache);
 
     // 2. Set the metadata in Garnet pointing to a DIFFERENT file_id (newer write occurred since crash)
     let mut con = redis_client
@@ -142,6 +183,7 @@ async fn test_stale_write_recovery_discard() {
         .unwrap();
     let meta_key = format!("metadata:{}", file_path);
     let _: () = redis::pipe()
+        .hset("squeezefs:format", "write_disk_limit", "5MB")
         .hset(&meta_key, "size", 4000)
         .hset(&meta_key, "type", "staged")
         .hset(&meta_key, "file_id", "newer-uuid-3333") // Different ID!
@@ -151,6 +193,7 @@ async fn test_stale_write_recovery_discard() {
         .unwrap();
 
     let meta_client = squeezefs::dlm::MetaClient::Single(redis_client.clone());
+    
     // 3. Execute recovery
     let recovered = recover_staging(temp_dir.path(), &mock_backend, &meta_client)
         .await
@@ -159,8 +202,16 @@ async fn test_stale_write_recovery_discard() {
     // Should NOT recover the file because it is stale
     assert_eq!(recovered, 0);
 
-    // 4. Stale local staging files should still be cleaned up to prevent disk leak
-    assert!(!staged_path.exists());
+    // 4. Stale local staging keys should still be cleaned up to prevent disk leak
+    let cache_after = hypertier::nvme::NvmeCache::new(
+        &[staging_segment_dir.as_path()],
+        &[5 * 1024 * 1024],
+        1,
+    )
+    .unwrap();
+    cache_after.recover_index();
+    let check_key = bytes::Bytes::copy_from_slice(file_id.as_bytes());
+    assert!(cache_after.get(&check_key).is_none(), "Stale entry should still be cleaned up from cache");
 
     // 5. Verify Garnet mapping has NOT been recorded for this stale ID
     let mapping_key = format!("mapping:{}", file_id);
@@ -170,16 +221,9 @@ async fn test_stale_write_recovery_discard() {
 
 #[tokio::test]
 async fn test_recovery_cleans_active_writes() {
-    let redis_url = get_redis_url();
-    let redis_client = match redis::Client::open(redis_url.clone()) {
-        Ok(c) => {
-            if c.get_multiplexed_tokio_connection().await.is_err() {
-                println!("Skipping test: Redis/Garnet not available");
-                return;
-            }
-            c
-        }
-        Err(_) => {
+    let redis_client = match get_dlm_client().await {
+        Some(c) => c,
+        None => {
             println!("Skipping test: Redis/Garnet not available");
             return;
         }

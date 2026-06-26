@@ -12,7 +12,7 @@ struct StagedMetadata {
     fencing_token: u64,
 }
 
-/// Scan NVMe staging directory, cross-reference pending staged files with Garnet metadata,
+/// Scan NVMe staging segment index, cross-reference pending staged files with Garnet metadata,
 /// and recover/finalize uploads to RustFS S3.
 /// Returns the number of successfully recovered files.
 pub async fn recover_staging(
@@ -37,109 +37,237 @@ pub async fn recover_staging(
         }
     }
 
-    let staging_subdir = staging_dir.join("staging");
-    if !staging_subdir.exists() {
+    let staging_segment_dir = staging_dir.join("staging_segment");
+    if !staging_segment_dir.exists() {
         return Ok(0);
     }
 
     info!(
-        "Crash Recovery: Scanning local NVMe staging directory '{:?}' for pending writes.",
-        staging_subdir
+        "Crash Recovery: Scanning NVMe staging segment directory '{:?}' for pending writes.",
+        staging_segment_dir
     );
-    let mut recovered_count = 0;
+
     let mut con = redis_client.get_connection().await?;
+    
+    // Determine staging capacity limit
+    let size_str: Option<String> = con.hget("squeezefs:format", "write_disk_limit").await.unwrap_or(None);
+    let max_write_bytes = if let Some(ref s) = size_str {
+        crate::cache::parse_size_string(s, 100 * 1024 * 1024 * 1024).unwrap_or(100 * 1024 * 1024)
+    } else {
+        100 * 1024 * 1024
+    };
 
-    let entries = fs::read_dir(&staging_subdir)?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
+    // Load encryption and compression settings
+    let compression: String = con
+        .hget("squeezefs:format", "compression")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| "none".to_string());
+    let encrypt_algo: String = con
+        .hget("squeezefs:format", "encrypt_algo")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| "none".to_string());
+    let encrypt_key: Option<String> = con
+        .hget("squeezefs:format", "encrypt_key")
+        .await
+        .unwrap_or(None);
 
-        // Only process staged files (.staged)
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "staged") {
-            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let crypto_state = crate::crypto_compress::CryptoCompressState::new(
+        compression,
+        encrypt_algo,
+        encrypt_key.as_deref(),
+    );
 
-            if !name.starts_with("file_") {
-                continue;
-            }
-            let file_id = name.trim_start_matches("file_").to_string();
+    let write_shards = if max_write_bytes < 10 * 1024 * 1024 { 1 } else { 16 };
+    // Instantiate NvmeCache temporarily to recover from segment files
+    let cache = hypertier::nvme::NvmeCache::new(
+        &[staging_segment_dir.as_path()],
+        &[max_write_bytes as usize],
+        write_shards,
+    )?;
 
-            if file_id.is_empty() {
-                continue;
-            }
+    cache.recover_index();
 
-            let staged_path = &path;
+    let mut recovered_count = 0;
+    let keys = cache.list_keys();
+    for key_bytes in keys {
+        let file_id = String::from_utf8(key_bytes.to_vec()).unwrap_or_default();
+        if file_id.is_empty() {
+            continue;
+        }
 
-            debug!(
-                "Crash Recovery: Found staged write transaction ID: {}",
-                file_id
-            );
+        if file_id.starts_with("active_block:") {
+            let active_block_data = {
+                if let Some(guard) = cache.get(&key_bytes) {
+                    let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                    if bytes.len() >= 8 {
+                        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                        if bytes.len() >= 8 + meta_len {
+                            if let Ok(meta) = serde_json::from_slice::<StagedMetadata>(&bytes[8..8 + meta_len]) {
+                                let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                                    Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                    Err(_) => 0,
+                                };
+                                let data_start = 8 + meta_len;
+                                let data_end = data_start + original_size;
+                                if bytes.len() >= data_end {
+                                    let data = bytes[data_start..data_end].to_vec();
+                                    Some((meta, data))
+                                } else { None }
+                            } else { None }
+                        } else { None }
+                    } else { None }
+                } else { None }
+            }; // guard dropped here
 
-            // 1. Read staged file bytes
-            let bytes = match fs::read(staged_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    error!(
-                        "Crash Recovery: Failed to read staged file {:?}: {:?}",
-                        staged_path, e
-                    );
-                    continue;
+            if let Some((meta, data)) = active_block_data {
+                // Parse inode and block index
+                let parts: Vec<&str> = file_id.split(':').collect();
+                if parts.len() == 3 {
+                    let ino_part = parts[1].trim_start_matches("inode_");
+                    let b_part = parts[2].trim_start_matches("block_");
+                    if let (Ok(ino), Ok(b)) = (ino_part.parse::<u64>(), b_part.parse::<u32>()) {
+                        // Cross-reference metadata
+                        let meta_key = format!("metadata:inode_{}", ino);
+                        let exists: bool = con.exists(&meta_key).await.unwrap_or(false);
+                        if exists {
+                            let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+                            let mut block_map_id = block_map_id_opt.unwrap_or_default();
+                            if block_map_id.is_empty() {
+                                block_map_id = uuid::Uuid::new_v4().to_string();
+                                let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
+                            }
+                            
+                            let block_map_key = format!("block_map:{}", block_map_id);
+                            let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
+                            
+                            let file_uuid = uuid::Uuid::new_v4().to_string();
+                            let block_write_uuid = uuid::Uuid::new_v4().to_string();
+                            let new_block_key = format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
+                            
+                            // Process block data with crypto
+                            let processed_block = match crypto_state.process_write(&data) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    error!(
+                                        "Crash Recovery: Failed to process active block {} of inode {} with crypto/compression: {:?}",
+                                        b, ino, e
+                                    );
+                                    cache.remove(&key_bytes);
+                                    continue;
+                                }
+                            };
+                            
+                            info!(
+                                "Crash Recovery: Recovering active block {} for inode {} (size: {} bytes, fencing token: {})",
+                                b, ino, data.len(), meta.fencing_token
+                            );
+                            
+                            if let Err(e) = backend
+                                .put_object(&new_block_key, processed_block, meta.fencing_token)
+                                .await
+                            {
+                                error!(
+                                    "Crash Recovery: Failed to upload active block {} of inode {} to S3: {:?}",
+                                    b, ino, e
+                                );
+                                continue;
+                            }
+                            
+                            let active_be = "backend_0";
+                            let stored_block_key = format!("{}:{}", active_be, new_block_key);
+                            
+                            let refcounts_key = "squeezefs:block_refcounts";
+                            let mut pipe = redis::pipe();
+                            pipe.hset(refcounts_key, &stored_block_key, 1).hset(
+                                &block_map_key,
+                                b.to_string(),
+                                &stored_block_key,
+                            );
+                            let _: () = pipe.query_async(&mut con).await?;
+                            
+                            if let Some(bk) = old_block_key {
+                                let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+                                if let Some(mut r) = old_ref {
+                                    r -= 1;
+                                    if r <= 0 {
+                                        let _: () = redis::pipe()
+                                            .hdel(refcounts_key, &bk)
+                                            .query_async(&mut con)
+                                            .await?;
+                                        let (_be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+                                        let _ = backend.delete_object(&real_key).await;
+                                    } else {
+                                        let _: () = con.hset(refcounts_key, &bk, r).await?;
+                                    }
+                                } else {
+                                    let (_be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+                                    let _ = backend.delete_object(&real_key).await;
+                                }
+                            }
+                            
+                            recovered_count += 1;
+                        } else {
+                            warn!(
+                                "Crash Recovery: Stale active block detected for inode {} (block {}). Inode metadata does not exist. Discarding entry.",
+                                ino, b
+                            );
+                        }
+                    }
                 }
-            };
-
-            if bytes.len() < 8 {
-                error!(
-                    "Crash Recovery: Staged file {:?} is truncated (size < 8 bytes)",
-                    staged_path
-                );
-                let _ = fs::remove_file(staged_path);
-                continue;
             }
+            cache.remove(&key_bytes);
+            continue;
+        }
 
-            let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
-            if bytes.len() < 8 + meta_len {
-                error!(
-                    "Crash Recovery: Staged file {:?} is truncated (size < 8 + meta_len)",
-                    staged_path
-                );
-                let _ = fs::remove_file(staged_path);
-                continue;
-            }
+        debug!(
+            "Crash Recovery: Found staged write transaction ID: {}",
+            file_id
+        );
 
-            let meta: StagedMetadata = match serde_json::from_slice(&bytes[8..8 + meta_len]) {
-                Ok(m) => m,
-                Err(e) => {
-                    error!(
-                        "Crash Recovery: Failed to parse metadata from staged file {:?}: {:?}",
-                        staged_path, e
-                    );
-                    let _ = fs::remove_file(staged_path);
-                    continue;
+        let staged_data = {
+            if let Some(guard) = cache.get(&key_bytes) {
+                let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                if bytes.len() < 8 {
+                    None
+                } else {
+                    let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                    if bytes.len() < 8 + meta_len {
+                        None
+                    } else {
+                        match serde_json::from_slice::<StagedMetadata>(&bytes[8..8 + meta_len]) {
+                            Ok(meta) => {
+                                let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
+                                    Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                    Err(_) => 0,
+                                };
+                                let data_start = 8 + meta_len;
+                                let data_end = data_start + original_size;
+                                if bytes.len() >= data_end {
+                                    let data = bytes[data_start..data_end].to_vec();
+                                    Some((meta, data))
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Crash Recovery: Failed to parse metadata from staged segment key {}: {:?}",
+                                    file_id, e
+                                );
+                                None
+                            }
+                        }
+                    }
                 }
-            };
-
-            // Read the JSON to get original_size
-            let original_size =
-                match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
-                    Ok(json) => json
-                        .get("original_size")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize,
-                    Err(_) => 0,
-                };
-
-            let data_start = 8 + meta_len;
-            let data_end = data_start + original_size;
-            if bytes.len() < data_end {
-                error!(
-                    "Crash Recovery: Staged file {:?} data payload is truncated",
-                    staged_path
-                );
-                let _ = fs::remove_file(staged_path);
-                continue;
+            } else {
+                None
             }
-            let data = bytes[data_start..data_end].to_vec();
+        }; // guard dropped here
 
-            // 2. Cross-reference with Garnet
+        if let Some((meta, data)) = staged_data {
+            // Cross-reference with Garnet
             let meta_key = format!("metadata:{}", meta.file_path);
             let redis_file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
             let redis_file_type: Option<String> = con.hget(&meta_key, "type").await?;
@@ -153,7 +281,7 @@ pub async fn recover_staging(
                     meta.file_path, file_id, data.len(), meta.fencing_token
                 );
 
-                // 3. Upload to RustFS S3
+                // Upload to RustFS S3
                 let recovered_key = format!("recovered/blocks/{}", file_id);
                 if let Err(e) = backend
                     .put_object(&recovered_key, data.clone(), meta.fencing_token)
@@ -166,7 +294,7 @@ pub async fn recover_staging(
                     continue;
                 }
 
-                // 4. Update Garnet mapping
+                // Update Garnet mapping
                 let mapping_key = format!("mapping:{}", file_id);
                 let _: () = redis::pipe()
                     .hset(&mapping_key, "block", &recovered_key)
@@ -178,14 +306,14 @@ pub async fn recover_staging(
                 recovered_count += 1;
             } else {
                 warn!(
-                    "Crash Recovery: Stale write detected for '{}' (ID: {}). Redis has type={:?} and file_id={:?}. Discarding stale local files.",
+                    "Crash Recovery: Stale write detected for '{}' (ID: {}). Redis has type={:?} and file_id={:?}. Discarding stale local entry.",
                     meta.file_path, file_id, redis_file_type, redis_file_id
                 );
             }
-
-            // 5. Clean up local staging file
-            let _ = fs::remove_file(staged_path);
         }
+
+        // Clean up entry from local staging cache
+        cache.remove(&key_bytes);
     }
 
     info!(

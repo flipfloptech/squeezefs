@@ -1115,41 +1115,6 @@ impl DataRouter {
                     ));
                 }
 
-                // Pipelined discovery of block peers for cache misses
-                let mut cache_misses = Vec::new();
-                for (_, b_key_opt) in &block_keys {
-                    if let Some(b_key) = b_key_opt {
-                        let safe_name = b_key.replace(['/', ':'], "_");
-                        let exists = self
-                            .cache
-                            .nvme
-                            .staging_dirs()
-                            .iter()
-                            .any(|dir| dir.join(format!("{}.block", safe_name)).exists());
-                        if !exists {
-                            cache_misses.push(b_key.clone());
-                        }
-                    }
-                }
-
-                let mut peer_mappings = std::collections::HashMap::new();
-                if !cache_misses.is_empty() {
-                    if let Ok(mut con) = self.dlm.get_connection().await {
-                        let mut pipe = redis::pipe();
-                        for key in &cache_misses {
-                            let safe_name = key.replace(['/', ':'], "_");
-                            pipe.smembers(format!("block_peers:{}", safe_name));
-                        }
-                        if let Ok(peer_lists) =
-                            pipe.query_async::<_, Vec<Vec<String>>>(&mut con).await
-                        {
-                            for (idx, list) in peer_lists.into_iter().enumerate() {
-                                peer_mappings.insert(cache_misses[idx].clone(), list);
-                            }
-                        }
-                    }
-                }
-
                 // Spawn concurrent tasks to download block data in parallel
                 let mut futures = Vec::new();
                 let crypto = self.get_crypto().clone();
@@ -1157,18 +1122,6 @@ impl DataRouter {
                     let cache_ref = self.cache.nvme.clone();
                     let read_lru = self.cache.read_lru.clone();
                     let backend_ref = self.backend.clone();
-                    let own_p2p_addr = self.cache.nvme.p2p_addr.clone();
-                    let peers = if let Some(ref b_key) = b_key_opt {
-                        let mut p_list = peer_mappings.get(b_key).cloned().unwrap_or_default();
-                        if let Some(own_addr) = own_p2p_addr.get() {
-                            p_list.retain(|p| p != own_addr);
-                        }
-                        fastrand::shuffle(&mut p_list);
-                        p_list.truncate(3);
-                        p_list
-                    } else {
-                        Vec::new()
-                    };
 
                     let b_start_offset = b_idx as u64 * block_size;
                     let b_end_offset = b_start_offset + block_size;
@@ -1202,16 +1155,12 @@ impl DataRouter {
 
                                 // Try P2P download
                                 let mut downloaded_data = None;
-                                let client = crate::p2p::P2pClient::new();
-                                for peer in &peers {
-                                    if Some(peer) == own_p2p_addr.get() {
-                                        continue;
-                                    }
+                                if let Some(dht) = cache_ref.dht_node.get() {
+                                    let client = crate::p2p::P2pClient::new();
                                     if let Ok(data) =
-                                        client.download_block_from_peer(peer, b_key).await
+                                        client.download_block_from_peer(dht, b_key).await
                                     {
                                         downloaded_data = Some(data);
-                                        break;
                                     }
                                 }
 
@@ -1602,13 +1551,14 @@ impl DataRouter {
             .hdel(&meta_key, "file_id");
         let _: () = pipe.query_async(con).await.unwrap_or(());
 
-        // Physically delete any local active writes directory for this inode
-        let staging_dirs = self.cache.nvme.staging_dirs();
-        for dir in staging_dirs {
-            let active_dir = dir.join("active_writes").join(file_path);
-            if active_dir.exists() {
-                let _ = tokio::fs::remove_dir_all(&active_dir).await;
-            }
+        // Remove any local active write blocks for this inode from the staging segment cache
+        let active_block_prefix = format!("active_block:{}:", file_path);
+        let keys_to_remove: Vec<String> = self.cache.nvme.list_staged_files()
+            .into_iter()
+            .filter(|k| k.starts_with(&active_block_prefix))
+            .collect();
+        for key in keys_to_remove {
+            self.cache.nvme.remove_active_block(&key);
         }
 
         self.cache.write_lru.remove(file_path);

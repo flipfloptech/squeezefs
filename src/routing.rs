@@ -1728,11 +1728,19 @@ impl DataRouter {
             .acquire_lock(dest, None, std::time::Duration::from_secs(5))
             .await?;
 
+        let src_ino = crate::dlm::parse_inode_from_key(&format!("metadata:{}", src))
+            .ok_or_else(|| SqueezefsError::InvalidOperation(format!("Invalid src key: {}", src)))?;
+        let dest_ino = crate::dlm::parse_inode_from_key(&format!("metadata:{}", dest))
+            .ok_or_else(|| SqueezefsError::InvalidOperation(format!("Invalid dest key: {}", dest)))?;
+
+        let mut src_con = self.dlm.get_connection_for_inode(src_ino).await?;
+        let mut dest_con = self.dlm.get_connection_for_inode(dest_ino).await?;
         let mut con = self.dlm.get_connection().await?;
+
         let src_meta_key = format!("metadata:{}", src);
         let dest_meta_key = format!("metadata:{}", dest);
 
-        let exists_src: bool = con.exists(&src_meta_key).await?;
+        let exists_src: bool = src_con.exists(&src_meta_key).await?;
         if !exists_src {
             return Err(SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1740,9 +1748,9 @@ impl DataRouter {
             )));
         }
 
-        let exists_dest: bool = con.exists(&dest_meta_key).await?;
+        let exists_dest: bool = dest_con.exists(&dest_meta_key).await?;
         if exists_dest {
-            let dest_size_opt: Option<u64> = con.hget(&dest_meta_key, "size").await?;
+            let dest_size_opt: Option<u64> = dest_con.hget(&dest_meta_key, "size").await?;
             let dest_size = dest_size_opt.unwrap_or(0);
             if dest_size > 0 {
                 return Err(SqueezefsError::Io(std::io::Error::new(
@@ -1750,10 +1758,10 @@ impl DataRouter {
                     format!("Destination file already exists and is not empty: {}", dest),
                 )));
             }
-            let _: () = con.del(&dest_meta_key).await?;
+            let _: () = dest_con.del(&dest_meta_key).await?;
         }
 
-        let file_type: Option<String> = con.hget(&src_meta_key, "type").await?;
+        let file_type: Option<String> = src_con.hget(&src_meta_key, "type").await?;
         let file_type = file_type
             .ok_or_else(|| SqueezefsError::InvalidOperation("Missing file type".to_string()))?;
 
@@ -1761,9 +1769,9 @@ impl DataRouter {
             let inline_src_key = format!("inline_data:{}", src);
             let inline_dest_key = format!("inline_data:{}", dest);
 
-            let inline_data: Option<Vec<u8>> = con.get(&inline_src_key).await?;
+            let inline_data: Option<Vec<u8>> = src_con.get(&inline_src_key).await?;
             let inline_data = inline_data.unwrap_or_default();
-            let size_opt: Option<u64> = con.hget(&src_meta_key, "size").await?;
+            let size_opt: Option<u64> = src_con.hget(&src_meta_key, "size").await?;
             let size = size_opt.unwrap_or(0);
 
             let mut pipe = redis::pipe();
@@ -1771,7 +1779,7 @@ impl DataRouter {
                 .hset(&dest_meta_key, "size", size)
                 .hset(&dest_meta_key, "type", "inline")
                 .hset(&dest_meta_key, "fencing_token", dest_lock.fencing_token());
-            let _: () = pipe.query_async(&mut con).await?;
+            let _: () = pipe.query_async(&mut dest_con).await?;
 
             let mut cached_opt = self.cache.write_lru.get(src);
             if cached_opt.is_none() {
@@ -1781,12 +1789,12 @@ impl DataRouter {
                 self.cache.write_lru.put(dest, cached);
             }
         } else if file_type == "staged" {
-            let src_file_id_opt: Option<String> = con.hget(&src_meta_key, "file_id").await?;
+            let src_file_id_opt: Option<String> = src_con.hget(&src_meta_key, "file_id").await?;
             let src_file_id = src_file_id_opt.ok_or_else(|| {
                 SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
             })?;
 
-            let size_opt: Option<u64> = con.hget(&src_meta_key, "size").await?;
+            let size_opt: Option<u64> = src_con.hget(&src_meta_key, "size").await?;
             let size = size_opt.unwrap_or(0);
             let new_file_id = Uuid::new_v4().to_string();
 
@@ -1815,13 +1823,14 @@ impl DataRouter {
                 let new_ref = current_ref.unwrap_or(1) + 1;
                 pipe.hset(refcounts_key, bk, new_ref);
             }
+            let _: () = pipe.query_async(&mut con).await?;
 
-            pipe.hset(&dest_meta_key, "size", size)
+            let mut dest_pipe = redis::pipe();
+            dest_pipe.hset(&dest_meta_key, "size", size)
                 .hset(&dest_meta_key, "type", "staged")
                 .hset(&dest_meta_key, "file_id", &new_file_id)
                 .hset(&dest_meta_key, "fencing_token", dest_lock.fencing_token());
-
-            let _: () = pipe.query_async(&mut con).await?;
+            let _: () = dest_pipe.query_async(&mut dest_con).await?;
 
             let mut cached_opt = self.cache.write_lru.get(src);
             if cached_opt.is_none() {
@@ -1832,18 +1841,18 @@ impl DataRouter {
             }
         } else if file_type == "striped" {
             let src_block_map_id_opt: Option<String> =
-                con.hget(&src_meta_key, "block_map_id").await?;
+                src_con.hget(&src_meta_key, "block_map_id").await?;
             let src_block_map_id = match src_block_map_id_opt {
                 Some(id) => id,
                 None => {
                     let block_prefix_opt: Option<String> =
-                        con.hget(&src_meta_key, "block_prefix").await?;
+                        src_con.hget(&src_meta_key, "block_prefix").await?;
                     let block_prefix = block_prefix_opt.ok_or_else(|| {
                         SqueezefsError::InvalidOperation(
                             "Missing block_map_id and block_prefix for striped file".to_string(),
                         )
                     })?;
-                    let num_blocks_opt: Option<u32> = con.hget(&src_meta_key, "num_blocks").await?;
+                    let num_blocks_opt: Option<u32> = src_con.hget(&src_meta_key, "num_blocks").await?;
                     let num_blocks = num_blocks_opt.unwrap_or(0);
 
                     let new_id = Uuid::new_v4().to_string();
@@ -1855,15 +1864,16 @@ impl DataRouter {
                         pipe.hset(&block_map_key, i.to_string(), &old_key);
                         pipe.hset(refcounts_key, &old_key, 1);
                     }
-                    pipe.hset(&src_meta_key, "block_map_id", &new_id);
                     let _: () = pipe.query_async(&mut con).await?;
+
+                    src_con.hset(&src_meta_key, "block_map_id", &new_id).await?;
                     new_id
                 }
             };
 
-            let size_opt: Option<u64> = con.hget(&src_meta_key, "size").await?;
+            let size_opt: Option<u64> = src_con.hget(&src_meta_key, "size").await?;
             let size = size_opt.unwrap_or(0);
-            let num_blocks_opt: Option<u32> = con.hget(&src_meta_key, "num_blocks").await?;
+            let num_blocks_opt: Option<u32> = src_con.hget(&src_meta_key, "num_blocks").await?;
             let num_blocks = num_blocks_opt.unwrap_or(0);
 
             let dest_block_map_id = Uuid::new_v4().to_string();
@@ -1900,7 +1910,7 @@ impl DataRouter {
                 .hset(&dest_meta_key, "block_map_id", &dest_block_map_id)
                 .hset(&dest_meta_key, "num_blocks", num_blocks)
                 .hset(&dest_meta_key, "fencing_token", dest_lock.fencing_token());
-            let _: () = pipe_meta.query_async(&mut con).await?;
+            let _: () = pipe_meta.query_async(&mut dest_con).await?;
 
             let mut cached_opt = self.cache.write_lru.get(src);
             if cached_opt.is_none() {
@@ -2022,13 +2032,13 @@ impl DataRouter {
 
     /// Resolve a logical filesystem path (e.g., "/dir1/file.txt") to its FUSE inode number.
     pub async fn resolve_path_to_inode(&self, path: &str) -> Result<u64> {
-        let mut con = self.dlm.get_connection().await?;
         let mut current_ino = 1u64; // Root inode
 
         for part in path.split('/') {
             if part.is_empty() || part == "." {
                 continue;
             }
+            let mut con = self.dlm.get_connection_for_inode(current_ino).await?;
             let dir_key = format!("squeezefs:dir:{}", current_ino);
             let next_ino_opt: Option<u64> = con.hget(&dir_key, part).await?;
             match next_ino_opt {
@@ -2065,11 +2075,11 @@ impl DataRouter {
         // Resolve parent directory to inode
         let parent_ino = self.resolve_path_to_inode(parent_str).await?;
 
-        let mut con = self.dlm.get_connection().await?;
+        let mut parent_con = self.dlm.get_connection_for_inode(parent_ino).await?;
         let parent_dir_key = format!("squeezefs:dir:{}", parent_ino);
 
         // Check if destination already exists
-        let exists: bool = con.hexists(&parent_dir_key, file_name).await?;
+        let exists: bool = parent_con.hexists(&parent_dir_key, file_name).await?;
         if exists {
             return Err(SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -2077,23 +2087,25 @@ impl DataRouter {
             )));
         }
 
-        // Generate new inode number
-        let dest_ino: u64 = con.incr("squeezefs:inode_counter", 1).await?;
+        // Generate new inode number on parent's shard connection using shard count step increment
+        let shard_count = self.dlm.shard_count() as i64;
+        let dest_ino: u64 = parent_con.incr("squeezefs:inode_counter", shard_count).await?;
 
-        // Retrieve attributes of source inode
+        // Retrieve attributes of source inode on its respective shard
+        let mut src_con = self.dlm.get_connection_for_inode(src_ino).await?;
         let src_attr_key = format!("squeezefs:attr:{}", src_ino);
-        let size_opt: Option<u64> = con.hget(&src_attr_key, "size").await?;
+        let size_opt: Option<u64> = src_con.hget(&src_attr_key, "size").await?;
         let size = size_opt.unwrap_or(0);
-        let mode_opt: Option<u32> = con.hget(&src_attr_key, "mode").await?;
+        let mode_opt: Option<u32> = src_con.hget(&src_attr_key, "mode").await?;
         let mode = mode_opt.unwrap_or(0o644);
-        let uid_opt: Option<u32> = con.hget(&src_attr_key, "uid").await?;
+        let uid_opt: Option<u32> = src_con.hget(&src_attr_key, "uid").await?;
         let uid = uid_opt.unwrap_or(1000);
-        let gid_opt: Option<u32> = con.hget(&src_attr_key, "gid").await?;
+        let gid_opt: Option<u32> = src_con.hget(&src_attr_key, "gid").await?;
         let gid = gid_opt.unwrap_or(1000);
-        let kind_opt: Option<u8> = con.hget(&src_attr_key, "kind").await?;
+        let kind_opt: Option<u8> = src_con.hget(&src_attr_key, "kind").await?;
         let kind = kind_opt.unwrap_or(1); // 1 = Regular file
 
-        // Set attributes of destination inode
+        // Set attributes of destination inode on parent_con (since dest_ino is on the same shard as parent_ino)
         let dest_attr_key = format!("squeezefs:attr:{}", dest_ino);
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -2118,7 +2130,7 @@ impl DataRouter {
             .hset(&dest_attr_key, "gid", gid)
             .hset(&dest_attr_key, "rdev", 0)
             .hset(&parent_dir_key, file_name, dest_ino);
-        let _: () = pipe.query_async(&mut con).await?;
+        let _: () = pipe.query_async(&mut parent_con).await?;
 
         // Clone the underlying data blocks/metadata
         self.clone_file(

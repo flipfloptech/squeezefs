@@ -198,6 +198,8 @@ pub async fn recover_staging(
                                  b, ino, data_bytes.len(), meta.fencing_token
                              );
 
+                            let data_len = data_bytes.len();
+                            let processed_len = processed_block.len();
                             if let Err(e) = backend
                                 .put_object(&new_block_key, processed_block, meta.fencing_token)
                                 .await
@@ -214,11 +216,13 @@ pub async fn recover_staging(
 
                             let refcounts_key = "squeezefs:block_refcounts";
                             let mut pipe = redis::pipe();
-                            pipe.hset(refcounts_key, &stored_block_key, 1).hset(
-                                &block_map_key,
-                                b.to_string(),
-                                &stored_block_key,
-                            );
+                            pipe.hset(refcounts_key, &stored_block_key, 1)
+                                .hset(&block_map_key, b.to_string(), &stored_block_key)
+                                .hset(
+                                    "squeezefs:block_sizes",
+                                    &stored_block_key,
+                                    format!("{}:{}", data_len, processed_len),
+                                );
                             let _: () = pipe.query_async(&mut con).await?;
 
                             if let Some(bk) = old_block_key {
@@ -228,6 +232,7 @@ pub async fn recover_staging(
                                     if r <= 0 {
                                         let _: () = redis::pipe()
                                             .hdel(refcounts_key, &bk)
+                                            .hdel("squeezefs:block_sizes", &bk)
                                             .query_async(&mut con)
                                             .await?;
                                         let (_be_id, real_key) =
@@ -237,6 +242,8 @@ pub async fn recover_staging(
                                         let _: () = con.hset(refcounts_key, &bk, r).await?;
                                     }
                                 } else {
+                                    let _: () =
+                                        con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
                                     let (_be_id, real_key) =
                                         crate::backend::parse_backend_and_key(&bk);
                                     let _ = backend.delete_object(&real_key).await;
@@ -347,6 +354,11 @@ pub async fn recover_staging(
                     .hset(&mapping_key, "block", &recovered_key)
                     .hset(&mapping_key, "offset", 0u64)
                     .hset(&mapping_key, "size", data.len() as u64)
+                    .hset(
+                        "squeezefs:block_sizes",
+                        &recovered_key,
+                        format!("{}:{}", data.len(), data.len()),
+                    )
                     .query_async(&mut con)
                     .await?;
 

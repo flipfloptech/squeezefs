@@ -1107,11 +1107,16 @@ impl SqueezefsFilesystem {
         for (k, v) in parts_map {
             let part_num: i32 = k.parse().unwrap_or(0);
             let split: Vec<&str> = v.split(',').collect();
-            if split.len() == 2 {
+            if split.len() >= 2 {
                 let etag = split[0].to_string();
-                let size: usize = split[1].parse().unwrap_or(0);
+                let logical_size: usize = split[1].parse().unwrap_or(0);
+                let physical_size: usize = if split.len() >= 3 {
+                    split[2].parse().unwrap_or(logical_size)
+                } else {
+                    logical_size
+                };
                 parts.push((part_num, etag));
-                part_offsets.push((part_num, size));
+                part_offsets.push((part_num, logical_size, physical_size));
             }
         }
 
@@ -1130,7 +1135,7 @@ impl SqueezefsFilesystem {
         }
 
         parts.sort_by_key(|(p, _)| *p);
-        part_offsets.sort_by_key(|(p, _)| *p);
+        part_offsets.sort_by_key(|(p, _, _)| *p);
 
         self.router
             .backend
@@ -1150,20 +1155,22 @@ impl SqueezefsFilesystem {
         let refcounts_key = "squeezefs:block_refcounts";
         let mut start_offset: u64 = 0;
 
-        for (part_num, size) in part_offsets {
+        for (part_num, logical_size, physical_size) in part_offsets {
             let block_num = (part_num - 1) as u32;
-            let end_offset = start_offset + size as u64;
+            let end_offset = start_offset + physical_size as u64;
             let stored_block_key = format!(
                 "{}:s3_single:{}:{}:{}",
                 backend_id, s3_key, start_offset, end_offset
             );
 
             let mut pipe = redis::pipe();
-            pipe.hset(refcounts_key, &stored_block_key, 1).hset(
-                &block_map_key,
-                block_num.to_string(),
-                &stored_block_key,
-            );
+            pipe.hset(refcounts_key, &stored_block_key, 1)
+                .hset(&block_map_key, block_num.to_string(), &stored_block_key)
+                .hset(
+                    "squeezefs:block_sizes",
+                    &stored_block_key,
+                    format!("{}:{}", logical_size, physical_size),
+                );
             let _: () = pipe.query_async(&mut con).await?;
 
             self.router.block_map_cache.insert(
@@ -5209,6 +5216,7 @@ async fn flush_single_active_block(
 
     let block_bytes = bytes::Bytes::from(block_data.clone());
     let processed_block = router.get_crypto().process_write(block_bytes.clone())?;
+    let processed_len = processed_block.len();
 
     if let Some((upload_id, s3_key, backend_id)) = active_multipart {
         let part_number = (b + 1) as i32;
@@ -5223,7 +5231,7 @@ async fn flush_single_active_block(
             )
             .await?;
         let parts_key = format!("squeezefs:multipart_parts:{}", ino);
-        let part_value = format!("{},{}", etag, block_bytes.len());
+        let part_value = format!("{},{},{}", etag, block_bytes.len(), processed_len);
         let _: () = con
             .hset(&parts_key, part_number.to_string(), part_value)
             .await?;
@@ -5279,11 +5287,13 @@ async fn flush_single_active_block(
 
     let refcounts_key = "squeezefs:block_refcounts";
     let mut pipe = redis::pipe();
-    pipe.hset(refcounts_key, &stored_block_key, 1).hset(
-        &block_map_key,
-        b.to_string(),
-        &stored_block_key,
-    );
+    pipe.hset(refcounts_key, &stored_block_key, 1)
+        .hset(&block_map_key, b.to_string(), &stored_block_key)
+        .hset(
+            "squeezefs:block_sizes",
+            &stored_block_key,
+            format!("{}:{}", block_bytes.len(), processed_len),
+        );
     let _: () = pipe.query_async(&mut con).await?;
 
     router.block_map_cache.insert(
@@ -5307,6 +5317,7 @@ async fn flush_single_active_block(
             if r <= 0 {
                 let _: () = redis::pipe()
                     .hdel(refcounts_key, &bk)
+                    .hdel("squeezefs:block_sizes", &bk)
                     .query_async(&mut con)
                     .await?;
                 let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
@@ -5315,6 +5326,7 @@ async fn flush_single_active_block(
                 let _: () = con.hset(refcounts_key, &bk, r).await?;
             }
         } else {
+            let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
             let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
             let _ = router.backend.delete_object(&be_id, &real_key).await;
         }

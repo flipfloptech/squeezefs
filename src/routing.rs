@@ -399,13 +399,18 @@ impl DataRouter {
             if let Some(mut r) = current_ref {
                 r -= 1;
                 if r <= 0 {
-                    let _: () = con.hdel(refcounts_key, &bk).await?;
+                    let _: () = redis::pipe()
+                        .hdel(refcounts_key, &bk)
+                        .hdel("squeezefs:block_sizes", &bk)
+                        .query_async(con)
+                        .await?;
                     let (be_id, real_key) = parse_backend_and_key(&bk);
                     let _ = self.backend.delete_object(&be_id, &real_key).await;
                 } else {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
             } else {
+                let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
                 let (be_id, real_key) = parse_backend_and_key(&bk);
                 let _ = self.backend.delete_object(&be_id, &real_key).await;
             }
@@ -516,13 +521,15 @@ impl DataRouter {
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 let task = tokio::spawn(async move {
+                    let chunk_len = chunk.len();
                     let processed = crypto.process_write(chunk)?;
+                    let processed_len = processed.len();
                     backend_clone
                         .put_object(&block_key, processed, fencing_token)
                         .await?;
                     // Cache the newly written block in RAM - dehydrated to NVMe on eviction
                     read_lru.put(&stored_block_key_clone, chunk_clone);
-                    Ok::<(), SqueezefsError>(())
+                    Ok::<_, SqueezefsError>((stored_block_key_clone, chunk_len, processed_len))
                 });
 
                 futures.push(task);
@@ -530,13 +537,15 @@ impl DataRouter {
                 block_count += 1;
             }
 
+            let mut sizes_to_register = Vec::new();
             for f in futures {
-                f.await.map_err(|e| {
+                let (key, logical, physical) = f.await.map_err(|e| {
                     SqueezefsError::Io(std::io::Error::other(format!(
                         "Stripe upload task failed: {:?}",
                         e
                     )))
                 })??;
+                sizes_to_register.push((key, logical, physical));
             }
 
             // Register block mappings and reference counts in Garnet
@@ -546,6 +555,13 @@ impl DataRouter {
             for (idx_str, key) in &block_mappings {
                 pipe_map.hset(&block_map_key, idx_str, key);
                 pipe_map.hset(refcounts_key, key, 1);
+            }
+            for (key, logical, physical) in &sizes_to_register {
+                pipe_map.hset(
+                    "squeezefs:block_sizes",
+                    key,
+                    format!("{}:{}", logical, physical),
+                );
             }
             let _: () = pipe_map.query_async(&mut con).await?;
 
@@ -708,6 +724,12 @@ impl DataRouter {
                         .hset(&mapping_key, "block", &stored_block_key)
                         .hset(&mapping_key, "offset", 0u64)
                         .hset(&mapping_key, "size", size)
+                        .hset("squeezefs:block_refcounts", &stored_block_key, 1)
+                        .hset(
+                            "squeezefs:block_sizes",
+                            &stored_block_key,
+                            format!("{}:{}", shared_data.len(), processed_data.len()),
+                        )
                         .query_async(&mut con)
                         .await?;
 
@@ -757,13 +779,15 @@ impl DataRouter {
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 let task = tokio::spawn(async move {
+                    let chunk_len = chunk.len();
                     let processed = crypto.process_write(chunk)?;
+                    let processed_len = processed.len();
                     backend_clone
                         .put_object(&block_key, processed, fencing_token)
                         .await?;
                     // Cache the newly written block in RAM - dehydrated to NVMe on eviction
                     read_lru.put(&stored_block_key_clone, chunk_clone);
-                    Ok::<(), SqueezefsError>(())
+                    Ok::<_, SqueezefsError>((stored_block_key_clone, chunk_len, processed_len))
                 });
 
                 futures.push(task);
@@ -771,13 +795,15 @@ impl DataRouter {
                 block_count += 1;
             }
 
+            let mut sizes_to_register = Vec::new();
             for f in futures {
-                f.await.map_err(|e| {
+                let (key, logical, physical) = f.await.map_err(|e| {
                     SqueezefsError::Io(std::io::Error::other(format!(
                         "Stripe upload task failed: {:?}",
                         e
                     )))
                 })??;
+                sizes_to_register.push((key, logical, physical));
             }
 
             // Register block mappings and reference counts in Garnet
@@ -787,6 +813,13 @@ impl DataRouter {
             for (idx_str, key) in &block_mappings {
                 pipe_map.hset(&block_map_key, idx_str, key);
                 pipe_map.hset(refcounts_key, key, 1);
+            }
+            for (key, logical, physical) in &sizes_to_register {
+                pipe_map.hset(
+                    "squeezefs:block_sizes",
+                    key,
+                    format!("{}:{}", logical, physical),
+                );
             }
             let _: () = pipe_map.query_async(&mut con).await?;
 
@@ -822,13 +855,18 @@ impl DataRouter {
                     if let Some(mut r) = current_ref {
                         r -= 1;
                         if r <= 0 {
-                            let _: () = con.hdel(refcounts_key, &bk).await?;
+                            let _: () = redis::pipe()
+                                .hdel(refcounts_key, &bk)
+                                .hdel("squeezefs:block_sizes", &bk)
+                                .query_async(&mut con)
+                                .await?;
                             let (be_id, real_key) = parse_backend_and_key(&bk);
                             let _ = self.backend.delete_object(&be_id, &real_key).await;
                         } else {
                             let _: () = con.hset(refcounts_key, &bk, r).await?;
                         }
                     } else {
+                        let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
                         let (be_id, real_key) = parse_backend_and_key(&bk);
                         let _ = self.backend.delete_object(&be_id, &real_key).await;
                     }
@@ -976,7 +1014,9 @@ impl DataRouter {
                 // Cache newly written block in RAM - dehydrated to NVMe on eviction
                 read_lru.put(&stored_new_block_key, block_bytes.clone());
 
+                let logical_size = block_bytes.len();
                 let processed_block = crypto.process_write(block_bytes)?;
+                let physical_size = processed_block.len();
                 router_clone
                     .backend
                     .put_object(&new_block_key, processed_block, fencing_token)
@@ -986,7 +1026,13 @@ impl DataRouter {
                     new_block_key
                 );
 
-                Ok::<_, SqueezefsError>((b, old_block_key, stored_new_block_key))
+                Ok::<_, SqueezefsError>((
+                    b,
+                    old_block_key,
+                    stored_new_block_key,
+                    logical_size,
+                    physical_size,
+                ))
             }));
         }
 
@@ -1001,12 +1047,15 @@ impl DataRouter {
         let mut pipe_update = redis::pipe();
         let mut old_keys_to_clean = Vec::new();
         for res in results {
-            let (b, old_block_key, new_block_key) = res?;
-            pipe_update.hset(refcounts_key, &new_block_key, 1).hset(
-                &block_map_key,
-                b.to_string(),
-                &new_block_key,
-            );
+            let (b, old_block_key, new_block_key, logical_size, physical_size) = res?;
+            pipe_update
+                .hset(refcounts_key, &new_block_key, 1)
+                .hset(&block_map_key, b.to_string(), &new_block_key)
+                .hset(
+                    "squeezefs:block_sizes",
+                    &new_block_key,
+                    format!("{}:{}", logical_size, physical_size),
+                );
 
             if let Some(bk) = old_block_key {
                 old_keys_to_clean.push(bk);
@@ -1023,6 +1072,7 @@ impl DataRouter {
                 if r <= 0 {
                     let _: () = redis::pipe()
                         .hdel(refcounts_key, &bk)
+                        .hdel("squeezefs:block_sizes", &bk)
                         .query_async(con)
                         .await?;
                     let (be_id, real_key) = parse_backend_and_key(&bk);
@@ -1031,6 +1081,7 @@ impl DataRouter {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
             } else {
+                let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
                 let (be_id, real_key) = parse_backend_and_key(&bk);
                 let _ = self.backend.delete_object(&be_id, &real_key).await;
             }
@@ -2009,13 +2060,18 @@ impl DataRouter {
                         if let Some(mut r) = current_ref {
                             r -= 1;
                             if r <= 0 {
-                                let _: () = con.hdel(refcounts_key, &bk).await?;
+                                let _: () = redis::pipe()
+                                    .hdel(refcounts_key, &bk)
+                                    .hdel("squeezefs:block_sizes", &bk)
+                                    .query_async(con)
+                                    .await?;
                                 let (be_id, real_key) = parse_backend_and_key(&bk);
                                 let _ = self.backend.delete_object(&be_id, &real_key).await;
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
                         } else {
+                            let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
                             let (be_id, real_key) = parse_backend_and_key(&bk);
                             let _ = self.backend.delete_object(&be_id, &real_key).await;
                         }
@@ -2043,13 +2099,18 @@ impl DataRouter {
                         if let Some(mut r) = current_ref {
                             r -= 1;
                             if r <= 0 {
-                                let _: () = con.hdel(refcounts_key, &bk).await?;
+                                let _: () = redis::pipe()
+                                    .hdel(refcounts_key, &bk)
+                                    .hdel("squeezefs:block_sizes", &bk)
+                                    .query_async(con)
+                                    .await?;
                                 let (be_id, real_key) = parse_backend_and_key(&bk);
                                 let _ = self.backend.delete_object(&be_id, &real_key).await;
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
                         } else {
+                            let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
                             let (be_id, real_key) = parse_backend_and_key(&bk);
                             let _ = self.backend.delete_object(&be_id, &real_key).await;
                         }

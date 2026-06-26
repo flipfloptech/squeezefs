@@ -514,6 +514,7 @@ impl NvmeStaging {
         let mut mappings = Vec::new();
         let mut highest_fencing_token = 0u64;
 
+        let mut total_logical_size = 0usize;
         for item in batch.iter() {
             let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
             let data_res = if let Some(guard) = staging_nvme_cache.get(&key_bytes) {
@@ -552,6 +553,7 @@ impl NvmeStaging {
             };
 
             if let Some(data) = data_res {
+                total_logical_size += data.len();
                 let processed_data = crypto_state.process_write(bytes::Bytes::from(data))?;
                 let offset = packed_payload.len() as u64;
                 let size = processed_data.len() as u64;
@@ -564,7 +566,8 @@ impl NvmeStaging {
             }
         }
 
-        info!("NVMe Staging: Uploading packed block {} (size {} bytes) to RustFS with fencing token {}.", packed_key, packed_payload.len(), highest_fencing_token);
+        let packed_payload_len = packed_payload.len();
+        info!("NVMe Staging: Uploading packed block {} (size {} bytes) to RustFS with fencing token {}.", packed_key, packed_payload_len, highest_fencing_token);
         backend
             .put_object(
                 &packed_key,
@@ -579,6 +582,13 @@ impl NvmeStaging {
                 .arg(refcounts_key)
                 .arg(&packed_key)
                 .arg(mappings.len() as i32)
+                .query_async(&mut con)
+                .await;
+
+            let _: std::result::Result<(), redis::RedisError> = redis::cmd("HSET")
+                .arg("squeezefs:block_sizes")
+                .arg(&packed_key)
+                .arg(format!("{}:{}", total_logical_size, packed_payload_len))
                 .query_async(&mut con)
                 .await;
 

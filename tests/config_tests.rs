@@ -597,3 +597,171 @@ async fn test_format_quick_vs_full() {
     .await;
     assert!(res_full.is_ok());
 }
+
+#[tokio::test]
+async fn test_format_parameter_validation() {
+    let redis_url = get_redis_url();
+    let client = match redis::Client::open(redis_url.clone()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut con = match client.get_multiplexed_tokio_connection().await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
+
+    // 1. Invalid compression should fail
+    let res = squeezefs::fuse_client::format_volume_ext(
+        &redis_url,
+        "test_vol_val",
+        4096,
+        1024 * 1024,
+        1000,
+        "invalid_compression_alg",
+        "none",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    assert!(res.is_err());
+    assert!(format!("{:?}", res).contains("Unsupported compression algorithm"));
+
+    // 2. Invalid encryption should fail
+    let res = squeezefs::fuse_client::format_volume_ext(
+        &redis_url,
+        "test_vol_val",
+        4096,
+        1024 * 1024,
+        1000,
+        "none",
+        "invalid_encrypt_alg",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    assert!(res.is_err());
+    assert!(format!("{:?}", res).contains("Unsupported encryption algorithm"));
+
+    // 3. Inodes == 0 should succeed
+    let res = squeezefs::fuse_client::format_volume_ext(
+        &redis_url,
+        "test_vol_val_inodes",
+        4096,
+        1024 * 1024,
+        0,
+        "none",
+        "none",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    assert!(res.is_ok());
+
+    // 4. Invalid mem_cache_size should fail
+    let res = squeezefs::fuse_client::format_volume_ext(
+        &redis_url,
+        "test_vol_val",
+        4096,
+        1024 * 1024,
+        1000,
+        "none",
+        "none",
+        None,
+        Some("invalid_size"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    assert!(res.is_err());
+    assert!(format!("{:?}", res).contains("Invalid mem_cache_size"));
+
+    // 5. S3 Bucket specified but no S3 endpoint should fail
+    let res = squeezefs::fuse_client::format_volume_ext(
+        &redis_url,
+        "test_vol_val",
+        4096,
+        1024 * 1024,
+        1000,
+        "none",
+        "none",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("test-bucket"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    assert!(res.is_err());
+    assert!(format!("{:?}", res).contains(
+        "S3 bucket or credential parameters were provided, but no S3 endpoint was specified"
+    ));
+}

@@ -4653,6 +4653,99 @@ pub async fn format_volume_ext(
     fuse_io_uring_sqpoll_idle_ms: Option<u32>,
     quick: bool,
 ) -> Result<(), SqueezefsError> {
+    // 2. Compression algorithm check
+    let comp = compression.to_lowercase();
+    if comp != "none" && comp != "lz4" && comp != "zstd" && !comp.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Unsupported compression algorithm: '{}'. Supported options are: none, lz4, zstd.",
+            compression
+        )));
+    }
+
+    // 3. Encryption algorithm check
+    let enc = encrypt_algo.to_lowercase();
+    if enc != "none" && enc != "aes256gcm-rsa" && enc != "chacha20-rsa" && !enc.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Unsupported encryption algorithm: '{}'. Supported options are: none, aes256gcm-rsa, chacha20-rsa.",
+            encrypt_algo
+        )));
+    }
+
+    // 4. S3 parameters consistency
+    let has_s3_endpoint = s3_endpoint.is_some_and(|s| !s.is_empty())
+        || std::env::var("RUSTFS_ENDPOINT").is_ok_and(|s| !s.is_empty())
+        || std::env::var("AWS_ENDPOINT_URL").is_ok_and(|s| !s.is_empty());
+
+    let has_other_s3_params = s3_access_key.is_some_and(|s| !s.is_empty())
+        || s3_secret_key.is_some_and(|s| !s.is_empty())
+        || s3_bucket.is_some_and(|s| !s.is_empty())
+        || std::env::var("RUSTFS_ACCESS_KEY").is_ok_and(|s| !s.is_empty())
+        || std::env::var("AWS_ACCESS_KEY_ID").is_ok_and(|s| !s.is_empty())
+        || std::env::var("RUSTFS_SECRET_KEY").is_ok_and(|s| !s.is_empty())
+        || std::env::var("AWS_SECRET_ACCESS_KEY").is_ok_and(|s| !s.is_empty())
+        || std::env::var("RUSTFS_BUCKET").is_ok_and(|s| !s.is_empty())
+        || std::env::var("AWS_BUCKET").is_ok_and(|s| !s.is_empty());
+
+    if has_other_s3_params && !has_s3_endpoint {
+        return Err(SqueezefsError::InvalidOperation(
+            "S3 bucket or credential parameters were provided, but no S3 endpoint was specified. \
+             If you want to use S3 storage, you must provide --s3-endpoint or set the RUSTFS_ENDPOINT environment variable. \
+             If you intended to use the in-memory mock store, please omit all S3 parameters.".to_string(),
+        ));
+    }
+
+    // 5. Human readable size limits validation
+    if let Some(sz) = mem_cache_size.filter(|s| !s.is_empty() && *s != "none") {
+        crate::cache::parse_size_string(sz, 1024 * 1024).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("Invalid mem_cache_size '{}': {:?}", sz, e))
+        })?;
+    }
+    if let Some(sz) = disk_cache_size.filter(|s| !s.is_empty() && *s != "none") {
+        crate::cache::parse_size_string(sz, 1024 * 1024).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("Invalid disk_cache_size '{}': {:?}", sz, e))
+        })?;
+    }
+    if let Some(sz) = read_cache_size.filter(|s| !s.is_empty() && *s != "none") {
+        crate::cache::parse_size_string(sz, 1024 * 1024).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("Invalid read_cache_size '{}': {:?}", sz, e))
+        })?;
+    }
+    if let Some(sz) = write_cache_size.filter(|s| !s.is_empty() && *s != "none") {
+        crate::cache::parse_size_string(sz, 1024 * 1024).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("Invalid write_cache_size '{}': {:?}", sz, e))
+        })?;
+    }
+    if let Some(sz) = read_mem_cache_size.filter(|s| !s.is_empty() && *s != "none") {
+        crate::cache::parse_size_string(sz, 1024 * 1024).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "Invalid read_mem_cache_size '{}': {:?}",
+                sz, e
+            ))
+        })?;
+    }
+    if let Some(sz) = write_mem_cache_size.filter(|s| !s.is_empty() && *s != "none") {
+        crate::cache::parse_size_string(sz, 1024 * 1024).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "Invalid write_mem_cache_size '{}': {:?}",
+                sz, e
+            ))
+        })?;
+    }
+
+    // 6. Dismount wait validation
+    if let Some(wait) = dismount_wait.filter(|s| !s.is_empty()) {
+        wait.parse::<u64>().map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("Invalid dismount_wait '{}': {:?}", wait, e))
+        })?;
+    }
+
+    // 7. Upload delay validation
+    if let Some(delay) = upload_delay.filter(|s| !s.is_empty()) {
+        crate::cache::parse_duration(delay).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("Invalid upload_delay '{}': {:?}", delay, e))
+        })?;
+    }
+
     let meta_client = crate::dlm::MetaClient::new(redis_url)?;
     let mut shard_clients = Vec::new();
     match &meta_client {
@@ -4954,8 +5047,45 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             .collect()
     };
 
+    let backends_map: std::collections::HashMap<String, String> =
+        con.hgetall("squeezefs:backends").await.unwrap_or_default();
+    let statuses_map: std::collections::HashMap<String, String> = con
+        .hgetall("squeezefs:backend:status")
+        .await
+        .unwrap_or_default();
+
+    let mut storage_backends = serde_json::Map::new();
+    for (be_id, be_json_str) in backends_map {
+        if let Ok(mut be_val) = serde_json::from_str::<serde_json::Value>(&be_json_str) {
+            let status = statuses_map
+                .get(&be_id)
+                .cloned()
+                .unwrap_or_else(|| "enabled".to_string());
+            if let Some(obj) = be_val.as_object_mut() {
+                obj.insert("status".to_string(), serde_json::Value::String(status));
+            }
+            storage_backends.insert(be_id, be_val);
+        }
+    }
+
     let s3_endpoint = fields.get("s3_endpoint").cloned().unwrap_or_default();
     let s3_bucket = fields.get("s3_bucket").cloned().unwrap_or_default();
+
+    if !storage_backends.contains_key("backend_0") {
+        let status = statuses_map
+            .get("backend_0")
+            .cloned()
+            .unwrap_or_else(|| "enabled".to_string());
+        let be_val = serde_json::json!({
+            "endpoint": s3_endpoint,
+            "access_key": "admin",
+            "secret_key": "password",
+            "bucket": s3_bucket,
+            "status": status,
+        });
+        storage_backends.insert("backend_0".to_string(), be_val);
+    }
+
     let active_write_backend = fields
         .get("active_write_backend")
         .cloned()
@@ -4982,6 +5112,7 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             "DiskCachePaths": disk_cache_paths,
             "S3Endpoint": s3_endpoint,
             "S3Bucket": s3_bucket,
+            "StorageBackends": storage_backends,
             "ActiveWriteBackend": active_write_backend,
         }
     }))
@@ -5108,16 +5239,6 @@ async fn flush_single_active_block(
     >,
     locked: bool,
 ) -> Result<(), SqueezefsError> {
-    let block_lock = BLOCK_FLUSH_LOCKS
-        .entry((ino, b))
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-        .value()
-        .clone();
-    let _block_guard = block_lock.lock().await;
-    let _cleanup_guard = BlockFlushGuard { key: (ino, b) };
-
-    let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
-
     // Acquire lock to avoid race conditions with active writes
     let lock_opt = if !locked {
         Some(
@@ -5130,11 +5251,22 @@ async fn flush_single_active_block(
         None
     };
 
-    let (block_data, block_map_id, old_block_key, is_striped) = {
+    let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
+
+    let block_lock = BLOCK_FLUSH_LOCKS
+        .entry((ino, b))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .value()
+        .clone();
+
+    let (block_data, block_map_id, old_block_key, is_striped, _block_guard, _cleanup_guard) = {
         let mut _guard = None;
         if let Some(ref l) = lock_opt {
             _guard = Some(l.write().await);
         }
+
+        let _block_guard = block_lock.lock().await;
+        let _cleanup_guard = BlockFlushGuard { key: (ino, b) };
 
         let block_data = match router.cache.nvme.read_staged(&cache_key) {
             Some(d) => d,
@@ -5157,7 +5289,14 @@ async fn flush_single_active_block(
         let block_map_key = format!("block_map:{}", block_map_id);
         let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
 
-        (block_data, block_map_id, old_block_key, is_striped)
+        (
+            block_data,
+            block_map_id,
+            old_block_key,
+            is_striped,
+            _block_guard,
+            _cleanup_guard,
+        )
     };
 
     use redis::AsyncCommands;

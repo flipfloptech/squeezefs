@@ -123,6 +123,7 @@ pub struct GdsCache {
     staging_dirs: Vec<PathBuf>,
     #[cfg(all(feature = "gds", unix))]
     cufile_lib: Option<Arc<LibCuFile>>,
+    pub force_available: bool,
 }
 
 impl GdsCache {
@@ -163,6 +164,7 @@ impl GdsCache {
                 gpu_detected,
                 staging_dirs,
                 cufile_lib,
+                force_available: false,
             }
         }
 
@@ -176,12 +178,17 @@ impl GdsCache {
             Self {
                 gpu_detected,
                 staging_dirs,
+                force_available: false,
             }
         }
     }
 
     /// Check if GPU Direct Storage is available.
     pub fn is_available(&self) -> bool {
+        if self.force_available {
+            return true;
+        }
+
         #[cfg(all(feature = "gds", unix))]
         {
             self.gpu_detected && self.cufile_lib.is_some()
@@ -298,5 +305,12 @@ impl GdsCache {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             Ok(())
         }
+    }
+
+    /// Helper to resolve the `.gds_cache` filepath for GDS block prefetching.
+    pub fn get_gds_path(&self, object_key: &str) -> Option<PathBuf> {
+        let staging_dir = self.staging_dirs.first()?;
+        let safe_filename = object_key.replace('/', "_");
+        Some(staging_dir.join(format!("{}.gds_cache", safe_filename)))
     }
 }

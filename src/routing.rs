@@ -35,6 +35,7 @@ pub struct DataRouter {
         std::sync::Arc<dashmap::DashMap<String, (u32, std::time::Instant), ahash::RandomState>>,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
+    pub prefetcher: std::sync::Arc<IoUringPrefetcher>,
 }
 
 struct InflightBlockReadGuard {
@@ -74,6 +75,7 @@ impl DataRouter {
                 ahash::RandomState::new(),
             )),
             crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
+            prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
         }
     }
 
@@ -273,11 +275,67 @@ impl DataRouter {
             for (_, block_key_opt) in block_keys {
                 if let Some(block_key) = block_key_opt {
                     let router_clone = router.clone();
-                    tasks.push(tokio::spawn(async move {
-                        if let Err(err) = router_clone.get_cached_or_fetch_block(&block_key).await {
-                            debug!("Prefetch: Failed to fetch block {}: {:?}", block_key, err);
+
+                    if router_clone.cache.gds.is_available() {
+                        if let Some(local_path) = router_clone.cache.gds.get_gds_path(&block_key) {
+                            if !local_path.exists() {
+                                debug!(
+                                    "Prefetch (GDS): Scheduling download for block {}",
+                                    block_key
+                                );
+                                let local_path_clone = local_path.clone();
+                                let block_key_clone = block_key.clone();
+                                tasks.push(tokio::spawn(async move {
+                                    if let Ok(downloaded) =
+                                        router_clone.fetch_block_from_remote(&block_key_clone).await
+                                    {
+                                        if let Err(e) =
+                                            tokio::fs::write(&local_path_clone, &*downloaded).await
+                                        {
+                                            debug!(
+                                                "Prefetch (GDS): Failed to write block {}: {:?}",
+                                                block_key_clone, e
+                                            );
+                                        } else {
+                                            debug!(
+                                                "Prefetch (GDS): Successfully cached block {}",
+                                                block_key_clone
+                                            );
+                                        }
+                                    }
+                                }));
+                                continue;
+                            }
                         }
-                    }));
+                    }
+
+                    if let Some(guard) = router_clone
+                        .cache
+                        .nvme
+                        .get_cached_read_block_range_zero_copy(&block_key, 0, u32::MAX)
+                    {
+                        debug!(
+                            "Prefetch (io_uring): Scheduling page prefetch for block {}",
+                            block_key
+                        );
+                        let addr = guard.as_ptr() as u64;
+                        let len = guard.len();
+                        router_clone.prefetcher.prefetch(addr, len);
+                    } else {
+                        debug!("Prefetch: Scheduling remote fetch for block {}", block_key);
+                        let block_key_clone = block_key.clone();
+                        tasks.push(tokio::spawn(async move {
+                            if let Err(err) = router_clone
+                                .get_cached_or_fetch_block(&block_key_clone)
+                                .await
+                            {
+                                debug!(
+                                    "Prefetch: Failed to fetch block {}: {:?}",
+                                    block_key_clone, err
+                                );
+                            }
+                        }));
+                    }
                 }
             }
             for task in tasks {
@@ -2150,5 +2208,83 @@ impl DataRouter {
         .await?;
 
         Ok(())
+    }
+}
+
+pub struct IoUringPrefetcher {
+    #[cfg(target_os = "linux")]
+    tx: tokio::sync::mpsc::UnboundedSender<(u64, usize)>,
+    pub prefetch_count: std::sync::atomic::AtomicUsize,
+}
+
+impl IoUringPrefetcher {
+    pub fn new() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, usize)>();
+            std::thread::spawn(move || {
+                use io_uring::{opcode, IoUring};
+                let mut ring = match IoUring::new(512) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::error!("Failed to initialize prefetcher io_uring: {:?}", e);
+                        return;
+                    }
+                };
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    while let Some((addr, len)) = rx.recv().await {
+                        let prefetch_e = opcode::Madvise::new(
+                            addr as *mut std::ffi::c_void,
+                            len as i64,
+                            libc::MADV_WILLNEED,
+                        )
+                        .build()
+                        .user_data(0x99);
+                        unsafe {
+                            if let Err(e) = ring.submission().push(&prefetch_e) {
+                                log::debug!("Prefetcher: Failed to push to io_uring: {:?}", e);
+                                continue;
+                            }
+                        }
+                        if let Err(e) = ring.submit() {
+                            log::debug!("Prefetcher: io_uring submit failed: {:?}", e);
+                        }
+                        // Reap completions
+                        let mut cq = ring.completion();
+                        cq.sync();
+                        for _ in cq {}
+                    }
+                });
+            });
+            Self {
+                tx,
+                prefetch_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self {
+                prefetch_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    pub fn prefetch(&self, _addr: u64, _len: usize) {
+        self.prefetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self.tx.send((_addr, _len));
+        }
+    }
+}
+
+impl Default for IoUringPrefetcher {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -840,8 +840,9 @@ impl SqueezefsFilesystem {
                             *guard = None;
 
                             let get_res = async {
-                                let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
-                                let raw = self.router.backend.get_object(&be_id, &real_key).await?;
+                                let raw =
+                                    crate::routing::fetch_block_bytes(&self.router.backend, &bk)
+                                        .await?;
                                 let decompressed = self.router.get_crypto().process_read(&raw)?;
                                 Ok::<Vec<u8>, SqueezefsError>(decompressed)
                             }
@@ -900,7 +901,7 @@ impl SqueezefsFilesystem {
         for key_bytes in keys {
             let key_str = String::from_utf8(key_bytes.to_vec()).unwrap_or_default();
             if key_str.starts_with(&prefix) {
-                active_keys.push((key_str, key_bytes));
+                active_keys.push(key_str);
             }
         }
 
@@ -908,109 +909,29 @@ impl SqueezefsFilesystem {
             return Ok(());
         }
 
-        let meta_key = format!("metadata:{}", file_path);
-        let mut con = self.dlm.get_connection_for_inode(ino).await?;
-        let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
-        let mut block_map_id = block_map_id_opt.unwrap_or_default();
-        if block_map_id.is_empty() {
-            block_map_id = uuid::Uuid::new_v4().to_string();
-            let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
-        }
-
         let mut tasks = Vec::new();
 
-        for (key_str, _key_bytes) in active_keys {
+        for key_str in active_keys {
             let b_str = key_str
                 .trim_start_matches(&prefix)
                 .trim_start_matches("block_");
             if let Ok(b) = b_str.parse::<u32>() {
-                let block_data_opt = self.router.cache.nvme.read_staged(&key_str);
-                if let Some(block_data) = block_data_opt {
-                    let backend_clone = self.router.backend.clone();
-                    let dlm_clone = self.dlm.clone();
-                    let block_map_id_clone = block_map_id.clone();
-                    let router_clone = self.router.clone();
-                    let nvme_clone = self.router.cache.nvme.clone();
+                let router_clone = self.router.clone();
+                let dlm_clone = self.dlm.clone();
+                let locks_clone = self.active_inode_locks.clone();
 
-                    tasks.push(tokio::spawn(async move {
-                        let file_uuid = uuid::Uuid::new_v4().to_string();
-                        let block_write_uuid = uuid::Uuid::new_v4().to_string();
-                        let new_block_key =
-                            format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
-
-                        let block_bytes = bytes::Bytes::from(block_data);
-                        let processed_block = router_clone
-                            .get_crypto()
-                            .process_write(block_bytes.clone())?;
-                        backend_clone
-                            .put_object(&new_block_key, processed_block, fencing_token)
-                            .await?;
-
-                        let active_be = backend_clone.get_backend_for_key(&new_block_key);
-                        let stored_block_key = format!("{}:{}", active_be, new_block_key);
-
-                        // Cache the flushed block in RAM (read_lru) - dehydrated to NVMe on eviction
-                        router_clone
-                            .cache
-                            .read_lru
-                            .put(&stored_block_key, block_bytes.clone());
-
-                        let mut con = dlm_clone.get_connection().await?;
-                        let block_map_key = format!("block_map:{}", block_map_id_clone);
-                        let refcounts_key = "squeezefs:block_refcounts";
-
-                        let old_block_key: Option<String> =
-                            con.hget(&block_map_key, b.to_string()).await?;
-
-                        let mut pipe = redis::pipe();
-                        pipe.hset(refcounts_key, &stored_block_key, 1).hset(
-                            &block_map_key,
-                            b.to_string(),
-                            &stored_block_key,
-                        );
-                        let _: () = pipe.query_async(&mut con).await?;
-
-                        // Update local block_map_cache
-                        router_clone.block_map_cache.insert(
-                            (block_map_id_clone.clone(), b),
-                            (Some(stored_block_key.clone()), std::time::Instant::now()),
-                        );
-
-                        if let Some(bk) = old_block_key {
-                            router_clone.cache.read_lru.remove(&bk);
-                            let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
-                            if let Some(mut r) = old_ref {
-                                r -= 1;
-                                if r <= 0 {
-                                    let _: () = redis::pipe()
-                                        .hdel(refcounts_key, &bk)
-                                        .query_async(&mut con)
-                                        .await?;
-                                    let (be_id, real_key) =
-                                        crate::backend::parse_backend_and_key(&bk);
-                                    let _ = backend_clone.delete_object(&be_id, &real_key).await;
-                                } else {
-                                    let _: () = con.hset(refcounts_key, &bk, r).await?;
-                                }
-                            } else {
-                                let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
-                                let _ = backend_clone.delete_object(&be_id, &real_key).await;
-                            }
-                        }
-
-                        // ONLY remove active write block from cache if it hasn't been modified by a newer write
-                        let current_staged = nvme_clone.read_staged(&key_str);
-                        if let Some(ref cur) = current_staged {
-                            if cur == &block_bytes[..] {
-                                nvme_clone.remove_active_block(&key_str);
-                            }
-                        } else {
-                            nvme_clone.remove_active_block(&key_str);
-                        }
-
-                        Ok::<_, SqueezefsError>(())
-                    }));
-                }
+                tasks.push(tokio::spawn(async move {
+                    flush_single_active_block(
+                        ino,
+                        b,
+                        fencing_token,
+                        &router_clone,
+                        &dlm_clone,
+                        &locks_clone,
+                        true,
+                    )
+                    .await
+                }));
             }
         }
 
@@ -1153,7 +1074,128 @@ impl SqueezefsFilesystem {
             .await?;
         Ok(())
     }
+
+    pub async fn complete_active_multipart_upload_if_any(
+        &self,
+        ino: u64,
+    ) -> Result<(), SqueezefsError> {
+        use redis::AsyncCommands;
+        let mut con = self.dlm.get_connection().await?;
+        let active_mp_key = format!("squeezefs:active_multipart:{}", ino);
+
+        let (upload_id_opt, s3_key_opt, backend_id_opt): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = redis::pipe()
+            .hget(&active_mp_key, "upload_id")
+            .hget(&active_mp_key, "s3_key")
+            .hget(&active_mp_key, "backend_id")
+            .query_async(&mut con)
+            .await?;
+
+        let (upload_id, s3_key, backend_id) = match (upload_id_opt, s3_key_opt, backend_id_opt) {
+            (Some(uid), Some(s3k), Some(bid)) => (uid, s3k, bid),
+            _ => return Ok(()),
+        };
+
+        let parts_key = format!("squeezefs:multipart_parts:{}", ino);
+        let parts_map: std::collections::HashMap<String, String> = con.hgetall(&parts_key).await?;
+
+        let mut parts = Vec::new();
+        let mut part_offsets = Vec::new();
+        for (k, v) in parts_map {
+            let part_num: i32 = k.parse().unwrap_or(0);
+            let split: Vec<&str> = v.split(',').collect();
+            if split.len() == 2 {
+                let etag = split[0].to_string();
+                let size: usize = split[1].parse().unwrap_or(0);
+                parts.push((part_num, etag));
+                part_offsets.push((part_num, size));
+            }
+        }
+
+        if parts.is_empty() {
+            let _ = self
+                .router
+                .backend
+                .abort_multipart_upload(&backend_id, &s3_key, &upload_id)
+                .await;
+            let _: () = redis::pipe()
+                .del(&active_mp_key)
+                .del(&parts_key)
+                .query_async(&mut con)
+                .await?;
+            return Ok(());
+        }
+
+        parts.sort_by_key(|(p, _)| *p);
+        part_offsets.sort_by_key(|(p, _)| *p);
+
+        self.router
+            .backend
+            .complete_multipart_upload(&backend_id, &s3_key, &upload_id, parts)
+            .await?;
+
+        let file_path = format!("inode_{}", ino);
+        let meta_key = format!("metadata:{}", file_path);
+        let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+        let mut block_map_id = block_map_id_opt.unwrap_or_default();
+        if block_map_id.is_empty() {
+            block_map_id = uuid::Uuid::new_v4().to_string();
+            let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
+        }
+        let block_map_key = format!("block_map:{}", block_map_id);
+
+        let refcounts_key = "squeezefs:block_refcounts";
+        let mut start_offset: u64 = 0;
+
+        for (part_num, size) in part_offsets {
+            let block_num = (part_num - 1) as u32;
+            let end_offset = start_offset + size as u64;
+            let stored_block_key = format!(
+                "{}:s3_single:{}:{}:{}",
+                backend_id, s3_key, start_offset, end_offset
+            );
+
+            let mut pipe = redis::pipe();
+            pipe.hset(refcounts_key, &stored_block_key, 1).hset(
+                &block_map_key,
+                block_num.to_string(),
+                &stored_block_key,
+            );
+            let _: () = pipe.query_async(&mut con).await?;
+
+            self.router.block_map_cache.insert(
+                (block_map_id.clone(), block_num),
+                (Some(stored_block_key.clone()), std::time::Instant::now()),
+            );
+
+            let cache_key = format!("active_block:inode_{}:block_{}", ino, block_num);
+            self.router.cache.nvme.remove_active_block(&cache_key);
+
+            start_offset = end_offset;
+        }
+
+        let _: () = redis::pipe()
+            .del(&active_mp_key)
+            .del(&parts_key)
+            .query_async(&mut con)
+            .await?;
+
+        Ok(())
+    }
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GdsReadArgs {
+    pub vram_address: u64,
+    pub offset: u64,
+    pub size: u64,
+}
+
+pub const SQUEEZEFS_IOC_GDS_READ: u32 = 0x80186601;
 
 // Implement fuse3 Raw Filesystem interface
 impl Filesystem for SqueezefsFilesystem {
@@ -3647,6 +3689,13 @@ impl Filesystem for SqueezefsFilesystem {
             let _ = self.flush_active_blocks(ino, fencing_token).await;
         }
 
+        if let Err(e) = self.complete_active_multipart_upload_if_any(ino).await {
+            error!(
+                "FUSE Release: Failed to complete multipart upload for inode {}: {:?}",
+                ino, e
+            );
+        }
+
         // If there's a cached lease, release it and remove it from our active_leases map
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
@@ -3956,10 +4005,133 @@ impl Filesystem for SqueezefsFilesystem {
             inode, cmd, flags
         );
 
-        match cmd as u64 {
-            libc::FS_IOC_GETFLAGS => Err(Errno::from(libc::ENOTTY)),
-            libc::FS_IOC_SETFLAGS => Err(Errno::from(libc::ENOTTY)),
-            _ => Err(Errno::from(libc::ENOTTY)),
+        match cmd {
+            SQUEEZEFS_IOC_GDS_READ => {
+                // 1. Read GdsReadArgs from client process memory
+                let mut bytes = [0u8; std::mem::size_of::<GdsReadArgs>()];
+                use std::os::unix::fs::FileExt;
+                let mem_file =
+                    std::fs::File::open(format!("/proc/{}/mem", _req.pid)).map_err(|e| {
+                        error!(
+                            "GDS ioctl: failed to open client memory file for pid {}: {:?}",
+                            _req.pid, e
+                        );
+                        Errno::from(libc::EFAULT)
+                    })?;
+                mem_file.read_exact_at(&mut bytes, _arg).map_err(|e| {
+                    error!(
+                        "GDS ioctl: failed to read client memory at 0x{:X}: {:?}",
+                        _arg, e
+                    );
+                    Errno::from(libc::EFAULT)
+                })?;
+
+                let args: GdsReadArgs =
+                    unsafe { std::ptr::read(bytes.as_ptr() as *const GdsReadArgs) };
+                debug!("GDS ioctl args: {:?}", args);
+
+                // 2. Lock inode
+                let lock = self.get_inode_lock(inode);
+                let _guard = lock.read().await;
+
+                // 3. Fetch metadata
+                let file_path = format!("inode_{}", inode);
+                let meta = match self.router.fetch_metadata(&file_path).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!(
+                            "GDS ioctl: failed to fetch metadata for inode {}: {:?}",
+                            inode, e
+                        );
+                        return Err(map_squeezefs_err(e));
+                    }
+                };
+
+                if meta.file_type != "striped" {
+                    error!(
+                        "GDS ioctl: only striped files support GDS, got layout: {}",
+                        meta.file_type
+                    );
+                    return Err(Errno::from(libc::EINVAL));
+                }
+
+                let block_size = self.router.block_size.load(Ordering::Relaxed);
+                let file_size = meta.size;
+
+                if args.offset >= file_size {
+                    return Ok(ReplyIoctl {
+                        result: 0,
+                        flags: 0,
+                        in_iovs: 0,
+                        out_iovs: 0,
+                    });
+                }
+
+                let end_offset = std::cmp::min(args.offset + args.size, file_size);
+                let start_block = (args.offset / block_size) as u32;
+                let end_block = ((end_offset - 1) / block_size) as u32;
+
+                let block_keys = match self
+                    .router
+                    .load_striped_block_keys(&meta, start_block, end_block)
+                    .await
+                {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        error!("GDS ioctl: failed to load block keys: {:?}", e);
+                        return Err(map_squeezefs_err(e));
+                    }
+                };
+
+                for (b_idx, key_opt) in block_keys {
+                    let b_key = match key_opt {
+                        Some(key) => key,
+                        None => continue, // Sparse hole
+                    };
+
+                    let b_start_offset = b_idx as u64 * block_size;
+                    let b_end_offset = b_start_offset + block_size;
+
+                    let read_start = std::cmp::max(args.offset, b_start_offset);
+                    let read_end = std::cmp::min(end_offset, b_end_offset);
+                    let block_read_offset = read_start - b_start_offset;
+                    let block_read_size = (read_end - read_start) as usize;
+
+                    let dest_vram_address = args.vram_address + (read_start - args.offset);
+
+                    if let Err(e) = self
+                        .router
+                        .cache
+                        .gds
+                        .read_direct(
+                            &b_key,
+                            dest_vram_address,
+                            block_read_offset,
+                            block_read_size,
+                            &self.router,
+                        )
+                        .await
+                    {
+                        error!(
+                            "GDS ioctl: read_direct failed for block {} key {}: {:?}",
+                            b_idx, b_key, e
+                        );
+                        return Err(map_squeezefs_err(e));
+                    }
+                }
+
+                Ok(ReplyIoctl {
+                    result: 0,
+                    flags: 0,
+                    in_iovs: 0,
+                    out_iovs: 0,
+                })
+            }
+            _ => match cmd as u64 {
+                libc::FS_IOC_GETFLAGS => Err(Errno::from(libc::ENOTTY)),
+                libc::FS_IOC_SETFLAGS => Err(Errno::from(libc::ENOTTY)),
+                _ => Err(Errno::from(libc::ENOTTY)),
+            },
         }
     }
 
@@ -4902,6 +5074,7 @@ async fn flush_due_active_blocks_for_inode(
                 &router,
                 &dlm,
                 &active_inode_locks,
+                false,
             )
             .await
         }
@@ -4926,6 +5099,7 @@ async fn flush_single_active_block(
         std::sync::Arc<tokio::sync::RwLock<()>>,
         ahash::RandomState,
     >,
+    locked: bool,
 ) -> Result<(), SqueezefsError> {
     let block_lock = BLOCK_FLUSH_LOCKS
         .entry((ino, b))
@@ -4938,12 +5112,22 @@ async fn flush_single_active_block(
     let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
 
     // Acquire lock to avoid race conditions with active writes
-    let (block_data, block_map_id, old_block_key) = {
-        let lock = active_inode_locks
-            .entry(ino)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
-            .clone();
-        let _guard = lock.write().await;
+    let lock_opt = if !locked {
+        Some(
+            active_inode_locks
+                .entry(ino)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
+                .clone(),
+        )
+    } else {
+        None
+    };
+
+    let (block_data, block_map_id, old_block_key, is_striped) = {
+        let mut _guard = None;
+        if let Some(ref l) = lock_opt {
+            _guard = Some(l.write().await);
+        }
 
         let block_data = match router.cache.nvme.read_staged(&cache_key) {
             Some(d) => d,
@@ -4953,6 +5137,9 @@ async fn flush_single_active_block(
         let file_path = format!("inode_{}", ino);
         let meta_key = format!("metadata:{}", file_path);
         let mut con = dlm.get_connection().await?;
+        let file_type: Option<String> = con.hget(&meta_key, "type").await?;
+        let is_striped = file_type.as_deref() == Some("striped");
+
         let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
         let mut block_map_id = block_map_id_opt.unwrap_or_default();
         if block_map_id.is_empty() {
@@ -4963,15 +5150,90 @@ async fn flush_single_active_block(
         let block_map_key = format!("block_map:{}", block_map_id);
         let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
 
-        (block_data, block_map_id, old_block_key)
+        (block_data, block_map_id, old_block_key, is_striped)
     };
+
+    use redis::AsyncCommands;
+    let mut con = dlm.get_connection().await?;
+    let mut active_multipart = None;
+    if is_striped {
+        let active_mp_key = format!("squeezefs:active_multipart:{}", ino);
+        let (upload_id_opt, s3_key_opt, backend_id_opt): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = redis::pipe()
+            .hget(&active_mp_key, "upload_id")
+            .hget(&active_mp_key, "s3_key")
+            .hget(&active_mp_key, "backend_id")
+            .query_async(&mut con)
+            .await?;
+
+        if let (Some(upload_id), Some(s3_key), Some(backend_id)) =
+            (upload_id_opt, s3_key_opt, backend_id_opt)
+        {
+            active_multipart = Some((upload_id, s3_key, backend_id));
+        } else {
+            // Check if block map is empty
+            let block_map_key = format!("block_map:{}", block_map_id);
+            let len: u64 = con.hlen(&block_map_key).await.unwrap_or(0);
+            if len == 0 {
+                // Initialize multipart upload!
+                let s3_key = format!("multipart/inode_{}_{}", ino, uuid::Uuid::new_v4());
+                let backend_id = router.backend.get_backend_for_key(&s3_key);
+                match router
+                    .backend
+                    .create_multipart_upload(&backend_id, &s3_key)
+                    .await
+                {
+                    Ok(upload_id) => {
+                        let _: () = redis::pipe()
+                            .hset(&active_mp_key, "upload_id", &upload_id)
+                            .hset(&active_mp_key, "s3_key", &s3_key)
+                            .hset(&active_mp_key, "backend_id", &backend_id)
+                            .query_async(&mut con)
+                            .await?;
+                        active_multipart = Some((upload_id, s3_key, backend_id));
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create multipart upload for inode {}: {:?}",
+                            ino, e
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    let block_bytes = bytes::Bytes::from(block_data.clone());
+    let processed_block = router.get_crypto().process_write(block_bytes.clone())?;
+
+    if let Some((upload_id, s3_key, backend_id)) = active_multipart {
+        let part_number = (b + 1) as i32;
+        let etag = router
+            .backend
+            .upload_part(
+                &backend_id,
+                &s3_key,
+                &upload_id,
+                part_number,
+                processed_block,
+            )
+            .await?;
+        let parts_key = format!("squeezefs:multipart_parts:{}", ino);
+        let part_value = format!("{},{}", etag, block_bytes.len());
+        let _: () = con
+            .hset(&parts_key, part_number.to_string(), part_value)
+            .await?;
+        return Ok(());
+    }
 
     let file_uuid = uuid::Uuid::new_v4().to_string();
     let block_write_uuid = uuid::Uuid::new_v4().to_string();
     let new_block_key = format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
-    let block_bytes = bytes::Bytes::from(block_data);
-    let processed_block = router.get_crypto().process_write(block_bytes.clone())?;
     if let Err(e) = router
         .backend
         .put_object(&new_block_key, processed_block, fencing_token)
@@ -4988,11 +5250,21 @@ async fn flush_single_active_block(
     let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
     // Re-acquire lock to verify consistency and finalize update
-    let lock = active_inode_locks
-        .entry(ino)
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
-        .clone();
-    let _guard = lock.write().await;
+    let lock_opt = if !locked {
+        Some(
+            active_inode_locks
+                .entry(ino)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
+                .clone(),
+        )
+    } else {
+        None
+    };
+
+    let mut _guard = None;
+    if let Some(ref l) = lock_opt {
+        _guard = Some(l.write().await);
+    }
 
     let mut con = dlm.get_connection().await?;
     let block_map_key = format!("block_map:{}", block_map_id);
@@ -5006,7 +5278,6 @@ async fn flush_single_active_block(
     }
 
     let refcounts_key = "squeezefs:block_refcounts";
-    use redis::AsyncCommands;
     let mut pipe = redis::pipe();
     pipe.hset(refcounts_key, &stored_block_key, 1).hset(
         &block_map_key,
@@ -5020,11 +5291,13 @@ async fn flush_single_active_block(
         (Some(stored_block_key.clone()), std::time::Instant::now()),
     );
 
-    // Cache in RAM - dehydrated to NVMe on eviction
-    router
-        .cache
-        .read_lru
-        .put(&stored_block_key, block_bytes.clone());
+    // Cache in RAM (bypass entirely if file is striped layout)
+    if !is_striped {
+        router
+            .cache
+            .read_lru
+            .put(&stored_block_key, block_bytes.clone());
+    }
 
     if let Some(bk) = old_block_key {
         router.cache.read_lru.remove(&bk);

@@ -167,7 +167,51 @@ impl DataRouter {
         }
     }
 
-    async fn load_striped_block_keys(
+    pub async fn fetch_metadata(&self, file_path: &str) -> Result<CachedMetadata> {
+        use std::time::Duration;
+        if let Some(entry) = self.metadata_cache.get(file_path) {
+            if entry.cached_at.elapsed() < Duration::from_secs(1) {
+                return Ok(entry.clone());
+            }
+        }
+        let mut con = self.dlm.get_connection().await?;
+        let meta_key = format!("metadata:{}", file_path);
+        let fields: std::collections::HashMap<String, String> = con.hgetall(&meta_key).await?;
+
+        let file_type = fields.get("type").cloned().ok_or_else(|| {
+            SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("File not found: {}", file_path),
+            ))
+        })?;
+        let size_val = fields
+            .get("size")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let block_map_id = fields
+            .get("block_map_id")
+            .filter(|s| !s.is_empty())
+            .cloned();
+        let block_prefix = fields
+            .get("block_prefix")
+            .filter(|s| !s.is_empty())
+            .cloned();
+        let file_id = fields.get("file_id").filter(|s| !s.is_empty()).cloned();
+
+        let m = CachedMetadata {
+            file_type,
+            size: size_val,
+            block_map_id,
+            block_prefix,
+            file_id,
+            cached_at: std::time::Instant::now(),
+            data_key: None,
+        };
+        self.metadata_cache.insert(file_path.to_string(), m.clone());
+        Ok(m)
+    }
+
+    pub async fn load_striped_block_keys(
         &self,
         meta: &CachedMetadata,
         start_block: u32,
@@ -1460,57 +1504,7 @@ impl DataRouter {
         }
 
         // Fetch file metadata from local cache or Garnet
-        let cached_meta = if let Some(entry) = self.metadata_cache.get(file_path) {
-            if entry.cached_at.elapsed() < Duration::from_secs(1) {
-                Some(entry.clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let meta = match cached_meta {
-            Some(m) => m,
-            None => {
-                let mut con = self.dlm.get_connection().await?;
-                let meta_key = format!("metadata:{}", file_path);
-                let fields: std::collections::HashMap<String, String> =
-                    con.hgetall(&meta_key).await?;
-
-                let file_type = fields.get("type").cloned().ok_or_else(|| {
-                    SqueezefsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("File not found: {}", file_path),
-                    ))
-                })?;
-                let size_val = fields
-                    .get("size")
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let block_map_id = fields
-                    .get("block_map_id")
-                    .filter(|s| !s.is_empty())
-                    .cloned();
-                let block_prefix = fields
-                    .get("block_prefix")
-                    .filter(|s| !s.is_empty())
-                    .cloned();
-                let file_id = fields.get("file_id").filter(|s| !s.is_empty()).cloned();
-
-                let m = CachedMetadata {
-                    file_type,
-                    size: size_val,
-                    block_map_id,
-                    block_prefix,
-                    file_id,
-                    cached_at: std::time::Instant::now(),
-                    data_key: None,
-                };
-                self.metadata_cache.insert(file_path.to_string(), m.clone());
-                m
-            }
-        };
+        let meta = self.fetch_metadata(file_path).await?;
 
         match meta.file_type.as_str() {
             "inline" => {

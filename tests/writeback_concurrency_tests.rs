@@ -598,7 +598,9 @@ async fn test_background_writeback_flushes_multi_block_inode_without_explicit_fl
     .expect("background writeback should flush both striped blocks without an explicit flush");
 
     // Complete the multipart upload
-    fs.release(req, ino, 0, 0, 0, false).await.expect("Release should succeed");
+    fs.release(req, ino, 0, 0, 0, false)
+        .await
+        .expect("Release should succeed");
 
     let block_map_id = con
         .hget::<_, _, Option<String>>(&meta_key, "block_map_id")

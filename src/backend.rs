@@ -8,11 +8,22 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-#[derive(Default)]
 struct MockStoreState {
     get_count: AtomicU64,
     range_get_count: AtomicU64,
     get_delay_ms: AtomicU64,
+    multiparts: DashMap<String, Vec<(i32, bytes::Bytes)>, ahash::RandomState>,
+}
+
+impl Default for MockStoreState {
+    fn default() -> Self {
+        Self {
+            get_count: AtomicU64::new(0),
+            range_get_count: AtomicU64::new(0),
+            get_delay_ms: AtomicU64::new(0),
+            multiparts: DashMap::with_hasher(ahash::RandomState::new()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -547,6 +558,122 @@ impl RustFsClient {
 
         Ok(())
     }
+
+    pub async fn create_multipart_upload(&self, key: &str) -> Result<String> {
+        if self.mock_store.is_some() {
+            let upload_id = uuid::Uuid::new_v4().to_string();
+            self.mock_state
+                .multiparts
+                .insert(upload_id.clone(), Vec::new());
+            return Ok(upload_id);
+        }
+        let s3 = self.get_s3_client().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
+        })?;
+        let res = s3
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| SqueezefsError::S3(format!("create_multipart_upload failed: {:?}", e)))?;
+        res.upload_id()
+            .map(|s| s.to_string())
+            .ok_or_else(|| SqueezefsError::S3("No upload ID returned".to_string()))
+    }
+
+    pub async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        data: bytes::Bytes,
+    ) -> Result<String> {
+        if self.mock_store.is_some() {
+            let etag = uuid::Uuid::new_v4().to_string();
+            if let Some(mut parts) = self.mock_state.multiparts.get_mut(upload_id) {
+                parts.push((part_number, data));
+            }
+            return Ok(etag);
+        }
+        let s3 = self.get_s3_client().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
+        })?;
+        let body = ByteStream::from(data);
+        let res = s3
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| SqueezefsError::S3(format!("upload_part failed: {:?}", e)))?;
+        res.e_tag()
+            .map(|s| s.to_string())
+            .ok_or_else(|| SqueezefsError::S3("No ETag returned".to_string()))
+    }
+
+    pub async fn complete_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<()> {
+        if let Some(ref store) = self.mock_store {
+            if let Some((_, mut parts_data)) = self.mock_state.multiparts.remove(upload_id) {
+                parts_data.sort_by_key(|(p, _)| *p);
+                let mut combined = Vec::new();
+                for (_, data) in parts_data {
+                    combined.extend_from_slice(&data);
+                }
+                store.insert(key.to_string(), (bytes::Bytes::from(combined), 1));
+            }
+            return Ok(());
+        }
+        let s3 = self.get_s3_client().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
+        })?;
+        let mut completed_multipart_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder();
+        for (part_num, etag) in parts {
+            let completed_part = aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(part_num)
+                .e_tag(etag)
+                .build();
+            completed_multipart_upload = completed_multipart_upload.parts(completed_part);
+        }
+        let multipart_upload = completed_multipart_upload.build();
+        s3.complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(multipart_upload)
+            .send()
+            .await
+            .map_err(|e| {
+                SqueezefsError::S3(format!("complete_multipart_upload failed: {:?}", e))
+            })?;
+        Ok(())
+    }
+
+    pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        if self.mock_store.is_some() {
+            self.mock_state.multiparts.remove(upload_id);
+            return Ok(());
+        }
+        let s3 = self.get_s3_client().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
+        })?;
+        s3.abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|e| SqueezefsError::S3(format!("abort_multipart_upload failed: {:?}", e)))?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -686,6 +813,70 @@ impl MultiBackendClient {
     ) -> Result<Vec<u8>> {
         if let Some(backend) = self.get_backend(backend_id) {
             backend.get_object_range(key, start, end).await
+        } else {
+            Err(SqueezefsError::InvalidOperation(format!(
+                "Backend ID {} not registered",
+                backend_id
+            )))
+        }
+    }
+
+    pub async fn create_multipart_upload(&self, backend_id: &str, key: &str) -> Result<String> {
+        if let Some(backend) = self.get_backend(backend_id) {
+            backend.create_multipart_upload(key).await
+        } else {
+            Err(SqueezefsError::InvalidOperation(format!(
+                "Backend ID {} not registered",
+                backend_id
+            )))
+        }
+    }
+
+    pub async fn upload_part(
+        &self,
+        backend_id: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        data: bytes::Bytes,
+    ) -> Result<String> {
+        if let Some(backend) = self.get_backend(backend_id) {
+            backend.upload_part(key, upload_id, part_number, data).await
+        } else {
+            Err(SqueezefsError::InvalidOperation(format!(
+                "Backend ID {} not registered",
+                backend_id
+            )))
+        }
+    }
+
+    pub async fn complete_multipart_upload(
+        &self,
+        backend_id: &str,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<()> {
+        if let Some(backend) = self.get_backend(backend_id) {
+            backend
+                .complete_multipart_upload(key, upload_id, parts)
+                .await
+        } else {
+            Err(SqueezefsError::InvalidOperation(format!(
+                "Backend ID {} not registered",
+                backend_id
+            )))
+        }
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        backend_id: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<()> {
+        if let Some(backend) = self.get_backend(backend_id) {
+            backend.abort_multipart_upload(key, upload_id).await
         } else {
             Err(SqueezefsError::InvalidOperation(format!(
                 "Backend ID {} not registered",

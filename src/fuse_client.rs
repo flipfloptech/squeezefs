@@ -20,7 +20,7 @@ use tokio::runtime::Builder;
 const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
-static BLOCK_FLUSH_LOCKS: Lazy<
+pub static BLOCK_FLUSH_LOCKS: Lazy<
     dashmap::DashMap<(u64, u32), std::sync::Arc<tokio::sync::Mutex<()>>, ahash::RandomState>,
 > = Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
@@ -649,7 +649,7 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
-    fn get_inode_lock(&self, ino: u64) -> std::sync::Arc<tokio::sync::RwLock<()>> {
+    pub fn get_inode_lock(&self, ino: u64) -> std::sync::Arc<tokio::sync::RwLock<()>> {
         self.active_inode_locks
             .entry(ino)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))

@@ -244,6 +244,11 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigActions,
     },
+    /// Show filesystem disk space usage across all caches and S3
+    Df {
+        /// Optional path to a file or directory
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1818,6 +1823,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             router.clone_path(&src, &dest).await?;
             println!("File cloned successfully.");
         }
+        Commands::Df { path } => {
+            let redis_url = &cli.garnet_url;
+            run_df_command(redis_url, path).await?;
+        }
         Commands::Tune => {
             tune_system()?;
         }
@@ -2415,6 +2424,505 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             std::process::exit(1);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn find_squeezefs_mounts() -> Vec<PathBuf> {
+    let mut mounts = Vec::new();
+    if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let mnt_dir = parts[1];
+                let mnt_type = parts[2];
+                if mnt_type.starts_with("fuse") {
+                    let path = PathBuf::from(mnt_dir);
+                    if path.join(".stats").exists() && path.join(".config").exists() {
+                        mounts.push(path);
+                    }
+                }
+            }
+        }
+    }
+    mounts
+}
+
+async fn resolve_path_to_inode(
+    dlm: &DlmClient,
+    path: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut current_ino = 1u64; // Root inode
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        let mut con = dlm.get_connection_for_inode(current_ino).await?;
+        let dir_key = format!("squeezefs:dir:{}", current_ino);
+        let next_ino_opt: Option<u64> = con.hget(&dir_key, part).await?;
+        match next_ino_opt {
+            Some(next_ino) => {
+                current_ino = next_ino;
+            }
+            None => {
+                return Err(format!(
+                    "Path component '{}' not found in inode {}",
+                    part, current_ino
+                )
+                .into());
+            }
+        }
+    }
+    Ok(current_ino)
+}
+
+async fn run_df_command(
+    redis_url: &str,
+    path_opt: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dlm = DlmClient::new(redis_url)?;
+    let mut con = dlm.get_connection().await?;
+
+    let mounts = find_squeezefs_mounts();
+
+    match path_opt {
+        None => {
+            let format_fields: HashMap<String, String> =
+                con.hgetall("squeezefs:format").await.unwrap_or_default();
+            let capacity_bytes: u64 = format_fields
+                .get("capacity")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let capacity_str = if capacity_bytes == 0 {
+                "Unlimited".to_string()
+            } else {
+                format_size(capacity_bytes)
+            };
+
+            let keys: Vec<String> = redis::cmd("KEYS")
+                .arg("metadata:*")
+                .query_async(&mut con)
+                .await
+                .unwrap_or_default();
+
+            let mut total_logical_size = 0u64;
+            if !keys.is_empty() {
+                let mut pipe = redis::pipe();
+                for k in &keys {
+                    pipe.hget(k, "size");
+                }
+                let results: Vec<Option<String>> =
+                    pipe.query_async(&mut con).await.unwrap_or_default();
+                for s in results.into_iter().flatten() {
+                    let size: u64 = s.parse().unwrap_or(0);
+                    total_logical_size += size;
+                }
+            }
+
+            let block_sizes: HashMap<String, String> = con
+                .hgetall("squeezefs:block_sizes")
+                .await
+                .unwrap_or_default();
+            let mut total_physical_size = 0u64;
+            for val in block_sizes.values() {
+                let parts: Vec<&str> = val.split(':').collect();
+                if parts.len() == 2 {
+                    let physical: u64 = parts[1].parse().unwrap_or(0);
+                    total_physical_size += physical;
+                }
+            }
+
+            let ratio_str = if total_physical_size > 0 {
+                format!(
+                    "{:.2}x",
+                    total_logical_size as f64 / total_physical_size as f64
+                )
+            } else {
+                "1.00x".to_string()
+            };
+
+            println!(
+                "{}",
+                "SqueezeFS Filesystem Space Usage Summary:".bold().cyan()
+            );
+            println!("--------------------------------------------------");
+            println!("Capacity:            {}", capacity_str);
+            println!("Logical File Size:   {}", format_size(total_logical_size));
+            println!("Physical S3 Size:    {}", format_size(total_physical_size));
+            println!("Compression Ratio:   {}", ratio_str);
+            println!();
+
+            if mounts.is_empty() {
+                println!("No active SqueezeFS mounts detected.");
+            } else {
+                println!("{}", "Active Mounts Cache Usage:".bold().cyan());
+                println!(
+                    "{:<20} {:<20} {:<20} {:<20} {:<20}",
+                    "Mountpoint",
+                    "RAM Read Cache",
+                    "RAM Write Cache",
+                    "NVMe Read Cache",
+                    "NVMe Staging"
+                );
+                println!("{}", "-".repeat(100));
+                for mnt in &mounts {
+                    let stats_path = mnt.join(".stats");
+                    if let Ok(stats_str) = std::fs::read_to_string(&stats_path) {
+                        if let Ok(stats_json) =
+                            serde_json::from_str::<serde_json::Value>(&stats_str)
+                        {
+                            let cap = &stats_json["cache_capacities"];
+                            let ram_read_curr = cap["read_lru_current_bytes"].as_u64().unwrap_or(0);
+                            let ram_read_max = cap["read_lru_max_bytes"].as_u64().unwrap_or(0);
+                            let ram_write_curr =
+                                cap["write_lru_current_bytes"].as_u64().unwrap_or(0);
+                            let ram_write_max = cap["write_lru_max_bytes"].as_u64().unwrap_or(0);
+                            let nvme_read_curr =
+                                cap["nvme_read_cache_current_bytes"].as_u64().unwrap_or(0);
+                            let nvme_read_max =
+                                cap["nvme_read_cache_max_bytes"].as_u64().unwrap_or(0);
+                            let nvme_stage_curr =
+                                cap["nvme_staging_current_bytes"].as_u64().unwrap_or(0);
+                            let nvme_stage_max =
+                                cap["nvme_staging_max_bytes"].as_u64().unwrap_or(0);
+
+                            println!(
+                                "{:<20} {:<20} {:<20} {:<20} {:<20}",
+                                mnt.to_string_lossy(),
+                                format!(
+                                    "{} / {}",
+                                    format_size(ram_read_curr),
+                                    format_size(ram_read_max)
+                                ),
+                                format!(
+                                    "{} / {}",
+                                    format_size(ram_write_curr),
+                                    format_size(ram_write_max)
+                                ),
+                                format!(
+                                    "{} / {}",
+                                    format_size(nvme_read_curr),
+                                    format_size(nvme_read_max)
+                                ),
+                                format!(
+                                    "{} / {}",
+                                    format_size(nvme_stage_curr),
+                                    format_size(nvme_stage_max)
+                                )
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Some(path_str) => {
+            let abs_path = std::path::Path::new(&path_str)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(&path_str));
+
+            let mut matching_mount = None;
+            let mut current = abs_path.clone();
+            loop {
+                if current.join(".stats").exists() && current.join(".config").exists() {
+                    matching_mount = Some(current.clone());
+                    break;
+                }
+                if !current.pop() {
+                    break;
+                }
+            }
+
+            let (relative_path_str, stats_json) = if let Some(ref mnt) = matching_mount {
+                let rel = abs_path.strip_prefix(mnt).unwrap_or(&abs_path);
+                let rel_str = format!("/{}", rel.to_string_lossy().trim_start_matches('/'));
+                let stats_path = mnt.join(".stats");
+                let json_val = std::fs::read_to_string(&stats_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                (rel_str, json_val)
+            } else {
+                let rel_str = format!("/{}", abs_path.to_string_lossy().trim_start_matches('/'));
+                (rel_str, None)
+            };
+
+            let mut ram_keys = std::collections::HashSet::new();
+            let mut nvme_keys = std::collections::HashSet::new();
+            let mut nvme_staged_file_ids = std::collections::HashSet::new();
+
+            if let Some(ref json) = stats_json {
+                if let Some(arr) = json["read_lru_keys"].as_array() {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            ram_keys.insert(s.to_string());
+                        }
+                    }
+                }
+                if let Some(arr) = json["write_lru_keys"].as_array() {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            ram_keys.insert(s.to_string());
+                        }
+                    }
+                }
+                if let Some(arr) = json["nvme_read_cache_block_keys"].as_array() {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            nvme_keys.insert(s.to_string());
+                        }
+                    }
+                }
+                if let Some(arr) = json["nvme_staged_write_file_ids"].as_array() {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            nvme_staged_file_ids.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+
+            let mut resolved_meta_key = None;
+            let mut resolved_ino = None;
+
+            if let Ok(inode) = resolve_path_to_inode(&dlm, &relative_path_str).await {
+                resolved_meta_key = Some(format!("metadata:inode_{}", inode));
+                resolved_ino = Some(inode);
+            } else {
+                let path_stripped = relative_path_str.trim_start_matches('/').to_string();
+                let keys_to_try = vec![
+                    format!("metadata:{}", relative_path_str),
+                    format!("metadata:{}", path_stripped),
+                ];
+                for k in keys_to_try {
+                    let exists: bool = con.exists(&k).await.unwrap_or(false);
+                    if exists {
+                        resolved_meta_key = Some(k);
+                        break;
+                    }
+                }
+            }
+
+            let meta_key = match resolved_meta_key {
+                Some(k) => k,
+                None => {
+                    eprintln!("Error: Path '{}' not found in metadata", path_str);
+                    std::process::exit(1);
+                }
+            };
+
+            let kind: Option<String> = con.hget(&meta_key, "type").await?;
+            let size: Option<u64> = con.hget(&meta_key, "size").await?;
+
+            let kind_str = kind.unwrap_or_else(|| "striped".to_string());
+            let size_bytes = size.unwrap_or(0);
+
+            println!(
+                "{}",
+                format!("File Space Usage Details for: {}", path_str)
+                    .bold()
+                    .cyan()
+            );
+            println!("--------------------------------------------------");
+            if let Some(ino) = resolved_ino {
+                println!("Inode:        {}", ino);
+            } else {
+                println!("Inode:        N/A (Direct Path Layout)");
+            }
+            println!("Logical Size: {}", format_size(size_bytes));
+            println!("Layout Type:  {}", kind_str);
+            println!();
+
+            if kind_str == "inline" {
+                let path_stripped = relative_path_str.trim_start_matches('/').to_string();
+                let inline_key = if let Some(ino) = resolved_ino {
+                    format!("inline_data:inode_{}", ino)
+                } else {
+                    let actual_path = meta_key.strip_prefix("metadata:").unwrap_or(&path_stripped);
+                    format!("inline_data:{}", actual_path)
+                };
+                let inline_len: u64 = redis::cmd("STRLEN")
+                    .arg(&inline_key)
+                    .query_async(&mut con)
+                    .await
+                    .unwrap_or(0);
+                let ratio_str = if inline_len > 0 {
+                    format!("{:.2}x", size_bytes as f64 / inline_len as f64)
+                } else {
+                    "1.00x".to_string()
+                };
+
+                println!(
+                    "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
+                    "Block",
+                    "Key / Location",
+                    "Logical Size",
+                    "Physical Size",
+                    "Ratio",
+                    "Residency"
+                );
+                println!("{}", "-".repeat(100));
+                println!(
+                    "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
+                    0,
+                    inline_key,
+                    format_size(size_bytes),
+                    format_size(inline_len),
+                    ratio_str,
+                    "RAM, DB"
+                );
+            } else if kind_str == "staged" {
+                let file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
+                if let Some(fid) = file_id {
+                    let is_staged_in_nvme = nvme_staged_file_ids.contains(&fid);
+                    if is_staged_in_nvme {
+                        println!(
+                            "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
+                            "Block",
+                            "Key / Location",
+                            "Logical Size",
+                            "Physical Size",
+                            "Ratio",
+                            "Residency"
+                        );
+                        println!("{}", "-".repeat(100));
+                        println!(
+                            "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
+                            0,
+                            format!("staging_file:{}", fid),
+                            format_size(size_bytes),
+                            format_size(size_bytes),
+                            "1.00x",
+                            "NVMe Staging"
+                        );
+                    } else {
+                        let mapping_key = format!("mapping:{}", fid);
+                        let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
+                        let offset_opt: Option<u64> = con.hget(&mapping_key, "offset").await?;
+                        let offset = offset_opt.unwrap_or(0);
+                        let physical_size_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
+                        let physical_size = physical_size_opt.unwrap_or(size_bytes);
+
+                        let bk = block_key.unwrap_or_else(|| "Unknown".to_string());
+                        let ratio_str = if physical_size > 0 {
+                            format!("{:.2}x", size_bytes as f64 / physical_size as f64)
+                        } else {
+                            "1.00x".to_string()
+                        };
+
+                        let mut locations = Vec::new();
+                        if ram_keys.contains(&bk) {
+                            locations.push("RAM");
+                        }
+                        if nvme_keys.contains(&bk) {
+                            locations.push("NVMe");
+                        }
+                        if locations.is_empty() {
+                            locations.push("S3");
+                        }
+                        let residency = locations.join(", ");
+
+                        println!(
+                            "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
+                            "Block",
+                            "Key / Location",
+                            "Logical Size",
+                            "Physical Size",
+                            "Ratio",
+                            "Residency"
+                        );
+                        println!("{}", "-".repeat(100));
+                        println!(
+                            "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
+                            0,
+                            format!("{} (offset {})", bk, offset),
+                            format_size(size_bytes),
+                            format_size(physical_size),
+                            ratio_str,
+                            residency
+                        );
+                    }
+                } else {
+                    println!("No staging mapping found for file.");
+                }
+            } else {
+                let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+                if let Some(map_id) = block_map_id {
+                    let block_map_key = format!("squeezefs:block_map:{}", map_id);
+                    let block_map: HashMap<String, String> =
+                        con.hgetall(&block_map_key).await.unwrap_or_default();
+
+                    let mut indices: Vec<u32> = block_map
+                        .keys()
+                        .filter_map(|k| k.parse::<u32>().ok())
+                        .collect();
+                    indices.sort_unstable();
+
+                    println!(
+                        "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
+                        "Block", "Block Key", "Logical Size", "Physical Size", "Ratio", "Residency"
+                    );
+                    println!("{}", "-".repeat(100));
+
+                    for idx in indices {
+                        if let Some(bk) = block_map.get(&idx.to_string()) {
+                            let size_info: Option<String> =
+                                con.hget("squeezefs:block_sizes", bk).await?;
+                            let (log_sz, phys_sz) = if let Some(info) = size_info {
+                                let parts: Vec<&str> = info.split(':').collect();
+                                if parts.len() == 2 {
+                                    (
+                                        parts[0].parse().unwrap_or(0u64),
+                                        parts[1].parse().unwrap_or(0u64),
+                                    )
+                                } else {
+                                    (0u64, 0u64)
+                                }
+                            } else {
+                                (0u64, 0u64)
+                            };
+
+                            let ratio_str = if phys_sz > 0 {
+                                format!("{:.2}x", log_sz as f64 / phys_sz as f64)
+                            } else {
+                                "1.00x".to_string()
+                            };
+
+                            let mut locations = Vec::new();
+                            if ram_keys.contains(bk) {
+                                locations.push("RAM");
+                            }
+                            if nvme_keys.contains(bk) {
+                                locations.push("NVMe");
+                            }
+                            if locations.is_empty() {
+                                locations.push("S3");
+                            }
+                            let residency = locations.join(", ");
+
+                            println!(
+                                "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
+                                idx,
+                                bk,
+                                if log_sz > 0 {
+                                    format_size(log_sz)
+                                } else {
+                                    "Unknown".to_string()
+                                },
+                                if phys_sz > 0 {
+                                    format_size(phys_sz)
+                                } else {
+                                    "Unknown".to_string()
+                                },
+                                ratio_str,
+                                residency
+                            );
+                        }
+                    }
+                } else {
+                    println!("No block map found for file.");
                 }
             }
         }

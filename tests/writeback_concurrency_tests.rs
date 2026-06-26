@@ -649,13 +649,7 @@ async fn test_fsync_deadlock_prevention() {
     };
 
     let reply_created = fs
-        .create(
-            req,
-            1,
-            OsStr::new("fsync_deadlock_test.bin"),
-            0o644,
-            0,
-        )
+        .create(req, 1, OsStr::new("fsync_deadlock_test.bin"), 0o644, 0)
         .await
         .expect("Create file should succeed");
     let ino = reply_created.attr.ino;
@@ -682,9 +676,6 @@ async fn test_fsync_deadlock_prevention() {
         .await
         .expect("Write should succeed");
 
-    let keys = fs.router.cache.nvme.staging_nvme_cache.list_keys();
-    println!("Active keys in staging: {:?}", keys.iter().map(|k| String::from_utf8_lossy(k)).collect::<Vec<_>>());
-
     // Get block lock entry
     let block_lock = squeezefs::fuse_client::BLOCK_FLUSH_LOCKS
         .entry((ino, 0))
@@ -693,35 +684,27 @@ async fn test_fsync_deadlock_prevention() {
         .clone();
 
     // Lock block_lock to simulate background task holding it during S3 upload
-    println!("Locking block lock in test...");
     let lock_guard = block_lock.clone().lock_owned().await;
-    println!("Block lock locked!");
 
     // Spawn a simulated background task B that tries to acquire InodeLock,
     // and drops lock_guard once it gets the lock
     let fs_arc = std::sync::Arc::new(fs);
     let inode_lock = fs_arc.get_inode_lock(ino);
     tokio::spawn(async move {
-        println!("Background task B sleeping...");
         tokio::time::sleep(Duration::from_millis(50)).await;
-        println!("Background task B attempting to acquire InodeLock...");
+        // B tries to acquire InodeLock (which is held by fsync)
         let _write_guard = inode_lock.write().await;
-        println!("Background task B acquired InodeLock! Releasing block lock...");
         // Reached! Release the block lock
         drop(lock_guard);
-        println!("Background task B finished.");
     });
 
     // Call fsync, which should complete successfully within a short timeout
     let fs_clone = fs_arc.clone();
-    println!("FUSE thread calling fsync...");
     let fsync_res = tokio::time::timeout(Duration::from_secs(3), async move {
         fs_clone.fsync(req, ino, 0, false).await
     })
     .await;
-    println!("fsync completed with result: {:?}", fsync_res);
 
     assert!(fsync_res.is_ok(), "fsync timed out due to deadlock!");
     fsync_res.unwrap().expect("fsync should succeed");
 }
-

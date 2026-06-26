@@ -116,7 +116,7 @@ This section is divided into actionable Epics for the engineering team.
 
 * **Task 5.1: Predictive Prefetching**
 * *Action*: AI dataloaders read sequentially or with predictable strides. Implement an aggressive read-ahead engine. If blocks $N$ and $N+1$ are read, asynchronously `io_uring` fetch blocks $N+2$ to $N+10$ into the NVMe/GDS tier before the FUSE client actually receives the read request.
-* *Status*: Partially implemented for striped reads in `src/routing.rs`. When adjacent blocks are read in sequence, the router asynchronously prefetches blocks $N+2$ through $N+10$ into the local cache tiers. This currently targets sequential forward access only and does not yet use `io_uring` or an explicit GDS-integrated prefetch path.
+* *Status*: Fully implemented. Refactored the prefetch engine to use asynchronous `io_uring` page prefetching (`MADV_WILLNEED`) via a background thread for cached NVMe blocks. For GDS-active scenarios, blocks are pre-downloaded directly to `.gds_cache` files on the local NVMe staging directory so that subsequent GPU Direct DMA reads hit local disk. Verified with the new `tests/prefetch_heuristics_tests.rs` integration suite.
 
 
 * **Task 5.2: Checkpoint Write-Around**

@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput, BatchSize};
 use fuse3::raw::prelude::*;
 use fuse3::raw::Request;
 use squeezefs::backend::RustFsClient;
@@ -88,6 +88,7 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     // Bench Micro-file routing path (< 64KB)
     let micro_data = vec![8u8; 1024]; // 1KB
     let micro_counter = Arc::new(AtomicU64::new(0));
+    group.throughput(Throughput::Bytes(1024));
     group.bench_function("write_micro_file_1kb", |b| {
         let counter = micro_counter.clone();
         let data_ref = &micro_data;
@@ -104,6 +105,7 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     // Bench Small-file routing path (64KB - 4MB)
     let small_data = vec![8u8; 128 * 1024]; // 128KB
     let small_counter = Arc::new(AtomicU64::new(0));
+    group.throughput(Throughput::Bytes(128 * 1024));
     group.bench_function("write_small_file_128kb", |b| {
         let counter = small_counter.clone();
         let data_ref = &small_data;
@@ -363,12 +365,14 @@ fn bench_squeezefs_data_io(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("squeezefs_data_io");
 
+    group.throughput(Throughput::Bytes(1024));
     group.bench_function("read_micro_file_1kb", |b| {
         b.to_async(&rt).iter(|| async {
             let _reply = fs.read(req, micro_ino, 0, 0, 1024).await.unwrap();
         });
     });
 
+    group.throughput(Throughput::Bytes(128 * 1024));
     group.bench_function("read_small_file_128kb", |b| {
         b.to_async(&rt).iter(|| async {
             let _reply = fs.read(req, small_ino, 0, 0, 128 * 1024).await.unwrap();
@@ -377,6 +381,7 @@ fn bench_squeezefs_data_io(c: &mut Criterion) {
 
     let write_large_counter = Arc::new(AtomicU64::new(0));
     let large_data = vec![8u8; 4 * 1024 * 1024]; // 4MB
+    group.throughput(Throughput::Bytes(4 * 1024 * 1024));
     group.bench_function("write_large_striped_4mb", |b| {
         let counter = write_large_counter.clone();
         let data_ref = &large_data;
@@ -398,6 +403,7 @@ fn bench_squeezefs_data_io(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Bytes(4 * 1024 * 1024));
     group.bench_function("read_large_striped_4mb", |b| {
         b.to_async(&rt).iter(|| async {
             let _reply = fs
@@ -419,6 +425,7 @@ fn bench_nvme_combined(c: &mut Criterion) {
     let router = fs.router.clone();
     let nvme = router.cache.nvme.clone();
     let mut group = c.benchmark_group("bench_nvme_combined");
+    group.throughput(Throughput::Bytes(64 * 1024));
 
     let test_data = vec![7u8; 64 * 1024]; // 64KB
     let counter = Arc::new(AtomicU64::new(0));
@@ -530,6 +537,182 @@ fn bench_crypto_compress(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
+    let mut group = c.benchmark_group("squeezefs_dht_and_p2p_at_scale");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(2));
+
+    let rt = match Runtime::new() {
+        Ok(val) => val,
+        Err(_) => return,
+    };
+    let redis_url = get_redis_url();
+
+    // Verify Redis/Garnet server connection
+    let connection_ok = rt.block_on(async {
+        if let Ok(client) = redis::Client::open(redis_url.clone()) {
+            if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                let _: () = redis::cmd("FLUSHALL")
+                    .query_async(&mut con)
+                    .await
+                    .unwrap_or(());
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+
+    if !connection_ok {
+        println!("Skipping scale benchmarks: Redis/Garnet server not available.");
+        return;
+    }
+
+    let dlm = match DlmClient::new(&redis_url) {
+        Ok(val) => val,
+        Err(_) => return,
+    };
+
+    let mut temp_dirs = Vec::new();
+    let mut nodes = Vec::new();
+
+    // Spawn 5 nodes locally
+    rt.block_on(async {
+        for i in 0..5 {
+            let temp_dir = tempdir().unwrap();
+            let backend = RustFsClient::new_mock();
+            let cache = TieredCache::new(
+                vec![temp_dir.path().to_path_buf()],
+                Some("50KB"),
+                Some("50KB"),
+                Some("200KB"),
+                Some("200KB"),
+                backend.clone(),
+                dlm.meta_client().clone(),
+            )
+            .unwrap();
+
+            let addr = format!("127.0.0.1:{}", 26300 + i);
+            let server = squeezefs::p2p::P2pServer::new(addr.clone(), cache.nvme.clone());
+            
+            // Spawn P2P server
+            tokio::spawn(async move {
+                let _ = server.run().await;
+            });
+
+            nodes.push(cache);
+            temp_dirs.push(temp_dir);
+        }
+
+        // Wait for DHT nodes to initialize and set in OnceLock
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Fully connect the nodes
+        for i in 0..5 {
+            let dht_i = nodes[i].nvme.dht_node.get().expect("DHT Node not initialized");
+            for j in 0..5 {
+                if i != j {
+                    dht_i.add_peer(format!("127.0.0.1:{}", 26300 + j));
+                }
+            }
+        }
+
+        // Allow some time for TCP networks to bind/connect
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    });
+
+    let node0_cache = nodes[0].clone();
+    let node4_cache = nodes[4].clone();
+    let val_data = vec![8u8; 128 * 1024]; // 128KB value
+    let val = bytes::Bytes::from(val_data.clone());
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // 1. Benchmark DHT Remote P2P Get
+    group.throughput(Throughput::Bytes(128 * 1024));
+    group.bench_function("DHT Remote P2P Get", |b| {
+        let counter = counter.clone();
+        let node0_cache = node0_cache.clone();
+        let node4_cache = node4_cache.clone();
+        let val = val.clone();
+
+        b.iter_batched(
+            || {
+                let id = counter.fetch_add(1, Ordering::Relaxed);
+                let block_key = format!("scale_bench_block_{}", id);
+                rt.block_on(async {
+                    // Cache the block on Node 4
+                    node4_cache.nvme.cache_read_block(&block_key, &val).unwrap();
+
+                    // Poll Node 0 DHT until provider registration is found (propagated from Node 4)
+                    let dht0 = node0_cache.nvme.dht_node.get().unwrap();
+                    let key_hash = xxhash_rust::xxh3::xxh3_64(block_key.as_bytes());
+                    let mut found = false;
+                    for _ in 0..500 {
+                        if let Ok(Some(addr)) = dht0.find_provider(key_hash).await {
+                            if addr == "127.0.0.1:26304" {
+                                found = true;
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    assert!(found, "DHT provider registration failed to propagate to node0 in time!");
+                });
+                block_key
+            },
+            |block_key| {
+                rt.block_on(async {
+                    // GET from Node 0. This misses locally and queries DHT to find Node 4, then downloads the block from Node 4.
+                    let dht0 = node0_cache.nvme.dht_node.get().unwrap();
+                    let client = squeezefs::p2p::P2pClient::new();
+                    let res = client.download_block_from_peer(dht0, &block_key).await.unwrap();
+                    assert_eq!(res.len(), 128 * 1024);
+                });
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    // 2. Benchmark DHT Lookup Rate
+    group.throughput(Throughput::Elements(1));
+    let dht0 = node0_cache.nvme.dht_node.get().unwrap().clone();
+    let static_key_hash = xxhash_rust::xxh3::xxh3_64(b"scale_bench_block_0");
+    group.bench_function("DHT Lookup Provider", |b| {
+        let dht = dht0.clone();
+        b.to_async(&rt).iter(|| {
+            let dht_clone = dht.clone();
+            async move {
+                let res = dht_clone.find_provider(static_key_hash).await.unwrap();
+                criterion::black_box(res);
+            }
+        });
+    });
+
+    // 3. Benchmark P2P Direct Fetch Value
+    group.throughput(Throughput::Bytes(128 * 1024));
+    let node4_addr = "127.0.0.1:26304".to_string();
+    let direct_key = bytes::Bytes::from("scale_bench_block_0");
+    group.bench_function("P2P Direct Fetch Remote Value", |b| {
+        let dht = dht0.clone();
+        let addr = node4_addr.clone();
+        let key = direct_key.clone();
+        b.to_async(&rt).iter(|| {
+            let dht_clone = dht.clone();
+            let addr_clone = addr.clone();
+            let key_clone = key.clone();
+            async move {
+                let res = dht_clone.fetch_remote_value(&addr_clone, key_clone).await.unwrap();
+                criterion::black_box(res);
+            }
+        });
+    });
+
+    group.finish();
+}
+
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .measurement_time(Duration::from_secs(3))
@@ -547,6 +730,7 @@ criterion_group! {
         bench_squeezefs_data_io,
         bench_nvme_combined,
         bench_dlm_centralized_heartbeat,
-        bench_crypto_compress
+        bench_crypto_compress,
+        bench_squeezefs_dht_and_p2p_at_scale
 }
 criterion_main!(benches);

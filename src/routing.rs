@@ -6,7 +6,7 @@ use crate::fuse_client::METRICS;
 use log::debug;
 use redis::AsyncCommands;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 

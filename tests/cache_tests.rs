@@ -39,13 +39,12 @@ async fn test_nvme_staging_and_merge() {
     let temp_dir = tempdir().unwrap();
     let mock_backend = RustFsClient::new_mock();
 
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1").unwrap();
     let mut con = redis_client
         .get_multiplexed_tokio_connection()
         .await
         .unwrap();
-    let _: () = redis::cmd("DEL")
-        .arg("squeezefs:format")
+    let _: () = redis::cmd("FLUSHDB")
         .query_async(&mut con)
         .await
         .unwrap_or(());
@@ -117,7 +116,15 @@ async fn test_multi_disk_distribution() {
     ];
 
     let mock_backend = RustFsClient::new_mock();
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/2").unwrap();
+    let mut con = redis_client
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
 
     // Max capacity 100MB for both
     let nvme = NvmeStaging::new(
@@ -168,7 +175,7 @@ async fn test_multi_disk_distribution() {
 async fn test_nvme_cache_separation_limits() {
     let temp_dir = tempdir().unwrap();
     let mock_backend = RustFsClient::new_mock();
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/3").unwrap();
     let mut con = redis_client
         .get_multiplexed_tokio_connection()
         .await
@@ -229,7 +236,15 @@ async fn test_nvme_cache_separation_limits() {
 async fn test_nvme_read_cache_eviction() {
     let temp_dir = tempdir().unwrap();
     let mock_backend = RustFsClient::new_mock();
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/4").unwrap();
+    let mut con = redis_client
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
 
     // 20KB write capacity, 5KB read capacity
     let nvme = NvmeStaging::new(
@@ -285,7 +300,7 @@ async fn test_virtual_stats_file() {
         }
     };
 
-    let redis_url = "redis://127.0.0.1:6379/";
+    let redis_url = "redis://127.0.0.1:6379/5";
     let dlm = squeezefs::dlm::DlmClient::new(redis_url).unwrap();
     let backend = squeezefs::backend::RustFsClient::new().await;
     let temp_dir = tempdir().unwrap();
@@ -347,7 +362,7 @@ async fn test_virtual_stats_file() {
 }
 
 async fn clean_db_for_stats() -> Option<redis::aio::MultiplexedConnection> {
-    let client = redis::Client::open("redis://127.0.0.1:6379/").ok()?;
+    let client = redis::Client::open("redis://127.0.0.1:6379/5").ok()?;
     let mut con = client.get_multiplexed_async_connection().await.ok()?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut con).await.ok()?;
     Some(con)
@@ -357,7 +372,15 @@ async fn clean_db_for_stats() -> Option<redis::aio::MultiplexedConnection> {
 async fn test_atomic_cache_write_concurrency() {
     let temp_dir = tempdir().unwrap();
     let mock_backend = RustFsClient::new_mock();
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/6").unwrap();
+    let mut con = redis_client
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
     let nvme = NvmeStaging::new(
         vec![temp_dir.path().to_path_buf()],
         10 * 1024 * 1024,
@@ -421,7 +444,7 @@ fn test_parse_duration() {
 async fn test_dynamic_upload_delay() {
     let temp_dir = tempdir().unwrap();
     let mock_backend = RustFsClient::new_mock();
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/7").unwrap();
 
     let mut con = redis_client
         .get_multiplexed_tokio_connection()
@@ -481,7 +504,7 @@ async fn test_active_writes_pruning_and_deletion() {
     use squeezefs::routing::DataRouter;
 
     let redis_url =
-        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/8".to_string());
     if let Ok(dlm) = squeezefs::dlm::DlmClient::new(&redis_url) {
         if let Ok(client) = redis::Client::open(redis_url.clone()) {
             if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
@@ -616,7 +639,15 @@ async fn test_concurrent_mounts_cache_sharing() {
 
     // Now initialize TieredCache for both isolated directories
     let backend = RustFsClient::new_mock();
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/9").unwrap();
+    let mut con = redis_client
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
 
     let _cache1 = squeezefs::cache::TieredCache::new(
         vec![isolated_dir1.clone()],
@@ -674,8 +705,16 @@ async fn test_concurrent_mounts_cache_sharing() {
 #[tokio::test]
 async fn test_router_cache_bounds() {
     let redis_url =
-        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/10".to_string());
     let dlm = squeezefs::dlm::DlmClient::new(&redis_url).unwrap();
+    if let Ok(client) = redis::Client::open(redis_url.clone()) {
+        if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+            let _: () = redis::cmd("FLUSHDB")
+                .query_async(&mut con)
+                .await
+                .unwrap_or(());
+        }
+    }
     let backend = squeezefs::backend::RustFsClient::new_mock();
     let temp_dir = tempfile::tempdir().unwrap();
     let cache = squeezefs::cache::TieredCache::new(

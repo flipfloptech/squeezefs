@@ -30,7 +30,7 @@ pub struct DataRouter {
     pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
     pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
     inflight_block_reads:
-        std::sync::Arc<dashmap::DashMap<String, Arc<tokio::sync::Notify>, ahash::RandomState>>,
+        std::sync::Arc<dashmap::DashMap<String, tokio::sync::broadcast::Sender<()>, ahash::RandomState>>,
     sequential_read_state:
         std::sync::Arc<dashmap::DashMap<String, (u32, std::time::Instant), ahash::RandomState>>,
     pub crypto:
@@ -41,15 +41,17 @@ pub struct DataRouter {
 struct InflightBlockReadGuard {
     key: String,
     inflight_block_reads:
-        std::sync::Arc<dashmap::DashMap<String, Arc<tokio::sync::Notify>, ahash::RandomState>>,
-    notify: Arc<tokio::sync::Notify>,
+        std::sync::Arc<dashmap::DashMap<String, tokio::sync::broadcast::Sender<()>, ahash::RandomState>>,
+    tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl Drop for InflightBlockReadGuard {
     fn drop(&mut self) {
+        // If the sender in the map is still ours, remove it
         self.inflight_block_reads
-            .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.notify));
-        self.notify.notify_waiters();
+            .remove_if(&self.key, |_, current| current.same_channel(&self.tx));
+        // Notify all waiters by sending a message, ignore errors if no one is listening
+        let _ = self.tx.send(());
     }
 }
 
@@ -58,15 +60,15 @@ impl DataRouter {
         Self {
             dlm,
             backend: backend.into(),
-            cache,
             block_size: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024)),
+            cache,
             metadata_cache: moka::sync::Cache::builder()
                 .max_capacity(100_000)
-                .time_to_live(Duration::from_secs(300))
+                .time_to_live(std::time::Duration::from_secs(60))
                 .build(),
             block_map_cache: moka::sync::Cache::builder()
-                .max_capacity(100_000)
-                .time_to_live(Duration::from_secs(300))
+                .max_capacity(500_000)
+                .time_to_live(std::time::Duration::from_secs(60))
                 .build(),
             inflight_block_reads: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
@@ -140,15 +142,15 @@ impl DataRouter {
                 return Ok(pooled);
             }
 
-            let notify = Arc::new(tokio::sync::Notify::new());
+            let (tx, _rx) = tokio::sync::broadcast::channel(1);
             match self.inflight_block_reads.entry(block_key.to_string()) {
                 dashmap::mapref::entry::Entry::Vacant(entry) => {
                     METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-                    entry.insert(notify.clone());
+                    entry.insert(tx.clone());
                     let _guard = InflightBlockReadGuard {
                         key: block_key.to_string(),
                         inflight_block_reads: self.inflight_block_reads.clone(),
-                        notify,
+                        tx,
                     };
 
                     let downloaded = self.fetch_block_from_remote(block_key).await?;
@@ -159,9 +161,10 @@ impl DataRouter {
                     return Ok(downloaded);
                 }
                 dashmap::mapref::entry::Entry::Occupied(entry) => {
-                    let existing = entry.get().clone();
-                    drop(entry);
-                    existing.notified().await;
+                    let tx = entry.get().clone();
+                    let mut rx = tx.subscribe();
+                    drop(entry); // Drop the dashmap lock before awaiting!
+                    let _ = rx.recv().await;
                 }
             }
         }
@@ -2266,7 +2269,7 @@ impl DataRouter {
 
 pub struct IoUringPrefetcher {
     #[cfg(target_os = "linux")]
-    tx: tokio::sync::mpsc::UnboundedSender<(u64, usize)>,
+    tx: tokio::sync::mpsc::Sender<(u64, usize)>,
     pub prefetch_count: std::sync::atomic::AtomicUsize,
 }
 
@@ -2274,7 +2277,7 @@ impl IoUringPrefetcher {
     pub fn new() -> Self {
         #[cfg(target_os = "linux")]
         {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, usize)>();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, usize)>(8192);
             std::thread::spawn(move || {
                 use io_uring::{opcode, IoUring};
                 let mut ring = match IoUring::new(512) {
@@ -2331,7 +2334,7 @@ impl IoUringPrefetcher {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
-            let _ = self.tx.send((_addr, _len));
+            let _ = self.tx.try_send((_addr, _len));
         }
     }
 }

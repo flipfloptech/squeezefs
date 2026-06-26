@@ -4495,6 +4495,47 @@ pub async fn format_volume_ext(
 
     let mut first_con = shard_clients[0].get_connection().await?;
 
+    // Read existing format configuration before flushing
+    let existing_format_fields: std::collections::HashMap<String, String> = first_con
+        .hgetall("squeezefs:format")
+        .await
+        .unwrap_or_default();
+
+    let mut dirs_to_wipe = std::collections::HashSet::new();
+
+    // 1. Get directories from the existing format configuration in the database
+    if let Some(paths_str) = existing_format_fields.get("disk_cache_paths") {
+        if !paths_str.is_empty() {
+            for p in paths_str.split(',') {
+                dirs_to_wipe.insert(std::path::PathBuf::from(p));
+            }
+        }
+    }
+
+    // 2. Get directories from parameters
+    if let Some(paths) = disk_cache_paths {
+        for p in paths {
+            dirs_to_wipe.insert(p.clone());
+        }
+    }
+
+    // Wipe each unique directory
+    for dir in dirs_to_wipe {
+        if dir.exists() {
+            log::info!("Wiping local staging/cache directory: {:?}", dir);
+            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                log::warn!("Failed to wipe local cache directory {:?}: {:?}", dir, e);
+            }
+            if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                log::warn!(
+                    "Failed to re-create local cache directory {:?}: {:?}",
+                    dir,
+                    e
+                );
+            }
+        }
+    }
+
     if !quick {
         // Read existing backends from Redis before doing FLUSHALL
         let existing_backends: std::collections::HashMap<String, String> = first_con

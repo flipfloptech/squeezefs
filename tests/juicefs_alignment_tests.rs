@@ -485,8 +485,14 @@ async fn test_multi_backend_routing() {
 
     // 2. Query status to ensure it contains S3 configs
     let status = get_volume_status(&redis_url).await.unwrap();
-    assert_eq!(status["Setting"]["S3Endpoint"], "http://127.0.0.1:9000");
-    assert_eq!(status["Setting"]["S3Bucket"], "test-bucket");
+    assert_eq!(
+        status["Setting"]["StorageBackends"]["backend_0"]["endpoint"],
+        "http://127.0.0.1:9000"
+    );
+    assert_eq!(
+        status["Setting"]["StorageBackends"]["backend_0"]["bucket"],
+        "test-bucket"
+    );
 
     let dlm = DlmClient::new(&redis_url).unwrap();
 

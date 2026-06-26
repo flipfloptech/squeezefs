@@ -65,18 +65,17 @@ pub fn parse_inode_from_key(key: &str) -> Option<u64> {
             }
         }
     }
-    if key.starts_with("metadata:inode_") {
-        if let Ok(ino) = key["metadata:inode_".len()..].parse::<u64>() {
+    if let Some(stripped) = key.strip_prefix("metadata:inode_") {
+        if let Ok(ino) = stripped.parse::<u64>() {
             return Some(ino);
         }
     }
-    if key.starts_with("inline_data:inode_") {
-        if let Ok(ino) = key["inline_data:inode_".len()..].parse::<u64>() {
+    if let Some(stripped) = key.strip_prefix("inline_data:inode_") {
+        if let Ok(ino) = stripped.parse::<u64>() {
             return Some(ino);
         }
     }
-    if key.starts_with("mapping:inode_") {
-        let remainder = &key["mapping:inode_".len()..];
+    if let Some(remainder) = key.strip_prefix("mapping:inode_") {
         if let Some(pos) = remainder.find('_') {
             if let Ok(ino) = remainder[..pos].parse::<u64>() {
                 return Some(ino);
@@ -422,7 +421,8 @@ impl MetaClient {
                 } else {
                     format!("redis://{}", node)
                 };
-                let shard_client = Box::pin(MetaClient::new_with_local_ips(&node_url, local_ips.clone())).await?;
+                let shard_client =
+                    Box::pin(MetaClient::new_with_local_ips(&node_url, local_ips.clone())).await?;
                 shards.push(shard_client);
             }
             return Ok(Self::Sharded { shards });

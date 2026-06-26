@@ -500,7 +500,9 @@ impl SqueezefsFilesystem {
                         1 => 1 + shard_count as u64,
                         _ => i as u64,
                     };
-                    let _: () = shard_con.set("squeezefs:inode_counter", initial_counter).await?;
+                    let _: () = shard_con
+                        .set("squeezefs:inode_counter", initial_counter)
+                        .await?;
                 }
             }
         }
@@ -1290,7 +1292,11 @@ impl Filesystem for SqueezefsFilesystem {
                     return Err(Errno::from(libc::ENOENT));
                 }
             } else {
-                let mut con = self.dlm.get_connection_for_inode(parent).await.map_err(map_squeezefs_err)?;
+                let mut con = self
+                    .dlm
+                    .get_connection_for_inode(parent)
+                    .await
+                    .map_err(map_squeezefs_err)?;
                 let dir_key = format!("squeezefs:dir:{}", parent);
                 let entries_map: std::collections::HashMap<String, u64> =
                     con.hgetall(&dir_key).await.map_err(map_err)?;
@@ -1393,7 +1399,11 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         let mknod_future = async {
-            let mut con = self.dlm.get_connection_for_inode(parent).await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             // Check if name already exists in parent
             let dir_key = format!("squeezefs:dir:{}", parent);
@@ -1513,7 +1523,11 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         let create_future = async {
-            let mut con = self.dlm.get_connection_for_inode(parent).await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             let dir_key = format!("squeezefs:dir:{}", parent);
             let now = SystemTime::now()
@@ -1855,7 +1869,11 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         let mkdir_future = async {
-            let mut con = self.dlm.get_connection_for_inode(parent).await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             let dir_key = format!("squeezefs:dir:{}", parent);
             let now = SystemTime::now()
@@ -1936,7 +1954,11 @@ impl Filesystem for SqueezefsFilesystem {
         debug!("FUSE rmdir: parent = {}, name = {}", parent, name_str);
 
         let rmdir_future = async {
-            let mut con = self.dlm.get_connection_for_inode(parent).await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             let dir_key = format!("squeezefs:dir:{}", parent);
             let now = SystemTime::now()
@@ -2347,7 +2369,11 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let unlink_future = async {
-            let mut con = self.dlm.get_connection_for_inode(parent).await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             let dir_key = format!("squeezefs:dir:{}", parent);
             let now = SystemTime::now()
@@ -2458,14 +2484,25 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let rename_future = async {
-            let mut parent_con = self.dlm.get_connection_for_inode(parent).await.map_err(map_squeezefs_err)?;
-            let mut new_parent_con = self.dlm.get_connection_for_inode(new_parent).await.map_err(map_squeezefs_err)?;
+            let mut parent_con = self
+                .dlm
+                .get_connection_for_inode(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
+            let mut new_parent_con = self
+                .dlm
+                .get_connection_for_inode(new_parent)
+                .await
+                .map_err(map_squeezefs_err)?;
             let mut global_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
             let src_dir_key = format!("squeezefs:dir:{}", parent);
             let dest_dir_key = format!("squeezefs:dir:{}", new_parent);
 
-            let ino_opt: Option<u64> = parent_con.hget(&src_dir_key, &*name_str).await.map_err(map_err)?;
+            let ino_opt: Option<u64> = parent_con
+                .hget(&src_dir_key, &*name_str)
+                .await
+                .map_err(map_err)?;
             let ino = match ino_opt {
                 Some(i) => i,
                 None => return Err(Errno::from(libc::ENOENT)),
@@ -2490,9 +2527,15 @@ impl Filesystem for SqueezefsFilesystem {
                         break;
                     }
                     let ancestor_dir_key = format!("squeezefs:dir:{}", ancestor);
-                    let mut ancestor_con = self.dlm.get_connection_for_inode(ancestor).await.map_err(map_squeezefs_err)?;
-                    let parent_of_ancestor: Option<u64> =
-                        ancestor_con.hget(&ancestor_dir_key, "..").await.map_err(map_err)?;
+                    let mut ancestor_con = self
+                        .dlm
+                        .get_connection_for_inode(ancestor)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                    let parent_of_ancestor: Option<u64> = ancestor_con
+                        .hget(&ancestor_dir_key, "..")
+                        .await
+                        .map_err(map_err)?;
                     match parent_of_ancestor {
                         Some(p) => {
                             if p == ancestor {
@@ -2531,8 +2574,10 @@ impl Filesystem for SqueezefsFilesystem {
                 if dest_kind == 2 {
                     // If it is a directory, it must be empty
                     let child_dest_dir_key = format!("squeezefs:dir:{}", dest_ino);
-                    let keys: Vec<String> =
-                        new_parent_con.hkeys(&child_dest_dir_key).await.map_err(map_err)?;
+                    let keys: Vec<String> = new_parent_con
+                        .hkeys(&child_dest_dir_key)
+                        .await
+                        .map_err(map_err)?;
                     for k in keys {
                         if k != "." && k != ".." {
                             return Err(Errno::from(libc::ENOTEMPTY));
@@ -2545,7 +2590,10 @@ impl Filesystem for SqueezefsFilesystem {
                         .map_err(map_err)?;
                 } else {
                     // Delete data blocks via router
-                    let _ = self.router.delete_file(&dest_file_path, &mut global_con).await;
+                    let _ = self
+                        .router
+                        .delete_file(&dest_file_path, &mut global_con)
+                        .await;
                 }
 
                 // Delete Redis keys
@@ -2554,8 +2602,10 @@ impl Filesystem for SqueezefsFilesystem {
                 let symlink_key = format!("squeezefs:symlink:{}", dest_ino);
 
                 // Fetch target size first to decrement used_bytes
-                let file_size_opt: Option<u64> =
-                    new_parent_con.hget(&dest_attr_key, "size").await.map_err(map_err)?;
+                let file_size_opt: Option<u64> = new_parent_con
+                    .hget(&dest_attr_key, "size")
+                    .await
+                    .map_err(map_err)?;
                 let file_size = file_size_opt.unwrap_or(0);
 
                 let mut pipe = redis::pipe();
@@ -2563,14 +2613,20 @@ impl Filesystem for SqueezefsFilesystem {
                     .del(&inline_key)
                     .del(&meta_key)
                     .del(&symlink_key);
-                let _: () = pipe.query_async(&mut new_parent_con).await.map_err(map_err)?;
+                let _: () = pipe
+                    .query_async(&mut new_parent_con)
+                    .await
+                    .map_err(map_err)?;
 
                 let mut global_pipe = redis::pipe();
                 if dest_kind != 2 {
                     global_pipe.decr("squeezefs:used_bytes", file_size);
                 }
                 global_pipe.decr("squeezefs:used_inodes", 1);
-                let _: () = global_pipe.query_async(&mut global_con).await.map_err(map_err)?;
+                let _: () = global_pipe
+                    .query_async(&mut global_con)
+                    .await
+                    .map_err(map_err)?;
 
                 // Invalidate caches
                 self.attr_cache.remove(&dest_ino);
@@ -2585,8 +2641,14 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             // Perform rename atomically
-            let _: () = parent_con.hdel(&src_dir_key, &*name_str).await.map_err(map_err)?;
-            let _: () = new_parent_con.hset(&dest_dir_key, &*new_name_str, ino).await.map_err(map_err)?;
+            let _: () = parent_con
+                .hdel(&src_dir_key, &*name_str)
+                .await
+                .map_err(map_err)?;
+            let _: () = new_parent_con
+                .hset(&dest_dir_key, &*new_name_str, ino)
+                .await
+                .map_err(map_err)?;
 
             // If renamed inode is a directory, update its ".." entry
             if src_kind == 2 {
@@ -2671,7 +2733,11 @@ impl Filesystem for SqueezefsFilesystem {
         debug!("FUSE readdir: parent = {}, offset = {}", parent, offset);
 
         let readdir_future = async {
-            let mut con = self.dlm.get_connection_for_inode(parent).await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
             let entries_map = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
                 cached_map
             } else {
@@ -2827,7 +2893,11 @@ impl Filesystem for SqueezefsFilesystem {
         debug!("FUSE readdirplus: parent = {}, offset = {}", parent, offset);
 
         let readdirplus_future = async {
-            let mut con = self.dlm.get_connection_for_inode(parent).await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
             let entries_map = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
                 cached_map
             } else {
@@ -3323,9 +3393,19 @@ impl Filesystem for SqueezefsFilesystem {
         let mut used_bytes = 0;
         let mut used_inodes = 0;
         for i in 0..shard_count {
-            let mut shard_con = self.dlm.get_connection_for_inode(i as u64).await.map_err(map_squeezefs_err)?;
-            let ub: Option<u64> = shard_con.get("squeezefs:used_bytes").await.map_err(map_err)?;
-            let ui: Option<u64> = shard_con.get("squeezefs:used_inodes").await.map_err(map_err)?;
+            let mut shard_con = self
+                .dlm
+                .get_connection_for_inode(i as u64)
+                .await
+                .map_err(map_squeezefs_err)?;
+            let ub: Option<u64> = shard_con
+                .get("squeezefs:used_bytes")
+                .await
+                .map_err(map_err)?;
+            let ui: Option<u64> = shard_con
+                .get("squeezefs:used_inodes")
+                .await
+                .map_err(map_err)?;
             used_bytes += ub.unwrap_or(0);
             used_inodes += ui.unwrap_or(0);
         }
@@ -4312,15 +4392,19 @@ pub async fn format_volume_ext(
     }
 
     if shard_clients.is_empty() {
-        return Err(SqueezefsError::InvalidOperation("No database nodes found to format".to_string()));
+        return Err(SqueezefsError::InvalidOperation(
+            "No database nodes found to format".to_string(),
+        ));
     }
 
     let mut first_con = shard_clients[0].get_connection().await?;
 
     if !quick {
         // Read existing backends from Redis before doing FLUSHALL
-        let existing_backends: std::collections::HashMap<String, String> =
-            first_con.hgetall("squeezefs:backends").await.unwrap_or_default();
+        let existing_backends: std::collections::HashMap<String, String> = first_con
+            .hgetall("squeezefs:backends")
+            .await
+            .unwrap_or_default();
 
         let mut buckets_to_wipe = Vec::new();
 
@@ -4458,8 +4542,8 @@ pub async fn format_volume_ext(
 
     let shard_count = shard_clients.len();
     if shard_count > 1 {
-        for i in 0..shard_count {
-            let mut con = shard_clients[i].get_connection().await?;
+        for (i, shard_client) in shard_clients.iter().enumerate() {
+            let mut con = shard_client.get_connection().await?;
             let initial_counter = match i {
                 0 => shard_count as u64,
                 1 => 1 + shard_count as u64,

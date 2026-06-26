@@ -1728,12 +1728,15 @@ impl DataRouter {
             .acquire_lock(dest, None, std::time::Duration::from_secs(5))
             .await?;
 
-        let mut src_con = if let Some(src_ino) = crate::dlm::parse_inode_from_key(&format!("metadata:{}", src)) {
-            self.dlm.get_connection_for_inode(src_ino).await?
-        } else {
-            self.dlm.get_connection().await?
-        };
-        let mut dest_con = if let Some(dest_ino) = crate::dlm::parse_inode_from_key(&format!("metadata:{}", dest)) {
+        let mut src_con =
+            if let Some(src_ino) = crate::dlm::parse_inode_from_key(&format!("metadata:{}", src)) {
+                self.dlm.get_connection_for_inode(src_ino).await?
+            } else {
+                self.dlm.get_connection().await?
+            };
+        let mut dest_con = if let Some(dest_ino) =
+            crate::dlm::parse_inode_from_key(&format!("metadata:{}", dest))
+        {
             self.dlm.get_connection_for_inode(dest_ino).await?
         } else {
             self.dlm.get_connection().await?
@@ -1829,7 +1832,8 @@ impl DataRouter {
             let _: () = pipe.query_async(&mut con).await?;
 
             let mut dest_pipe = redis::pipe();
-            dest_pipe.hset(&dest_meta_key, "size", size)
+            dest_pipe
+                .hset(&dest_meta_key, "size", size)
                 .hset(&dest_meta_key, "type", "staged")
                 .hset(&dest_meta_key, "file_id", &new_file_id)
                 .hset(&dest_meta_key, "fencing_token", dest_lock.fencing_token());
@@ -1855,7 +1859,8 @@ impl DataRouter {
                             "Missing block_map_id and block_prefix for striped file".to_string(),
                         )
                     })?;
-                    let num_blocks_opt: Option<u32> = src_con.hget(&src_meta_key, "num_blocks").await?;
+                    let num_blocks_opt: Option<u32> =
+                        src_con.hget(&src_meta_key, "num_blocks").await?;
                     let num_blocks = num_blocks_opt.unwrap_or(0);
 
                     let new_id = Uuid::new_v4().to_string();
@@ -2092,7 +2097,9 @@ impl DataRouter {
 
         // Generate new inode number on parent's shard connection using shard count step increment
         let shard_count = self.dlm.shard_count() as i64;
-        let dest_ino: u64 = parent_con.incr("squeezefs:inode_counter", shard_count).await?;
+        let dest_ino: u64 = parent_con
+            .incr("squeezefs:inode_counter", shard_count)
+            .await?;
 
         // Retrieve attributes of source inode on its respective shard
         let mut src_con = self.dlm.get_connection_for_inode(src_ino).await?;

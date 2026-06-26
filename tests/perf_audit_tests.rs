@@ -138,13 +138,6 @@ async fn test_get_cached_read_block_range() {
     let block_data: Vec<u8> = (0..block_size).map(|i| (i % 256) as u8).collect();
 
     let block_key = "test/block/key";
-    let safe_name = block_key.replace('/', "_");
-    let cache_dir = dir_path.join("cache");
-    std::fs::create_dir_all(&cache_dir).unwrap();
-    let block_file_path = cache_dir.join(format!("block_{}.block", safe_name));
-
-    std::fs::write(&block_file_path, &block_data).unwrap();
-
     let backend = RustFsClient::new_mock();
     let redis_client = squeezefs::dlm::MetaClient::new("redis://127.0.0.1:6379").unwrap();
 
@@ -152,12 +145,14 @@ async fn test_get_cached_read_block_range() {
         vec![dir_path],
         None,
         None,
-        None,
+        Some("32M"),
         None,
         backend,
         redis_client,
     )
     .unwrap();
+
+    cache.nvme.cache_read_block(block_key, &block_data).unwrap();
 
     // Call get_cached_read_block_range
     let offset = 500000u64;

@@ -10,7 +10,7 @@ pub struct CryptoCompressState {
     pub compression: String,
     pub encrypt_algo: String,
     pub private_key: Option<Arc<RsaPrivateKey>>,
-    pub unwrap_cache: Arc<dashmap::DashMap<Vec<u8>, Vec<u8>, ahash::RandomState>>,
+    pub unwrap_cache: moka::sync::Cache<Vec<u8>, Vec<u8>>,
     pub key_unwrap_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -29,11 +29,13 @@ impl CryptoCompressState {
             }
         });
 
+        let unwrap_cache = moka::sync::Cache::builder().max_capacity(10000).build();
+
         Self {
             compression,
             encrypt_algo,
             private_key,
-            unwrap_cache: Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
+            unwrap_cache,
             key_unwrap_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -161,7 +163,7 @@ impl CryptoCompressState {
         let ciphertext_payload = &data[3 + wrapped_key_len + nonce_len..];
 
         let key_bytes = if let Some(cached_key) = self.unwrap_cache.get(wrapped_key) {
-            cached_key.value().clone()
+            cached_key
         } else {
             let private_key = self.private_key.as_ref().ok_or_else(|| {
                 SqueezefsError::InvalidOperation(
@@ -207,12 +209,21 @@ impl CryptoCompressState {
         Ok(decrypted_slice.to_vec())
     }
 
-    pub fn process_write(&self, data: &[u8]) -> Result<Vec<u8>, SqueezefsError> {
-        let compressed = self.compress(data)?;
-        if self.encrypt_algo != "none" && !self.encrypt_algo.is_empty() {
-            self.encrypt(&compressed)
+    pub fn process_write(&self, data: bytes::Bytes) -> Result<bytes::Bytes, SqueezefsError> {
+        let compression = self.compression.trim();
+        let encrypt_algo = self.encrypt_algo.trim();
+        if (compression == "none" || compression.is_empty())
+            && (encrypt_algo == "none" || encrypt_algo.is_empty())
+        {
+            Ok(data)
         } else {
-            Ok(compressed)
+            let compressed = self.compress(&data)?;
+            if encrypt_algo != "none" && !encrypt_algo.is_empty() {
+                let encrypted = self.encrypt(&compressed)?;
+                Ok(bytes::Bytes::from(encrypted))
+            } else {
+                Ok(bytes::Bytes::from(compressed))
+            }
         }
     }
 

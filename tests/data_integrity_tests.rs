@@ -299,6 +299,33 @@ async fn test_data_integrity_chunked_writes_sha512() {
 
     let reply_read = fs_recreate.read(req, ino, 0, 0, size as u32).await.unwrap();
     assert_eq!(reply_read.data.len(), size);
+    if reply_read.data != data {
+        let mut con = dlm.get_connection().await.unwrap();
+        let meta_key = format!("metadata:inode_{}", ino);
+        let meta_fields: std::collections::HashMap<String, String> =
+            con.hgetall(&meta_key).await.unwrap();
+        println!(
+            "DIAGNOSTIC - Garnet metadata (inode {}): {:?}",
+            ino, meta_fields
+        );
+        if let Some(map_id) = meta_fields.get("block_map_id") {
+            let map_key = format!("block_map:{}", map_id);
+            let map_fields: std::collections::HashMap<String, String> =
+                con.hgetall(&map_key).await.unwrap();
+            println!("DIAGNOSTIC - Garnet block map: {:?}", map_fields);
+        }
+        for (key, len) in backend.get_mock_keys_and_sizes() {
+            println!("DIAGNOSTIC - Mock store key: {}, size: {}", key, len);
+        }
+        for (i, (&read_val, &expected_val)) in reply_read.data.iter().zip(data.iter()).enumerate() {
+            if read_val != expected_val {
+                panic!(
+                    "Mismatch at index {}: read {}, expected {}",
+                    i, read_val, expected_val
+                );
+            }
+        }
+    }
     let checksum = calculate_sha512(&reply_read.data);
     assert_eq!(checksum, expected_checksum);
 }

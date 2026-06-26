@@ -108,7 +108,7 @@ impl Notify {
 
                 // TODO should I add null at the end?
 
-                Either::Right((data, Bytes::copy_from_slice(name.as_bytes())))
+                Either::Right((data, Bytes::copy_from_slice(name.as_bytes()), None))
             }
 
             NotifyKind::Delete {
@@ -141,7 +141,7 @@ impl Notify {
 
                 // TODO should I add null at the end?
 
-                Either::Right((data, Bytes::copy_from_slice(name.as_bytes())))
+                Either::Right((data, Bytes::copy_from_slice(name.as_bytes()), None))
             }
 
             NotifyKind::Store {
@@ -172,7 +172,7 @@ impl Notify {
                     .serialize_into(&mut data_buf, &store_out)
                     .expect("vec size is not enough");
 
-                Either::Right((data_buf, data.clone()))
+                Either::Right((data_buf, data.clone(), None))
             }
 
             NotifyKind::Retrieve {

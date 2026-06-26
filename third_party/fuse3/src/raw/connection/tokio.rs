@@ -27,6 +27,32 @@ impl Drop for SendIovec {
 struct DebugUring(IoUring);
 
 #[cfg(target_os = "linux")]
+fn build_io_uring(entries: u32) -> io::Result<IoUring> {
+    let sqpoll_idle = std::env::var("SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|idle| *idle > 0);
+
+    if let Some(idle_ms) = sqpoll_idle {
+        let mut builder = IoUring::builder();
+        builder.setup_sqpoll(idle_ms);
+
+        if let Some(cpu) = std::env::var("SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU")
+            .ok()
+            .and_then(|raw| raw.parse::<u32>().ok())
+        {
+            builder.setup_sqpoll_cpu(cpu);
+        }
+
+        if let Ok(ring) = builder.build(entries) {
+            return Ok(ring);
+        }
+    }
+
+    IoUring::new(entries)
+}
+
+#[cfg(target_os = "linux")]
 impl std::fmt::Debug for DebugUring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("IoUring")
@@ -39,19 +65,26 @@ impl std::fmt::Debug for DebugUring {
     target_os = "freebsd"
 ))]
 use std::io::ErrorKind;
-#[cfg(target_os = "linux")]
-use std::io::Write;
-use std::io::{IoSlice, IoSliceMut};
-use std::ops::{Deref, DerefMut};
+
+#[cfg(target_os = "freebsd")]
+use std::io::IoSlice;
+
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
+    target_os = "freebsd"
+))]
+use std::io::IoSliceMut;
+
+use std::ops::{Deref, DerefMut};
+#[cfg(any(
+    target_os = "linux",
     target_os = "freebsd"
 ))]
 use std::os::fd::OwnedFd;
 use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(target_os = "freebsd")]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(all(target_os = "linux", feature = "unprivileged"))]
+#[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
 use std::pin::pin;
 use std::sync::Arc;
@@ -61,19 +94,14 @@ use std::{ffi::OsString, path::Path};
 use async_notify::Notify;
 use futures_util::lock::Mutex;
 use futures_util::{select, FutureExt};
-#[cfg(any(
-    all(target_os = "linux", feature = "unprivileged"),
-    target_os = "freebsd"
-))]
 #[cfg(target_os = "freebsd")]
 use nix::sys::uio;
+#[cfg(target_os = "linux")]
+use nix::fcntl::{FcntlArg, OFlag};
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
-use nix::{
-    fcntl::{FcntlArg, OFlag},
-    sys::socket::{self, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType},
-};
+use nix::sys::socket::{self, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType};
 #[cfg(any(
-    all(target_os = "linux", feature = "unprivileged"),
+    target_os = "linux",
     target_os = "freebsd"
 ))]
 use tokio::io::{unix::AsyncFd, Interest};
@@ -96,6 +124,8 @@ use crate::MountOptions;
 pub struct FuseConnection {
     unmount_notify: Arc<Notify>,
     mode: ConnectionMode,
+    pub(crate) splice_read: std::sync::atomic::AtomicBool,
+    pub(crate) splice_write: std::sync::atomic::AtomicBool,
 }
 
 impl FuseConnection {
@@ -107,6 +137,8 @@ impl FuseConnection {
             Ok(Self {
                 unmount_notify,
                 mode: ConnectionMode::NonBlock(connection),
+                splice_read: std::sync::atomic::AtomicBool::new(false),
+                splice_write: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -117,6 +149,8 @@ impl FuseConnection {
             Ok(Self {
                 unmount_notify,
                 mode: ConnectionMode::Block(connection),
+                splice_read: std::sync::atomic::AtomicBool::new(false),
+                splice_write: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -133,7 +167,44 @@ impl FuseConnection {
         Ok(Self {
             unmount_notify,
             mode: ConnectionMode::NonBlock(connection),
+            splice_read: std::sync::atomic::AtomicBool::new(false),
+            splice_write: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn clone_connection(&self) -> io::Result<Self> {
+        match &self.mode {
+            ConnectionMode::Block(_) => {
+                use std::os::fd::AsRawFd;
+                let primary_fd = self.as_fd().as_raw_fd();
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .open("/dev/fuse")?;
+
+                let worker_fd = file.as_raw_fd();
+                let mut session_fd = primary_fd as libc::c_int;
+
+                nix::ioctl_read!(fuse_dev_clone, 229, 0, libc::c_int);
+                unsafe {
+                    fuse_dev_clone(worker_fd, &mut session_fd)?;
+                }
+
+                let connection = BlockFuseConnection::from_file(file)?;
+
+                Ok(Self {
+                    unmount_notify: self.unmount_notify.clone(),
+                    mode: ConnectionMode::Block(connection),
+                    splice_read: std::sync::atomic::AtomicBool::new(self.splice_read.load(std::sync::atomic::Ordering::Relaxed)),
+                    splice_write: std::sync::atomic::AtomicBool::new(self.splice_write.load(std::sync::atomic::Ordering::Relaxed)),
+                })
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Cloning non-blocking connections is not supported",
+            )),
+        }
     }
 
     pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
@@ -206,6 +277,10 @@ enum ConnectionMode {
 #[derive(Debug)]
 struct BlockFuseConnection {
     file: File,
+    read_ring: std::sync::Mutex<DebugUring>,
+    read_ring_fd: AsyncFd<OwnedFd>,
+    write_ring: std::sync::Mutex<DebugUring>,
+    write_ring_fd: AsyncFd<OwnedFd>,
     read: Mutex<()>,
     write: Mutex<()>,
 }
@@ -214,11 +289,63 @@ struct BlockFuseConnection {
 impl BlockFuseConnection {
     pub fn new() -> io::Result<Self> {
         const DEV_FUSE: &str = "/dev/fuse";
-
         let file = OpenOptions::new().write(true).read(true).open(DEV_FUSE)?;
+        Self::from_file(file)
+    }
+
+    pub fn from_file(file: File) -> io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::io::FromRawFd;
+
+        let fd = file.as_raw_fd();
+
+        // Set non-blocking to allow AsyncFd polling on eventfd completions
+        let flags = nix::fcntl::fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::from)?;
+        let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+        nix::fcntl::fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
+
+        let read_ring = build_io_uring(256)?;
+        let write_ring = build_io_uring(256)?;
+
+        let read_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if read_event_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let write_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if write_event_fd < 0 {
+            unsafe { libc::close(read_event_fd); }
+            return Err(io::Error::last_os_error());
+        }
+
+        if let Err(e) = read_ring.submitter().register_eventfd(read_event_fd) {
+            unsafe {
+                libc::close(read_event_fd);
+                libc::close(write_event_fd);
+            }
+            return Err(e);
+        }
+
+        if let Err(e) = write_ring.submitter().register_eventfd(write_event_fd) {
+            unsafe {
+                libc::close(read_event_fd);
+                libc::close(write_event_fd);
+            }
+            return Err(e);
+        }
+
+        let read_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(read_event_fd) })?;
+        let write_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(write_event_fd) })?;
+
+        let read_ring = DebugUring(read_ring);
+        let write_ring = DebugUring(write_ring);
 
         Ok(Self {
             file,
+            read_ring: std::sync::Mutex::new(read_ring),
+            read_ring_fd,
+            write_ring: std::sync::Mutex::new(write_ring),
+            write_ring_fd,
             read: Mutex::new(()),
             write: Mutex::new(()),
         })
@@ -229,31 +356,98 @@ impl BlockFuseConnection {
         mut header_buf: Vec<u8>,
         mut data_buf: T,
     ) -> CompleteIoResult<(Vec<u8>, T), usize> {
-        use std::io::Read;
-        use std::mem::ManuallyDrop;
-        use std::os::fd::{AsRawFd, FromRawFd};
-
+        use std::os::fd::AsRawFd;
         let _guard = self.read.lock().await;
+
         let fd = self.file.as_raw_fd();
+        let iovecs = [
+            SendIovec(libc::iovec {
+                iov_base: header_buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: header_buf.len(),
+            }),
+            SendIovec(libc::iovec {
+                iov_base: data_buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: data_buf.len(),
+            }),
+        ];
 
-        let ((header_buf, data_buf), res) = task::spawn_blocking(move || {
-            // Safety: when we call read, the fd is still valid, when fd is closed and file is
-            // dropped, the read operation will return error
-            let file = unsafe { File::from_raw_fd(fd) };
-            // avoid close the file
-            let mut file = ManuallyDrop::new(file);
+        {
+            let mut guard = self.read_ring.lock().unwrap();
+            let ring = &mut guard.0;
+            let read_e = opcode::Readv::new(
+                types::Fd(fd),
+                iovecs.as_ptr() as *mut libc::iovec,
+                iovecs.len() as u32,
+            )
+            .build()
+            .user_data(0x01);
 
-            let res = file.read_vectored(&mut [
-                IoSliceMut::new(&mut header_buf),
-                IoSliceMut::new(&mut data_buf),
-            ]);
+            unsafe {
+                ring.submission()
+                    .push(&read_e)
+                    .expect("Failed to push readv to io_uring");
+            }
 
-            ((header_buf, data_buf), res)
-        })
-        .await
-        .unwrap();
+            ring.submit().expect("Failed to submit readv to io_uring");
+        }
 
-        ((header_buf, data_buf), res)
+        let io_res = loop {
+            let cqe = {
+                let mut guard = self.read_ring.lock().unwrap();
+                let x = guard.0.completion().next();
+                x
+            };
+            if let Some(cqe) = cqe {
+                if cqe.user_data() == 0x01 {
+                    let res = cqe.result();
+                    break if res < 0 {
+                        Err(io::Error::from_raw_os_error(-res))
+                    } else {
+                        Ok(res as usize)
+                    };
+                }
+            }
+
+            let mut fd_guard = match self.read_ring_fd.ready(Interest::READABLE).await {
+                Err(err) => break Err(err),
+                Ok(guard) => guard,
+            };
+
+            let mut read_err = None;
+            loop {
+                let mut buf = [0u8; 8];
+                let res = unsafe {
+                    libc::read(
+                        self.read_ring_fd.get_ref().as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        8,
+                    )
+                };
+                if res < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        fd_guard.clear_ready();
+                        break;
+                    } else {
+                        read_err = Some(err);
+                        break;
+                    }
+                } else if res == 0 {
+                    break;
+                } else {
+                    continue;
+                }
+            }
+
+            if let Some(err) = read_err {
+                break Err(err);
+            }
+        };
+
+        ((header_buf, data_buf), io_res)
     }
 
     async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
@@ -261,23 +455,102 @@ impl BlockFuseConnection {
         data: T,
         body_extend_data: Option<U>,
     ) -> CompleteIoResult<(T, Option<U>), usize> {
+        use std::os::fd::AsRawFd;
         let _guard = self.write.lock().await;
 
-        let res = {
-            let body_extend_data = body_extend_data.as_deref();
+        let fd = self.file.as_raw_fd();
+        let body_extend_data_ref = body_extend_data.as_deref();
 
-            match body_extend_data {
-                None => (&self.file).write_vectored(&[IoSlice::new(data.deref())]),
+        let mut iovecs = Vec::with_capacity(2);
+        iovecs.push(SendIovec(libc::iovec {
+            iov_base: data.deref().as_ptr() as *mut libc::c_void,
+            iov_len: data.deref().len(),
+        }));
 
-                Some(body_extend_data) => (&self.file)
-                    .write_vectored(&[IoSlice::new(data.deref()), IoSlice::new(body_extend_data)]),
+        if let Some(extend) = body_extend_data_ref {
+            iovecs.push(SendIovec(libc::iovec {
+                iov_base: extend.as_ptr() as *mut libc::c_void,
+                iov_len: extend.len(),
+            }));
+        }
+
+        {
+            let mut guard = self.write_ring.lock().unwrap();
+            let ring = &mut guard.0;
+            let write_e = opcode::Writev::new(
+                types::Fd(fd),
+                iovecs.as_ptr() as *mut libc::iovec,
+                iovecs.len() as u32,
+            )
+            .build()
+            .user_data(0x01);
+
+            unsafe {
+                ring.submission()
+                    .push(&write_e)
+                    .expect("Failed to push writev to io_uring");
+            }
+
+            ring.submit().expect("Failed to submit writev to io_uring");
+        }
+
+        let io_res = loop {
+            let cqe = {
+                let mut guard = self.write_ring.lock().unwrap();
+                let x = guard.0.completion().next();
+                x
+            };
+            if let Some(cqe) = cqe {
+                if cqe.user_data() == 0x01 {
+                    let res = cqe.result();
+                    break if res < 0 {
+                        Err(io::Error::from_raw_os_error(-res))
+                    } else {
+                        Ok(res as usize)
+                    };
+                }
+            }
+
+            let mut fd_guard = match self.write_ring_fd.ready(Interest::READABLE).await {
+                Err(err) => break Err(err),
+                Ok(guard) => guard,
+            };
+
+            let mut read_err = None;
+            loop {
+                let mut buf = [0u8; 8];
+                let res = unsafe {
+                    libc::read(
+                        self.write_ring_fd.get_ref().as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        8,
+                    )
+                };
+                if res < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        fd_guard.clear_ready();
+                        break;
+                    } else {
+                        read_err = Some(err);
+                        break;
+                    }
+                } else if res == 0 {
+                    break;
+                } else {
+                    continue;
+                }
+            }
+
+            if let Some(err) = read_err {
+                break Err(err);
             }
         };
 
-        match res {
-            Err(err) => ((data, body_extend_data), Err(err)),
-            Ok(n) => ((data, body_extend_data), Ok(n)),
-        }
+        ((data, body_extend_data), io_res)
     }
 }
 
@@ -419,8 +692,8 @@ impl NonBlockFuseConnection {
 
         #[cfg(target_os = "linux")]
         {
-            let read_ring = IoUring::new(256)?;
-            let write_ring = IoUring::new(256)?;
+            let read_ring = build_io_uring(256)?;
+            let write_ring = build_io_uring(256)?;
 
             let read_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             if read_event_fd < 0 {

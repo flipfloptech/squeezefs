@@ -97,7 +97,7 @@ async fn test_crash_recovery_flow() {
         .unwrap();
 
     let meta_client = squeezefs::dlm::MetaClient::Single(redis_client.clone());
-    
+
     // 3. Execute recovery (passing the parent staging directory which contains staging_segment)
     let recovered = recover_staging(temp_dir.path(), &mock_backend, &meta_client)
         .await
@@ -106,15 +106,15 @@ async fn test_crash_recovery_flow() {
     assert_eq!(recovered, 1);
 
     // 4. Verify local staging keys are cleaned up from NvmeCache
-    let cache_after = hypertier::nvme::NvmeCache::new(
-        &[staging_segment_dir.as_path()],
-        &[5 * 1024 * 1024],
-        1,
-    )
-    .unwrap();
+    let cache_after =
+        hypertier::nvme::NvmeCache::new(&[staging_segment_dir.as_path()], &[5 * 1024 * 1024], 1)
+            .unwrap();
     cache_after.recover_index();
     let check_key = bytes::Bytes::copy_from_slice(file_id.as_bytes());
-    assert!(cache_after.get(&check_key).is_none(), "Staged entry should be cleaned up from cache");
+    assert!(
+        cache_after.get(&check_key).is_none(),
+        "Staged entry should be cleaned up from cache"
+    );
 
     // 5. Verify Garnet mapping has been recorded
     let mapping_key = format!("mapping:{}", file_id);
@@ -193,7 +193,7 @@ async fn test_stale_write_recovery_discard() {
         .unwrap();
 
     let meta_client = squeezefs::dlm::MetaClient::Single(redis_client.clone());
-    
+
     // 3. Execute recovery
     let recovered = recover_staging(temp_dir.path(), &mock_backend, &meta_client)
         .await
@@ -203,15 +203,15 @@ async fn test_stale_write_recovery_discard() {
     assert_eq!(recovered, 0);
 
     // 4. Stale local staging keys should still be cleaned up to prevent disk leak
-    let cache_after = hypertier::nvme::NvmeCache::new(
-        &[staging_segment_dir.as_path()],
-        &[5 * 1024 * 1024],
-        1,
-    )
-    .unwrap();
+    let cache_after =
+        hypertier::nvme::NvmeCache::new(&[staging_segment_dir.as_path()], &[5 * 1024 * 1024], 1)
+            .unwrap();
     cache_after.recover_index();
     let check_key = bytes::Bytes::copy_from_slice(file_id.as_bytes());
-    assert!(cache_after.get(&check_key).is_none(), "Stale entry should still be cleaned up from cache");
+    assert!(
+        cache_after.get(&check_key).is_none(),
+        "Stale entry should still be cleaned up from cache"
+    );
 
     // 5. Verify Garnet mapping has NOT been recorded for this stale ID
     let mapping_key = format!("mapping:{}", file_id);

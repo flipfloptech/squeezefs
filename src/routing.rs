@@ -1,5 +1,5 @@
 use crate::backend::{parse_backend_and_key, MultiBackendClient};
-use crate::cache::TieredCache;
+use crate::cache::{PooledBuf, TieredCache, BUFFER_POOL};
 use crate::dlm::DlmClient;
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
@@ -29,8 +29,27 @@ pub struct DataRouter {
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
     pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
+    inflight_block_reads:
+        std::sync::Arc<dashmap::DashMap<String, Arc<tokio::sync::Notify>, ahash::RandomState>>,
+    sequential_read_state:
+        std::sync::Arc<dashmap::DashMap<String, (u32, std::time::Instant), ahash::RandomState>>,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
+}
+
+struct InflightBlockReadGuard {
+    key: String,
+    inflight_block_reads:
+        std::sync::Arc<dashmap::DashMap<String, Arc<tokio::sync::Notify>, ahash::RandomState>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for InflightBlockReadGuard {
+    fn drop(&mut self) {
+        self.inflight_block_reads
+            .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.notify));
+        self.notify.notify_waiters();
+    }
 }
 
 impl DataRouter {
@@ -48,6 +67,12 @@ impl DataRouter {
                 .max_capacity(100_000)
                 .time_to_live(Duration::from_secs(300))
                 .build(),
+            inflight_block_reads: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            sequential_read_state: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
             crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
         }
     }
@@ -71,6 +96,194 @@ impl DataRouter {
     pub fn set_block_size(&self, block_size: u64) {
         self.block_size
             .store(block_size, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn fetch_block_from_remote(&self, block_key: &str) -> Result<PooledBuf> {
+        let raw = if let Some(dht) = self.cache.nvme.dht_node.get() {
+            let client = crate::p2p::P2pClient::new();
+            if let Ok(data) = client.download_block_from_peer(dht, block_key).await {
+                data
+            } else {
+                let (be_id, real_key) = parse_backend_and_key(block_key);
+                self.backend.get_object(&be_id, &real_key).await?
+            }
+        } else {
+            let (be_id, real_key) = parse_backend_and_key(block_key);
+            self.backend.get_object(&be_id, &real_key).await?
+        };
+
+        let decompressed = self.get_crypto().process_read(&raw)?;
+        let mut pooled = BUFFER_POOL.alloc();
+        pooled.resize(decompressed.len(), 0);
+        pooled.copy_from_slice(&decompressed);
+        Ok(pooled)
+    }
+
+    async fn get_cached_or_fetch_block(&self, block_key: &str) -> Result<PooledBuf> {
+        loop {
+            if let Some(cached_block) = self.cache.read_lru.get(block_key) {
+                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                let mut pooled = BUFFER_POOL.alloc();
+                pooled.resize(cached_block.len(), 0);
+                pooled.copy_from_slice(&cached_block);
+                return Ok(pooled);
+            }
+
+            if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
+                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                self.cache
+                    .read_lru
+                    .put(block_key, bytes::Bytes::from(cached_block.clone()));
+                let mut pooled = BUFFER_POOL.alloc();
+                pooled.resize(cached_block.len(), 0);
+                pooled.copy_from_slice(&cached_block);
+                return Ok(pooled);
+            }
+
+            let notify = Arc::new(tokio::sync::Notify::new());
+            match self.inflight_block_reads.entry(block_key.to_string()) {
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    entry.insert(notify.clone());
+                    let _guard = InflightBlockReadGuard {
+                        key: block_key.to_string(),
+                        inflight_block_reads: self.inflight_block_reads.clone(),
+                        notify,
+                    };
+
+                    let downloaded = self.fetch_block_from_remote(block_key).await?;
+                    let _ = self.cache.nvme.cache_read_block(block_key, &downloaded);
+                    self.cache
+                        .read_lru
+                        .put(block_key, bytes::Bytes::copy_from_slice(&downloaded));
+                    return Ok(downloaded);
+                }
+                dashmap::mapref::entry::Entry::Occupied(entry) => {
+                    let existing = entry.get().clone();
+                    drop(entry);
+                    existing.notified().await;
+                }
+            }
+        }
+    }
+
+    async fn load_striped_block_keys(
+        &self,
+        meta: &CachedMetadata,
+        start_block: u32,
+        end_block: u32,
+    ) -> Result<Vec<(u32, Option<String>)>> {
+        let mut block_keys = Vec::new();
+
+        if let Some(block_map_id) = &meta.block_map_id {
+            let block_map_key = format!("block_map:{}", block_map_id);
+
+            let mut blocks_to_query = Vec::new();
+            for b in start_block..=end_block {
+                let cache_key = (block_map_id.clone(), b);
+                if let Some(entry) = self.block_map_cache.get(&cache_key) {
+                    let (bk, cached_at) = &entry;
+                    if cached_at.elapsed() < Duration::from_secs(1) {
+                        block_keys.push((b, bk.clone()));
+                        continue;
+                    }
+                }
+                blocks_to_query.push(b);
+            }
+
+            if !blocks_to_query.is_empty() {
+                let mut pipe = redis::pipe();
+                for &b in &blocks_to_query {
+                    pipe.hget(&block_map_key, b.to_string());
+                }
+                let mut con = self.dlm.get_connection().await?;
+                let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
+                for (idx, key_opt) in res.into_iter().enumerate() {
+                    let b = blocks_to_query[idx];
+                    self.block_map_cache.insert(
+                        (block_map_id.clone(), b),
+                        (key_opt.clone(), std::time::Instant::now()),
+                    );
+                    block_keys.push((b, key_opt));
+                }
+            }
+        } else if let Some(block_prefix) = &meta.block_prefix {
+            for b in start_block..=end_block {
+                block_keys.push((b, Some(format!("{}/part_{}", block_prefix, b))));
+            }
+        } else {
+            return Err(SqueezefsError::InvalidOperation(
+                "Missing block_map_id and block_prefix for striped file".to_string(),
+            ));
+        }
+
+        block_keys.sort_by_key(|(block_idx, _)| *block_idx);
+        Ok(block_keys)
+    }
+
+    fn should_prefetch_after_striped_read(
+        &self,
+        file_path: &str,
+        start_block: u32,
+        end_block: u32,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        let mut should_prefetch = end_block > start_block;
+
+        if !should_prefetch {
+            if let Some(previous) = self.sequential_read_state.get(file_path) {
+                let (prev_end_block, prev_seen_at) = *previous.value();
+                should_prefetch = prev_seen_at.elapsed() < Duration::from_secs(2)
+                    && start_block == prev_end_block.saturating_add(1);
+            }
+        }
+
+        self.sequential_read_state
+            .insert(file_path.to_string(), (end_block, now));
+        should_prefetch
+    }
+
+    fn schedule_striped_prefetch(&self, meta: CachedMetadata, next_block: u32, block_size: u64) {
+        const PREFETCH_BLOCK_COUNT: u32 = 9;
+
+        let total_blocks = meta.size.div_ceil(block_size) as u32;
+        if next_block >= total_blocks {
+            return;
+        }
+
+        let prefetch_end = std::cmp::min(
+            next_block.saturating_add(PREFETCH_BLOCK_COUNT - 1),
+            total_blocks.saturating_sub(1),
+        );
+        let router = self.clone();
+
+        tokio::spawn(async move {
+            let block_keys = match router
+                .load_striped_block_keys(&meta, next_block, prefetch_end)
+                .await
+            {
+                Ok(block_keys) => block_keys,
+                Err(err) => {
+                    debug!("Prefetch: Failed to resolve striped block keys: {:?}", err);
+                    return;
+                }
+            };
+
+            let mut tasks = Vec::new();
+            for (_, block_key_opt) in block_keys {
+                if let Some(block_key) = block_key_opt {
+                    let router_clone = router.clone();
+                    tasks.push(tokio::spawn(async move {
+                        if let Err(err) = router_clone.get_cached_or_fetch_block(&block_key).await {
+                            debug!("Prefetch: Failed to fetch block {}: {:?}", block_key, err);
+                        }
+                    }));
+                }
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
     }
 
     async fn decrement_staged_block_refcount(
@@ -117,8 +330,15 @@ impl DataRouter {
 
         // 1. If file is already striped, perform RMW block-by-block without loading the whole file
         if file_type.as_deref() == Some("striped") {
-            self.write_striped(file_path, &meta_key, offset, data, fencing_token, &mut con)
-                .await?;
+            self.write_striped(
+                file_path,
+                &meta_key,
+                offset,
+                bytes::Bytes::copy_from_slice(data),
+                fencing_token,
+                &mut con,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -174,11 +394,12 @@ impl DataRouter {
             let mut offset_cursor = 0;
             let mut block_count = 0;
             let mut block_mappings = Vec::new();
-            let existing_size = existing_data.len();
+            let existing_bytes = bytes::Bytes::from(existing_data);
+            let existing_size = existing_bytes.len();
 
             while offset_cursor < existing_size {
                 let end = std::cmp::min(offset_cursor + block_size, existing_size);
-                let chunk = existing_data[offset_cursor..end].to_vec();
+                let chunk = existing_bytes.slice(offset_cursor..end);
                 let block_write_uuid = Uuid::new_v4().to_string();
                 let block_key = format!(
                     "blocks/{}/block_{}_{}",
@@ -195,12 +416,12 @@ impl DataRouter {
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 let task = tokio::spawn(async move {
-                    let processed = crypto.process_write(&chunk)?;
+                    let processed = crypto.process_write(chunk)?;
                     backend_clone
                         .put_object(&block_key, processed, fencing_token)
                         .await?;
                     // Cache the newly written block in RAM - dehydrated to NVMe on eviction
-                    read_lru.put(&stored_block_key_clone, Arc::new(chunk_clone.clone()));
+                    read_lru.put(&stored_block_key_clone, chunk_clone);
                     Ok::<(), SqueezefsError>(())
                 });
 
@@ -251,12 +472,7 @@ impl DataRouter {
             let _: () = pipe.query_async(&mut con).await?;
 
             if let Some(old_id) = old_file_id {
-                let old_staged_path = self
-                    .cache
-                    .nvme
-                    .get_staged_path(&old_id)
-                    .join(format!("file_{}.staged", old_id));
-                let _ = tokio::fs::remove_file(old_staged_path).await;
+                self.cache.nvme.remove_staged(&old_id);
                 let _ = self
                     .decrement_staged_block_refcount(&old_id, &mut con)
                     .await;
@@ -265,8 +481,15 @@ impl DataRouter {
             }
 
             // Now that layout is transitioned to "striped", perform the write block-by-block
-            self.write_striped(file_path, &meta_key, offset, data, fencing_token, &mut con)
-                .await?;
+            self.write_striped(
+                file_path,
+                &meta_key,
+                offset,
+                bytes::Bytes::copy_from_slice(data),
+                fencing_token,
+                &mut con,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -280,9 +503,10 @@ impl DataRouter {
         if new_size < 64 * 1024 {
             // Layout: inline
             let inline_key = format!("inline_data:{}", file_path);
-            let processed_data = self.get_crypto().process_write(&existing_data)?;
+            let shared_data = bytes::Bytes::from(existing_data);
+            let processed_data = self.get_crypto().process_write(shared_data.clone())?;
             let mut pipe = redis::pipe();
-            pipe.set(&inline_key, &processed_data)
+            pipe.set(&inline_key, &processed_data[..])
                 .hset(&meta_key, "size", new_size)
                 .hset(&meta_key, "type", "inline")
                 .hset(&meta_key, "fencing_token", fencing_token);
@@ -297,12 +521,7 @@ impl DataRouter {
             let _: () = pipe.query_async(&mut con).await?;
 
             if let Some(old_id) = old_file_id {
-                let old_staged_path = self
-                    .cache
-                    .nvme
-                    .get_staged_path(&old_id)
-                    .join(format!("file_{}.staged", old_id));
-                let _ = tokio::fs::remove_file(old_staged_path).await;
+                self.cache.nvme.remove_staged(&old_id);
                 let _ = self
                     .decrement_staged_block_refcount(&old_id, &mut con)
                     .await;
@@ -310,7 +529,6 @@ impl DataRouter {
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
             }
 
-            let shared_data = Arc::new(existing_data);
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
         } else if new_size <= 4 * 1024 * 1024 {
@@ -330,6 +548,8 @@ impl DataRouter {
                 .stage_write(file_path, &new_file_id, &existing_data, fencing_token)
                 .await;
 
+            let shared_data = bytes::Bytes::from(existing_data);
+
             match stage_res {
                 Ok(_) => {
                     let mut pipe = redis::pipe();
@@ -345,12 +565,7 @@ impl DataRouter {
                     let _: () = pipe.query_async(&mut con).await?;
 
                     if let Some(old_id) = old_file_id {
-                        let old_staged_path = self
-                            .cache
-                            .nvme
-                            .get_staged_path(&old_id)
-                            .join(format!("file_{}.staged", old_id));
-                        let _ = tokio::fs::remove_file(old_staged_path).await;
+                        self.cache.nvme.remove_staged(&old_id);
                         let _ = self
                             .decrement_staged_block_refcount(&old_id, &mut con)
                             .await;
@@ -362,7 +577,7 @@ impl DataRouter {
                     log::warn!("NVMe write staging cache full. Falling back to direct synchronous S3 upload for: {}", file_path);
 
                     // 1. Process data (encryption and compression)
-                    let processed_data = self.get_crypto().process_write(&existing_data)?;
+                    let processed_data = self.get_crypto().process_write(shared_data.clone())?;
 
                     // 2. Upload block directly to S3
                     let direct_block_uuid = uuid::Uuid::new_v4().to_string();
@@ -398,12 +613,7 @@ impl DataRouter {
 
                     // 4. Remove old staged files if any
                     if let Some(old_id) = old_file_id {
-                        let old_staged_path = self
-                            .cache
-                            .nvme
-                            .get_staged_path(&old_id)
-                            .join(format!("file_{}.staged", old_id));
-                        let _ = tokio::fs::remove_file(old_staged_path).await;
+                        self.cache.nvme.remove_staged(&old_id);
                         let _ = self
                             .decrement_staged_block_refcount(&old_id, &mut con)
                             .await;
@@ -414,7 +624,6 @@ impl DataRouter {
                 Err(e) => return Err(e),
             }
 
-            let shared_data = Arc::new(existing_data);
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
         } else {
@@ -426,10 +635,12 @@ impl DataRouter {
             let mut offset_cursor = 0;
             let mut block_count = 0;
             let mut block_mappings = Vec::new();
+            let existing_bytes = bytes::Bytes::from(existing_data);
+            let new_size = existing_bytes.len();
 
             while offset_cursor < new_size {
                 let end = std::cmp::min(offset_cursor + block_size, new_size);
-                let chunk = existing_data[offset_cursor..end].to_vec();
+                let chunk = existing_bytes.slice(offset_cursor..end);
                 let block_write_uuid = Uuid::new_v4().to_string();
                 let block_key = format!(
                     "blocks/{}/block_{}_{}",
@@ -446,12 +657,12 @@ impl DataRouter {
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 let task = tokio::spawn(async move {
-                    let processed = crypto.process_write(&chunk)?;
+                    let processed = crypto.process_write(chunk)?;
                     backend_clone
                         .put_object(&block_key, processed, fencing_token)
                         .await?;
                     // Cache the newly written block in RAM - dehydrated to NVMe on eviction
-                    read_lru.put(&stored_block_key_clone, Arc::new(chunk_clone.clone()));
+                    read_lru.put(&stored_block_key_clone, chunk_clone);
                     Ok::<(), SqueezefsError>(())
                 });
 
@@ -502,12 +713,7 @@ impl DataRouter {
             let _: () = pipe.query_async(&mut con).await?;
 
             if let Some(old_id) = old_file_id {
-                let old_staged_path = self
-                    .cache
-                    .nvme
-                    .get_staged_path(&old_id)
-                    .join(format!("file_{}.staged", old_id));
-                let _ = tokio::fs::remove_file(old_staged_path).await;
+                self.cache.nvme.remove_staged(&old_id);
                 let mapping_key = format!("mapping:{}", old_id);
                 // Decrement refcount of old staged merged block if it exists
                 let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
@@ -539,13 +745,12 @@ impl DataRouter {
         Ok(())
     }
 
-    /// Perform a highly efficient block-by-block offset write to a striped file, avoiding loading the entire file.
     async fn write_striped(
         &self,
         file_path: &str,
         meta_key: &str,
         offset: u64,
-        data: &[u8],
+        data: bytes::Bytes,
         fencing_token: u64,
         con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
@@ -625,32 +830,31 @@ impl DataRouter {
             let rel_end = (overlap_end - block_start_file_offset) as usize;
 
             let data_slice =
-                data[(overlap_start - offset) as usize..(overlap_end - offset) as usize].to_vec();
+                data.slice((overlap_start - offset) as usize..(overlap_end - offset) as usize);
 
-            let backend_clone = self.backend.clone();
+            let router_clone = self.clone();
             let crypto = self.get_crypto().clone();
             let read_lru = self.cache.read_lru.clone();
-            let cache_ref = self.cache.nvme.clone();
+
+            let needs_existing = {
+                let existing_block_end = std::cmp::min(existing_size, block_end_file_offset);
+                existing_block_end > block_start_file_offset
+                    && (overlap_start > block_start_file_offset || overlap_end < existing_block_end)
+            };
 
             tasks.push(tokio::spawn(async move {
-                let mut block_data = if let Some(ref bk) = old_block_key {
-                    if let Some(cached_block) = read_lru.get(bk) {
-                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                        (*cached_block).clone()
-                    } else if let Some(decompressed) = cache_ref.read_cached_block(bk) {
-                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                        read_lru.put(bk, Arc::new(decompressed.clone()));
-                        decompressed
+                let mut block_data = if needs_existing {
+                    if let Some(ref bk) = old_block_key {
+                        router_clone.get_cached_or_fetch_block(bk).await?
                     } else {
-                        METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-                        let (be_id, real_key) = parse_backend_and_key(bk);
-                        let raw = backend_clone.get_object(&be_id, &real_key).await?;
-                        let decompressed = crypto.process_read(&raw)?;
-                        read_lru.put(bk, Arc::new(decompressed.clone()));
-                        decompressed
+                        let mut pooled = BUFFER_POOL.alloc();
+                        pooled.resize(rel_end, 0);
+                        pooled
                     }
                 } else {
-                    vec![0; rel_end]
+                    let mut pooled = BUFFER_POOL.alloc();
+                    pooled.resize(rel_end, 0);
+                    pooled
                 };
 
                 if block_data.len() < rel_end {
@@ -664,14 +868,17 @@ impl DataRouter {
                 let new_block_key =
                     format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
-                let active_be = backend_clone.get_backend_for_key(&new_block_key);
+                let active_be = router_clone.backend.get_backend_for_key(&new_block_key);
                 let stored_new_block_key = format!("{}:{}", active_be, new_block_key);
 
-                // Cache newly written block in RAM - dehydrated to NVMe on eviction
-                read_lru.put(&stored_new_block_key, Arc::new(block_data.clone()));
+                let block_bytes = bytes::Bytes::copy_from_slice(&block_data);
 
-                let processed_block = crypto.process_write(&block_data)?;
-                backend_clone
+                // Cache newly written block in RAM - dehydrated to NVMe on eviction
+                read_lru.put(&stored_new_block_key, block_bytes.clone());
+
+                let processed_block = crypto.process_write(block_bytes)?;
+                router_clone
+                    .backend
                     .put_object(&new_block_key, processed_block, fencing_token)
                     .await?;
                 debug!(
@@ -744,14 +951,16 @@ impl DataRouter {
         if found_data.is_none() {
             found_data = self.cache.read_lru.get(file_path);
         }
-        if let Some(mut cached_data) = found_data {
+        if let Some(cached_data) = found_data {
             let end_offset = end_pos as usize;
-            let data_vec = Arc::make_mut(&mut cached_data);
+            let mut data_vec = cached_data.to_vec();
             if data_vec.len() < end_offset {
                 data_vec.resize(end_offset, 0);
             }
-            data_vec[offset as usize..end_offset].copy_from_slice(data);
-            self.cache.write_lru.put(file_path, cached_data);
+            data_vec[offset as usize..end_offset].copy_from_slice(&data);
+            self.cache
+                .write_lru
+                .put(file_path, bytes::Bytes::from(data_vec));
             self.cache.read_lru.remove(file_path);
         }
 
@@ -776,7 +985,7 @@ impl DataRouter {
                 "Routing: Cache hit (Tier 2 - System RAM) for '{}'",
                 file_path
             );
-            return Ok((*cached_data).clone());
+            return Ok(cached_data.to_vec());
         }
         METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
 
@@ -890,17 +1099,15 @@ impl DataRouter {
                 };
 
                 let mut futures = Vec::new();
-                let crypto = self.get_crypto().clone();
                 for block_key_opt in block_keys {
-                    let backend_clone = self.backend.clone();
-                    let crypto_clone = crypto.clone();
+                    let router = self.clone();
                     let task = tokio::spawn(async move {
                         if let Some(block_key) = block_key_opt {
-                            let (be_id, real_key) = parse_backend_and_key(&block_key);
-                            let raw = backend_clone.get_object(&be_id, &real_key).await?;
-                            crypto_clone.process_read(&raw)
+                            router.get_cached_or_fetch_block(&block_key).await
                         } else {
-                            Ok(vec![0; block_size as usize])
+                            let mut buf = BUFFER_POOL.alloc();
+                            buf.resize(block_size as usize, 0);
+                            Ok(buf)
                         }
                     });
                     futures.push(task);
@@ -930,7 +1137,9 @@ impl DataRouter {
         };
 
         // Cache in Tier 2: System RAM (Read Cache)
-        self.cache.read_lru.put(file_path, Arc::new(data.clone()));
+        self.cache
+            .read_lru
+            .put(file_path, bytes::Bytes::from(data.clone()));
 
         Ok(data)
     }
@@ -1072,122 +1281,66 @@ impl DataRouter {
                 let start_block = (offset / block_size) as u32;
                 let end_block = ((end_offset - 1) / block_size) as u32;
 
-                let mut block_keys = Vec::new();
-                if let Some(block_map_id) = &meta.block_map_id {
-                    let block_map_key = format!("block_map:{}", block_map_id);
-
-                    let mut blocks_to_query = Vec::new();
-                    for b in start_block..=end_block {
-                        let cache_key = (block_map_id.clone(), b);
-                        if let Some(entry) = self.block_map_cache.get(&cache_key) {
-                            let (bk, cached_at) = &entry;
-                            if cached_at.elapsed() < Duration::from_secs(1) {
-                                block_keys.push((b, bk.clone()));
-                                continue;
-                            }
-                        }
-                        blocks_to_query.push(b);
-                    }
-
-                    if !blocks_to_query.is_empty() {
-                        let mut pipe = redis::pipe();
-                        for &b in &blocks_to_query {
-                            pipe.hget(&block_map_key, b.to_string());
-                        }
-                        let mut con = self.dlm.get_connection().await?;
-                        let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
-                        for (idx, key_opt) in res.into_iter().enumerate() {
-                            let b = blocks_to_query[idx];
-                            self.block_map_cache.insert(
-                                (block_map_id.clone(), b),
-                                (key_opt.clone(), std::time::Instant::now()),
-                            );
-                            block_keys.push((b, key_opt));
-                        }
-                    }
-                } else if let Some(block_prefix) = &meta.block_prefix {
-                    for b in start_block..=end_block {
-                        block_keys.push((b, Some(format!("{}/part_{}", block_prefix, b))));
-                    }
-                } else {
-                    return Err(SqueezefsError::InvalidOperation(
-                        "Missing block_map_id and block_prefix for striped file".to_string(),
-                    ));
-                }
+                let block_keys = self
+                    .load_striped_block_keys(&meta, start_block, end_block)
+                    .await?;
 
                 // Spawn concurrent tasks to download block data in parallel
                 let mut futures = Vec::new();
-                let crypto = self.get_crypto().clone();
                 for (b_idx, b_key_opt) in block_keys {
-                    let cache_ref = self.cache.nvme.clone();
-                    let read_lru = self.cache.read_lru.clone();
-                    let backend_ref = self.backend.clone();
-
+                    let router = self.clone();
                     let b_start_offset = b_idx as u64 * block_size;
                     let b_end_offset = b_start_offset + block_size;
                     let slice_start = std::cmp::max(offset, b_start_offset) - b_start_offset;
                     let slice_end = std::cmp::min(end_offset, b_end_offset);
                     let rel_end = slice_end - b_start_offset;
                     let slice_len = (rel_end - slice_start) as u32;
-
-                    let crypto_clone = crypto.clone();
+                    let file_path_clone = file_path.to_string();
                     futures.push(tokio::spawn(async move {
-                        let block_data = if let Some(ref b_key) = b_key_opt {
-                            if let Some(cached_block) = read_lru.get(b_key) {
+                        let cache_key = format!("active_block:{}:block_{}", file_path_clone, b_idx);
+                        let block_data = if let Some(active_data) =
+                            router.cache.nvme.read_staged(&cache_key)
+                        {
+                            let start = std::cmp::min(slice_start as usize, active_data.len());
+                            let end = std::cmp::min(
+                                (slice_start + slice_len as u64) as usize,
+                                active_data.len(),
+                            );
+                            let mut sliced_pooled = BUFFER_POOL.alloc();
+                            sliced_pooled.resize(slice_len as usize, 0);
+                            sliced_pooled[0..end - start].copy_from_slice(&active_data[start..end]);
+                            sliced_pooled
+                        } else if let Some(ref b_key) = b_key_opt {
+                            if let Some(cached_block) = router.cache.read_lru.get(b_key) {
                                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                                 let start = std::cmp::min(slice_start as usize, cached_block.len());
                                 let end = std::cmp::min(
                                     (slice_start + slice_len as u64) as usize,
                                     cached_block.len(),
                                 );
-                                cached_block[start..end].to_vec()
-                            } else if let Some(decompressed) = cache_ref.read_cached_block(b_key) {
-                                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                read_lru.put(b_key, Arc::new(decompressed.clone()));
-                                let start = std::cmp::min(slice_start as usize, decompressed.len());
-                                let end = std::cmp::min(
-                                    (slice_start + slice_len as u64) as usize,
-                                    decompressed.len(),
-                                );
-                                decompressed[start..end].to_vec()
+                                let mut sliced_pooled = BUFFER_POOL.alloc();
+                                sliced_pooled.resize(slice_len as usize, 0);
+                                sliced_pooled[0..end - start]
+                                    .copy_from_slice(&cached_block[start..end]);
+                                sliced_pooled
                             } else {
-                                METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-
-                                // Try P2P download
-                                let mut downloaded_data = None;
-                                if let Some(dht) = cache_ref.dht_node.get() {
-                                    let client = crate::p2p::P2pClient::new();
-                                    if let Ok(data) =
-                                        client.download_block_from_peer(dht, b_key).await
-                                    {
-                                        downloaded_data = Some(data);
-                                    }
-                                }
-
-                                let downloaded = match downloaded_data {
-                                    Some(data) => data,
-                                    None => {
-                                        // Fallback to S3
-                                        let (be_id, real_key) = parse_backend_and_key(b_key);
-                                        crypto_clone.process_read(
-                                            &backend_ref.get_object(&be_id, &real_key).await?,
-                                        )?
-                                    }
-                                };
-
-                                let _ = cache_ref.cache_read_block(b_key, &downloaded);
-                                read_lru.put(b_key, Arc::new(downloaded.clone()));
-
+                                let downloaded = router.get_cached_or_fetch_block(b_key).await?;
                                 let start = std::cmp::min(slice_start as usize, downloaded.len());
                                 let end = std::cmp::min(
                                     (slice_start + slice_len as u64) as usize,
                                     downloaded.len(),
                                 );
-                                downloaded[start..end].to_vec()
+                                let mut sliced_pooled = BUFFER_POOL.alloc();
+                                sliced_pooled.resize(slice_len as usize, 0);
+                                sliced_pooled[0..end - start]
+                                    .copy_from_slice(&downloaded[start..end]);
+                                sliced_pooled
                             }
                         } else {
                             // Hole support: return zero-filled block
-                            vec![0u8; slice_len as usize]
+                            let mut hole_pooled = BUFFER_POOL.alloc();
+                            hole_pooled.resize(slice_len as usize, 0);
+                            hole_pooled
                         };
                         Ok::<_, SqueezefsError>((b_idx, block_data))
                     }));
@@ -1211,7 +1364,328 @@ impl DataRouter {
                     range_data.extend_from_slice(&block_data);
                 }
 
+                if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
+                    self.schedule_striped_prefetch(
+                        meta.clone(),
+                        end_block.saturating_add(1),
+                        block_size,
+                    );
+                }
+
                 Ok(range_data)
+            }
+            _ => Err(SqueezefsError::InvalidOperation(format!(
+                "Unknown file type: {}",
+                meta.file_type
+            ))),
+        }
+    }
+
+    pub async fn read_file_range_zero_copy(
+        &self,
+        file_path: &str,
+        offset: u64,
+        size: u32,
+    ) -> Result<(
+        bytes::Bytes,
+        Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    )> {
+        // Tier 2 check: System RAM LRU Caches
+        let mut cached_opt = self.cache.write_lru.get(file_path);
+        if cached_opt.is_none() {
+            cached_opt = self.cache.read_lru.get(file_path);
+        }
+        if let Some(cached_data) = cached_opt {
+            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+            let start = std::cmp::min(offset as usize, cached_data.len());
+            let end = std::cmp::min((offset + size as u64) as usize, cached_data.len());
+            let data = cached_data.slice(start..end);
+            return Ok((data, None));
+        }
+
+        // Fetch file metadata from local cache or Garnet
+        let cached_meta = if let Some(entry) = self.metadata_cache.get(file_path) {
+            if entry.cached_at.elapsed() < Duration::from_secs(1) {
+                Some(entry.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let meta = match cached_meta {
+            Some(m) => m,
+            None => {
+                let mut con = self.dlm.get_connection().await?;
+                let meta_key = format!("metadata:{}", file_path);
+                let fields: std::collections::HashMap<String, String> =
+                    con.hgetall(&meta_key).await?;
+
+                let file_type = fields.get("type").cloned().ok_or_else(|| {
+                    SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("File not found: {}", file_path),
+                    ))
+                })?;
+                let size_val = fields
+                    .get("size")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let block_map_id = fields
+                    .get("block_map_id")
+                    .filter(|s| !s.is_empty())
+                    .cloned();
+                let block_prefix = fields
+                    .get("block_prefix")
+                    .filter(|s| !s.is_empty())
+                    .cloned();
+                let file_id = fields.get("file_id").filter(|s| !s.is_empty()).cloned();
+
+                let m = CachedMetadata {
+                    file_type,
+                    size: size_val,
+                    block_map_id,
+                    block_prefix,
+                    file_id,
+                    cached_at: std::time::Instant::now(),
+                    data_key: None,
+                };
+                self.metadata_cache.insert(file_path.to_string(), m.clone());
+                m
+            }
+        };
+
+        match meta.file_type.as_str() {
+            "inline" => {
+                let mut con = self.dlm.get_connection().await?;
+                let inline_key = format!("inline_data:{}", file_path);
+                let bytes: Vec<u8> = con.get(&inline_key).await?;
+                let decompressed = self.get_crypto().process_read(&bytes)?;
+                let start = std::cmp::min(offset as usize, decompressed.len());
+                let end = std::cmp::min((offset + size as u64) as usize, decompressed.len());
+                let data = bytes::Bytes::from(decompressed[start..end].to_vec());
+                Ok((data, None))
+            }
+            "staged" => {
+                let file_id = meta.file_id.as_ref().ok_or_else(|| {
+                    SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
+                })?;
+
+                if let Some(guard) = self.cache.nvme.read_staged_zero_copy(file_id) {
+                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    let start = std::cmp::min(offset as usize, guard.len);
+                    let end = std::cmp::min((offset + size as u64) as usize, guard.len);
+                    let mut sliced_guard = guard;
+                    sliced_guard.offset += start;
+                    sliced_guard.len = end - start;
+                    let slice: &[u8] = &sliced_guard;
+                    let data = unsafe {
+                        bytes::Bytes::from_static(std::mem::transmute::<&[u8], &'static [u8]>(
+                            slice,
+                        ))
+                    };
+                    Ok((data, Some(std::sync::Arc::new(sliced_guard))))
+                } else {
+                    let mapping_key = format!("mapping:{}", file_id);
+                    let mut con = self.dlm.get_connection().await?;
+                    let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
+                    let off_opt: Option<u64> = con.hget(&mapping_key, "offset").await?;
+                    let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
+
+                    if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
+                        let (be_id, real_key) = parse_backend_and_key(&bk);
+                        let packed_bytes = self
+                            .backend
+                            .get_object_range(&be_id, &real_key, off, off + sz)
+                            .await?;
+                        let decompressed = self.get_crypto().process_read(&packed_bytes)?;
+                        if offset >= decompressed.len() as u64 {
+                            return Ok((bytes::Bytes::new(), None));
+                        }
+                        let start = offset as usize;
+                        let end =
+                            std::cmp::min((offset + size as u64) as usize, decompressed.len());
+                        let data = bytes::Bytes::from(decompressed[start..end].to_vec());
+                        Ok((data, None))
+                    } else {
+                        Err(SqueezefsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Staged file ID {} mapping not found in Garnet", file_id),
+                        )))
+                    }
+                }
+            }
+            "striped" => {
+                let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
+                let file_size = meta.size;
+
+                if offset >= file_size {
+                    return Ok((bytes::Bytes::new(), None));
+                }
+
+                let end_offset = std::cmp::min(offset + size as u64, file_size);
+                if offset >= end_offset {
+                    return Ok((bytes::Bytes::new(), None));
+                }
+
+                let start_block = (offset / block_size) as u32;
+                let end_block = ((end_offset - 1) / block_size) as u32;
+
+                // 1. Single block read optimization: check cache and staging zero-copy
+                if start_block == end_block {
+                    let b_idx = start_block;
+                    let b_start_offset = b_idx as u64 * block_size;
+                    let slice_start = offset - b_start_offset;
+                    let slice_len = (end_offset - offset) as u32;
+                    let cache_key = format!("active_block:{}:block_{}", file_path, b_idx);
+
+                    // Check active block staging first
+                    if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&cache_key) {
+                        let start = std::cmp::min(slice_start as usize, guard.len);
+                        let end =
+                            std::cmp::min((slice_start + slice_len as u64) as usize, guard.len);
+                        let mut sliced_guard = guard;
+                        sliced_guard.offset += start;
+                        sliced_guard.len = end - start;
+                        let slice: &[u8] = &sliced_guard;
+                        let data = unsafe {
+                            bytes::Bytes::from_static(std::mem::transmute::<&[u8], &'static [u8]>(
+                                slice,
+                            ))
+                        };
+                        return Ok((data, Some(std::sync::Arc::new(sliced_guard))));
+                    }
+
+                    // Check NVMe read block cache next
+                    let block_keys = self
+                        .load_striped_block_keys(&meta, start_block, end_block)
+                        .await?;
+                    if let Some((_, Some(ref b_key))) = block_keys.first() {
+                        if let Some(guard) = self.cache.nvme.get_cached_read_block_range_zero_copy(
+                            b_key,
+                            slice_start,
+                            slice_len,
+                        ) {
+                            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                            let slice: &[u8] = &guard;
+                            let data = unsafe {
+                                bytes::Bytes::from_static(
+                                    std::mem::transmute::<&[u8], &'static [u8]>(slice),
+                                )
+                            };
+                            return Ok((data, Some(std::sync::Arc::new(guard))));
+                        }
+                    }
+                }
+
+                // 2. Multi-block or cache miss: load and assemble using pooled buffer
+                let block_keys = self
+                    .load_striped_block_keys(&meta, start_block, end_block)
+                    .await?;
+
+                // Spawn concurrent tasks to download block data in parallel
+                let mut futures = Vec::new();
+                for (b_idx, b_key_opt) in block_keys {
+                    let router = self.clone();
+                    let b_start_offset = b_idx as u64 * block_size;
+                    let b_end_offset = b_start_offset + block_size;
+                    let slice_start = std::cmp::max(offset, b_start_offset) - b_start_offset;
+                    let slice_end = std::cmp::min(end_offset, b_end_offset);
+                    let rel_end = slice_end - b_start_offset;
+                    let slice_len = (rel_end - slice_start) as u32;
+                    let file_path_clone = file_path.to_string();
+                    futures.push(tokio::spawn(async move {
+                        let cache_key = format!("active_block:{}:block_{}", file_path_clone, b_idx);
+                        let block_data = if let Some(active_data) =
+                            router.cache.nvme.read_staged(&cache_key)
+                        {
+                            let start = std::cmp::min(slice_start as usize, active_data.len());
+                            let end = std::cmp::min(
+                                (slice_start + slice_len as u64) as usize,
+                                active_data.len(),
+                            );
+                            let mut sliced_pooled = BUFFER_POOL.alloc();
+                            sliced_pooled.resize(slice_len as usize, 0);
+                            sliced_pooled[0..end - start].copy_from_slice(&active_data[start..end]);
+                            sliced_pooled
+                        } else if let Some(ref b_key) = b_key_opt {
+                            if let Some(cached_block) = router.cache.read_lru.get(b_key) {
+                                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                let start = std::cmp::min(slice_start as usize, cached_block.len());
+                                let end = std::cmp::min(
+                                    (slice_start + slice_len as u64) as usize,
+                                    cached_block.len(),
+                                );
+                                let mut sliced_pooled = BUFFER_POOL.alloc();
+                                sliced_pooled.resize(slice_len as usize, 0);
+                                sliced_pooled[0..end - start]
+                                    .copy_from_slice(&cached_block[start..end]);
+                                sliced_pooled
+                            } else {
+                                let downloaded = router.get_cached_or_fetch_block(b_key).await?;
+                                let start = std::cmp::min(slice_start as usize, downloaded.len());
+                                let end = std::cmp::min(
+                                    (slice_start + slice_len as u64) as usize,
+                                    downloaded.len(),
+                                );
+                                let mut sliced_pooled = BUFFER_POOL.alloc();
+                                sliced_pooled.resize(slice_len as usize, 0);
+                                sliced_pooled[0..end - start]
+                                    .copy_from_slice(&downloaded[start..end]);
+                                sliced_pooled
+                            }
+                        } else {
+                            // Hole support: return zero-filled block
+                            let mut hole_pooled = BUFFER_POOL.alloc();
+                            hole_pooled.resize(slice_len as usize, 0);
+                            hole_pooled
+                        };
+                        Ok::<_, SqueezefsError>((b_idx, block_data))
+                    }));
+                }
+
+                let results = futures::future::try_join_all(futures).await.map_err(|e| {
+                    SqueezefsError::Io(std::io::Error::other(format!(
+                        "Parallel block download task panicked: {:?}",
+                        e
+                    )))
+                })?;
+
+                let mut results_sorted = Vec::new();
+                for res in results {
+                    results_sorted.push(res?);
+                }
+                results_sorted.sort_by_key(|r| r.0);
+
+                let mut final_buf = BUFFER_POOL.alloc();
+                final_buf.resize((end_offset - offset) as usize, 0);
+                for (b_idx, block_data) in results_sorted {
+                    let b_start_offset = b_idx as u64 * block_size;
+                    let b_end_offset = b_start_offset + block_size;
+                    let slice_start = std::cmp::max(offset, b_start_offset);
+                    let slice_end = std::cmp::min(end_offset, b_end_offset);
+                    let dest_start = (slice_start - offset) as usize;
+                    let dest_end = (slice_end - offset) as usize;
+                    let copy_len = dest_end - dest_start;
+                    let src_len = std::cmp::min(copy_len, block_data.len());
+                    final_buf[dest_start..dest_start + src_len]
+                        .copy_from_slice(&block_data[..src_len]);
+                }
+
+                if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
+                    self.schedule_striped_prefetch(
+                        meta.clone(),
+                        end_block.saturating_add(1),
+                        block_size,
+                    );
+                }
+
+                let slice: &[u8] = &final_buf[..(end_offset - offset) as usize];
+                let data = unsafe {
+                    bytes::Bytes::from_static(std::mem::transmute::<&[u8], &'static [u8]>(slice))
+                };
+                Ok((data, Some(std::sync::Arc::new(final_buf))))
             }
             _ => Err(SqueezefsError::InvalidOperation(format!(
                 "Unknown file type: {}",
@@ -1316,31 +1790,12 @@ impl DataRouter {
             let size = size_opt.unwrap_or(0);
             let new_file_id = Uuid::new_v4().to_string();
 
-            let src_staged_path = self
-                .cache
-                .nvme
-                .get_staged_path(&src_file_id)
-                .join(format!("file_{}.staged", src_file_id));
-
-            let dest_dir = self.cache.nvme.get_staged_path(&new_file_id);
-            tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
-                SqueezefsError::Io(std::io::Error::other(format!(
-                    "Failed to create stage dir for clone: {:?}",
-                    e
-                )))
-            })?;
-
-            let dest_staged_path = dest_dir.join(format!("file_{}.staged", new_file_id));
-
-            if tokio::fs::metadata(&src_staged_path).await.is_ok() {
-                tokio::fs::copy(&src_staged_path, &dest_staged_path)
-                    .await
-                    .map_err(|e| {
-                        SqueezefsError::Io(std::io::Error::other(format!(
-                            "Failed to copy stage data: {:?}",
-                            e
-                        )))
-                    })?;
+            // Clone staging data if it's still in the local NVMe cache
+            if let Some(data) = self.cache.nvme.read_staged(&src_file_id) {
+                self.cache
+                    .nvme
+                    .stage_write(dest, &new_file_id, &data, dest_lock.fencing_token())
+                    .await?;
             }
 
             let mapping_src_key = format!("mapping:{}", src_file_id);
@@ -1533,12 +1988,7 @@ impl DataRouter {
                     }
                     let _: () = con.del(&mapping_key).await?;
 
-                    let old_staged_path = self
-                        .cache
-                        .nvme
-                        .get_staged_path(&fid)
-                        .join(format!("file_{}.staged", fid));
-                    let _ = tokio::fs::remove_file(old_staged_path).await;
+                    self.cache.nvme.remove_staged(&fid);
                 }
             }
         }
@@ -1553,7 +2003,10 @@ impl DataRouter {
 
         // Remove any local active write blocks for this inode from the staging segment cache
         let active_block_prefix = format!("active_block:{}:", file_path);
-        let keys_to_remove: Vec<String> = self.cache.nvme.list_staged_files()
+        let keys_to_remove: Vec<String> = self
+            .cache
+            .nvme
+            .list_staged_files()
             .into_iter()
             .filter(|k| k.starts_with(&active_block_prefix))
             .collect();

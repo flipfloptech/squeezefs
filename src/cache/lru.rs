@@ -2,13 +2,13 @@ use crate::error::Result;
 use bytes::Bytes;
 use std::sync::Arc;
 
-type EvictReceiver = tokio::sync::mpsc::UnboundedReceiver<(String, Arc<Vec<u8>>)>;
+type EvictReceiver = tokio::sync::mpsc::UnboundedReceiver<(String, Bytes)>;
 
 #[derive(Clone)]
 pub struct LruCache {
     inner: Arc<hypertier::memory::MemoryCache>,
     max_bytes: u64,
-    evict_tx: tokio::sync::mpsc::UnboundedSender<(String, Arc<Vec<u8>>)>,
+    evict_tx: tokio::sync::mpsc::UnboundedSender<(String, Bytes)>,
     evict_rx: Arc<std::sync::Mutex<Option<EvictReceiver>>>,
 }
 
@@ -26,41 +26,65 @@ impl LruCache {
 
     /// Construct with a custom memory limit in bytes.
     pub fn with_capacity(max_bytes: u64) -> Self {
-        // 16 shards for high concurrency lock-free reads, scale down for small capacities
-        let num_shards = if max_bytes < 10 * 1024 * 1024 { 1 } else { 16 };
-        let inner = Arc::new(hypertier::memory::MemoryCache::new(max_bytes as usize, num_shards));
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(16);
+        let num_shards = std::cmp::max(cores.next_power_of_two(), 16);
+
+        let mut actual_shards = num_shards;
+
+        let actual_bytes = if max_bytes < 10 * 1024 * 1024 {
+            actual_shards = 1;
+            max_bytes
+        } else {
+            #[cfg(test)]
+            {
+                // In tests, scale down shards if capacity is too small to avoid huge allocations
+                while actual_shards > 16 && max_bytes / (actual_shards as u64) < 4 * 1024 * 1024 {
+                    actual_shards /= 2;
+                }
+                max_bytes
+            }
+            #[cfg(not(test))]
+            {
+                let min_required = (num_shards * 4 * 1024 * 1024) as u64;
+                // In production, never let capacity be smaller than the minimum required
+                std::cmp::max(max_bytes, min_required)
+            }
+        };
+
+        let inner = Arc::new(hypertier::memory::MemoryCache::new(
+            actual_bytes as usize,
+            actual_shards,
+        ));
         let (evict_tx, evict_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             inner,
-            max_bytes,
+            max_bytes: actual_bytes,
             evict_tx,
             evict_rx: Arc::new(std::sync::Mutex::new(Some(evict_rx))),
         }
     }
 
     /// Retrieve the eviction receiver. Can only be taken once.
-    pub fn take_evict_rx(
-        &self,
-    ) -> Option<EvictReceiver> {
+    pub fn take_evict_rx(&self) -> Option<EvictReceiver> {
         self.evict_rx.lock().ok()?.take()
     }
 
     /// Retrieve an entry from the cache, updating its clock status.
-    pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+    pub fn get(&self, key: &str) -> Option<Bytes> {
         let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-        let val = self.inner.get(&key_bytes)?;
-        Some(Arc::new(val.to_vec()))
+        self.inner.get(&key_bytes)
     }
 
     /// Insert an entry into the cache, executing Clock eviction if maximum capacity is exceeded.
-    pub fn put(&self, key: &str, data: Arc<Vec<u8>>) {
+    pub fn put(&self, key: &str, data: Bytes) {
         if (data.len() as u64) <= self.max_bytes {
             let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-            let val_bytes = Bytes::copy_from_slice(&data);
-            let evicted = self.inner.put(key_bytes, val_bytes);
+            let evicted = self.inner.put(key_bytes, data);
             for (ek, ev) in evicted {
                 if let Ok(k_str) = String::from_utf8(ek.to_vec()) {
-                    let _ = self.evict_tx.send((k_str, Arc::new(ev.to_vec())));
+                    let _ = self.evict_tx.send((k_str, ev));
                 }
             }
         }
@@ -93,5 +117,10 @@ impl LruCache {
 
     pub fn clear(&self) {
         self.inner.clear();
+    }
+
+    /// Expose the number of shards for testing.
+    pub fn num_shards(&self) -> usize {
+        self.inner.num_shards()
     }
 }

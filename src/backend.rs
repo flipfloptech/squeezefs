@@ -5,19 +5,38 @@ use aws_sdk_s3::Client as S3Client;
 use dashmap::DashMap;
 use log::{info, warn};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[derive(Default)]
+struct MockStoreState {
+    get_count: AtomicU64,
+    range_get_count: AtomicU64,
+    get_delay_ms: AtomicU64,
+}
 
 #[derive(Clone)]
 pub struct RustFsClient {
     s3_clients: Vec<S3Client>,
     bucket: String,
     #[allow(clippy::type_complexity)]
-    mock_store: Option<Arc<DashMap<String, (Vec<u8>, u64), ahash::RandomState>>>,
+    mock_store: Option<Arc<DashMap<String, (bytes::Bytes, u64), ahash::RandomState>>>,
     current_idx: Arc<AtomicUsize>,
+    mock_state: Arc<MockStoreState>,
 }
 
 impl RustFsClient {
+    pub fn get_mock_keys_and_sizes(&self) -> Vec<(String, usize)> {
+        if let Some(store) = &self.mock_store {
+            store
+                .iter()
+                .map(|e| (e.key().clone(), e.value().0.len()))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Create a new S3-compatible client.
     /// If environment variables are not set or connection fails, falls back to mock in-memory store.
     pub async fn new() -> Self {
@@ -106,6 +125,7 @@ impl RustFsClient {
                 bucket: bucket.clone(),
                 mock_store: None,
                 current_idx: Arc::new(AtomicUsize::new(0)),
+                mock_state: Arc::new(MockStoreState::default()),
             };
 
             match client.init_bucket().await {
@@ -139,6 +159,7 @@ impl RustFsClient {
             bucket,
             mock_store: Some(Arc::new(DashMap::with_hasher(ahash::RandomState::new()))),
             current_idx: Arc::new(AtomicUsize::new(0)),
+            mock_state: Arc::new(MockStoreState::default()),
         }
     }
 
@@ -153,11 +174,27 @@ impl RustFsClient {
             bucket: "mock-bucket".to_string(),
             mock_store: Some(Arc::new(DashMap::with_hasher(ahash::RandomState::new()))),
             current_idx: Arc::new(AtomicUsize::new(0)),
+            mock_state: Arc::new(MockStoreState::default()),
         }
     }
 
     pub fn client_count(&self) -> usize {
         self.s3_clients.len()
+    }
+
+    pub fn set_mock_get_delay(&self, delay: std::time::Duration) {
+        self.mock_state.get_delay_ms.store(
+            delay.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn mock_get_count(&self) -> u64 {
+        self.mock_state.get_count.load(Ordering::Relaxed)
+    }
+
+    pub fn mock_range_get_count(&self) -> u64 {
+        self.mock_state.range_get_count.load(Ordering::Relaxed)
     }
 
     fn get_s3_client(&self) -> Option<&S3Client> {
@@ -166,6 +203,21 @@ impl RustFsClient {
         } else {
             let idx = self.current_idx.fetch_add(1, Ordering::Relaxed);
             Some(&self.s3_clients[idx % self.s3_clients.len()])
+        }
+    }
+
+    async fn observe_mock_read(&self, is_range: bool) {
+        if is_range {
+            self.mock_state
+                .range_get_count
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.mock_state.get_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let delay_ms = self.mock_state.get_delay_ms.load(Ordering::Relaxed);
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
     }
 
@@ -189,7 +241,12 @@ impl RustFsClient {
 
     /// Upload data to S3.
     /// Before uploading, checks if a newer fencing token has already been written.
-    pub async fn put_object(&self, key: &str, data: Vec<u8>, fencing_token: u64) -> Result<()> {
+    pub async fn put_object(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        fencing_token: u64,
+    ) -> Result<()> {
         METRICS.put_obj.fetch_add(1, Ordering::Relaxed);
         if let Some(store) = &self.mock_store {
             if let Some(existing) = store.get(key) {
@@ -246,8 +303,9 @@ impl RustFsClient {
     pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
         METRICS.get_obj.fetch_add(1, Ordering::Relaxed);
         if let Some(store) = &self.mock_store {
+            self.observe_mock_read(false).await;
             if let Some(val) = store.get(key) {
-                return Ok(val.0.clone());
+                return Ok(val.0.to_vec());
             } else {
                 return Err(SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -301,6 +359,7 @@ impl RustFsClient {
     pub async fn get_object_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>> {
         METRICS.get_obj.fetch_add(1, Ordering::Relaxed);
         if let Some(store) = &self.mock_store {
+            self.observe_mock_read(true).await;
             if let Some(val) = store.get(key) {
                 let data = &val.0;
                 let s = std::cmp::min(start as usize, data.len());
@@ -345,7 +404,10 @@ impl RustFsClient {
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!("S3 GET range failed on current rail: {:?}. Retrying next...", e);
+                    warn!(
+                        "S3 GET range failed on current rail: {:?}. Retrying next...",
+                        e
+                    );
                     last_err = Some(format!("{:?}", e));
                 }
                 Err(_) => {
@@ -380,11 +442,7 @@ impl RustFsClient {
                 SqueezefsError::InvalidOperation("No S3 client initialized".to_string())
             })?;
 
-            let fut = s3
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .send();
+            let fut = s3.delete_object().bucket(&self.bucket).key(key).send();
             match tokio::time::timeout(std::time::Duration::from_secs(2), fut).await {
                 Ok(Ok(_)) => return Ok(()),
                 Ok(Err(e)) => {
@@ -433,7 +491,10 @@ impl RustFsClient {
             }
 
             let res = builder.send().await.map_err(|e| {
-                SqueezefsError::S3(format!("Failed to list objects in bucket {}: {:?}", self.bucket, e))
+                SqueezefsError::S3(format!(
+                    "Failed to list objects in bucket {}: {:?}",
+                    self.bucket, e
+                ))
             })?;
 
             let contents = res.contents();
@@ -446,7 +507,10 @@ impl RustFsClient {
                             .key(key)
                             .build()
                             .map_err(|e| {
-                                SqueezefsError::S3(format!("Failed to build ObjectIdentifier for key {}: {:?}", key, e))
+                                SqueezefsError::S3(format!(
+                                    "Failed to build ObjectIdentifier for key {}: {:?}",
+                                    key, e
+                                ))
                             })?;
                         delete_builder = delete_builder.objects(obj_id);
                         count += 1;
@@ -469,7 +533,7 @@ impl RustFsClient {
                                 self.bucket, e
                             ))
                         })?;
-                    
+
                     info!("Deleted {} objects from bucket {}", count, self.bucket);
                 }
             }
@@ -574,7 +638,12 @@ impl MultiBackendClient {
         self.backends.contains_key(id)
     }
 
-    pub async fn put_object(&self, key: &str, data: Vec<u8>, fencing_token: u64) -> Result<()> {
+    pub async fn put_object(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        fencing_token: u64,
+    ) -> Result<()> {
         let active_id = self.get_backend_for_key(key);
         self.put_object_on_backend(&active_id, key, data, fencing_token)
             .await
@@ -584,7 +653,7 @@ impl MultiBackendClient {
         &self,
         backend_id: &str,
         key: &str,
-        data: Vec<u8>,
+        data: bytes::Bytes,
         fencing_token: u64,
     ) -> Result<()> {
         if let Some(backend) = self.get_backend(backend_id) {

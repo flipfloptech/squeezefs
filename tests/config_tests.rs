@@ -513,9 +513,12 @@ async fn test_set_config_quotas() {
 #[tokio::test]
 async fn test_destroy_bucket_data_mock() {
     let client = squeezefs::backend::RustFsClient::new_mock();
-    client.put_object("test_key", b"test_data".to_vec(), 0).await.unwrap();
+    client
+        .put_object("test_key", bytes::Bytes::from_static(b"test_data"), 0)
+        .await
+        .unwrap();
     assert_eq!(client.get_object("test_key").await.unwrap(), b"test_data");
-    
+
     client.destroy_bucket_data().await.unwrap();
     assert!(client.get_object("test_key").await.is_err());
 }
@@ -531,7 +534,10 @@ async fn test_format_quick_vs_full() {
         Ok(c) => c,
         Err(_) => return,
     };
-    let _: () = redis::cmd("FLUSHDB").query_async(&mut con).await.unwrap_or(());
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut con)
+        .await
+        .unwrap_or(());
 
     // Call format_volume_ext with quick = true
     let res_quick = squeezefs::fuse_client::format_volume_ext(
@@ -556,6 +562,7 @@ async fn test_format_quick_vs_full() {
         None,
         None,
         None,
+        None, // fuse_io_uring_sqpoll_idle_ms
         true, // quick
     )
     .await;
@@ -584,6 +591,7 @@ async fn test_format_quick_vs_full() {
         None,
         None,
         None,
+        None,  // fuse_io_uring_sqpoll_idle_ms
         false, // quick = false
     )
     .await;

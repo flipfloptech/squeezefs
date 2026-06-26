@@ -11,9 +11,9 @@ pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use request::Request;
 #[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
-pub use session::{MountHandle, Session};
+pub use session::{MountHandle, Session, tpc_spawn, tpc_thread_count};
 
-pub(crate) type FuseData = Either<Vec<u8>, (Vec<u8>, Bytes)>;
+pub(crate) type FuseData = Either<Vec<u8>, (Vec<u8>, Bytes, Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>)>;
 
 pub(crate) mod abi;
 mod connection;

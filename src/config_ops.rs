@@ -682,9 +682,35 @@ pub async fn set_config_quota(
                 .await?;
             println!("Configuration quota 'write_cache_size' set to '{}'.", value);
         }
+        "fuse_io_uring_sqpoll_idle_ms" | "fuse-io-uring-sqpoll-idle-ms" => {
+            let parsed: u32 = value.parse().map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "Invalid fuse_io_uring_sqpoll_idle_ms value '{}': {:?}",
+                    value, e
+                ))
+            })?;
+            let stored_value = if parsed == 0 { "" } else { value };
+            let _: () = con
+                .hset(
+                    "squeezefs:format",
+                    "fuse_io_uring_sqpoll_idle_ms",
+                    stored_value,
+                )
+                .await?;
+            if parsed == 0 {
+                println!(
+                    "Configuration 'fuse_io_uring_sqpoll_idle_ms' cleared; mounts will fall back to local CLI/env overrides or disabled SQPOLL."
+                );
+            } else {
+                println!(
+                    "Configuration quota 'fuse_io_uring_sqpoll_idle_ms' set to '{}'.",
+                    value
+                );
+            }
+        }
         _ => {
             return Err(SqueezefsError::InvalidOperation(format!(
-                "Invalid config quota key '{}'. Supported keys: 'capacity', 'inodes', 'mem_cache_size', 'read_mem_cache_size', 'write_mem_cache_size', 'disk_cache_size', 'read_cache_size', 'write_cache_size'",
+                "Invalid config quota key '{}'. Supported keys: 'capacity', 'inodes', 'mem_cache_size', 'read_mem_cache_size', 'write_mem_cache_size', 'disk_cache_size', 'read_cache_size', 'write_cache_size', 'fuse_io_uring_sqpoll_idle_ms'",
                 key
             )));
         }

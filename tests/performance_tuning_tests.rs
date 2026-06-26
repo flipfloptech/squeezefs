@@ -206,16 +206,16 @@ async fn test_staging_backpressure_wait() {
     )
     .expect("Should construct NVMe staging");
 
-    // Fill staging with 4KB (padded size is aligned to 4096 so it is exactly 4096 bytes)
-    let data1 = vec![1u8; 2000];
+    // Fill staging with 4KB (padded size is ~4068 bytes)
+    let data1 = vec![1u8; 4000];
     nvme.stage_write("f1", "id1", &data1, 1).await.unwrap();
 
     let nvme_clone = nvme.clone();
-    // Spawn task to write data2 (2KB) -> total would be 6KB > 5KB capacity.
+    // Spawn task to write data2 (2KB) -> total would be > 6KB > 5KB capacity.
     // It should block and wait.
     let write_handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
-        let data2 = vec![2u8; 1000];
+        let data2 = vec![2u8; 2000];
         // This stage_write should wait on backpressure
         nvme_clone
             .stage_write("f2", "id2", &data2, 2)

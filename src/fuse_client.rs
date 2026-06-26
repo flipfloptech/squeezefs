@@ -214,14 +214,6 @@ static LUA_RMDIR_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
     )
 });
 
-fn get_default_staging_dir() -> std::path::PathBuf {
-    let uid = unsafe { libc::getuid() };
-    if uid == 0 {
-        std::path::PathBuf::from("/tmp/squeezefs_staging")
-    } else {
-        std::path::PathBuf::from(format!("/tmp/squeezefs_staging_{}", uid))
-    }
-}
 
 #[derive(Default)]
 pub struct ProbabilisticAtomic {

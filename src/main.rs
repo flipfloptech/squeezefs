@@ -974,25 +974,6 @@ async fn test_storage(client: &RustFsClient) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-fn get_file_path_from_staged(path: &std::path::Path) -> Option<String> {
-    use std::io::Read;
-    if let Ok(mut file) = std::fs::File::open(path) {
-        let mut header = vec![0u8; 4096];
-        if let Ok(n) = file.read(&mut header) {
-            if n >= 8 {
-                let meta_len = u64::from_be_bytes(header[0..8].try_into().unwrap_or([0; 8])) as usize;
-                if n >= 8 + meta_len {
-                    if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&header[8..8 + meta_len]) {
-                        if let Some(file_path) = meta_json.get("file_path").and_then(|v| v.as_str()) {
-                            return Some(file_path.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
 
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
@@ -1990,7 +1971,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let mut skipped = false;
                     let mut current_staged = 0;
                     let mut current_active = 0;
-                    let mut current_bytes = 0;
 
                     loop {
                         while let Ok(msg) = rx.try_recv() {
@@ -2004,7 +1984,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         current_staged = 0;
-                        current_bytes = 0;
+                        let mut current_bytes = 0;
                         current_active = 0;
 
                         for cache in &caches {

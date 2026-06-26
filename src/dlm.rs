@@ -56,6 +56,36 @@ pub struct BoundConnection {
     pub conn_info: redis::ConnectionInfo,
 }
 
+pub fn parse_inode_from_key(key: &str) -> Option<u64> {
+    if key.starts_with("squeezefs:") {
+        let parts: Vec<&str> = key.split(':').collect();
+        if parts.len() >= 3 {
+            if let Ok(ino) = parts[2].parse::<u64>() {
+                return Some(ino);
+            }
+        }
+    }
+    if key.starts_with("metadata:inode_") {
+        if let Ok(ino) = key["metadata:inode_".len()..].parse::<u64>() {
+            return Some(ino);
+        }
+    }
+    if key.starts_with("inline_data:inode_") {
+        if let Ok(ino) = key["inline_data:inode_".len()..].parse::<u64>() {
+            return Some(ino);
+        }
+    }
+    if key.starts_with("mapping:inode_") {
+        let remainder = &key["mapping:inode_".len()..];
+        if let Some(pos) = remainder.find('_') {
+            if let Ok(ino) = remainder[..pos].parse::<u64>() {
+                return Some(ino);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 pub enum MetaClient {
     Single(redis::Client),
@@ -68,6 +98,9 @@ pub enum MetaClient {
     Sentinel {
         client: std::sync::Arc<tokio::sync::Mutex<redis::sentinel::SentinelClient>>,
         service_name: String,
+    },
+    Sharded {
+        shards: Vec<MetaClient>,
     },
 }
 
@@ -297,6 +330,27 @@ fn resolve_redis_addr(redis_url: &str) -> Result<SocketAddr> {
 
 impl MetaClient {
     pub fn new(redis_url: &str) -> Result<Self> {
+        if redis_url.starts_with("redis+sharded://") {
+            let remainder = redis_url.strip_prefix("redis+sharded://").unwrap();
+            let cleaned = remainder.replace("redis://", "");
+            let nodes: Vec<&str> = cleaned
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut shards = Vec::new();
+            for node in nodes {
+                let node_url = if node.starts_with("redis://") {
+                    node.to_string()
+                } else {
+                    format!("redis://{}", node)
+                };
+                let shard_client = MetaClient::new(&node_url)?;
+                shards.push(shard_client);
+            }
+            return Ok(Self::Sharded { shards });
+        }
+
         let is_sentinel = redis_url.starts_with("redis-sentinel://");
         let is_cluster = !is_sentinel
             && (redis_url.contains(',')
@@ -351,6 +405,27 @@ impl MetaClient {
     }
 
     pub async fn new_with_local_ips(redis_url: &str, local_ips: Vec<IpAddr>) -> Result<Self> {
+        if redis_url.starts_with("redis+sharded://") {
+            let remainder = redis_url.strip_prefix("redis+sharded://").unwrap();
+            let cleaned = remainder.replace("redis://", "");
+            let nodes: Vec<&str> = cleaned
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut shards = Vec::new();
+            for node in nodes {
+                let node_url = if node.starts_with("redis://") {
+                    node.to_string()
+                } else {
+                    format!("redis://{}", node)
+                };
+                let shard_client = Box::pin(MetaClient::new_with_local_ips(&node_url, local_ips.clone())).await?;
+                shards.push(shard_client);
+            }
+            return Ok(Self::Sharded { shards });
+        }
+
         let is_sentinel = redis_url.starts_with("redis-sentinel://");
         let is_cluster = !is_sentinel
             && (redis_url.contains(',')
@@ -525,6 +600,44 @@ impl MetaClient {
                     service_name: Some(service_name.clone()),
                 })
             }
+            Self::Sharded { shards } => {
+                if shards.is_empty() {
+                    return Err(SqueezefsError::InvalidOperation(
+                        "Sharded client has no shards".to_string(),
+                    ));
+                }
+                shards[0].get_connection().await
+            }
+        }
+    }
+
+    pub fn shard_count(&self) -> usize {
+        match self {
+            Self::Sharded { shards } => shards.len(),
+            _ => 1,
+        }
+    }
+
+    pub async fn get_connection_for_inode(&self, ino: u64) -> Result<MetaConnection> {
+        match self {
+            Self::Sharded { shards } => {
+                if shards.is_empty() {
+                    return Err(SqueezefsError::InvalidOperation(
+                        "Sharded client has no shards".to_string(),
+                    ));
+                }
+                let idx = (ino % shards.len() as u64) as usize;
+                shards[idx].get_connection().await
+            }
+            _ => self.get_connection().await,
+        }
+    }
+
+    pub async fn get_connection_for_key(&self, key: &str) -> Result<MetaConnection> {
+        if let Some(ino) = parse_inode_from_key(key) {
+            self.get_connection_for_inode(ino).await
+        } else {
+            self.get_connection().await
         }
     }
 }
@@ -728,6 +841,18 @@ impl DlmClient {
 
     pub async fn get_connection(&self) -> Result<MetaConnection> {
         self.meta_client.get_connection().await
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.meta_client.shard_count()
+    }
+
+    pub async fn get_connection_for_inode(&self, ino: u64) -> Result<MetaConnection> {
+        self.meta_client.get_connection_for_inode(ino).await
+    }
+
+    pub async fn get_connection_for_key(&self, key: &str) -> Result<MetaConnection> {
+        self.meta_client.get_connection_for_key(key).await
     }
 
     /// Acquire a lease for a file-level or byte-range lock.

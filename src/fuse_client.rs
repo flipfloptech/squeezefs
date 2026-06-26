@@ -888,60 +888,92 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
-    async fn flush_active_blocks(
+    async fn flush_active_blocks_with_retry<'a>(
         &self,
         ino: u64,
         fencing_token: u64,
+        lock: &'a tokio::sync::RwLock<()>,
+        guard: &mut Option<tokio::sync::RwLockWriteGuard<'a, ()>>,
     ) -> Result<(), SqueezefsError> {
         let file_path = format!("inode_{}", ino);
         let prefix = format!("active_block:inode_{}:", ino);
-        let keys = self.router.cache.nvme.staging_nvme_cache.list_keys();
 
-        let mut active_keys = Vec::new();
-        for key_bytes in keys {
-            let key_str = String::from_utf8(key_bytes.to_vec()).unwrap_or_default();
-            if key_str.starts_with(&prefix) {
-                active_keys.push(key_str);
+        loop {
+            let keys = self.router.cache.nvme.staging_nvme_cache.list_keys();
+
+            let mut active_keys = Vec::new();
+            for key_bytes in keys {
+                let key_str = String::from_utf8(key_bytes.to_vec()).unwrap_or_default();
+                if key_str.starts_with(&prefix) {
+                    active_keys.push(key_str);
+                }
             }
-        }
 
-        if active_keys.is_empty() {
-            return Ok(());
-        }
-
-        let mut tasks = Vec::new();
-
-        for key_str in active_keys {
-            let b_str = key_str
-                .trim_start_matches(&prefix)
-                .trim_start_matches("block_");
-            if let Ok(b) = b_str.parse::<u32>() {
-                let router_clone = self.router.clone();
-                let dlm_clone = self.dlm.clone();
-                let locks_clone = self.active_inode_locks.clone();
-
-                tasks.push(tokio::spawn(async move {
-                    flush_single_active_block(
-                        ino,
-                        b,
-                        fencing_token,
-                        &router_clone,
-                        &dlm_clone,
-                        &locks_clone,
-                        true,
-                    )
-                    .await
-                }));
+            if active_keys.is_empty() {
+                break;
             }
-        }
 
-        for task in tasks {
-            task.await.map_err(|e| {
-                SqueezefsError::Io(std::io::Error::other(format!(
-                    "Parallel block upload task panicked: {:?}",
-                    e
-                )))
-            })??;
+            let mut tasks = Vec::new();
+            let mut contested_block_lock = None;
+
+            for key_str in active_keys {
+                let b_str = key_str
+                    .trim_start_matches(&prefix)
+                    .trim_start_matches("block_");
+                if let Ok(b) = b_str.parse::<u32>() {
+                    let block_lock = BLOCK_FLUSH_LOCKS
+                        .entry((ino, b))
+                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                        .value()
+                        .clone();
+
+                    if block_lock.try_lock().is_ok() {
+                        let router_clone = self.router.clone();
+                        let dlm_clone = self.dlm.clone();
+                        let locks_clone = self.active_inode_locks.clone();
+
+                        tasks.push(tokio::spawn(async move {
+                            flush_single_active_block(
+                                ino,
+                                b,
+                                fencing_token,
+                                &router_clone,
+                                &dlm_clone,
+                                &locks_clone,
+                                true,
+                            )
+                            .await
+                        }));
+                    } else {
+                        // Contested lock!
+                        contested_block_lock = Some(block_lock);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(block_lock) = contested_block_lock {
+                // Release the write guard before waiting to prevent deadlock
+                *guard = None;
+
+                // Wait for the contended block lock to be released
+                let _lock = block_lock.lock().await;
+
+                // Re-acquire the write guard
+                *guard = Some(lock.write().await);
+                continue;
+            }
+
+            for task in tasks {
+                task.await.map_err(|e| {
+                    SqueezefsError::Io(std::io::Error::other(format!(
+                        "Parallel block upload task panicked: {:?}",
+                        e
+                    )))
+                })??;
+            }
+
+            break;
         }
 
         self.router.metadata_cache.remove(&file_path);
@@ -3656,7 +3688,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         // 1. Acquire local inode lock
         let lock = self.get_inode_lock(ino);
-        let _guard = lock.write().await;
+        let mut guard = Some(lock.write().await);
 
         // 2. Get or acquire lease (fencing token)
         let fencing_token = self
@@ -3665,7 +3697,10 @@ impl Filesystem for SqueezefsFilesystem {
             .map_err(map_squeezefs_err)?;
 
         // 3. Flush the staging blocks concurrently to backend (S3/RustFS)
-        if let Err(e) = self.flush_active_blocks(ino, fencing_token).await {
+        if let Err(e) = self
+            .flush_active_blocks_with_retry(ino, fencing_token, &lock, &mut guard)
+            .await
+        {
             warn!(
                 "FUSE Flush failed for ino {}, but masking error for editor compatibility: {:?}",
                 ino, e
@@ -3689,11 +3724,13 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Acquire local inode lock
         let lock = self.get_inode_lock(ino);
-        let _guard = lock.write().await;
+        let mut guard = Some(lock.write().await);
 
         // Flush any remaining active staging blocks before releasing the lease
         if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
-            let _ = self.flush_active_blocks(ino, fencing_token).await;
+            let _ = self
+                .flush_active_blocks_with_retry(ino, fencing_token, &lock, &mut guard)
+                .await;
         }
 
         if let Err(e) = self.complete_active_multipart_upload_if_any(ino).await {
@@ -3723,7 +3760,7 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // Also clean up local inode lock if no longer needed (only if strong_count <= 2)
-        drop(_guard);
+        drop(guard);
         if std::sync::Arc::strong_count(&lock) <= 2 {
             self.active_inode_locks.remove(&ino);
         }
@@ -3737,7 +3774,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         // 1. Acquire local inode lock
         let lock = self.get_inode_lock(ino);
-        let _guard = lock.write().await;
+        let mut guard = Some(lock.write().await);
 
         // 2. Get or acquire lease (fencing token)
         let fencing_token = self
@@ -3746,7 +3783,10 @@ impl Filesystem for SqueezefsFilesystem {
             .map_err(map_squeezefs_err)?;
 
         // 3. Flush the staging blocks concurrently to backend (S3/RustFS)
-        if let Err(e) = self.flush_active_blocks(ino, fencing_token).await {
+        if let Err(e) = self
+            .flush_active_blocks_with_retry(ino, fencing_token, &lock, &mut guard)
+            .await
+        {
             warn!(
                 "FUSE Fsync failed for ino {}, but masking error for editor compatibility: {:?}",
                 ino, e

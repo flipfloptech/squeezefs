@@ -630,3 +630,98 @@ async fn test_background_writeback_flushes_multi_block_inode_without_explicit_fl
         "full-block sequential writes should not require backend reads before background flush"
     );
 }
+
+#[tokio::test]
+async fn test_fsync_deadlock_prevention() {
+    let (fs, _backend, _staging_dir) = match setup_fs_mock("fsync-deadlock").await {
+        Some(res) => res,
+        None => {
+            println!("Skipping test: Garnet/Redis not available");
+            return;
+        }
+    };
+
+    let req = Request {
+        unique: 101,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    let reply_created = fs
+        .create(
+            req,
+            1,
+            OsStr::new("fsync_deadlock_test.bin"),
+            0o644,
+            0,
+        )
+        .await
+        .expect("Create file should succeed");
+    let ino = reply_created.attr.ino;
+
+    // Set file type to striped in Redis to route through write_file_staged/active blocks
+    let redis_url = get_redis_url();
+    let mut con = redis::Client::open(redis_url)
+        .unwrap()
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+    let meta_key = format!("metadata:inode_{}", ino);
+    let _: () = redis::cmd("HSET")
+        .arg(&meta_key)
+        .arg("type")
+        .arg("striped")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // Write a block to populate active staging blocks
+    let data = vec![0xaa; 1024];
+    fs.write(req, ino, 0, 0, &data, 0, 0)
+        .await
+        .expect("Write should succeed");
+
+    let keys = fs.router.cache.nvme.staging_nvme_cache.list_keys();
+    println!("Active keys in staging: {:?}", keys.iter().map(|k| String::from_utf8_lossy(k)).collect::<Vec<_>>());
+
+    // Get block lock entry
+    let block_lock = squeezefs::fuse_client::BLOCK_FLUSH_LOCKS
+        .entry((ino, 0))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .value()
+        .clone();
+
+    // Lock block_lock to simulate background task holding it during S3 upload
+    println!("Locking block lock in test...");
+    let lock_guard = block_lock.clone().lock_owned().await;
+    println!("Block lock locked!");
+
+    // Spawn a simulated background task B that tries to acquire InodeLock,
+    // and drops lock_guard once it gets the lock
+    let fs_arc = std::sync::Arc::new(fs);
+    let inode_lock = fs_arc.get_inode_lock(ino);
+    tokio::spawn(async move {
+        println!("Background task B sleeping...");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        println!("Background task B attempting to acquire InodeLock...");
+        let _write_guard = inode_lock.write().await;
+        println!("Background task B acquired InodeLock! Releasing block lock...");
+        // Reached! Release the block lock
+        drop(lock_guard);
+        println!("Background task B finished.");
+    });
+
+    // Call fsync, which should complete successfully within a short timeout
+    let fs_clone = fs_arc.clone();
+    println!("FUSE thread calling fsync...");
+    let fsync_res = tokio::time::timeout(Duration::from_secs(3), async move {
+        fs_clone.fsync(req, ino, 0, false).await
+    })
+    .await;
+    println!("fsync completed with result: {:?}", fsync_res);
+
+    assert!(fsync_res.is_ok(), "fsync timed out due to deadlock!");
+    fsync_res.unwrap().expect("fsync should succeed");
+}
+

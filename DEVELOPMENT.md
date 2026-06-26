@@ -70,7 +70,7 @@ This section is divided into actionable Epics for the engineering team.
 
 * **Task 2.3: Zero-Copy Transfers (`splice`)**
 * *Action*: Implement `FUSE_CAP_SPLICE_READ` and `FUSE_CAP_SPLICE_WRITE`. Data streaming from the network or local NVMe must pass directly into the `/dev/fuse` kernel buffers without ever being copied (`memcpy`) into the Rust userspace heap.
-* *Status*: Partially implemented at the capability-negotiation layer only. Vendored `fuse3` already negotiates `FUSE_SPLICE_READ`/`FUSE_SPLICE_WRITE` support when the kernel advertises it, but SqueezeFS does not yet have a verified end-to-end zero-copy network/NVMe-to-FUSE data path.
+* *Status*: Fully implemented on the read path. Integrated the `FUSE_SPLICE_READ` capability and implemented a thread-local pipeline using `vmsplice` and `splice` over a pipe to transfer NVMe/RAM cache blocks directly to `/dev/fuse` without userspace memory copies.
 
 
 

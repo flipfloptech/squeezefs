@@ -131,11 +131,14 @@ async fn test_mount_auto_format_and_abi_check() {
     // ABI check: if we write a higher version in the format key, subsequent fs creation should fail
     let _: () = con.hset("squeezefs:format", "version", 99).await.unwrap();
 
+    drop(fs);
+
     // Re-create fs
     let dlm2 = DlmClient::new(&redis_url).unwrap();
     let backend2 = RustFsClient::new().await;
+    let temp_dir2 = tempdir().unwrap();
     let cache2 = TieredCache::new(
-        vec![temp_dir.path().to_path_buf()],
+        vec![temp_dir2.path().to_path_buf()],
         None,
         None,
         None,
@@ -346,18 +349,11 @@ async fn test_three_tiered_writeback_and_lease_cache() {
         .await
         .unwrap();
 
-    // Verify local staging directory under temp_dir/active_writes exists and has dirty block files
-    let active_dir = temp_dir
-        .path()
-        .join("active_writes")
-        .join(format!("inode_{}", ino));
+    // Verify local active write block 0 exists in NVMe cache
+    let cache_key = format!("active_block:inode_{}:block_0", ino);
     assert!(
-        active_dir.exists(),
-        "Local active writes directory must exist"
-    );
-    assert!(
-        active_dir.join("block_0").exists(),
-        "Local dirty block 0 file must be present"
+        fs.router.cache.nvme.read_staged(&cache_key).is_some(),
+        "Local dirty block 0 must be present in NVMe cache"
     );
 
     // Call FUSE flush (mimicking close)
@@ -370,10 +366,10 @@ async fn test_three_tiered_writeback_and_lease_cache() {
         .await
         .expect("Release should succeed");
 
-    // Verify local active writes directory has been cleaned up after flush
+    // Verify local active write block 0 has been cleaned up/deleted post-flush
     assert!(
-        !active_dir.exists(),
-        "Local active writes directory must be cleaned up post-flush"
+        fs.router.cache.nvme.read_staged(&cache_key).is_none(),
+        "Local active write block 0 must be cleaned up post-flush"
     );
 
     // Retrieve block map id from redis to verify block keys and contents in S3
@@ -1314,28 +1310,28 @@ async fn test_real_mount_and_browseable() {
     .await
     .expect("Format volume should succeed");
 
-    let dlm = DlmClient::new(&redis_url).unwrap();
-    let backend = RustFsClient::new().await;
-
-    let cache = TieredCache::new(
-        vec![temp_dir_cache.path().to_path_buf()],
-        None,
-        None,
-        None,
-        None,
-        backend.clone(),
-        dlm.meta_client().clone(),
-    )
-    .unwrap();
-
-    let router = DataRouter::new(dlm.clone(), backend, cache);
-    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
-
-    // Spawn mount task in background
+    // Spawn mount task in background via sudo
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
     let mount_path_clone = mount_path.clone();
-    let mount_handle = tokio::spawn(async move {
-        let _ = start_mount(mount_path_clone, fs, 1000, 1000, false, false, None).await;
-    });
+    let redis_url_clone = redis_url.clone();
+    let cache_dir_path = temp_dir_cache.path().to_path_buf();
+
+    let mut mount_child = std::process::Command::new("sudo")
+        .arg("./target/debug/squeezefs")
+        .arg("--garnet-url")
+        .arg(&redis_url_clone)
+        .arg("mount")
+        .arg(&mount_path_clone)
+        .arg("--cache-dir")
+        .arg(&cache_dir_path)
+        .arg("--uid")
+        .arg(uid.to_string())
+        .arg("--gid")
+        .arg(gid.to_string())
+        .arg("--allow-other")
+        .spawn()
+        .expect("Failed to spawn squeezefs mount via sudo");
 
     // Wait for the mountpoint to become ready and check if browseable
     let mut ready = false;
@@ -1353,11 +1349,13 @@ async fn test_real_mount_and_browseable() {
 
     if !ready {
         // Unmount before failing to be clean
-        let _ = std::process::Command::new("fusermount3")
+        let _ = std::process::Command::new("sudo")
+            .arg("fusermount3")
             .arg("-u")
             .arg("-z")
             .arg(&mount_path)
             .output();
+        let _ = mount_child.kill();
         panic!("FUSE mount failed to become ready at {:?}", mount_path);
     }
 
@@ -1367,8 +1365,9 @@ async fn test_real_mount_and_browseable() {
     let content = std::fs::read_to_string(&test_file).expect("Should read file from mountpoint");
     assert_eq!(content, "hello real mount");
 
-    // Clean up mountpoint by running fusermount3 -u
-    let unmount_res = std::process::Command::new("fusermount3")
+    // Clean up mountpoint by running fusermount3 -u via sudo
+    let unmount_res = std::process::Command::new("sudo")
+        .arg("fusermount3")
         .arg("-u")
         .arg(&mount_path)
         .output();
@@ -1376,7 +1375,8 @@ async fn test_real_mount_and_browseable() {
     if let Ok(output) = unmount_res {
         if !output.status.success() {
             // Lazy unmount as fallback
-            let _ = std::process::Command::new("fusermount3")
+            let _ = std::process::Command::new("sudo")
+                .arg("fusermount3")
                 .arg("-u")
                 .arg("-z")
                 .arg(&mount_path)
@@ -1384,6 +1384,6 @@ async fn test_real_mount_and_browseable() {
         }
     }
 
-    // Wait for the mount handle task to finish
-    let _ = mount_handle.await;
+    // Wait for the child mount process to terminate
+    let _ = mount_child.wait();
 }

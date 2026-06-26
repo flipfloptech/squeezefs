@@ -109,8 +109,18 @@ async fn test_p2p_happy_path() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Get the DHT nodes
-    let dht_a = router_a.cache.nvme.dht_node.get().expect("A's DHT Node should be set");
-    let dht_b = router_b.cache.nvme.dht_node.get().expect("B's DHT Node should be set");
+    let dht_a = router_a
+        .cache
+        .nvme
+        .dht_node
+        .get()
+        .expect("A's DHT Node should be set");
+    let dht_b = router_b
+        .cache
+        .nvme
+        .dht_node
+        .get()
+        .expect("B's DHT Node should be set");
 
     // Link them manually
     dht_a.add_peer(p2p_addr_b.clone());
@@ -178,46 +188,10 @@ async fn test_p2p_cooperative_read_after_write() {
         let _ = server_a.run().await;
     });
 
-    // Seed the S3 mock store with empty default data for our test block
-    let block_key = "backend_0/part_coop_p2p/part_0";
-    let default_s3_data = vec![0u8; 1000];
-    backend_a
-        .put_object(block_key, default_s3_data.clone(), 0)
-        .await
-        .expect("Should seed mock S3 block");
-
-    // Node A writes actual data to the file, transitioning to striped layout
-    let file_path = "coop_striped.bin";
-    let mut con_meta = dlm_a.get_connection().await.unwrap();
-    let meta_key = format!("metadata:{}", file_path);
-    let _: () = redis::pipe()
-        .hset(&meta_key, "type", "striped")
-        .hset(&meta_key, "size", 1000u64)
-        .hset(&meta_key, "block_prefix", "backend_0/part_coop_p2p")
-        .query_async(&mut con_meta)
-        .await
-        .unwrap();
-
-    let write_data = vec![99u8; 1000];
-    // Node A writes the block. This caches it on Node A and registers it in DHT
-    router_a
-        .cache
-        .nvme
-        .cache_read_block(block_key, &write_data)
-        .expect("Should cache write data on Node A");
-
-    // Wait a brief moment to ensure P2P server is ready and registered
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
     // Set up Node B (Reader / Client)
     let dlm_b = DlmClient::new(&get_redis_url()).unwrap();
     let temp_dir_b = tempdir().unwrap();
-    let backend_b = RustFsClient::new_mock(); // Fresh S3 client with default_s3_data
-    backend_b
-        .put_object(block_key, default_s3_data.clone(), 0)
-        .await
-        .expect("Should seed mock S3 block on B");
-
+    let backend_b = RustFsClient::new_mock();
     let p2p_addr_b = "127.0.0.1:29104".to_string();
 
     let cache_b = TieredCache::new(
@@ -232,7 +206,7 @@ async fn test_p2p_cooperative_read_after_write() {
     .expect("Should create cache B");
     let _ = cache_b.nvme.p2p_addr.set(p2p_addr_b.clone());
 
-    let router_b = DataRouter::new(dlm_b.clone(), backend_b, cache_b);
+    let router_b = DataRouter::new(dlm_b.clone(), backend_b.clone(), cache_b);
 
     // Start P2P server B so B has a DHT node initialized
     let server_b = P2pServer::new(p2p_addr_b.clone(), router_b.cache.nvme.clone());
@@ -240,15 +214,61 @@ async fn test_p2p_cooperative_read_after_write() {
         let _ = server_b.run().await;
     });
 
+    // Wait a brief moment to ensure P2P servers are ready and registered
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Get the DHT nodes
-    let dht_a = router_a.cache.nvme.dht_node.get().expect("A's DHT Node should be set");
-    let dht_b = router_b.cache.nvme.dht_node.get().expect("B's DHT Node should be set");
+    let dht_a = router_a
+        .cache
+        .nvme
+        .dht_node
+        .get()
+        .expect("A's DHT Node should be set");
+    let dht_b = router_b
+        .cache
+        .nvme
+        .dht_node
+        .get()
+        .expect("B's DHT Node should be set");
 
     // Link them manually
     dht_a.add_peer(p2p_addr_b.clone());
     dht_b.add_peer(p2p_addr_a.clone());
+
+    // Seed the S3 mock store with empty default data for our test block
+    let block_key = "backend_0/part_coop_p2p/part_0";
+    let default_s3_data = bytes::Bytes::from(vec![0u8; 1000]);
+    backend_a
+        .put_object(block_key, default_s3_data.clone(), 0)
+        .await
+        .expect("Should seed mock S3 block");
+    backend_b
+        .put_object(block_key, default_s3_data.clone(), 0)
+        .await
+        .expect("Should seed mock S3 block on B");
+
+    // Node A writes actual data to the file, transitioning to striped layout
+    let file_path = "coop_striped.bin";
+    let mut con_meta = dlm_a.get_connection().await.unwrap();
+    let meta_key = format!("metadata:{}", file_path);
+    let _: () = redis::pipe()
+        .hset(&meta_key, "type", "striped")
+        .hset(&meta_key, "size", 1000u64)
+        .hset(&meta_key, "block_prefix", "backend_0/part_coop_p2p")
+        .query_async(&mut con_meta)
+        .await
+        .unwrap();
+
+    let write_data = vec![99u8; 1000];
+    // Node A writes the block. Since A and B are already peers, this registers A as the provider of the block in DHT
+    router_a
+        .cache
+        .nvme
+        .cache_read_block(block_key, &write_data)
+        .expect("Should cache write data on Node A");
+
+    // Wait for DHT registration to propagate
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Node B reads the file range.
     // Since Node A has registered itself as a peer for this block in the DHT, Node B should read it
@@ -279,7 +299,7 @@ async fn test_p2p_fallback_path() {
     // S3 mock client prepopulated with block data
     let backend = RustFsClient::new_mock();
     let block_key = "backend_0/part_fallback_p2p/part_0";
-    let block_data = vec![77u8; 1000];
+    let block_data = bytes::Bytes::from(vec![77u8; 1000]);
     backend
         .put_object(block_key, block_data.clone(), 0)
         .await
@@ -309,25 +329,20 @@ async fn test_p2p_fallback_path() {
 
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let dht = router.cache.nvme.dht_node.get().expect("DHT Node should be set");
-    
+    let dht = router
+        .cache
+        .nvme
+        .dht_node
+        .get()
+        .expect("DHT Node should be set");
+
     // Add a dead peer to DHT routing table
     dht.add_peer("127.0.0.1:29098".to_string());
 
-    // Register the dead peer as provider of this block key hash in the DHT.
-    // We send a RegisterProvider message to our own DHT node claiming that the dead peer is the provider.
-    let key_hash = xxhash_rust::xxh3::xxh3_64(block_key.as_bytes());
-    
-    // Send register message to our own listener
-    let mut stream = tokio::net::TcpStream::connect(&p2p_addr).await.unwrap();
-    let reg_msg = hypertier::dht::Message::RegisterProvider {
-        key_hash,
-        provider_addr: "127.0.0.1:29098".to_string(),
-    };
-    hypertier::dht::write_msg(&mut stream, &reg_msg).await.unwrap();
-    
-    // Wait for registration
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Under consistent hashing, the client mathematically targets the closest peers
+    // (which includes the dead peer we just added). It will attempt connection, fail,
+    // and fall back to S3.
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Write metadata for striped file using this block
     let file_path = "fallback_striped.bin";

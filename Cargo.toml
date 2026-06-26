@@ -45,6 +45,7 @@ twox-hash = "1.6"
 hypertier = { path = "../hypertier" }
 bytes = "1.5"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crossbeam = "0.8"
 
 [features]
 default = []
@@ -58,6 +59,7 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 rand = "0.8"
 rand_chacha = "0.3"
 sha2 = "0.10"
+nix = { version = "0.29.0", features = ["ioctl"] }
 
 [[bench]]
 name = "squeezefs_bench"

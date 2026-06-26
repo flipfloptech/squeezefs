@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -102,6 +104,9 @@ enum Commands {
         /// Delay/interval for background staging write uploads (e.g. "500ms", "5s", default: "500ms")
         #[arg(long, default_value = "500ms")]
         upload_delay: String,
+        /// Shared default /dev/fuse io_uring SQPOLL idle timeout in milliseconds. Use 0 to disable the shared default.
+        #[arg(long, env = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS")]
+        fuse_io_uring_sqpoll_idle_ms: Option<u32>,
     },
     /// Show filesystem status
     Status,
@@ -190,6 +195,14 @@ enum Commands {
         #[arg(long)]
         upload_delay: Option<String>,
 
+        /// Override the /dev/fuse io_uring SQPOLL idle timeout in milliseconds for this mount. Use 0 to disable even if the volume has a shared default.
+        #[arg(long, env = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS")]
+        fuse_io_uring_sqpoll_idle_ms: Option<u32>,
+
+        /// Pin the /dev/fuse io_uring SQPOLL kernel thread to a CPU for this mount only. Use 0 to disable CPU pinning.
+        #[arg(long, env = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU")]
+        fuse_io_uring_sqpoll_cpu: Option<u32>,
+
         /// Custom FUSE options (comma-separated list, e.g. "ro,nonempty")
         #[arg(short = 'o', long)]
         options: Option<String>,
@@ -243,7 +256,7 @@ enum ConfigActions {
     DiskCache(DiskCacheActions),
     /// Set runtime configuration quotas (capacity, inodes, or memory cache sizes)
     Set {
-        /// Quota key (e.g. "capacity", "inodes", "mem_cache_size", "read_mem_cache_size", "write_mem_cache_size")
+        /// Quota/config key (e.g. "capacity", "inodes", "mem_cache_size", "read_mem_cache_size", "write_mem_cache_size", "fuse_io_uring_sqpoll_idle_ms")
         key: String,
         /// New value (e.g. "100G", "2T" or numeric value/0)
         value: String,
@@ -340,6 +353,10 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(unix)]
 static DAEMON_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+const FUSE_IO_URING_SQPOLL_IDLE_MS_KEY: &str = "fuse_io_uring_sqpoll_idle_ms";
+const FUSE_IO_URING_SQPOLL_IDLE_MS_ENV: &str = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS";
+const FUSE_IO_URING_SQPOLL_CPU_ENV: &str = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU";
+
 fn get_default_staging_dir() -> PathBuf {
     let uid = unsafe { libc::getuid() };
     if uid == 0 {
@@ -349,11 +366,84 @@ fn get_default_staging_dir() -> PathBuf {
     }
 }
 
+fn resolve_shared_sqpoll_idle_ms(
+    explicit_override: Option<u32>,
+    format_fields: &HashMap<String, String>,
+) -> Result<Option<u32>, String> {
+    if let Some(value) = explicit_override {
+        return Ok((value > 0).then_some(value));
+    }
+
+    match format_fields
+        .get(FUSE_IO_URING_SQPOLL_IDLE_MS_KEY)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw) => {
+            let parsed = raw.parse::<u32>().map_err(|err| {
+                format!(
+                    "Invalid {} value '{}': {}",
+                    FUSE_IO_URING_SQPOLL_IDLE_MS_KEY, raw, err
+                )
+            })?;
+            Ok((parsed > 0).then_some(parsed))
+        }
+        None => Ok(None),
+    }
+}
+
+fn resolve_local_sqpoll_cpu(explicit_override: Option<u32>) -> Option<u32> {
+    explicit_override.filter(|value| *value > 0)
+}
+
+fn format_optional_u32(value: Option<u32>, disabled_label: &str) -> String {
+    value
+        .map(|parsed| parsed.to_string())
+        .unwrap_or_else(|| disabled_label.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_fuse_io_uring_sqpoll_env(idle_ms: Option<u32>, cpu: Option<u32>) {
+    if let Some(idle_ms) = idle_ms {
+        std::env::set_var(FUSE_IO_URING_SQPOLL_IDLE_MS_ENV, idle_ms.to_string());
+    } else {
+        std::env::remove_var(FUSE_IO_URING_SQPOLL_IDLE_MS_ENV);
+    }
+
+    if let Some(cpu) = cpu {
+        std::env::set_var(FUSE_IO_URING_SQPOLL_CPU_ENV, cpu.to_string());
+    } else {
+        std::env::remove_var(FUSE_IO_URING_SQPOLL_CPU_ENV);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_fuse_io_uring_sqpoll_env(_idle_ms: Option<u32>, _cpu: Option<u32>) {}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dhat-on")]
     let _profiler = dhat::Profiler::new_heap();
 
     let cli = Cli::parse();
+
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::getuid() };
+        if uid != 0 {
+            match &cli.command {
+                Commands::Format { .. }
+                | Commands::Mount { .. }
+                | Commands::Umount { .. }
+                | Commands::Config { .. }
+                | Commands::Tune
+                | Commands::Status => {
+                    eprintln!("Error: This command must be run as root (or with sudo).");
+                    std::process::exit(1);
+                }
+                _ => {}
+            }
+        }
+    }
 
     #[cfg(unix)]
     if let Commands::Mount {
@@ -373,6 +463,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_cache_size,
         read_mem_cache_size,
         write_mem_cache_size,
+        fuse_io_uring_sqpoll_idle_ms,
+        fuse_io_uring_sqpoll_cpu,
         ..
     } = &cli.command
     {
@@ -438,6 +530,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             *writeback,
             *allow_other,
             options.as_deref(),
+            *fuse_io_uring_sqpoll_idle_ms,
+            *fuse_io_uring_sqpoll_cpu,
         ) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
@@ -474,7 +568,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let mut ready = false;
                     let start = std::time::Instant::now();
-                    while start.elapsed() < std::time::Duration::from_secs(10) {
+                    while start.elapsed() < std::time::Duration::from_secs(30) {
                         std::thread::sleep(std::time::Duration::from_millis(500));
 
                         // Read from pipe to check for errors/panics from child
@@ -556,7 +650,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         libc::close(pipefd[0]);
                         std::process::exit(0);
                     } else {
-                        eprintln!("The mount point is not ready in 10 seconds, exiting");
+                        eprintln!("The mount point is not ready in 30 seconds, exiting");
                         let _ = std::process::Command::new("umount")
                             .arg("-l")
                             .arg(&mountpoint_path)
@@ -679,6 +773,20 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+fn halve_size_string(val: &str, default_fallback: &str) -> String {
+    let s = val.trim();
+    if let Some(stripped) = s.strip_suffix('%') {
+        if let Ok(p) = stripped.trim().parse::<f64>() {
+            return format!("{:.1}%", p / 2.0);
+        }
+    }
+    if let Ok(bytes) = squeezefs::cache::parse_size_string(s, 0) {
+        format_size(bytes / 2)
+    } else {
+        default_fallback.to_string()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_mount_diagnostics(
     garnet_url: &str,
@@ -698,6 +806,8 @@ fn print_mount_diagnostics(
     writeback: bool,
     allow_other: bool,
     options: Option<&str>,
+    fuse_io_uring_sqpoll_idle_ms: Option<u32>,
+    fuse_io_uring_sqpoll_cpu: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use redis::Commands;
     let client = redis::Client::open(garnet_url)?;
@@ -741,57 +851,63 @@ fn print_mount_diagnostics(
 
     let resolved_mem_cache_size = mem_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("mem_cache_size").filter(|s| !s.is_empty()).cloned())
+        .or_else(|| {
+            format_fields
+                .get("mem_cache_size")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
         .unwrap_or_else(|| "1GB".to_string());
 
     let resolved_disk_cache_size = disk_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("disk_cache_size").filter(|s| !s.is_empty()).cloned())
+        .or_else(|| {
+            format_fields
+                .get("disk_cache_size")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
         .unwrap_or_else(|| "10GB".to_string());
 
     let resolved_read_cache_size = read_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("read_cache_size").filter(|s| !s.is_empty()).cloned())
-        .unwrap_or_else(|| {
-            if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0) {
-                format_size(bytes / 2)
-            } else {
-                "5GB".to_string()
-            }
-        });
+        .or_else(|| {
+            format_fields
+                .get("read_cache_size")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"));
 
     let resolved_write_cache_size = write_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("write_cache_size").filter(|s| !s.is_empty()).cloned())
-        .unwrap_or_else(|| {
-            if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0) {
-                format_size(bytes / 2)
-            } else {
-                "5GB".to_string()
-            }
-        });
+        .or_else(|| {
+            format_fields
+                .get("write_cache_size")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"));
 
     let resolved_read_mem_cache_size = read_mem_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("read_mem_cache_size").filter(|s| !s.is_empty()).cloned())
-        .unwrap_or_else(|| {
-            if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0) {
-                format_size(bytes / 2)
-            } else {
-                "512MB".to_string()
-            }
-        });
+        .or_else(|| {
+            format_fields
+                .get("read_mem_cache_size")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"));
 
     let resolved_write_mem_cache_size = write_mem_cache_size
         .map(|s| s.to_string())
-        .or_else(|| format_fields.get("write_mem_cache_size").filter(|s| !s.is_empty()).cloned())
-        .unwrap_or_else(|| {
-            if let Ok(bytes) = squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0) {
-                format_size(bytes / 2)
-            } else {
-                "512MB".to_string()
-            }
-        });
+        .or_else(|| {
+            format_fields
+                .get("write_mem_cache_size")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"));
 
     let staging_dirs = if let Some(dirs) = disk_cache_paths {
         if dirs.is_empty() {
@@ -813,26 +929,51 @@ fn print_mount_diagnostics(
         .map(|s| s.to_string())
         .or_else(|| std::env::var("RUSTFS_ENDPOINT").ok())
         .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
-        .or_else(|| format_fields.get("s3_endpoint").filter(|s| !s.is_empty()).cloned());
+        .or_else(|| {
+            format_fields
+                .get("s3_endpoint")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        });
     let final_s3_access_key = s3_access_key
         .map(|s| s.to_string())
         .or_else(|| std::env::var("RUSTFS_ACCESS_KEY").ok())
         .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
-        .or_else(|| format_fields.get("s3_access_key").filter(|s| !s.is_empty()).cloned());
+        .or_else(|| {
+            format_fields
+                .get("s3_access_key")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        });
     let final_s3_secret_key = s3_secret_key
         .map(|s| s.to_string())
         .or_else(|| std::env::var("RUSTFS_SECRET_KEY").ok())
         .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
-        .or_else(|| format_fields.get("s3_secret_key").filter(|s| !s.is_empty()).cloned());
+        .or_else(|| {
+            format_fields
+                .get("s3_secret_key")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        });
     let final_s3_bucket = s3_bucket
         .map(|s| s.to_string())
         .or_else(|| std::env::var("RUSTFS_BUCKET").ok())
-        .or_else(|| format_fields.get("s3_bucket").filter(|s| !s.is_empty()).cloned());
+        .or_else(|| {
+            format_fields
+                .get("s3_bucket")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        });
 
     let active_be_id = format_fields
         .get("active_write_backend")
         .cloned()
         .unwrap_or_else(|| "backend_0".to_string());
+
+    let resolved_sqpoll_idle_ms =
+        resolve_shared_sqpoll_idle_ms(fuse_io_uring_sqpoll_idle_ms, &format_fields)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+    let resolved_sqpoll_cpu = resolve_local_sqpoll_cpu(fuse_io_uring_sqpoll_cpu);
 
     let compression = format_fields
         .get("compression")
@@ -885,6 +1026,15 @@ fn print_mount_diagnostics(
     } else {
         println!("  Custom Options: \"max_read=1048576\"");
     }
+    println!("I/O Rings:");
+    println!(
+        "  FUSE io_uring SQPOLL Idle (ms): {}",
+        format_optional_u32(resolved_sqpoll_idle_ms, "disabled")
+    );
+    println!(
+        "  FUSE io_uring SQPOLL CPU: {}",
+        format_optional_u32(resolved_sqpoll_cpu, "auto")
+    );
     println!("Metadata Client:");
     println!("  Garnet URL: {:?}", garnet_url);
     println!("  Volume Name: {:?}", name);
@@ -961,7 +1111,9 @@ async fn test_storage(client: &RustFsClient) -> Result<(), Box<dyn std::error::E
     let test_data = vec![42u8; 100];
 
     // Put object
-    client.put_object(&key, test_data.clone(), 1).await?;
+    client
+        .put_object(&key, bytes::Bytes::from(test_data.clone()), 1)
+        .await?;
 
     // Get object
     let read_data = client.get_object(&key).await?;
@@ -973,7 +1125,6 @@ async fn test_storage(client: &RustFsClient) -> Result<(), Box<dyn std::error::E
     client.delete_object(&key).await?;
     Ok(())
 }
-
 
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
@@ -1000,6 +1151,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             write_mem_cache_size,
             dismount_wait,
             upload_delay,
+            fuse_io_uring_sqpoll_idle_ms,
         } => {
             let redis_url = &cli.garnet_url;
 
@@ -1086,6 +1238,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 write_mem_cache_size.as_deref(),
                 dismount_wait.as_deref(),
                 Some(&upload_delay),
+                fuse_io_uring_sqpoll_idle_ms,
                 quick,
             )
             .await?;
@@ -1121,6 +1274,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             write_mem_cache_size,
             dismount_wait,
             upload_delay,
+            fuse_io_uring_sqpoll_idle_ms,
+            fuse_io_uring_sqpoll_cpu,
         } => {
             let redis_url = &cli.garnet_url;
 
@@ -1144,12 +1299,22 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Resolve memory cache size: CLI override > Garnet setting > default "1GB"
             let resolved_mem_cache_size = mem_cache_size
-                .or_else(|| format_fields.get("mem_cache_size").filter(|s| !s.is_empty()).cloned())
+                .or_else(|| {
+                    format_fields
+                        .get("mem_cache_size")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                })
                 .unwrap_or_else(|| "1GB".to_string());
 
             // Resolve dismount wait time: CLI override > Garnet setting > default 10 seconds
             let resolved_dismount_wait: u64 = dismount_wait
-                .or_else(|| format_fields.get("dismount_wait").filter(|s| !s.is_empty()).cloned())
+                .or_else(|| {
+                    format_fields
+                        .get("dismount_wait")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                })
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10);
 
@@ -1168,64 +1333,68 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Resolve upload delay: CLI override > Garnet setting > default "500ms"
             let resolved_upload_delay = upload_delay
-                .or_else(|| format_fields.get("upload_delay").filter(|s| !s.is_empty()).cloned())
+                .or_else(|| {
+                    format_fields
+                        .get("upload_delay")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                })
                 .unwrap_or_else(|| "500ms".to_string());
 
             // Validate resolved upload delay
             squeezefs::cache::parse_duration(&resolved_upload_delay)?;
 
+            let resolved_fuse_io_uring_sqpoll_idle_ms =
+                resolve_shared_sqpoll_idle_ms(fuse_io_uring_sqpoll_idle_ms, &format_fields)
+                    .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+            let resolved_fuse_io_uring_sqpoll_cpu =
+                resolve_local_sqpoll_cpu(fuse_io_uring_sqpoll_cpu);
+
             // Resolve disk cache size: CLI override > Garnet setting > default "10GB"
             let resolved_disk_cache_size = disk_cache_size
-                .or_else(|| format_fields.get("disk_cache_size").filter(|s| !s.is_empty()).cloned())
+                .or_else(|| {
+                    format_fields
+                        .get("disk_cache_size")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                })
                 .unwrap_or_else(|| "10GB".to_string());
 
             let resolved_read_cache_size = read_cache_size
-                .or_else(|| format_fields.get("read_cache_size").filter(|s| !s.is_empty()).cloned())
-                .unwrap_or_else(|| {
-                    if let Ok(bytes) =
-                        squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0)
-                    {
-                        format_size(bytes / 2)
-                    } else {
-                        "5GB".to_string()
-                    }
-                });
+                .or_else(|| {
+                    format_fields
+                        .get("read_cache_size")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                })
+                .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"));
 
             let resolved_write_cache_size = write_cache_size
-                .or_else(|| format_fields.get("write_cache_size").filter(|s| !s.is_empty()).cloned())
-                .unwrap_or_else(|| {
-                    if let Ok(bytes) =
-                        squeezefs::cache::parse_size_string(&resolved_disk_cache_size, 0)
-                    {
-                        format_size(bytes / 2)
-                    } else {
-                        "5GB".to_string()
-                    }
-                });
+                .or_else(|| {
+                    format_fields
+                        .get("write_cache_size")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                })
+                .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"));
 
             let resolved_read_mem_cache_size = read_mem_cache_size
-                .or_else(|| format_fields.get("read_mem_cache_size").filter(|s| !s.is_empty()).cloned())
-                .unwrap_or_else(|| {
-                    if let Ok(bytes) =
-                        squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0)
-                    {
-                        format_size(bytes / 2)
-                    } else {
-                        "512MB".to_string()
-                    }
-                });
+                .or_else(|| {
+                    format_fields
+                        .get("read_mem_cache_size")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                })
+                .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"));
 
             let resolved_write_mem_cache_size = write_mem_cache_size
-                .or_else(|| format_fields.get("write_mem_cache_size").filter(|s| !s.is_empty()).cloned())
-                .unwrap_or_else(|| {
-                    if let Ok(bytes) =
-                        squeezefs::cache::parse_size_string(&resolved_mem_cache_size, 0)
-                    {
-                        format_size(bytes / 2)
-                    } else {
-                        "512MB".to_string()
-                    }
-                });
+                .or_else(|| {
+                    format_fields
+                        .get("write_mem_cache_size")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                })
+                .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"));
 
             // Resolve staging directories: CLI override > Garnet setting > default "/tmp/squeezefs_staging"
             let staging_dirs = if let Some(dirs) = disk_cache_paths {
@@ -1338,18 +1507,36 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let final_s3_endpoint = std::env::var("RUSTFS_ENDPOINT")
                 .ok()
                 .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
-                .or_else(|| format_fields.get("s3_endpoint").filter(|s| !s.is_empty()).cloned());
+                .or_else(|| {
+                    format_fields
+                        .get("s3_endpoint")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                });
             let final_s3_access_key = std::env::var("RUSTFS_ACCESS_KEY")
                 .ok()
                 .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
-                .or_else(|| format_fields.get("s3_access_key").filter(|s| !s.is_empty()).cloned());
+                .or_else(|| {
+                    format_fields
+                        .get("s3_access_key")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                });
             let final_s3_secret_key = std::env::var("RUSTFS_SECRET_KEY")
                 .ok()
                 .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
-                .or_else(|| format_fields.get("s3_secret_key").filter(|s| !s.is_empty()).cloned());
-            let final_s3_bucket = std::env::var("RUSTFS_BUCKET")
-                .ok()
-                .or_else(|| format_fields.get("s3_bucket").filter(|s| !s.is_empty()).cloned());
+                .or_else(|| {
+                    format_fields
+                        .get("s3_secret_key")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                });
+            let final_s3_bucket = std::env::var("RUSTFS_BUCKET").ok().or_else(|| {
+                format_fields
+                    .get("s3_bucket")
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+            });
 
             // Retrieve registered backends or initialize the default one
             let multi_backend = MultiBackendClient::new();
@@ -1505,6 +1692,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "disk_cache_paths": active_staging_dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
                 "dismount_wait_seconds": resolved_dismount_wait,
                 "upload_delay": resolved_upload_delay,
+                "fuse_io_uring_sqpoll_idle_ms": resolved_fuse_io_uring_sqpoll_idle_ms,
+                "fuse_io_uring_sqpoll_cpu": resolved_fuse_io_uring_sqpoll_cpu,
                 "endpoint": final_s3_endpoint.as_deref().unwrap_or(""),
                 "access_key": masked_access_key,
                 "secret_key": masked_secret_key,
@@ -1564,6 +1753,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let mut fs_engine = SqueezefsFilesystem::new(router, dlm, resolved_uid, resolved_gid);
             fs_engine.dismount_wait = resolved_dismount_wait;
+
+            apply_fuse_io_uring_sqpoll_env(
+                resolved_fuse_io_uring_sqpoll_idle_ms,
+                resolved_fuse_io_uring_sqpoll_cpu,
+            );
 
             println!("Mounting Squeezefs at {:?}...", mountpoint);
 
@@ -1847,9 +2041,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut max_write_bytes = 100 * 1024 * 1024;
             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                 if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                    let size_str: Option<String> = con.hget("squeezefs:format", "write_disk_limit").await.unwrap_or(None);
+                    let size_str: Option<String> = con
+                        .hget("squeezefs:format", "write_disk_limit")
+                        .await
+                        .unwrap_or(None);
                     if let Some(ref s) = size_str {
-                        max_write_bytes = squeezefs::cache::parse_size_string(s, 100 * 1024 * 1024 * 1024).unwrap_or(100 * 1024 * 1024);
+                        max_write_bytes =
+                            squeezefs::cache::parse_size_string(s, 100 * 1024 * 1024 * 1024)
+                                .unwrap_or(100 * 1024 * 1024);
                     }
                 }
             }
@@ -1864,7 +2063,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         &[write_cap],
                         16,
                     ) {
-                        cache.recover_index();
+                        if squeezefs::cache::nvme::dir_has_segment_data(&staging_segment_dir) {
+                            cache.recover_index();
+                        }
                         caches.push(cache);
                     }
                 }
@@ -1939,14 +2140,25 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             };
                             if !is_active {
                                 if let Some(guard) = cache.get(&key_bytes) {
-                                    let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                                    let bytes =
+                                        &guard.guard.mmap[guard.offset..guard.offset + guard.len];
                                     if bytes.len() >= 8 {
-                                        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                                        let meta_len = u64::from_be_bytes(
+                                            bytes[0..8].try_into().unwrap_or([0; 8]),
+                                        )
+                                            as usize;
                                         if bytes.len() >= 8 + meta_len {
-                                            let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
-                                                Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                                                Err(_) => 0,
-                                            };
+                                            let original_size =
+                                                match serde_json::from_slice::<serde_json::Value>(
+                                                    &bytes[8..8 + meta_len],
+                                                ) {
+                                                    Ok(json) => json
+                                                        .get("original_size")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0)
+                                                        as usize,
+                                                    Err(_) => 0,
+                                                };
                                             total_bytes_at_start += original_size as u64;
                                         }
                                     }
@@ -1989,7 +2201,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                         for cache in &caches {
                             for key_bytes in cache.list_keys() {
-                                let is_active = if let Ok(s) = String::from_utf8(key_bytes.to_vec()) {
+                                let is_active = if let Ok(s) = String::from_utf8(key_bytes.to_vec())
+                                {
                                     s.starts_with("active_block:")
                                 } else {
                                     false
@@ -1999,12 +2212,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     current_staged += 1;
                                     if let Some(guard) = cache.get(&key_bytes) {
-                                        let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                                        let bytes = &guard.guard.mmap
+                                            [guard.offset..guard.offset + guard.len];
                                         if bytes.len() >= 8 {
-                                            let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                                            let meta_len = u64::from_be_bytes(
+                                                bytes[0..8].try_into().unwrap_or([0; 8]),
+                                            )
+                                                as usize;
                                             if bytes.len() >= 8 + meta_len {
-                                                let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
-                                                    Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                                let original_size = match serde_json::from_slice::<
+                                                    serde_json::Value,
+                                                >(
+                                                    &bytes[8..8 + meta_len]
+                                                ) {
+                                                    Ok(json) => json
+                                                        .get("original_size")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0)
+                                                        as usize,
                                                     Err(_) => 0,
                                                 };
                                                 current_bytes += original_size as u64;
@@ -2022,11 +2247,16 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                         let elapsed = start_wait.elapsed().as_secs_f64();
                         let bytes_flushed = total_bytes_at_start.saturating_sub(current_bytes);
-                        let speed = if elapsed > 0.1 { bytes_flushed as f64 / elapsed } else { 0.0 };
+                        let speed = if elapsed > 0.1 {
+                            bytes_flushed as f64 / elapsed
+                        } else {
+                            0.0
+                        };
                         let speed_mb = speed / (1024.0 * 1024.0);
-                        
+
                         let progress_pct = if total_bytes_at_start > 0 {
-                            100.0 * (total_bytes_at_start - current_bytes) as f64 / total_bytes_at_start as f64
+                            100.0 * (total_bytes_at_start - current_bytes) as f64
+                                / total_bytes_at_start as f64
                         } else {
                             100.0
                         };
@@ -2058,7 +2288,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = std::io::stdout().flush();
 
                         let mut confirmed = false;
-                        let timeout_fut = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv());
+                        let timeout_fut =
+                            tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv());
                         if let Ok(Some(msg)) = timeout_fut.await {
                             if msg == "y" || msg == "yes" {
                                 confirmed = true;
@@ -2067,35 +2298,65 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                         if confirmed {
                             println!("Discarding unflushed data and cleaning up Redis metadata/local staging...");
-                            
+
                             // 1. Connect to Redis to clear metadata
                             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-                                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await
+                                {
                                     for cache in &caches {
                                         for key_bytes in cache.list_keys() {
-                                            let is_active = if let Ok(s) = String::from_utf8(key_bytes.to_vec()) {
+                                            let is_active = if let Ok(s) =
+                                                String::from_utf8(key_bytes.to_vec())
+                                            {
                                                 s.starts_with("active_block:")
                                             } else {
                                                 false
                                             };
                                             if !is_active {
                                                 if let Some(guard) = cache.get(&key_bytes) {
-                                                    let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                                                    let bytes = &guard.guard.mmap
+                                                        [guard.offset..guard.offset + guard.len];
                                                     if bytes.len() >= 8 {
-                                                        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                                                        let meta_len = u64::from_be_bytes(
+                                                            bytes[0..8]
+                                                                .try_into()
+                                                                .unwrap_or([0; 8]),
+                                                        )
+                                                            as usize;
                                                         if bytes.len() >= 8 + meta_len {
                                                             // Parse metadata to get file_path
-                                                            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
-                                                                if let Some(file_path) = meta.get("file_path").and_then(|v| v.as_str()) {
-                                                                    let meta_key = format!("metadata:{}", file_path);
-                                                                    let file_id: Option<String> = con.hget(&meta_key, "file_id").await.unwrap_or(None);
+                                                            if let Ok(meta) = serde_json::from_slice::<
+                                                                serde_json::Value,
+                                                            >(
+                                                                &bytes[8..8 + meta_len],
+                                                            ) {
+                                                                if let Some(file_path) = meta
+                                                                    .get("file_path")
+                                                                    .and_then(|v| v.as_str())
+                                                                {
+                                                                    let meta_key = format!(
+                                                                        "metadata:{}",
+                                                                        file_path
+                                                                    );
+                                                                    let file_id: Option<String> =
+                                                                        con.hget(
+                                                                            &meta_key, "file_id",
+                                                                        )
+                                                                        .await
+                                                                        .unwrap_or(None);
                                                                     let mut pipe = redis::pipe();
                                                                     pipe.del(&meta_key);
                                                                     if let Some(fid) = file_id {
-                                                                        let mapping_key = format!("mapping:{}", fid);
+                                                                        let mapping_key = format!(
+                                                                            "mapping:{}",
+                                                                            fid
+                                                                        );
                                                                         pipe.del(&mapping_key);
                                                                     }
-                                                                    let _: () = pipe.query_async(&mut con).await.unwrap_or(());
+                                                                    let _: () = pipe
+                                                                        .query_async(&mut con)
+                                                                        .await
+                                                                        .unwrap_or(());
                                                                     println!("Removed metadata for unflushed file: {}", file_path);
                                                                 }
                                                             }
@@ -2160,6 +2421,53 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_sqpoll_idle_prefers_explicit_override() {
+        let mut format_fields = HashMap::new();
+        format_fields.insert(
+            FUSE_IO_URING_SQPOLL_IDLE_MS_KEY.to_string(),
+            "250".to_string(),
+        );
+
+        assert_eq!(
+            resolve_shared_sqpoll_idle_ms(Some(100), &format_fields).unwrap(),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn resolve_sqpoll_idle_allows_explicit_disable() {
+        let mut format_fields = HashMap::new();
+        format_fields.insert(
+            FUSE_IO_URING_SQPOLL_IDLE_MS_KEY.to_string(),
+            "250".to_string(),
+        );
+
+        assert_eq!(
+            resolve_shared_sqpoll_idle_ms(Some(0), &format_fields).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_sqpoll_idle_uses_shared_metadata_default() {
+        let mut format_fields = HashMap::new();
+        format_fields.insert(
+            FUSE_IO_URING_SQPOLL_IDLE_MS_KEY.to_string(),
+            "300".to_string(),
+        );
+
+        assert_eq!(
+            resolve_shared_sqpoll_idle_ms(None, &format_fields).unwrap(),
+            Some(300)
+        );
+    }
 }
 
 async fn get_daemon_metrics(redis_url: &str) -> Option<HashMap<String, u64>> {
@@ -2620,6 +2928,27 @@ pub fn tune_system() -> Result<(), std::io::Error> {
                     if is_root {
                         let _ = std::fs::write(max_bg_path, "64\n");
                         let _ = std::fs::write(cong_path, "48\n");
+                    }
+                }
+
+                if let Some(conn_id_str) = entry.file_name().to_str() {
+                    let bdi_path_str = format!("/sys/class/bdi/0:{}/read_ahead_kb", conn_id_str);
+                    let bdi_path = std::path::Path::new(&bdi_path_str);
+                    if bdi_path.exists() {
+                        if let Ok(curr) = std::fs::read_to_string(bdi_path) {
+                            println!(
+                                "FUSE Connection {}: read_ahead_kb = {}",
+                                conn_id_str,
+                                curr.trim()
+                            );
+                        }
+                        if is_root {
+                            println!(
+                                "Applying optimized read_ahead_kb = 16384 (16MB) for connection {}...",
+                                conn_id_str
+                            );
+                            let _ = std::fs::write(bdi_path, "16384\n");
+                        }
                     }
                 }
             }

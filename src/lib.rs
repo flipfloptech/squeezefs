@@ -1,3 +1,9 @@
+#![allow(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::redundant_closure
+)]
+
 pub mod backend;
 pub mod cache;
 pub mod config_ops;

@@ -131,16 +131,44 @@ impl From<ReplyAttr> for fuse_attr_out {
     }
 }
 
-#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone)]
 /// data reply.
 pub struct ReplyData {
     /// the data.
     pub data: Bytes,
+    /// Backing resource to keep alive (e.g. guard or pooled buffer)
+    pub backing: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl PartialEq for ReplyData {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl Eq for ReplyData {}
+
+impl PartialOrd for ReplyData {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReplyData {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.data.cmp(&other.data)
+    }
+}
+
+impl std::hash::Hash for ReplyData {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.data.hash(state);
+    }
 }
 
 impl From<Bytes> for ReplyData {
     fn from(data: Bytes) -> Self {
-        Self { data }
+        Self { data, backing: None }
     }
 }
 

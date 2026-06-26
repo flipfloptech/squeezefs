@@ -101,6 +101,7 @@ version = "0.29.0"
 features = [
     "fs",
     "mount",
+    "ioctl",
 ]
 default-features = false
 
@@ -136,6 +137,12 @@ optional = true
 [dependencies.io-uring]
 version = "0.6"
 
+[dependencies.once_cell]
+version = "1.19"
+
+[dependencies.core_affinity]
+version = "0.8"
+
 
 [features]
 async-io-runtime = [
@@ -155,5 +162,5 @@ unprivileged = [
 
 [target.'cfg(target_os = "linux")'.dependencies.nix]
 version = "0.29.0"
-features = ["user"]
+features = ["user", "ioctl"]
 default-features = false

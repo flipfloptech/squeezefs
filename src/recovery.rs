@@ -48,9 +48,12 @@ pub async fn recover_staging(
     );
 
     let mut con = redis_client.get_connection().await?;
-    
+
     // Determine staging capacity limit
-    let size_str: Option<String> = con.hget("squeezefs:format", "write_disk_limit").await.unwrap_or(None);
+    let size_str: Option<String> = con
+        .hget("squeezefs:format", "write_disk_limit")
+        .await
+        .unwrap_or(None);
     let max_write_bytes = if let Some(ref s) = size_str {
         crate::cache::parse_size_string(s, 100 * 1024 * 1024 * 1024).unwrap_or(100 * 1024 * 1024)
     } else {
@@ -79,7 +82,11 @@ pub async fn recover_staging(
         encrypt_key.as_deref(),
     );
 
-    let write_shards = if max_write_bytes < 10 * 1024 * 1024 { 1 } else { 16 };
+    let write_shards = if max_write_bytes < 10 * 1024 * 1024 {
+        1
+    } else {
+        16
+    };
     // Instantiate NvmeCache temporarily to recover from segment files
     let cache = hypertier::nvme::NvmeCache::new(
         &[staging_segment_dir.as_path()],
@@ -87,7 +94,9 @@ pub async fn recover_staging(
         write_shards,
     )?;
 
-    cache.recover_index();
+    if crate::cache::nvme::dir_has_segment_data(&staging_segment_dir) {
+        cache.recover_index();
+    }
 
     let mut recovered_count = 0;
     let keys = cache.list_keys();
@@ -102,11 +111,20 @@ pub async fn recover_staging(
                 if let Some(guard) = cache.get(&key_bytes) {
                     let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
                     if bytes.len() >= 8 {
-                        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                        let meta_len =
+                            u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
                         if bytes.len() >= 8 + meta_len {
-                            if let Ok(meta) = serde_json::from_slice::<StagedMetadata>(&bytes[8..8 + meta_len]) {
-                                let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
-                                    Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                            if let Ok(meta) =
+                                serde_json::from_slice::<StagedMetadata>(&bytes[8..8 + meta_len])
+                            {
+                                let original_size = match serde_json::from_slice::<serde_json::Value>(
+                                    &bytes[8..8 + meta_len],
+                                ) {
+                                    Ok(json) => json
+                                        .get("original_size")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0)
+                                        as usize,
                                     Err(_) => 0,
                                 };
                                 let data_start = 8 + meta_len;
@@ -114,11 +132,21 @@ pub async fn recover_staging(
                                 if bytes.len() >= data_end {
                                     let data = bytes[data_start..data_end].to_vec();
                                     Some((meta, data))
-                                } else { None }
-                            } else { None }
-                        } else { None }
-                    } else { None }
-                } else { None }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }; // guard dropped here
 
             if let Some((meta, data)) = active_block_data {
@@ -132,38 +160,44 @@ pub async fn recover_staging(
                         let meta_key = format!("metadata:inode_{}", ino);
                         let exists: bool = con.exists(&meta_key).await.unwrap_or(false);
                         if exists {
-                            let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+                            let block_map_id_opt: Option<String> =
+                                con.hget(&meta_key, "block_map_id").await?;
                             let mut block_map_id = block_map_id_opt.unwrap_or_default();
                             if block_map_id.is_empty() {
                                 block_map_id = uuid::Uuid::new_v4().to_string();
-                                let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
+                                let _: () =
+                                    con.hset(&meta_key, "block_map_id", &block_map_id).await?;
                             }
-                            
+
                             let block_map_key = format!("block_map:{}", block_map_id);
-                            let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
-                            
+                            let old_block_key: Option<String> =
+                                con.hget(&block_map_key, b.to_string()).await?;
+
                             let file_uuid = uuid::Uuid::new_v4().to_string();
                             let block_write_uuid = uuid::Uuid::new_v4().to_string();
-                            let new_block_key = format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
-                            
-                            // Process block data with crypto
-                            let processed_block = match crypto_state.process_write(&data) {
+                            let new_block_key =
+                                format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
+
+                            let data_bytes = bytes::Bytes::from(data);
+                            let processed_block = match crypto_state
+                                .process_write(data_bytes.clone())
+                            {
                                 Ok(b) => b,
                                 Err(e) => {
                                     error!(
-                                        "Crash Recovery: Failed to process active block {} of inode {} with crypto/compression: {:?}",
-                                        b, ino, e
-                                    );
+                                         "Crash Recovery: Failed to process active block {} of inode {} with crypto/compression: {:?}",
+                                         b, ino, e
+                                     );
                                     cache.remove(&key_bytes);
                                     continue;
                                 }
                             };
-                            
+
                             info!(
-                                "Crash Recovery: Recovering active block {} for inode {} (size: {} bytes, fencing token: {})",
-                                b, ino, data.len(), meta.fencing_token
-                            );
-                            
+                                 "Crash Recovery: Recovering active block {} for inode {} (size: {} bytes, fencing token: {})",
+                                 b, ino, data_bytes.len(), meta.fencing_token
+                             );
+
                             if let Err(e) = backend
                                 .put_object(&new_block_key, processed_block, meta.fencing_token)
                                 .await
@@ -174,10 +208,10 @@ pub async fn recover_staging(
                                 );
                                 continue;
                             }
-                            
+
                             let active_be = "backend_0";
                             let stored_block_key = format!("{}:{}", active_be, new_block_key);
-                            
+
                             let refcounts_key = "squeezefs:block_refcounts";
                             let mut pipe = redis::pipe();
                             pipe.hset(refcounts_key, &stored_block_key, 1).hset(
@@ -186,7 +220,7 @@ pub async fn recover_staging(
                                 &stored_block_key,
                             );
                             let _: () = pipe.query_async(&mut con).await?;
-                            
+
                             if let Some(bk) = old_block_key {
                                 let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
                                 if let Some(mut r) = old_ref {
@@ -196,17 +230,19 @@ pub async fn recover_staging(
                                             .hdel(refcounts_key, &bk)
                                             .query_async(&mut con)
                                             .await?;
-                                        let (_be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+                                        let (_be_id, real_key) =
+                                            crate::backend::parse_backend_and_key(&bk);
                                         let _ = backend.delete_object(&real_key).await;
                                     } else {
                                         let _: () = con.hset(refcounts_key, &bk, r).await?;
                                     }
                                 } else {
-                                    let (_be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
+                                    let (_be_id, real_key) =
+                                        crate::backend::parse_backend_and_key(&bk);
                                     let _ = backend.delete_object(&real_key).await;
                                 }
                             }
-                            
+
                             recovered_count += 1;
                         } else {
                             warn!(
@@ -232,14 +268,21 @@ pub async fn recover_staging(
                 if bytes.len() < 8 {
                     None
                 } else {
-                    let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                    let meta_len =
+                        u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
                     if bytes.len() < 8 + meta_len {
                         None
                     } else {
                         match serde_json::from_slice::<StagedMetadata>(&bytes[8..8 + meta_len]) {
                             Ok(meta) => {
-                                let original_size = match serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len]) {
-                                    Ok(json) => json.get("original_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                let original_size = match serde_json::from_slice::<serde_json::Value>(
+                                    &bytes[8..8 + meta_len],
+                                ) {
+                                    Ok(json) => json
+                                        .get("original_size")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0)
+                                        as usize,
                                     Err(_) => 0,
                                 };
                                 let data_start = 8 + meta_len;
@@ -284,7 +327,11 @@ pub async fn recover_staging(
                 // Upload to RustFS S3
                 let recovered_key = format!("recovered/blocks/{}", file_id);
                 if let Err(e) = backend
-                    .put_object(&recovered_key, data.clone(), meta.fencing_token)
+                    .put_object(
+                        &recovered_key,
+                        bytes::Bytes::from(data.clone()),
+                        meta.fencing_token,
+                    )
                     .await
                 {
                     error!(

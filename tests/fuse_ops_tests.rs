@@ -518,3 +518,62 @@ async fn test_fuse_forget_eviction() {
         "Forget should evict from active_inode_locks"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fuse_ops_timeout_protection() {
+    use std::net::TcpListener;
+    use std::thread;
+
+    // Start a TCP listener on a random port. It will accept connections but not respond,
+    // causing any redis query to hang/timeout.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let _handle = thread::spawn(move || {
+        if let Ok((_stream, _)) = listener.accept() {
+            // Keep the stream open but do not write any response, causing it to block.
+            thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+
+    // Use a dummy redis url for the tiered cache so its background worker does not hang
+    let dummy_redis_url = "redis://127.0.0.1:9/";
+    let dummy_dlm = DlmClient::new(dummy_redis_url).unwrap();
+
+    let redis_url = format!("redis://127.0.0.1:{}/", port);
+    let dlm = DlmClient::new(&redis_url).unwrap();
+    let backend = RustFsClient::new().await;
+    let temp_dir = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![temp_dir.path().to_path_buf()],
+        None,
+        None,
+        Some("10MB"),
+        Some("10MB"),
+        backend.clone(),
+        dummy_dlm.meta_client().clone(),
+    )
+    .unwrap();
+
+    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    let req = Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1234,
+    };
+
+    // Call getattr (not CONFIG_INODE or STATS_INODE to trigger connection query)
+    // Since the database hangs, it should hit the 2-second timeout and return ETIMEDOUT.
+    let start = std::time::Instant::now();
+    let res = fs.getattr(req, 42, None, 0).await;
+    let elapsed = start.elapsed();
+
+    assert!(elapsed >= std::time::Duration::from_secs(2));
+    assert!(elapsed < std::time::Duration::from_secs(4));
+    assert_eq!(res.unwrap_err(), fuse3::Errno::from(libc::ETIMEDOUT));
+
+    // Leak temp_dir to keep the backing files alive on disk, preventing SIGBUS during async shutdown
+    std::mem::forget(temp_dir);
+}

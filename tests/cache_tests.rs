@@ -12,10 +12,7 @@ fn test_lru_eviction() {
 
     // Insert 40 blocks of 100 bytes (total 4000 bytes > 1000 bytes)
     for i in 0..40 {
-        cache.put(
-            &format!("key{}", i),
-            std::sync::Arc::new(vec![i as u8; 100]),
-        );
+        cache.put(&format!("key{}", i), bytes::Bytes::from(vec![i as u8; 100]));
     }
     cache.run_pending_tasks();
 
@@ -161,7 +158,10 @@ async fn test_multi_disk_distribution() {
             dirs_with_segments += 1;
         }
     }
-    assert_eq!(dirs_with_segments, 3, "Staged writes should be distributed across all 3 directories");
+    assert_eq!(
+        dirs_with_segments, 3,
+        "Staged writes should be distributed across all 3 directories"
+    );
 }
 
 #[tokio::test]
@@ -721,21 +721,24 @@ async fn test_nvme_read_cache_lru_in_memory() {
     let cache = squeezefs::cache::lru::LruCache::with_capacity(5 * 1024);
 
     // Cache b1 (2KB)
-    let b1 = std::sync::Arc::new(vec![1u8; 2 * 1024]);
+    let b1 = bytes::Bytes::from(vec![1u8; 2 * 1024]);
     cache.put("blocks/b1", b1);
 
     // Cache b2 (2KB)
-    let b2 = std::sync::Arc::new(vec![2u8; 2 * 1024]);
+    let b2 = bytes::Bytes::from(vec![2u8; 2 * 1024]);
     cache.put("blocks/b2", b2);
 
     // Cache b3 (2KB) -> total capacity is now 6KB > 5KB limit.
     // This triggers eviction. The clock hand sweeps starting at index 0 (b1).
     // It clears b1 and b2 referenced bits, wraps around, and evicts b1.
     // Index 1 (b2) and Index 2 (b3) remain, both with referenced = false.
-    let b3 = std::sync::Arc::new(vec![3u8; 2 * 1024]);
+    let b3 = bytes::Bytes::from(vec![3u8; 2 * 1024]);
     cache.put("blocks/b3", b3);
 
-    assert!(cache.get("blocks/b1").is_none(), "b1 should have been evicted");
+    assert!(
+        cache.get("blocks/b1").is_none(),
+        "b1 should have been evicted"
+    );
 
     // Promote b2 back to referenced = true
     assert!(cache.get("blocks/b2").is_some());
@@ -744,7 +747,7 @@ async fn test_nvme_read_cache_lru_in_memory() {
     // This triggers eviction. The clock hand starts at index 1 (b2).
     // b2 has referenced = true, so it is skipped (referenced set to false).
     // b3 has referenced = false, so it is evicted.
-    let b4 = std::sync::Arc::new(vec![4u8; 2 * 1024]);
+    let b4 = bytes::Bytes::from(vec![4u8; 2 * 1024]);
     cache.put("blocks/b4", b4);
 
     // Verify b3 was evicted, but b2 and b4 are still present

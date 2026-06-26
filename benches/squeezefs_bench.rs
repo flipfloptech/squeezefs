@@ -1,4 +1,6 @@
-use criterion::{criterion_group, criterion_main, Criterion, Throughput, BatchSize};
+#![allow(clippy::needless_range_loop)]
+
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use fuse3::raw::prelude::*;
 use fuse3::raw::Request;
 use squeezefs::backend::RustFsClient;
@@ -83,7 +85,7 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     };
 
     let router = fs.router.clone();
-    let mut group = c.benchmark_group("squeezefs_routing_writes");
+    let mut group = c.benchmark_group("squeezefs_routing");
 
     // Bench Micro-file routing path (< 64KB)
     let micro_data = vec![8u8; 1024]; // 1KB
@@ -98,6 +100,8 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
             let name = format!("bench_micro_{}.bin", c);
             async move {
                 router_ref.write_file(&name, 0, data_ref, 1).await.unwrap();
+                let mut con = router_ref.dlm.get_connection().await.unwrap();
+                let _ = router_ref.delete_file(&name, &mut con).await;
             }
         });
     });
@@ -115,8 +119,93 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
             let name = format!("bench_small_{}.bin", c);
             async move {
                 router_ref.write_file(&name, 0, data_ref, 2).await.unwrap();
+                let mut con = router_ref.dlm.get_connection().await.unwrap();
+                let _ = router_ref.delete_file(&name, &mut con).await;
             }
         });
+    });
+
+    // Bench Large-file routing path (> 4MB)
+    let large_data = vec![8u8; 4 * 1024 * 1024]; // 4MB
+    let large_counter = Arc::new(AtomicU64::new(0));
+    group.throughput(Throughput::Bytes(4 * 1024 * 1024));
+    group.bench_function("write_large_striped_4mb", |b| {
+        let counter = large_counter.clone();
+        let data_ref = &large_data;
+        let router_ref = &router;
+        b.to_async(&rt).iter(|| {
+            let c = counter.fetch_add(1, Ordering::Relaxed);
+            let name = format!("bench_large_{}.bin", c);
+            async move {
+                router_ref.write_file(&name, 0, data_ref, 3).await.unwrap();
+                let mut con = router_ref.dlm.get_connection().await.unwrap();
+                let _ = router_ref.delete_file(&name, &mut con).await;
+            }
+        });
+    });
+
+    // Pre-create routing files for read benchmarks
+    let (micro_path, small_path, large_path) = rt.block_on(async {
+        let micro_path = "routing_micro_read.bin".to_string();
+        router
+            .write_file(&micro_path, 0, &vec![8u8; 1024], 10)
+            .await
+            .unwrap();
+
+        let small_path = "routing_small_read.bin".to_string();
+        router
+            .write_file(&small_path, 0, &vec![8u8; 128 * 1024], 11)
+            .await
+            .unwrap();
+
+        let large_path = "routing_large_read.bin".to_string();
+        router
+            .write_file(&large_path, 0, &vec![8u8; 4 * 1024 * 1024], 12)
+            .await
+            .unwrap();
+
+        (micro_path, small_path, large_path)
+    });
+
+    group.throughput(Throughput::Bytes(1024));
+    group.bench_function("read_micro_file_1kb", |b| {
+        let router_ref = &router;
+        let path_ref = &micro_path;
+        b.to_async(&rt).iter(|| async move {
+            let _reply = router_ref.read_file_range(path_ref, 0, 1024).await.unwrap();
+        });
+    });
+
+    group.throughput(Throughput::Bytes(128 * 1024));
+    group.bench_function("read_small_file_128kb", |b| {
+        let router_ref = &router;
+        let path_ref = &small_path;
+        b.to_async(&rt).iter(|| async move {
+            let _reply = router_ref
+                .read_file_range(path_ref, 0, 128 * 1024)
+                .await
+                .unwrap();
+        });
+    });
+
+    group.throughput(Throughput::Bytes(4 * 1024 * 1024));
+    group.bench_function("read_large_striped_4mb", |b| {
+        let router_ref = &router;
+        let path_ref = &large_path;
+        b.to_async(&rt).iter(|| async move {
+            let _reply = router_ref
+                .read_file_range(path_ref, 0, 4 * 1024 * 1024)
+                .await
+                .unwrap();
+        });
+    });
+
+    // Clean up read files
+    rt.block_on(async {
+        let mut con = router.dlm.get_connection().await.unwrap();
+        let _ = router.delete_file(&micro_path, &mut con).await;
+        let _ = router.delete_file(&small_path, &mut con).await;
+        let _ = router.delete_file(&large_path, &mut con).await;
     });
 
     group.finish();
@@ -379,6 +468,54 @@ fn bench_squeezefs_data_io(c: &mut Criterion) {
         });
     });
 
+    let write_micro_counter = Arc::new(AtomicU64::new(0));
+    let micro_write_data = vec![8u8; 1024]; // 1KB
+    group.throughput(Throughput::Bytes(1024));
+    group.bench_function("write_micro_file_1kb", |b| {
+        let counter = write_micro_counter.clone();
+        let data_ref = &micro_write_data;
+        let fs_ref = &fs;
+        b.to_async(&rt).iter(|| {
+            let c = counter.fetch_add(1, Ordering::Relaxed);
+            let name = format!("micro_write_{}.bin", c);
+            async move {
+                let reply = fs_ref
+                    .create(req, 1, OsStr::new(&name), 0o644, 0)
+                    .await
+                    .unwrap();
+                fs_ref
+                    .write(req, reply.attr.ino, 0, 0, data_ref, 0, 0)
+                    .await
+                    .unwrap();
+                fs_ref.unlink(req, 1, OsStr::new(&name)).await.unwrap();
+            }
+        });
+    });
+
+    let write_small_counter = Arc::new(AtomicU64::new(0));
+    let small_write_data = vec![8u8; 128 * 1024]; // 128KB
+    group.throughput(Throughput::Bytes(128 * 1024));
+    group.bench_function("write_small_file_128kb", |b| {
+        let counter = write_small_counter.clone();
+        let data_ref = &small_write_data;
+        let fs_ref = &fs;
+        b.to_async(&rt).iter(|| {
+            let c = counter.fetch_add(1, Ordering::Relaxed);
+            let name = format!("small_write_{}.bin", c);
+            async move {
+                let reply = fs_ref
+                    .create(req, 1, OsStr::new(&name), 0o644, 0)
+                    .await
+                    .unwrap();
+                fs_ref
+                    .write(req, reply.attr.ino, 0, 0, data_ref, 0, 0)
+                    .await
+                    .unwrap();
+                fs_ref.unlink(req, 1, OsStr::new(&name)).await.unwrap();
+            }
+        });
+    });
+
     let write_large_counter = Arc::new(AtomicU64::new(0));
     let large_data = vec![8u8; 4 * 1024 * 1024]; // 4MB
     group.throughput(Throughput::Bytes(4 * 1024 * 1024));
@@ -508,28 +645,29 @@ fn bench_crypto_compress(c: &mut Criterion) {
     let state_both =
         CryptoCompressState::new("lz4".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
 
-    let payload =
-        b"Hello World! This is a test of client-side encryption and compression. ".repeat(100); // ~7KB
+    let payload = bytes::Bytes::from(
+        b"Hello World! This is a test of client-side encryption and compression. ".repeat(100),
+    ); // ~7KB
 
     let mut group = c.benchmark_group("crypto_compress");
 
     group.bench_function("process_write_none", |b| {
-        b.iter(|| state_none.process_write(&payload).unwrap());
+        b.iter(|| state_none.process_write(payload.clone()).unwrap());
     });
     group.bench_function("process_write_lz4", |b| {
-        b.iter(|| state_lz4.process_write(&payload).unwrap());
+        b.iter(|| state_lz4.process_write(payload.clone()).unwrap());
     });
     group.bench_function("process_write_zstd", |b| {
-        b.iter(|| state_zstd.process_write(&payload).unwrap());
+        b.iter(|| state_zstd.process_write(payload.clone()).unwrap());
     });
     group.bench_function("process_write_aes256gcm", |b| {
-        b.iter(|| state_enc.process_write(&payload).unwrap());
+        b.iter(|| state_enc.process_write(payload.clone()).unwrap());
     });
     group.bench_function("process_write_both", |b| {
-        b.iter(|| state_both.process_write(&payload).unwrap());
+        b.iter(|| state_both.process_write(payload.clone()).unwrap());
     });
 
-    let encrypted = state_both.process_write(&payload).unwrap();
+    let encrypted = state_both.process_write(payload.clone()).unwrap();
     group.bench_function("process_read_both", |b| {
         b.iter(|| state_both.process_read(&encrypted).unwrap());
     });
@@ -597,7 +735,7 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
 
             let addr = format!("127.0.0.1:{}", 26300 + i);
             let server = squeezefs::p2p::P2pServer::new(addr.clone(), cache.nvme.clone());
-            
+
             // Spawn P2P server
             tokio::spawn(async move {
                 let _ = server.run().await;
@@ -612,7 +750,11 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
 
         // Fully connect the nodes
         for i in 0..5 {
-            let dht_i = nodes[i].nvme.dht_node.get().expect("DHT Node not initialized");
+            let dht_i = nodes[i]
+                .nvme
+                .dht_node
+                .get()
+                .expect("DHT Node not initialized");
             for j in 0..5 {
                 if i != j {
                     dht_i.add_peer(format!("127.0.0.1:{}", 26300 + j));
@@ -630,13 +772,23 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
     let val = bytes::Bytes::from(val_data.clone());
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    // Seed Node 4's cache with the static block for lookups/fetches
+    rt.block_on(async {
+        node4_cache
+            .nvme
+            .cache_read_block("scale_bench_block_0", &val)
+            .unwrap();
+    });
+
     // 1. Benchmark DHT Remote P2P Get
     group.throughput(Throughput::Bytes(128 * 1024));
+    let nodes_clone = nodes.clone();
     group.bench_function("DHT Remote P2P Get", |b| {
         let counter = counter.clone();
         let node0_cache = node0_cache.clone();
         let node4_cache = node4_cache.clone();
         let val = val.clone();
+        let nodes_all = nodes_clone.clone();
 
         b.iter_batched(
             || {
@@ -646,20 +798,27 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
                     // Cache the block on Node 4
                     node4_cache.nvme.cache_read_block(&block_key, &val).unwrap();
 
-                    // Poll Node 0 DHT until provider registration is found (propagated from Node 4)
+                    // Poll the primary owner node until the async push is completed
                     let dht0 = node0_cache.nvme.dht_node.get().unwrap();
                     let key_hash = xxhash_rust::xxh3::xxh3_64(block_key.as_bytes());
+                    let target_nodes = dht0.find_closest_peers(key_hash, 3);
+                    let primary_owner_addr = target_nodes[0].clone();
+
+                    let primary_node = nodes_all
+                        .iter()
+                        .find(|n| n.nvme.dht_node.get().unwrap().peer_addr() == primary_owner_addr)
+                        .unwrap();
+
                     let mut found = false;
+                    let key_bytes = bytes::Bytes::copy_from_slice(block_key.as_bytes());
                     for _ in 0..500 {
-                        if let Ok(Some(addr)) = dht0.find_provider(key_hash).await {
-                            if addr == "127.0.0.1:26304" {
-                                found = true;
-                                break;
-                            }
+                        if primary_node.nvme.read_nvme_cache.get(&key_bytes).is_some() {
+                            found = true;
+                            break;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
-                    assert!(found, "DHT provider registration failed to propagate to node0 in time!");
+                    assert!(found, "Block failed to push to primary owner node in time!");
                 });
                 block_key
             },
@@ -668,7 +827,10 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
                     // GET from Node 0. This misses locally and queries DHT to find Node 4, then downloads the block from Node 4.
                     let dht0 = node0_cache.nvme.dht_node.get().unwrap();
                     let client = squeezefs::p2p::P2pClient::new();
-                    let res = client.download_block_from_peer(dht0, &block_key).await.unwrap();
+                    let res = client
+                        .download_block_from_peer(dht0, &block_key)
+                        .await
+                        .unwrap();
                     assert_eq!(res.len(), 128 * 1024);
                 });
             },
@@ -704,7 +866,10 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
             let addr_clone = addr.clone();
             let key_clone = key.clone();
             async move {
-                let res = dht_clone.fetch_remote_value(&addr_clone, key_clone).await.unwrap();
+                let res = dht_clone
+                    .fetch_remote_value(&addr_clone, key_clone)
+                    .await
+                    .unwrap();
                 criterion::black_box(res);
             }
         });

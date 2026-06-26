@@ -1,7 +1,9 @@
 pub mod gds;
 pub mod lru;
 pub mod nvme;
+pub mod pool;
 pub use nvme::NvmeStaging;
+pub use pool::{PooledBuf, BUFFER_POOL};
 
 use crate::backend::RustFsClient;
 use crate::error::{Result, SqueezefsError};

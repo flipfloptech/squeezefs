@@ -40,15 +40,17 @@ static RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
     )
 });
 
-static SINGLE_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>> =
-    Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
+static SINGLE_CONN_POOL: Lazy<
+    dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>,
+> = Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
-pub static SENTINEL_CONN_POOL: Lazy<dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>> =
-    Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
+pub static SENTINEL_CONN_POOL: Lazy<
+    dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>,
+> = Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
 #[derive(Clone)]
 pub struct BoundConnection {
-    pub conn: std::sync::Arc<std::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    pub conn: std::sync::Arc<std::sync::RwLock<redis::aio::MultiplexedConnection>>,
     pub local_ip: IpAddr,
     pub remote_addr: SocketAddr,
     pub conn_info: redis::ConnectionInfo,
@@ -91,7 +93,7 @@ async fn reconnect_bound(bound: &BoundConnection) -> Result<redis::aio::Multiple
     let (new_conn, driver) =
         redis::aio::MultiplexedConnection::new(&bound.conn_info.redis, stream).await?;
     tokio::spawn(driver);
-    *bound.conn.lock().unwrap() = new_conn.clone();
+    *bound.conn.write().unwrap() = new_conn.clone();
     Ok(new_conn)
 }
 
@@ -427,7 +429,7 @@ impl MetaClient {
                                 Ok((conn, driver)) => {
                                     tokio::spawn(driver);
                                     bound_conns.push(BoundConnection {
-                                        conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+                                        conn: std::sync::Arc::new(std::sync::RwLock::new(conn)),
                                         local_ip: ip,
                                         remote_addr,
                                         conn_info: conn_info.clone(),
@@ -485,7 +487,7 @@ impl MetaClient {
                 if !bound_conns.is_empty() {
                     let idx = current_idx.fetch_add(1, Ordering::Relaxed);
                     let bound = bound_conns[idx % bound_conns.len()].clone();
-                    let conn_val = bound.conn.lock().unwrap().clone();
+                    let conn_val = bound.conn.read().unwrap().clone();
                     return Ok(MetaConnection::Single {
                         conn: conn_val,
                         client: Some(client.clone()),

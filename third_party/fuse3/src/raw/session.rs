@@ -30,7 +30,6 @@ use async_global_executor::{self as task, Task as JoinHandle};
 ))]
 use async_process::Command;
 use bincode::Options;
-use bytes::Bytes;
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::future::{Either, FutureExt};
 use futures_util::select;
@@ -157,7 +156,9 @@ impl MountHandleInner {
         #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
         {
             // wait destroy done
-            self.task.await.unwrap()?;
+            if !self.task.is_finished() {
+                self.task.await.unwrap()?;
+            }
 
             // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
             #[cfg(target_os = "freebsd")]
@@ -224,6 +225,18 @@ pub struct Session<FS> {
     response_sender: UnboundedSender<FuseData>,
     response_receiver: Option<UnboundedReceiver<FuseData>>,
     mount_options: MountOptions,
+}
+
+impl<FS> Clone for Session<FS> {
+    fn clone(&self) -> Self {
+        Self {
+            fuse_connection: self.fuse_connection.clone(),
+            filesystem: self.filesystem.clone(),
+            response_sender: self.response_sender.clone(),
+            response_receiver: None,
+            mount_options: self.mount_options.clone(),
+        }
+    }
 }
 
 enum ReadResult {
@@ -435,12 +448,70 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         })
     }
 
-    async fn inner_mount(mut self) -> IoResult<()> {
+    async fn inner_mount_worker(mut self, max_write: usize) -> IoResult<()> {
         let fuse_write_connection = self.fuse_connection.as_ref().unwrap().clone();
-
         let receiver = self.response_receiver.take().unwrap();
 
-        let dispatch_task = self.dispatch().fuse();
+        let dispatch_task = self.dispatch_with_max_write(max_write).fuse();
+        let mut dispatch_task = pin!(dispatch_task);
+
+        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver))
+            .map(Result::unwrap)
+            .fuse();
+        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+        let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver))
+            .fuse();
+
+        let mut reply_task = pin!(reply_task);
+
+        select! {
+            reply_result = reply_task => {
+                reply_result?;
+            }
+
+            dispatch_result = dispatch_task => {
+                dispatch_result?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn inner_mount(mut self) -> IoResult<()> {
+        let fuse_connection = self.fuse_connection.clone().unwrap();
+        let fs = self.filesystem.clone().expect("filesystem not init");
+
+        let max_write = self.init_filesystem(&fs, &fuse_connection).await?.get() as usize;
+
+        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+        {
+            let threads = crate::raw::session::tpc_thread_count();
+            if threads > 0 {
+                debug!("Multi-Queue FUSE: Spawning {} worker connections", threads);
+                for _ in 0..threads {
+                    let mut worker_session = self.clone();
+                    let (tx, rx) = unbounded();
+                    worker_session.response_sender = tx;
+                    worker_session.response_receiver = Some(rx);
+
+                    let cloned_conn = fuse_connection.clone_connection()?;
+                    worker_session.fuse_connection = Some(Arc::new(cloned_conn));
+                    worker_session.filesystem = self.filesystem.clone();
+
+                    crate::raw::session::tpc_spawn(async move {
+                        if let Err(e) = worker_session.inner_mount_worker(max_write).await {
+                            error!("Multi-Queue FUSE worker exited with error: {:?}", e);
+                        }
+                    });
+                }
+            }
+        }
+
+        let fuse_write_connection = self.fuse_connection.as_ref().unwrap().clone();
+        let receiver = self.response_receiver.take().unwrap();
+
+        let dispatch_task = self.dispatch_with_max_write(max_write).fuse();
         let mut dispatch_task = pin!(dispatch_task);
 
         #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
@@ -472,24 +543,45 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         mut response_receiver: UnboundedReceiver<FuseData>,
     ) -> IoResult<()> {
         while let Some(response) = response_receiver.next().await {
-            let (data, extend_data) = match response {
-                Either::Left(data) => (data, None),
-                Either::Right((data, extend_data)) => (data, Some(extend_data)),
+            let (data, extend_data, backing) = match response {
+                Either::Left(data) => (data, None, None),
+                Either::Right((data, extend_data, backing)) => (data, Some(extend_data), backing),
             };
-            if let Err(err) = fuse_connection.write_vectored(data, extend_data).await.1 {
-                if err.kind() == ErrorKind::NotFound {
-                    warn!(
-                        "may reply interrupted fuse request, ignore this error {}",
-                        err
-                    );
 
-                    continue;
+            let mut write_done = false;
+            if fuse_connection.splice_read.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(ref payload) = extend_data {
+                    use std::os::fd::AsRawFd;
+                    let fd = fuse_connection.as_fd().as_raw_fd();
+                    match splice_reply(fd, &data, payload) {
+                        Ok(_) => {
+                            write_done = true;
+                        }
+                        Err(err) => {
+                            warn!("splice_reply failed: {:?}, falling back to write_vectored", err);
+                        }
+                    }
                 }
-
-                error!("reply fuse failed {}", err);
-
-                return Err(err);
             }
+
+            if !write_done {
+                if let Err(err) = fuse_connection.write_vectored(data, extend_data).await.1 {
+                    if err.kind() == ErrorKind::NotFound {
+                        warn!(
+                            "may reply interrupted fuse request, ignore this error {}",
+                            err
+                        );
+
+                        continue;
+                    }
+
+                    error!("reply fuse failed {}", err);
+
+                    return Err(err);
+                }
+            }
+
+            drop(backing);
         }
 
         Ok(())
@@ -641,11 +733,17 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         }
     }
 
+    #[allow(dead_code)]
     async fn dispatch(&mut self) -> IoResult<()> {
+        let fuse_connection = self.fuse_connection.clone().unwrap();
+        let fs = self.filesystem.clone().expect("filesystem not init");
+        let max_write = self.init_filesystem(&fs, &fuse_connection).await?.get() as usize;
+        self.dispatch_with_max_write(max_write).await
+    }
+
+    async fn dispatch_with_max_write(&mut self, max_write: usize) -> IoResult<()> {
         let fuse_connection = self.fuse_connection.take().unwrap();
         let fs = self.filesystem.take().expect("filesystem not init");
-
-        let max_write = self.init_filesystem(&fs, &fuse_connection).await?.get() as usize;
         let buffer_size = (max_write + FUSE_WRITE_IN_SIZE).max(FUSE_MIN_READ_BUFFER_SIZE);
 
         let mut header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
@@ -1152,6 +1250,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             unused: [0; 8],
         };
 
+        let has_splice_read = (reply_flags & FUSE_SPLICE_READ) > 0;
+        let has_splice_write = (reply_flags & FUSE_SPLICE_WRITE) > 0;
+        fuse_connection.splice_read.store(has_splice_read, std::sync::atomic::Ordering::Relaxed);
+        fuse_connection.splice_write.store(has_splice_write, std::sync::atomic::Ordering::Relaxed);
+
         debug!("fuse init out {:?}", init_out);
 
         let out_header = fuse_out_header {
@@ -1493,7 +1596,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         .serialize_into(&mut data_buf, &out_header)
                         .expect("won't happened");
 
-                    Either::Right((data_buf, data.data))
+                    Either::Right((data_buf, data.data, data.backing))
                 }
             };
 
@@ -2138,7 +2241,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 request.unique, in_header.nodeid, read_in
             );
 
-            let mut reply_data = match fs
+            let (mut reply_data, backing) = match fs
                 .read(
                     request,
                     in_header.nodeid,
@@ -2154,7 +2257,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     return;
                 }
 
-                Ok(reply_data) => reply_data.data,
+                Ok(reply_data) => (reply_data.data, reply_data.backing),
             };
 
             if reply_data.len() > read_in.size as _ {
@@ -2174,7 +2277,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .expect("won't happened");
 
             let _ = resp_sender
-                .send(Either::Right((data_buf, reply_data)))
+                .send(Either::Right((data_buf, reply_data, backing)))
                 .await;
         });
     }
@@ -2623,7 +2726,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         .serialize_into(&mut data, &out_header)
                         .expect("won't happened");
 
-                    Either::Right((data, xattr_data))
+                    Either::Right((data, xattr_data, None))
                 }
             };
 
@@ -2713,7 +2816,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         .serialize_into(&mut data, &out_header)
                         .expect("won't happened");
 
-                    Either::Right((data, xattr_data))
+                    Either::Right((data, xattr_data, None))
                 }
             };
 
@@ -3004,7 +3107,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .expect("won't happened");
 
             let _ = resp_sender
-                .send(Either::Right((data, entry_data.into())))
+                .send(Either::Right((data, entry_data.into(), None)))
                 .await;
         });
     }
@@ -3992,7 +4095,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .expect("won't happened");
 
             let _ = resp_sender
-                .send(Either::Right((data, entry_data.into())))
+                .send(Either::Right((data, entry_data.into(), None)))
                 .await;
         });
     }
@@ -4252,7 +4355,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
 async fn reply_error_in_place<S>(err: Errno, request: Request, sender: S)
 where
-    S: Sink<Either<Vec<u8>, (Vec<u8>, Bytes)>>,
+    S: Sink<FuseData>,
 {
     let out_header = fuse_out_header {
         len: FUSE_OUT_HEADER_SIZE as u32,
@@ -4267,6 +4370,75 @@ where
     let _ = pin!(sender).send(Either::Left(data)).await;
 }
 
+struct TpcScheduler {
+    senders: Vec<tokio::sync::mpsc::UnboundedSender<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
+    next_idx: std::sync::atomic::AtomicUsize,
+}
+
+impl TpcScheduler {
+    fn new() -> Self {
+        let mut core_ids = core_affinity::get_core_ids().unwrap_or_default();
+        if !core_ids.is_empty() {
+            core_ids.remove(0); // Reserve Core 0 for OS kernel tasks
+        }
+        
+        let mut senders = Vec::new();
+        let core_count = if core_ids.is_empty() {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16)
+        } else {
+            core_ids.len()
+        };
+
+        for i in 0..core_count {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>();
+            senders.push(tx);
+
+            let core_id = if !core_ids.is_empty() {
+                Some(core_ids[i % core_ids.len()])
+            } else {
+                None
+            };
+
+            std::thread::spawn(move || {
+                if let Some(cid) = core_id {
+                    core_affinity::set_for_current(cid);
+                }
+                
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&rt, async move {
+                    while let Some(fut) = rx.recv().await {
+                        tokio::task::spawn_local(fut);
+                    }
+                });
+            });
+        }
+
+        Self {
+            senders,
+            next_idx: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn spawn<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if self.senders.is_empty() {
+            tokio::task::spawn(fut);
+            return;
+        }
+        let idx = self.next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.senders.len();
+        let _ = self.senders[idx].send(Box::pin(fut));
+    }
+}
+
+static TPC_SCHEDULER: once_cell::sync::Lazy<TpcScheduler> = once_cell::sync::Lazy::new(TpcScheduler::new);
+
 #[inline]
 fn spawn<F>(span: Span, fut: F)
 where
@@ -4274,8 +4446,157 @@ where
     F::Output: Send + 'static,
 {
     #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
-    task::spawn(fut.instrument(span));
+    {
+        TPC_SCHEDULER.spawn(async move {
+            let _ = fut.instrument(span).await;
+        });
+    }
 
     #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
     task::spawn(fut.instrument(span)).detach()
+}
+
+pub fn tpc_spawn<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    TPC_SCHEDULER.spawn(fut);
+}
+
+pub fn tpc_thread_count() -> usize {
+    TPC_SCHEDULER.senders.len()
+}
+
+struct ThreadPipe {
+    rx: std::os::fd::RawFd,
+    tx: std::os::fd::RawFd,
+}
+
+impl ThreadPipe {
+    fn new() -> Option<Self> {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == 0 {
+            let rx = fds[0];
+            let tx = fds[1];
+            unsafe {
+                libc::fcntl(tx, libc::F_SETPIPE_SZ, 4 * 1024 * 1024);
+            }
+            Some(ThreadPipe { rx, tx })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ThreadPipe {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.rx);
+            libc::close(self.tx);
+        }
+    }
+}
+
+thread_local! {
+    static PIPE: std::cell::RefCell<Option<ThreadPipe>> = std::cell::RefCell::new(ThreadPipe::new());
+}
+
+fn splice_reply(
+    fd: std::os::fd::RawFd,
+    header: &[u8],
+    payload: &[u8],
+) -> std::io::Result<usize> {
+    PIPE.with(|pipe_cell| {
+        let mut pipe_opt = pipe_cell.borrow_mut();
+        if pipe_opt.is_none() {
+            *pipe_opt = ThreadPipe::new();
+        }
+        let pipe = pipe_opt.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Pipe not initialized")
+        })?;
+
+        fn run_splice(tx: std::os::fd::RawFd, rx: std::os::fd::RawFd, target_fd: std::os::fd::RawFd, header: &[u8], payload: &[u8]) -> std::io::Result<usize> {
+            let mut written_header = 0;
+            while written_header < header.len() {
+                let res = unsafe {
+                    libc::write(
+                        tx,
+                        header[written_header..].as_ptr() as *const libc::c_void,
+                        header.len() - written_header,
+                    )
+                };
+                if res < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                written_header += res as usize;
+            }
+
+            let mut written_payload = 0;
+            while written_payload < payload.len() {
+                let iov = libc::iovec {
+                    iov_base: payload[written_payload..].as_ptr() as *mut libc::c_void,
+                    iov_len: payload.len() - written_payload,
+                };
+                let res = unsafe {
+                    libc::vmsplice(
+                        tx,
+                        &iov as *const libc::iovec,
+                        1,
+                        libc::SPLICE_F_GIFT | libc::SPLICE_F_NONBLOCK,
+                    )
+                };
+                if res < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if res == 0 {
+                    break;
+                }
+                written_payload += res as usize;
+            }
+
+            let total_len = header.len() + payload.len();
+            let mut spliced = 0;
+            while spliced < total_len {
+                let res = unsafe {
+                    libc::splice(
+                        rx,
+                        std::ptr::null_mut(),
+                        target_fd,
+                        std::ptr::null_mut(),
+                        total_len - spliced,
+                        libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                    )
+                };
+                if res < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if res == 0 {
+                    break;
+                }
+                spliced += res as usize;
+            }
+
+            Ok(spliced)
+        }
+
+        match run_splice(pipe.tx, pipe.rx, fd, header, payload) {
+            Ok(spliced) => Ok(spliced),
+            Err(err) => {
+                *pipe_opt = ThreadPipe::new();
+                Err(err)
+            }
+        }
+    })
 }

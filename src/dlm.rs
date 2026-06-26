@@ -634,7 +634,7 @@ enum HeartbeatCommand {
 }
 
 struct ActiveLease {
-    lock_key: String,
+    _lock_key: String,
     client_id: String,
     ttl_ms: u64,
     next_renewal: tokio::time::Instant,
@@ -661,7 +661,7 @@ async fn run_heartbeat_manager(
                         let interval_dur = Duration::from_millis(ttl_ms / 3);
                         let next_renewal = Instant::now() + interval_dur;
                         leases.insert(lock_key.clone(), ActiveLease {
-                            lock_key,
+                            _lock_key: lock_key,
                             client_id,
                             ttl_ms,
                             next_renewal,
@@ -738,7 +738,7 @@ async fn run_heartbeat_manager(
                         con_opt = Some(con);
                         for (key, success) in renewals {
                             if success {
-                                if let Some(mut lease) = leases.get_mut(&key) {
+                                if let Some(lease) = leases.get_mut(&key) {
                                     debug!("Heartbeat manager: Successfully renewed lease for key: {}", key);
                                     let interval_dur = Duration::from_millis(lease.ttl_ms / 3);
                                     lease.next_renewal = Instant::now() + interval_dur;

@@ -1836,7 +1836,7 @@ impl Filesystem for SqueezefsFilesystem {
             let cached_size = self.attr_cache.get(&ino).map(|e| e.value().0.size);
             let cached_meta = self.router.metadata_cache.get(&file_path);
 
-            let mut file_type = String::new();
+            let file_type;
 
             let (old_size, is_striped) = match (cached_size, cached_meta.clone()) {
                 (Some(s), Some(m)) => {

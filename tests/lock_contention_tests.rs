@@ -1,7 +1,7 @@
 use squeezefs::cache::lru::LruCache;
 use squeezefs::dlm::BoundConnection;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[test]
 fn test_lru_cache_sharding_count() {
@@ -45,7 +45,7 @@ async fn test_bound_connection_rwlock_concurrency() {
     };
 
     let bound = BoundConnection {
-        conn: Arc::new(RwLock::new(conn)),
+        conn: Arc::new(tokio::sync::RwLock::new(conn)),
         local_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379),
         conn_info: client.get_connection_info().clone(),
@@ -57,7 +57,7 @@ async fn test_bound_connection_rwlock_concurrency() {
         let bound_clone = bound.clone();
         let handle = tokio::spawn(async move {
             // Read-locking bound.conn should be completely concurrent (no blocking)
-            let _conn_clone = bound_clone.conn.read().unwrap().clone();
+            let _conn_clone = bound_clone.conn.read().await.clone();
         });
         handles.push(handle);
     }

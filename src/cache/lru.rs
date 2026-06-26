@@ -2,13 +2,13 @@ use crate::error::Result;
 use bytes::Bytes;
 use std::sync::Arc;
 
-type EvictReceiver = tokio::sync::mpsc::UnboundedReceiver<(String, Bytes)>;
+type EvictReceiver = tokio::sync::mpsc::Receiver<(String, Bytes)>;
 
 #[derive(Clone)]
 pub struct LruCache {
     inner: Arc<hypertier::memory::MemoryCache>,
     max_bytes: u64,
-    evict_tx: tokio::sync::mpsc::UnboundedSender<(String, Bytes)>,
+    evict_tx: tokio::sync::mpsc::Sender<(String, Bytes)>,
     evict_rx: Arc<std::sync::Mutex<Option<EvictReceiver>>>,
 }
 
@@ -57,7 +57,7 @@ impl LruCache {
             actual_bytes as usize,
             actual_shards,
         ));
-        let (evict_tx, evict_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (evict_tx, evict_rx) = tokio::sync::mpsc::channel(16384);
         Self {
             inner,
             max_bytes: actual_bytes,
@@ -84,7 +84,7 @@ impl LruCache {
             let evicted = self.inner.put(key_bytes, data);
             for (ek, ev) in evicted {
                 if let Ok(k_str) = String::from_utf8(ek.to_vec()) {
-                    let _ = self.evict_tx.send((k_str, ev));
+                    let _ = self.evict_tx.try_send((k_str, ev));
                 }
             }
         }

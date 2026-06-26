@@ -190,8 +190,9 @@ impl ConnectionLike for MetaConnection {
                                 }
                             } else if let Some(client_ref) = &client_opt {
                                 warn!("Cached Redis connection broken: {:?}. Reconnecting...", e);
+                                let db = client_ref.get_connection_info().redis.db;
                                 let addr_str =
-                                    format!("{:?}", client_ref.get_connection_info().addr);
+                                    format!("{:?}/{}", client_ref.get_connection_info().addr, db);
                                 match client_ref.get_multiplexed_tokio_connection().await {
                                     Ok(new_conn) => {
                                         SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
@@ -267,8 +268,9 @@ impl ConnectionLike for MetaConnection {
                                 }
                             } else if let Some(client_ref) = &client_opt {
                                 warn!("Cached Redis connection broken in pipeline: {:?}. Reconnecting...", e);
+                                let db = client_ref.get_connection_info().redis.db;
                                 let addr_str =
-                                    format!("{:?}", client_ref.get_connection_info().addr);
+                                    format!("{:?}/{}", client_ref.get_connection_info().addr, db);
                                 match client_ref.get_multiplexed_tokio_connection().await {
                                     Ok(new_conn) => {
                                         SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
@@ -538,7 +540,8 @@ impl MetaClient {
     pub async fn get_connection(&self) -> Result<MetaConnection> {
         match self {
             Self::Single(client) => {
-                let addr_str = format!("{:?}", client.get_connection_info().addr);
+                let db = client.get_connection_info().redis.db;
+                let addr_str = format!("{:?}/{}", client.get_connection_info().addr, db);
                 let conn = if let Some(conn) = SINGLE_CONN_POOL.get(&addr_str).map(|r| r.clone()) {
                     conn
                 } else {

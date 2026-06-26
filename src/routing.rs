@@ -1728,13 +1728,16 @@ impl DataRouter {
             .acquire_lock(dest, None, std::time::Duration::from_secs(5))
             .await?;
 
-        let src_ino = crate::dlm::parse_inode_from_key(&format!("metadata:{}", src))
-            .ok_or_else(|| SqueezefsError::InvalidOperation(format!("Invalid src key: {}", src)))?;
-        let dest_ino = crate::dlm::parse_inode_from_key(&format!("metadata:{}", dest))
-            .ok_or_else(|| SqueezefsError::InvalidOperation(format!("Invalid dest key: {}", dest)))?;
-
-        let mut src_con = self.dlm.get_connection_for_inode(src_ino).await?;
-        let mut dest_con = self.dlm.get_connection_for_inode(dest_ino).await?;
+        let mut src_con = if let Some(src_ino) = crate::dlm::parse_inode_from_key(&format!("metadata:{}", src)) {
+            self.dlm.get_connection_for_inode(src_ino).await?
+        } else {
+            self.dlm.get_connection().await?
+        };
+        let mut dest_con = if let Some(dest_ino) = crate::dlm::parse_inode_from_key(&format!("metadata:{}", dest)) {
+            self.dlm.get_connection_for_inode(dest_ino).await?
+        } else {
+            self.dlm.get_connection().await?
+        };
         let mut con = self.dlm.get_connection().await?;
 
         let src_meta_key = format!("metadata:{}", src);

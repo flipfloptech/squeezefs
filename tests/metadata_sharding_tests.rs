@@ -1,9 +1,6 @@
 use redis::AsyncCommands;
-use squeezefs::dlm::{DlmClient, MetaClient};
-use squeezefs::fuse_client::{format_volume_ext, get_volume_status, SqueezefsFilesystem};
-use squeezefs::routing::DataRouter;
-use std::time::Duration;
-use tempfile::tempdir;
+use squeezefs::dlm::DlmClient;
+use squeezefs::fuse_client::{format_volume_ext, get_volume_status};
 
 fn get_sharded_redis_url() -> String {
     // We target three separate database indexes (1, 2, 3) on the local Redis/Garnet instance to act as separate shards.

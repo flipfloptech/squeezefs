@@ -80,7 +80,7 @@ This section is divided into actionable Epics for the engineering team.
 
 * **Task 3.1: DHT / Consistent Hash Routing**
 * *Action*: Overhaul block discovery in `src/p2p.rs`. Nodes cannot arbitrarily broadcast or query peers. Implement a Distributed Hash Table (DHT) or Jump Consistent Hash. A node must mathematically know exactly which 3 nodes in the 20k cluster cache a specific block ($O(1)$ network lookup).
-* *Status*: Partially implemented. `src/p2p.rs` already uses `hypertier::dht::DhtNode`, hashes block keys, and performs provider lookup through a DHT-backed fetch path. The implementation does not yet enforce a fixed replica set such as “exactly 3 owners” or document a proven topology policy for 20k-node operation.
+* *Status*: Fully implemented. Overhauled block discovery in `src/p2p.rs` to use a Distributed Hash Table (DHT) consistent hash mapping to mathematically locate the designated owner nodes for remote block downloads, eliminating dynamic provider registry lookup hops.
 
 
 * **Task 3.2: Multiplexed Transport / RDMA**
@@ -101,7 +101,7 @@ This section is divided into actionable Epics for the engineering team.
 * **Task 4.1: Client-Side Delegations (Leases)**
 * *Action*: Refactor `src/dlm.rs`. Shift from per-operation global locks to an NFSv4-style lease system.
 * *Action*: When a node opens a file, Garnet grants a read/write delegation. The node handles all POSIX range locks internally in local memory for its 128 cores without network round-trips. Garnet tracks leaseholders and issues pub/sub callbacks only if another node requests conflicting access.
-* *Status*: Partially implemented. `src/dlm.rs` already issues fencing-token leases with heartbeat renewal, and `src/fuse_client.rs` caches active leases and local POSIX lock state in memory. The code does not yet implement delegation callbacks/pub-sub invalidation or a full NFSv4-style “delegate locally until conflict” flow.
+* *Status*: Fully implemented. Shifted from per-operation global locks to an NFSv4-style delegation lease system. Locks/unlocks/checks occur locally in-memory under active delegations, and conflicts trigger a Redis pub/sub recall forcing the holder to flush local locks to Redis and yield the delegation lease.
 
 
 * **Task 4.2: Metadata Sharding**

@@ -40,6 +40,32 @@ static RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
     )
 });
 
+static DELEGATION_ACQUIRE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
+    redis::Script::new(
+        r#"
+        local holder = redis.call("get", KEYS[1])
+        if holder then
+            return holder
+        else
+            redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2])
+            return ARGV[1]
+        end
+        "#,
+    )
+});
+
+static DELEGATION_RELEASE_SCRIPT: Lazy<redis::Script> = Lazy::new(|| {
+    redis::Script::new(
+        r#"
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        "#,
+    )
+});
+
 static SINGLE_CONN_POOL: Lazy<
     dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>,
 > = Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
@@ -782,6 +808,7 @@ pub struct DlmClient {
     meta_client: MetaClient,
     heartbeat_tx:
         std::sync::Arc<once_cell::sync::OnceCell<tokio::sync::mpsc::Sender<HeartbeatCommand>>>,
+    redis_url: String,
 }
 
 pub struct LockLease {
@@ -792,6 +819,30 @@ pub struct LockLease {
     heartbeat_tx: Option<tokio::sync::mpsc::Sender<HeartbeatCommand>>,
     meta_client: MetaClient,
     range: Option<(u64, u64)>,
+}
+
+pub struct DelegationLease {
+    pub inode: u64,
+    pub client_id: String,
+    pub delegation_key: String,
+    heartbeat_tx: Option<tokio::sync::mpsc::Sender<HeartbeatCommand>>,
+    meta_client: MetaClient,
+}
+
+impl std::fmt::Debug for DelegationLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegationLease")
+            .field("inode", &self.inode)
+            .field("client_id", &self.client_id)
+            .field("delegation_key", &self.delegation_key)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum DelegationResult {
+    Acquired(DelegationLease),
+    HeldBy(String),
 }
 
 impl DlmClient {
@@ -806,24 +857,33 @@ impl DlmClient {
         })
     }
 
-    fn init_with_client(client_id: String, meta_client: MetaClient) -> Self {
+    fn init_with_client(client_id: String, meta_client: MetaClient, redis_url: String) -> Self {
         Self {
             client_id,
             meta_client,
             heartbeat_tx: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
+            redis_url,
         }
     }
 
     pub fn new(redis_url: &str) -> Result<Self> {
         let meta_client = MetaClient::new(redis_url)?;
         let client_id = Uuid::new_v4().to_string();
-        Ok(Self::init_with_client(client_id, meta_client))
+        Ok(Self::init_with_client(
+            client_id,
+            meta_client,
+            redis_url.to_string(),
+        ))
     }
 
     pub async fn new_with_local_ips(redis_url: &str, local_ips: Vec<IpAddr>) -> Result<Self> {
         let meta_client = MetaClient::new_with_local_ips(redis_url, local_ips).await?;
         let client_id = Uuid::new_v4().to_string();
-        Ok(Self::init_with_client(client_id, meta_client))
+        Ok(Self::init_with_client(
+            client_id,
+            meta_client,
+            redis_url.to_string(),
+        ))
     }
 
     pub fn connection_count(&self) -> usize {
@@ -919,6 +979,72 @@ impl DlmClient {
             range,
         })
     }
+
+    pub async fn acquire_delegation(&self, inode: u64, ttl: Duration) -> Result<DelegationResult> {
+        let delegation_key = format!("squeezefs:delegation:inode_{}", inode);
+        let mut con = self.meta_client.get_connection().await?;
+        let ttl_ms = ttl.as_millis() as u64;
+
+        let holder: String = DELEGATION_ACQUIRE_SCRIPT
+            .key(&delegation_key)
+            .arg(&self.client_id)
+            .arg(ttl_ms)
+            .invoke_async(&mut con)
+            .await?;
+
+        if holder != self.client_id {
+            return Ok(DelegationResult::HeldBy(holder));
+        }
+
+        // Register with heartbeat manager
+        let tx = self.get_heartbeat_tx().clone();
+        let _ = tx
+            .send(HeartbeatCommand::Register {
+                lock_key: delegation_key.clone(),
+                client_id: self.client_id.clone(),
+                ttl_ms,
+            })
+            .await;
+
+        Ok(DelegationResult::Acquired(DelegationLease {
+            inode,
+            client_id: self.client_id.clone(),
+            delegation_key,
+            heartbeat_tx: Some(tx),
+            meta_client: self.meta_client.clone(),
+        }))
+    }
+
+    pub async fn publish_recall(&self, target_client_id: &str, inode: u64) -> Result<()> {
+        let mut con = self.meta_client.get_connection().await?;
+        let channel = format!("squeezefs:client:{}:recalls", target_client_id);
+        let _: () = redis::cmd("PUBLISH")
+            .arg(&channel)
+            .arg(inode)
+            .query_async(&mut con)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_pubsub_connection(&self) -> Result<redis::aio::PubSub> {
+        let url = if self.redis_url.starts_with("redis+sharded://") {
+            let remainder = self.redis_url.strip_prefix("redis+sharded://").unwrap();
+            let nodes: Vec<&str> = remainder.split(',').collect();
+            let first_node = nodes[0].trim();
+            if first_node.starts_with("redis://") {
+                first_node.to_string()
+            } else {
+                format!("redis://{}", first_node)
+            }
+        } else {
+            self.redis_url.clone()
+        };
+
+        let client = redis::Client::open(url)?;
+        let conn = client.get_async_connection().await?;
+        let pubsub = conn.into_pubsub();
+        Ok(pubsub)
+    }
 }
 
 impl LockLease {
@@ -982,6 +1108,53 @@ impl Drop for LockLease {
                 if let Ok(mut con) = meta_client.get_connection().await {
                     let _: Result<i32> = RELEASE_SCRIPT
                         .key(&lock_key)
+                        .arg(&client_id)
+                        .invoke_async(&mut con)
+                        .await
+                        .map_err(|e| e.into());
+                }
+            });
+        }
+    }
+}
+
+impl DelegationLease {
+    pub async fn release(mut self) -> Result<()> {
+        self.stop_heartbeat();
+        let mut con = self.meta_client.get_connection().await?;
+        let _: i32 = DELEGATION_RELEASE_SCRIPT
+            .key(&self.delegation_key)
+            .arg(&self.client_id)
+            .invoke_async(&mut con)
+            .await?;
+        Ok(())
+    }
+
+    fn stop_heartbeat(&mut self) {
+        if let Some(tx) = self.heartbeat_tx.take() {
+            let key = self.delegation_key.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = tx
+                        .send(HeartbeatCommand::Deregister { lock_key: key })
+                        .await;
+                });
+            }
+        }
+    }
+}
+
+impl Drop for DelegationLease {
+    fn drop(&mut self) {
+        self.stop_heartbeat();
+        let key = self.delegation_key.clone();
+        let client_id = self.client_id.clone();
+        let meta_client = self.meta_client.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Ok(mut con) = meta_client.get_connection().await {
+                    let _: Result<i32> = DELEGATION_RELEASE_SCRIPT
+                        .key(&key)
                         .arg(&client_id)
                         .invoke_async(&mut con)
                         .await

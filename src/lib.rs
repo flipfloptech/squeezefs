@@ -4,6 +4,7 @@
     clippy::redundant_closure
 )]
 pub mod tiering;
+pub mod nvme_writer;
 
 pub mod backend;
 pub mod cache;

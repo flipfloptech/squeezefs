@@ -135,7 +135,10 @@ pub fn pool_list() -> Result<()> {
         .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to execute vgs: {}", e)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SqueezefsError::InvalidOperation(format!("Command vgs failed: {}", stderr)));
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Command vgs failed: {}",
+            stderr
+        )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!("{}", stdout);
@@ -148,10 +151,12 @@ pub fn volume_list() -> Result<()> {
         .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to execute lvs: {}", e)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SqueezefsError::InvalidOperation(format!("Command lvs failed: {}", stderr)));
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Command lvs failed: {}",
+            stderr
+        )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!("{}", stdout);
     Ok(())
 }
-

@@ -2318,7 +2318,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let staging_segment_dir = dir.join("staging_segment");
                 if staging_segment_dir.exists() {
                     let write_cap = max_write_bytes as usize / staging_dirs.len();
-                    if let Ok(cache) = crate::tiering::nvme::NvmeCache::new(
+                    if let Ok(cache) = squeezefs::tiering::nvme::NvmeCache::new(
                         &[staging_segment_dir.as_path()],
                         &[write_cap],
                         16,

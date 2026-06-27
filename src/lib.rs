@@ -4,9 +4,9 @@
     clippy::redundant_closure
 )]
 pub mod tiering;
-pub mod nvme_writer;
+pub mod nvme_dev;
 
-pub mod backend;
+
 pub mod cache;
 pub mod config_ops;
 pub mod crypto_compress;
@@ -30,3 +30,4 @@ macro_rules! coz_progress {
     };
 }
 pub mod block_allocator;
+pub mod defrag;

@@ -4,7 +4,6 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use redis::AsyncCommands;
-use squeezefs::backend::{MultiBackendClient, RustFsClient};
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{start_mount, SqueezefsFilesystem};
@@ -73,16 +72,12 @@ enum Commands {
         disk_cache_paths: Option<Vec<PathBuf>>,
         /// S3 compatible object store endpoint url
         #[arg(long, alias = "endpoint")]
-        s3_endpoint: Option<String>,
         /// S3 compatible object store access key
         #[arg(long, alias = "access-key")]
-        s3_access_key: Option<String>,
         /// S3 compatible object store secret key
         #[arg(long, alias = "secret-key")]
-        s3_secret_key: Option<String>,
         /// S3 compatible object store bucket name
         #[arg(long, alias = "bucket")]
-        s3_bucket: Option<String>,
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
         force: bool,
@@ -149,16 +144,12 @@ enum Commands {
 
         /// S3 compatible object store endpoint url (overrides stored configuration)
         #[arg(long, alias = "endpoint")]
-        s3_endpoint: Option<String>,
         /// S3 compatible object store access key (overrides stored configuration)
         #[arg(long, alias = "access-key")]
-        s3_access_key: Option<String>,
         /// S3 compatible object store secret key (overrides stored configuration)
         #[arg(long, alias = "secret-key")]
-        s3_secret_key: Option<String>,
         /// S3 compatible object store bucket name (overrides stored configuration)
         #[arg(long, alias = "bucket")]
-        s3_bucket: Option<String>,
 
         /// Run FUSE daemon in the background (detach from terminal)
         #[arg(long)]
@@ -240,6 +231,18 @@ enum Commands {
         /// Destination file path
         dest: String,
     },
+    /// Defragment a formatted SqueezeFS volume
+    Defrag {
+        /// Garnet/Redis URL (e.g. redis://127.0.0.1:6379/)
+        #[arg(long, default_value = "redis://127.0.0.1:6379/")]
+        redis_url: String,
+        /// Volume name (filesystem name)
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// NVMe device path
+        #[arg(long)]
+        nvme_path: String,
+    },
     /// Automatically tune client node configurations (requires root/sudo to apply changes)
     Tune,
     /// Configuration management utility
@@ -307,9 +310,6 @@ enum NvmeofActions {
 
 #[derive(Subcommand, Debug, Clone)]
 enum ConfigActions {
-    /// Manage storage backends
-    #[command(subcommand, alias = "backends")]
-    Backend(BackendActions),
     /// Manage staging disk caches
     #[command(subcommand, alias = "diskcaches")]
     DiskCache(DiskCacheActions),
@@ -357,47 +357,6 @@ enum DiskCacheActions {
         path: String,
     },
     /// List all staging disk caches and their status
-    List,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-enum BackendActions {
-    /// Add a storage backend
-    Add {
-        /// Name/ID of the backend (e.g. backend_1, my-rustfs)
-        name: String,
-        /// S3 compatible object store endpoint url
-        #[arg(long, alias = "endpoint")]
-        s3_endpoint: String,
-        /// S3 compatible object store access key
-        #[arg(long, alias = "access-key", default_value = "admin")]
-        s3_access_key: String,
-        /// S3 compatible object store secret key
-        #[arg(long, alias = "secret-key", default_value = "password")]
-        s3_secret_key: String,
-        /// S3 compatible object store bucket name
-        #[arg(long, alias = "bucket", default_value = "squeezefs-data")]
-        s3_bucket: String,
-    },
-    /// Remove a storage backend
-    Remove {
-        /// Name of the backend
-        name: String,
-        /// Force removal ignoring safety checks
-        #[arg(long)]
-        force: bool,
-    },
-    /// Enable a storage backend for writes
-    Enable {
-        /// Name of the backend
-        name: String,
-    },
-    /// Disable a storage backend (no new writes, but existing blocks are still readable)
-    Disable {
-        /// Name of the backend
-        name: String,
-    },
-    /// List all storage backends and their status
     List,
 }
 
@@ -510,10 +469,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mem_cache_size,
         disk_cache_size,
         disk_cache_paths,
-        s3_endpoint,
-        s3_access_key,
-        s3_secret_key,
-        s3_bucket,
         daemon,
         no_writeback,
         max_background_uploads,
@@ -584,10 +539,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             read_mem_cache_size.as_deref(),
             write_mem_cache_size.as_deref(),
             disk_cache_paths.as_deref(),
-            s3_endpoint.as_deref(),
-            s3_access_key.as_deref(),
-            s3_secret_key.as_deref(),
-            s3_bucket.as_deref(),
             writeback,
             *max_background_uploads,
             *allow_other,
@@ -861,10 +812,6 @@ fn print_mount_diagnostics(
     read_mem_cache_size: Option<&str>,
     write_mem_cache_size: Option<&str>,
     disk_cache_paths: Option<&[PathBuf]>,
-    s3_endpoint: Option<&str>,
-    s3_access_key: Option<&str>,
-    s3_secret_key: Option<&str>,
-    s3_bucket: Option<&str>,
     writeback: bool,
     max_background_uploads: usize,
     allow_other: bool,
@@ -988,46 +935,6 @@ fn print_mount_diagnostics(
         vec![get_default_staging_dir()]
     };
 
-    let final_s3_endpoint = s3_endpoint
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("RUSTFS_ENDPOINT").ok())
-        .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
-        .or_else(|| {
-            format_fields
-                .get("s3_endpoint")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        });
-    let final_s3_access_key = s3_access_key
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("RUSTFS_ACCESS_KEY").ok())
-        .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
-        .or_else(|| {
-            format_fields
-                .get("s3_access_key")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        });
-    let final_s3_secret_key = s3_secret_key
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("RUSTFS_SECRET_KEY").ok())
-        .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
-        .or_else(|| {
-            format_fields
-                .get("s3_secret_key")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        });
-    let final_s3_bucket = s3_bucket
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("RUSTFS_BUCKET").ok())
-        .or_else(|| {
-            format_fields
-                .get("s3_bucket")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        });
-
     let active_be_id = format_fields
         .get("active_write_backend")
         .cloned()
@@ -1051,26 +958,6 @@ fn print_mount_diagnostics(
         .map(|s| !s.is_empty())
         .unwrap_or(false);
 
-    let masked_access_key = final_s3_access_key
-        .as_ref()
-        .map(|s| {
-            if s.is_empty() {
-                "none".to_string()
-            } else {
-                "******".to_string()
-            }
-        })
-        .unwrap_or_else(|| "none".to_string());
-    let masked_secret_key = final_s3_secret_key
-        .as_ref()
-        .map(|s| {
-            if s.is_empty() {
-                "none".to_string()
-            } else {
-                "******".to_string()
-            }
-        })
-        .unwrap_or_else(|| "none".to_string());
     let masked_encrypt_key = if encrypt_key_present {
         "******".to_string()
     } else {
@@ -1121,16 +1008,6 @@ fn print_mount_diagnostics(
     println!("  Disk Cache Paths: {:?}", staging_dirs);
     println!("Storage Backend:");
     println!("  Active Backend: {:?}", active_be_id);
-    println!(
-        "  S3 Endpoint: {:?}",
-        final_s3_endpoint.as_deref().unwrap_or("")
-    );
-    println!("  S3 Access Key: {}", masked_access_key);
-    println!("  S3 Secret Key: {}", masked_secret_key);
-    println!(
-        "  S3 Bucket: {:?}",
-        final_s3_bucket.as_deref().unwrap_or("squeezefs-data")
-    );
     println!("Security & Compression:");
     println!("  Compression: {:?}", compression);
     println!("  Encryption Algorithm: {:?}", encrypt_algo);
@@ -1170,25 +1047,6 @@ fn parse_human_readable_size(s: &str) -> Result<u64, String> {
     Ok(base_val * multiplier)
 }
 
-async fn test_storage(client: &RustFsClient) -> Result<(), Box<dyn std::error::Error>> {
-    let key = format!("testing/{}", uuid::Uuid::new_v4());
-    let test_data = vec![42u8; 100];
-
-    // Put object
-    client
-        .put_object(&key, bytes::Bytes::from(test_data.clone()), 1)
-        .await?;
-
-    // Get object
-    let read_data = client.get_object(&key).await?;
-    if read_data != test_data {
-        return Err("Read data does not match written data".into());
-    }
-
-    // Delete object
-    client.delete_object(&key).await?;
-    Ok(())
-}
 
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
@@ -1199,10 +1057,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
-            s3_endpoint,
-            s3_access_key,
-            s3_secret_key,
-            s3_bucket,
             force,
             quick,
             inodes,
@@ -1333,27 +1187,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ).into());
             }
 
-            // 4. S3 parameters consistency
-            let has_s3_endpoint = s3_endpoint.is_some()
-                || std::env::var("RUSTFS_ENDPOINT").is_ok()
-                || std::env::var("AWS_ENDPOINT_URL").is_ok();
-
-            let has_other_s3_params = s3_access_key.is_some()
-                || s3_secret_key.is_some()
-                || s3_bucket.is_some()
-                || std::env::var("RUSTFS_ACCESS_KEY").is_ok()
-                || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-                || std::env::var("RUSTFS_SECRET_KEY").is_ok()
-                || std::env::var("AWS_SECRET_ACCESS_KEY").is_ok()
-                || std::env::var("RUSTFS_BUCKET").is_ok()
-                || std::env::var("AWS_BUCKET").is_ok();
-
-            if has_other_s3_params && !has_s3_endpoint {
-                return Err("S3 bucket or credential parameters were provided, but no S3 endpoint was specified. \
-                             If you want to use S3 storage, you must provide --s3-endpoint or set the RUSTFS_ENDPOINT environment variable. \
-                             If you intended to use the in-memory mock store, please omit all S3 parameters.".into());
-            }
-
             // 5. Human readable size limits validation
             if let Some(ref sz) = mem_cache_size
                 .as_ref()
@@ -1409,15 +1242,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             squeezefs::cache::parse_duration(&upload_delay)?;
 
-            if !has_s3_endpoint {
-                println!(
-                    "{} {}",
-                    "WARNING:".yellow().bold(),
-                    "No S3 endpoint provided. SqueezeFS will fall back to an IN-MEMORY mock store. ALL DATA WILL BE LOST when the mount daemon terminates."
-                        .yellow()
-                );
-            }
-
             squeezefs::fuse_client::format_volume_ext(
                 redis_url,
                 &name,
@@ -1430,10 +1254,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 mem_cache_size.as_deref(),
                 disk_cache_size.as_deref(),
                 disk_cache_paths.as_deref(),
-                s3_endpoint.as_deref(),
-                s3_access_key.as_deref(),
-                s3_secret_key.as_deref(),
-                s3_bucket.as_deref(),
+                None, // nvme_target_path
                 read_cache_size.as_deref(),
                 write_cache_size.as_deref(),
                 read_mem_cache_size.as_deref(),
@@ -1458,10 +1279,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             disk_cache_size,
             disk_cache_paths,
             local_ips,
-            s3_endpoint,
-            s3_access_key,
-            s3_secret_key,
-            s3_bucket,
             daemon: _,
             uid,
             gid,
@@ -1469,7 +1286,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             no_writeback,
             max_background_uploads,
             allow_other,
-            check_storage,
+            check_storage: _check_storage,
             options,
             read_cache_size,
             write_cache_size,
@@ -1697,137 +1514,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Tune host parameters automatically
             let _ = tune_system();
 
-            log::info!("Resolving backend object store configuration...");
-            if s3_endpoint.is_some()
-                || s3_access_key.is_some()
-                || s3_secret_key.is_some()
-                || s3_bucket.is_some()
-            {
-                return Err("Backend overrides on mount are not allowed. Please configure backends using 'squeezefs backend'.".into());
-            }
-
-            log::info!("Resolving backend object store configuration...");
-            // Load S3 settings: Env variables > Garnet stored settings
-            let final_s3_endpoint = std::env::var("RUSTFS_ENDPOINT")
-                .ok()
-                .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
-                .or_else(|| {
-                    format_fields
-                        .get("s3_endpoint")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                });
-            let final_s3_access_key = std::env::var("RUSTFS_ACCESS_KEY")
-                .ok()
-                .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
-                .or_else(|| {
-                    format_fields
-                        .get("s3_access_key")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                });
-            let final_s3_secret_key = std::env::var("RUSTFS_SECRET_KEY")
-                .ok()
-                .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
-                .or_else(|| {
-                    format_fields
-                        .get("s3_secret_key")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                });
-            let final_s3_bucket = std::env::var("RUSTFS_BUCKET").ok().or_else(|| {
-                format_fields
-                    .get("s3_bucket")
-                    .filter(|s| !s.is_empty())
-                    .cloned()
-            });
-
-            // Retrieve registered backends or initialize the default one
-            let multi_backend = MultiBackendClient::new();
-
-            // Read all registered backends and their statuses from Garnet
-            if let Ok(mut con) = dlm.meta_client().get_connection().await {
-                let backends_map: std::collections::HashMap<String, String> =
-                    con.hgetall("squeezefs:backends").await.unwrap_or_default();
-                let statuses_map: std::collections::HashMap<String, String> = con
-                    .hgetall("squeezefs:backend:status")
-                    .await
-                    .unwrap_or_default();
-
-                for (be_id, be_json) in backends_map {
-                    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
-                        let ep = config["endpoint"].as_str().map(|s| s.to_string());
-                        let ak = config["access_key"].as_str().map(|s| s.to_string());
-                        let sk = config["secret_key"].as_str().map(|s| s.to_string());
-                        let bu = config["bucket"].as_str().map(|s| s.to_string());
-
-                        log::info!(
-                            "Registering storage backend: {} (S3 endpoint: {:?}, bucket: {:?})",
-                            be_id,
-                            ep.as_deref().unwrap_or("default"),
-                            bu.as_deref().unwrap_or("squeezefs-data")
-                        );
-
-                        let client = RustFsClient::new_with_local_ips(
-                            local_ips.clone().unwrap_or_default(),
-                            ep,
-                            ak,
-                            sk,
-                            bu,
-                        )
-                        .await;
-                        multi_backend.register_backend(&be_id, client);
-
-                        if let Some(status) = statuses_map.get(&be_id) {
-                            multi_backend.set_backend_status(&be_id, status);
-                            log::info!("Set storage backend status: {} -> {}", be_id, status);
-                        }
-                    }
-                }
-
-                for (be_id, status) in statuses_map {
-                    multi_backend.set_backend_status(&be_id, &status);
-                }
-            }
-
-            // Determine active write backend
-            let active_be_id = format_fields
-                .get("active_write_backend")
-                .cloned()
-                .unwrap_or_else(|| "backend_0".to_string());
-
-            // Ensure we have at least backend_0 registered if no backends were found
-            if !multi_backend.has_backend("backend_0") {
-                log::info!("Registering default storage backend: backend_0");
-                let default_client = RustFsClient::new_with_local_ips(
-                    local_ips.clone().unwrap_or_default(),
-                    final_s3_endpoint.clone(),
-                    final_s3_access_key.clone(),
-                    final_s3_secret_key.clone(),
-                    final_s3_bucket.clone(),
+            log::info!("Initializing NVMe-oF Block Allocator and Block Device...");
+            let block_alloc = std::sync::Arc::new(
+                squeezefs::block_allocator::BlockAllocator::new(
+                    std::sync::Arc::new(dlm.meta_client().clone()),
+                    &fs_name,
                 )
-                .await;
-                multi_backend.register_backend("backend_0", default_client);
-            }
-
-            multi_backend.set_active_backend_id(active_be_id.clone());
-            log::info!("Active write storage backend set to: {}", active_be_id);
-
-            let active_client = multi_backend
-                .get_backend(&active_be_id)
-                .or_else(|| multi_backend.get_backend("backend_0"))
-                .ok_or("No storage backend client available")?;
-
-            if check_storage {
-                log::info!("Running storage connectivity check...");
-                let start = std::time::Instant::now();
-                if let Err(e) = test_storage(&active_client).await {
-                    log::error!("Object storage check failed: {:?}", e);
-                    return Err(format!("Object storage check failed: {:?}", e).into());
-                } else {
-                    log::info!("Object storage check passed in {:?}", start.elapsed());
-                }
-            }
+                .await?,
+            );
+            
+            // Assume the first staging dir's nvme backing path
+            let nvme_path = format!("{}/.squeezefs_nvme", active_staging_dirs[0].display());
+            let nvme_dev = std::sync::Arc::new(
+                squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path)
+            );
 
             // Read the full format values from Garnet for JSON logging
             let block_size_bytes: u64 = format_fields
@@ -1855,26 +1555,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .map(|s| !s.is_empty())
                 .unwrap_or(false);
 
-            let masked_access_key = final_s3_access_key
-                .as_ref()
-                .map(|s| {
-                    if s.is_empty() {
-                        "none".to_string()
-                    } else {
-                        "******".to_string()
-                    }
-                })
-                .unwrap_or_else(|| "none".to_string());
-            let masked_secret_key = final_s3_secret_key
-                .as_ref()
-                .map(|s| {
-                    if s.is_empty() {
-                        "none".to_string()
-                    } else {
-                        "******".to_string()
-                    }
-                })
-                .unwrap_or_else(|| "none".to_string());
             let masked_encrypt_key = if encrypt_key_present {
                 "******".to_string()
             } else {
@@ -1898,10 +1578,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "upload_delay": resolved_upload_delay,
                 "fuse_io_uring_sqpoll_idle_ms": resolved_fuse_io_uring_sqpoll_idle_ms,
                 "fuse_io_uring_sqpoll_cpu": resolved_fuse_io_uring_sqpoll_cpu,
-                "endpoint": final_s3_endpoint.as_deref().unwrap_or(""),
-                "access_key": masked_access_key,
-                "secret_key": masked_secret_key,
-                "bucket": final_s3_bucket.as_deref().unwrap_or("squeezefs-data"),
                 "writeback": writeback,
                 "allow_other": allow_other,
                 "options": options,
@@ -1911,22 +1587,22 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             });
             let config_str = serde_json::to_string_pretty(&config_json).unwrap_or_default();
             log::info!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
-            log::info!(
-                "Data use {:?}",
-                final_s3_bucket.as_deref().unwrap_or("mock")
-            );
             log::info!("SqueezeFS mount configuration:\n{}", config_str);
 
             // Run staging / active write recovery on mount startup
             for dir in &active_staging_dirs {
                 log::info!("Running staging recovery on: {:?}", dir);
-                let recovery_backend = multi_backend.get_backend("backend_0").unwrap();
-                if let Err(e) =
-                    squeezefs::recovery::recover_staging(dir, &recovery_backend, dlm.meta_client())
-                        .await
-                {
-                    log::warn!("Staging recovery failed for {:?}: {:?}", dir, e);
-                }
+                let _recovery_count = squeezefs::recovery::recover_staging(
+                    dir,
+                    dlm.meta_client(),
+                    &block_alloc,
+                    &nvme_dev,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("Background recovery failed for dir {:?}: {}", dir, e);
+                    0
+                });
             }
 
             let cache = TieredCache::new(
@@ -1935,13 +1611,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Some(&resolved_write_mem_cache_size),
                 Some(&resolved_read_cache_size),
                 Some(&resolved_write_cache_size),
-                multi_backend.clone().get_backend("backend_0").unwrap(), // Cache uses default backend for staging
                 dlm.meta_client().clone(),
+                block_alloc.clone(),
+                nvme_dev.clone(),
             )?;
             if let Some(ref addr) = p2p_addr {
                 let _ = cache.nvme.p2p_addr.set(addr.clone());
             }
-            let router = DataRouter::new(dlm.clone(), multi_backend, cache);
+            let router = DataRouter::new(dlm.clone(), cache, block_alloc.clone(), nvme_dev.clone());
             let resolved_uid = uid.unwrap_or_else(|| {
                 std::env::var("SUDO_UID")
                     .ok()
@@ -1993,6 +1670,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
+        Commands::Defrag { redis_url, name, nvme_path } => {
+            println!("Starting defragmentation for volume '{}'", name);
+            squeezefs::defrag::run_defragmentation(&redis_url, &name, &nvme_path).await?;
+        }
         Commands::Bench {
             path,
             threads,
@@ -2012,9 +1693,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let staging_dirs = vec![get_default_staging_dir()];
 
             let dlm = DlmClient::new(redis_url)?;
-            let backend = RustFsClient::new().await;
-            let multi_backend = MultiBackendClient::new();
-            multi_backend.register_backend("backend_0", backend.clone());
+            
+            // Reconstruct block allocator and nvme block dev for clone operation
+            let fs_name = "default".to_string(); // Assuming default fs name for now
+            let block_alloc = std::sync::Arc::new(
+                squeezefs::block_allocator::BlockAllocator::new(
+                    std::sync::Arc::new(dlm.meta_client().clone()),
+                    &fs_name,
+                )
+                .await?,
+            );
+            
+            let nvme_path = format!("{}/.squeezefs_nvme", staging_dirs[0].display());
+            let nvme_dev = std::sync::Arc::new(
+                squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path)
+            );
 
             let cache = TieredCache::new(
                 staging_dirs,
@@ -2022,10 +1715,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 None,
-                backend,
                 dlm.meta_client().clone(),
+                block_alloc.clone(),
+                nvme_dev.clone(),
             )?;
-            let router = DataRouter::new(dlm, multi_backend, cache);
+            let router = DataRouter::new(dlm, cache, block_alloc.clone(), nvme_dev.clone());
 
             println!("Cloning file from {} to {}...", src, dest);
             router.clone_path(&src, &dest).await?;
@@ -2086,85 +1780,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fs_name,
             action,
         } => match action {
-            ConfigActions::Backend(action) => match action {
-                BackendActions::Add {
-                    name,
-                    s3_endpoint,
-                    s3_access_key,
-                    s3_secret_key,
-                    s3_bucket,
-                } => {
-                    squeezefs::config_ops::add_storage_backend(
-                        &garnet_url,
-                        &fs_name,
-                        &name,
-                        &s3_endpoint,
-                        &s3_access_key,
-                        &s3_secret_key,
-                        &s3_bucket,
-                    )
-                    .await?;
-                    println!("Storage backend '{}' added successfully.", name);
-                }
-                BackendActions::Remove { name, force } => {
-                    squeezefs::config_ops::remove_storage_backend(
-                        &garnet_url,
-                        &fs_name,
-                        &name,
-                        force,
-                    )
-                    .await?;
-                    println!("Storage backend '{}' removed successfully.", name);
-                }
-                BackendActions::Enable { name } => {
-                    squeezefs::config_ops::enable_storage_backend(&garnet_url, &fs_name, &name)
-                        .await?;
-                    println!("Storage backend '{}' enabled successfully.", name);
-                }
-                BackendActions::Disable { name } => {
-                    squeezefs::config_ops::disable_storage_backend(&garnet_url, &fs_name, &name)
-                        .await?;
-                    println!("Storage backend '{}' disabled successfully.", name);
-                }
-                BackendActions::List => {
-                    let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                    let mut output = serde_json::Map::new();
-                    for (be_id, be_json_str) in &list.backends {
-                        if let Ok(mut be_val) =
-                            serde_json::from_str::<serde_json::Value>(be_json_str)
-                        {
-                            let status = list
-                                .backend_statuses
-                                .get(be_id)
-                                .cloned()
-                                .unwrap_or_else(|| "enabled".to_string());
-                            if let Some(obj) = be_val.as_object_mut() {
-                                obj.insert("status".to_string(), serde_json::Value::String(status));
-                            }
-                            output.insert(be_id.clone(), be_val);
-                        }
-                    }
-                    if !list.backends.contains_key("backend_0") {
-                        let status = list
-                            .backend_statuses
-                            .get("backend_0")
-                            .cloned()
-                            .unwrap_or_else(|| "enabled".to_string());
-                        let be_val = serde_json::json!({
-                            "endpoint": "",
-                            "access_key": "admin",
-                            "secret_key": "password",
-                            "bucket": "squeezefs-data",
-                            "status": status,
-                        });
-                        output.insert("backend_0".to_string(), be_val);
-                    }
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::Value::Object(output))?
-                    );
-                }
-            },
             ConfigActions::Set { key, value } => {
                 squeezefs::config_ops::set_config_quota(&garnet_url, &fs_name, &key, &value)
                     .await?;

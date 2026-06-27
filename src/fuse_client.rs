@@ -1,4 +1,3 @@
-use crate::backend::RustFsClient;
 use crate::dlm::DlmClient;
 use crate::error::SqueezefsError;
 use crate::routing::DataRouter;
@@ -747,9 +746,7 @@ impl SqueezefsFilesystem {
                             // S3 read path: lock is handled natively by block_lock
 
                             let get_res = async {
-                                let raw =
-                                    crate::routing::fetch_block_bytes(&self.router.backend, &bk)
-                                        .await?;
+                                let raw = self.router.read_nvme_block(&bk).await?;
                                 let decompressed = self.router.get_crypto().process_read(&raw)?;
                                 Ok::<Vec<u8>, SqueezefsError>(decompressed)
                             }
@@ -972,123 +969,8 @@ impl SqueezefsFilesystem {
 
     pub async fn complete_active_multipart_upload_if_any(
         &self,
-        ino: u64,
+        _ino: u64,
     ) -> Result<(), SqueezefsError> {
-        use redis::AsyncCommands;
-        let mut con = self.dlm.get_connection_for_inode(ino).await?;
-        let active_mp_key = format!("squeezefs:active_multipart:{}", ino);
-
-        let (upload_id_opt, s3_key_opt, backend_id_opt): (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = redis::pipe()
-            .hget(&active_mp_key, "upload_id")
-            .hget(&active_mp_key, "s3_key")
-            .hget(&active_mp_key, "backend_id")
-            .query_async(&mut con)
-            .await?;
-
-        let (upload_id, s3_key, backend_id) = match (upload_id_opt, s3_key_opt, backend_id_opt) {
-            (Some(uid), Some(s3k), Some(bid)) => (uid, s3k, bid),
-            _ => return Ok(()),
-        };
-
-        let parts_key = format!("squeezefs:multipart_parts:{}", ino);
-        let parts_map: std::collections::HashMap<String, String> = con.hgetall(&parts_key).await?;
-
-        let mut parts = Vec::new();
-        let mut part_offsets = Vec::new();
-        for (k, v) in parts_map {
-            let part_num: i32 = k.parse().unwrap_or(0);
-            let split: Vec<&str> = v.split(',').collect();
-            if split.len() >= 2 {
-                let etag = split[0].to_string();
-                let logical_size: usize = split[1].parse().unwrap_or(0);
-                let physical_size: usize = if split.len() >= 3 {
-                    split[2].parse().unwrap_or(logical_size)
-                } else {
-                    logical_size
-                };
-                parts.push((part_num, etag));
-                part_offsets.push((part_num, logical_size, physical_size));
-            }
-        }
-
-        if parts.is_empty() {
-            let _ = self
-                .router
-                .backend
-                .abort_multipart_upload(&backend_id, &s3_key, &upload_id)
-                .await;
-            let _: () = redis::pipe()
-                .del(&active_mp_key)
-                .del(&parts_key)
-                .query_async(&mut con)
-                .await?;
-            return Ok(());
-        }
-
-        parts.sort_by_key(|(p, _)| *p);
-        part_offsets.sort_by_key(|(p, _, _)| *p);
-
-        self.router
-            .backend
-            .complete_multipart_upload(&backend_id, &s3_key, &upload_id, parts)
-            .await?;
-
-        let file_path = format!("inode_{}", ino);
-        let meta_key = format!("metadata:{}", file_path);
-        let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
-        let mut block_map_id = block_map_id_opt.unwrap_or_default();
-        if block_map_id.is_empty() {
-            block_map_id = uuid::Uuid::new_v4().to_string();
-            let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
-        }
-        let block_map_key = format!("block_map:{}", block_map_id);
-
-        let refcounts_key = "squeezefs:block_refcounts";
-        let mut start_offset: u64 = 0;
-
-        for (part_num, logical_size, physical_size) in part_offsets {
-            let block_num = (part_num - 1) as u32;
-            let end_offset = start_offset + physical_size as u64;
-            let stored_block_key = format!(
-                "{}:s3_single:{}:{}:{}",
-                backend_id, s3_key, start_offset, end_offset
-            );
-
-            let mut pipe = redis::pipe();
-            pipe.hset(refcounts_key, &stored_block_key, 1)
-                .hset(&block_map_key, block_num.to_string(), &stored_block_key)
-                .hset(
-                    "squeezefs:block_sizes",
-                    &stored_block_key,
-                    format!("{}:{}", logical_size, physical_size),
-                );
-            let _: () = pipe.query_async(&mut con).await?;
-
-            self.router.block_map_cache.insert(
-                (block_map_id.clone(), block_num),
-                (Some(stored_block_key.clone()), std::time::Instant::now()),
-            );
-
-            let cache_key = format!("active_block:inode_{}:block_{}", ino, block_num);
-            let nvme_clone = self.router.cache.nvme.clone();
-            let cache_key_clone = cache_key.clone();
-            tokio::task::spawn_blocking(move || {
-                nvme_clone.remove_active_block(&cache_key_clone);
-            });
-
-            start_offset = end_offset;
-        }
-
-        let _: () = redis::pipe()
-            .del(&active_mp_key)
-            .del(&parts_key)
-            .query_async(&mut con)
-            .await?;
-
         Ok(())
     }
 }
@@ -4643,7 +4525,6 @@ pub async fn start_mount<P: AsRef<Path>>(
         mountpoint.as_ref()
     );
     info!("FUSE Daemon: Garnet metadata connection active.");
-    info!("FUSE Daemon: S3 object storage backend active.");
 
     let mount_path = mountpoint.as_ref().to_path_buf();
 
@@ -4924,10 +4805,7 @@ pub async fn format_volume(
     mem_cache_size: Option<&str>,
     disk_cache_size: Option<&str>,
     disk_cache_paths: Option<&[std::path::PathBuf]>,
-    s3_endpoint: Option<&str>,
-    s3_access_key: Option<&str>,
-    s3_secret_key: Option<&str>,
-    s3_bucket: Option<&str>,
+    nvme_target_path: Option<&str>,
     read_cache_size: Option<&str>,
     write_cache_size: Option<&str>,
     read_mem_cache_size: Option<&str>,
@@ -4945,10 +4823,7 @@ pub async fn format_volume(
         mem_cache_size,
         disk_cache_size,
         disk_cache_paths,
-        s3_endpoint,
-        s3_access_key,
-        s3_secret_key,
-        s3_bucket,
+        None,
         read_cache_size,
         write_cache_size,
         read_mem_cache_size,
@@ -4974,10 +4849,7 @@ pub async fn format_volume_ext(
     mem_cache_size: Option<&str>,
     disk_cache_size: Option<&str>,
     disk_cache_paths: Option<&[std::path::PathBuf]>,
-    s3_endpoint: Option<&str>,
-    s3_access_key: Option<&str>,
-    s3_secret_key: Option<&str>,
-    s3_bucket: Option<&str>,
+    nvme_target_path: Option<&str>,
     read_cache_size: Option<&str>,
     write_cache_size: Option<&str>,
     read_mem_cache_size: Option<&str>,
@@ -5003,29 +4875,6 @@ pub async fn format_volume_ext(
             "Unsupported encryption algorithm: '{}'. Supported options are: none, aes256gcm-rsa, chacha20-rsa.",
             encrypt_algo
         )));
-    }
-
-    // 4. S3 parameters consistency
-    let has_s3_endpoint = s3_endpoint.is_some_and(|s| !s.is_empty())
-        || std::env::var("RUSTFS_ENDPOINT").is_ok_and(|s| !s.is_empty())
-        || std::env::var("AWS_ENDPOINT_URL").is_ok_and(|s| !s.is_empty());
-
-    let has_other_s3_params = s3_access_key.is_some_and(|s| !s.is_empty())
-        || s3_secret_key.is_some_and(|s| !s.is_empty())
-        || s3_bucket.is_some_and(|s| !s.is_empty())
-        || std::env::var("RUSTFS_ACCESS_KEY").is_ok_and(|s| !s.is_empty())
-        || std::env::var("AWS_ACCESS_KEY_ID").is_ok_and(|s| !s.is_empty())
-        || std::env::var("RUSTFS_SECRET_KEY").is_ok_and(|s| !s.is_empty())
-        || std::env::var("AWS_SECRET_ACCESS_KEY").is_ok_and(|s| !s.is_empty())
-        || std::env::var("RUSTFS_BUCKET").is_ok_and(|s| !s.is_empty())
-        || std::env::var("AWS_BUCKET").is_ok_and(|s| !s.is_empty());
-
-    if has_other_s3_params && !has_s3_endpoint {
-        return Err(SqueezefsError::InvalidOperation(
-            "S3 bucket or credential parameters were provided, but no S3 endpoint was specified. \
-             If you want to use S3 storage, you must provide --s3-endpoint or set the RUSTFS_ENDPOINT environment variable. \
-             If you intended to use the in-memory mock store, please omit all S3 parameters.".to_string(),
-        ));
     }
 
     // 5. Human readable size limits validation
@@ -5099,6 +4948,52 @@ pub async fn format_volume_ext(
         ));
     }
 
+    if !quick {
+        if let Some(target_path) = nvme_target_path {
+            if !target_path.is_empty() {
+                if capacity > 0 {
+                    log::info!("Wiping NVMe target path: {}", target_path);
+                    let file_result = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .open(target_path)
+                        .await;
+                        
+                    if let Ok(mut file) = file_result {
+                        let pb = indicatif::ProgressBar::new(capacity);
+                        pb.set_style(
+                            indicatif::ProgressStyle::default_bar()
+                                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                                .unwrap()
+                                .progress_chars("#>-"),
+                        );
+                        
+                        let chunk_size = 4 * 1024 * 1024;
+                        let zeros = vec![0u8; chunk_size];
+                        let mut written = 0;
+                        use tokio::io::AsyncWriteExt;
+                        
+                        while written < capacity {
+                            let to_write = std::cmp::min(chunk_size as u64, capacity - written);
+                            if let Err(e) = file.write_all(&zeros[..to_write as usize]).await {
+                                log::warn!("Failed to write zero block to NVMe target: {:?}", e);
+                                break;
+                            }
+                            written += to_write;
+                            pb.inc(to_write);
+                        }
+                        if let Err(e) = file.sync_all().await {
+                            log::warn!("Failed to sync NVMe target: {:?}", e);
+                        }
+                        pb.finish_with_message("NVMe target wiped");
+                    } else {
+                        log::warn!("Failed to open NVMe target for wiping: {:?}", file_result.err());
+                    }
+                }
+            }
+        }
+    }
+
     let mut first_con = shard_clients[0].get_connection().await?;
 
     // Read existing format configuration before flushing
@@ -5138,70 +5033,6 @@ pub async fn format_volume_ext(
                     dir,
                     e
                 );
-            }
-        }
-    }
-
-    if !quick {
-        // Read existing backends from Redis before doing FLUSHALL
-        let existing_backends: std::collections::HashMap<String, String> = first_con
-            .hgetall("squeezefs:backends")
-            .await
-            .unwrap_or_default();
-
-        let mut buckets_to_wipe = Vec::new();
-
-        // Add existing backends from DB
-        for (_, json_str) in existing_backends {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                let ep = val
-                    .get("endpoint")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let ak = val
-                    .get("access_key")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let sk = val
-                    .get("secret_key")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let bu = val
-                    .get("bucket")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                if let Some(bucket) = bu {
-                    buckets_to_wipe.push((ep, ak, sk, bucket));
-                }
-            }
-        }
-
-        // Also add the new S3 backend being configured in the parameters (if any)
-        let new_endpoint = s3_endpoint.unwrap_or("").to_string();
-        let new_access_key = s3_access_key.unwrap_or("admin").to_string();
-        let new_secret_key = s3_secret_key.unwrap_or("password").to_string();
-        let new_bucket = s3_bucket.unwrap_or("squeezefs-data").to_string();
-
-        if !new_endpoint.is_empty() {
-            buckets_to_wipe.push((
-                Some(new_endpoint),
-                Some(new_access_key),
-                Some(new_secret_key),
-                new_bucket,
-            ));
-        }
-
-        // De-duplicate buckets_to_wipe by (endpoint, bucket)
-        let mut unique_buckets = std::collections::HashSet::new();
-        for (ep, ak, sk, bu) in buckets_to_wipe {
-            let key = (ep.clone(), bu.clone());
-            if unique_buckets.insert(key) {
-                let backend_client =
-                    RustFsClient::new_with_local_ips(Vec::new(), ep, ak, sk, Some(bu)).await;
-
-                if let Err(e) = backend_client.destroy_bucket_data().await {
-                    log::warn!("Failed to destroy bucket data during format: {:?}", e);
-                }
             }
         }
     }
@@ -5260,45 +5091,6 @@ pub async fn format_volume_ext(
             )
             .hset("squeezefs:format", "active_write_backend", "backend_0");
 
-        let default_endpoint = s3_endpoint.unwrap_or("");
-        let default_access_key = s3_access_key.unwrap_or("admin");
-        let default_secret_key = s3_secret_key.unwrap_or("password");
-        let default_bucket = s3_bucket.unwrap_or("squeezefs-data");
-
-        let endpoints: Vec<&str> = default_endpoint
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if endpoints.len() > 1 {
-            for (i, ep) in endpoints.iter().enumerate() {
-                let be_id = format!("backend_{}", i);
-                let backend_json = serde_json::json!({
-                    "endpoint": ep,
-                    "access_key": default_access_key,
-                    "secret_key": default_secret_key,
-                    "bucket": default_bucket,
-                })
-                .to_string();
-                pipe.hset("squeezefs:backends", &be_id, backend_json);
-            }
-        } else {
-            let backend_json = serde_json::json!({
-                "endpoint": default_endpoint,
-                "access_key": default_access_key,
-                "secret_key": default_secret_key,
-                "bucket": default_bucket,
-            })
-            .to_string();
-            pipe.hset("squeezefs:backends", "backend_0", backend_json);
-        }
-
-        if !default_endpoint.is_empty() {
-            pipe.hset("squeezefs:format", "s3_endpoint", default_endpoint)
-                .hset("squeezefs:format", "s3_bucket", default_bucket);
-        }
-
         let _: () = pipe.query_async(&mut con).await?;
     }
 
@@ -5341,25 +5133,6 @@ pub async fn format_volume_ext(
                     .await?;
             }
         }
-    }
-
-    // Create/initialize bucket on S3 if endpoint is provided
-    let default_endpoint = s3_endpoint.unwrap_or("");
-    if !default_endpoint.is_empty() {
-        let default_access_key = s3_access_key.unwrap_or("admin");
-        let default_secret_key = s3_secret_key.unwrap_or("password");
-        let default_bucket = s3_bucket.unwrap_or("squeezefs-data");
-
-        let backend_client = RustFsClient::new_with_local_ips(
-            Vec::new(),
-            Some(default_endpoint.to_string()),
-            Some(default_access_key.to_string()),
-            Some(default_secret_key.to_string()),
-            Some(default_bucket.to_string()),
-        )
-        .await;
-
-        backend_client.init_bucket().await?;
     }
 
     Ok(())
@@ -5692,102 +5465,24 @@ async fn flush_single_active_block(
 
     use redis::AsyncCommands;
     let mut con = dlm.get_connection_for_inode(ino).await?;
-    let mut active_multipart = None;
-    if is_striped {
-        let active_mp_key = format!("squeezefs:active_multipart:{}", ino);
-        let (upload_id_opt, s3_key_opt, backend_id_opt): (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = redis::pipe()
-            .hget(&active_mp_key, "upload_id")
-            .hget(&active_mp_key, "s3_key")
-            .hget(&active_mp_key, "backend_id")
-            .query_async(&mut con)
-            .await?;
-
-        if let (Some(upload_id), Some(s3_key), Some(backend_id)) =
-            (upload_id_opt, s3_key_opt, backend_id_opt)
-        {
-            active_multipart = Some((upload_id, s3_key, backend_id));
-        } else {
-            // Check if block map is empty
-            let block_map_key = format!("block_map:{}", block_map_id);
-            let len: u64 = con.hlen(&block_map_key).await.unwrap_or(0);
-            if len == 0 {
-                // Initialize multipart upload!
-                let s3_key = format!("multipart/inode_{}_{}", ino, uuid::Uuid::new_v4());
-                let backend_id = router.backend.get_backend_for_key(&s3_key);
-                match router
-                    .backend
-                    .create_multipart_upload(&backend_id, &s3_key)
-                    .await
-                {
-                    Ok(upload_id) => {
-                        let _: () = redis::pipe()
-                            .hset(&active_mp_key, "upload_id", &upload_id)
-                            .hset(&active_mp_key, "s3_key", &s3_key)
-                            .hset(&active_mp_key, "backend_id", &backend_id)
-                            .query_async(&mut con)
-                            .await?;
-                        active_multipart = Some((upload_id, s3_key, backend_id));
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to create multipart upload for inode {}: {:?}",
-                            ino, e
-                        );
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
 
     let block_bytes = bytes::Bytes::from(block_data.clone());
     let processed_block = router.get_crypto().process_write(block_bytes.clone())?;
     let processed_len = processed_block.len();
 
-    if let Some((upload_id, s3_key, backend_id)) = active_multipart {
-        let part_number = (b + 1) as i32;
-        let etag = router
-            .backend
-            .upload_part(
-                &backend_id,
-                &s3_key,
-                &upload_id,
-                part_number,
-                processed_block,
-            )
-            .await?;
-        let parts_key = format!("squeezefs:multipart_parts:{}", ino);
-        let part_value = format!("{},{},{}", etag, block_bytes.len(), processed_len);
-        let _: () = con
-            .hset(&parts_key, part_number.to_string(), part_value)
-            .await?;
-        return Ok(());
-    }
-
-    let file_uuid = uuid::Uuid::new_v4().to_string();
-    let block_write_uuid = uuid::Uuid::new_v4().to_string();
-    let new_block_key = format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
-
-    if let Err(e) = router
-        .backend
-        .put_object(&new_block_key, processed_block, fencing_token)
-        .await
-    {
+    let offset = router.block_allocator.allocate_block().await?;
+    
+    if let Err(e) = router.nvme_writer.write_block(offset, &processed_block).await {
         error!(
-            "flush_single_active_block: Failed to upload block {} of inode {} to S3: {:?}",
+            "flush_single_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
             b, ino, e
         );
+        let _ = router.block_allocator.free_block(offset).await;
         return Err(e);
     }
 
-    let active_be = router.backend.get_backend_for_key(&new_block_key);
-    let stored_block_key = format!("{}:{}", active_be, new_block_key);
+    let stored_block_key = offset.to_string();
 
-    let mut con = dlm.get_connection_for_inode(ino).await?;
     let block_map_key = format!("block_map:{}", block_map_id);
 
     let refcounts_key = "squeezefs:block_refcounts";
@@ -5825,15 +5520,17 @@ async fn flush_single_active_block(
                     .hdel("squeezefs:block_sizes", &bk)
                     .query_async(&mut con)
                     .await?;
-                let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
-                let _ = router.backend.delete_object(&be_id, &real_key).await;
+                if let Ok(old_offset) = bk.parse::<u64>() {
+                    let _ = router.block_allocator.free_block(old_offset).await;
+                }
             } else {
                 let _: () = con.hset(refcounts_key, &bk, r).await?;
             }
         } else {
             let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
-            let (be_id, real_key) = crate::backend::parse_backend_and_key(&bk);
-            let _ = router.backend.delete_object(&be_id, &real_key).await;
+            if let Ok(old_offset) = bk.parse::<u64>() {
+                let _ = router.block_allocator.free_block(old_offset).await;
+            }
         }
     }
 
@@ -5849,7 +5546,6 @@ async fn flush_single_active_block(
 
     Ok(())
 }
-
 async fn handle_recall(
     inode: Inode,
     dlm: &DlmClient,

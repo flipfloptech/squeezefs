@@ -1,4 +1,4 @@
-use crate::backend::{parse_backend_and_key, MultiBackendClient};
+
 use crate::cache::{PooledBuf, TieredCache, BUFFER_POOL};
 use crate::dlm::DlmClient;
 use crate::error::{Result, SqueezefsError};
@@ -35,8 +35,9 @@ pub struct CachedMetadata {
 #[derive(Clone)]
 pub struct DataRouter {
     pub dlm: DlmClient,
-    pub backend: MultiBackendClient,
     pub cache: TieredCache,
+    pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+    pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
     pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
@@ -69,12 +70,18 @@ impl Drop for InflightBlockReadGuard {
 }
 
 impl DataRouter {
-    pub fn new(dlm: DlmClient, backend: impl Into<MultiBackendClient>, cache: TieredCache) -> Self {
+    pub fn new(
+        dlm: DlmClient,
+        cache: TieredCache,
+        block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    ) -> Self {
         Self {
             dlm,
-            backend: backend.into(),
-            block_size: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024)),
             cache,
+            block_allocator,
+            nvme_writer,
+            block_size: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024)),
             metadata_cache: moka::sync::Cache::builder()
                 .max_capacity(100_000)
                 .time_to_live(std::time::Duration::from_secs(60))
@@ -110,6 +117,12 @@ impl DataRouter {
         self.crypto.get().unwrap_or(&*DEFAULT_CRYPTO)
     }
 
+        pub async fn read_nvme_block(&self, offset_str: &str) -> Result<Vec<u8>> {
+        let offset = offset_str.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
+        let size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        self.nvme_writer.read_block(offset, size).await
+    }
+
     pub fn set_block_size(&self, block_size: u64) {
         self.block_size
             .store(block_size, std::sync::atomic::Ordering::Relaxed);
@@ -121,10 +134,10 @@ impl DataRouter {
             if let Ok(data) = client.download_block_from_peer(dht, block_key).await {
                 data
             } else {
-                fetch_block_bytes(&self.backend, block_key).await?
+                self.read_nvme_block(block_key).await?
             }
         } else {
-            fetch_block_bytes(&self.backend, block_key).await?
+            self.read_nvme_block(block_key).await?
         };
 
         let decompressed = self.get_crypto().process_read(&raw)?;
@@ -477,15 +490,17 @@ impl DataRouter {
                         .hdel("squeezefs:block_sizes", &bk)
                         .query_async(con)
                         .await?;
-                    let (be_id, real_key) = parse_backend_and_key(&bk);
-                    let _ = self.backend.delete_object(&be_id, &real_key).await;
+                    if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
                 } else {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
             } else {
                 let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
-                let (be_id, real_key) = parse_backend_and_key(&bk);
-                let _ = self.backend.delete_object(&be_id, &real_key).await;
+                if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
             }
         }
         Ok(())
@@ -546,11 +561,8 @@ impl DataRouter {
                         let sz_val: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                         if let (Some(bk), Some(off), Some(sz)) = (block_key, off_val, sz_val) {
-                            let (be_id, real_key) = parse_backend_and_key(&bk);
-                            let raw = self
-                                .backend
-                                .get_object_range(&be_id, &real_key, off, off + sz)
-                                .await?;
+                            let offset_u64 = bk.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
+                            let raw = self.nvme_writer.read_block(offset_u64 + off, sz as usize).await?;
                             self.get_crypto().process_read(&raw)?
                         } else {
                             Vec::new()
@@ -580,16 +592,11 @@ impl DataRouter {
             while offset_cursor < existing_size {
                 let end = std::cmp::min(offset_cursor + block_size, existing_size);
                 let chunk = existing_bytes.slice(offset_cursor..end);
-                let block_write_uuid = Uuid::new_v4().to_string();
-                let block_key = format!(
-                    "blocks/{}/block_{}_{}",
-                    file_uuid, block_count, block_write_uuid
-                );
-                let active_be = self.backend.get_backend_for_key(&block_key);
-                let stored_block_key = format!("{}:{}", active_be, block_key);
+                let offset = self.block_allocator.allocate_block().await?;
+                let stored_block_key = offset.to_string();
                 let stored_block_key_clone = stored_block_key.clone();
 
-                block_mappings.push((block_count.to_string(), stored_block_key));
+                block_mappings.push((block_count.to_string(), stored_block_key.clone()));
 
                 let chunk_len = chunk.len();
                 let processed = match self.get_crypto().process_write(chunk.clone()) {
@@ -599,17 +606,17 @@ impl DataRouter {
                 let processed_len = processed.len();
                 sizes_to_register.push((stored_block_key_clone.clone(), chunk_len, processed_len));
 
-                let backend_clone = self.backend.clone();
+                let nvme_writer = self.nvme_writer.clone();
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = backend_clone
-                        .put_object(&block_key, processed, fencing_token)
+                    if let Err(e) = nvme_writer
+                        .write_block(offset, &processed)
                         .await
                     {
                         log::error!(
                             "Background Stripe upload task failed for block {}: {:?}",
-                            block_key,
+                            stored_block_key,
                             e
                         );
                     }
@@ -799,13 +806,11 @@ impl DataRouter {
                     let processed_data = self.get_crypto().process_write(shared_data.clone())?;
 
                     // 2. Upload block directly to S3
-                    let direct_block_uuid = uuid::Uuid::new_v4().to_string();
-                    let block_key = format!("blocks/direct/{}", direct_block_uuid);
-                    let active_be = self.backend.get_backend_for_key(&block_key);
-                    let stored_block_key = format!("{}:{}", active_be, block_key);
+                    let offset = self.block_allocator.allocate_block().await?;
+                    let stored_block_key = offset.to_string();
 
-                    self.backend
-                        .put_object(&block_key, processed_data.clone(), fencing_token)
+                    self.nvme_writer
+                        .write_block(offset, &processed_data)
                         .await?;
 
                     // 3. Register type as staged, file_id, and mapping in Garnet
@@ -875,16 +880,11 @@ impl DataRouter {
             while offset_cursor < new_size {
                 let end = std::cmp::min(offset_cursor + block_size, new_size);
                 let chunk = existing_bytes.slice(offset_cursor..end);
-                let block_write_uuid = Uuid::new_v4().to_string();
-                let block_key = format!(
-                    "blocks/{}/block_{}_{}",
-                    file_uuid, block_count, block_write_uuid
-                );
-                let active_be = self.backend.get_backend_for_key(&block_key);
-                let stored_block_key = format!("{}:{}", active_be, block_key);
+                let offset = self.block_allocator.allocate_block().await?;
+                let stored_block_key = offset.to_string();
                 let stored_block_key_clone = stored_block_key.clone();
 
-                block_mappings.push((block_count.to_string(), stored_block_key));
+                block_mappings.push((block_count.to_string(), stored_block_key.clone()));
 
                 let chunk_len = chunk.len();
                 let processed = match self.get_crypto().process_write(chunk.clone()) {
@@ -894,17 +894,17 @@ impl DataRouter {
                 let processed_len = processed.len();
                 sizes_to_register.push((stored_block_key_clone.clone(), chunk_len, processed_len));
 
-                let backend_clone = self.backend.clone();
+                let nvme_writer = self.nvme_writer.clone();
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = backend_clone
-                        .put_object(&block_key, processed, fencing_token)
+                    if let Err(e) = nvme_writer
+                        .write_block(offset, &processed)
                         .await
                     {
                         log::error!(
                             "Background Stripe upload task failed for block {}: {:?}",
-                            block_key,
+                            stored_block_key,
                             e
                         );
                     }
@@ -980,15 +980,17 @@ impl DataRouter {
                                 .hdel("squeezefs:block_sizes", &bk)
                                 .query_async(&mut con)
                                 .await?;
-                            let (be_id, real_key) = parse_backend_and_key(&bk);
-                            let _ = self.backend.delete_object(&be_id, &real_key).await;
+                            if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
                         } else {
                             let _: () = con.hset(refcounts_key, &bk, r).await?;
                         }
                     } else {
                         let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
-                        let (be_id, real_key) = parse_backend_and_key(&bk);
-                        let _ = self.backend.delete_object(&be_id, &real_key).await;
+                        if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
                     }
                 }
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
@@ -1126,8 +1128,8 @@ impl DataRouter {
                 let new_block_key =
                     format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
-                let active_be = router_clone.backend.get_backend_for_key(&new_block_key);
-                let stored_new_block_key = format!("{}:{}", active_be, new_block_key);
+                let offset = router_clone.block_allocator.allocate_block().await?;
+                let stored_new_block_key = offset.to_string();
 
                 let block_bytes = bytes::Bytes::copy_from_slice(&block_data);
 
@@ -1138,8 +1140,8 @@ impl DataRouter {
                 let processed_block = crypto.process_write(block_bytes)?;
                 let physical_size = processed_block.len();
                 router_clone
-                    .backend
-                    .put_object(&new_block_key, processed_block, fencing_token)
+                    .nvme_writer
+                    .write_block(offset, &processed_block)
                     .await?;
                 debug!(
                     "Writeback: Successfully uploaded block {} to S3",
@@ -1199,15 +1201,17 @@ impl DataRouter {
                         .hdel("squeezefs:block_sizes", &bk)
                         .query_async(con)
                         .await?;
-                    let (be_id, real_key) = parse_backend_and_key(&bk);
-                    let _ = self.backend.delete_object(&be_id, &real_key).await;
+                    if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
                 } else {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
             } else {
                 let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
-                let (be_id, real_key) = parse_backend_and_key(&bk);
-                let _ = self.backend.delete_object(&be_id, &real_key).await;
+                if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
             }
         }
 
@@ -1316,11 +1320,8 @@ impl DataRouter {
                     let size: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, offset, size) {
-                        let (be_id, real_key) = parse_backend_and_key(&bk);
-                        let raw = self
-                            .backend
-                            .get_object_range(&be_id, &real_key, off, off + sz)
-                            .await?;
+                        let offset_u64 = bk.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
+                            let raw = self.nvme_writer.read_block(offset_u64 + off, sz as usize).await?;
                         self.get_crypto().process_read(&raw)?
                     } else {
                         return Err(SqueezefsError::Io(std::io::Error::new(
@@ -1548,11 +1549,8 @@ impl DataRouter {
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
-                        let (be_id, real_key) = parse_backend_and_key(&bk);
-                        let packed_bytes = self
-                            .backend
-                            .get_object_range(&be_id, &real_key, off, off + sz)
-                            .await?;
+                        let offset_u64 = bk.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
+                        let packed_bytes = self.nvme_writer.read_block(offset_u64 + off, sz as usize).await?;
                         let decompressed = self.get_crypto().process_read(&packed_bytes)?;
                         if offset >= decompressed.len() as u64 {
                             return Ok(Vec::new());
@@ -1755,11 +1753,8 @@ impl DataRouter {
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
-                        let (be_id, real_key) = parse_backend_and_key(&bk);
-                        let packed_bytes = self
-                            .backend
-                            .get_object_range(&be_id, &real_key, off, off + sz)
-                            .await?;
+                        let offset_u64 = bk.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
+                        let packed_bytes = self.nvme_writer.read_block(offset_u64 + off, sz as usize).await?;
                         let decompressed = self.get_crypto().process_read(&packed_bytes)?;
                         if offset >= decompressed.len() as u64 {
                             return Ok((bytes::Bytes::new(), None));
@@ -1976,9 +1971,7 @@ impl DataRouter {
         &self.cache
     }
 
-    pub fn backend(&self) -> &MultiBackendClient {
-        &self.backend
-    }
+    
 
     /// Clone a file metadata-only. If it's inline, copy the inline data.
     /// If it's staged, copy the staging folder/files and mapping.
@@ -2247,15 +2240,17 @@ impl DataRouter {
                                     .hdel("squeezefs:block_sizes", &bk)
                                     .query_async(con)
                                     .await?;
-                                let (be_id, real_key) = parse_backend_and_key(&bk);
-                                let _ = self.backend.delete_object(&be_id, &real_key).await;
+                                if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
                         } else {
                             let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
-                            let (be_id, real_key) = parse_backend_and_key(&bk);
-                            let _ = self.backend.delete_object(&be_id, &real_key).await;
+                            if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
                         }
                     }
                     let _: () = con.del(&block_map_key).await?;
@@ -2266,7 +2261,7 @@ impl DataRouter {
                     if let (Some(bp), Some(nb)) = (block_prefix_opt, num_blocks_opt) {
                         for i in 0..nb {
                             let block_key = format!("{}/part_{}", bp, i);
-                            let _ = self.backend.delete_object("backend_0", &block_key).await;
+                            // Old backend logic removed for part cleanup
                         }
                     }
                 }
@@ -2286,15 +2281,17 @@ impl DataRouter {
                                     .hdel("squeezefs:block_sizes", &bk)
                                     .query_async(con)
                                     .await?;
-                                let (be_id, real_key) = parse_backend_and_key(&bk);
-                                let _ = self.backend.delete_object(&be_id, &real_key).await;
+                                if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
                         } else {
                             let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
-                            let (be_id, real_key) = parse_backend_and_key(&bk);
-                            let _ = self.backend.delete_object(&be_id, &real_key).await;
+                            if let Ok(offset_u64) = bk.parse::<u64>() {
+                                let _ = self.block_allocator.free_block(offset_u64).await;
+                            }
                         }
                     }
                     let _: () = con.del(&mapping_key).await?;
@@ -2527,22 +2524,3 @@ impl Default for IoUringPrefetcher {
     }
 }
 
-pub async fn fetch_block_bytes(
-    backend: &crate::backend::MultiBackendClient,
-    bk: &str,
-) -> Result<Vec<u8>> {
-    let (be_id, real_key) = crate::backend::parse_backend_and_key(bk);
-    if real_key.starts_with("s3_single:") {
-        let parts: Vec<&str> = real_key.split(':').collect();
-        if parts.len() == 4 {
-            let s3_key = parts[1];
-            let start: u64 = parts[2].parse().unwrap_or(0);
-            let end: u64 = parts[3].parse().unwrap_or(0);
-            Ok(backend.get_object_range(&be_id, s3_key, start, end).await?)
-        } else {
-            Ok(backend.get_object(&be_id, &real_key).await?)
-        }
-    } else {
-        Ok(backend.get_object(&be_id, &real_key).await?)
-    }
-}

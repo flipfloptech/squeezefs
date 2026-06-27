@@ -69,9 +69,6 @@ async fn test_sharded_volume_formatting_and_initialization() {
         None,
         None,
         None,
-        None,
-        None,
-        None,
         true, // quick
     )
     .await

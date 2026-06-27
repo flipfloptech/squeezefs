@@ -50,3 +50,43 @@ async fn test_concurrent_allocations() {
     offsets.dedup();
     assert_eq!(offsets.len(), 100, "All concurrent allocations must yield unique block offsets");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_interleaved_alloc_free() {
+    let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let meta = Arc::new(MetaClient::Single(client));
+    
+    let allocator = Arc::new(BlockAllocator::new(meta, "test_vol_interleaved").await.unwrap());
+
+    // Allocate 10 blocks
+    let mut offsets = vec![];
+    for _ in 0..10 {
+        offsets.push(allocator.allocate_block().await.unwrap());
+    }
+
+    // Free 5 of them concurrently
+    let mut free_handles = vec![];
+    for i in 0..5 {
+        let alloc_clone = allocator.clone();
+        let offset = offsets[i];
+        free_handles.push(tokio::spawn(async move {
+            alloc_clone.free_block(offset).await.unwrap()
+        }));
+    }
+
+    for handle in free_handles {
+        handle.await.unwrap();
+    }
+
+    // Allocate 5 more, they should reuse the freed ones
+    let mut new_offsets = vec![];
+    for _ in 0..5 {
+        new_offsets.push(allocator.allocate_block().await.unwrap());
+    }
+
+    new_offsets.sort();
+    let mut freed_offsets = offsets[0..5].to_vec();
+    freed_offsets.sort();
+
+    assert_eq!(new_offsets, freed_offsets, "Freed blocks should be reused");
+}

@@ -362,11 +362,17 @@ enum StoragePoolActions {
         pool_name: String,
         /// Physical disk paths to remove
         disks: Vec<String>,
+        /// Automatically bypass interactive confirmations
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Delete an entire storage pool
     Delete {
         /// Pool name
         pool_name: String,
+        /// Automatically bypass interactive confirmations
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// List all storage pools (Volume Groups)
     List,
@@ -406,6 +412,9 @@ enum StorageVolumeActions {
         pool_name: String,
         /// Volume name
         vol_name: String,
+        /// Automatically bypass interactive confirmations
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// List all storage volumes (Logical Volumes)
     List,
@@ -1889,11 +1898,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 StoragePoolActions::Add { pool_name, disks } => {
                     squeezefs::storage::pool_add(&pool_name, &disks)?;
                 }
-                StoragePoolActions::Remove { pool_name, disks } => {
-                    squeezefs::storage::pool_remove(&pool_name, &disks)?;
+                StoragePoolActions::Remove {
+                    pool_name,
+                    disks,
+                    yes,
+                } => {
+                    squeezefs::storage::pool_remove(&pool_name, &disks, yes)?;
                 }
-                StoragePoolActions::Delete { pool_name } => {
-                    squeezefs::storage::pool_delete(&pool_name)?;
+                StoragePoolActions::Delete { pool_name, yes } => {
+                    squeezefs::storage::pool_delete(&pool_name, yes)?;
                 }
                 StoragePoolActions::List => {
                     squeezefs::storage::pool_list()?;
@@ -1925,8 +1938,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 StorageVolumeActions::Delete {
                     pool_name,
                     vol_name,
+                    yes,
                 } => {
-                    squeezefs::storage::volume_delete(&pool_name, &vol_name)?;
+                    squeezefs::storage::volume_delete(&pool_name, &vol_name, yes)?;
                 }
                 StorageVolumeActions::List => {
                     squeezefs::storage::volume_list()?;

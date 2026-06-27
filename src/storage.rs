@@ -140,7 +140,7 @@ pub fn volume_extend(pool_name: &str, vol_name: &str, add_size: &str) -> Result<
 
 pub fn detect_squeezefs_volume(device_path: &str) -> Option<String> {
     use std::fs::File;
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
 
     let mut file = File::open(device_path).ok()?;
     let mut buf = vec![0u8; 512];
@@ -149,8 +149,13 @@ pub fn detect_squeezefs_volume(device_path: &str) -> Option<String> {
     let magic = b"SQUEEZEFS_SUPER\x00";
     if buf[0..magic.len()] == *magic {
         let name_bytes = &buf[16..80];
-        let end_idx = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
-        let name = String::from_utf8_lossy(&name_bytes[..end_idx]).trim().to_string();
+        let end_idx = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_bytes.len());
+        let name = String::from_utf8_lossy(&name_bytes[..end_idx])
+            .trim()
+            .to_string();
         if !name.is_empty() {
             return Some(name);
         }
@@ -215,12 +220,15 @@ pub fn pool_remove(pool_name: &str, disks: &[String], force_yes: bool) -> Result
             );
 
             let migrate = force_yes || confirm_action(
-                &format!("Do you want to migrate this data to other disks in the pool using pvmove first?"),
+                "Do you want to migrate this data to other disks in the pool using pvmove first?",
                 true,
             );
 
             if migrate {
-                println!("Migrating data off '{}' via pvmove (this may take some time)...", d);
+                println!(
+                    "Migrating data off '{}' via pvmove (this may take some time)...",
+                    d
+                );
                 if let Err(e) = run_cmd("pvmove", &[d.as_str()]) {
                     println!("{}", format!("ERROR: pvmove failed: {:?}", e).red().bold());
                     let proceed = force_yes || confirm_action(
@@ -228,7 +236,9 @@ pub fn pool_remove(pool_name: &str, disks: &[String], force_yes: bool) -> Result
                         false,
                     );
                     if !proceed {
-                        return Err(SqueezefsError::InvalidOperation("Disk removal cancelled by user due to migration failure".to_string()));
+                        return Err(SqueezefsError::InvalidOperation(
+                            "Disk removal cancelled by user due to migration failure".to_string(),
+                        ));
                     }
                 } else {
                     println!("Data migrated successfully from '{}'.", d);
@@ -239,7 +249,9 @@ pub fn pool_remove(pool_name: &str, disks: &[String], force_yes: bool) -> Result
                     false,
                 );
                 if !proceed {
-                    return Err(SqueezefsError::InvalidOperation("Disk removal cancelled by user".to_string()));
+                    return Err(SqueezefsError::InvalidOperation(
+                        "Disk removal cancelled by user".to_string(),
+                    ));
                 }
             }
         }
@@ -292,16 +304,27 @@ pub fn pool_delete(pool_name: &str, force_yes: bool) -> Result<()> {
         for vol in &detected_vols {
             println!("  - {}", vol);
         }
-        println!("{}", "Deleting this storage pool will destroy these filesystems!".red().bold());
+        println!(
+            "{}",
+            "Deleting this storage pool will destroy these filesystems!"
+                .red()
+                .bold()
+        );
     }
 
-    let proceed = force_yes || confirm_action(
-        &format!("Are you sure you want to delete storage pool '{}' and all its volumes?", pool_name),
-        false,
-    );
+    let proceed = force_yes
+        || confirm_action(
+            &format!(
+                "Are you sure you want to delete storage pool '{}' and all its volumes?",
+                pool_name
+            ),
+            false,
+        );
 
     if !proceed {
-        return Err(SqueezefsError::InvalidOperation("Storage pool deletion cancelled by user".to_string()));
+        return Err(SqueezefsError::InvalidOperation(
+            "Storage pool deletion cancelled by user".to_string(),
+        ));
     }
 
     info!("Deleting entire storage pool '{}'", pool_name);
@@ -325,22 +348,39 @@ pub fn volume_delete(pool_name: &str, vol_name: &str, force_yes: bool) -> Result
             .red()
             .bold()
         );
-        println!("{}", "Deleting this volume will destroy all files and metadata stored on it!".red().bold());
-
-        let proceed = force_yes || confirm_action(
-            &format!("Are you sure you want to delete SqueezeFS volume '{}'?", fs_name),
-            false,
+        println!(
+            "{}",
+            "Deleting this volume will destroy all files and metadata stored on it!"
+                .red()
+                .bold()
         );
+
+        let proceed = force_yes
+            || confirm_action(
+                &format!(
+                    "Are you sure you want to delete SqueezeFS volume '{}'?",
+                    fs_name
+                ),
+                false,
+            );
         if !proceed {
-            return Err(SqueezefsError::InvalidOperation("Volume deletion cancelled by user".to_string()));
+            return Err(SqueezefsError::InvalidOperation(
+                "Volume deletion cancelled by user".to_string(),
+            ));
         }
     } else {
-        let proceed = force_yes || confirm_action(
-            &format!("Are you sure you want to delete Logical Volume '{}'?", lv_path),
-            false,
-        );
+        let proceed = force_yes
+            || confirm_action(
+                &format!(
+                    "Are you sure you want to delete Logical Volume '{}'?",
+                    lv_path
+                ),
+                false,
+            );
         if !proceed {
-            return Err(SqueezefsError::InvalidOperation("Volume deletion cancelled by user".to_string()));
+            return Err(SqueezefsError::InvalidOperation(
+                "Volume deletion cancelled by user".to_string(),
+            ));
         }
     }
 

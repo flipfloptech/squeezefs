@@ -4836,6 +4836,24 @@ pub async fn format_volume(
     .await
 }
 
+fn create_superblock(name: &str, capacity: u64, block_size: u64, inodes: u64) -> Vec<u8> {
+    let mut sb = vec![0u8; 4096];
+    let magic = b"SQUEEZEFS_SUPER\x00";
+    sb[0..magic.len()].copy_from_slice(magic);
+    let name_bytes = name.as_bytes();
+    let name_len = std::cmp::min(name_bytes.len(), 63);
+    sb[16..16 + name_len].copy_from_slice(&name_bytes[..name_len]);
+    sb[80..88].copy_from_slice(&capacity.to_be_bytes());
+    sb[88..96].copy_from_slice(&block_size.to_be_bytes());
+    sb[96..104].copy_from_slice(&inodes.to_be_bytes());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    sb[104..112].copy_from_slice(&timestamp.to_be_bytes());
+    sb
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn format_volume_ext(
     redis_url: &str,
@@ -4991,6 +5009,34 @@ pub async fn format_volume_ext(
                         "Failed to open NVMe target for wiping: {:?}",
                         file_result.err()
                     );
+                }
+            }
+        }
+    }
+
+    if let Some(target_path) = nvme_target_path {
+        if !target_path.is_empty() {
+            log::info!("Writing SqueezeFS superblock signature to target: {}", target_path);
+            let file_result = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(target_path)
+                .await;
+            match file_result {
+                Ok(mut file) => {
+                    use tokio::io::AsyncSeekExt;
+                    use tokio::io::AsyncWriteExt;
+                    let sb = create_superblock(name, parsed_capacity, parsed_block_size, inodes);
+                    if let Ok(_) = file.seek(std::io::SeekFrom::Start(0)).await {
+                        if let Err(e) = file.write_all(&sb).await {
+                            log::warn!("Failed to write SqueezeFS superblock to NVMe target: {:?}", e);
+                        } else {
+                            let _ = file.sync_all().await;
+                            log::info!("Successfully wrote SqueezeFS superblock to target {}", target_path);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to open NVMe target for writing superblock: {:?}", e);
                 }
             }
         }

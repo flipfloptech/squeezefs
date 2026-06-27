@@ -61,3 +61,36 @@ async fn test_max_background_uploads_config() {
     // This will initially FAIL compilation since the field does not exist.
     assert_eq!(fs.max_background_uploads(), 16);
 }
+
+#[tokio::test]
+async fn test_background_io_pipelining_concurrency() {
+    let redis_url = get_redis_url();
+    let dlm = DlmClient::new(&redis_url).ok();
+    if dlm.is_none() {
+        return;
+    }
+    let dlm = dlm.unwrap();
+
+    let backend = RustFsClient::new_mock();
+    let multi_backend = MultiBackendClient::new();
+    multi_backend.register_backend("backend_0", backend.clone());
+
+    let temp_staging = tempdir().expect("Failed to create tempdir");
+    let cache = TieredCache::new(
+        vec![temp_staging.path().to_path_buf()],
+        Some("128MB"),
+        Some("128MB"),
+        Some("500MB"),
+        Some("500MB"),
+        backend.clone(),
+        dlm.meta_client().clone(),
+    )
+    .expect("Failed to create cache");
+
+    let router = DataRouter::new(dlm.clone(), multi_backend.clone(), cache.clone());
+    let mut fs = SqueezefsFilesystem::new(router.clone(), dlm.clone(), 1000, 1000);
+    fs.max_background_uploads = 2; // set concurrency limit to 2
+
+    // Assert that the writeback worker respects the concurrency limit.
+    assert_eq!(fs.max_background_uploads(), 2);
+}

@@ -158,6 +158,9 @@ pub struct SqueezefsFilesystem {
     uid: u32,
     gid: u32,
     active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease, ahash::RandomState>>,
+    lease_locks: std::sync::Arc<
+        dashmap::DashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>, ahash::RandomState>,
+    >,
     active_posix_locks:
         std::sync::Arc<dashmap::DashMap<(Inode, u64, u64, u64), PosixLock, ahash::RandomState>>,
     active_delegations:
@@ -191,6 +194,9 @@ impl SqueezefsFilesystem {
             active_leases: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            lease_locks: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
             active_posix_locks: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
@@ -213,6 +219,11 @@ impl SqueezefsFilesystem {
 
     pub fn max_background_uploads(&self) -> usize {
         self.max_background_uploads
+    }
+
+    pub fn disable_background_writeback(&self) {
+        let mut rx_guard = self.writeback_rx.lock().unwrap();
+        let _ = rx_guard.take();
     }
 
     pub fn dlm(&self) -> &DlmClient {
@@ -539,6 +550,18 @@ impl SqueezefsFilesystem {
         if let Some(lease) = self.active_leases.get(&ino) {
             return Ok(lease.fencing_token());
         }
+
+        let lock_arc = self
+            .lease_locks
+            .entry(ino)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock_arc.lock().await;
+
+        if let Some(lease) = self.active_leases.get(&ino) {
+            return Ok(lease.fencing_token());
+        }
+
         let file_path = format!("inode_{}", ino);
         let lease = self
             .dlm
@@ -676,7 +699,7 @@ impl SqueezefsFilesystem {
                     Some(id) => Some(id),
                     None => {
                         let meta_key = format!("metadata:{}", file_path);
-                        let mut con = self.dlm.get_connection().await?;
+                        let mut con = self.dlm.get_connection_for_inode(ino).await?;
                         let id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
                         id_opt
                     }
@@ -700,7 +723,7 @@ impl SqueezefsFilesystem {
                         Some(key_opt) => key_opt,
                         None => {
                             let block_map_key = format!("block_map:{}", block_map_id);
-                            let mut con = self.dlm.get_connection().await?;
+                            let mut con = self.dlm.get_connection_for_inode(ino).await?;
                             let key_opt: Option<String> =
                                 con.hget(&block_map_key, b.to_string()).await?;
                             key_opt
@@ -952,7 +975,7 @@ impl SqueezefsFilesystem {
         ino: u64,
     ) -> Result<(), SqueezefsError> {
         use redis::AsyncCommands;
-        let mut con = self.dlm.get_connection().await?;
+        let mut con = self.dlm.get_connection_for_inode(ino).await?;
         let active_mp_key = format!("squeezefs:active_multipart:{}", ino);
 
         let (upload_id_opt, s3_key_opt, backend_id_opt): (
@@ -1230,7 +1253,14 @@ impl Filesystem for SqueezefsFilesystem {
             let active_inode_locks = self.active_inode_locks.clone();
             let max_uploads = self.max_background_uploads;
             tokio::spawn(async move {
-                run_constant_writeback_worker(writeback_rx, router, dlm, active_inode_locks, max_uploads).await;
+                run_constant_writeback_worker(
+                    writeback_rx,
+                    router,
+                    dlm,
+                    active_inode_locks,
+                    max_uploads,
+                )
+                .await;
             });
         }
 
@@ -1639,6 +1669,17 @@ impl Filesystem for SqueezefsFilesystem {
             let max_inodes_val = if max_inodes > 0 { max_inodes } else { u64::MAX };
 
             if used.unwrap_or(0) >= max_inodes_val {
+                let mut con_dec = self
+                    .dlm
+                    .get_connection_for_inode(parent)
+                    .await
+                    .map_err(map_squeezefs_err)?;
+                let _: () = redis::cmd("DECRBY")
+                    .arg("squeezefs:inode_counter")
+                    .arg(shard_count)
+                    .query_async(&mut con_dec)
+                    .await
+                    .map_err(map_err)?;
                 return Err(Errno::from(libc::ENOSPC));
             }
 
@@ -1801,7 +1842,11 @@ impl Filesystem for SqueezefsFilesystem {
         let file_size = if let Some(entry) = self.attr_cache.get(&ino) {
             entry.value().0.size
         } else {
-            let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(ino)
+                .await
+                .map_err(map_squeezefs_err)?;
             let attr_key = format!("squeezefs:attr:{}", ino);
             let size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
             size_opt.unwrap_or(0)
@@ -1865,7 +1910,11 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
 
-            let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(ino)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             let attr_key = format!("squeezefs:attr:{}", ino);
             let meta_key = format!("metadata:inode_{}", ino);
@@ -2097,6 +2146,17 @@ impl Filesystem for SqueezefsFilesystem {
             let max_inodes_val = if max_inodes > 0 { max_inodes } else { u64::MAX };
 
             if used.unwrap_or(0) >= max_inodes_val {
+                let mut con_dec = self
+                    .dlm
+                    .get_connection_for_inode(parent)
+                    .await
+                    .map_err(map_squeezefs_err)?;
+                let _: () = redis::cmd("DECRBY")
+                    .arg("squeezefs:inode_counter")
+                    .arg(shard_count)
+                    .query_async(&mut con_dec)
+                    .await
+                    .map_err(map_err)?;
                 return Err(Errno::from(libc::ENOSPC));
             }
 
@@ -2329,7 +2389,11 @@ impl Filesystem for SqueezefsFilesystem {
             let lock = self.get_inode_lock(ino);
             let _guard = lock.write().await;
 
-            let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(ino)
+                .await
+                .map_err(map_squeezefs_err)?;
             let attr_key = format!("squeezefs:attr:{}", ino);
 
             // Check if inode exists first
@@ -2457,7 +2521,11 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         let symlink_future = async {
-            let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(parent)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             // Check if name already exists in parent
             let dir_key = format!("squeezefs:dir:{}", parent);
@@ -2538,7 +2606,11 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn readlink(&self, _req: Request, ino: u64) -> FuseResult<ReplyData> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+        let mut con = self
+            .dlm
+            .get_connection_for_inode(ino)
+            .await
+            .map_err(map_squeezefs_err)?;
         let symlink_key = format!("squeezefs:symlink:{}", ino);
         let target: Option<String> = con.get(&symlink_key).await.map_err(map_err)?;
 
@@ -2569,7 +2641,11 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         let link_future = async {
-            let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(new_parent)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             // Check if destination name already exists in new_parent
             let dir_key = format!("squeezefs:dir:{}", new_parent);
@@ -2690,56 +2766,40 @@ impl Filesystem for SqueezefsFilesystem {
             };
 
             let child_attr_key = format!("squeezefs:attr:{}", ino);
+            let meta_key = format!("metadata:inode_{}", ino);
+
+            let mut child_con = self
+                .dlm
+                .get_connection_for_inode(ino)
+                .await
+                .map_err(map_squeezefs_err)?;
 
             let mut pipe = redis::pipe();
             pipe.cmd("HGET").arg(&child_attr_key).arg("kind");
-            pipe.cmd("HDEL").arg(&dir_key).arg(&*name_str);
-            pipe.cmd("HINCRBY")
-                .arg(&child_attr_key)
-                .arg("nlink")
-                .arg(-1);
             pipe.cmd("HGET").arg(&child_attr_key).arg("size");
-            pipe.cmd("HGET")
-                .arg(format!("metadata:inode_{}", ino))
-                .arg("type");
-            let (kind_str, deleted, mut new_nlink, size_str, type_str): (
-                Option<String>,
-                i64,
-                i64,
-                Option<String>,
-                Option<String>,
-            ) = pipe.query_async(&mut con).await.map_err(map_err)?;
+            pipe.cmd("HGET").arg(&meta_key).arg("type");
+            let (kind_str, size_str, type_str): (Option<String>, Option<String>, Option<String>) =
+                pipe.query_async(&mut child_con).await.map_err(map_err)?;
 
             let kind = kind_str.and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
             if kind == 2 {
-                let mut rb_pipe = redis::pipe();
-                rb_pipe.cmd("HSET").arg(&dir_key).arg(&*name_str).arg(ino);
-                rb_pipe
-                    .cmd("HINCRBY")
-                    .arg(&child_attr_key)
-                    .arg("nlink")
-                    .arg(1);
-                let _: () = rb_pipe.query_async(&mut con).await.map_err(map_err)?;
                 return Err(Errno::from(libc::EISDIR));
             }
+
+            let deleted: i64 = con.hdel(&dir_key, &*name_str).await.map_err(map_err)?;
             if deleted == 0 {
-                let _: () = redis::cmd("HINCRBY")
-                    .arg(&child_attr_key)
-                    .arg("nlink")
-                    .arg(1)
-                    .query_async(&mut con)
-                    .await
-                    .map_err(map_err)?;
                 return Err(Errno::from(libc::ENOENT));
             }
 
+            let mut new_nlink: i64 = child_con
+                .hincr(&child_attr_key, "nlink", -1)
+                .await
+                .map_err(map_err)?;
+
             if new_nlink < 0 {
                 new_nlink = 0;
-                let _: () = redis::cmd("HSET")
-                    .arg(&child_attr_key)
-                    .arg("nlink")
-                    .arg(0)
-                    .query_async(&mut con)
+                let _: () = child_con
+                    .hset(&child_attr_key, "nlink", 0)
                     .await
                     .map_err(map_err)?;
             }
@@ -2748,10 +2808,9 @@ impl Filesystem for SqueezefsFilesystem {
             let file_type = type_str.unwrap_or_else(|| "inline".to_string());
 
             let parent_attr_key = format!("squeezefs:attr:{}", parent);
-            let attr_key = format!("squeezefs:attr:{}", ino);
 
-            let mut final_pipe = redis::pipe();
-            final_pipe.hset_multiple(
+            let mut parent_pipe = redis::pipe();
+            parent_pipe.hset_multiple(
                 &parent_attr_key,
                 &[
                     ("mtime_sec", sec.to_string()),
@@ -2760,28 +2819,42 @@ impl Filesystem for SqueezefsFilesystem {
                     ("ctime_nsec", nsec.to_string()),
                 ],
             );
+            let _: () = parent_pipe.query_async(&mut con).await.map_err(map_err)?;
 
             if new_nlink == 0 {
                 // Delete metadata and data completely
                 let file_path = format!("inode_{}", ino);
                 let inline_key = format!("inline_data:{}", file_path);
-                let meta_key = format!("metadata:{}", file_path);
+                let meta_key_del = format!("metadata:{}", file_path);
                 let symlink_key = format!("squeezefs:symlink:{}", ino);
 
                 if file_type != "inline" {
                     self.router
-                        .delete_file(&file_path, &mut con)
+                        .delete_file(&file_path, &mut child_con)
                         .await
                         .map_err(map_squeezefs_err)?;
                 }
 
-                final_pipe
-                    .del(&attr_key)
+                let mut child_del_pipe = redis::pipe();
+                child_del_pipe
+                    .del(&child_attr_key)
                     .del(&inline_key)
-                    .del(&meta_key)
-                    .del(&symlink_key)
+                    .del(&meta_key_del)
+                    .del(&symlink_key);
+                let _: () = child_del_pipe
+                    .query_async(&mut child_con)
+                    .await
+                    .map_err(map_err)?;
+
+                let mut global_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+                let mut global_pipe = redis::pipe();
+                global_pipe
                     .decr("squeezefs:used_bytes", file_size)
                     .decr("squeezefs:used_inodes", 1);
+                let _: () = global_pipe
+                    .query_async(&mut global_con)
+                    .await
+                    .map_err(map_err)?;
 
                 if let Some((_, lease)) = self.active_leases.remove(&ino) {
                     let _ = lease.release().await;
@@ -2789,7 +2862,6 @@ impl Filesystem for SqueezefsFilesystem {
                 self.active_inode_locks.remove(&ino);
                 self.active_posix_locks.retain(|key, _| key.0 != ino);
             }
-            let _: () = final_pipe.query_async(&mut con).await.map_err(map_err)?;
 
             // Invalidate attr_cache, router metadata_cache, and dir_entry_cache
             self.attr_cache.remove(&ino);
@@ -3654,7 +3726,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
 
             // Update destination attributes size and times in Garnet
-            if let Ok(mut con) = self.dlm.get_connection().await {
+            if let Ok(mut con) = self.dlm.get_connection_for_inode(inode_out).await {
                 let attr_key = format!("squeezefs:attr:{}", inode_out);
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -3716,7 +3788,7 @@ impl Filesystem for SqueezefsFilesystem {
         let copied_len = chunk.len() as u64;
         let new_dest_size = std::cmp::max(dest_size, off_out + copied_len);
 
-        if let Ok(mut con) = self.dlm.get_connection().await {
+        if let Ok(mut con) = self.dlm.get_connection_for_inode(inode_out).await {
             let attr_key = format!("squeezefs:attr:{}", inode_out);
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -3938,7 +4010,11 @@ impl Filesystem for SqueezefsFilesystem {
         // Pre-allocation isn't strictly required to reserve physical space in our S3-backed store
         // as S3 objects are sparse/dynamic by nature. We just update the size attribute if we are extending.
         if mode & libc::FALLOC_FL_KEEP_SIZE as u32 == 0 {
-            let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+            let mut con = self
+                .dlm
+                .get_connection_for_inode(ino)
+                .await
+                .map_err(map_squeezefs_err)?;
             let attr_key = format!("squeezefs:attr:{}", ino);
 
             // Check if inode exists first
@@ -4248,7 +4324,7 @@ impl Filesystem for SqueezefsFilesystem {
 
                 let block_keys = match self
                     .router
-                    .load_striped_block_keys(&meta, start_block, end_block)
+                    .load_striped_block_keys(&file_path, &meta, start_block, end_block)
                     .await
                 {
                     Ok(keys) => keys,
@@ -5189,15 +5265,34 @@ pub async fn format_volume_ext(
         let default_secret_key = s3_secret_key.unwrap_or("password");
         let default_bucket = s3_bucket.unwrap_or("squeezefs-data");
 
-        let backend_json = serde_json::json!({
-            "endpoint": default_endpoint,
-            "access_key": default_access_key,
-            "secret_key": default_secret_key,
-            "bucket": default_bucket,
-        })
-        .to_string();
+        let endpoints: Vec<&str> = default_endpoint
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-        pipe.hset("squeezefs:backends", "backend_0", backend_json);
+        if endpoints.len() > 1 {
+            for (i, ep) in endpoints.iter().enumerate() {
+                let be_id = format!("backend_{}", i);
+                let backend_json = serde_json::json!({
+                    "endpoint": ep,
+                    "access_key": default_access_key,
+                    "secret_key": default_secret_key,
+                    "bucket": default_bucket,
+                })
+                .to_string();
+                pipe.hset("squeezefs:backends", &be_id, backend_json);
+            }
+        } else {
+            let backend_json = serde_json::json!({
+                "endpoint": default_endpoint,
+                "access_key": default_access_key,
+                "secret_key": default_secret_key,
+                "bucket": default_bucket,
+            })
+            .to_string();
+            pipe.hset("squeezefs:backends", "backend_0", backend_json);
+        }
 
         if !default_endpoint.is_empty() {
             pipe.hset("squeezefs:format", "s3_endpoint", default_endpoint)
@@ -5430,15 +5525,16 @@ async fn run_constant_writeback_worker(
                 Err(_) => return,
             };
 
-            let (file_type_opt, block_map_id_opt): (Option<String>, Option<String>) = match redis::pipe()
-                .hget(&meta_key, "type")
-                .hget(&meta_key, "block_map_id")
-                .query_async(&mut con)
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => return,
-            };
+            let (file_type_opt, block_map_id_opt): (Option<String>, Option<String>) =
+                match redis::pipe()
+                    .hget(&meta_key, "type")
+                    .hget(&meta_key, "block_map_id")
+                    .query_async(&mut con)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
 
             let file_type = file_type_opt.unwrap_or_else(|| "inline".to_string());
             let is_striped = file_type == "striped";
@@ -5449,10 +5545,11 @@ async fn run_constant_writeback_worker(
             }
 
             let block_map_key = format!("block_map:{}", block_map_id);
-            let old_key: Option<String> = match con.hget(&block_map_key, req.block_idx.to_string()).await {
-                Ok(k) => k,
-                Err(_) => return,
-            };
+            let old_key: Option<String> =
+                match con.hget(&block_map_key, req.block_idx.to_string()).await {
+                    Ok(k) => k,
+                    Err(_) => return,
+                };
 
             let _ = flush_single_active_block(
                 req.ino,
@@ -5485,7 +5582,7 @@ async fn flush_due_active_blocks_for_inode(
 
     let file_path = format!("inode_{}", ino);
     let meta_key = format!("metadata:{}", file_path);
-    let mut con = dlm.get_connection().await?;
+    let mut con = dlm.get_connection_for_inode(ino).await?;
     let (file_type_opt, block_map_id_opt): (Option<String>, Option<String>) = redis::pipe()
         .hget(&meta_key, "type")
         .hget(&meta_key, "block_map_id")
@@ -5512,28 +5609,30 @@ async fn flush_due_active_blocks_for_inode(
     let active_inode_locks = active_inode_locks.clone();
     let block_map_id_val = block_map_id.clone();
 
-    let mut flushes = stream::iter(block_indices.into_iter().enumerate().map(move |(idx, block_idx)| {
-        let router = router.clone();
-        let dlm = dlm.clone();
-        let active_inode_locks = active_inode_locks.clone();
-        let old_key = old_block_keys[idx].clone();
-        let block_map_id_val = block_map_id_val.clone();
-        async move {
-            flush_single_active_block(
-                ino,
-                block_idx,
-                fencing_token,
-                &router,
-                &dlm,
-                &active_inode_locks,
-                is_striped,
-                &block_map_id_val,
-                old_key,
-                false,
-            )
-            .await
-        }
-    }))
+    let mut flushes = stream::iter(block_indices.into_iter().enumerate().map(
+        move |(idx, block_idx)| {
+            let router = router.clone();
+            let dlm = dlm.clone();
+            let active_inode_locks = active_inode_locks.clone();
+            let old_key = old_block_keys[idx].clone();
+            let block_map_id_val = block_map_id_val.clone();
+            async move {
+                flush_single_active_block(
+                    ino,
+                    block_idx,
+                    fencing_token,
+                    &router,
+                    &dlm,
+                    &active_inode_locks,
+                    is_striped,
+                    &block_map_id_val,
+                    old_key,
+                    false,
+                )
+                .await
+            }
+        },
+    ))
     .buffer_unordered(8);
 
     while let Some(result) = flushes.next().await {
@@ -5567,20 +5666,32 @@ async fn flush_single_active_block(
         .value()
         .clone();
 
-    let (block_data, _block_guard, _cleanup_guard) = {
-        let _block_guard = block_lock.lock().await;
-        let _cleanup_guard = BlockFlushGuard { key: (ino, b) };
+    let _block_guard = block_lock.lock().await;
+    let _cleanup_guard = BlockFlushGuard { key: (ino, b) };
 
-        let block_data = match router.cache.nvme.read_staged(&cache_key) {
-            Some(d) => d,
-            None => return Ok(()),
-        };
+    let lock_opt = if !locked {
+        Some(
+            active_inode_locks
+                .entry(ino)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
+                .clone(),
+        )
+    } else {
+        None
+    };
 
-        (block_data, _block_guard, _cleanup_guard)
+    let mut _inode_guard = None;
+    if let Some(ref l) = lock_opt {
+        _inode_guard = Some(l.read().await);
+    }
+
+    let block_data = match router.cache.nvme.read_staged(&cache_key) {
+        Some(d) => d,
+        None => return Ok(()),
     };
 
     use redis::AsyncCommands;
-    let mut con = dlm.get_connection().await?;
+    let mut con = dlm.get_connection_for_inode(ino).await?;
     let mut active_multipart = None;
     if is_striped {
         let active_mp_key = format!("squeezefs:active_multipart:{}", ino);
@@ -5676,24 +5787,7 @@ async fn flush_single_active_block(
     let active_be = router.backend.get_backend_for_key(&new_block_key);
     let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
-    // Re-acquire lock to verify consistency and finalize update
-    let lock_opt = if !locked {
-        Some(
-            active_inode_locks
-                .entry(ino)
-                .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
-                .clone(),
-        )
-    } else {
-        None
-    };
-
-    let mut _guard = None;
-    if let Some(ref l) = lock_opt {
-        _guard = Some(l.write().await);
-    }
-
-    let mut con = dlm.get_connection().await?;
+    let mut con = dlm.get_connection_for_inode(ino).await?;
     let block_map_key = format!("block_map:{}", block_map_id);
 
     let refcounts_key = "squeezefs:block_refcounts";
@@ -5805,7 +5899,7 @@ async fn load_locks_from_redis(
     posix_locks: &dashmap::DashMap<(Inode, u64, u64, u64), PosixLock, ahash::RandomState>,
 ) -> Result<(), SqueezefsError> {
     use redis::AsyncCommands;
-    let mut con = dlm.get_connection().await?;
+    let mut con = dlm.get_connection_for_inode(inode).await?;
     let pattern = format!("lock:inode_{}:range:*", inode);
 
     let mut keys = Vec::new();

@@ -142,6 +142,7 @@ async fn test_data_integrity_various_sizes() {
     // Force flush if necessary, and then clear memory caches
     // Recreating them forces reload of block maps from Garnet and read from disk cache or S3!
     drop(fs);
+    drop(cache);
 
     // Recreate filesystem structure with the SAME Garnet and S3 mock backend
     let cache_recreate = TieredCache::new(
@@ -281,6 +282,7 @@ async fn test_data_integrity_chunked_writes_sha512() {
 
     // Recreate filesystem to bypass RAM caches and force read from S3/Staging
     drop(fs);
+    drop(cache);
 
     let cache_recreate = TieredCache::new(
         vec![temp_staging.path().to_path_buf()],
@@ -435,6 +437,7 @@ async fn test_striped_rmw_corruption_with_compression() {
 
     // Recreate filesystem to clear memory caches and read back from storage
     drop(fs);
+    drop(cache);
 
     let cache_recreate = TieredCache::new(
         vec![temp_staging.path().to_path_buf()],
@@ -839,6 +842,7 @@ async fn test_data_integrity_known_sha512_hash() {
 
     // Recreate FS to bypass memory cache
     drop(fs);
+    drop(cache);
 
     let cache_recreate = TieredCache::new(
         vec![temp_staging.path().to_path_buf()],
@@ -947,6 +951,7 @@ async fn test_data_integrity_10mb_sha512_hash() {
 
     // Recreate FS to bypass memory cache
     drop(fs);
+    drop(cache);
 
     let cache_recreate = TieredCache::new(
         vec![temp_staging.path().to_path_buf()],

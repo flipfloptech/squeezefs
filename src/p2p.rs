@@ -11,7 +11,7 @@ struct SqueezefsLocalCacheReader {
     cache: NvmeStaging,
 }
 
-impl hypertier::dht::LocalCacheReader for SqueezefsLocalCacheReader {
+impl crate::tiering::dht::LocalCacheReader for SqueezefsLocalCacheReader {
     fn get_local(&self, key: &Bytes) -> Option<Bytes> {
         let guard = self.cache.read_nvme_cache.get(key)?;
         Some(Bytes::copy_from_slice(
@@ -57,7 +57,7 @@ impl P2pServer {
             cache: self.cache.clone(),
         });
 
-        let dht_node = Arc::new(hypertier::dht::DhtNode::new(self.addr.clone(), reader));
+        let dht_node = Arc::new(crate::tiering::dht::DhtNode::new(self.addr.clone(), reader));
 
         // Store DhtNode in NvmeStaging so clients can retrieve it
         let _ = self.cache.dht_node.set(dht_node.clone());
@@ -132,7 +132,7 @@ impl P2pClient {
 
     pub async fn download_block_from_peer(
         &self,
-        dht_node: &hypertier::dht::DhtNode,
+        dht_node: &crate::tiering::dht::DhtNode,
         block_key: &str,
     ) -> Result<Vec<u8>> {
         let key_hash = xxh3_64(block_key.as_bytes());

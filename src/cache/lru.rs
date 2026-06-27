@@ -6,7 +6,7 @@ type EvictReceiver = tokio::sync::mpsc::Receiver<(String, Bytes)>;
 
 #[derive(Clone)]
 pub struct LruCache {
-    inner: Arc<hypertier::memory::MemoryCache>,
+    inner: Arc<crate::tiering::memory::MemoryCache>,
     max_bytes: u64,
     evict_tx: tokio::sync::mpsc::Sender<(String, Bytes)>,
     evict_rx: Arc<std::sync::Mutex<Option<EvictReceiver>>>,
@@ -53,7 +53,7 @@ impl LruCache {
             }
         };
 
-        let inner = Arc::new(hypertier::memory::MemoryCache::new(
+        let inner = Arc::new(crate::tiering::memory::MemoryCache::new(
             actual_bytes as usize,
             actual_shards,
         ));

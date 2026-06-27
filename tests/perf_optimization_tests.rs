@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-use squeezefs::fuse_client::SqueezefsFilesystem;
-use squeezefs::dlm::DlmClient;
 use squeezefs::backend::{MultiBackendClient, RustFsClient};
 use squeezefs::cache::TieredCache;
+use squeezefs::dlm::DlmClient;
+use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::routing::DataRouter;
 use tempfile::tempdir;
 

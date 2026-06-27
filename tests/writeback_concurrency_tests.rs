@@ -419,6 +419,9 @@ async fn test_rmw_cache_ingestion() {
         .await
         .unwrap();
 
+    // Give background cache_read_block task a moment to execute
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
     // 5. Verify the block is now cached in the NVMe read cache
     let cached_res = fs_arc
         .router

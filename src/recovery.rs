@@ -88,7 +88,7 @@ pub async fn recover_staging(
         16
     };
     // Instantiate NvmeCache temporarily to recover from segment files
-    let cache = hypertier::nvme::NvmeCache::new(
+    let cache = crate::tiering::nvme::NvmeCache::new(
         &[staging_segment_dir.as_path()],
         &[max_write_bytes as usize],
         write_shards,

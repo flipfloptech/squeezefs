@@ -34,6 +34,7 @@ pub struct RustFsClient {
     mock_store: Option<Arc<DashMap<String, (bytes::Bytes, u64), ahash::RandomState>>>,
     current_idx: Arc<AtomicUsize>,
     mock_state: Arc<MockStoreState>,
+    local_dir: Option<std::path::PathBuf>,
 }
 
 impl RustFsClient {
@@ -73,9 +74,34 @@ impl RustFsClient {
             .or_else(|| std::env::var("RUSTFS_BUCKET").ok())
             .unwrap_or_else(|| "squeezefs-data".to_string());
 
+        let mut local_dir = None;
+        let mut actual_endpoint = endpoint;
+        if let Some(ref ep) = actual_endpoint {
+            if ep.starts_with("file://") {
+                let path_str = ep.strip_prefix("file://").unwrap();
+                local_dir = Some(std::path::PathBuf::from(path_str));
+                actual_endpoint = None;
+            }
+        }
+
+        if let Some(dir) = local_dir {
+            info!(
+                "Initializing Local File Storage Backend targeting: {:?}",
+                dir
+            );
+            return Self {
+                s3_clients: Vec::new(),
+                bucket,
+                mock_store: None,
+                current_idx: Arc::new(AtomicUsize::new(0)),
+                mock_state: Arc::new(MockStoreState::default()),
+                local_dir: Some(dir),
+            };
+        }
+
         let mut s3_clients = Vec::new();
 
-        if let Some(endpoint_url) = endpoint {
+        if let Some(endpoint_url) = actual_endpoint {
             info!("Initializing S3 client targeting: {}", endpoint_url);
             let credentials = aws_sdk_s3::config::Credentials::new(
                 access_key,
@@ -137,6 +163,7 @@ impl RustFsClient {
                 mock_store: None,
                 current_idx: Arc::new(AtomicUsize::new(0)),
                 mock_state: Arc::new(MockStoreState::default()),
+                local_dir: None,
             };
 
             match client.init_bucket().await {
@@ -171,6 +198,7 @@ impl RustFsClient {
             mock_store: Some(Arc::new(DashMap::with_hasher(ahash::RandomState::new()))),
             current_idx: Arc::new(AtomicUsize::new(0)),
             mock_state: Arc::new(MockStoreState::default()),
+            local_dir: None,
         }
     }
 
@@ -186,6 +214,7 @@ impl RustFsClient {
             mock_store: Some(Arc::new(DashMap::with_hasher(ahash::RandomState::new()))),
             current_idx: Arc::new(AtomicUsize::new(0)),
             mock_state: Arc::new(MockStoreState::default()),
+            local_dir: None,
         }
     }
 
@@ -233,6 +262,10 @@ impl RustFsClient {
     }
 
     pub async fn init_bucket(&self) -> Result<()> {
+        if let Some(ref dir) = self.local_dir {
+            tokio::fs::create_dir_all(dir).await?;
+            return Ok(());
+        }
         if self.mock_store.is_some() {
             return Ok(());
         }
@@ -259,6 +292,14 @@ impl RustFsClient {
         fencing_token: u64,
     ) -> Result<()> {
         METRICS.put_obj.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref dir) = self.local_dir {
+            let file_path = dir.join(key);
+            if let Some(parent) = file_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&file_path, data).await?;
+            return Ok(());
+        }
         if let Some(store) = &self.mock_store {
             if let Some(existing) = store.get(key) {
                 let (_, existing_token) = *existing;
@@ -313,6 +354,18 @@ impl RustFsClient {
     /// Download data from S3.
     pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
         METRICS.get_obj.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref dir) = self.local_dir {
+            let file_path = dir.join(key);
+            match tokio::fs::read(&file_path).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => {
+                    return Err(SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("object {} not found in local dir: {:?}", key, e),
+                    )));
+                }
+            }
+        }
         if let Some(store) = &self.mock_store {
             self.observe_mock_read(false).await;
             if let Some(val) = store.get(key) {
@@ -369,6 +422,16 @@ impl RustFsClient {
     /// Download a range of data from S3.
     pub async fn get_object_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>> {
         METRICS.get_obj.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref dir) = self.local_dir {
+            let file_path = dir.join(key);
+            let mut file = tokio::fs::File::open(&file_path).await?;
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            file.seek(std::io::SeekFrom::Start(start)).await?;
+            let len = end.saturating_sub(start);
+            let mut buf = vec![0; len as usize];
+            file.read_exact(&mut buf).await?;
+            return Ok(buf);
+        }
         if let Some(store) = &self.mock_store {
             self.observe_mock_read(true).await;
             if let Some(val) = store.get(key) {
@@ -440,6 +503,13 @@ impl RustFsClient {
     /// Delete an object from S3.
     pub async fn delete_object(&self, key: &str) -> Result<()> {
         METRICS.del_obj.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref dir) = self.local_dir {
+            let file_path = dir.join(key);
+            if file_path.exists() {
+                let _ = tokio::fs::remove_file(&file_path).await;
+            }
+            return Ok(());
+        }
         if let Some(store) = &self.mock_store {
             store.remove(key);
             return Ok(());
@@ -478,6 +548,13 @@ impl RustFsClient {
 
     /// Delete all objects in the configured S3 bucket.
     pub async fn destroy_bucket_data(&self) -> Result<()> {
+        if let Some(ref dir) = self.local_dir {
+            if dir.exists() {
+                let _ = tokio::fs::remove_dir_all(dir).await;
+                let _ = tokio::fs::create_dir_all(dir).await;
+            }
+            return Ok(());
+        }
         if let Some(store) = &self.mock_store {
             store.clear();
             return Ok(());
@@ -560,7 +637,7 @@ impl RustFsClient {
     }
 
     pub async fn create_multipart_upload(&self, key: &str) -> Result<String> {
-        if self.mock_store.is_some() {
+        if self.mock_store.is_some() || self.local_dir.is_some() {
             let upload_id = uuid::Uuid::new_v4().to_string();
             self.mock_state
                 .multiparts
@@ -589,7 +666,7 @@ impl RustFsClient {
         part_number: i32,
         data: bytes::Bytes,
     ) -> Result<String> {
-        if self.mock_store.is_some() {
+        if self.mock_store.is_some() || self.local_dir.is_some() {
             let etag = uuid::Uuid::new_v4().to_string();
             if let Some(mut parts) = self.mock_state.multiparts.get_mut(upload_id) {
                 parts.push((part_number, data));
@@ -621,6 +698,21 @@ impl RustFsClient {
         upload_id: &str,
         parts: Vec<(i32, String)>,
     ) -> Result<()> {
+        if self.local_dir.is_some() {
+            if let Some((_, mut parts_data)) = self.mock_state.multiparts.remove(upload_id) {
+                parts_data.sort_by_key(|(p, _)| *p);
+                let mut combined = Vec::new();
+                for (_, data) in parts_data {
+                    combined.extend_from_slice(&data);
+                }
+                let file_path = self.local_dir.as_ref().unwrap().join(key);
+                if let Some(parent) = file_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(&file_path, combined).await?;
+            }
+            return Ok(());
+        }
         if let Some(ref store) = self.mock_store {
             if let Some((_, mut parts_data)) = self.mock_state.multiparts.remove(upload_id) {
                 parts_data.sort_by_key(|(p, _)| *p);

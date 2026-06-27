@@ -1,4 +1,3 @@
-use crate::backend::RustFsClient;
 use crate::error::{Result, SqueezefsError};
 use bytes::Bytes;
 use log::{debug, error, info, warn};
@@ -59,7 +58,8 @@ pub struct NvmeStaging {
     staging_dirs: Vec<PathBuf>,
     max_write_bytes: u64,
     max_read_bytes: u64,
-    pub backend: RustFsClient,
+    pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+    pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     redis_client: crate::dlm::MetaClient,
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
@@ -85,7 +85,8 @@ impl NvmeStaging {
         staging_dirs: Vec<PathBuf>,
         max_write_bytes: u64,
         max_read_bytes: u64,
-        backend: RustFsClient,
+        block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
         redis_client: crate::dlm::MetaClient,
     ) -> Result<Self> {
         if staging_dirs.is_empty() {
@@ -192,7 +193,8 @@ impl NvmeStaging {
             staging_dirs: staging_dirs.clone(),
             max_write_bytes: actual_max_write_bytes,
             max_read_bytes: actual_max_read_bytes,
-            backend: backend.clone(),
+            block_allocator: block_allocator.clone(),
+            nvme_writer: nvme_writer.clone(),
             redis_client: redis_client.clone(),
             write_tx,
             p2p_addr: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -404,7 +406,8 @@ impl NvmeStaging {
     }
 
     fn start_merge_worker(&self, mut write_rx: mpsc::Receiver<PendingStagedWrite>) {
-        let backend = self.backend.clone();
+        let block_allocator = self.block_allocator.clone();
+        let nvme_writer = self.nvme_writer.clone();
         let redis_client = self.redis_client.clone();
         let staged_bytes = self.current_staged_write_bytes.clone();
         let space_freed_notify = self.space_freed_notify.clone();
@@ -450,7 +453,7 @@ impl NvmeStaging {
 
                         if current_bytes >= max_batch_bytes {
                             info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &block_allocator, &nvme_writer).await {
                                 error!("Failed to flush NVMe staging batch: {:?}", e);
                             }
                         }
@@ -458,7 +461,7 @@ impl NvmeStaging {
                     _ = &mut sleep => {
                         if !batch.is_empty() {
                             info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &backend, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &block_allocator, &nvme_writer).await {
                                 error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
                             }
                         }
@@ -470,12 +473,13 @@ impl NvmeStaging {
 
     async fn flush_batch(
         staging_nvme_cache: &crate::tiering::nvme::NvmeCache,
-        backend: &RustFsClient,
         redis_client: &crate::dlm::MetaClient,
         batch: &mut Vec<PendingStagedWrite>,
         current_bytes: &mut u64,
         staged_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
         space_freed_notify: &tokio::sync::Notify,
+        block_allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        nvme_writer: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -508,7 +512,8 @@ impl NvmeStaging {
         );
 
         let packed_id = Uuid::new_v4().to_string();
-        let packed_key = format!("packed/blocks/{}", packed_id);
+        let offset = block_allocator.allocate_block().await?;
+        let packed_key = offset.to_string();
 
         let mut packed_payload = Vec::new();
         let mut mappings = Vec::new();
@@ -568,13 +573,10 @@ impl NvmeStaging {
 
         let packed_payload_len = packed_payload.len();
         info!("NVMe Staging: Uploading packed block {} (size {} bytes) to RustFS with fencing token {}.", packed_key, packed_payload_len, highest_fencing_token);
-        backend
-            .put_object(
-                &packed_key,
-                bytes::Bytes::from(packed_payload),
-                highest_fencing_token,
-            )
-            .await?;
+        if let Err(e) = nvme_writer.write_block(offset, &bytes::Bytes::from(packed_payload)).await {
+            let _ = block_allocator.free_block(offset).await;
+            return Err(e.into());
+        }
 
         if let Ok(mut con) = redis_client.get_connection().await {
             let refcounts_key = "squeezefs:block_refcounts";

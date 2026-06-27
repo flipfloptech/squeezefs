@@ -1,4 +1,4 @@
-use crate::backend::RustFsClient;
+
 use crate::error::Result;
 use log::{debug, error, info, warn};
 use redis::AsyncCommands;
@@ -17,8 +17,9 @@ struct StagedMetadata {
 /// Returns the number of successfully recovered files.
 pub async fn recover_staging(
     staging_dir: &Path,
-    backend: &RustFsClient,
     redis_client: &crate::dlm::MetaClient,
+    block_allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
+    nvme_writer: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
 ) -> Result<usize> {
     if !staging_dir.exists() {
         return Ok(0);
@@ -200,10 +201,9 @@ pub async fn recover_staging(
 
                             let data_len = data_bytes.len();
                             let processed_len = processed_block.len();
-                            if let Err(e) = backend
-                                .put_object(&new_block_key, processed_block, meta.fencing_token)
-                                .await
-                            {
+                            let offset = block_allocator.allocate_block().await?;
+let new_block_key = offset.to_string();
+if let Err(e) = nvme_writer.write_block(offset, &processed_block).await {
                                 error!(
                                     "Crash Recovery: Failed to upload active block {} of inode {} to S3: {:?}",
                                     b, ino, e
@@ -235,18 +235,14 @@ pub async fn recover_staging(
                                             .hdel("squeezefs:block_sizes", &bk)
                                             .query_async(&mut con)
                                             .await?;
-                                        let (_be_id, real_key) =
-                                            crate::backend::parse_backend_and_key(&bk);
-                                        let _ = backend.delete_object(&real_key).await;
+                                        
                                     } else {
                                         let _: () = con.hset(refcounts_key, &bk, r).await?;
                                     }
                                 } else {
                                     let _: () =
                                         con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
-                                    let (_be_id, real_key) =
-                                        crate::backend::parse_backend_and_key(&bk);
-                                    let _ = backend.delete_object(&real_key).await;
+                                    
                                 }
                             }
 
@@ -333,14 +329,9 @@ pub async fn recover_staging(
 
                 // Upload to RustFS S3
                 let recovered_key = format!("recovered/blocks/{}", file_id);
-                if let Err(e) = backend
-                    .put_object(
-                        &recovered_key,
-                        bytes::Bytes::from(data.clone()),
-                        meta.fencing_token,
-                    )
-                    .await
-                {
+                let offset = block_allocator.allocate_block().await?;
+let recovered_key = offset.to_string();
+if let Err(e) = nvme_writer.write_block(offset, &bytes::Bytes::from(data.clone())).await {
                     error!(
                         "Crash Recovery: Failed to upload recovered block to RustFS: {:?}",
                         e

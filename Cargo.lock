@@ -1851,23 +1851,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hypertier"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "bytes",
- "memmap2",
- "parking_lot",
- "quinn",
- "rcgen",
- "rustls 0.23.40",
- "serde",
- "tempfile",
- "tokio",
- "xxhash-rust",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3315,6 +3298,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-runtime",
+ "bincode",
  "bytes",
  "clap",
  "colored",
@@ -3330,21 +3314,25 @@ dependencies = [
  "futures",
  "hyper 0.14.32",
  "hyper-rustls 0.24.2",
- "hypertier",
  "indicatif",
  "io-uring",
  "libc",
  "libloading",
  "log",
  "lz4_flex",
+ "memmap2",
  "moka",
  "nix",
  "once_cell",
+ "parking_lot",
+ "quinn",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
+ "rcgen",
  "redis",
  "ring",
  "rsa",
+ "rustls 0.23.40",
  "serde",
  "serde_json",
  "sha2 0.10.9",

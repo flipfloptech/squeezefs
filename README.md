@@ -1,8 +1,8 @@
 # Squeezefs
 
-Squeezefs is a slimmed-down, high-performance distributed filesystem featuring a decoupled metadata/object store backend and a local POSIX FUSE client daemon.
+Squeezefs is a slimmed-down, high-performance distributed filesystem featuring a decoupled metadata store backend (Garnet) and a local or NVMe-oF block device client.
 
-Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal file throughput by leveraging asynchronous network and file architectures, client-side caching, and multi-rail network load balancing.
+Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal file throughput by leveraging asynchronous network and file architectures, client-side caching, and multi-rail network load balancing over NVMe-oF fabrics.
 
 ---
 
@@ -18,8 +18,8 @@ Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal 
             |                               |
             v                               v
   +-------------------+           +-------------------+
-  | Microsoft Garnet  |           |      RustFS       |
-  |  (RESP Metadata)  |           | (S3-Compatible Object)
+  | Microsoft Garnet  |           |     NVMe / NVMe-oF|
+  |  (RESP Metadata)  |           |   (Local Block Dev)
   +-------------------+           +-------------------+
 ```
 
@@ -29,14 +29,14 @@ Built in **Rust** using the asynchronous `tokio` runtime and `io_uring` polling 
 ### 2. Progressive Data Layout & I/O Routing
 Writes are dynamically routed based on file sizes to optimize storage overhead and network latency:
 - **Micro-Files (< 64KB):** Inlined directly in the Microsoft Garnet key-value store alongside metadata.
-- **Small Files (64KB - 4MB):** Staged locally on NVMe and asynchronously merged into 4MB physical blocks uploaded to S3.
-- **Large Files (> 4MB):** Sliced into 4MB blocks and striped concurrently across RustFS volumes.
+- **Small Files (64KB - 4MB):** Staged locally on NVMe and asynchronously merged into physical blocks flushed to the main NVMe device.
+- **Large Files (> 4MB):** Sliced into 4MB blocks and written directly to the target NVMe block device.
 
 ### 3. Distributed Lock Manager (DLM) & Consistency
 Translates POSIX FUSE locks to cluster-wide locks in Garnet using `SETNX` commands, protected by heartbeats and monotonic fencing tokens to prevent split-brain write conflicts.
 
 ### 4. Tiered Caching & Zero-Copy Paths
-- **Tier 1 (GPU Direct Storage - GDS):** Routes RDMA transfers directly from S3/RustFS to VRAM, bypassing the host CPU/RAM.
+- **Tier 1 (GPU Direct Storage - GDS):** Routes RDMA transfers directly from NVMe to VRAM, bypassing the host CPU/RAM.
 - **Tier 2 (Unified System RAM):** LRU cache dynamically sizing to 20% of system RAM.
 - **Tier 3 (Local NVMe Staging):** Staging directory (`.staging`) for async writes and local caching of read blocks to avoid RTT latency.
 
@@ -52,17 +52,16 @@ Includes built-in host auto-tuning (`squeezefs tune`) to optimize virtual memory
 
 Squeezefs exposes a clean CLI to manage formats, mounts, status, performance benchmarks, and optimize systems:
 
-* **Format squeezefs Volume:**
+* **Format Squeezefs Volume:**
   ```bash
   squeezefs format <name> [options]
   ```
   *Options:*
   - `--block-size <bytes>`: Block size in bytes (default: 4MB).
   - `--capacity <bytes>`: Maximum capacity of the volume in bytes (default: 1PB).
-  - `--s3-endpoint <url>`: S3 compatible object store endpoint URL.
-  - `--s3-access-key <key>`: S3 compatible access key.
-  - `--s3-secret-key <key>`: S3 compatible secret key.
-  - `--s3-bucket <bucket>`: S3 compatible bucket name (automatically initialized/created on format).
+  - `--mem-cache-size <size>`: Memory cache limit (default: 20%).
+  - `--disk-cache-size <size>`: Staging disk cache capacity (default: 50G).
+  - `--nvme-target-path <path>`: Required NVMe device target path for format (e.g. /dev/nvme0n1).
 
 * **Mount Squeezefs:**
   ```bash
@@ -77,11 +76,18 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
   - `--uid <id>`: Custom UID owner for the mount (default: current user or SUDO_UID).
   - `--gid <id>`: Custom GID owner for the mount (default: current group or SUDO_GID).
   - `--log-file <path>`: Path to write daemon logs to when running in background.
+  - `--nvme-path <path>`: Local NVMe path or NVMe-oF connected target path (required).
 
 * **Show filesystem Status:**
   ```bash
   squeezefs status
   ```
+
+* **Defragment Squeezefs Volume:**
+  ```bash
+  squeezefs defrag --name <name> --nvme-path <path>
+  ```
+  Calculates block fragmentation on the NVMe device and performs in-place reallocation to compact blocks and fill holes.
 
 * **Benchmark Mountpoint:**
   ```bash
@@ -98,25 +104,27 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
   squeezefs tune
   ```
 
-* **Runtime Configuration & Storage Backend Management:**
-  Configure limits, caches, and storage backends at runtime:
+* **NVMe-oF Utilities:**
+  Share and manage NVMe-oF targets via `squeezefs nvmeof`.
+  ```bash
+  squeezefs nvmeof share <path>
+  squeezefs nvmeof connect --ip <ip> --subnqn <nqn>
+  squeezefs nvmeof disconnect <nqn>
+  squeezefs nvmeof list
+  ```
+
+* **Runtime Configuration Management:**
+  Configure limits and caches at runtime:
   ```bash
   squeezefs config <garnet_url> <fs_name> <action>
   ```
   *Actions:*
   - `set <key> <value>`: Updates runtime format quotas and cache limits. Supported keys are `capacity` (e.g. "100G", "2T"), `inodes` (e.g. "2000000"), `mem_cache_size`, `read_mem_cache_size`, `write_mem_cache_size`, `disk_cache_size`, `read_cache_size`, and `write_cache_size`.
-  - `backend <subcommand>` (alias: `backends`): Manages sharded storage backend endpoints.
-    * `add <name> --endpoint <url> [--access-key <key>] [--secret-key <secret>] [--bucket <bucket>]`
-    * `remove <name> [--force]`
-    * `enable <name>`
-    * `disable <name>`
-    * `list`
   - `diskcache <subcommand>` (alias: `diskcaches`): Manages staging disk cache paths.
     * `add <path>`
     * `remove <path> [--force]`
     * `enable <path>`
     * `disable <path>`
-    * `flush <path>`
     * `list`
   - `list`: Lists the entire unified configuration.
   - `fsck`: Runs consistency checks on metadata and block references.
@@ -125,4 +133,4 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
 
 ## Quick Start & Verification
 
-To get up and running quickly with local mock backends in Docker, or deploy directly onto physical bare-metal hardware, see the [QUICKSTART.md](QUICKSTART.md) guide.
+To get up and running quickly or deploy directly onto physical bare-metal hardware over NVMe-oF, see the [QUICKSTART.md](QUICKSTART.md) guide.

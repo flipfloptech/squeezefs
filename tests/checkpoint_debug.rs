@@ -30,9 +30,6 @@ async fn test_debug() {
         None,
         None,
         None,
-        None,
-        None,
-        None,
     )
     .await
     .unwrap();

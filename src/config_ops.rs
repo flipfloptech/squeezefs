@@ -1,6 +1,8 @@
-use crate::backend::{parse_backend_and_key, RustFsClient};
+
 use crate::error::{Result, SqueezefsError};
 use crate::recovery::recover_staging;
+use crate::block_allocator::BlockAllocator;
+use crate::nvme_dev::NvmeBlockDev;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -186,33 +188,10 @@ pub async fn flush_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Path)
         )));
     }
 
-    // Resolve backend S3 configuration
-    let format_fields: HashMap<String, String> =
-        con.hgetall("squeezefs:format").await.unwrap_or_default();
-    let active_be_id = format_fields
-        .get("active_write_backend")
-        .cloned()
-        .unwrap_or_else(|| "backend_0".to_string());
-
-    let backend = if let Ok(Some(json_str)) = con
-        .hget::<_, _, Option<String>>("squeezefs:backends", &active_be_id)
-        .await
-    {
-        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&json_str) {
-            let ep = config["endpoint"].as_str().map(|s| s.to_string());
-            let ak = config["access_key"].as_str().map(|s| s.to_string());
-            let sk = config["secret_key"].as_str().map(|s| s.to_string());
-            let bu = config["bucket"].as_str().map(|s| s.to_string());
-            RustFsClient::new_with_local_ips(Vec::new(), ep, ak, sk, bu).await
-        } else {
-            RustFsClient::new().await
-        }
-    } else {
-        RustFsClient::new().await
-    };
-
-    let meta_client = crate::dlm::MetaClient::new(redis_url)?;
-    recover_staging(path, &backend, &meta_client).await?;
+    let meta_client = std::sync::Arc::new(crate::dlm::MetaClient::new(redis_url)?);
+    let block_alloc = std::sync::Arc::new(BlockAllocator::new(meta_client.clone(), "default").await?);
+    let nvme_dev = std::sync::Arc::new(NvmeBlockDev::new(path.to_str().unwrap()));
+    recover_staging(path, &meta_client, &block_alloc, &nvme_dev).await?;
     Ok(())
 }
 
@@ -384,7 +363,8 @@ pub async fn remove_storage_backend(
                     let map_key = format!("block_map:{}", bmid);
                     let block_keys: Vec<String> = con.hvals(&map_key).await.unwrap_or_default();
                     for bk in block_keys {
-                        let (be_id, _) = parse_backend_and_key(&bk);
+                        let parts: Vec<&str> = bk.split("://").collect();
+                        let be_id = if parts.len() > 1 { parts[0].to_string() } else { "backend_0".to_string() };
                         if be_id == backend_id {
                             return Err(SqueezefsError::InvalidOperation(format!(
                                 "Cannot remove backend '{}' because it is referenced by block metadata for key '{}'",
@@ -399,7 +379,8 @@ pub async fn remove_storage_backend(
                     let mapping_key = format!("mapping:{}", fid);
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     if let Some(bk) = block_key {
-                        let (be_id, _) = parse_backend_and_key(&bk);
+                        let parts: Vec<&str> = bk.split("://").collect();
+                        let be_id = if parts.len() > 1 { parts[0].to_string() } else { "backend_0".to_string() };
                         if be_id == backend_id {
                             return Err(SqueezefsError::InvalidOperation(format!(
                                 "Cannot remove backend '{}' because it is referenced by staged mapping for file ID '{}'",
@@ -485,7 +466,8 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
                         ));
                     }
                     for (b_idx, bk) in block_keys {
-                        let (be_id, _) = parse_backend_and_key(&bk);
+                        let parts: Vec<&str> = bk.split("://").collect();
+                        let be_id = if parts.len() > 1 { parts[0].to_string() } else { "backend_0".to_string() };
                         if be_id != "backend_0" && !backends.contains_key(&be_id) {
                             issues.push(format!(
                                 "File '{}' block '{}' references unregistered backend '{}' (key: {})",
@@ -506,7 +488,8 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
                     let mapping_key = format!("mapping:{}", fid);
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     if let Some(bk) = block_key {
-                        let (be_id, _) = parse_backend_and_key(&bk);
+                        let parts: Vec<&str> = bk.split("://").collect();
+                        let be_id = if parts.len() > 1 { parts[0].to_string() } else { "backend_0".to_string() };
                         if be_id != "backend_0" && !backends.contains_key(&be_id) {
                             issues.push(format!(
                                 "File '{}' staged block references unregistered backend '{}' (key: {})",

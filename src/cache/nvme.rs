@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use uuid::Uuid;
+
 use xxhash_rust::xxh3::xxh3_64;
 
 pub fn dir_has_segment_data(path: &std::path::Path) -> bool {
@@ -511,7 +511,7 @@ impl NvmeStaging {
             encrypt_key.as_deref(),
         );
 
-        let _packed_id = Uuid::new_v4().to_string();
+
         let offset = block_allocator.allocate_block().await?;
         let packed_key = offset.to_string();
 

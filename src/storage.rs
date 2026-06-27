@@ -1,5 +1,5 @@
 use crate::error::{Result, SqueezefsError};
-use log::{error, info};
+use log::info;
 use std::process::Command;
 
 fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {

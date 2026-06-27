@@ -165,6 +165,27 @@ impl DataRouter {
                     let mut rx = tx.subscribe();
                     drop(entry); // Drop the dashmap lock before awaiting!
                     let _ = rx.recv().await;
+                    if let Some(cached_block) = self.cache.read_lru.get(block_key) {
+                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        let mut pooled = BUFFER_POOL.alloc();
+                        pooled.resize(cached_block.len(), 0);
+                        pooled.copy_from_slice(&cached_block);
+                        return Ok(pooled);
+                    }
+                    if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
+                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        self.cache
+                            .read_lru
+                            .put(block_key, bytes::Bytes::from(cached_block.clone()));
+                        let mut pooled = BUFFER_POOL.alloc();
+                        pooled.resize(cached_block.len(), 0);
+                        pooled.copy_from_slice(&cached_block);
+                        return Ok(pooled);
+                    }
+                    return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Block fetch failed by the primary fetcher task",
+                    )));
                 }
             }
         }
@@ -179,7 +200,7 @@ impl DataRouter {
         }
         let mut con = self.dlm.get_connection().await?;
         let meta_key = format!("metadata:{}", file_path);
-        let fields: std::collections::HashMap<String, String> = con.hgetall(&meta_key).await?;
+        let fields: std::collections::HashMap<String, String> = tokio::time::timeout(std::time::Duration::from_secs(2), con.hgetall(&meta_key)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
         let file_type = fields.get("type").cloned().ok_or_else(|| {
             SqueezefsError::Io(std::io::Error::new(
@@ -244,7 +265,7 @@ impl DataRouter {
                     pipe.hget(&block_map_key, b.to_string());
                 }
                 let mut con = self.dlm.get_connection().await?;
-                let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
+                let res: Vec<Option<String>> = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
                 for (idx, key_opt) in res.into_iter().enumerate() {
                     let b = blocks_to_query[idx];
                     self.block_map_cache.insert(
@@ -498,13 +519,12 @@ impl DataRouter {
             let file_uuid = Uuid::new_v4().to_string();
             let block_map_id = Uuid::new_v4().to_string();
             let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
-            let mut futures = Vec::new();
+            let mut sizes_to_register = Vec::new();
             let mut offset_cursor = 0;
             let mut block_count = 0;
             let mut block_mappings = Vec::new();
             let existing_bytes = bytes::Bytes::from(existing_data);
             let existing_size = existing_bytes.len();
-
             while offset_cursor < existing_size {
                 let end = std::cmp::min(offset_cursor + block_size, existing_size);
                 let chunk = existing_bytes.slice(offset_cursor..end);
@@ -519,36 +539,30 @@ impl DataRouter {
 
                 block_mappings.push((block_count.to_string(), stored_block_key));
 
+                let chunk_len = chunk.len();
+                let processed = match self.get_crypto().process_write(chunk.clone()) {
+                    Ok(p) => p,
+                    Err(e) => return Err(e),
+                };
+                let processed_len = processed.len();
+                sizes_to_register.push((stored_block_key_clone.clone(), chunk_len, processed_len));
+
                 let backend_clone = self.backend.clone();
-                let crypto = self.get_crypto().clone();
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
-                let task = tokio::spawn(async move {
-                    let chunk_len = chunk.len();
-                    let processed = crypto.process_write(chunk)?;
-                    let processed_len = processed.len();
-                    backend_clone
+                tokio::spawn(async move {
+                    if let Err(e) = backend_clone
                         .put_object(&block_key, processed, fencing_token)
-                        .await?;
+                        .await
+                    {
+                        log::error!("Background Stripe upload task failed for block {}: {:?}", block_key, e);
+                    }
                     // Cache the newly written block in RAM - dehydrated to NVMe on eviction
                     read_lru.put(&stored_block_key_clone, chunk_clone);
-                    Ok::<_, SqueezefsError>((stored_block_key_clone, chunk_len, processed_len))
                 });
 
-                futures.push(task);
                 offset_cursor = end;
                 block_count += 1;
-            }
-
-            let mut sizes_to_register = Vec::new();
-            for f in futures {
-                let (key, logical, physical) = f.await.map_err(|e| {
-                    SqueezefsError::Io(std::io::Error::other(format!(
-                        "Stripe upload task failed: {:?}",
-                        e
-                    )))
-                })??;
-                sizes_to_register.push((key, logical, physical));
             }
 
             // Register block mappings and reference counts in Garnet
@@ -588,7 +602,7 @@ impl DataRouter {
                 None
             };
 
-            let _: () = pipe.query_async(&mut con).await?;
+            let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
             if let Some(old_id) = old_file_id {
                 self.cache.nvme.remove_staged(&old_id);
@@ -637,7 +651,7 @@ impl DataRouter {
                 None
             };
 
-            let _: () = pipe.query_async(&mut con).await?;
+            let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
             if let Some(old_id) = old_file_id {
                 self.cache.nvme.remove_staged(&old_id);
@@ -681,7 +695,7 @@ impl DataRouter {
                         let inline_key = format!("inline_data:{}", file_path);
                         pipe.del(&inline_key);
                     }
-                    let _: () = pipe.query_async(&mut con).await?;
+                    let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
                     if let Some(old_id) = old_file_id {
                         self.cache.nvme.remove_staged(&old_id);
@@ -719,7 +733,7 @@ impl DataRouter {
                         let inline_key = format!("inline_data:{}", file_path);
                         pipe.del(&inline_key);
                     }
-                    let _: () = pipe.query_async(&mut con).await?;
+                    let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
                     let mapping_key = format!("mapping:{}", new_file_id);
                     let size = processed_data.len() as u64;
@@ -756,13 +770,12 @@ impl DataRouter {
             let file_uuid = Uuid::new_v4().to_string();
             let block_map_id = Uuid::new_v4().to_string();
             let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
-            let mut futures = Vec::new();
+            let mut sizes_to_register = Vec::new();
             let mut offset_cursor = 0;
             let mut block_count = 0;
             let mut block_mappings = Vec::new();
             let existing_bytes = bytes::Bytes::from(existing_data);
             let new_size = existing_bytes.len();
-
             while offset_cursor < new_size {
                 let end = std::cmp::min(offset_cursor + block_size, new_size);
                 let chunk = existing_bytes.slice(offset_cursor..end);
@@ -777,36 +790,30 @@ impl DataRouter {
 
                 block_mappings.push((block_count.to_string(), stored_block_key));
 
+                let chunk_len = chunk.len();
+                let processed = match self.get_crypto().process_write(chunk.clone()) {
+                    Ok(p) => p,
+                    Err(e) => return Err(e),
+                };
+                let processed_len = processed.len();
+                sizes_to_register.push((stored_block_key_clone.clone(), chunk_len, processed_len));
+
                 let backend_clone = self.backend.clone();
-                let crypto = self.get_crypto().clone();
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
-                let task = tokio::spawn(async move {
-                    let chunk_len = chunk.len();
-                    let processed = crypto.process_write(chunk)?;
-                    let processed_len = processed.len();
-                    backend_clone
+                tokio::spawn(async move {
+                    if let Err(e) = backend_clone
                         .put_object(&block_key, processed, fencing_token)
-                        .await?;
+                        .await
+                    {
+                        log::error!("Background Stripe upload task failed for block {}: {:?}", block_key, e);
+                    }
                     // Cache the newly written block in RAM - dehydrated to NVMe on eviction
                     read_lru.put(&stored_block_key_clone, chunk_clone);
-                    Ok::<_, SqueezefsError>((stored_block_key_clone, chunk_len, processed_len))
                 });
 
-                futures.push(task);
                 offset_cursor = end;
                 block_count += 1;
-            }
-
-            let mut sizes_to_register = Vec::new();
-            for f in futures {
-                let (key, logical, physical) = f.await.map_err(|e| {
-                    SqueezefsError::Io(std::io::Error::other(format!(
-                        "Stripe upload task failed: {:?}",
-                        e
-                    )))
-                })??;
-                sizes_to_register.push((key, logical, physical));
             }
 
             // Register block mappings and reference counts in Garnet
@@ -846,7 +853,7 @@ impl DataRouter {
                 None
             };
 
-            let _: () = pipe.query_async(&mut con).await?;
+            let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
             if let Some(old_id) = old_file_id {
                 self.cache.nvme.remove_staged(&old_id);
@@ -1039,18 +1046,22 @@ impl DataRouter {
             }));
         }
 
-        let results = futures::future::try_join_all(tasks).await.map_err(|e| {
-            SqueezefsError::Io(std::io::Error::other(format!(
-                "Block write task panicked: {:?}",
-                e
-            )))
-        })?;
+        let mut results = Vec::new();
+        for task in tasks {
+            let res = task.await.map_err(|e| {
+                SqueezefsError::Io(std::io::Error::other(format!(
+                    "Block write task panicked: {:?}",
+                    e
+                )))
+            })??;
+            results.push(res);
+        }
 
         // 4. Build single Redis pipeline to update mappings
         let mut pipe_update = redis::pipe();
         let mut old_keys_to_clean = Vec::new();
         for res in results {
-            let (b, old_block_key, new_block_key, logical_size, physical_size) = res?;
+            let (b, old_block_key, new_block_key, logical_size, physical_size) = res;
             pipe_update
                 .hset(refcounts_key, &new_block_key, 1)
                 .hset(&block_map_key, b.to_string(), &new_block_key)
@@ -1232,7 +1243,7 @@ impl DataRouter {
                     for i in 0..num_blocks {
                         pipe.hget(&block_map_key, i.to_string());
                     }
-                    let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
+                    let res: Vec<Option<String>> = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
                     for key_opt in res {
                         keys.push(key_opt);
                     }
@@ -1334,7 +1345,7 @@ impl DataRouter {
                 let mut con = self.dlm.get_connection().await?;
                 let meta_key = format!("metadata:{}", file_path);
                 let fields: std::collections::HashMap<String, String> =
-                    con.hgetall(&meta_key).await?;
+                    tokio::time::timeout(std::time::Duration::from_secs(2), con.hgetall(&meta_key)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
                 let file_type = fields.get("type").cloned().ok_or_else(|| {
                     SqueezefsError::Io(std::io::Error::new(
@@ -1933,7 +1944,7 @@ impl DataRouter {
                 let new_ref = current_ref.unwrap_or(1) + 1;
                 pipe.hset(refcounts_key, bk, new_ref);
             }
-            let _: () = pipe.query_async(&mut con).await?;
+            let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
             let mut dest_pipe = redis::pipe();
             dest_pipe
@@ -1976,7 +1987,7 @@ impl DataRouter {
                         pipe.hset(&block_map_key, i.to_string(), &old_key);
                         pipe.hset(refcounts_key, &old_key, 1);
                     }
-                    let _: () = pipe.query_async(&mut con).await?;
+                    let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
                     let _: () = src_con.hset(&src_meta_key, "block_map_id", &new_id).await?;
                     new_id
@@ -2000,7 +2011,7 @@ impl DataRouter {
             for (idx_str, bk) in &block_mappings {
                 pipe.hset(&dest_block_map_key, idx_str, bk);
             }
-            let _: () = pipe.query_async(&mut con).await?;
+            let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(&mut con)).await.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))??;
 
             let mut pipe_fetch = redis::pipe();
             for bk in block_mappings.values() {

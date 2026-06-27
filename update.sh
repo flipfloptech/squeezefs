@@ -1,0 +1,1 @@
+sed -i 's/pipe\.query_async(&mut con)\.await?/tokio::time::timeout(std::time::Duration::from_secs(2), pipe\.query_async(\&mut con))\.await\.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))\?\?/' src/routing.rs

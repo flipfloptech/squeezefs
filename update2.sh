@@ -1,0 +1,1 @@
+sed -i 's/con\.hgetall(\&meta_key)\.await?/tokio::time::timeout(std::time::Duration::from_secs(2), con\.hgetall(\&meta_key))\.await\.map_err(|_| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Redis query timed out")))\?\?/' src/routing.rs

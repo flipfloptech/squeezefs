@@ -26,18 +26,15 @@ impl BlockAllocator {
             .arg(&free_set_key)
             .query_async(&mut conn)
             .await?;
-
         let block_idx = match popped {
             Some(idx) => idx,
             None => {
-                // 2. If no freed blocks, increment the global max block counter
                 let new_max: u64 = redis::cmd("INCR")
                     .arg(&max_block_key)
                     .query_async(&mut conn)
                     .await?;
-
-                // INCR returns the value after incrementing (1-based). We want 0-based index.
-                new_max - 1
+                // INCR returns the value after incrementing (1-based). We start index from 1 to reserve block 0 for superblock.
+                new_max
             }
         };
 

@@ -264,6 +264,64 @@ enum Commands {
         #[command(subcommand)]
         action: NvmeofActions,
     },
+    /// Manage underlying LVM storage pools and volumes
+    Storage {
+        #[command(subcommand)]
+        action: StorageActions,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum StorageActions {
+    /// Manage storage pools (LVM Volume Groups)
+    #[command(subcommand)]
+    Pool(StoragePoolActions),
+    
+    /// Manage storage volumes (LVM Logical Volumes)
+    #[command(subcommand)]
+    Volume(StorageVolumeActions),
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum StoragePoolActions {
+    /// Create a new storage pool from physical disks
+    Create {
+        /// Pool name
+        pool_name: String,
+        /// Physical disk paths (e.g. /dev/nvme0n1 /dev/nvme1n1)
+        disks: Vec<String>,
+    },
+    /// Add physical disks to an existing storage pool
+    Add {
+        /// Pool name
+        pool_name: String,
+        /// Physical disk paths
+        disks: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum StorageVolumeActions {
+    /// Create a storage volume in a pool
+    Create {
+        /// Pool name
+        pool_name: String,
+        /// Volume name
+        vol_name: String,
+        /// Volume size (e.g. 1P, 100G)
+        #[arg(long)]
+        size: String,
+    },
+    /// Extend a storage volume
+    Extend {
+        /// Pool name
+        pool_name: String,
+        /// Volume name
+        vol_name: String,
+        /// Size to add (e.g. 500G, 10T)
+        #[arg(long)]
+        add_size: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1771,6 +1829,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             NvmeofActions::List => {
                 squeezefs::nvmeof::list_nvmeof()?;
             }
+        },
+        Commands::Storage { action } => match action {
+            StorageActions::Pool(pool_action) => match pool_action {
+                StoragePoolActions::Create { pool_name, disks } => {
+                    squeezefs::storage::pool_create(&pool_name, &disks)?;
+                }
+                StoragePoolActions::Add { pool_name, disks } => {
+                    squeezefs::storage::pool_add(&pool_name, &disks)?;
+                }
+            },
+            StorageActions::Volume(vol_action) => match vol_action {
+                StorageVolumeActions::Create { pool_name, vol_name, size } => {
+                    squeezefs::storage::volume_create(&pool_name, &vol_name, &size)?;
+                }
+                StorageVolumeActions::Extend { pool_name, vol_name, add_size } => {
+                    squeezefs::storage::volume_extend(&pool_name, &vol_name, &add_size)?;
+                }
+            },
         },
         Commands::Tune => {
             tune_system()?;

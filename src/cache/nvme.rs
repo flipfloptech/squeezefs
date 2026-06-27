@@ -511,7 +511,7 @@ impl NvmeStaging {
             encrypt_key.as_deref(),
         );
 
-        let packed_id = Uuid::new_v4().to_string();
+        let _packed_id = Uuid::new_v4().to_string();
         let offset = block_allocator.allocate_block().await?;
         let packed_key = offset.to_string();
 

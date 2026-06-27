@@ -21,15 +21,6 @@ struct Cli {
     #[arg(long, global = true)]
     log_file: Option<PathBuf>,
 
-    #[arg(
-        long,
-        short = 'g',
-        global = true,
-        env = "GARNET_URL",
-        default_value = "redis://127.0.0.1:6379"
-    )]
-    garnet_url: String,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -38,6 +29,14 @@ struct Cli {
 enum Commands {
     /// Format Garnet database to initialize squeezefs volume
     Format {
+        /// Garnet/Redis URL
+        #[arg(
+            long,
+            short = 'g',
+            env = "GARNET_URL",
+            default_value = "redis://127.0.0.1:6379"
+        )]
+        garnet_url: String,
         /// Volume name
         name: String,
         /// Block size (e.g. "4M", "1M", default: 4MB)
@@ -104,9 +103,26 @@ enum Commands {
         fuse_io_uring_sqpoll_idle_ms: Option<u32>,
     },
     /// Show filesystem status
-    Status,
+    Status {
+        /// Garnet/Redis URL
+        #[arg(
+            long,
+            short = 'g',
+            env = "GARNET_URL",
+            default_value = "redis://127.0.0.1:6379"
+        )]
+        garnet_url: String,
+    },
     /// Mount squeezefs at a target path
     Mount {
+        /// Garnet/Redis URL
+        #[arg(
+            long,
+            short = 'g',
+            env = "GARNET_URL",
+            default_value = "redis://127.0.0.1:6379"
+        )]
+        garnet_url: String,
         /// Path to mount the filesystem at
         mountpoint: PathBuf,
 
@@ -204,6 +220,14 @@ enum Commands {
     },
     /// Cleanly unmount a squeezefs mountpoint, with options to cancel, wait, or force dismount
     Umount {
+        /// Garnet/Redis URL
+        #[arg(
+            long,
+            short = 'g',
+            env = "GARNET_URL",
+            default_value = "redis://127.0.0.1:6379"
+        )]
+        garnet_url: String,
         /// Path to the mountpoint
         mountpoint: PathBuf,
         /// Force unmount immediately without prompting/waiting
@@ -212,6 +236,14 @@ enum Commands {
     },
     /// Benchmark performance of the filesystem
     Bench {
+        /// Garnet/Redis URL
+        #[arg(
+            long,
+            short = 'g',
+            env = "GARNET_URL",
+            default_value = "redis://127.0.0.1:6379"
+        )]
+        garnet_url: String,
         /// Path to the mounted filesystem directory
         path: PathBuf,
         /// Number of concurrent threads
@@ -226,6 +258,14 @@ enum Commands {
     },
     /// Clone a file metadata-only (instant Copy-on-Write cloning)
     Clone {
+        /// Garnet/Redis URL
+        #[arg(
+            long,
+            short = 'g',
+            env = "GARNET_URL",
+            default_value = "redis://127.0.0.1:6379"
+        )]
+        garnet_url: String,
         /// Source file path
         src: String,
         /// Destination file path
@@ -233,9 +273,14 @@ enum Commands {
     },
     /// Defragment a formatted SqueezeFS volume
     Defrag {
-        /// Garnet/Redis URL (e.g. redis://127.0.0.1:6379/)
-        #[arg(long, default_value = "redis://127.0.0.1:6379/")]
-        redis_url: String,
+        /// Garnet/Redis URL
+        #[arg(
+            long,
+            short = 'g',
+            env = "GARNET_URL",
+            default_value = "redis://127.0.0.1:6379"
+        )]
+        garnet_url: String,
         /// Volume name (filesystem name)
         #[arg(long, default_value = "default")]
         name: String,
@@ -248,6 +293,12 @@ enum Commands {
     /// Configuration management utility
     Config {
         /// Garnet/Redis URL
+        #[arg(
+            long,
+            short = 'g',
+            env = "GARNET_URL",
+            default_value = "redis://127.0.0.1:6379"
+        )]
         garnet_url: String,
         /// Volume name (filesystem name)
         fs_name: String,
@@ -256,13 +307,16 @@ enum Commands {
     },
     /// Show filesystem disk space usage across all caches and S3
     Df {
+        /// Garnet/Redis URL
+        #[arg(
+            long,
+            short = 'g',
+            env = "GARNET_URL",
+            default_value = "redis://127.0.0.1:6379"
+        )]
+        garnet_url: String,
         /// Optional path to a file or directory
         path: Option<String>,
-    },
-    /// NVMe over Fabrics configuration and management utility
-    Nvmeof {
-        #[command(subcommand)]
-        action: NvmeofActions,
     },
     /// Manage underlying LVM storage pools and volumes
     Storage {
@@ -280,6 +334,10 @@ enum StorageActions {
     /// Manage storage volumes (LVM Logical Volumes)
     #[command(subcommand)]
     Volume(StorageVolumeActions),
+
+    /// Configure and manage NVMe over Fabrics targets and connections
+    #[command(subcommand)]
+    Nvmeof(NvmeofActions),
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -310,6 +368,8 @@ enum StoragePoolActions {
         /// Pool name
         pool_name: String,
     },
+    /// List all storage pools (Volume Groups)
+    List,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -341,6 +401,8 @@ enum StorageVolumeActions {
         /// Volume name
         vol_name: String,
     },
+    /// List all storage volumes (Logical Volumes)
+    List,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -531,7 +593,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 | Commands::Umount { .. }
                 | Commands::Config { .. }
                 | Commands::Tune
-                | Commands::Status => {
+                | Commands::Status { .. } => {
                     eprintln!("Error: This command must be run as root (or with sudo).");
                     std::process::exit(1);
                 }
@@ -542,6 +604,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     if let Commands::Mount {
+        garnet_url,
         mountpoint,
         mem_cache_size,
         disk_cache_size,
@@ -606,7 +669,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let writeback = !no_writeback;
         if let Err(e) = print_mount_diagnostics(
-            &cli.garnet_url,
+            garnet_url,
             mountpoint,
             *daemon,
             mem_cache_size.as_deref(),
@@ -1127,6 +1190,7 @@ fn parse_human_readable_size(s: &str) -> Result<u64, String> {
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Format {
+            garnet_url,
             name,
             block_size,
             capacity,
@@ -1147,7 +1211,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             upload_delay,
             fuse_io_uring_sqpoll_idle_ms,
         } => {
-            let redis_url = &cli.garnet_url;
+            let redis_url = &garnet_url;
 
             // Check if active clients are connected to the filesystem
             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
@@ -1344,12 +1408,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
-        Commands::Status => {
-            let redis_url = &cli.garnet_url;
+        Commands::Status { garnet_url } => {
+            let redis_url = &garnet_url;
             let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Commands::Mount {
+            garnet_url,
             mountpoint,
             mem_cache_size,
             disk_cache_size,
@@ -1374,7 +1439,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fuse_io_uring_sqpoll_cpu,
         } => {
             let writeback = !no_writeback;
-            let redis_url = &cli.garnet_url;
+            let redis_url = &garnet_url;
 
             log::info!(
                 "Connecting to Garnet (metadata database) at {}...",
@@ -1745,20 +1810,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Commands::Defrag {
-            redis_url,
+            garnet_url,
             name,
             nvme_path,
         } => {
             println!("Starting defragmentation for volume '{}'", name);
-            squeezefs::defrag::run_defragmentation(&redis_url, &name, &nvme_path).await?;
+            squeezefs::defrag::run_defragmentation(&garnet_url, &name, &nvme_path).await?;
         }
         Commands::Bench {
+            garnet_url,
             path,
             threads,
             size,
             iterations,
         } => {
-            let redis_url = &cli.garnet_url;
+            let redis_url = &garnet_url;
             for iter in 1..=iterations {
                 if iterations > 1 {
                     println!("\n--- Benchmark Iteration {}/{} ---", iter, iterations);
@@ -1766,8 +1832,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 run_benchmark(&path, threads, size, redis_url).await?;
             }
         }
-        Commands::Clone { src, dest } => {
-            let redis_url = &cli.garnet_url;
+        Commands::Clone {
+            garnet_url,
+            src,
+            dest,
+        } => {
+            let redis_url = &garnet_url;
             let staging_dirs = vec![get_default_staging_dir()];
 
             let dlm = DlmClient::new(redis_url)?;
@@ -1801,49 +1871,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             router.clone_path(&src, &dest).await?;
             println!("File cloned successfully.");
         }
-        Commands::Df { path } => {
-            let redis_url = &cli.garnet_url;
+        Commands::Df { garnet_url, path } => {
+            let redis_url = &garnet_url;
             run_df_command(redis_url, path).await?;
         }
-        Commands::Nvmeof { action } => match action {
-            NvmeofActions::Share {
-                backing_path,
-                subnqn,
-                port,
-                ip,
-            } => {
-                let resolved_nqn =
-                    squeezefs::nvmeof::share_target(&backing_path, subnqn.as_deref(), port, &ip)?;
-                println!("Successfully shared '{}' as NVMe-oF target.", backing_path);
-                println!("Subsystem NQN: {}", resolved_nqn);
-                println!("Connection string for client nodes:");
-                println!(
-                    "  squeezefs nvmeof connect --ip <your-target-ip> --port {} --subnqn {}",
-                    port, resolved_nqn
-                );
-            }
-            NvmeofActions::Unshare { subnqn } => {
-                squeezefs::nvmeof::unshare_target(&subnqn)?;
-                println!("Successfully stopped sharing target NQN '{}'.", subnqn);
-            }
-            NvmeofActions::Connect { ip, port, subnqn } => {
-                println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
-                let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn)?;
-                if dev.starts_with("/dev/") {
-                    println!("{}", "Connection successful!".green().bold());
-                    println!("Attached Remote Disk: {}", dev.cyan().bold());
-                } else {
-                    println!("{}", dev.yellow());
-                }
-            }
-            NvmeofActions::Disconnect { subnqn } => {
-                squeezefs::nvmeof::disconnect_target(&subnqn)?;
-                println!("Successfully disconnected from target NQN '{}'.", subnqn);
-            }
-            NvmeofActions::List => {
-                squeezefs::nvmeof::list_nvmeof()?;
-            }
-        },
         Commands::Storage { action } => match action {
             StorageActions::Pool(pool_action) => match pool_action {
                 StoragePoolActions::Create { pool_name, disks } => {
@@ -1857,6 +1888,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 StoragePoolActions::Delete { pool_name } => {
                     squeezefs::storage::pool_delete(&pool_name)?;
+                }
+                StoragePoolActions::List => {
+                    squeezefs::storage::pool_list()?;
                 }
             },
             StorageActions::Volume(vol_action) => match vol_action {
@@ -1879,6 +1913,52 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     vol_name,
                 } => {
                     squeezefs::storage::volume_delete(&pool_name, &vol_name)?;
+                }
+                StorageVolumeActions::List => {
+                    squeezefs::storage::volume_list()?;
+                }
+            },
+            StorageActions::Nvmeof(nvmeof_action) => match nvmeof_action {
+                NvmeofActions::Share {
+                    backing_path,
+                    subnqn,
+                    port,
+                    ip,
+                } => {
+                    let resolved_nqn = squeezefs::nvmeof::share_target(
+                        &backing_path,
+                        subnqn.as_deref(),
+                        port,
+                        &ip,
+                    )?;
+                    println!("Successfully shared '{}' as NVMe-oF target.", backing_path);
+                    println!("Subsystem NQN: {}", resolved_nqn);
+                    println!("Connection string for client nodes:");
+                    println!(
+                        "  squeezefs storage nvmeof connect --ip <your-target-ip> --port {} --subnqn {}",
+                        port, resolved_nqn
+                    );
+                }
+                NvmeofActions::Unshare { subnqn } => {
+                    squeezefs::nvmeof::unshare_target(&subnqn)?;
+                    println!("Successfully stopped sharing target NQN '{}'.", subnqn);
+                }
+                NvmeofActions::Connect { ip, port, subnqn } => {
+                    println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
+                    let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn)?;
+                    if dev.starts_with("/dev/") {
+                        println!("{}", "Connection successful!".green().bold());
+                        println!("Attached Remote Disk: {}", dev.cyan().bold());
+                    } else {
+                        println!("{}", dev.yellow());
+                    }
+                }
+                NvmeofActions::Disconnect { subnqn } => {
+                    squeezefs::nvmeof::disconnect_target(&subnqn)?;
+                    println!("Successfully disconnected from target NQN '{}'.", subnqn);
+                }
+                NvmeofActions::List => {
+                    squeezefs::nvmeof::list_nvmeof()?;
                 }
             },
         },
@@ -1965,11 +2045,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
-        Commands::Umount { mountpoint, force } => {
+        Commands::Umount {
+            garnet_url,
+            mountpoint,
+            force,
+        } => {
             use std::io::IsTerminal;
             use std::io::Write;
 
-            let redis_url = &cli.garnet_url;
+            let redis_url = &garnet_url;
 
             // 1. Try to read mountpoint/.config to resolve staging directories
             let mut staging_dirs = Vec::new();

@@ -1,12 +1,6 @@
-use fuse3::raw::Request;
-use redis::AsyncCommands;
-use squeezefs::backend::{MultiBackendClient, RustFsClient};
-use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
-use squeezefs::fuse_client::{format_volume, SqueezefsFilesystem};
-use squeezefs::routing::DataRouter;
+use squeezefs::fuse_client::format_volume;
 use std::path::PathBuf;
-use tempfile::tempdir;
 
 #[tokio::test]
 async fn test_debug() {

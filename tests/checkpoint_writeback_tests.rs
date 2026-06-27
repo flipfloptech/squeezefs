@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
+#[allow(dead_code)]
 fn get_redis_url() -> String {
     std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
 }
@@ -244,6 +245,7 @@ async fn test_checkpoint_writeback_existing_file_fallback() {
     fs.write(req, ino, 0, 0, &initial_data, 0, 0)
         .await
         .expect("Failed");
+
     fs.flush(req, ino, 0, 0).await.expect("Failed");
     fs.release(req, ino, 0, 0, 0, false).await.expect("Failed");
 
@@ -251,6 +253,7 @@ async fn test_checkpoint_writeback_existing_file_fallback() {
     let overwrite_data = vec![0xCC; 1024 * 1024]; // 1MB
                                                   // Open the file again
     fs.open(req, ino, 0).await.expect("Failed");
+
     fs.write(req, ino, 0, 0, &overwrite_data, 0, 0)
         .await
         .expect("Failed");

@@ -21,17 +21,17 @@ const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
 fn get_fuse_timeout() -> Duration {
+    if let Ok(val) = std::env::var("SQUEEZEFS_TIMEOUT") {
+        if let Ok(secs) = val.parse::<u64>() {
+            return Duration::from_secs(secs);
+        }
+    }
     #[cfg(debug_assertions)]
     {
         Duration::from_secs(15)
     }
     #[cfg(not(debug_assertions))]
     {
-        if let Ok(val) = std::env::var("SQUEEZEFS_TIMEOUT") {
-            if let Ok(secs) = val.parse::<u64>() {
-                return Duration::from_secs(secs);
-            }
-        }
         Duration::from_secs(2)
     }
 }
@@ -173,6 +173,7 @@ pub struct SqueezefsFilesystem {
     writeback_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<WritebackRequest>>>,
     pub client_id: std::sync::Arc<std::sync::Mutex<String>>,
     pub mountpoint: std::sync::Arc<std::sync::Mutex<String>>,
+    pub max_background_uploads: usize,
 }
 
 impl SqueezefsFilesystem {
@@ -206,7 +207,12 @@ impl SqueezefsFilesystem {
             writeback_rx: std::sync::Mutex::new(Some(writeback_rx)),
             client_id: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             mountpoint: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            max_background_uploads: 16,
         }
+    }
+
+    pub fn max_background_uploads(&self) -> usize {
+        self.max_background_uploads
     }
 
     pub fn dlm(&self) -> &DlmClient {
@@ -778,82 +784,39 @@ impl SqueezefsFilesystem {
         ino: u64,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
-        let file_path = format!("inode_{}", ino);
         let prefix = format!("active_block:inode_{}:", ino);
 
-        loop {
-            let keys = self.router.cache.nvme.staging_nvme_cache.list_keys();
+        let keys = self.router.cache.nvme.staging_nvme_cache.list_keys();
 
-            let mut active_keys = Vec::new();
-            for key_bytes in keys {
-                let key_str = String::from_utf8(key_bytes.to_vec()).unwrap_or_default();
-                if key_str.starts_with(&prefix) {
-                    active_keys.push(key_str);
-                }
+        let mut active_keys = Vec::new();
+        for key_bytes in keys {
+            let key_str = String::from_utf8(key_bytes.to_vec()).unwrap_or_default();
+            if key_str.starts_with(&prefix) {
+                active_keys.push(key_str);
             }
+        }
 
-            if active_keys.is_empty() {
-                break;
-            }
-
-            let mut tasks = Vec::new();
-            let mut contested_block_lock = None;
-
+        if !active_keys.is_empty() {
+            let mut block_indices = Vec::new();
             for key_str in active_keys {
                 let b_str = key_str
                     .trim_start_matches(&prefix)
                     .trim_start_matches("block_");
                 if let Ok(b) = b_str.parse::<u32>() {
-                    let block_lock = BLOCK_FLUSH_LOCKS
-                        .entry((ino, b))
-                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-                        .value()
-                        .clone();
-
-                    if block_lock.try_lock().is_ok() {
-                        let router_clone = self.router.clone();
-                        let dlm_clone = self.dlm.clone();
-                        let locks_clone = self.active_inode_locks.clone();
-
-                        tasks.push(tokio::spawn(async move {
-                            flush_single_active_block(
-                                ino,
-                                b,
-                                fencing_token,
-                                &router_clone,
-                                &dlm_clone,
-                                &locks_clone,
-                                true,
-                            )
-                            .await
-                        }));
-                    } else {
-                        // Contested lock!
-                        contested_block_lock = Some(block_lock);
-                        break;
-                    }
+                    block_indices.push(b);
                 }
             }
 
-            if let Some(block_lock) = contested_block_lock {
-                // Wait for the contended block lock to be released
-                let _lock = block_lock.lock().await;
-                continue;
-            }
-
-            for task in tasks {
-                task.await.map_err(|e| {
-                    SqueezefsError::Io(std::io::Error::other(format!(
-                        "Parallel block upload task panicked: {:?}",
-                        e
-                    )))
-                })??;
-            }
-
-            break;
+            flush_due_active_blocks_for_inode(
+                ino,
+                block_indices,
+                fencing_token,
+                &self.router,
+                &self.dlm,
+                &self.active_inode_locks,
+            )
+            .await?;
         }
-
-        self.router.metadata_cache.remove(&file_path);
 
         Ok(())
     }
@@ -1265,8 +1228,9 @@ impl Filesystem for SqueezefsFilesystem {
             let router = self.router.clone();
             let dlm = self.dlm.clone();
             let active_inode_locks = self.active_inode_locks.clone();
+            let max_uploads = self.max_background_uploads;
             tokio::spawn(async move {
-                run_constant_writeback_worker(writeback_rx, router, dlm, active_inode_locks).await;
+                run_constant_writeback_worker(writeback_rx, router, dlm, active_inode_locks, max_uploads).await;
             });
         }
 
@@ -5443,59 +5407,67 @@ async fn run_constant_writeback_worker(
     active_inode_locks: std::sync::Arc<
         dashmap::DashMap<u64, std::sync::Arc<tokio::sync::RwLock<()>>, ahash::RandomState>,
     >,
+    max_uploads: usize,
 ) {
-    use std::collections::{BTreeSet, HashMap};
-    use tokio::time::{self, Duration, Instant};
+    let upload_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_uploads));
 
-    let mut pending: HashMap<u64, (Instant, BTreeSet<u32>, u64)> = HashMap::new();
-    let debounce_duration = Duration::from_millis(200);
+    while let Some(req) = rx.recv().await {
+        let router_clone = router.clone();
+        let dlm_clone = dlm.clone();
+        let locks_clone = active_inode_locks.clone();
+        let sem_clone = upload_semaphore.clone();
 
-    let mut tick_interval = time::interval(Duration::from_millis(50));
-    loop {
-        tokio::select! {
-            Some(req) = rx.recv() => {
-                let scheduled = Instant::now() + debounce_duration;
-                pending
-                    .entry(req.ino)
-                    .and_modify(|(existing_scheduled, block_indices, token)| {
-                        *existing_scheduled = scheduled;
-                        block_indices.insert(req.block_idx);
-                        *token = (*token).max(req.fencing_token);
-                    })
-                    .or_insert_with(|| {
-                        let mut block_indices = BTreeSet::new();
-                        block_indices.insert(req.block_idx);
-                        (scheduled, block_indices, req.fencing_token)
-                    });
+        tokio::spawn(async move {
+            let _permit = match sem_clone.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+
+            let file_path = format!("inode_{}", req.ino);
+            let meta_key = format!("metadata:{}", file_path);
+            let mut con = match dlm_clone.get_connection().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let (file_type_opt, block_map_id_opt): (Option<String>, Option<String>) = match redis::pipe()
+                .hget(&meta_key, "type")
+                .hget(&meta_key, "block_map_id")
+                .query_async(&mut con)
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+
+            let file_type = file_type_opt.unwrap_or_else(|| "inline".to_string());
+            let is_striped = file_type == "striped";
+            let mut block_map_id = block_map_id_opt.unwrap_or_default();
+            if block_map_id.is_empty() {
+                block_map_id = uuid::Uuid::new_v4().to_string();
+                let _: Result<(), _> = con.hset(&meta_key, "block_map_id", &block_map_id).await;
             }
-            _ = tick_interval.tick() => {
-                let now = Instant::now();
-                let mut to_flush = Vec::new();
-                for (ino, (scheduled, block_indices, token)) in &pending {
-                    if *scheduled <= now {
-                        to_flush.push((*ino, block_indices.iter().copied().collect::<Vec<_>>(), *token));
-                    }
-                }
 
-                for (ino, block_indices, token) in to_flush {
-                    pending.remove(&ino);
-                    let router_clone = router.clone();
-                    let dlm_clone = dlm.clone();
-                    let locks_clone = active_inode_locks.clone();
+            let block_map_key = format!("block_map:{}", block_map_id);
+            let old_key: Option<String> = match con.hget(&block_map_key, req.block_idx.to_string()).await {
+                Ok(k) => k,
+                Err(_) => return,
+            };
 
-                    tokio::spawn(async move {
-                        let _ = flush_due_active_blocks_for_inode(
-                            ino,
-                            block_indices,
-                            token,
-                            &router_clone,
-                            &dlm_clone,
-                            &locks_clone,
-                        ).await;
-                    });
-                }
-            }
-        }
+            let _ = flush_single_active_block(
+                req.ino,
+                req.block_idx,
+                req.fencing_token,
+                &router_clone,
+                &dlm_clone,
+                &locks_clone,
+                is_striped,
+                &block_map_id,
+                old_key,
+                false,
+            )
+            .await;
+        });
     }
 }
 
@@ -5511,17 +5483,41 @@ async fn flush_due_active_blocks_for_inode(
 ) -> Result<(), SqueezefsError> {
     use futures::stream::{self, StreamExt};
 
-    const BACKGROUND_WRITEBACK_CONCURRENCY: usize = 8;
+    let file_path = format!("inode_{}", ino);
+    let meta_key = format!("metadata:{}", file_path);
+    let mut con = dlm.get_connection().await?;
+    let (file_type_opt, block_map_id_opt): (Option<String>, Option<String>) = redis::pipe()
+        .hget(&meta_key, "type")
+        .hget(&meta_key, "block_map_id")
+        .query_async(&mut con)
+        .await?;
 
-    let unique_blocks = block_indices;
+    let file_type = file_type_opt.unwrap_or_else(|| "inline".to_string());
+    let is_striped = file_type == "striped";
+    let mut block_map_id = block_map_id_opt.unwrap_or_default();
+    if block_map_id.is_empty() {
+        block_map_id = uuid::Uuid::new_v4().to_string();
+        let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
+    }
+
+    let block_map_key = format!("block_map:{}", block_map_id);
+    let mut pipe = redis::pipe();
+    for &b in &block_indices {
+        pipe.hget(&block_map_key, b.to_string());
+    }
+    let old_block_keys: Vec<Option<String>> = pipe.query_async(&mut con).await?;
+
     let router = router.clone();
     let dlm = dlm.clone();
     let active_inode_locks = active_inode_locks.clone();
+    let block_map_id_val = block_map_id.clone();
 
-    let mut flushes = stream::iter(unique_blocks.into_iter().map(move |block_idx| {
+    let mut flushes = stream::iter(block_indices.into_iter().enumerate().map(move |(idx, block_idx)| {
         let router = router.clone();
         let dlm = dlm.clone();
         let active_inode_locks = active_inode_locks.clone();
+        let old_key = old_block_keys[idx].clone();
+        let block_map_id_val = block_map_id_val.clone();
         async move {
             flush_single_active_block(
                 ino,
@@ -5530,12 +5526,15 @@ async fn flush_due_active_blocks_for_inode(
                 &router,
                 &dlm,
                 &active_inode_locks,
+                is_striped,
+                &block_map_id_val,
+                old_key,
                 false,
             )
             .await
         }
     }))
-    .buffer_unordered(BACKGROUND_WRITEBACK_CONCURRENCY);
+    .buffer_unordered(8);
 
     while let Some(result) = flushes.next().await {
         result?;
@@ -5555,20 +5554,11 @@ async fn flush_single_active_block(
         std::sync::Arc<tokio::sync::RwLock<()>>,
         ahash::RandomState,
     >,
+    is_striped: bool,
+    block_map_id: &str,
+    old_block_key: Option<String>,
     locked: bool,
 ) -> Result<(), SqueezefsError> {
-    // Acquire lock to avoid race conditions with active writes
-    let lock_opt = if !locked {
-        Some(
-            active_inode_locks
-                .entry(ino)
-                .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
-                .clone(),
-        )
-    } else {
-        None
-    };
-
     let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
 
     let block_lock = BLOCK_FLUSH_LOCKS
@@ -5577,12 +5567,7 @@ async fn flush_single_active_block(
         .value()
         .clone();
 
-    let (block_data, block_map_id, old_block_key, is_striped, _block_guard, _cleanup_guard) = {
-        let mut _guard = None;
-        if let Some(ref l) = lock_opt {
-            _guard = Some(l.write().await);
-        }
-
+    let (block_data, _block_guard, _cleanup_guard) = {
         let _block_guard = block_lock.lock().await;
         let _cleanup_guard = BlockFlushGuard { key: (ino, b) };
 
@@ -5591,30 +5576,7 @@ async fn flush_single_active_block(
             None => return Ok(()),
         };
 
-        let file_path = format!("inode_{}", ino);
-        let meta_key = format!("metadata:{}", file_path);
-        let mut con = dlm.get_connection().await?;
-        let file_type: Option<String> = con.hget(&meta_key, "type").await?;
-        let is_striped = file_type.as_deref() == Some("striped");
-
-        let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
-        let mut block_map_id = block_map_id_opt.unwrap_or_default();
-        if block_map_id.is_empty() {
-            block_map_id = uuid::Uuid::new_v4().to_string();
-            let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
-        }
-
-        let block_map_key = format!("block_map:{}", block_map_id);
-        let old_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
-
-        (
-            block_data,
-            block_map_id,
-            old_block_key,
-            is_striped,
-            _block_guard,
-            _cleanup_guard,
-        )
+        (block_data, _block_guard, _cleanup_guard)
     };
 
     use redis::AsyncCommands;
@@ -5734,14 +5696,6 @@ async fn flush_single_active_block(
     let mut con = dlm.get_connection().await?;
     let block_map_key = format!("block_map:{}", block_map_id);
 
-    // If block key changed in Redis during S3 upload, delete stale S3 object and exit
-    let current_block_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
-    if current_block_key != old_block_key {
-        let (be_id, real_key) = crate::backend::parse_backend_and_key(&stored_block_key);
-        let _ = router.backend.delete_object(&be_id, &real_key).await;
-        return Ok(());
-    }
-
     let refcounts_key = "squeezefs:block_refcounts";
     let mut pipe = redis::pipe();
     pipe.hset(refcounts_key, &stored_block_key, 1)
@@ -5754,7 +5708,7 @@ async fn flush_single_active_block(
     let _: () = pipe.query_async(&mut con).await?;
 
     router.block_map_cache.insert(
-        (block_map_id.clone(), b),
+        (block_map_id.to_string(), b),
         (Some(stored_block_key.clone()), std::time::Instant::now()),
     );
 
@@ -5793,18 +5747,10 @@ async fn flush_single_active_block(
     let current_staged = router.cache.nvme.read_staged(&cache_key);
     if let Some(ref cur) = current_staged {
         if cur == &block_bytes[..] {
-            let nvme_clone = router.cache.nvme.clone();
-            let cache_key_clone = cache_key.clone();
-            tokio::task::spawn_blocking(move || {
-                nvme_clone.remove_active_block(&cache_key_clone);
-            });
+            router.cache.nvme.remove_active_block(&cache_key);
         }
     } else {
-        let nvme_clone = router.cache.nvme.clone();
-        let cache_key_clone = cache_key.clone();
-        tokio::task::spawn_blocking(move || {
-            nvme_clone.remove_active_block(&cache_key_clone);
-        });
+        router.cache.nvme.remove_active_block(&cache_key);
     }
 
     Ok(())

@@ -84,38 +84,44 @@ cargo build --release
    export GARNET_URL="redis://127.0.0.1:6379"
    ```
 
-2. **Format the filesystem volume** (this sets up block allocation maps for your NVMe device in Garnet):
+2. **Create a storage pool and volume for Squeezefs**:
    ```bash
    # Assuming /dev/nvme0n1 is a local fast NVMe drive dedicated to Squeezefs
-   ./target/release/squeezefs format squeezefs-volume \
-     --nvme-target-path /dev/nvme0n1
+   ./target/release/squeezefs storage pool create main-pool /dev/nvme0n1
+   ./target/release/squeezefs storage volume create main-pool my-vol --size 1P
    ```
 
-3. **Create the mount point and local staging directories**:
+3. **Format the filesystem volume** (this sets up block allocation maps for your NVMe device in Garnet):
+   ```bash
+   ./target/release/squeezefs format squeezefs-volume \
+     --nvme-target-path /dev/main-pool/my-vol
+   ```
+
+4. **Create the mount point and local staging directories**:
    ```bash
    mkdir -p /mnt/squeezefs
    mkdir -p /tmp/squeezefs_staging
    ```
 
-4. **Mount the FUSE daemon** (run in background with daemon mode, specify log file destination, and pass your NVMe path):
+5. **Mount the FUSE daemon** (run in background with daemon mode, specify log file destination, and pass your volume path):
    ```bash
    sudo ./target/release/squeezefs mount /mnt/squeezefs \
      --disk-cache-paths /tmp/squeezefs_staging \
-     --nvme-path /dev/nvme0n1 \
+     --nvme-path /dev/main-pool/my-vol \
      --daemon \
      --log-file /tmp/squeezefs.log \
      --uid 1000 \
      --gid 1000
    ```
 
-5. **(Optional) Configure quotas at runtime**:
+6. **(Optional) Configure quotas at runtime**:
    To dynamically adjust size or inode quotas:
    ```bash
    # Change filesystem capacity quota at runtime
    ./target/release/squeezefs config "redis://127.0.0.1:6379" squeezefs-volume set capacity 10T
    ```
 
-6. **Run the benchmark tool** in a separate terminal:
+7. **Run the benchmark tool** in a separate terminal:
    ```bash
    ./target/release/squeezefs bench --path /mnt/squeezefs --threads 8 --size 128
    ```
@@ -151,9 +157,14 @@ To connect to an NVMe over Fabrics target device before mounting:
 ```bash
 # Connect to the remote storage cluster
 sudo ./target/release/squeezefs nvmeof connect --ip 10.10.10.50 --subnqn nqn.2026-06.org.squeezefs:data
-# Format and mount the fabric-attached block device
-sudo ./target/release/squeezefs format default --nvme-target-path /dev/nvme1n1
-sudo ./target/release/squeezefs mount /mnt/squeezefs --nvme-path /dev/nvme1n1 --local-ips 10.10.10.1,10.10.20.1
+
+# Create pool and volume spanning the fabric-attached block device
+sudo ./target/release/squeezefs storage pool create fabric-pool /dev/nvme1n1
+sudo ./target/release/squeezefs storage volume create fabric-pool my-fabric-vol --size 1P
+
+# Format and mount the fabric-attached volume
+sudo ./target/release/squeezefs format default --nvme-target-path /dev/fabric-pool/my-fabric-vol
+sudo ./target/release/squeezefs mount /mnt/squeezefs --nvme-path /dev/fabric-pool/my-fabric-vol --local-ips 10.10.10.1,10.10.20.1
 ```
 
 * **Load Balancing:** All IO operations will cycle and balance round-robin between the two local IPs traversing the fabric.

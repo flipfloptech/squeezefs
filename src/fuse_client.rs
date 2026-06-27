@@ -5016,7 +5016,10 @@ pub async fn format_volume_ext(
 
     if let Some(target_path) = nvme_target_path {
         if !target_path.is_empty() {
-            log::info!("Writing SqueezeFS superblock signature to target: {}", target_path);
+            log::info!(
+                "Writing SqueezeFS superblock signature to target: {}",
+                target_path
+            );
             let file_result = tokio::fs::OpenOptions::new()
                 .write(true)
                 .open(target_path)
@@ -5025,13 +5028,19 @@ pub async fn format_volume_ext(
                 Ok(mut file) => {
                     use tokio::io::AsyncSeekExt;
                     use tokio::io::AsyncWriteExt;
-                    let sb = create_superblock(name, parsed_capacity, parsed_block_size, inodes);
-                    if let Ok(_) = file.seek(std::io::SeekFrom::Start(0)).await {
+                    let sb = create_superblock(name, capacity, block_size, inodes);
+                    if file.seek(std::io::SeekFrom::Start(0)).await.is_ok() {
                         if let Err(e) = file.write_all(&sb).await {
-                            log::warn!("Failed to write SqueezeFS superblock to NVMe target: {:?}", e);
+                            log::warn!(
+                                "Failed to write SqueezeFS superblock to NVMe target: {:?}",
+                                e
+                            );
                         } else {
                             let _ = file.sync_all().await;
-                            log::info!("Successfully wrote SqueezeFS superblock to target {}", target_path);
+                            log::info!(
+                                "Successfully wrote SqueezeFS superblock to target {}",
+                                target_path
+                            );
                         }
                     }
                 }

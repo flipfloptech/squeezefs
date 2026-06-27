@@ -15,10 +15,10 @@
  */
 
 use crate::error::Result;
+use once_cell::sync::OnceCell;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
-use once_cell::sync::OnceCell;
 
 pub struct NvmeBlockDev {
     pub device_path: String,
@@ -34,15 +34,16 @@ impl NvmeBlockDev {
     }
 
     fn get_file(&self) -> Result<Arc<File>> {
-        self.file.get_or_try_init(|| {
-            let std_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&self.device_path)
-                .map_err(|e| crate::error::SqueezefsError::Io(e))?;
-            Ok(Arc::new(std_file))
-        })
-        .cloned()
+        self.file
+            .get_or_try_init(|| {
+                let std_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&self.device_path)
+                    .map_err(|e| crate::error::SqueezefsError::Io(e))?;
+                Ok(Arc::new(std_file))
+            })
+            .cloned()
     }
 
     pub async fn write_block(&self, offset: u64, data: &[u8]) -> Result<()> {

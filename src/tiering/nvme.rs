@@ -4,8 +4,8 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
 
 const BLOCK_MAGIC: u32 = 0xCAFEBABE;
@@ -101,6 +101,7 @@ impl NvmeShard {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         file.set_len(capacity as u64)?;
@@ -278,11 +279,11 @@ impl NvmeShard {
                 }
             } else {
                 let mut skipped = false;
-                if offset + 128 <= capacity {
-                    if inner.mmap[offset..offset + 128].iter().all(|&x| x == 0) {
-                        offset += 128;
-                        skipped = true;
-                    }
+                if offset + 128 <= capacity
+                    && inner.mmap[offset..offset + 128].iter().all(|&x| x == 0)
+                {
+                    offset += 128;
+                    skipped = true;
                 }
                 if !skipped && offset + 8 <= capacity {
                     let chunk =

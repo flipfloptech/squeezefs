@@ -786,7 +786,7 @@ impl SqueezefsFilesystem {
                 nvme_clone.put_active_block(&cache_key_clone, &block_data_clone, fencing_token_val);
             })
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
             let req = WritebackRequest {
                 ino,
@@ -4950,45 +4950,47 @@ pub async fn format_volume_ext(
 
     if !quick {
         if let Some(target_path) = nvme_target_path {
-            if !target_path.is_empty() {
-                if capacity > 0 {
-                    log::info!("Wiping NVMe target path: {}", target_path);
-                    let file_result = tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .open(target_path)
-                        .await;
-                        
-                    if let Ok(mut file) = file_result {
-                        let pb = indicatif::ProgressBar::new(capacity);
-                        pb.set_style(
+            if !target_path.is_empty() && capacity > 0 {
+                log::info!("Wiping NVMe target path: {}", target_path);
+                let file_result = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(target_path)
+                    .await;
+
+                if let Ok(mut file) = file_result {
+                    let pb = indicatif::ProgressBar::new(capacity);
+                    pb.set_style(
                             indicatif::ProgressStyle::default_bar()
                                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
                                 .unwrap()
                                 .progress_chars("#>-"),
                         );
-                        
-                        let chunk_size = 4 * 1024 * 1024;
-                        let zeros = vec![0u8; chunk_size];
-                        let mut written = 0;
-                        use tokio::io::AsyncWriteExt;
-                        
-                        while written < capacity {
-                            let to_write = std::cmp::min(chunk_size as u64, capacity - written);
-                            if let Err(e) = file.write_all(&zeros[..to_write as usize]).await {
-                                log::warn!("Failed to write zero block to NVMe target: {:?}", e);
-                                break;
-                            }
-                            written += to_write;
-                            pb.inc(to_write);
+
+                    let chunk_size = 4 * 1024 * 1024;
+                    let zeros = vec![0u8; chunk_size];
+                    let mut written = 0;
+                    use tokio::io::AsyncWriteExt;
+
+                    while written < capacity {
+                        let to_write = std::cmp::min(chunk_size as u64, capacity - written);
+                        if let Err(e) = file.write_all(&zeros[..to_write as usize]).await {
+                            log::warn!("Failed to write zero block to NVMe target: {:?}", e);
+                            break;
                         }
-                        if let Err(e) = file.sync_all().await {
-                            log::warn!("Failed to sync NVMe target: {:?}", e);
-                        }
-                        pb.finish_with_message("NVMe target wiped");
-                    } else {
-                        log::warn!("Failed to open NVMe target for wiping: {:?}", file_result.err());
+                        written += to_write;
+                        pb.inc(to_write);
                     }
+                    if let Err(e) = file.sync_all().await {
+                        log::warn!("Failed to sync NVMe target: {:?}", e);
+                    }
+                    pb.finish_with_message("NVMe target wiped");
+                } else {
+                    log::warn!(
+                        "Failed to open NVMe target for wiping: {:?}",
+                        file_result.err()
+                    );
                 }
             }
         }
@@ -5471,8 +5473,12 @@ async fn flush_single_active_block(
     let processed_len = processed_block.len();
 
     let offset = router.block_allocator.allocate_block().await?;
-    
-    if let Err(e) = router.nvme_writer.write_block(offset, &processed_block).await {
+
+    if let Err(e) = router
+        .nvme_writer
+        .write_block(offset, &processed_block)
+        .await
+    {
         error!(
             "flush_single_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
             b, ino, e

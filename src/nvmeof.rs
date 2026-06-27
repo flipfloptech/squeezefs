@@ -69,14 +69,11 @@ fn execute_cmd(cmd_name: &str, args: &[&str]) -> std::io::Result<String> {
     }
     let output = Command::new(cmd_name).args(args).output()?;
     if !output.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Command {} failed: {}",
-                cmd_name,
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        ));
+        return Err(std::io::Error::other(format!(
+            "Command {} failed: {}",
+            cmd_name,
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -91,7 +88,10 @@ pub fn share_target(
     // 1. Check/create backing path if it's a regular file path
     let backing_path_buf = PathBuf::from(backing_path);
     if !backing_path_buf.exists() {
-        println!("Backing file '{}' does not exist. Auto-creating a 1GB sparse file...", backing_path);
+        println!(
+            "Backing file '{}' does not exist. Auto-creating a 1GB sparse file...",
+            backing_path
+        );
         let f = fs::File::create(&backing_path_buf)?;
         f.set_len(1024 * 1024 * 1024)?; // 1GB default
     }
@@ -163,7 +163,7 @@ pub fn share_target(
 
     let sub_dir = config_dir.join("subsystems").join(&subnqn);
     fs::create_dir_all(&sub_dir)?;
-    
+
     // Enable any host access
     fs::write(sub_dir.join("attr_allow_any_host"), "1")?;
 
@@ -208,7 +208,7 @@ pub fn share_target(
     // Link subsystem to port
     let link_dest = port_dir.join("subsystems").join(&subnqn);
     fs::create_dir_all(port_dir.join("subsystems"))?;
-    
+
     #[cfg(unix)]
     if !link_dest.exists() {
         std::os::unix::fs::symlink(&sub_dir, &link_dest)?;
@@ -345,16 +345,8 @@ pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<Stri
     if has_nvme_cli {
         let port_str = port.to_string();
         let _ = Command::new("nvme")
-            .args(&[
-                "connect",
-                "-t",
-                "tcp",
-                "-a",
-                ip,
-                "-s",
-                &port_str,
-                "-n",
-                subnqn,
+            .args([
+                "connect", "-t", "tcp", "-a", ip, "-s", &port_str, "-n", subnqn,
             ])
             .output()?;
     } else {
@@ -387,9 +379,12 @@ pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<Stri
             let ctrl_dir = sysfs_nvme_path().join("nvme0");
             fs::create_dir_all(&ctrl_dir)?;
             fs::write(ctrl_dir.join("subsysnqn"), subnqn)?;
-            fs::write(ctrl_dir.join("address"), format!("traddr={},trsvcid={}", ip, port))?;
+            fs::write(
+                ctrl_dir.join("address"),
+                format!("traddr={},trsvcid={}", ip, port),
+            )?;
             fs::write(ctrl_dir.join("delete_controller"), "")?;
-            
+
             // Create mock namespace
             let ns_dev_dir = ctrl_dir.join("nvme0n1");
             fs::create_dir_all(&ns_dev_dir)?;
@@ -424,7 +419,12 @@ pub fn disconnect_target(subnqn: &str) -> std::io::Result<()> {
     for entry in fs::read_dir(nvme_path)? {
         let entry = entry?;
         let path = entry.path();
-        if path.file_name().unwrap_or_default().to_string_lossy().starts_with("nvme") {
+        if path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .starts_with("nvme")
+        {
             let nqn_file = path.join("subsysnqn");
             if nqn_file.exists() {
                 let current_nqn = fs::read_to_string(nqn_file)?.trim().to_string();
@@ -434,7 +434,10 @@ pub fn disconnect_target(subnqn: &str) -> std::io::Result<()> {
                     if del_file.exists() {
                         fs::write(del_file, "1")?;
                         found = true;
-                        println!("Sent delete request to controller '{}'.", path.file_name().unwrap().to_string_lossy());
+                        println!(
+                            "Sent delete request to controller '{}'.",
+                            path.file_name().unwrap().to_string_lossy()
+                        );
                     }
                 }
             }
@@ -455,7 +458,7 @@ pub fn list_nvmeof() -> std::io::Result<()> {
     check_root()?;
     let config_dir = configfs_path();
     let subs_dir = config_dir.join("subsystems");
-    
+
     // Colored is imported in main.rs but not necessarily here. We can just print standard strings or implement simple coloring.
     println!("=== Shared NVMe-oF Targets ===");
     let mut targets_found = false;
@@ -465,7 +468,9 @@ pub fn list_nvmeof() -> std::io::Result<()> {
             let sub_name = entry.file_name().to_string_lossy().to_string();
             let sub_path = entry.path();
 
-            let backing = if let Ok(dev) = fs::read_to_string(sub_path.join("namespaces").join("1").join("device_path")) {
+            let backing = if let Ok(dev) =
+                fs::read_to_string(sub_path.join("namespaces").join("1").join("device_path"))
+            {
                 dev.trim().to_string()
             } else {
                 "unknown".to_string()
@@ -483,8 +488,10 @@ pub fn list_nvmeof() -> std::io::Result<()> {
                 for p_entry in fs::read_dir(ports_dir)? {
                     let p_entry = p_entry?;
                     if p_entry.path().join("subsystems").join(&sub_name).exists() {
-                        let ip = fs::read_to_string(p_entry.path().join("addr_traddr")).unwrap_or_default();
-                        let port = fs::read_to_string(p_entry.path().join("addr_trsvcid")).unwrap_or_default();
+                        let ip = fs::read_to_string(p_entry.path().join("addr_traddr"))
+                            .unwrap_or_default();
+                        let port = fs::read_to_string(p_entry.path().join("addr_trsvcid"))
+                            .unwrap_or_default();
                         bound_addr = format!("{}:{}", ip.trim(), port.trim());
                         break;
                     }

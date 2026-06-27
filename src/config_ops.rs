@@ -1,8 +1,7 @@
-
-use crate::error::{Result, SqueezefsError};
-use crate::recovery::recover_staging;
 use crate::block_allocator::BlockAllocator;
+use crate::error::{Result, SqueezefsError};
 use crate::nvme_dev::NvmeBlockDev;
+use crate::recovery::recover_staging;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -189,7 +188,8 @@ pub async fn flush_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Path)
     }
 
     let meta_client = std::sync::Arc::new(crate::dlm::MetaClient::new(redis_url)?);
-    let block_alloc = std::sync::Arc::new(BlockAllocator::new(meta_client.clone(), "default").await?);
+    let block_alloc =
+        std::sync::Arc::new(BlockAllocator::new(meta_client.clone(), "default").await?);
     let nvme_dev = std::sync::Arc::new(NvmeBlockDev::new(path.to_str().unwrap()));
     recover_staging(path, &meta_client, &block_alloc, &nvme_dev).await?;
     Ok(())
@@ -364,7 +364,11 @@ pub async fn remove_storage_backend(
                     let block_keys: Vec<String> = con.hvals(&map_key).await.unwrap_or_default();
                     for bk in block_keys {
                         let parts: Vec<&str> = bk.split("://").collect();
-                        let be_id = if parts.len() > 1 { parts[0].to_string() } else { "backend_0".to_string() };
+                        let be_id = if parts.len() > 1 {
+                            parts[0].to_string()
+                        } else {
+                            "backend_0".to_string()
+                        };
                         if be_id == backend_id {
                             return Err(SqueezefsError::InvalidOperation(format!(
                                 "Cannot remove backend '{}' because it is referenced by block metadata for key '{}'",
@@ -380,7 +384,11 @@ pub async fn remove_storage_backend(
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     if let Some(bk) = block_key {
                         let parts: Vec<&str> = bk.split("://").collect();
-                        let be_id = if parts.len() > 1 { parts[0].to_string() } else { "backend_0".to_string() };
+                        let be_id = if parts.len() > 1 {
+                            parts[0].to_string()
+                        } else {
+                            "backend_0".to_string()
+                        };
                         if be_id == backend_id {
                             return Err(SqueezefsError::InvalidOperation(format!(
                                 "Cannot remove backend '{}' because it is referenced by staged mapping for file ID '{}'",
@@ -467,7 +475,11 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
                     }
                     for (b_idx, bk) in block_keys {
                         let parts: Vec<&str> = bk.split("://").collect();
-                        let be_id = if parts.len() > 1 { parts[0].to_string() } else { "backend_0".to_string() };
+                        let be_id = if parts.len() > 1 {
+                            parts[0].to_string()
+                        } else {
+                            "backend_0".to_string()
+                        };
                         if be_id != "backend_0" && !backends.contains_key(&be_id) {
                             issues.push(format!(
                                 "File '{}' block '{}' references unregistered backend '{}' (key: {})",
@@ -489,7 +501,11 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     if let Some(bk) = block_key {
                         let parts: Vec<&str> = bk.split("://").collect();
-                        let be_id = if parts.len() > 1 { parts[0].to_string() } else { "backend_0".to_string() };
+                        let be_id = if parts.len() > 1 {
+                            parts[0].to_string()
+                        } else {
+                            "backend_0".to_string()
+                        };
                         if be_id != "backend_0" && !backends.contains_key(&be_id) {
                             issues.push(format!(
                                 "File '{}' staged block references unregistered backend '{}' (key: {})",

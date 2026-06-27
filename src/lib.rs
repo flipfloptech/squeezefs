@@ -3,9 +3,8 @@
     clippy::too_many_arguments,
     clippy::redundant_closure
 )]
-pub mod tiering;
 pub mod nvme_dev;
-
+pub mod tiering;
 
 pub mod cache;
 pub mod config_ops;
@@ -13,10 +12,10 @@ pub mod crypto_compress;
 pub mod dlm;
 pub mod error;
 pub mod fuse_client;
+pub mod nvmeof;
 pub mod p2p;
 pub mod recovery;
 pub mod routing;
-pub mod nvmeof;
 
 #[macro_export]
 macro_rules! coz_progress {

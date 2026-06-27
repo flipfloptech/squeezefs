@@ -1687,20 +1687,7 @@ impl DataRouter {
                     SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
                 })?;
 
-                let nvme_clone = self.cache.nvme.clone();
-                let file_id_clone = file_id.clone();
-                let guard_opt = tokio::task::spawn_blocking(move || {
-                    nvme_clone.read_staged_zero_copy(&file_id_clone)
-                })
-                .await
-                .map_err(|e| {
-                    SqueezefsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
-
-                if let Some(guard) = guard_opt {
+                if let Some(guard) = self.cache.nvme.read_staged_zero_copy(file_id) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     let start = std::cmp::min(offset as usize, guard.len);
                     let end = std::cmp::min((offset + size as u64) as usize, guard.len);
@@ -1769,20 +1756,7 @@ impl DataRouter {
                     let cache_key = format!("active_block:{}:block_{}", file_path, b_idx);
 
                     // Check active block staging first
-                    let nvme_clone = self.cache.nvme.clone();
-                    let cache_key_clone = cache_key.clone();
-                    let guard_opt = tokio::task::spawn_blocking(move || {
-                        nvme_clone.read_staged_zero_copy(&cache_key_clone)
-                    })
-                    .await
-                    .map_err(|e| {
-                        SqueezefsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        ))
-                    })?;
-
-                    if let Some(guard) = guard_opt {
+                    if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&cache_key) {
                         let start = std::cmp::min(slice_start as usize, guard.len);
                         let end =
                             std::cmp::min((slice_start + slice_len as u64) as usize, guard.len);
@@ -1803,24 +1777,11 @@ impl DataRouter {
                         .load_striped_block_keys(&meta, start_block, end_block)
                         .await?;
                     if let Some((_, Some(ref b_key))) = block_keys.first() {
-                        let nvme_clone = self.cache.nvme.clone();
-                        let b_key_clone = b_key.clone();
-                        let guard_opt = tokio::task::spawn_blocking(move || {
-                            nvme_clone.get_cached_read_block_range_zero_copy(
-                                &b_key_clone,
-                                slice_start,
-                                slice_len,
-                            )
-                        })
-                        .await
-                        .map_err(|e| {
-                            SqueezefsError::Io(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            ))
-                        })?;
-
-                        if let Some(guard) = guard_opt {
+                        if let Some(guard) = self.cache.nvme.get_cached_read_block_range_zero_copy(
+                            b_key,
+                            slice_start,
+                            slice_len,
+                        ) {
                             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                             let slice: &[u8] = &guard;
                             let data = unsafe {

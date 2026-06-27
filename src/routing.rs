@@ -2254,16 +2254,6 @@ impl DataRouter {
                         }
                     }
                     let _: () = con.del(&block_map_key).await?;
-                } else {
-                    let block_prefix_opt: Option<String> =
-                        con.hget(&meta_key, "block_prefix").await?;
-                    let num_blocks_opt: Option<u32> = con.hget(&meta_key, "num_blocks").await?;
-                    if let (Some(bp), Some(nb)) = (block_prefix_opt, num_blocks_opt) {
-                        for i in 0..nb {
-                            let _block_key = format!("{}/part_{}", bp, i);
-                            // Old backend logic removed for part cleanup
-                        }
-                    }
                 }
             } else if t == "staged" {
                 let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;

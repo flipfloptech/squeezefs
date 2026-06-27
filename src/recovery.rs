@@ -174,10 +174,7 @@ pub async fn recover_staging(
                             let old_block_key: Option<String> =
                                 con.hget(&block_map_key, b.to_string()).await?;
 
-                            let file_uuid = uuid::Uuid::new_v4().to_string();
-                            let block_write_uuid = uuid::Uuid::new_v4().to_string();
-                            let _new_block_key =
-                                format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
+
 
                             let data_bytes = bytes::Bytes::from(data);
                             let processed_block = match crypto_state
@@ -328,7 +325,7 @@ if let Err(e) = nvme_writer.write_block(offset, &processed_block).await {
                 );
 
                 // Upload to RustFS S3
-                let _recovered_key = format!("recovered/blocks/{}", file_id);
+
                 let offset = block_allocator.allocate_block().await?;
 let recovered_key = offset.to_string();
 if let Err(e) = nvme_writer.write_block(offset, &bytes::Bytes::from(data.clone())).await {

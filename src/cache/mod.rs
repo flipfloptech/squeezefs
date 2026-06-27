@@ -5,7 +5,6 @@ pub mod pool;
 pub use nvme::NvmeStaging;
 pub use pool::{PooledBuf, BUFFER_POOL};
 
-
 use crate::error::{Result, SqueezefsError};
 use std::path::PathBuf;
 
@@ -24,7 +23,7 @@ impl TieredCache {
         write_mem_cache_size: Option<&str>,
         read_disk_cache_size: Option<&str>,
         write_disk_cache_size: Option<&str>,
-        
+
         redis_client: crate::dlm::MetaClient,
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
@@ -94,7 +93,7 @@ impl TieredCache {
             read_disk_limit,
             block_allocator.clone(),
             nvme_writer.clone(),
-            redis_client
+            redis_client,
         )?;
 
         // Spawn background dehydration task to move evicted RAM blocks to NVMe

@@ -276,7 +276,7 @@ enum StorageActions {
     /// Manage storage pools (LVM Volume Groups)
     #[command(subcommand)]
     Pool(StoragePoolActions),
-    
+
     /// Manage storage volumes (LVM Logical Volumes)
     #[command(subcommand)]
     Volume(StorageVolumeActions),
@@ -1124,7 +1124,6 @@ fn parse_human_readable_size(s: &str) -> Result<u64, String> {
     Ok(base_val * multiplier)
 }
 
-
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Format {
@@ -1599,12 +1598,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?,
             );
-            
+
             // Assume the first staging dir's nvme backing path
             let nvme_path = format!("{}/.squeezefs_nvme", active_staging_dirs[0].display());
-            let nvme_dev = std::sync::Arc::new(
-                squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path)
-            );
+            let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path));
 
             // Read the full format values from Garnet for JSON logging
             let block_size_bytes: u64 = format_fields
@@ -1747,7 +1744,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
-        Commands::Defrag { redis_url, name, nvme_path } => {
+        Commands::Defrag {
+            redis_url,
+            name,
+            nvme_path,
+        } => {
             println!("Starting defragmentation for volume '{}'", name);
             squeezefs::defrag::run_defragmentation(&redis_url, &name, &nvme_path).await?;
         }
@@ -1770,7 +1771,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let staging_dirs = vec![get_default_staging_dir()];
 
             let dlm = DlmClient::new(redis_url)?;
-            
+
             // Reconstruct block allocator and nvme block dev for clone operation
             let fs_name = "default".to_string(); // Assuming default fs name for now
             let block_alloc = std::sync::Arc::new(
@@ -1780,11 +1781,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?,
             );
-            
+
             let nvme_path = format!("{}/.squeezefs_nvme", staging_dirs[0].display());
-            let nvme_dev = std::sync::Arc::new(
-                squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path)
-            );
+            let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path));
 
             let cache = TieredCache::new(
                 staging_dirs,
@@ -1813,12 +1812,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 ip,
             } => {
-                let resolved_nqn = squeezefs::nvmeof::share_target(
-                    &backing_path,
-                    subnqn.as_deref(),
-                    port,
-                    &ip,
-                )?;
+                let resolved_nqn =
+                    squeezefs::nvmeof::share_target(&backing_path, subnqn.as_deref(), port, &ip)?;
                 println!("Successfully shared '{}' as NVMe-oF target.", backing_path);
                 println!("Subsystem NQN: {}", resolved_nqn);
                 println!("Connection string for client nodes:");
@@ -1865,13 +1860,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             StorageActions::Volume(vol_action) => match vol_action {
-                StorageVolumeActions::Create { pool_name, vol_name, size } => {
+                StorageVolumeActions::Create {
+                    pool_name,
+                    vol_name,
+                    size,
+                } => {
                     squeezefs::storage::volume_create(&pool_name, &vol_name, &size)?;
                 }
-                StorageVolumeActions::Extend { pool_name, vol_name, add_size } => {
+                StorageVolumeActions::Extend {
+                    pool_name,
+                    vol_name,
+                    add_size,
+                } => {
                     squeezefs::storage::volume_extend(&pool_name, &vol_name, &add_size)?;
                 }
-                StorageVolumeActions::Delete { pool_name, vol_name } => {
+                StorageVolumeActions::Delete {
+                    pool_name,
+                    vol_name,
+                } => {
                     squeezefs::storage::volume_delete(&pool_name, &vol_name)?;
                 }
             },

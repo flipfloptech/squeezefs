@@ -87,7 +87,10 @@ pub fn volume_extend(pool_name: &str, vol_name: &str, add_size: &str) -> Result<
 }
 
 pub fn pool_remove(pool_name: &str, disks: &[String]) -> Result<()> {
-    info!("Removing disks {:?} from storage pool '{}'", disks, pool_name);
+    info!(
+        "Removing disks {:?} from storage pool '{}'",
+        disks, pool_name
+    );
     // 1. Move any data off the physical volumes if possible (pvmove)
     // Note: pvmove might take a long time and requires free space elsewhere in the VG.
     // For simplicity/safety, we just try to vgreduce. If it fails, the user must ensure it's empty.

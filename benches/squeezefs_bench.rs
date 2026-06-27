@@ -57,9 +57,7 @@ fn setup_fs_and_rt() -> Option<(SqueezefsFilesystem, Runtime, tempfile::TempDir)
         Some(std::sync::Arc::new(alloc))
     })?;
     let nvme_path = format!("{}/.squeezefs_nvme", temp_dir.path().display());
-    let nvme_dev = std::sync::Arc::new(
-        squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path)
-    );
+    let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path));
     let cache = rt.block_on(async {
         TieredCache::new(
             vec![temp_dir.path().to_path_buf()],
@@ -744,9 +742,7 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
                 .unwrap(),
             );
             let nvme_path = format!("{}/.squeezefs_nvme", temp_dir.path().display());
-            let nvme_dev = std::sync::Arc::new(
-                squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path)
-            );
+            let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path));
             let cache = TieredCache::new(
                 vec![temp_dir.path().to_path_buf()],
                 Some("50KB"),

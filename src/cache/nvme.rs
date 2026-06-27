@@ -511,7 +511,6 @@ impl NvmeStaging {
             encrypt_key.as_deref(),
         );
 
-
         let offset = block_allocator.allocate_block().await?;
         let packed_key = offset.to_string();
 
@@ -573,9 +572,12 @@ impl NvmeStaging {
 
         let packed_payload_len = packed_payload.len();
         info!("NVMe Staging: Uploading packed block {} (size {} bytes) to RustFS with fencing token {}.", packed_key, packed_payload_len, highest_fencing_token);
-        if let Err(e) = nvme_writer.write_block(offset, &bytes::Bytes::from(packed_payload)).await {
+        if let Err(e) = nvme_writer
+            .write_block(offset, &bytes::Bytes::from(packed_payload))
+            .await
+        {
             let _ = block_allocator.free_block(offset).await;
-            return Err(e.into());
+            return Err(e);
         }
 
         if let Ok(mut con) = redis_client.get_connection().await {

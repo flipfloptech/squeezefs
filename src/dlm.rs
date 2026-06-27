@@ -1098,7 +1098,11 @@ impl LockLease {
     /// Explicitly release the lease.
     pub async fn release(mut self) -> Result<()> {
         if let Some(tx) = self.heartbeat_tx.take() {
-            let _ = tx.send(HeartbeatCommand::Deregister { lock_key: self.lock_key.clone() }).await;
+            let _ = tx
+                .send(HeartbeatCommand::Deregister {
+                    lock_key: self.lock_key.clone(),
+                })
+                .await;
         }
 
         let mut con = self.meta_client.get_connection().await.map_err(|e| {
@@ -1134,7 +1138,9 @@ impl Drop for LockLease {
 
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = tx.send(HeartbeatCommand::Deregister { lock_key: key }).await;
+                    let _ = tx
+                        .send(HeartbeatCommand::Deregister { lock_key: key })
+                        .await;
                     let lock_key = if let Some((start, end)) = range {
                         format!("lock:{}:range:{}-{}", file_path, start, end)
                     } else {
@@ -1164,7 +1170,9 @@ impl DelegationLease {
     pub async fn release(mut self) -> Result<()> {
         if let Some(tx) = self.heartbeat_tx.take() {
             let _ = tx
-                .send(HeartbeatCommand::Deregister { lock_key: self.delegation_key.clone() })
+                .send(HeartbeatCommand::Deregister {
+                    lock_key: self.delegation_key.clone(),
+                })
                 .await;
         }
         let mut con = self.meta_client.get_connection().await.map_err(|e| {
@@ -1196,7 +1204,9 @@ impl Drop for DelegationLease {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     let _ = tx
-                        .send(HeartbeatCommand::Deregister { lock_key: key.clone() })
+                        .send(HeartbeatCommand::Deregister {
+                            lock_key: key.clone(),
+                        })
                         .await;
                     if let Ok(mut con) = meta_client.get_connection().await {
                         let current_holder: Option<String> = redis::cmd("GET")

@@ -72,7 +72,8 @@ async fn test_nvmeof_target_and_initiator_mock_lifecycle() {
     let enable = fs::read_to_string(ns1_dir.join("enable")).unwrap();
     assert_eq!(enable.trim(), "1");
 
-    let port_addr = fs::read_to_string(mock_configfs.join("ports").join("1").join("addr_traddr")).unwrap();
+    let port_addr =
+        fs::read_to_string(mock_configfs.join("ports").join("1").join("addr_traddr")).unwrap();
     assert_eq!(port_addr.trim(), "127.0.0.1");
 
     // Link check

@@ -1,4 +1,3 @@
-
 use crate::cache::{PooledBuf, TieredCache, BUFFER_POOL};
 use crate::dlm::DlmClient;
 use crate::error::{Result, SqueezefsError};
@@ -117,8 +116,13 @@ impl DataRouter {
         self.crypto.get().unwrap_or(&*DEFAULT_CRYPTO)
     }
 
-        pub async fn read_nvme_block(&self, offset_str: &str) -> Result<Vec<u8>> {
-        let offset = offset_str.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
+    pub async fn read_nvme_block(&self, offset_str: &str) -> Result<Vec<u8>> {
+        let offset = offset_str.parse::<u64>().map_err(|_| {
+            crate::error::SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid block offset",
+            ))
+        })?;
         let size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
         self.nvme_writer.read_block(offset, size).await
     }
@@ -148,76 +152,74 @@ impl DataRouter {
     }
 
     pub async fn get_cached_or_fetch_block(&self, block_key: &str) -> Result<PooledBuf> {
-        loop {
-            if let Some(cached_block) = self.cache.read_lru.get(block_key) {
-                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                let mut pooled = BUFFER_POOL.alloc();
-                pooled.resize(cached_block.len(), 0);
-                pooled.copy_from_slice(&cached_block);
-                return Ok(pooled);
-            }
+        if let Some(cached_block) = self.cache.read_lru.get(block_key) {
+            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+            let mut pooled = BUFFER_POOL.alloc();
+            pooled.resize(cached_block.len(), 0);
+            pooled.copy_from_slice(&cached_block);
+            return Ok(pooled);
+        }
 
-            if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
-                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+        if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
+            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+            self.cache
+                .read_lru
+                .put(block_key, bytes::Bytes::from(cached_block.clone()));
+            let mut pooled = BUFFER_POOL.alloc();
+            pooled.resize(cached_block.len(), 0);
+            pooled.copy_from_slice(&cached_block);
+            return Ok(pooled);
+        }
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        match self.inflight_block_reads.entry(block_key.to_string()) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+                entry.insert(tx.clone());
+                let _guard = InflightBlockReadGuard {
+                    key: block_key.to_string(),
+                    inflight_block_reads: self.inflight_block_reads.clone(),
+                    tx,
+                };
+
+                let downloaded = self.fetch_block_from_remote(block_key).await?;
+                let nvme_clone = self.cache.nvme.clone();
+                let bk_clone = block_key.to_string();
+                let dl_clone = downloaded.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = nvme_clone.cache_read_block(&bk_clone, &dl_clone);
+                });
                 self.cache
                     .read_lru
-                    .put(block_key, bytes::Bytes::from(cached_block.clone()));
-                let mut pooled = BUFFER_POOL.alloc();
-                pooled.resize(cached_block.len(), 0);
-                pooled.copy_from_slice(&cached_block);
-                return Ok(pooled);
+                    .put(block_key, bytes::Bytes::copy_from_slice(&downloaded));
+                Ok(downloaded)
             }
-
-            let (tx, _rx) = tokio::sync::broadcast::channel(1);
-            match self.inflight_block_reads.entry(block_key.to_string()) {
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-                    entry.insert(tx.clone());
-                    let _guard = InflightBlockReadGuard {
-                        key: block_key.to_string(),
-                        inflight_block_reads: self.inflight_block_reads.clone(),
-                        tx,
-                    };
-
-                    let downloaded = self.fetch_block_from_remote(block_key).await?;
-                    let nvme_clone = self.cache.nvme.clone();
-                    let bk_clone = block_key.to_string();
-                    let dl_clone = downloaded.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let _ = nvme_clone.cache_read_block(&bk_clone, &dl_clone);
-                    });
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let tx = entry.get().clone();
+                let mut rx = tx.subscribe();
+                drop(entry); // Drop the dashmap lock before awaiting!
+                let _ = rx.recv().await;
+                if let Some(cached_block) = self.cache.read_lru.get(block_key) {
+                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    let mut pooled = BUFFER_POOL.alloc();
+                    pooled.resize(cached_block.len(), 0);
+                    pooled.copy_from_slice(&cached_block);
+                    return Ok(pooled);
+                }
+                if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
+                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     self.cache
                         .read_lru
-                        .put(block_key, bytes::Bytes::copy_from_slice(&downloaded));
-                    return Ok(downloaded);
+                        .put(block_key, bytes::Bytes::from(cached_block.clone()));
+                    let mut pooled = BUFFER_POOL.alloc();
+                    pooled.resize(cached_block.len(), 0);
+                    pooled.copy_from_slice(&cached_block);
+                    return Ok(pooled);
                 }
-                dashmap::mapref::entry::Entry::Occupied(entry) => {
-                    let tx = entry.get().clone();
-                    let mut rx = tx.subscribe();
-                    drop(entry); // Drop the dashmap lock before awaiting!
-                    let _ = rx.recv().await;
-                    if let Some(cached_block) = self.cache.read_lru.get(block_key) {
-                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                        let mut pooled = BUFFER_POOL.alloc();
-                        pooled.resize(cached_block.len(), 0);
-                        pooled.copy_from_slice(&cached_block);
-                        return Ok(pooled);
-                    }
-                    if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
-                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                        self.cache
-                            .read_lru
-                            .put(block_key, bytes::Bytes::from(cached_block.clone()));
-                        let mut pooled = BUFFER_POOL.alloc();
-                        pooled.resize(cached_block.len(), 0);
-                        pooled.copy_from_slice(&cached_block);
-                        return Ok(pooled);
-                    }
-                    return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Block fetch failed by the primary fetcher task",
-                    )));
-                }
+                Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Block fetch failed by the primary fetcher task",
+                )))
             }
         }
     }
@@ -491,16 +493,16 @@ impl DataRouter {
                         .query_async(con)
                         .await?;
                     if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                        let _ = self.block_allocator.free_block(offset_u64).await;
+                    }
                 } else {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
             } else {
                 let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
                 if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                    let _ = self.block_allocator.free_block(offset_u64).await;
+                }
             }
         }
         Ok(())
@@ -561,8 +563,16 @@ impl DataRouter {
                         let sz_val: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                         if let (Some(bk), Some(off), Some(sz)) = (block_key, off_val, sz_val) {
-                            let offset_u64 = bk.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
-                            let raw = self.nvme_writer.read_block(offset_u64 + off, sz as usize).await?;
+                            let offset_u64 = bk.parse::<u64>().map_err(|_| {
+                                crate::error::SqueezefsError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Invalid block offset",
+                                ))
+                            })?;
+                            let raw = self
+                                .nvme_writer
+                                .read_block(offset_u64 + off, sz as usize)
+                                .await?;
                             self.get_crypto().process_read(&raw)?
                         } else {
                             Vec::new()
@@ -610,10 +620,7 @@ impl DataRouter {
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = nvme_writer
-                        .write_block(offset, &processed)
-                        .await
-                    {
+                    if let Err(e) = nvme_writer.write_block(offset, &processed).await {
                         log::error!(
                             "Background Stripe upload task failed for block {}: {:?}",
                             stored_block_key,
@@ -898,10 +905,7 @@ impl DataRouter {
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = nvme_writer
-                        .write_block(offset, &processed)
-                        .await
-                    {
+                    if let Err(e) = nvme_writer.write_block(offset, &processed).await {
                         log::error!(
                             "Background Stripe upload task failed for block {}: {:?}",
                             stored_block_key,
@@ -989,8 +993,8 @@ impl DataRouter {
                     } else {
                         let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
                         if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                            let _ = self.block_allocator.free_block(offset_u64).await;
+                        }
                     }
                 }
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
@@ -1202,16 +1206,16 @@ impl DataRouter {
                         .query_async(con)
                         .await?;
                     if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                        let _ = self.block_allocator.free_block(offset_u64).await;
+                    }
                 } else {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
             } else {
                 let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
                 if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                    let _ = self.block_allocator.free_block(offset_u64).await;
+                }
             }
         }
 
@@ -1320,8 +1324,16 @@ impl DataRouter {
                     let size: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, offset, size) {
-                        let offset_u64 = bk.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
-                            let raw = self.nvme_writer.read_block(offset_u64 + off, sz as usize).await?;
+                        let offset_u64 = bk.parse::<u64>().map_err(|_| {
+                            crate::error::SqueezefsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Invalid block offset",
+                            ))
+                        })?;
+                        let raw = self
+                            .nvme_writer
+                            .read_block(offset_u64 + off, sz as usize)
+                            .await?;
                         self.get_crypto().process_read(&raw)?
                     } else {
                         return Err(SqueezefsError::Io(std::io::Error::new(
@@ -1549,8 +1561,16 @@ impl DataRouter {
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
-                        let offset_u64 = bk.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
-                        let packed_bytes = self.nvme_writer.read_block(offset_u64 + off, sz as usize).await?;
+                        let offset_u64 = bk.parse::<u64>().map_err(|_| {
+                            crate::error::SqueezefsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Invalid block offset",
+                            ))
+                        })?;
+                        let packed_bytes = self
+                            .nvme_writer
+                            .read_block(offset_u64 + off, sz as usize)
+                            .await?;
                         let decompressed = self.get_crypto().process_read(&packed_bytes)?;
                         if offset >= decompressed.len() as u64 {
                             return Ok(Vec::new());
@@ -1753,8 +1773,16 @@ impl DataRouter {
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
-                        let offset_u64 = bk.parse::<u64>().map_err(|_| crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid block offset")))?;
-                        let packed_bytes = self.nvme_writer.read_block(offset_u64 + off, sz as usize).await?;
+                        let offset_u64 = bk.parse::<u64>().map_err(|_| {
+                            crate::error::SqueezefsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Invalid block offset",
+                            ))
+                        })?;
+                        let packed_bytes = self
+                            .nvme_writer
+                            .read_block(offset_u64 + off, sz as usize)
+                            .await?;
                         let decompressed = self.get_crypto().process_read(&packed_bytes)?;
                         if offset >= decompressed.len() as u64 {
                             return Ok((bytes::Bytes::new(), None));
@@ -1970,8 +1998,6 @@ impl DataRouter {
     pub fn cache(&self) -> &TieredCache {
         &self.cache
     }
-
-    
 
     /// Clone a file metadata-only. If it's inline, copy the inline data.
     /// If it's staged, copy the staging folder/files and mapping.
@@ -2241,8 +2267,8 @@ impl DataRouter {
                                     .query_async(con)
                                     .await?;
                                 if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                                    let _ = self.block_allocator.free_block(offset_u64).await;
+                                }
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
@@ -2272,8 +2298,8 @@ impl DataRouter {
                                     .query_async(con)
                                     .await?;
                                 if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                                    let _ = self.block_allocator.free_block(offset_u64).await;
+                                }
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
@@ -2513,4 +2539,3 @@ impl Default for IoUringPrefetcher {
         Self::new()
     }
 }
-

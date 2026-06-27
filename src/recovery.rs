@@ -1,4 +1,3 @@
-
 use crate::error::Result;
 use log::{debug, error, info, warn};
 use redis::AsyncCommands;
@@ -174,8 +173,6 @@ pub async fn recover_staging(
                             let old_block_key: Option<String> =
                                 con.hget(&block_map_key, b.to_string()).await?;
 
-
-
                             let data_bytes = bytes::Bytes::from(data);
                             let processed_block = match crypto_state
                                 .process_write(data_bytes.clone())
@@ -199,8 +196,9 @@ pub async fn recover_staging(
                             let data_len = data_bytes.len();
                             let processed_len = processed_block.len();
                             let offset = block_allocator.allocate_block().await?;
-let new_block_key = offset.to_string();
-if let Err(e) = nvme_writer.write_block(offset, &processed_block).await {
+                            let new_block_key = offset.to_string();
+                            if let Err(e) = nvme_writer.write_block(offset, &processed_block).await
+                            {
                                 error!(
                                     "Crash Recovery: Failed to upload active block {} of inode {} to S3: {:?}",
                                     b, ino, e
@@ -232,14 +230,12 @@ if let Err(e) = nvme_writer.write_block(offset, &processed_block).await {
                                             .hdel("squeezefs:block_sizes", &bk)
                                             .query_async(&mut con)
                                             .await?;
-                                        
                                     } else {
                                         let _: () = con.hset(refcounts_key, &bk, r).await?;
                                     }
                                 } else {
                                     let _: () =
                                         con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
-                                    
                                 }
                             }
 
@@ -327,8 +323,11 @@ if let Err(e) = nvme_writer.write_block(offset, &processed_block).await {
                 // Upload to RustFS S3
 
                 let offset = block_allocator.allocate_block().await?;
-let recovered_key = offset.to_string();
-if let Err(e) = nvme_writer.write_block(offset, &bytes::Bytes::from(data.clone())).await {
+                let recovered_key = offset.to_string();
+                if let Err(e) = nvme_writer
+                    .write_block(offset, &bytes::Bytes::from(data.clone()))
+                    .await
+                {
                     error!(
                         "Crash Recovery: Failed to upload recovered block to RustFS: {:?}",
                         e

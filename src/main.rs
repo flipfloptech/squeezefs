@@ -298,6 +298,18 @@ enum StoragePoolActions {
         /// Physical disk paths
         disks: Vec<String>,
     },
+    /// Remove physical disks from a storage pool
+    Remove {
+        /// Pool name
+        pool_name: String,
+        /// Physical disk paths to remove
+        disks: Vec<String>,
+    },
+    /// Delete an entire storage pool
+    Delete {
+        /// Pool name
+        pool_name: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -321,6 +333,13 @@ enum StorageVolumeActions {
         /// Size to add (e.g. 500G, 10T)
         #[arg(long)]
         add_size: String,
+    },
+    /// Delete a storage volume
+    Delete {
+        /// Pool name
+        pool_name: String,
+        /// Volume name
+        vol_name: String,
     },
 }
 
@@ -1838,6 +1857,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 StoragePoolActions::Add { pool_name, disks } => {
                     squeezefs::storage::pool_add(&pool_name, &disks)?;
                 }
+                StoragePoolActions::Remove { pool_name, disks } => {
+                    squeezefs::storage::pool_remove(&pool_name, &disks)?;
+                }
+                StoragePoolActions::Delete { pool_name } => {
+                    squeezefs::storage::pool_delete(&pool_name)?;
+                }
             },
             StorageActions::Volume(vol_action) => match vol_action {
                 StorageVolumeActions::Create { pool_name, vol_name, size } => {
@@ -1845,6 +1870,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 StorageVolumeActions::Extend { pool_name, vol_name, add_size } => {
                     squeezefs::storage::volume_extend(&pool_name, &vol_name, &add_size)?;
+                }
+                StorageVolumeActions::Delete { pool_name, vol_name } => {
+                    squeezefs::storage::volume_delete(&pool_name, &vol_name)?;
                 }
             },
         },

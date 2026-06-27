@@ -3,7 +3,7 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use fuse3::raw::prelude::*;
 use fuse3::raw::Request;
-use squeezefs::backend::RustFsClient;
+// No longer using RustFsClient
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
@@ -46,8 +46,20 @@ fn setup_fs_and_rt() -> Option<(SqueezefsFilesystem, Runtime, tempfile::TempDir)
     }
 
     let dlm = DlmClient::new(&redis_url).ok()?;
-    let backend = rt.block_on(RustFsClient::new());
     let temp_dir = tempdir().ok()?;
+    let block_alloc = rt.block_on(async {
+        let alloc = squeezefs::block_allocator::BlockAllocator::new(
+            std::sync::Arc::new(dlm.meta_client().clone()),
+            "bench_vol",
+        )
+        .await
+        .ok()?;
+        Some(std::sync::Arc::new(alloc))
+    })?;
+    let nvme_path = format!("{}/.squeezefs_nvme", temp_dir.path().display());
+    let nvme_dev = std::sync::Arc::new(
+        squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path)
+    );
     let cache = rt.block_on(async {
         TieredCache::new(
             vec![temp_dir.path().to_path_buf()],
@@ -55,13 +67,14 @@ fn setup_fs_and_rt() -> Option<(SqueezefsFilesystem, Runtime, tempfile::TempDir)
             None,
             None,
             None,
-            backend.clone(),
             dlm.meta_client().clone(),
+            block_alloc.clone(),
+            nvme_dev.clone(),
         )
         .ok()
     })?;
 
-    let router = DataRouter::new(dlm.clone(), backend, cache);
+    let router = DataRouter::new(dlm.clone(), cache, block_alloc, nvme_dev);
     let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
 
     let req = Request {
@@ -721,15 +734,28 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
     rt.block_on(async {
         for i in 0..5 {
             let temp_dir = tempdir().unwrap();
-            let backend = RustFsClient::new_mock();
+            let fs_name = format!("bench_vol_p2p_{}", i);
+            let block_alloc = std::sync::Arc::new(
+                squeezefs::block_allocator::BlockAllocator::new(
+                    std::sync::Arc::new(dlm.meta_client().clone()),
+                    &fs_name,
+                )
+                .await
+                .unwrap(),
+            );
+            let nvme_path = format!("{}/.squeezefs_nvme", temp_dir.path().display());
+            let nvme_dev = std::sync::Arc::new(
+                squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path)
+            );
             let cache = TieredCache::new(
                 vec![temp_dir.path().to_path_buf()],
                 Some("50KB"),
                 Some("50KB"),
                 Some("200KB"),
                 Some("200KB"),
-                backend.clone(),
                 dlm.meta_client().clone(),
+                block_alloc,
+                nvme_dev,
             )
             .unwrap();
 

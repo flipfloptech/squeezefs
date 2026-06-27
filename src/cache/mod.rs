@@ -101,7 +101,13 @@ impl TieredCache {
                 handle.spawn(async move {
                     while let Some((key, data)) = evict_rx.recv().await {
                         if key.contains("blocks/") {
-                            let _ = nvme_clone.cache_read_block(&key, &data);
+                            let nvme_clone_inner = nvme_clone.clone();
+                            let key_clone = key.clone();
+                            let data_clone = data.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                nvme_clone_inner.cache_read_block(&key_clone, &data_clone)
+                            })
+                            .await;
                         }
                     }
                 });

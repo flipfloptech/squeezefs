@@ -7,16 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
-
-
-
-
-
-
-
-
-
-
 static SINGLE_CONN_POOL: Lazy<
     dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>,
 > = Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
@@ -98,9 +88,16 @@ async fn reconnect_bound(bound: &BoundConnection) -> Result<redis::aio::Multiple
         IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
     };
     socket.bind(SocketAddr::new(bound.local_ip, 0))?;
-    let stream = socket.connect(bound.remote_addr).await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
-    let (new_conn, driver) =
-        redis::aio::MultiplexedConnection::new(&bound.conn_info.redis, stream).await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+    let stream = socket.connect(bound.remote_addr).await.map_err(|e| {
+        println!("REDIS ERROR: {:?}", e);
+        e
+    })?;
+    let (new_conn, driver) = redis::aio::MultiplexedConnection::new(&bound.conn_info.redis, stream)
+        .await
+        .map_err(|e| {
+            println!("REDIS ERROR: {:?}", e);
+            e
+        })?;
     tokio::spawn(driver);
     *bound.conn.write().await = new_conn.clone();
     Ok(new_conn)
@@ -399,7 +396,12 @@ impl MetaClient {
                     format!("redis://{}", node)
                 };
                 let shard_client =
-                    Box::pin(MetaClient::new_with_local_ips(&node_url, local_ips.clone())).await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+                    Box::pin(MetaClient::new_with_local_ips(&node_url, local_ips.clone()))
+                        .await
+                        .map_err(|e| {
+                            println!("REDIS ERROR: {:?}", e);
+                            e
+                        })?;
                 shards.push(shard_client);
             }
             return Ok(Self::Sharded { shards });
@@ -522,7 +524,14 @@ impl MetaClient {
                 let conn = if let Some(conn) = SINGLE_CONN_POOL.get(&addr_str).map(|r| r.clone()) {
                     conn
                 } else {
-                    let new_conn = client.get_multiplexed_tokio_connection().await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+                    let new_conn =
+                        client
+                            .get_multiplexed_tokio_connection()
+                            .await
+                            .map_err(|e| {
+                                println!("REDIS ERROR: {:?}", e);
+                                e
+                            })?;
                     SINGLE_CONN_POOL.insert(addr_str, new_conn.clone());
                     new_conn
                 };
@@ -556,7 +565,10 @@ impl MetaClient {
                 ))
             }
             Self::Cluster(c) => {
-                let conn = c.get_async_connection().await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+                let conn = c.get_async_connection().await.map_err(|e| {
+                    println!("REDIS ERROR: {:?}", e);
+                    e
+                })?;
                 Ok(MetaConnection::Cluster(conn))
             }
             Self::Sentinel {
@@ -568,7 +580,10 @@ impl MetaClient {
                         conn
                     } else {
                         let mut guard = client.lock().await;
-                        let new_conn = guard.get_async_connection().await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+                        let new_conn = guard.get_async_connection().await.map_err(|e| {
+                            println!("REDIS ERROR: {:?}", e);
+                            e
+                        })?;
                         SENTINEL_CONN_POOL.insert(service_name.clone(), new_conn.clone());
                         new_conn
                     };
@@ -838,7 +853,12 @@ impl DlmClient {
     }
 
     pub async fn new_with_local_ips(redis_url: &str, local_ips: Vec<IpAddr>) -> Result<Self> {
-        let meta_client = MetaClient::new_with_local_ips(redis_url, local_ips).await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+        let meta_client = MetaClient::new_with_local_ips(redis_url, local_ips)
+            .await
+            .map_err(|e| {
+                println!("REDIS ERROR: {:?}", e);
+                e
+            })?;
         let client_id = Uuid::new_v4().to_string();
         Ok(Self::init_with_client(
             client_id,
@@ -896,7 +916,10 @@ impl DlmClient {
             format!("lock:{}", file_path)
         };
 
-        let mut con = self.meta_client.get_connection().await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+        let mut con = self.meta_client.get_connection().await.map_err(|e| {
+            println!("REDIS ERROR: {:?}", e);
+            e
+        })?;
         let ttl_ms = ttl.as_millis() as u64;
 
         // Generate a monotonic fencing token key
@@ -910,10 +933,23 @@ impl DlmClient {
             .arg("PX")
             .arg(ttl_ms)
             .query_async(&mut con)
-            .await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
-        
+            .await
+            .map_err(|e| {
+                println!("REDIS ERROR: {:?}", e);
+                e
+            })?;
+
         let fencing_token: Option<u64> = if acquired.is_some() {
-            Some(redis::cmd("INCR").arg(&fencing_gen_key).query_async(&mut con).await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?)
+            Some(
+                redis::cmd("INCR")
+                    .arg(&fencing_gen_key)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(|e| {
+                        println!("REDIS ERROR: {:?}", e);
+                        e
+                    })?,
+            )
         } else {
             None
         };
@@ -950,14 +986,34 @@ impl DlmClient {
 
     pub async fn acquire_delegation(&self, inode: u64, ttl: Duration) -> Result<DelegationResult> {
         let delegation_key = format!("squeezefs:delegation:inode_{}", inode);
-        let mut con = self.meta_client.get_connection().await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+        let mut con = self.meta_client.get_connection().await.map_err(|e| {
+            println!("REDIS ERROR: {:?}", e);
+            e
+        })?;
         let ttl_ms = ttl.as_millis() as u64;
 
-        let current_holder: Option<String> = redis::cmd("GET").arg(&delegation_key).query_async(&mut con).await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+        let current_holder: Option<String> = redis::cmd("GET")
+            .arg(&delegation_key)
+            .query_async(&mut con)
+            .await
+            .map_err(|e| {
+                println!("REDIS ERROR: {:?}", e);
+                e
+            })?;
         let holder = if let Some(h) = current_holder {
             h
         } else {
-            let _: () = redis::cmd("SET").arg(&delegation_key).arg(&self.client_id).arg("PX").arg(ttl_ms).query_async(&mut con).await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+            let _: () = redis::cmd("SET")
+                .arg(&delegation_key)
+                .arg(&self.client_id)
+                .arg("PX")
+                .arg(ttl_ms)
+                .query_async(&mut con)
+                .await
+                .map_err(|e| {
+                    println!("REDIS ERROR: {:?}", e);
+                    e
+                })?;
             self.client_id.clone()
         };
 
@@ -985,13 +1041,20 @@ impl DlmClient {
     }
 
     pub async fn publish_recall(&self, target_client_id: &str, inode: u64) -> Result<()> {
-        let mut con = self.meta_client.get_connection().await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+        let mut con = self.meta_client.get_connection().await.map_err(|e| {
+            println!("REDIS ERROR: {:?}", e);
+            e
+        })?;
         let channel = format!("squeezefs:client:{}:recalls", target_client_id);
         let _: () = redis::cmd("PUBLISH")
             .arg(&channel)
             .arg(inode)
             .query_async(&mut con)
-            .await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+            .await
+            .map_err(|e| {
+                println!("REDIS ERROR: {:?}", e);
+                e
+            })?;
         Ok(())
     }
 
@@ -1010,7 +1073,10 @@ impl DlmClient {
         };
 
         let client = redis::Client::open(url)?;
-        let conn = client.get_async_connection().await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+        let conn = client.get_async_connection().await.map_err(|e| {
+            println!("REDIS ERROR: {:?}", e);
+            e
+        })?;
         let pubsub = conn.into_pubsub();
         Ok(pubsub)
     }
@@ -1033,11 +1099,22 @@ impl LockLease {
     pub async fn release(mut self) -> Result<()> {
         self.stop_heartbeat();
 
-        let mut con = self.meta_client.get_connection().await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
+        let mut con = self.meta_client.get_connection().await.map_err(|e| {
+            println!("REDIS ERROR: {:?}", e);
+            e
+        })?;
         // Release ONLY if we still own it to avoid releasing other client's lock
-        let current_holder: Option<String> = redis::cmd("GET").arg(&self.lock_key).query_async(&mut con).await.unwrap_or(None);
+        let current_holder: Option<String> = redis::cmd("GET")
+            .arg(&self.lock_key)
+            .query_async(&mut con)
+            .await
+            .unwrap_or(None);
         if current_holder == Some(self.client_id.clone()) {
-            let _: () = redis::cmd("DEL").arg(&self.lock_key).query_async(&mut con).await.unwrap_or(());
+            let _: () = redis::cmd("DEL")
+                .arg(&self.lock_key)
+                .query_async(&mut con)
+                .await
+                .unwrap_or(());
         }
 
         Ok(())
@@ -1074,9 +1151,17 @@ impl Drop for LockLease {
                     format!("lock:{}", file_path)
                 };
                 if let Ok(mut con) = meta_client.get_connection().await {
-                    let current_holder: Option<String> = redis::cmd("GET").arg(&lock_key).query_async(&mut con).await.unwrap_or(None);
+                    let current_holder: Option<String> = redis::cmd("GET")
+                        .arg(&lock_key)
+                        .query_async(&mut con)
+                        .await
+                        .unwrap_or(None);
                     if current_holder == Some(client_id.clone()) {
-                        let _: () = redis::cmd("DEL").arg(&lock_key).query_async(&mut con).await.unwrap_or(());
+                        let _: () = redis::cmd("DEL")
+                            .arg(&lock_key)
+                            .query_async(&mut con)
+                            .await
+                            .unwrap_or(());
                     }
                 }
             });
@@ -1087,10 +1172,21 @@ impl Drop for LockLease {
 impl DelegationLease {
     pub async fn release(mut self) -> Result<()> {
         self.stop_heartbeat();
-        let mut con = self.meta_client.get_connection().await.map_err(|e| { println!("REDIS ERROR: {:?}", e); e })?;
-        let current_holder: Option<String> = redis::cmd("GET").arg(&self.delegation_key).query_async(&mut con).await.unwrap_or(None);
+        let mut con = self.meta_client.get_connection().await.map_err(|e| {
+            println!("REDIS ERROR: {:?}", e);
+            e
+        })?;
+        let current_holder: Option<String> = redis::cmd("GET")
+            .arg(&self.delegation_key)
+            .query_async(&mut con)
+            .await
+            .unwrap_or(None);
         if current_holder == Some(self.client_id.clone()) {
-            let _: () = redis::cmd("DEL").arg(&self.delegation_key).query_async(&mut con).await.unwrap_or(());
+            let _: () = redis::cmd("DEL")
+                .arg(&self.delegation_key)
+                .query_async(&mut con)
+                .await
+                .unwrap_or(());
         }
         Ok(())
     }
@@ -1118,9 +1214,17 @@ impl Drop for DelegationLease {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Ok(mut con) = meta_client.get_connection().await {
-                    let current_holder: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut con).await.unwrap_or(None);
+                    let current_holder: Option<String> = redis::cmd("GET")
+                        .arg(&key)
+                        .query_async(&mut con)
+                        .await
+                        .unwrap_or(None);
                     if current_holder == Some(client_id.clone()) {
-                        let _: () = redis::cmd("DEL").arg(&key).query_async(&mut con).await.unwrap_or(());
+                        let _: () = redis::cmd("DEL")
+                            .arg(&key)
+                            .query_async(&mut con)
+                            .await
+                            .unwrap_or(());
                     }
                 }
             });

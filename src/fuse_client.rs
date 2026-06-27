@@ -20,6 +20,22 @@ use tokio::runtime::Builder;
 const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
+fn get_fuse_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    {
+        Duration::from_secs(15)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        if let Ok(val) = std::env::var("SQUEEZEFS_TIMEOUT") {
+            if let Ok(secs) = val.parse::<u64>() {
+                return Duration::from_secs(secs);
+            }
+        }
+        Duration::from_secs(2)
+    }
+}
+
 pub static BLOCK_FLUSH_LOCKS: Lazy<
     dashmap::DashMap<(u64, u32), std::sync::Arc<tokio::sync::Mutex<()>>, ahash::RandomState>,
 > = Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
@@ -33,8 +49,6 @@ impl Drop for BlockFlushGuard {
         BLOCK_FLUSH_LOCKS.remove_if(&self.key, |_, arc| std::sync::Arc::strong_count(arc) <= 2);
     }
 }
-
-
 
 #[derive(Default)]
 pub struct ProbabilisticAtomic {
@@ -674,13 +688,17 @@ impl SqueezefsFilesystem {
                             }
                             .await;
 
-
                             let decompressed = get_res?;
                             self.router
                                 .cache
                                 .read_lru
                                 .put(&bk, bytes::Bytes::from(decompressed.clone()));
-                            let _ = self.router.cache.nvme.cache_read_block(&bk, &decompressed);
+                            let nvme_clone = self.router.cache.nvme.clone();
+                            let bk_clone = bk.clone();
+                            let decompressed_clone = decompressed.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = nvme_clone.cache_read_block(&bk_clone, &decompressed_clone);
+                            });
                             decompressed
                         };
                     }
@@ -696,10 +714,15 @@ impl SqueezefsFilesystem {
             block_data[rel_start..rel_start + slice_len].copy_from_slice(file_data_slice);
 
             // 3. Write back to staging_nvme_cache
-            self.router
-                .cache
-                .nvme
-                .put_active_block(&cache_key, &block_data, _fencing_token);
+            let nvme_clone = self.router.cache.nvme.clone();
+            let cache_key_clone = cache_key.clone();
+            let block_data_clone = block_data.clone();
+            let fencing_token_val = _fencing_token;
+            tokio::task::spawn_blocking(move || {
+                nvme_clone.put_active_block(&cache_key_clone, &block_data_clone, fencing_token_val);
+            })
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
             let req = WritebackRequest {
                 ino,
@@ -1027,7 +1050,11 @@ impl SqueezefsFilesystem {
             );
 
             let cache_key = format!("active_block:inode_{}:block_{}", ino, block_num);
-            self.router.cache.nvme.remove_active_block(&cache_key);
+            let nvme_clone = self.router.cache.nvme.clone();
+            let cache_key_clone = cache_key.clone();
+            tokio::task::spawn_blocking(move || {
+                nvme_clone.remove_active_block(&cache_key_clone);
+            });
 
             start_offset = end_offset;
         }
@@ -1361,7 +1388,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), lookup_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), lookup_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -1413,7 +1440,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), getattr_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), getattr_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!("FUSE Getattr timeout on inode {}", ino);
@@ -1510,7 +1537,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let meta_key = format!("metadata:inode_{}", new_ino);
                 pipe.hset(&meta_key, "type", "inline")
                     .hset(&meta_key, "size", 0);
-                    
+
                 self.router.metadata_cache.insert(
                     format!("inode_{}", new_ino),
                     crate::routing::CachedMetadata {
@@ -1521,7 +1548,7 @@ impl Filesystem for SqueezefsFilesystem {
                         file_id: None,
                         cached_at: std::time::Instant::now(),
                         data_key: None,
-                    }
+                    },
                 );
             }
 
@@ -1546,7 +1573,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), mknod_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), mknod_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -1590,19 +1617,25 @@ impl Filesystem for SqueezefsFilesystem {
             let nsec = now.subsec_nanos();
 
             let shard_count = self.dlm.shard_count() as u64;
-            let (inodes_limit_str, used, new_ino): (Option<String>, Option<u64>, u64) = redis::pipe()
-                .cmd("HGET").arg("squeezefs:format").arg("inodes")
-                .cmd("GET").arg("squeezefs:used_inodes")
-                .cmd("INCRBY").arg("squeezefs:inode_counter").arg(shard_count)
-                .query_async(&mut con)
-                .await
-                .map_err(map_err)?;
+            let (inodes_limit_str, used, new_ino): (Option<String>, Option<u64>, u64) =
+                redis::pipe()
+                    .cmd("HGET")
+                    .arg("squeezefs:format")
+                    .arg("inodes")
+                    .cmd("GET")
+                    .arg("squeezefs:used_inodes")
+                    .cmd("INCRBY")
+                    .arg("squeezefs:inode_counter")
+                    .arg(shard_count)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(map_err)?;
 
             let max_inodes = inodes_limit_str
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
             let max_inodes_val = if max_inodes > 0 { max_inodes } else { u64::MAX };
-            
+
             if used.unwrap_or(0) >= max_inodes_val {
                 return Err(Errno::from(libc::ENOSPC));
             }
@@ -1625,33 +1658,39 @@ impl Filesystem for SqueezefsFilesystem {
 
             let mut pipe = redis::pipe();
             pipe.atomic();
-            pipe.hset_multiple(&attr_key, &[
-                ("ino", new_ino.to_string()),
-                ("size", "0".to_string()),
-                ("blocks", "0".to_string()),
-                ("kind", "1".to_string()),
-                ("perm", (mode as u16 & 0o7777).to_string()),
-                ("nlink", "1".to_string()),
-                ("uid", req.uid.to_string()),
-                ("gid", req.gid.to_string()),
-                ("atime_sec", sec.to_string()),
-                ("atime_nsec", nsec.to_string()),
-                ("mtime_sec", sec.to_string()),
-                ("mtime_nsec", nsec.to_string()),
-                ("ctime_sec", sec.to_string()),
-                ("ctime_nsec", nsec.to_string()),
-            ]);
-            pipe.hset_multiple(&meta_key, &[
-                ("type", "inline".to_string()),
-                ("size", "0".to_string()),
-            ]);
+            pipe.hset_multiple(
+                &attr_key,
+                &[
+                    ("ino", new_ino.to_string()),
+                    ("size", "0".to_string()),
+                    ("blocks", "0".to_string()),
+                    ("kind", "1".to_string()),
+                    ("perm", (mode as u16 & 0o7777).to_string()),
+                    ("nlink", "1".to_string()),
+                    ("uid", req.uid.to_string()),
+                    ("gid", req.gid.to_string()),
+                    ("atime_sec", sec.to_string()),
+                    ("atime_nsec", nsec.to_string()),
+                    ("mtime_sec", sec.to_string()),
+                    ("mtime_nsec", nsec.to_string()),
+                    ("ctime_sec", sec.to_string()),
+                    ("ctime_nsec", nsec.to_string()),
+                ],
+            );
+            pipe.hset_multiple(
+                &meta_key,
+                &[("type", "inline".to_string()), ("size", "0".to_string())],
+            );
             pipe.cmd("INCRBY").arg("squeezefs:used_inodes").arg(1);
-            pipe.hset_multiple(&parent_attr_key, &[
-                ("mtime_sec", sec.to_string()),
-                ("mtime_nsec", nsec.to_string()),
-                ("ctime_sec", sec.to_string()),
-                ("ctime_nsec", nsec.to_string()),
-            ]);
+            pipe.hset_multiple(
+                &parent_attr_key,
+                &[
+                    ("mtime_sec", sec.to_string()),
+                    ("mtime_nsec", nsec.to_string()),
+                    ("ctime_sec", sec.to_string()),
+                    ("ctime_nsec", nsec.to_string()),
+                ],
+            );
 
             let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
 
@@ -1672,7 +1711,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), create_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), create_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -1754,8 +1793,6 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
-
-
         let file_path = format!("inode_{}", ino);
 
         // Get file size to bound the read
@@ -1781,8 +1818,7 @@ impl Filesystem for SqueezefsFilesystem {
         let read_future =
             self.router
                 .read_file_range_zero_copy(&file_path, offset, read_len as u32);
-        let (data, backing) = match tokio::time::timeout(Duration::from_secs(2), read_future).await
-        {
+        let (data, backing) = match tokio::time::timeout(get_fuse_timeout(), read_future).await {
             Ok(Ok(res)) => res,
             Ok(Err(e)) => {
                 error!("FUSE Read error: {:?}", e);
@@ -1842,12 +1878,13 @@ impl Filesystem for SqueezefsFilesystem {
                 (Some(s), Some(m)) => {
                     file_type = m.file_type.clone();
                     (s, m.file_type == "striped")
-                },
+                }
                 _ => {
                     let mut pipe = redis::pipe();
                     pipe.cmd("HGET").arg(&attr_key).arg("size");
                     pipe.cmd("HGET").arg(&meta_key).arg("type");
-                    let (size_str, type_str): (Option<String>, Option<String>) = pipe.query_async(&mut con).await.map_err(map_err)?;
+                    let (size_str, type_str): (Option<String>, Option<String>) =
+                        pipe.query_async(&mut con).await.map_err(map_err)?;
                     let size = size_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
                     file_type = type_str.unwrap_or_else(|| "inline".to_string());
                     let striped = file_type == "striped";
@@ -1862,7 +1899,8 @@ impl Filesystem for SqueezefsFilesystem {
                 self.check_capacity_quota(&mut con, diff).await?;
             }
 
-            let fits_inline = expected_new_size <= 65536 && file_type != "staged" && file_type != "striped";
+            let fits_inline =
+                expected_new_size <= 65536 && file_type != "staged" && file_type != "striped";
 
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -1870,32 +1908,50 @@ impl Filesystem for SqueezefsFilesystem {
             let sec = now.as_secs() as i64;
             let nsec = now.subsec_nanos();
             let block_size = self.router.block_size.load(Ordering::Relaxed);
-            let num_blocks = if is_striped { expected_new_size.div_ceil(block_size).to_string() } else { "0".to_string() };
+            let num_blocks = if is_striped {
+                expected_new_size.div_ceil(block_size).to_string()
+            } else {
+                "0".to_string()
+            };
 
             let mut pipe = redis::pipe();
             pipe.atomic();
 
             if expected_new_size > old_size {
                 let diff = expected_new_size - old_size;
-                pipe.hset_multiple(&attr_key, &[
-                    ("size", expected_new_size.to_string()),
-                    ("mtime_sec", sec.to_string()),
-                    ("mtime_nsec", nsec.to_string()),
-                    ("ctime_sec", sec.to_string()),
-                    ("ctime_nsec", nsec.to_string()),
-                ]);
-                pipe.cmd("HSET").arg(&meta_key).arg("size").arg(expected_new_size.to_string());
+                pipe.hset_multiple(
+                    &attr_key,
+                    &[
+                        ("size", expected_new_size.to_string()),
+                        ("mtime_sec", sec.to_string()),
+                        ("mtime_nsec", nsec.to_string()),
+                        ("ctime_sec", sec.to_string()),
+                        ("ctime_nsec", nsec.to_string()),
+                    ],
+                );
+                pipe.cmd("HSET")
+                    .arg(&meta_key)
+                    .arg("size")
+                    .arg(expected_new_size.to_string());
                 if num_blocks != "0" {
-                    pipe.cmd("HSET").arg(&meta_key).arg("num_blocks").arg(&num_blocks);
+                    pipe.cmd("HSET")
+                        .arg(&meta_key)
+                        .arg("num_blocks")
+                        .arg(&num_blocks);
                 }
-                pipe.cmd("INCRBY").arg("squeezefs:used_bytes").arg(diff.to_string());
+                pipe.cmd("INCRBY")
+                    .arg("squeezefs:used_bytes")
+                    .arg(diff.to_string());
             } else {
-                pipe.hset_multiple(&attr_key, &[
-                    ("mtime_sec", sec.to_string()),
-                    ("mtime_nsec", nsec.to_string()),
-                    ("ctime_sec", sec.to_string()),
-                    ("ctime_nsec", nsec.to_string()),
-                ]);
+                pipe.hset_multiple(
+                    &attr_key,
+                    &[
+                        ("mtime_sec", sec.to_string()),
+                        ("mtime_nsec", nsec.to_string()),
+                        ("ctime_sec", sec.to_string()),
+                        ("ctime_nsec", nsec.to_string()),
+                    ],
+                );
             }
 
             if fits_inline {
@@ -1905,7 +1961,10 @@ impl Filesystem for SqueezefsFilesystem {
                     let inline_key = format!("inline_data:{}", file_path);
                     let bytes: Option<Vec<u8>> = con.get(&inline_key).await.map_err(map_err)?;
                     if let Some(b) = bytes {
-                        self.router.get_crypto().process_read(&b).map_err(map_squeezefs_err)?
+                        self.router
+                            .get_crypto()
+                            .process_read(&b)
+                            .map_err(map_squeezefs_err)?
                     } else {
                         Vec::new()
                     }
@@ -1915,16 +1974,20 @@ impl Filesystem for SqueezefsFilesystem {
                     final_data.resize(offset as usize + data.len(), 0);
                 }
                 final_data[offset as usize..offset as usize + data.len()].copy_from_slice(data);
-                
-                let packed = self.router.get_crypto().process_write(bytes::Bytes::copy_from_slice(&final_data)).map_err(map_squeezefs_err)?;
+
+                let packed = self
+                    .router
+                    .get_crypto()
+                    .process_write(bytes::Bytes::copy_from_slice(&final_data))
+                    .map_err(map_squeezefs_err)?;
                 let inline_key = format!("inline_data:{}", file_path);
-                
+
                 pipe.hset(&meta_key, "type", "inline");
                 pipe.set(&inline_key, packed.as_ref());
 
                 let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
                 drop(con);
-                
+
                 self.router.metadata_cache.insert(
                     file_path.clone(),
                     crate::routing::CachedMetadata {
@@ -1935,22 +1998,16 @@ impl Filesystem for SqueezefsFilesystem {
                         file_id: None,
                         cached_at: std::time::Instant::now(),
                         data_key: None,
-                    }
+                    },
                 );
             } else {
                 let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
                 drop(con); // PREVENT DEADLOCK
 
                 if is_striped {
-                    self.write_file_staged(
-                        ino,
-                        offset,
-                        data,
-                        old_size,
-                        fencing_token,
-                    )
-                    .await
-                    .map_err(map_squeezefs_err)?;
+                    self.write_file_staged(ino, offset, data, old_size, fencing_token)
+                        .await
+                        .map_err(map_squeezefs_err)?;
                     self.router.cache.write_lru.remove(&file_path);
                     self.router.cache.read_lru.remove(&file_path);
                 } else {
@@ -1978,7 +2035,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), write_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), write_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!("FUSE Write timeout on inode {}", ino);
@@ -2018,19 +2075,25 @@ impl Filesystem for SqueezefsFilesystem {
             let nsec = now.subsec_nanos();
 
             let shard_count = self.dlm.shard_count() as u64;
-            let (inodes_limit_str, used, new_ino): (Option<String>, Option<u64>, u64) = redis::pipe()
-                .cmd("HGET").arg("squeezefs:format").arg("inodes")
-                .cmd("GET").arg("squeezefs:used_inodes")
-                .cmd("INCRBY").arg("squeezefs:inode_counter").arg(shard_count)
-                .query_async(&mut con)
-                .await
-                .map_err(map_err)?;
+            let (inodes_limit_str, used, new_ino): (Option<String>, Option<u64>, u64) =
+                redis::pipe()
+                    .cmd("HGET")
+                    .arg("squeezefs:format")
+                    .arg("inodes")
+                    .cmd("GET")
+                    .arg("squeezefs:used_inodes")
+                    .cmd("INCRBY")
+                    .arg("squeezefs:inode_counter")
+                    .arg(shard_count)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(map_err)?;
 
             let max_inodes = inodes_limit_str
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
             let max_inodes_val = if max_inodes > 0 { max_inodes } else { u64::MAX };
-            
+
             if used.unwrap_or(0) >= max_inodes_val {
                 return Err(Errno::from(libc::ENOSPC));
             }
@@ -2054,38 +2117,47 @@ impl Filesystem for SqueezefsFilesystem {
 
             let mut pipe = redis::pipe();
             pipe.atomic();
-            pipe.hset_multiple(&attr_key, &[
-                ("ino", new_ino.to_string()),
-                ("size", "4096".to_string()),
-                ("blocks", "8".to_string()),
-                ("kind", "2".to_string()),
-                ("perm", (mode as u16 & 0o7777).to_string()),
-                ("nlink", "2".to_string()),
-                ("uid", req.uid.to_string()),
-                ("gid", req.gid.to_string()),
-                ("atime_sec", sec.to_string()),
-                ("atime_nsec", nsec.to_string()),
-                ("mtime_sec", sec.to_string()),
-                ("mtime_nsec", nsec.to_string()),
-                ("ctime_sec", sec.to_string()),
-                ("ctime_nsec", nsec.to_string()),
-            ]);
-            pipe.hset_multiple(&meta_key, &[
-                ("type", "inline".to_string()),
-                ("size", "0".to_string()),
-            ]);
-            pipe.hset_multiple(&child_dir_key, &[
-                (".", new_ino.to_string()),
-                ("..", parent.to_string()),
-            ]);
+            pipe.hset_multiple(
+                &attr_key,
+                &[
+                    ("ino", new_ino.to_string()),
+                    ("size", "4096".to_string()),
+                    ("blocks", "8".to_string()),
+                    ("kind", "2".to_string()),
+                    ("perm", (mode as u16 & 0o7777).to_string()),
+                    ("nlink", "2".to_string()),
+                    ("uid", req.uid.to_string()),
+                    ("gid", req.gid.to_string()),
+                    ("atime_sec", sec.to_string()),
+                    ("atime_nsec", nsec.to_string()),
+                    ("mtime_sec", sec.to_string()),
+                    ("mtime_nsec", nsec.to_string()),
+                    ("ctime_sec", sec.to_string()),
+                    ("ctime_nsec", nsec.to_string()),
+                ],
+            );
+            pipe.hset_multiple(
+                &meta_key,
+                &[("type", "inline".to_string()), ("size", "0".to_string())],
+            );
+            pipe.hset_multiple(
+                &child_dir_key,
+                &[(".", new_ino.to_string()), ("..", parent.to_string())],
+            );
             pipe.cmd("INCRBY").arg("squeezefs:used_inodes").arg(1);
-            pipe.cmd("HINCRBY").arg(&parent_attr_key).arg("nlink").arg(1);
-            pipe.hset_multiple(&parent_attr_key, &[
-                ("mtime_sec", sec.to_string()),
-                ("mtime_nsec", nsec.to_string()),
-                ("ctime_sec", sec.to_string()),
-                ("ctime_nsec", nsec.to_string()),
-            ]);
+            pipe.cmd("HINCRBY")
+                .arg(&parent_attr_key)
+                .arg("nlink")
+                .arg(1);
+            pipe.hset_multiple(
+                &parent_attr_key,
+                &[
+                    ("mtime_sec", sec.to_string()),
+                    ("mtime_nsec", nsec.to_string()),
+                    ("ctime_sec", sec.to_string()),
+                    ("ctime_nsec", nsec.to_string()),
+                ],
+            );
 
             let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
 
@@ -2104,7 +2176,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), mkdir_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), mkdir_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -2143,13 +2215,24 @@ impl Filesystem for SqueezefsFilesystem {
             };
 
             let child_dir_key = format!("squeezefs:dir:{}", ino);
-            
+
             loop {
-                let _: () = redis::cmd("WATCH").arg(&child_dir_key).query_async(&mut con).await.map_err(map_err)?;
-                
-                let size: u64 = redis::cmd("HLEN").arg(&child_dir_key).query_async(&mut con).await.map_err(map_err)?;
+                let _: () = redis::cmd("WATCH")
+                    .arg(&child_dir_key)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(map_err)?;
+
+                let size: u64 = redis::cmd("HLEN")
+                    .arg(&child_dir_key)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(map_err)?;
                 if size > 2 {
-                    let _: () = redis::cmd("UNWATCH").query_async(&mut con).await.map_err(map_err)?;
+                    let _: () = redis::cmd("UNWATCH")
+                        .query_async(&mut con)
+                        .await
+                        .map_err(map_err)?;
                     return Err(Errno::from(libc::ENOTEMPTY));
                 }
 
@@ -2157,7 +2240,7 @@ impl Filesystem for SqueezefsFilesystem {
                 pipe.atomic();
                 pipe.cmd("HDEL").arg(&dir_key).arg(&*name_str);
                 pipe.cmd("DEL").arg(&child_dir_key);
-                
+
                 let res: Option<Vec<i64>> = pipe.query_async(&mut con).await.map_err(map_err)?;
                 if res.is_some() {
                     break;
@@ -2167,21 +2250,35 @@ impl Filesystem for SqueezefsFilesystem {
             let child_attr_key = format!("squeezefs:attr:{}", ino);
             let child_meta_key = format!("metadata:inode_{}", ino);
             let child_inline_key = format!("inline_data:inode_{}", ino);
-            
+
             let mut pipe = redis::pipe();
             pipe.cmd("DEL").arg(&child_attr_key);
             pipe.cmd("DEL").arg(&child_meta_key);
             pipe.cmd("DEL").arg(&child_inline_key);
             pipe.cmd("DECR").arg("squeezefs:used_inodes");
             let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
-            
+
             let parent_attr_key = format!("squeezefs:attr:{}", parent);
             let parent_nlink: i64 = con.hget(&parent_attr_key, "nlink").await.unwrap_or(2);
             let mut new_nlink = parent_nlink - 1;
             if new_nlink < 1 {
                 new_nlink = 1;
             }
-            let _: () = redis::cmd("HSET").arg(&parent_attr_key).arg("nlink").arg(new_nlink).arg("mtime_sec").arg(sec).arg("mtime_nsec").arg(nsec).arg("ctime_sec").arg(sec).arg("ctime_nsec").arg(nsec).query_async(&mut con).await.map_err(map_err)?;
+            let _: () = redis::cmd("HSET")
+                .arg(&parent_attr_key)
+                .arg("nlink")
+                .arg(new_nlink)
+                .arg("mtime_sec")
+                .arg(sec)
+                .arg("mtime_nsec")
+                .arg(nsec)
+                .arg("ctime_sec")
+                .arg(sec)
+                .arg("ctime_nsec")
+                .arg(nsec)
+                .query_async(&mut con)
+                .await
+                .map_err(map_err)?;
 
             // Invalidate caches
             self.attr_cache.remove(&ino);
@@ -2200,7 +2297,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(())
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), rmdir_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), rmdir_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -2332,7 +2429,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), setattr_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), setattr_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!("FUSE Setattr timeout on inode {}", ino);
@@ -2425,7 +2522,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), symlink_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), symlink_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -2538,7 +2635,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), link_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), link_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -2575,10 +2672,15 @@ impl Filesystem for SqueezefsFilesystem {
             let sec = now.as_secs() as i64;
             let nsec = now.subsec_nanos();
 
-            let ino = if let Some(cached_ino) = self.dir_entry_cache.get(&parent).and_then(|map| map.get(&*name_str).copied()) {
+            let ino = if let Some(cached_ino) = self
+                .dir_entry_cache
+                .get(&parent)
+                .and_then(|map| map.get(&*name_str).copied())
+            {
                 cached_ino
             } else {
-                let ino_str: Option<String> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
+                let ino_str: Option<String> =
+                    con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
                 match ino_str {
                     Some(s) => s.parse::<u64>().unwrap_or(0),
                     None => return Err(Errno::from(libc::ENOENT)),
@@ -2586,46 +2688,76 @@ impl Filesystem for SqueezefsFilesystem {
             };
 
             let child_attr_key = format!("squeezefs:attr:{}", ino);
-            
+
             let mut pipe = redis::pipe();
             pipe.cmd("HGET").arg(&child_attr_key).arg("kind");
             pipe.cmd("HDEL").arg(&dir_key).arg(&*name_str);
-            pipe.cmd("HINCRBY").arg(&child_attr_key).arg("nlink").arg(-1);
+            pipe.cmd("HINCRBY")
+                .arg(&child_attr_key)
+                .arg("nlink")
+                .arg(-1);
             pipe.cmd("HGET").arg(&child_attr_key).arg("size");
-            pipe.cmd("HGET").arg(format!("metadata:inode_{}", ino)).arg("type");
-            let (kind_str, deleted, mut new_nlink, size_str, type_str): (Option<String>, i64, i64, Option<String>, Option<String>) = pipe.query_async(&mut con).await.map_err(map_err)?;
-            
+            pipe.cmd("HGET")
+                .arg(format!("metadata:inode_{}", ino))
+                .arg("type");
+            let (kind_str, deleted, mut new_nlink, size_str, type_str): (
+                Option<String>,
+                i64,
+                i64,
+                Option<String>,
+                Option<String>,
+            ) = pipe.query_async(&mut con).await.map_err(map_err)?;
+
             let kind = kind_str.and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
             if kind == 2 {
                 let mut rb_pipe = redis::pipe();
                 rb_pipe.cmd("HSET").arg(&dir_key).arg(&*name_str).arg(ino);
-                rb_pipe.cmd("HINCRBY").arg(&child_attr_key).arg("nlink").arg(1);
+                rb_pipe
+                    .cmd("HINCRBY")
+                    .arg(&child_attr_key)
+                    .arg("nlink")
+                    .arg(1);
                 let _: () = rb_pipe.query_async(&mut con).await.map_err(map_err)?;
                 return Err(Errno::from(libc::EISDIR));
             }
             if deleted == 0 {
-                let _: () = redis::cmd("HINCRBY").arg(&child_attr_key).arg("nlink").arg(1).query_async(&mut con).await.map_err(map_err)?;
+                let _: () = redis::cmd("HINCRBY")
+                    .arg(&child_attr_key)
+                    .arg("nlink")
+                    .arg(1)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(map_err)?;
                 return Err(Errno::from(libc::ENOENT));
             }
 
             if new_nlink < 0 {
                 new_nlink = 0;
-                let _: () = redis::cmd("HSET").arg(&child_attr_key).arg("nlink").arg(0).query_async(&mut con).await.map_err(map_err)?;
+                let _: () = redis::cmd("HSET")
+                    .arg(&child_attr_key)
+                    .arg("nlink")
+                    .arg(0)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(map_err)?;
             }
-            
+
             let file_size = size_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let file_type = type_str.unwrap_or_else(|| "inline".to_string());
-            
+
             let parent_attr_key = format!("squeezefs:attr:{}", parent);
             let attr_key = format!("squeezefs:attr:{}", ino);
 
             let mut final_pipe = redis::pipe();
-            final_pipe.hset_multiple(&parent_attr_key, &[
-                ("mtime_sec", sec.to_string()),
-                ("mtime_nsec", nsec.to_string()),
-                ("ctime_sec", sec.to_string()),
-                ("ctime_nsec", nsec.to_string()),
-            ]);
+            final_pipe.hset_multiple(
+                &parent_attr_key,
+                &[
+                    ("mtime_sec", sec.to_string()),
+                    ("mtime_nsec", nsec.to_string()),
+                    ("ctime_sec", sec.to_string()),
+                    ("ctime_nsec", nsec.to_string()),
+                ],
+            );
 
             if new_nlink == 0 {
                 // Delete metadata and data completely
@@ -2667,7 +2799,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(())
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), unlink_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), unlink_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -2927,7 +3059,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(())
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), rename_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), rename_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -3090,7 +3222,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(ReplyDirectory { entries: stream })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), readdir_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), readdir_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!("FUSE readdir timeout parent = {}", parent);
@@ -3362,7 +3494,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(ReplyDirectoryPlus { entries: stream })
         };
 
-        match tokio::time::timeout(Duration::from_secs(2), readdirplus_future).await {
+        match tokio::time::timeout(get_fuse_timeout(), readdirplus_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!("FUSE readdirplus timeout parent = {}", parent);
@@ -5507,10 +5639,18 @@ async fn flush_single_active_block(
     let current_staged = router.cache.nvme.read_staged(&cache_key);
     if let Some(ref cur) = current_staged {
         if cur == &block_bytes[..] {
-            router.cache.nvme.remove_active_block(&cache_key);
+            let nvme_clone = router.cache.nvme.clone();
+            let cache_key_clone = cache_key.clone();
+            tokio::task::spawn_blocking(move || {
+                nvme_clone.remove_active_block(&cache_key_clone);
+            });
         }
     } else {
-        router.cache.nvme.remove_active_block(&cache_key);
+        let nvme_clone = router.cache.nvme.clone();
+        let cache_key_clone = cache_key.clone();
+        tokio::task::spawn_blocking(move || {
+            nvme_clone.remove_active_block(&cache_key_clone);
+        });
     }
 
     Ok(())

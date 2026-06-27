@@ -383,6 +383,12 @@ enum StorageVolumeActions {
         /// Volume size (e.g. 1P, 100G)
         #[arg(long)]
         size: String,
+        /// Explicit number of disks/stripes to stripe across (defaults to auto-detecting all disks in the pool)
+        #[arg(long)]
+        stripes: Option<usize>,
+        /// Stripe size (e.g. 64K, 256K, 512K, default: 512K)
+        #[arg(long)]
+        stripe_size: Option<String>,
     },
     /// Extend a storage volume
     Extend {
@@ -1898,8 +1904,16 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     pool_name,
                     vol_name,
                     size,
+                    stripes,
+                    stripe_size,
                 } => {
-                    squeezefs::storage::volume_create(&pool_name, &vol_name, &size)?;
+                    squeezefs::storage::volume_create(
+                        &pool_name,
+                        &vol_name,
+                        &size,
+                        stripes,
+                        stripe_size.as_deref(),
+                    )?;
                 }
                 StorageVolumeActions::Extend {
                     pool_name,

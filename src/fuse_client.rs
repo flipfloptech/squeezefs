@@ -4805,7 +4805,7 @@ pub async fn format_volume(
     mem_cache_size: Option<&str>,
     disk_cache_size: Option<&str>,
     disk_cache_paths: Option<&[std::path::PathBuf]>,
-    nvme_target_path: Option<&str>,
+    _nvme_target_path: Option<&str>,
     read_cache_size: Option<&str>,
     write_cache_size: Option<&str>,
     read_mem_cache_size: Option<&str>,
@@ -5418,7 +5418,7 @@ async fn flush_due_active_blocks_for_inode(
 async fn flush_single_active_block(
     ino: u64,
     b: u32,
-    fencing_token: u64,
+    _fencing_token: u64,
     router: &DataRouter,
     dlm: &DlmClient,
     active_inode_locks: &dashmap::DashMap<

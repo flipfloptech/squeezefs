@@ -1,9 +1,9 @@
-pub mod tiering;
 #![allow(
     clippy::type_complexity,
     clippy::too_many_arguments,
     clippy::redundant_closure
 )]
+pub mod tiering;
 
 pub mod backend;
 pub mod cache;
@@ -28,3 +28,4 @@ macro_rules! coz_progress {
         coz::progress!();
     };
 }
+pub mod block_allocator;

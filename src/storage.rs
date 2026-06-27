@@ -59,14 +59,53 @@ pub fn pool_add(pool_name: &str, disks: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub fn volume_create(pool_name: &str, vol_name: &str, size: &str) -> Result<()> {
-    info!(
-        "Creating volume '{}' in pool '{}' with size {}",
-        vol_name, pool_name, size
-    );
+pub fn volume_create(
+    pool_name: &str,
+    vol_name: &str,
+    size: &str,
+    stripes: Option<usize>,
+    stripe_size: Option<&str>,
+) -> Result<()> {
+    // 1. Resolve number of stripes
+    let resolved_stripes = match stripes {
+        Some(s) => s,
+        None => {
+            let count = get_pool_disk_count(pool_name).unwrap_or(1);
+            info!("Auto-detected {} disk(s) in pool '{}'", count, pool_name);
+            count
+        }
+    };
 
-    // Run lvcreate
-    run_cmd("lvcreate", &["-y", "-n", vol_name, "-L", size, pool_name])?;
+    // 2. Run lvcreate
+    if resolved_stripes > 1 {
+        let size_str = stripe_size.unwrap_or("512K");
+        let stripes_str = resolved_stripes.to_string();
+        info!(
+            "Creating striped volume '{}' in pool '{}' with size {}, striped across {} disks (stripe size {})",
+            vol_name, pool_name, size, stripes_str, size_str
+        );
+        run_cmd(
+            "lvcreate",
+            &[
+                "-y",
+                "-i",
+                &stripes_str,
+                "-I",
+                size_str,
+                "-n",
+                vol_name,
+                "-L",
+                size,
+                pool_name,
+            ],
+        )?;
+    } else {
+        info!(
+            "Creating linear volume '{}' in pool '{}' with size {}",
+            vol_name, pool_name, size
+        );
+        run_cmd("lvcreate", &["-y", "-n", vol_name, "-L", size, pool_name])?;
+    }
 
     info!(
         "Successfully created volume. It is accessible at /dev/{}/{}",
@@ -74,6 +113,20 @@ pub fn volume_create(pool_name: &str, vol_name: &str, size: &str) -> Result<()> 
     );
     Ok(())
 }
+
+fn get_pool_disk_count(pool_name: &str) -> Option<usize> {
+    let output = Command::new("vgs")
+        .args(&["-o", "pv_count", "--noheadings", pool_name])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.trim().parse::<usize>().ok()
+    } else {
+        None
+    }
+}
+
 
 pub fn volume_extend(pool_name: &str, vol_name: &str, add_size: &str) -> Result<()> {
     let lv_path = format!("/dev/{}/{}", pool_name, vol_name);

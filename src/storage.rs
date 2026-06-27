@@ -116,7 +116,7 @@ pub fn volume_create(
 
 fn get_pool_disk_count(pool_name: &str) -> Option<usize> {
     let output = Command::new("vgs")
-        .args(&["-o", "pv_count", "--noheadings", pool_name])
+        .args(["-o", "pv_count", "--noheadings", pool_name])
         .output()
         .ok()?;
     if output.status.success() {
@@ -126,7 +126,6 @@ fn get_pool_disk_count(pool_name: &str) -> Option<usize> {
         None
     }
 }
-
 
 pub fn volume_extend(pool_name: &str, vol_name: &str, add_size: &str) -> Result<()> {
     let lv_path = format!("/dev/{}/{}", pool_name, vol_name);

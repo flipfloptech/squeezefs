@@ -225,6 +225,9 @@ enum Commands {
         /// Size of the big file in MB per thread
         #[arg(long, default_value_t = 128)]
         size: usize,
+        /// Number of iterations to run the benchmark
+        #[arg(short, long, default_value_t = 1)]
+        iterations: usize,
     },
     /// Clone a file metadata-only (instant Copy-on-Write cloning)
     Clone {
@@ -1893,9 +1896,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             path,
             threads,
             size,
+            iterations,
         } => {
             let redis_url = &cli.garnet_url;
-            run_benchmark(&path, threads, size, redis_url).await?;
+            for iter in 1..=iterations {
+                if iterations > 1 {
+                    println!("\n--- Benchmark Iteration {}/{} ---", iter, iterations);
+                }
+                run_benchmark(&path, threads, size, redis_url).await?;
+            }
         }
         Commands::Clone { src, dest } => {
             let redis_url = &cli.garnet_url;

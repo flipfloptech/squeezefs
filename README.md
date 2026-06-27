@@ -113,6 +113,17 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
   squeezefs nvmeof list
   ```
 
+* **Storage Pool & Volume Management:**
+  Abstracts underlying LVM operations for seamless scale-out and multi-tenancy.
+  ```bash
+  squeezefs storage pool create <pool> <disks...>
+  squeezefs storage pool add <pool> <disks...>
+  squeezefs storage pool remove <pool> <disks...>
+  squeezefs storage volume create <pool> <volume> --size <size>
+  squeezefs storage volume extend <pool> <volume> --add-size <size>
+  squeezefs storage volume delete <pool> <volume>
+  ```
+
 * **Runtime Configuration Management:**
   Configure limits and caches at runtime:
   ```bash

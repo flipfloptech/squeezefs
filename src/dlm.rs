@@ -887,12 +887,12 @@ impl DlmClient {
         self.meta_client.get_connection().await
     }
 
-    pub fn shard_count(&self) -> usize {
-        self.meta_client.shard_count()
-    }
-
     pub async fn get_connection_for_inode(&self, ino: u64) -> Result<MetaConnection> {
         self.meta_client.get_connection_for_inode(ino).await
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.meta_client.shard_count()
     }
 
     pub async fn get_connection_for_key(&self, key: &str) -> Result<MetaConnection> {

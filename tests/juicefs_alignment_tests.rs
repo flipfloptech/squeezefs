@@ -326,6 +326,7 @@ async fn test_three_tiered_writeback_and_lease_cache() {
         gid: 1000,
         pid: 1234,
     };
+    fs.disable_background_writeback();
     fs.init(req).await.unwrap();
 
     // Create a large file

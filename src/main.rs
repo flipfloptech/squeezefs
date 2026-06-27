@@ -256,6 +256,53 @@ enum Commands {
         /// Optional path to a file or directory
         path: Option<String>,
     },
+    /// NVMe over Fabrics configuration and management utility
+    Nvmeof {
+        #[command(subcommand)]
+        action: NvmeofActions,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum NvmeofActions {
+    /// Share a local disk or regular file as an NVMe-oF target subsystem
+    Share {
+        /// Local backing path (e.g. /dev/nvme1n1 or /tmp/testfile.img)
+        backing_path: String,
+        /// Optional custom Subsystem NQN
+        #[arg(long)]
+        subnqn: Option<String>,
+        /// Port to bind target listener to (default: 4420)
+        #[arg(long, default_value_t = 4420)]
+        port: u16,
+        /// IP address to bind target to (default: 0.0.0.0)
+        #[arg(long, default_value = "0.0.0.0")]
+        ip: String,
+    },
+    /// Stop sharing an NVMe-oF target subsystem
+    Unshare {
+        /// Subsystem NQN to unshare
+        subnqn: String,
+    },
+    /// Connect local client to a remote NVMe-oF target
+    Connect {
+        /// Remote target IP address
+        #[arg(long)]
+        ip: String,
+        /// Remote target port (default: 4420)
+        #[arg(long, default_value_t = 4420)]
+        port: u16,
+        /// Remote target Subsystem NQN
+        #[arg(long)]
+        subnqn: String,
+    },
+    /// Disconnect local client from a remote NVMe-oF target
+    Disconnect {
+        /// Subsystem NQN to disconnect
+        subnqn: String,
+    },
+    /// List locally shared targets and connected remote fabric disks
+    List,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1988,6 +2035,49 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let redis_url = &cli.garnet_url;
             run_df_command(redis_url, path).await?;
         }
+        Commands::Nvmeof { action } => match action {
+            NvmeofActions::Share {
+                backing_path,
+                subnqn,
+                port,
+                ip,
+            } => {
+                let resolved_nqn = squeezefs::nvmeof::share_target(
+                    &backing_path,
+                    subnqn.as_deref(),
+                    port,
+                    &ip,
+                )?;
+                println!("Successfully shared '{}' as NVMe-oF target.", backing_path);
+                println!("Subsystem NQN: {}", resolved_nqn);
+                println!("Connection string for client nodes:");
+                println!(
+                    "  squeezefs nvmeof connect --ip <your-target-ip> --port {} --subnqn {}",
+                    port, resolved_nqn
+                );
+            }
+            NvmeofActions::Unshare { subnqn } => {
+                squeezefs::nvmeof::unshare_target(&subnqn)?;
+                println!("Successfully stopped sharing target NQN '{}'.", subnqn);
+            }
+            NvmeofActions::Connect { ip, port, subnqn } => {
+                println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
+                let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn)?;
+                if dev.starts_with("/dev/") {
+                    println!("{}", "Connection successful!".green().bold());
+                    println!("Attached Remote Disk: {}", dev.cyan().bold());
+                } else {
+                    println!("{}", dev.yellow());
+                }
+            }
+            NvmeofActions::Disconnect { subnqn } => {
+                squeezefs::nvmeof::disconnect_target(&subnqn)?;
+                println!("Successfully disconnected from target NQN '{}'.", subnqn);
+            }
+            NvmeofActions::List => {
+                squeezefs::nvmeof::list_nvmeof()?;
+            }
+        },
         Commands::Tune => {
             tune_system()?;
         }
@@ -2228,7 +2318,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let staging_segment_dir = dir.join("staging_segment");
                 if staging_segment_dir.exists() {
                     let write_cap = max_write_bytes as usize / staging_dirs.len();
-                    if let Ok(cache) = hypertier::nvme::NvmeCache::new(
+                    if let Ok(cache) = crate::tiering::nvme::NvmeCache::new(
                         &[staging_segment_dir.as_path()],
                         &[write_cap],
                         16,

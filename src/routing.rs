@@ -10,6 +10,17 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
+pub fn parse_inode_from_path(path: &str) -> u64 {
+    if path.starts_with("inode_") {
+        path.strip_prefix("inode_")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 #[derive(Clone)]
 pub struct CachedMetadata {
     pub file_type: String,
@@ -205,7 +216,10 @@ impl DataRouter {
                 return Ok(entry.clone());
             }
         }
-        let mut con = self.dlm.get_connection().await?;
+        let mut con = self
+            .dlm
+            .get_connection_for_inode(parse_inode_from_path(file_path))
+            .await?;
         let meta_key = format!("metadata:{}", file_path);
         let fields: std::collections::HashMap<String, String> =
             tokio::time::timeout(std::time::Duration::from_secs(2), con.hgetall(&meta_key))
@@ -252,6 +266,7 @@ impl DataRouter {
 
     pub async fn load_striped_block_keys(
         &self,
+        file_path: &str,
         meta: &CachedMetadata,
         start_block: u32,
         end_block: u32,
@@ -279,7 +294,10 @@ impl DataRouter {
                 for &b in &blocks_to_query {
                     pipe.hget(&block_map_key, b.to_string());
                 }
-                let mut con = self.dlm.get_connection().await?;
+                let mut con = self
+                    .dlm
+                    .get_connection_for_inode(parse_inode_from_path(file_path))
+                    .await?;
                 let res: Vec<Option<String>> = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     pipe.query_async(&mut con),
@@ -336,7 +354,13 @@ impl DataRouter {
         should_prefetch
     }
 
-    fn schedule_striped_prefetch(&self, meta: CachedMetadata, next_block: u32, block_size: u64) {
+    fn schedule_striped_prefetch(
+        &self,
+        file_path: String,
+        meta: CachedMetadata,
+        next_block: u32,
+        block_size: u64,
+    ) {
         const PREFETCH_BLOCK_COUNT: u32 = 9;
 
         let total_blocks = meta.size.div_ceil(block_size) as u32;
@@ -352,7 +376,7 @@ impl DataRouter {
 
         tokio::spawn(async move {
             let block_keys = match router
-                .load_striped_block_keys(&meta, next_block, prefetch_end)
+                .load_striped_block_keys(&file_path, &meta, next_block, prefetch_end)
                 .await
             {
                 Ok(block_keys) => block_keys,
@@ -477,7 +501,10 @@ impl DataRouter {
     ) -> Result<()> {
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
 
-        let mut con = self.dlm.get_connection().await?;
+        let mut con = self
+            .dlm
+            .get_connection_for_inode(parse_inode_from_path(file_path))
+            .await?;
         let meta_key = format!("metadata:{}", file_path);
 
         let file_type: Option<String> = con.hget(&meta_key, "type").await?;
@@ -1238,7 +1265,10 @@ impl DataRouter {
         METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         // Fetch file metadata from Garnet
-        let mut con = self.dlm.get_connection().await?;
+        let mut con = self
+            .dlm
+            .get_connection_for_inode(parse_inode_from_path(file_path))
+            .await?;
         let meta_key = format!("metadata:{}", file_path);
 
         let file_type: Option<String> = con.hget(&meta_key, "type").await?;
@@ -1435,7 +1465,10 @@ impl DataRouter {
         let meta = match cached_meta {
             Some(m) => m,
             None => {
-                let mut con = self.dlm.get_connection().await?;
+                let mut con = self
+                    .dlm
+                    .get_connection_for_inode(parse_inode_from_path(file_path))
+                    .await?;
                 let meta_key = format!("metadata:{}", file_path);
                 let fields: std::collections::HashMap<String, String> =
                     tokio::time::timeout(std::time::Duration::from_secs(2), con.hgetall(&meta_key))
@@ -1483,7 +1516,10 @@ impl DataRouter {
 
         match meta.file_type.as_str() {
             "inline" => {
-                let mut con = self.dlm.get_connection().await?;
+                let mut con = self
+                    .dlm
+                    .get_connection_for_inode(parse_inode_from_path(file_path))
+                    .await?;
                 let inline_key = format!("inline_data:{}", file_path);
                 let bytes: Vec<u8> = con.get(&inline_key).await?;
                 let decompressed = self.get_crypto().process_read(&bytes)?;
@@ -1503,7 +1539,10 @@ impl DataRouter {
                     Ok(staged_data[start..end].to_vec())
                 } else {
                     let mapping_key = format!("mapping:{}", file_id);
-                    let mut con = self.dlm.get_connection().await?;
+                    let mut con = self
+                        .dlm
+                        .get_connection_for_inode(parse_inode_from_path(file_path))
+                        .await?;
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     let off_opt: Option<u64> = con.hget(&mapping_key, "offset").await?;
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
@@ -1547,7 +1586,7 @@ impl DataRouter {
                 let end_block = ((end_offset - 1) / block_size) as u32;
 
                 let block_keys = self
-                    .load_striped_block_keys(&meta, start_block, end_block)
+                    .load_striped_block_keys(file_path, &meta, start_block, end_block)
                     .await?;
 
                 // Spawn concurrent tasks to download block data in parallel
@@ -1631,6 +1670,7 @@ impl DataRouter {
 
                 if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
                     self.schedule_striped_prefetch(
+                        file_path.to_string(),
                         meta.clone(),
                         end_block.saturating_add(1),
                         block_size,
@@ -1673,7 +1713,10 @@ impl DataRouter {
 
         match meta.file_type.as_str() {
             "inline" => {
-                let mut con = self.dlm.get_connection().await?;
+                let mut con = self
+                    .dlm
+                    .get_connection_for_inode(parse_inode_from_path(file_path))
+                    .await?;
                 let inline_key = format!("inline_data:{}", file_path);
                 let bytes: Vec<u8> = con.get(&inline_key).await?;
                 let decompressed = self.get_crypto().process_read(&bytes)?;
@@ -1703,7 +1746,10 @@ impl DataRouter {
                     Ok((data, Some(std::sync::Arc::new(sliced_guard))))
                 } else {
                     let mapping_key = format!("mapping:{}", file_id);
-                    let mut con = self.dlm.get_connection().await?;
+                    let mut con = self
+                        .dlm
+                        .get_connection_for_inode(parse_inode_from_path(file_path))
+                        .await?;
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     let off_opt: Option<u64> = con.hget(&mapping_key, "offset").await?;
                     let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
@@ -1774,7 +1820,7 @@ impl DataRouter {
 
                     // Check NVMe read block cache next
                     let block_keys = self
-                        .load_striped_block_keys(&meta, start_block, end_block)
+                        .load_striped_block_keys(file_path, &meta, start_block, end_block)
                         .await?;
                     if let Some((_, Some(ref b_key))) = block_keys.first() {
                         if let Some(guard) = self.cache.nvme.get_cached_read_block_range_zero_copy(
@@ -1796,7 +1842,7 @@ impl DataRouter {
 
                 // 2. Multi-block or cache miss: load and assemble using pooled buffer
                 let block_keys = self
-                    .load_striped_block_keys(&meta, start_block, end_block)
+                    .load_striped_block_keys(file_path, &meta, start_block, end_block)
                     .await?;
 
                 // Spawn concurrent tasks to download block data in parallel
@@ -1890,6 +1936,7 @@ impl DataRouter {
 
                 if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
                     self.schedule_striped_prefetch(
+                        file_path.to_string(),
                         meta.clone(),
                         end_block.saturating_add(1),
                         block_size,
@@ -1911,7 +1958,10 @@ impl DataRouter {
 
     /// Retrieve the file size from metadata.
     pub async fn get_file_size(&self, file_path: &str) -> Result<u64> {
-        let mut con = self.dlm.get_connection().await?;
+        let mut con = self
+            .dlm
+            .get_connection_for_inode(parse_inode_from_path(file_path))
+            .await?;
         let meta_key = format!("metadata:{}", file_path);
         let size: Option<u64> = con.hget(&meta_key, "size").await?;
         size.ok_or_else(|| {
@@ -2029,32 +2079,23 @@ impl DataRouter {
 
             let mapping_src_key = format!("mapping:{}", src_file_id);
             let mapping_dest_key = format!("mapping:{}", new_file_id);
-            let block: Option<String> = con.hget(&mapping_src_key, "block").await?;
-            let offset: Option<u64> = con.hget(&mapping_src_key, "offset").await?;
-            let sz: Option<u64> = con.hget(&mapping_src_key, "size").await?;
+            let block: Option<String> = src_con.hget(&mapping_src_key, "block").await?;
+            let offset: Option<u64> = src_con.hget(&mapping_src_key, "offset").await?;
+            let sz: Option<u64> = src_con.hget(&mapping_src_key, "size").await?;
 
-            let mut pipe = redis::pipe();
             if let (Some(ref bk), Some(off), Some(s)) = (&block, offset, sz) {
-                pipe.hset(&mapping_dest_key, "block", bk)
+                let mut map_pipe = redis::pipe();
+                map_pipe
+                    .hset(&mapping_dest_key, "block", bk)
                     .hset(&mapping_dest_key, "offset", off)
                     .hset(&mapping_dest_key, "size", s);
+                let _: () = map_pipe.query_async(&mut dest_con).await?;
 
                 let refcounts_key = "squeezefs:block_refcounts";
                 let current_ref: Option<i32> = con.hget(refcounts_key, bk).await?;
                 let new_ref = current_ref.unwrap_or(1) + 1;
-                pipe.hset(refcounts_key, bk, new_ref);
+                let _: () = con.hset(refcounts_key, bk, new_ref).await?;
             }
-            let _: () = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                pipe.query_async(&mut con),
-            )
-            .await
-            .map_err(|_| {
-                SqueezefsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Redis query timed out",
-                ))
-            })??;
 
             let mut dest_pipe = redis::pipe();
             dest_pipe
@@ -2091,23 +2132,20 @@ impl DataRouter {
                     let new_id = Uuid::new_v4().to_string();
                     let block_map_key = format!("block_map:{}", new_id);
                     let refcounts_key = "squeezefs:block_refcounts";
-                    let mut pipe = redis::pipe();
+
+                    let mut map_pipe = redis::pipe();
                     for i in 0..num_blocks {
                         let old_key = format!("{}/part_{}", block_prefix, i);
-                        pipe.hset(&block_map_key, i.to_string(), &old_key);
-                        pipe.hset(refcounts_key, &old_key, 1);
+                        map_pipe.hset(&block_map_key, i.to_string(), &old_key);
                     }
-                    let _: () = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        pipe.query_async(&mut con),
-                    )
-                    .await
-                    .map_err(|_| {
-                        SqueezefsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "Redis query timed out",
-                        ))
-                    })??;
+                    let _: () = map_pipe.query_async(&mut src_con).await?;
+
+                    let mut ref_pipe = redis::pipe();
+                    for i in 0..num_blocks {
+                        let old_key = format!("{}/part_{}", block_prefix, i);
+                        ref_pipe.hset(refcounts_key, &old_key, 1);
+                    }
+                    let _: () = ref_pipe.query_async(&mut con).await?;
 
                     let _: () = src_con.hset(&src_meta_key, "block_map_id", &new_id).await?;
                     new_id
@@ -2125,7 +2163,7 @@ impl DataRouter {
             let refcounts_key = "squeezefs:block_refcounts";
 
             let block_mappings: std::collections::HashMap<String, String> =
-                con.hgetall(&src_block_map_key).await?;
+                src_con.hgetall(&src_block_map_key).await?;
 
             let mut pipe = redis::pipe();
             for (idx_str, bk) in &block_mappings {
@@ -2133,7 +2171,7 @@ impl DataRouter {
             }
             let _: () = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                pipe.query_async(&mut con),
+                pipe.query_async(&mut dest_con),
             )
             .await
             .map_err(|_| {

@@ -67,9 +67,9 @@ pub struct NvmeStaging {
     pub space_freed_notify: std::sync::Arc<tokio::sync::Notify>,
 
     // Hypertier NVMe cache instances
-    pub read_nvme_cache: std::sync::Arc<hypertier::nvme::NvmeCache>,
-    pub staging_nvme_cache: std::sync::Arc<hypertier::nvme::NvmeCache>,
-    pub dht_node: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<hypertier::dht::DhtNode>>>,
+    pub read_nvme_cache: std::sync::Arc<crate::tiering::nvme::NvmeCache>,
+    pub staging_nvme_cache: std::sync::Arc<crate::tiering::nvme::NvmeCache>,
+    pub dht_node: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::tiering::dht::DhtNode>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +139,7 @@ impl NvmeStaging {
             read_cache_dirs.iter().map(|p| p.as_path()).collect();
         let read_cap = actual_max_read_bytes as usize / staging_dirs.len();
         let read_capacities = vec![read_cap; staging_dirs.len()];
-        let read_nvme_cache = Arc::new(hypertier::nvme::NvmeCache::new(
+        let read_nvme_cache = Arc::new(crate::tiering::nvme::NvmeCache::new(
             &read_cache_dirs_refs,
             &read_capacities,
             read_shards,
@@ -167,7 +167,7 @@ impl NvmeStaging {
             staging_segment_dirs.iter().map(|p| p.as_path()).collect();
         let write_cap = actual_max_write_bytes as usize / staging_dirs.len();
         let write_capacities = vec![write_cap; staging_dirs.len()];
-        let staging_nvme_cache = Arc::new(hypertier::nvme::NvmeCache::new(
+        let staging_nvme_cache = Arc::new(crate::tiering::nvme::NvmeCache::new(
             &staging_dirs_refs,
             &write_capacities,
             write_shards,
@@ -377,7 +377,7 @@ impl NvmeStaging {
     pub fn read_staged_zero_copy(
         &self,
         file_id: &str,
-    ) -> Option<hypertier::nvme::NvmeCacheReadGuard> {
+    ) -> Option<crate::tiering::nvme::NvmeCacheReadGuard> {
         let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
         let mut guard = self.staging_nvme_cache.get_static(&key_bytes)?;
         let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
@@ -469,7 +469,7 @@ impl NvmeStaging {
     }
 
     async fn flush_batch(
-        staging_nvme_cache: &hypertier::nvme::NvmeCache,
+        staging_nvme_cache: &crate::tiering::nvme::NvmeCache,
         backend: &RustFsClient,
         redis_client: &crate::dlm::MetaClient,
         batch: &mut Vec<PendingStagedWrite>,
@@ -732,7 +732,7 @@ impl NvmeStaging {
         block_key: &str,
         offset: u64,
         size: u32,
-    ) -> Option<hypertier::nvme::NvmeCacheReadGuard> {
+    ) -> Option<crate::tiering::nvme::NvmeCacheReadGuard> {
         let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
         let mut guard = self.read_nvme_cache.get_static(&key_bytes)?;
         let start = guard.offset + offset as usize;

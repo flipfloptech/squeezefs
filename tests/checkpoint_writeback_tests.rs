@@ -91,19 +91,27 @@ async fn test_checkpoint_writeback_and_multipart_upload() {
 
     // Set file as striped
     let name = "checkpoint.bin";
-    let reply_create = fs.create(req, 1, OsStr::new(name), 0o644, 0).await.expect("Failed");
+    let reply_create = fs
+        .create(req, 1, OsStr::new(name), 0o644, 0)
+        .await
+        .expect("Failed");
     let ino = reply_create.attr.ino;
 
     let mut con = dlm.get_connection().await.expect("Failed");
     let meta_key = format!("metadata:inode_{}", ino);
     // Explicitly set type to striped so the Progressive layout promotes it immediately
-    let _: () = con.hset(&meta_key, "type", "striped").await.expect("Failed");
+    let _: () = con
+        .hset(&meta_key, "type", "striped")
+        .await
+        .expect("Failed");
 
     // Prepare 2.5MB data (3 blocks: 1MB, 1MB, 0.5MB)
     let write_data = vec![0xAA; 2500000]; // 2,500,000 bytes
 
     // Write file sequentially
-    fs.write(req, ino, 0, 0, &write_data, 0, 0).await.expect("Failed");
+    fs.write(req, ino, 0, 0, &write_data, 0, 0)
+        .await
+        .expect("Failed");
 
     // Flush the blocks to trigger upload/multipart initialization!
     fs.flush(req, ino, 0, 0).await.expect("Failed");
@@ -123,14 +131,16 @@ async fn test_checkpoint_writeback_and_multipart_upload() {
     fs.release(req, ino, 0, 0, 0, false).await.expect("Failed");
 
     // Verify active multipart hash is deleted from Redis
-    let upload_id_post: Option<String> = con.hget(&active_mp_key, "upload_id").await.expect("Failed");
+    let upload_id_post: Option<String> =
+        con.hget(&active_mp_key, "upload_id").await.expect("Failed");
     assert!(
         upload_id_post.is_none(),
         "Active multipart metadata should be deleted from Redis after release"
     );
 
     // Verify block map has been updated to use s3_single
-    let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await.expect("Failed");
+    let block_map_id_opt: Option<String> =
+        con.hget(&meta_key, "block_map_id").await.expect("Failed");
     let block_map_id = block_map_id_opt.expect("Failed");
     let block_map_key = format!("block_map:{}", block_map_id);
 
@@ -216,16 +226,24 @@ async fn test_checkpoint_writeback_existing_file_fallback() {
     fs.init(req).await.expect("Failed");
 
     let name = "checkpoint_fallback.bin";
-    let reply_create = fs.create(req, 1, OsStr::new(name), 0o644, 0).await.expect("Failed");
+    let reply_create = fs
+        .create(req, 1, OsStr::new(name), 0o644, 0)
+        .await
+        .expect("Failed");
     let ino = reply_create.attr.ino;
 
     let mut con = dlm.get_connection().await.expect("Failed");
     let meta_key = format!("metadata:inode_{}", ino);
-    let _: () = con.hset(&meta_key, "type", "striped").await.expect("Failed");
+    let _: () = con
+        .hset(&meta_key, "type", "striped")
+        .await
+        .expect("Failed");
 
     // 1. Initial write to populate block map
     let initial_data = vec![0xBB; 512 * 1024]; // 512KB
-    fs.write(req, ino, 0, 0, &initial_data, 0, 0).await.expect("Failed");
+    fs.write(req, ino, 0, 0, &initial_data, 0, 0)
+        .await
+        .expect("Failed");
     fs.flush(req, ino, 0, 0).await.expect("Failed");
     fs.release(req, ino, 0, 0, 0, false).await.expect("Failed");
 

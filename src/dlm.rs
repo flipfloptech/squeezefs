@@ -1097,7 +1097,9 @@ impl LockLease {
 
     /// Explicitly release the lease.
     pub async fn release(mut self) -> Result<()> {
-        self.stop_heartbeat();
+        if let Some(tx) = self.heartbeat_tx.take() {
+            let _ = tx.send(HeartbeatCommand::Deregister { lock_key: self.lock_key.clone() }).await;
+        }
 
         let mut con = self.meta_client.get_connection().await.map_err(|e| {
             println!("REDIS ERROR: {:?}", e);
@@ -1119,59 +1121,52 @@ impl LockLease {
 
         Ok(())
     }
+}
 
-    fn stop_heartbeat(&mut self) {
+impl Drop for LockLease {
+    fn drop(&mut self) {
         if let Some(tx) = self.heartbeat_tx.take() {
             let key = self.lock_key.clone();
+            let file_path = self.file_path.clone();
+            let client_id = self.client_id.clone();
+            let range = self.range;
+            let meta_client = self.meta_client.clone();
+
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = tx
-                        .send(HeartbeatCommand::Deregister { lock_key: key })
-                        .await;
+                    let _ = tx.send(HeartbeatCommand::Deregister { lock_key: key }).await;
+                    let lock_key = if let Some((start, end)) = range {
+                        format!("lock:{}:range:{}-{}", file_path, start, end)
+                    } else {
+                        format!("lock:{}", file_path)
+                    };
+                    if let Ok(mut con) = meta_client.get_connection().await {
+                        let current_holder: Option<String> = redis::cmd("GET")
+                            .arg(&lock_key)
+                            .query_async(&mut con)
+                            .await
+                            .unwrap_or(None);
+                        if current_holder == Some(client_id.clone()) {
+                            let _: () = redis::cmd("DEL")
+                                .arg(&lock_key)
+                                .query_async(&mut con)
+                                .await
+                                .unwrap_or(());
+                        }
+                    }
                 });
             }
         }
     }
 }
 
-impl Drop for LockLease {
-    fn drop(&mut self) {
-        self.stop_heartbeat();
-        // Since drop is synchronous, spawn background task to delete the Redis lock key
-        let file_path = self.file_path.clone();
-        let client_id = self.client_id.clone();
-        let range = self.range;
-        let meta_client = self.meta_client.clone();
-
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let lock_key = if let Some((start, end)) = range {
-                    format!("lock:{}:range:{}-{}", file_path, start, end)
-                } else {
-                    format!("lock:{}", file_path)
-                };
-                if let Ok(mut con) = meta_client.get_connection().await {
-                    let current_holder: Option<String> = redis::cmd("GET")
-                        .arg(&lock_key)
-                        .query_async(&mut con)
-                        .await
-                        .unwrap_or(None);
-                    if current_holder == Some(client_id.clone()) {
-                        let _: () = redis::cmd("DEL")
-                            .arg(&lock_key)
-                            .query_async(&mut con)
-                            .await
-                            .unwrap_or(());
-                    }
-                }
-            });
-        }
-    }
-}
-
 impl DelegationLease {
     pub async fn release(mut self) -> Result<()> {
-        self.stop_heartbeat();
+        if let Some(tx) = self.heartbeat_tx.take() {
+            let _ = tx
+                .send(HeartbeatCommand::Deregister { lock_key: self.delegation_key.clone() })
+                .await;
+        }
         let mut con = self.meta_client.get_connection().await.map_err(|e| {
             println!("REDIS ERROR: {:?}", e);
             e
@@ -1190,44 +1185,35 @@ impl DelegationLease {
         }
         Ok(())
     }
-
-    fn stop_heartbeat(&mut self) {
-        if let Some(tx) = self.heartbeat_tx.take() {
-            let key = self.delegation_key.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = tx
-                        .send(HeartbeatCommand::Deregister { lock_key: key })
-                        .await;
-                });
-            }
-        }
-    }
 }
 
 impl Drop for DelegationLease {
     fn drop(&mut self) {
-        self.stop_heartbeat();
-        let key = self.delegation_key.clone();
-        let client_id = self.client_id.clone();
-        let meta_client = self.meta_client.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Ok(mut con) = meta_client.get_connection().await {
-                    let current_holder: Option<String> = redis::cmd("GET")
-                        .arg(&key)
-                        .query_async(&mut con)
-                        .await
-                        .unwrap_or(None);
-                    if current_holder == Some(client_id.clone()) {
-                        let _: () = redis::cmd("DEL")
+        if let Some(tx) = self.heartbeat_tx.take() {
+            let key = self.delegation_key.clone();
+            let client_id = self.client_id.clone();
+            let meta_client = self.meta_client.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = tx
+                        .send(HeartbeatCommand::Deregister { lock_key: key.clone() })
+                        .await;
+                    if let Ok(mut con) = meta_client.get_connection().await {
+                        let current_holder: Option<String> = redis::cmd("GET")
                             .arg(&key)
                             .query_async(&mut con)
                             .await
-                            .unwrap_or(());
+                            .unwrap_or(None);
+                        if current_holder == Some(client_id.clone()) {
+                            let _: () = redis::cmd("DEL")
+                                .arg(&key)
+                                .query_async(&mut con)
+                                .await
+                                .unwrap_or(());
+                        }
                     }
-                }
-            });
+                });
+            }
         }
     }
 }

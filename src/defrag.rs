@@ -28,7 +28,7 @@ pub async fn run_defragmentation(
     // 2. Build reverse block map
     println!("Scanning metadata to build reverse block map...");
     let mut conn = client.get_connection().await?;
-    let mut block_to_file: std::collections::HashMap<u64, (String, String)> = std::collections::HashMap::new();
+    let mut block_to_file: std::collections::BTreeMap<u64, (String, String)> = std::collections::BTreeMap::new();
     
     let mut cursor: u64 = 0;
     loop {
@@ -80,15 +80,11 @@ pub async fn run_defragmentation(
         .progress_chars("#>-"));
         
     for target_hole_idx in free_holes {
-        let mut highest_offset = 0;
-        let mut highest_file_info = None;
-        
-        for (offset, file_info) in &block_to_file {
-            if *offset > highest_offset {
-                highest_offset = *offset;
-                highest_file_info = Some(file_info.clone());
-            }
-        }
+        let (&highest_offset, highest_file_info) = match block_to_file.iter().next_back() {
+            Some(entry) => entry,
+            None => break,
+        };
+        let highest_file_info = highest_file_info.clone();
         
         if highest_offset <= used_blocks * chunk_size {
             break; // No more high blocks to move
@@ -102,7 +98,7 @@ pub async fn run_defragmentation(
             if let Ok(data) = nvme_dev.read_block(highest_offset, chunk_size as usize).await {
                 if nvme_dev.write_block(target_hole_offset, &data).await.is_ok() {
                     // Atomically update block_map
-                    let (map_id, idx_str) = highest_file_info.unwrap();
+                    let (map_id, idx_str) = highest_file_info;
                     let key = format!("squeezefs:block_map:{}", map_id);
                     let _: () = redis::cmd("HSET")
                         .arg(&key)

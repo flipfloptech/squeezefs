@@ -82,6 +82,40 @@ pub struct Metrics {
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct ClientInfo {
+    pub client_id: String,
+    pub hostname: String,
+    pub pid: u32,
+    pub mountpoint: String,
+    pub mounted_at: u64,
+    pub last_heartbeat: u64,
+    pub stats: ClientStats,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct ClientStats {
+    pub fuse_ops: u64,
+    pub meta_updates: u64,
+    pub put_obj: u64,
+    pub get_obj: u64,
+    pub del_obj: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+}
+
+fn get_hostname() -> String {
+    if let Ok(mut f) = std::fs::File::open("/proc/sys/kernel/hostname") {
+        use std::io::Read;
+        let mut s = String::new();
+        if f.read_to_string(&mut s).is_ok() {
+            return s.trim().to_string();
+        }
+    }
+    std::env::var("HOSTNAME")
+        .unwrap_or_else(|_| std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string()))
+}
+
 fn map_err(e: redis::RedisError) -> Errno {
     error!("Garnet Database error: {:?}", e);
     Errno::from(libc::ECOMM)
@@ -137,6 +171,8 @@ pub struct SqueezefsFilesystem {
     pub dismount_wait: u64,
     writeback_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
     writeback_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<WritebackRequest>>>,
+    pub client_id: std::sync::Arc<std::sync::Mutex<String>>,
+    pub mountpoint: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl SqueezefsFilesystem {
@@ -168,6 +204,8 @@ impl SqueezefsFilesystem {
             dismount_wait: 10,
             writeback_tx,
             writeback_rx: std::sync::Mutex::new(Some(writeback_rx)),
+            client_id: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            mountpoint: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
         }
     }
 
@@ -4598,6 +4636,88 @@ pub async fn start_mount<P: AsRef<Path>>(
     let dismount_wait = fs.dismount_wait;
     let nvme_cache = fs.router.cache.nvme.clone();
 
+    let client_id_str = uuid::Uuid::new_v4().to_string();
+    *fs.client_id.lock().unwrap() = client_id_str.clone();
+    *fs.mountpoint.lock().unwrap() = mount_path.to_string_lossy().to_string();
+
+    let dlm_clone = fs.dlm.clone();
+    let client_id_heartbeat = client_id_str.clone();
+    let hostname_val = get_hostname();
+    let pid_val = std::process::id();
+    let mountpoint_val = mount_path.to_string_lossy().to_string();
+    let mounted_at_val = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Do initial HSET to register client
+    if let Ok(mut con) = dlm_clone.meta_client().get_connection().await {
+        let stats = ClientStats {
+            fuse_ops: METRICS.fuse_ops.load(Ordering::Relaxed),
+            meta_updates: METRICS.meta_updates.load(Ordering::Relaxed),
+            put_obj: METRICS.put_obj.load(Ordering::Relaxed),
+            get_obj: METRICS.get_obj.load(Ordering::Relaxed),
+            del_obj: METRICS.del_obj.load(Ordering::Relaxed),
+            cache_hits: METRICS.cache_hits.load(Ordering::Relaxed),
+            cache_misses: METRICS.cache_misses.load(Ordering::Relaxed),
+        };
+        let info = ClientInfo {
+            client_id: client_id_heartbeat.clone(),
+            hostname: hostname_val.clone(),
+            pid: pid_val,
+            mountpoint: mountpoint_val.clone(),
+            mounted_at: mounted_at_val,
+            last_heartbeat: mounted_at_val,
+            stats,
+        };
+        if let Ok(json_str) = serde_json::to_string(&info) {
+            let _: Result<(), _> = con
+                .hset("squeezefs:active_clients", &client_id_heartbeat, json_str)
+                .await;
+        }
+    }
+
+    // Spawn heartbeat worker
+    let dlm_heartbeat = dlm_clone.clone();
+    let client_id_loop = client_id_str.clone();
+    let hostname_val_clone = hostname_val.clone();
+    let mountpoint_val_clone = mountpoint_val.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            if let Ok(mut con) = dlm_heartbeat.meta_client().get_connection().await {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let stats = ClientStats {
+                    fuse_ops: METRICS.fuse_ops.load(Ordering::Relaxed),
+                    meta_updates: METRICS.meta_updates.load(Ordering::Relaxed),
+                    put_obj: METRICS.put_obj.load(Ordering::Relaxed),
+                    get_obj: METRICS.get_obj.load(Ordering::Relaxed),
+                    del_obj: METRICS.del_obj.load(Ordering::Relaxed),
+                    cache_hits: METRICS.cache_hits.load(Ordering::Relaxed),
+                    cache_misses: METRICS.cache_misses.load(Ordering::Relaxed),
+                };
+                let info = ClientInfo {
+                    client_id: client_id_loop.clone(),
+                    hostname: hostname_val_clone.clone(),
+                    pid: pid_val,
+                    mountpoint: mountpoint_val_clone.clone(),
+                    mounted_at: mounted_at_val,
+                    last_heartbeat: now,
+                    stats,
+                };
+                if let Ok(json_str) = serde_json::to_string(&info) {
+                    let _: Result<(), _> = con
+                        .hset("squeezefs:active_clients", &client_id_loop, json_str)
+                        .await;
+                }
+            }
+        }
+    });
+
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options);
 
@@ -4731,6 +4851,14 @@ pub async fn start_mount<P: AsRef<Path>>(
                 should_exit = true;
             }
         }
+    }
+
+    // Stop heartbeat task
+    heartbeat_handle.abort();
+
+    // Clean up active client registration
+    if let Ok(mut con) = dlm_clone.meta_client().get_connection().await {
+        let _: Result<(), _> = con.hdel("squeezefs:active_clients", &client_id_str).await;
     }
 
     // Clean up the mount by unmounting the session if it hasn't been done already.
@@ -5265,6 +5393,31 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
         .cloned()
         .unwrap_or_else(|| "none".to_string());
 
+    let raw_clients: std::collections::HashMap<String, String> = con
+        .hgetall("squeezefs:active_clients")
+        .await
+        .unwrap_or_default();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut active_clients = Vec::new();
+    for (cid, json_str) in raw_clients {
+        if let Ok(info) = serde_json::from_str::<ClientInfo>(&json_str) {
+            if now.saturating_sub(info.last_heartbeat) <= 6 {
+                active_clients.push(info);
+            } else {
+                // Stale client cleanup
+                let _: Result<(), _> = con.hdel("squeezefs:active_clients", &cid).await;
+            }
+        } else {
+            // Invalid entry cleanup
+            let _: Result<(), _> = con.hdel("squeezefs:active_clients", &cid).await;
+        }
+    }
+
     Ok(serde_json::json!({
         "Setting": {
             "Name": name,
@@ -5278,7 +5431,8 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             "DiskCachePaths": disk_cache_paths,
             "StorageBackends": storage_backends,
             "ActiveWriteBackend": active_write_backend,
-        }
+        },
+        "Clients": active_clients,
     }))
 }
 

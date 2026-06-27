@@ -1163,6 +1163,46 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let redis_url = &cli.garnet_url;
 
+            // Check if active clients are connected to the filesystem
+            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                    let raw_clients: std::collections::HashMap<String, String> = con
+                        .hgetall("squeezefs:active_clients")
+                        .await
+                        .unwrap_or_default();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let mut active_clients = Vec::new();
+                    for (_, json_str) in raw_clients {
+                        if let Ok(info) =
+                            serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str)
+                        {
+                            if now.saturating_sub(info.last_heartbeat) <= 6 {
+                                active_clients.push(info);
+                            }
+                        }
+                    }
+                    if !active_clients.is_empty() {
+                        use colored::Colorize;
+                        println!(
+                            "{}",
+                            "ERROR: Cannot format filesystem because active clients are connected:"
+                                .red()
+                                .bold()
+                        );
+                        for client in active_clients {
+                            println!(
+                                "  - Client ID: {} | Host: {} | PID: {} | Mount: {}",
+                                client.client_id, client.hostname, client.pid, client.mountpoint
+                            );
+                        }
+                        return Err("Active clients are connected".into());
+                    }
+                }
+            }
+
             // Check if squeezefs volume is already formatted on the database
             if !force {
                 if let Ok(client) = redis::Client::open(redis_url.as_str()) {

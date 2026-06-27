@@ -176,9 +176,13 @@ enum Commands {
         #[arg(long)]
         p2p_addr: Option<String>,
 
-        /// Enable FUSE writeback cache
+        /// Disable FUSE writeback cache (enabled by default)
         #[arg(long)]
-        writeback: bool,
+        no_writeback: bool,
+
+        /// Max concurrent background uploads to S3 (default: 16)
+        #[arg(long, default_value_t = 16)]
+        max_background_uploads: usize,
 
         /// Allow other users to access the mount
         #[arg(long)]
@@ -464,7 +468,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         s3_secret_key,
         s3_bucket,
         daemon,
-        writeback,
+        no_writeback,
+        max_background_uploads,
         allow_other,
         options,
         read_cache_size,
@@ -520,6 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        let writeback = !no_writeback;
         if let Err(e) = print_mount_diagnostics(
             &cli.garnet_url,
             mountpoint,
@@ -535,7 +541,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             s3_access_key.as_deref(),
             s3_secret_key.as_deref(),
             s3_bucket.as_deref(),
-            *writeback,
+            writeback,
+            *max_background_uploads,
             *allow_other,
             options.as_deref(),
             *fuse_io_uring_sqpoll_idle_ms,
@@ -812,6 +819,7 @@ fn print_mount_diagnostics(
     s3_secret_key: Option<&str>,
     s3_bucket: Option<&str>,
     writeback: bool,
+    max_background_uploads: usize,
     allow_other: bool,
     options: Option<&str>,
     fuse_io_uring_sqpoll_idle_ms: Option<u32>,
@@ -1028,6 +1036,7 @@ fn print_mount_diagnostics(
     println!("  Mountpoint: {:?}", mountpoint);
     println!("  Daemon: {}", daemon);
     println!("  Writeback: {}", writeback);
+    println!("  Max Background Uploads: {}", max_background_uploads);
     println!("  Allow Other: {}", allow_other);
     if let Some(opts) = options {
         println!("  Custom Options: {:?}", opts);
@@ -1410,7 +1419,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             uid,
             gid,
             p2p_addr,
-            writeback,
+            no_writeback,
+            max_background_uploads,
             allow_other,
             check_storage,
             options,
@@ -1423,6 +1433,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fuse_io_uring_sqpoll_idle_ms,
             fuse_io_uring_sqpoll_cpu,
         } => {
+            let writeback = !no_writeback;
             let redis_url = &cli.garnet_url;
 
             log::info!(
@@ -1899,6 +1910,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let mut fs_engine = SqueezefsFilesystem::new(router, dlm, resolved_uid, resolved_gid);
             fs_engine.dismount_wait = resolved_dismount_wait;
+            fs_engine.max_background_uploads = max_background_uploads;
 
             apply_fuse_io_uring_sqpoll_env(
                 resolved_fuse_io_uring_sqpoll_idle_ms,
@@ -1921,12 +1933,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
+            let writeback_val = !no_writeback;
+
             start_mount(
                 mountpoint,
                 fs_engine,
                 resolved_uid,
                 resolved_gid,
-                writeback,
+                writeback_val,
                 allow_other,
                 options,
             )

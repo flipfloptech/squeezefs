@@ -521,6 +521,7 @@ async fn test_fuse_forget_eviction() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_fuse_ops_timeout_protection() {
+    std::env::set_var("SQUEEZEFS_TIMEOUT", "2");
     use std::net::TcpListener;
     use std::thread;
 

@@ -14,13 +14,11 @@
  * limitations under the License.
  */
 
-use squeezefs::fuse_client::{SqueezefsFilesystem, WritebackRequest};
+use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::dlm::DlmClient;
 use squeezefs::backend::{MultiBackendClient, RustFsClient};
 use squeezefs::cache::TieredCache;
 use squeezefs::routing::DataRouter;
-use std::sync::Arc;
-use tokio::sync::mpsc;
 use tempfile::tempdir;
 
 fn get_redis_url() -> String {

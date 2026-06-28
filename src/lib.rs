@@ -31,6 +31,7 @@ macro_rules! coz_progress {
 pub mod block_allocator;
 pub mod defrag;
 pub mod storage;
+pub mod jobs;
 
 use once_cell::sync::Lazy;
 use std::sync::RwLock;

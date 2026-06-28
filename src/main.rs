@@ -205,6 +205,10 @@ enum Commands {
         /// Custom FUSE options (comma-separated list, e.g. "ro,nonempty")
         #[arg(short = 'o', long)]
         options: Option<String>,
+
+        /// Limit the background job worker CPU utilization percentage (1 to 100, default: 50)
+        #[arg(long, default_value_t = 50)]
+        job_cpu_limit: u32,
     },
     /// Cleanly unmount a squeezefs mountpoint, with options to cancel, wait, or force dismount
     Umount {
@@ -1596,6 +1600,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             upload_delay,
             fuse_io_uring_sqpoll_idle_ms,
             fuse_io_uring_sqpoll_cpu,
+            job_cpu_limit,
         } => {
             let (redis_url_str, fs_name) = parse_squeeze_uri(&squeeze_uri)?;
             squeezefs::set_fs_prefix(&fs_name);
@@ -2040,6 +2045,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut fs_engine = SqueezefsFilesystem::new(router, dlm, resolved_uid, resolved_gid);
             fs_engine.dismount_wait = resolved_dismount_wait;
             fs_engine.max_background_uploads = max_background_uploads;
+
+            squeezefs::jobs::start_job_worker(
+                std::sync::Arc::new(fs_engine.router.clone()),
+                fs_name.clone(),
+                job_cpu_limit,
+            );
 
             apply_fuse_io_uring_sqpoll_env(
                 resolved_fuse_io_uring_sqpoll_idle_ms,

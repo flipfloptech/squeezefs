@@ -17,9 +17,14 @@
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
+
+static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[tokio::test]
 async fn test_nvmeof_target_and_initiator_mock_lifecycle() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     // 1. Set environment to mock mode
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF", "1");
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_DIR", "/tmp/squeezefs_nvmet");
@@ -139,6 +144,7 @@ fn backing_path_to_str(path: &Path) -> &str {
 
 #[test]
 fn test_nvmeof_target_share_persistence() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let mock_configfs = Path::new("/tmp/squeezefs_nvmet_persist");
     let mock_fabrics = Path::new("/tmp/squeezefs_nvme_fabrics_persist");
     let mock_nvme = Path::new("/tmp/squeezefs_nvme_persist");

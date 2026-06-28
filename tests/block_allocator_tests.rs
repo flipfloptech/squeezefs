@@ -7,6 +7,14 @@ use std::sync::Arc;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_allocate_and_free_block() {
     let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    {
+        let mut conn = client.get_connection().unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg("test_vol_1:free_blocks")
+            .arg("test_vol_1:highest_block")
+            .query(&mut conn)
+            .unwrap_or_default();
+    }
     let meta = Arc::new(MetaClient::Single(client));
 
     let allocator = BlockAllocator::new(meta, "test_vol_1")
@@ -46,6 +54,14 @@ async fn test_allocate_and_free_block() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_allocations() {
     let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    {
+        let mut conn = client.get_connection().unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg("test_vol_concurrent:free_blocks")
+            .arg("test_vol_concurrent:highest_block")
+            .query(&mut conn)
+            .unwrap_or_default();
+    }
     let meta = Arc::new(MetaClient::Single(client));
 
     let allocator = Arc::new(
@@ -82,6 +98,14 @@ async fn test_concurrent_allocations() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_interleaved_alloc_free() {
     let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    {
+        let mut conn = client.get_connection().unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg("test_vol_interleaved:free_blocks")
+            .arg("test_vol_interleaved:highest_block")
+            .query(&mut conn)
+            .unwrap_or_default();
+    }
     let meta = Arc::new(MetaClient::Single(client));
 
     let allocator = Arc::new(

@@ -1,5 +1,4 @@
 use crate::error::{Result, SqueezefsError};
-use log::info;
 use std::process::Command;
 
 fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
@@ -23,7 +22,7 @@ pub fn pool_create(pool_name: &str, disks: &[String]) -> Result<()> {
     for d in disks {
         pv_args.push(d.as_str());
     }
-    info!("Initializing physical volumes on disks: {:?}", disks);
+    println!("Initializing physical volumes on disks: {:?}", disks);
     run_cmd("pvcreate", &pv_args)?;
 
     // 2. Run vgcreate
@@ -31,10 +30,10 @@ pub fn pool_create(pool_name: &str, disks: &[String]) -> Result<()> {
     for d in disks {
         vg_args.push(d.as_str());
     }
-    info!("Creating storage pool '{}'", pool_name);
+    println!("Creating storage pool '{}'...", pool_name);
     run_cmd("vgcreate", &vg_args)?;
 
-    info!("Successfully created storage pool '{}'", pool_name);
+    println!("Successfully created storage pool '{}'.", pool_name);
     Ok(())
 }
 
@@ -44,7 +43,7 @@ pub fn pool_add(pool_name: &str, disks: &[String]) -> Result<()> {
     for d in disks {
         pv_args.push(d.as_str());
     }
-    info!("Initializing physical volumes on new disks: {:?}", disks);
+    println!("Initializing physical volumes on new disks: {:?}", disks);
     run_cmd("pvcreate", &pv_args)?;
 
     // 2. Run vgextend
@@ -52,10 +51,10 @@ pub fn pool_add(pool_name: &str, disks: &[String]) -> Result<()> {
     for d in disks {
         vg_args.push(d.as_str());
     }
-    info!("Adding disks to storage pool '{}'", pool_name);
+    println!("Adding disks to storage pool '{}'...", pool_name);
     run_cmd("vgextend", &vg_args)?;
 
-    info!("Successfully extended storage pool '{}'", pool_name);
+    println!("Successfully extended storage pool '{}'.", pool_name);
     Ok(())
 }
 
@@ -71,7 +70,7 @@ pub fn volume_create(
         Some(s) => s,
         None => {
             let count = get_pool_disk_count(pool_name).unwrap_or(1);
-            info!("Auto-detected {} disk(s) in pool '{}'", count, pool_name);
+            println!("Auto-detected {} disk(s) in pool '{}'", count, pool_name);
             count
         }
     };
@@ -80,7 +79,7 @@ pub fn volume_create(
     if resolved_stripes > 1 {
         let size_str = stripe_size.unwrap_or("512K");
         let stripes_str = resolved_stripes.to_string();
-        info!(
+        println!(
             "Creating striped volume '{}' in pool '{}' with size {}, striped across {} disks (stripe size {})",
             vol_name, pool_name, size, stripes_str, size_str
         );
@@ -100,14 +99,14 @@ pub fn volume_create(
             ],
         )?;
     } else {
-        info!(
+        println!(
             "Creating linear volume '{}' in pool '{}' with size {}",
             vol_name, pool_name, size
         );
         run_cmd("lvcreate", &["-y", "-n", vol_name, "-L", size, pool_name])?;
     }
 
-    info!(
+    println!(
         "Successfully created volume. It is accessible at /dev/{}/{}",
         pool_name, vol_name
     );
@@ -130,11 +129,11 @@ fn get_pool_disk_count(pool_name: &str) -> Option<usize> {
 pub fn volume_extend(pool_name: &str, vol_name: &str, add_size: &str) -> Result<()> {
     let lv_path = format!("/dev/{}/{}", pool_name, vol_name);
     let size_arg = format!("+{}", add_size);
-    info!("Extending volume '{}' by {}", lv_path, add_size);
+    println!("Extending volume '{}' by {}...", lv_path, add_size);
 
     run_cmd("lvextend", &["-L", &size_arg, &lv_path])?;
 
-    info!("Successfully extended volume.");
+    println!("Successfully extended volume.");
     Ok(())
 }
 
@@ -198,8 +197,8 @@ fn confirm_action(prompt: &str, default_yes: bool) -> bool {
 }
 
 pub fn pool_remove(pool_name: &str, disks: &[String], force_yes: bool) -> Result<()> {
-    info!(
-        "Removing disks {:?} from storage pool '{}'",
+    println!(
+        "Removing disks {:?} from storage pool '{}'...",
         disks, pool_name
     );
 
@@ -266,7 +265,7 @@ pub fn pool_remove(pool_name: &str, disks: &[String], force_yes: bool) -> Result
     }
     run_cmd("pvremove", &pv_args)?;
 
-    info!("Successfully removed disks from pool '{}'", pool_name);
+    println!("Successfully removed disks from pool '{}'.", pool_name);
     Ok(())
 }
 
@@ -327,9 +326,9 @@ pub fn pool_delete(pool_name: &str, force_yes: bool) -> Result<()> {
         ));
     }
 
-    info!("Deleting entire storage pool '{}'", pool_name);
+    println!("Deleting entire storage pool '{}'...", pool_name);
     run_cmd("vgremove", &["-y", pool_name])?;
-    info!("Successfully deleted pool.");
+    println!("Successfully deleted pool.");
     Ok(())
 }
 
@@ -384,9 +383,9 @@ pub fn volume_delete(pool_name: &str, vol_name: &str, force_yes: bool) -> Result
         }
     }
 
-    info!("Deleting volume '{}'", lv_path);
+    println!("Deleting volume '{}'...", lv_path);
     run_cmd("lvremove", &["-y", &lv_path])?;
-    info!("Successfully deleted volume.");
+    println!("Successfully deleted volume.");
     Ok(())
 }
 

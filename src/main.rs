@@ -242,23 +242,21 @@ enum Commands {
         #[arg(long, short = 'f')]
         force: bool,
     },
-    /// Benchmark performance of the filesystem
     Bench {
-        /// Garnet/Redis URL
-        #[arg(
-            long,
-            short = 'g',
-            env = "GARNET_URL"
-        )]
-        garnet_url: Option<String>,
         /// Path to the mounted filesystem directory
         path: PathBuf,
         /// Number of concurrent threads
         #[arg(short, long, default_value_t = 1)]
         threads: usize,
-        /// Size of the big file in MB per thread
+        /// Size of the large file in MB per thread
         #[arg(long, default_value_t = 128)]
-        size: usize,
+        large_size: usize,
+        /// Size of the small files in KB per thread
+        #[arg(long, default_value_t = 128)]
+        small_size: usize,
+        /// Number of small files to write per thread
+        #[arg(long, default_value_t = 100)]
+        small_count: usize,
         /// Number of iterations to run the benchmark
         #[arg(short, long, default_value_t = 1)]
         iterations: usize,
@@ -2090,20 +2088,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::defrag::run_defragmentation(&garnet_url, &name, &nvme_path).await?;
         }
         Commands::Bench {
-            garnet_url,
             path,
             threads,
-            size,
+            large_size,
+            small_size,
+            small_count,
             iterations,
         } => {
-            let mut resolved_url = garnet_url.clone();
+            let mut resolved_url = None;
             let config_path = path.join(".config");
             let is_squeeze = if let Ok(config_str) = std::fs::read_to_string(&config_path) {
                 if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                    if resolved_url.is_none() {
-                        if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
-                            resolved_url = Some(url_str.to_string());
-                        }
+                    if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
+                        resolved_url = Some(url_str.to_string());
                     }
                     true
                 } else {
@@ -2133,7 +2130,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if iterations > 1 {
                     println!("\n--- Benchmark Iteration {}/{} ---", iter, iterations);
                 }
-                run_benchmark(&path, threads, size, resolved_url.as_deref()).await?;
+                run_benchmark(&path, threads, large_size, small_size, small_count, resolved_url.as_deref()).await?;
             }
         }
         Commands::Clone {
@@ -3531,7 +3528,9 @@ async fn get_daemon_metrics(redis_url: &str) -> Option<HashMap<String, u64>> {
 async fn run_benchmark(
     path: &Path,
     threads: usize,
-    size_mb: usize,
+    large_size_mb: usize,
+    small_size_kb: usize,
+    small_count: usize,
     redis_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !path.exists() {
@@ -3540,15 +3539,15 @@ async fn run_benchmark(
 
     println!(
         "{}",
-        "==================================================".bold()
+        "==================================================================================".bold()
     );
     println!(
-        "  Running Squeezefs Benchmark (T={}, Size={}MB)",
-        threads, size_mb
+        "  Running Squeezefs Benchmark (T={}, Large={}MB, Small={}KB x {})",
+        threads, large_size_mb, small_size_kb, small_count
     );
     println!(
         "{}",
-        "==================================================".bold()
+        "==================================================================================".bold()
     );
 
     // 1. Fetch baseline metrics
@@ -3564,23 +3563,22 @@ async fn run_benchmark(
         .progress_chars("#>-");
 
     // Pre-calculate byte size
-    let big_file_bytes = size_mb * 1024 * 1024;
     let chunk_size = 1024 * 1024; // 1MB block size
-    let num_chunks = big_file_bytes / chunk_size;
+    let num_chunks = large_size_mb;
 
-    // --- WRITE BIG FILE ---
-    println!("Writing big file ({} MB/thread)...", size_mb);
-    let pb_write_big = mp.add(ProgressBar::new((threads * num_chunks) as u64));
-    pb_write_big.set_style(pb_style.clone());
-    pb_write_big.set_message("Write Big File");
+    // --- WRITE LARGE FILE ---
+    println!("Writing large file ({} MB/thread)...", large_size_mb);
+    let pb_write_large = mp.add(ProgressBar::new((threads * num_chunks) as u64));
+    pb_write_large.set_style(pb_style.clone());
+    pb_write_large.set_message("Write Large File");
 
     let t_start = Instant::now();
     let mut write_tasks = Vec::new();
     for t_id in 0..threads {
         let path_clone = path.to_path_buf();
-        let pb = pb_write_big.clone();
+        let pb = pb_write_large.clone();
         write_tasks.push(tokio::spawn(async move {
-            let file_path = path_clone.join(format!("bench_big_{}.bin", t_id));
+            let file_path = path_clone.join(format!("bench_large_{}.bin", t_id));
             let mut file = OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -3600,22 +3598,22 @@ async fn run_benchmark(
     for task in write_tasks {
         task.await??;
     }
-    pb_write_big.finish_with_message("Done");
-    let d_write_big = t_start.elapsed();
+    pb_write_large.finish_with_message("Done");
+    let d_write_large = t_start.elapsed();
 
-    // --- READ BIG FILE ---
-    println!("Reading big file...");
-    let pb_read_big = mp.add(ProgressBar::new((threads * num_chunks) as u64));
-    pb_read_big.set_style(pb_style.clone());
-    pb_read_big.set_message("Read Big File");
+    // --- READ LARGE FILE ---
+    println!("Reading large file...");
+    let pb_read_large = mp.add(ProgressBar::new((threads * num_chunks) as u64));
+    pb_read_large.set_style(pb_style.clone());
+    pb_read_large.set_message("Read Large File");
 
     let t_start = Instant::now();
     let mut read_tasks = Vec::new();
     for t_id in 0..threads {
         let path_clone = path.to_path_buf();
-        let pb = pb_read_big.clone();
+        let pb = pb_read_large.clone();
         read_tasks.push(tokio::spawn(async move {
-            let file_path = path_clone.join(format!("bench_big_{}.bin", t_id));
+            let file_path = path_clone.join(format!("bench_large_{}.bin", t_id));
             let mut file = fs::File::open(&file_path).await?;
             let mut buf = vec![0u8; chunk_size];
             for _ in 0..num_chunks {
@@ -3629,17 +3627,16 @@ async fn run_benchmark(
     for task in read_tasks {
         task.await??;
     }
-    pb_read_big.finish_with_message("Done");
-    let d_read_big = t_start.elapsed();
+    pb_read_large.finish_with_message("Done");
+    let d_read_large = t_start.elapsed();
 
     // --- WRITE SMALL FILES ---
-    let small_files_count = 100;
-    let small_file_bytes = 128 * 1024; // 128 KB
+    let small_file_bytes = small_size_kb * 1024;
     println!(
-        "Writing small files ({} files of 128 KB per thread)...",
-        small_files_count
+        "Writing small files ({} files of {} KB per thread)...",
+        small_count, small_size_kb
     );
-    let pb_write_small = mp.add(ProgressBar::new((threads * small_files_count) as u64));
+    let pb_write_small = mp.add(ProgressBar::new((threads * small_count) as u64));
     pb_write_small.set_style(pb_style.clone());
     pb_write_small.set_message("Write Small Files");
 
@@ -3650,7 +3647,7 @@ async fn run_benchmark(
         let pb = pb_write_small.clone();
         write_small_tasks.push(tokio::spawn(async move {
             let buf = vec![1u8; small_file_bytes];
-            for f_id in 0..small_files_count {
+            for f_id in 0..small_count {
                 let file_path = path_clone.join(format!("bench_small_{}_{}.bin", t_id, f_id));
                 let mut file = OpenOptions::new()
                     .write(true)
@@ -3674,7 +3671,7 @@ async fn run_benchmark(
 
     // --- READ SMALL FILES ---
     println!("Reading small files...");
-    let pb_read_small = mp.add(ProgressBar::new((threads * small_files_count) as u64));
+    let pb_read_small = mp.add(ProgressBar::new((threads * small_count) as u64));
     pb_read_small.set_style(pb_style.clone());
     pb_read_small.set_message("Read Small Files");
 
@@ -3685,7 +3682,7 @@ async fn run_benchmark(
         let pb = pb_read_small.clone();
         read_small_tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; small_file_bytes];
-            for f_id in 0..small_files_count {
+            for f_id in 0..small_count {
                 let file_path = path_clone.join(format!("bench_small_{}_{}.bin", t_id, f_id));
                 let mut file = fs::File::open(&file_path).await?;
                 file.read_exact(&mut buf).await?;
@@ -3703,7 +3700,7 @@ async fn run_benchmark(
 
     // --- STAT SMALL FILES ---
     println!("Stat small files...");
-    let pb_stat_small = mp.add(ProgressBar::new((threads * small_files_count) as u64));
+    let pb_stat_small = mp.add(ProgressBar::new((threads * small_count) as u64));
     pb_stat_small.set_style(pb_style.clone());
     pb_stat_small.set_message("Stat Files");
 
@@ -3713,7 +3710,7 @@ async fn run_benchmark(
         let path_clone = path.to_path_buf();
         let pb = pb_stat_small.clone();
         stat_tasks.push(tokio::spawn(async move {
-            for f_id in 0..small_files_count {
+            for f_id in 0..small_count {
                 let file_path = path_clone.join(format!("bench_small_{}_{}.bin", t_id, f_id));
                 let _meta = fs::metadata(&file_path).await?;
                 pb.inc(1);
@@ -3728,9 +3725,95 @@ async fn run_benchmark(
     pb_stat_small.finish_with_message("Done");
     let d_stat = t_start.elapsed();
 
+    // --- MKDIR DIRECTORIES ---
+    println!("Mkdir directories...");
+    let pb_mkdir = mp.add(ProgressBar::new((threads * small_count) as u64));
+    pb_mkdir.set_style(pb_style.clone());
+    pb_mkdir.set_message("Mkdir");
+
+    let t_start = Instant::now();
+    let mut mkdir_tasks = Vec::new();
+    for t_id in 0..threads {
+        let path_clone = path.to_path_buf();
+        let pb = pb_mkdir.clone();
+        mkdir_tasks.push(tokio::spawn(async move {
+            let thread_dir = path_clone.join(format!("bench_dir_{}", t_id));
+            let _ = fs::create_dir_all(&thread_dir).await;
+            for d_id in 0..small_count {
+                let dir_path = thread_dir.join(format!("dir_{}", d_id));
+                fs::create_dir(&dir_path).await?;
+                pb.inc(1);
+            }
+            Ok::<_, std::io::Error>(())
+        }));
+    }
+
+    for task in mkdir_tasks {
+        task.await??;
+    }
+    pb_mkdir.finish_with_message("Done");
+    let d_mkdir = t_start.elapsed();
+
+    // --- READDIR DIRECTORIES ---
+    println!("Readdir directories...");
+    let pb_readdir = mp.add(ProgressBar::new((threads * small_count) as u64));
+    pb_readdir.set_style(pb_style.clone());
+    pb_readdir.set_message("Readdir");
+
+    let t_start = Instant::now();
+    let mut readdir_tasks = Vec::new();
+    for t_id in 0..threads {
+        let path_clone = path.to_path_buf();
+        let pb = pb_readdir.clone();
+        readdir_tasks.push(tokio::spawn(async move {
+            let thread_dir = path_clone.join(format!("bench_dir_{}", t_id));
+            for _ in 0..small_count {
+                let mut reader = fs::read_dir(&thread_dir).await?;
+                while let Some(_entry) = reader.next_entry().await? {}
+                pb.inc(1);
+            }
+            Ok::<_, std::io::Error>(())
+        }));
+    }
+
+    for task in readdir_tasks {
+        task.await??;
+    }
+    pb_readdir.finish_with_message("Done");
+    let d_readdir = t_start.elapsed();
+
+    // --- RMDIR DIRECTORIES ---
+    println!("Rmdir directories...");
+    let pb_rmdir = mp.add(ProgressBar::new((threads * small_count) as u64));
+    pb_rmdir.set_style(pb_style.clone());
+    pb_rmdir.set_message("Rmdir");
+
+    let t_start = Instant::now();
+    let mut rmdir_tasks = Vec::new();
+    for t_id in 0..threads {
+        let path_clone = path.to_path_buf();
+        let pb = pb_rmdir.clone();
+        rmdir_tasks.push(tokio::spawn(async move {
+            let thread_dir = path_clone.join(format!("bench_dir_{}", t_id));
+            for d_id in 0..small_count {
+                let dir_path = thread_dir.join(format!("dir_{}", d_id));
+                fs::remove_dir(&dir_path).await?;
+                pb.inc(1);
+            }
+            let _ = fs::remove_dir(&thread_dir).await;
+            Ok::<_, std::io::Error>(())
+        }));
+    }
+
+    for task in rmdir_tasks {
+        task.await??;
+    }
+    pb_rmdir.finish_with_message("Done");
+    let d_rmdir = t_start.elapsed();
+
     // --- DELETE FILES ---
     println!("Deleting small files...");
-    let pb_delete_small = mp.add(ProgressBar::new((threads * small_files_count) as u64));
+    let pb_delete_small = mp.add(ProgressBar::new((threads * small_count) as u64));
     pb_delete_small.set_style(pb_style.clone());
     pb_delete_small.set_message("Delete Files");
 
@@ -3740,7 +3823,7 @@ async fn run_benchmark(
         let path_clone = path.to_path_buf();
         let pb = pb_delete_small.clone();
         delete_tasks.push(tokio::spawn(async move {
-            for f_id in 0..small_files_count {
+            for f_id in 0..small_count {
                 let file_path = path_clone.join(format!("bench_small_{}_{}.bin", t_id, f_id));
                 let _ = fs::remove_file(&file_path).await;
                 pb.inc(1);
@@ -3757,7 +3840,7 @@ async fn run_benchmark(
 
     // Clean up big files
     for t_id in 0..threads {
-        let file_path = path.join(format!("bench_big_{}.bin", t_id));
+        let file_path = path.join(format!("bench_large_{}.bin", t_id));
         let _ = fs::remove_file(file_path).await;
     }
 
@@ -3769,28 +3852,42 @@ async fn run_benchmark(
     };
 
     // --- CALCULATE PERFORMANCE VALUES ---
-    let total_big_bytes = (threads * big_file_bytes) as f64;
-    let write_big_tput = (total_big_bytes / (1024.0 * 1024.0)) / d_write_big.as_secs_f64();
-    let write_big_cost = (d_write_big.as_secs_f64() * 1000.0) / threads as f64;
+    let total_large_bytes = (threads * num_chunks * chunk_size) as f64;
+    let write_large_tput = (total_large_bytes / (1024.0 * 1024.0)) / d_write_large.as_secs_f64();
+    let write_large_iops = (threads * num_chunks) as f64 / d_write_large.as_secs_f64();
+    let write_large_cost = (d_write_large.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
 
-    let read_big_tput = (total_big_bytes / (1024.0 * 1024.0)) / d_read_big.as_secs_f64();
-    let read_big_cost = (d_read_big.as_secs_f64() * 1000.0) / threads as f64;
+    let read_large_tput = (total_large_bytes / (1024.0 * 1024.0)) / d_read_large.as_secs_f64();
+    let read_large_iops = (threads * num_chunks) as f64 / d_read_large.as_secs_f64();
+    let read_large_cost = (d_read_large.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
 
-    let total_small_files = (threads * small_files_count) as f64;
-    let write_small_rate = total_small_files / d_write_small.as_secs_f64();
+    let total_small_files = (threads * small_count) as f64;
+    let total_small_bytes = total_small_files * small_file_bytes as f64;
+    let write_small_tput = (total_small_bytes / (1024.0 * 1024.0)) / d_write_small.as_secs_f64();
+    let write_small_iops = total_small_files / d_write_small.as_secs_f64();
     let write_small_cost = (d_write_small.as_secs_f64() * 1000.0) / total_small_files;
 
-    let read_small_rate = total_small_files / d_read_small.as_secs_f64();
+    let read_small_tput = (total_small_bytes / (1024.0 * 1024.0)) / d_read_small.as_secs_f64();
+    let read_small_iops = total_small_files / d_read_small.as_secs_f64();
     let read_small_cost = (d_read_small.as_secs_f64() * 1000.0) / total_small_files;
 
-    let stat_rate = total_small_files / d_stat.as_secs_f64();
+    let stat_iops = total_small_files / d_stat.as_secs_f64();
     let stat_cost = (d_stat.as_secs_f64() * 1000.0) / total_small_files;
 
-    let delete_rate = total_small_files / d_delete.as_secs_f64();
+    let mkdir_iops = total_small_files / d_mkdir.as_secs_f64();
+    let mkdir_cost = (d_mkdir.as_secs_f64() * 1000.0) / total_small_files;
+
+    let readdir_iops = total_small_files / d_readdir.as_secs_f64();
+    let readdir_cost = (d_readdir.as_secs_f64() * 1000.0) / total_small_files;
+
+    let rmdir_iops = total_small_files / d_rmdir.as_secs_f64();
+    let rmdir_cost = (d_rmdir.as_secs_f64() * 1000.0) / total_small_files;
+
+    let delete_iops = total_small_files / d_delete.as_secs_f64();
     let delete_cost = (d_delete.as_secs_f64() * 1000.0) / total_small_files;
 
     // --- COLOR THRESHOLDS ---
-    let format_big_val = |val: f64| {
+    let format_tput = |val: f64| {
         let s = format!("{:>12.2} MiB/s", val);
         if val > 100.0 {
             s.green()
@@ -3800,7 +3897,7 @@ async fn run_benchmark(
             s.red()
         }
     };
-    let format_small_val = |val: f64| {
+    let format_iops = |val: f64| {
         let s = format!("{:>12.2} ops/s", val);
         if val > 200.0 {
             s.green()
@@ -3810,7 +3907,7 @@ async fn run_benchmark(
             s.red()
         }
     };
-    let format_stat_val = |val: f64| {
+    let format_stat_iops = |val: f64| {
         let s = format!("{:>12.2} ops/s", val);
         if val > 2000.0 {
             s.green()
@@ -3823,52 +3920,86 @@ async fn run_benchmark(
 
     println!(
         "\n{}",
-        "+--------------------+--------------------+--------------------+".bold()
+        "+----------------------+--------------------+--------------------+--------------------+".bold()
     );
-    println!("| {:<18} | {:<18} | {:<18} |", "ITEM", "VALUE", "COST");
+    println!(
+        "| {:<20} | {:<18} | {:<18} | {:<18} |",
+        "WORKLOAD", "THROUGHPUT", "IOPS", "AVG LATENCY"
+    );
     println!(
         "{}",
-        "+--------------------+--------------------+--------------------+".bold()
+        "+----------------------+--------------------+--------------------+--------------------+".bold()
     );
     println!(
-        "| {:<18} | {} | {:>14.2} ms/op |",
-        "Write big file",
-        format_big_val(write_big_tput),
-        write_big_cost
+        "| {:<20} | {} | {} | {:>14.2} ms |",
+        "Write (Large File)",
+        format_tput(write_large_tput),
+        format_iops(write_large_iops),
+        write_large_cost
     );
     println!(
-        "| {:<18} | {} | {:>14.2} ms/op |",
-        "Read big file",
-        format_big_val(read_big_tput),
-        read_big_cost
+        "| {:<20} | {} | {} | {:>14.2} ms |",
+        "Read (Large File)",
+        format_tput(read_large_tput),
+        format_iops(read_large_iops),
+        read_large_cost
     );
     println!(
-        "| {:<18} | {} | {:>14.2} ms/op |",
-        "Write small files",
-        format_small_val(write_small_rate),
+        "| {:<20} | {} | {} | {:>14.2} ms |",
+        "Write (Small Files)",
+        format_tput(write_small_tput),
+        format_iops(write_small_iops),
         write_small_cost
     );
     println!(
-        "| {:<18} | {} | {:>14.2} ms/op |",
-        "Read small files",
-        format_small_val(read_small_rate),
+        "| {:<20} | {} | {} | {:>14.2} ms |",
+        "Read (Small Files)",
+        format_tput(read_small_tput),
+        format_iops(read_small_iops),
         read_small_cost
     );
     println!(
-        "| {:<18} | {} | {:>14.2} ms/op |",
-        "Stat files",
-        format_stat_val(stat_rate),
+        "{}",
+        "+----------------------+--------------------+--------------------+--------------------+".bold()
+    );
+    println!(
+        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
+        "Metadata Stat",
+        "N/A",
+        format_stat_iops(stat_iops),
         stat_cost
     );
     println!(
-        "| {:<18} | {} | {:>14.2} ms/op |",
-        "Delete files",
-        format_stat_val(delete_rate),
+        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
+        "Metadata Mkdir",
+        "N/A",
+        format_stat_iops(mkdir_iops),
+        mkdir_cost
+    );
+    println!(
+        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
+        "Metadata Readdir",
+        "N/A",
+        format_stat_iops(readdir_iops),
+        readdir_cost
+    );
+    println!(
+        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
+        "Metadata Rmdir",
+        "N/A",
+        format_stat_iops(rmdir_iops),
+        rmdir_cost
+    );
+    println!(
+        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
+        "Metadata Delete",
+        "N/A",
+        format_stat_iops(delete_iops),
         delete_cost
     );
     println!(
         "{}",
-        "+--------------------+--------------------+--------------------+".bold()
+        "+----------------------+--------------------+--------------------+--------------------+".bold()
     );
 
     // --- RENDER DAEMON METRICS ---

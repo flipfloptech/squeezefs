@@ -5009,23 +5009,45 @@ pub async fn format_volume_ext(
         ));
     }
 
-    if !quick {
-        if let Some(target_path) = nvme_target_path {
-            if !target_path.is_empty() && capacity > 0 {
-                let wipe_len = std::cmp::min(capacity, 32 * 1024 * 1024);
+    if let Some(target_path) = nvme_target_path {
+        if !target_path.is_empty() && capacity > 0 {
+            let wipe_len = if quick {
+                std::cmp::min(capacity, 32 * 1024 * 1024)
+            } else {
+                capacity
+            };
+
+            if quick {
                 log::info!(
-                    "Wiping first {} bytes of NVMe target path: {}",
+                    "Quick format: Wiping first {} bytes of NVMe target path: {}",
                     wipe_len,
                     target_path
                 );
-                let file_result = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(target_path)
-                    .await;
+            } else {
+                log::info!(
+                    "Full format: Wiping entire capacity of {} bytes of NVMe target path: {}",
+                    wipe_len,
+                    target_path
+                );
+            }
 
-                if let Ok(mut file) = file_result {
+            let file_result = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(target_path);
+
+            match file_result {
+                Ok(file) => {
+                    use std::os::unix::fs::FileExt;
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    use std::sync::Arc;
+
+                    let file = Arc::new(file);
+                    let chunk_size = 4 * 1024 * 1024; // 4MB chunks
+                    let total_chunks = wipe_len.div_ceil(chunk_size);
+                    let next_chunk = Arc::new(AtomicU64::new(0));
+
                     let pb = indicatif::ProgressBar::new(wipe_len);
                     pb.set_style(
                         indicatif::ProgressStyle::default_bar()
@@ -5033,30 +5055,61 @@ pub async fn format_volume_ext(
                             .unwrap()
                             .progress_chars("#>-"),
                     );
+                    let pb = Arc::new(pb);
 
-                    let chunk_size = 4 * 1024 * 1024;
-                    let zeros = vec![0u8; chunk_size];
-                    let mut written = 0;
-                    use tokio::io::AsyncWriteExt;
+                    let num_threads = if wipe_len <= 32 * 1024 * 1024 {
+                        1
+                    } else {
+                        8
+                    };
 
-                    while written < wipe_len {
-                        let to_write = std::cmp::min(chunk_size as u64, wipe_len - written);
-                        if let Err(e) = file.write_all(&zeros[..to_write as usize]).await {
-                            log::warn!("Failed to write zero block to NVMe target: {:?}", e);
-                            break;
-                        }
-                        written += to_write;
-                        pb.inc(to_write);
+                    let mut handles = vec![];
+                    for _ in 0..num_threads {
+                        let file_clone = file.clone();
+                        let next_chunk_clone = next_chunk.clone();
+                        let pb_clone = pb.clone();
+                        let target_path_str = target_path.to_string();
+
+                        let handle = std::thread::spawn(move || {
+                            let zeros = vec![0u8; chunk_size as usize];
+                            loop {
+                                let chunk_idx = next_chunk_clone.fetch_add(1, Ordering::Relaxed);
+                                if chunk_idx >= total_chunks {
+                                    break;
+                                }
+
+                                let offset = chunk_idx * chunk_size;
+                                let to_write = std::cmp::min(chunk_size, wipe_len - offset);
+
+                                if let Err(e) = file_clone.write_at(&zeros[..to_write as usize], offset) {
+                                    log::warn!(
+                                        "Failed to write zero block to NVMe target {} at offset {}: {:?}",
+                                        target_path_str,
+                                        offset,
+                                        e
+                                    );
+                                    break;
+                                }
+                                pb_clone.inc(to_write);
+                            }
+                        });
+                        handles.push(handle);
                     }
-                    if let Err(e) = file.sync_all().await {
+
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for handle in handles {
+                            let _ = handle.join();
+                        }
+                    })
+                    .await;
+
+                    if let Err(e) = file.sync_all() {
                         log::warn!("Failed to sync NVMe target: {:?}", e);
                     }
                     pb.finish_with_message("NVMe target wiped");
-                } else {
-                    log::warn!(
-                        "Failed to open NVMe target for wiping: {:?}",
-                        file_result.err()
-                    );
+                }
+                Err(e) => {
+                    log::warn!("Failed to open NVMe target for wiping: {:?}", e);
                 }
             }
         }

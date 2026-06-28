@@ -51,7 +51,7 @@ pub async fn recover_staging(
 
     // Determine staging capacity limit
     let size_str: Option<String> = con
-        .hget("squeezefs:format", "write_disk_limit")
+        .hget(crate::fs_key!("format"), "write_disk_limit")
         .await
         .unwrap_or(None);
     let max_write_bytes = if let Some(ref s) = size_str {
@@ -62,17 +62,17 @@ pub async fn recover_staging(
 
     // Load encryption and compression settings
     let compression: String = con
-        .hget("squeezefs:format", "compression")
+        .hget(crate::fs_key!("format"), "compression")
         .await
         .unwrap_or(None)
         .unwrap_or_else(|| "none".to_string());
     let encrypt_algo: String = con
-        .hget("squeezefs:format", "encrypt_algo")
+        .hget(crate::fs_key!("format"), "encrypt_algo")
         .await
         .unwrap_or(None)
         .unwrap_or_else(|| "none".to_string());
     let encrypt_key: Option<String> = con
-        .hget("squeezefs:format", "encrypt_key")
+        .hget(crate::fs_key!("format"), "encrypt_key")
         .await
         .unwrap_or(None);
 
@@ -209,12 +209,13 @@ pub async fn recover_staging(
                             let active_be = "backend_0";
                             let stored_block_key = format!("{}:{}", active_be, new_block_key);
 
-                            let refcounts_key = "squeezefs:block_refcounts";
+                            let refcounts_key_str = crate::fs_key!("block_refcounts");
+                            let refcounts_key = &refcounts_key_str;
                             let mut pipe = redis::pipe();
                             pipe.hset(refcounts_key, &stored_block_key, 1)
                                 .hset(&block_map_key, b.to_string(), &stored_block_key)
                                 .hset(
-                                    "squeezefs:block_sizes",
+                                    crate::fs_key!("block_sizes"),
                                     &stored_block_key,
                                     format!("{}:{}", data_len, processed_len),
                                 );
@@ -227,15 +228,17 @@ pub async fn recover_staging(
                                     if r <= 0 {
                                         let _: () = redis::pipe()
                                             .hdel(refcounts_key, &bk)
-                                            .hdel("squeezefs:block_sizes", &bk)
+                                            .hdel(crate::fs_key!("block_sizes"), &bk)
                                             .query_async(&mut con)
                                             .await?;
                                     } else {
                                         let _: () = con.hset(refcounts_key, &bk, r).await?;
                                     }
                                 } else {
-                                    let _: () =
-                                        con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
+                                    let _: () = con
+                                        .hdel(crate::fs_key!("block_sizes"), &bk)
+                                        .await
+                                        .unwrap_or(());
                                 }
                             }
 
@@ -341,7 +344,7 @@ pub async fn recover_staging(
                     .hset(&mapping_key, "offset", 0u64)
                     .hset(&mapping_key, "size", data.len() as u64)
                     .hset(
-                        "squeezefs:block_sizes",
+                        crate::fs_key!("block_sizes"),
                         &recovered_key,
                         format!("{}:{}", data.len(), data.len()),
                     )

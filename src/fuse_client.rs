@@ -266,7 +266,9 @@ impl SqueezefsFilesystem {
 
         let mut format_fields: std::collections::HashMap<String, String> =
             if let Some(ref mut con) = con_opt {
-                con.hgetall("squeezefs:format").await.unwrap_or_default()
+                con.hgetall(crate::fs_key!("format"))
+                    .await
+                    .unwrap_or_default()
             } else {
                 std::collections::HashMap::new()
             };
@@ -282,7 +284,9 @@ impl SqueezefsFilesystem {
 
         let backends_raw: std::collections::HashMap<String, String> =
             if let Some(ref mut con) = con_opt {
-                con.hgetall("squeezefs:backends").await.unwrap_or_default()
+                con.hgetall(crate::fs_key!("backends"))
+                    .await
+                    .unwrap_or_default()
             } else {
                 std::collections::HashMap::new()
             };
@@ -444,7 +448,7 @@ impl SqueezefsFilesystem {
         if shard_count > 1 {
             for i in 0..shard_count {
                 let mut shard_con = self.dlm.get_connection_for_inode(i as u64).await?;
-                let exists: bool = shard_con.exists("squeezefs:inode_counter").await?;
+                let exists: bool = shard_con.exists(crate::fs_key!("inode_counter")).await?;
                 if !exists {
                     let initial_counter = match i {
                         0 => shard_count as u64,
@@ -452,14 +456,14 @@ impl SqueezefsFilesystem {
                         _ => i as u64,
                     };
                     let _: () = shard_con
-                        .set("squeezefs:inode_counter", initial_counter)
+                        .set(crate::fs_key!("inode_counter"), initial_counter)
                         .await?;
                 }
             }
         }
 
         let mut con = self.dlm.get_connection_for_inode(1).await?;
-        let exists: bool = con.exists("squeezefs:attr:1").await?;
+        let exists: bool = con.exists(crate::fs_key!("attr:1")).await?;
         if !exists {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -473,22 +477,22 @@ impl SqueezefsFilesystem {
             };
 
             let _: () = redis::pipe()
-                .hset("squeezefs:attr:1", "ino", 1)
-                .hset("squeezefs:attr:1", "size", 0)
-                .hset("squeezefs:attr:1", "blocks", 0)
-                .hset("squeezefs:attr:1", "kind", 2) // Directory
-                .hset("squeezefs:attr:1", "perm", 0o777)
-                .hset("squeezefs:attr:1", "nlink", 2)
-                .hset("squeezefs:attr:1", "uid", self.uid)
-                .hset("squeezefs:attr:1", "gid", self.gid)
-                .hset("squeezefs:attr:1", "atime_sec", sec)
-                .hset("squeezefs:attr:1", "atime_nsec", nsec)
-                .hset("squeezefs:attr:1", "mtime_sec", sec)
-                .hset("squeezefs:attr:1", "mtime_nsec", nsec)
-                .hset("squeezefs:attr:1", "ctime_sec", sec)
-                .hset("squeezefs:attr:1", "ctime_nsec", nsec)
-                .set_nx("squeezefs:inode_counter", initial_counter)
-                .incr("squeezefs:used_inodes", 1)
+                .hset(crate::fs_key!("attr:1"), "ino", 1)
+                .hset(crate::fs_key!("attr:1"), "size", 0)
+                .hset(crate::fs_key!("attr:1"), "blocks", 0)
+                .hset(crate::fs_key!("attr:1"), "kind", 2) // Directory
+                .hset(crate::fs_key!("attr:1"), "perm", 0o777)
+                .hset(crate::fs_key!("attr:1"), "nlink", 2)
+                .hset(crate::fs_key!("attr:1"), "uid", self.uid)
+                .hset(crate::fs_key!("attr:1"), "gid", self.gid)
+                .hset(crate::fs_key!("attr:1"), "atime_sec", sec)
+                .hset(crate::fs_key!("attr:1"), "atime_nsec", nsec)
+                .hset(crate::fs_key!("attr:1"), "mtime_sec", sec)
+                .hset(crate::fs_key!("attr:1"), "mtime_nsec", nsec)
+                .hset(crate::fs_key!("attr:1"), "ctime_sec", sec)
+                .hset(crate::fs_key!("attr:1"), "ctime_nsec", nsec)
+                .set_nx(crate::fs_key!("inode_counter"), initial_counter)
+                .incr(crate::fs_key!("used_inodes"), 1)
                 .query_async(&mut con)
                 .await?;
         }
@@ -497,14 +501,14 @@ impl SqueezefsFilesystem {
 
     async fn check_inode_quota(&self, con: &mut crate::dlm::MetaConnection) -> Result<(), Errno> {
         let inodes_limit_str: Option<String> = con
-            .hget("squeezefs:format", "inodes")
+            .hget(crate::fs_key!("format"), "inodes")
             .await
             .map_err(map_err)?;
         let inodes_limit = inodes_limit_str
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         if inodes_limit > 0 {
-            let used_inodes: u64 = con.get("squeezefs:used_inodes").await.unwrap_or(0);
+            let used_inodes: u64 = con.get(crate::fs_key!("used_inodes")).await.unwrap_or(0);
             if used_inodes >= inodes_limit {
                 return Err(Errno::from(libc::ENOSPC));
             }
@@ -517,10 +521,13 @@ impl SqueezefsFilesystem {
         con: &mut crate::dlm::MetaConnection,
         additional_bytes: u64,
     ) -> Result<(), Errno> {
-        let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
+        let format_exists: bool = con
+            .exists(crate::fs_key!("format"))
+            .await
+            .map_err(map_err)?;
         let capacity_limit = if format_exists {
             let cap_str: Option<String> = con
-                .hget("squeezefs:format", "capacity")
+                .hget(crate::fs_key!("format"), "capacity")
                 .await
                 .map_err(map_err)?;
             cap_str
@@ -530,7 +537,10 @@ impl SqueezefsFilesystem {
             1024 * 1024 * 1024 * 1024 * 1024 // 1PB default
         };
 
-        let used_bytes_opt: Option<u64> = con.get("squeezefs:used_bytes").await.map_err(map_err)?;
+        let used_bytes_opt: Option<u64> = con
+            .get(crate::fs_key!("used_bytes"))
+            .await
+            .map_err(map_err)?;
         let used_bytes = used_bytes_opt.unwrap_or(0);
         if used_bytes + additional_bytes > capacity_limit {
             return Err(Errno::from(libc::ENOSPC));
@@ -850,7 +860,7 @@ impl SqueezefsFilesystem {
         }
 
         let mut con = self.dlm.get_connection_for_inode(ino).await?;
-        let attr_key = format!("squeezefs:attr:{}", ino);
+        let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
         let fields: std::collections::HashMap<String, String> = con.hgetall(&attr_key).await?;
 
         if fields.is_empty() {
@@ -956,7 +966,7 @@ impl SqueezefsFilesystem {
             .unwrap_or(Duration::ZERO);
         let sec = now.as_secs() as i64;
         let nsec = now.subsec_nanos();
-        let parent_attr_key = format!("squeezefs:attr:{}", parent);
+        let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
         let _: () = redis::pipe()
             .hset(&parent_attr_key, "mtime_sec", sec)
             .hset(&parent_attr_key, "mtime_nsec", nsec)
@@ -997,7 +1007,10 @@ impl Filesystem for SqueezefsFilesystem {
         info!("FUSE init: getting connection...");
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         info!("FUSE init: connection obtained. Checking format existence...");
-        let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
+        let format_exists: bool = con
+            .exists(crate::fs_key!("format"))
+            .await
+            .map_err(map_err)?;
         info!("FUSE init: format_exists = {}", format_exists);
 
         if !format_exists {
@@ -1005,22 +1018,22 @@ impl Filesystem for SqueezefsFilesystem {
             let default_capacity: u64 = 1024u64 * 1024 * 1024 * 1024 * 1024;
             info!("Volume not formatted. Performing auto-format on mount...");
             let _: () = redis::pipe()
-                .hset("squeezefs:format", "name", "squeezefs")
-                .hset("squeezefs:format", "block_size", default_block_size)
-                .hset("squeezefs:format", "capacity", default_capacity)
-                .hset("squeezefs:format", "inodes", 1000000)
-                .hset("squeezefs:format", "compression", "none")
-                .hset("squeezefs:format", "encrypt_algo", "none")
-                .hset("squeezefs:format", "encrypt_key", "")
-                .hset("squeezefs:format", "version", 1) // ABI version
-                .hset("squeezefs:format", "mem_cache_size", "1GB")
-                .hset("squeezefs:format", "disk_cache_size", "10GB")
-                .hset("squeezefs:format", "read_cache_size", "")
-                .hset("squeezefs:format", "write_cache_size", "")
-                .hset("squeezefs:format", "read_mem_cache_size", "")
-                .hset("squeezefs:format", "write_mem_cache_size", "")
-                .hset("squeezefs:format", "disk_cache_paths", "")
-                .hset("squeezefs:format", "fuse_io_uring_sqpoll_idle_ms", "")
+                .hset(crate::fs_key!("format"), "name", "squeezefs")
+                .hset(crate::fs_key!("format"), "block_size", default_block_size)
+                .hset(crate::fs_key!("format"), "capacity", default_capacity)
+                .hset(crate::fs_key!("format"), "inodes", 1000000)
+                .hset(crate::fs_key!("format"), "compression", "none")
+                .hset(crate::fs_key!("format"), "encrypt_algo", "none")
+                .hset(crate::fs_key!("format"), "encrypt_key", "")
+                .hset(crate::fs_key!("format"), "version", 1) // ABI version
+                .hset(crate::fs_key!("format"), "mem_cache_size", "1GB")
+                .hset(crate::fs_key!("format"), "disk_cache_size", "10GB")
+                .hset(crate::fs_key!("format"), "read_cache_size", "")
+                .hset(crate::fs_key!("format"), "write_cache_size", "")
+                .hset(crate::fs_key!("format"), "read_mem_cache_size", "")
+                .hset(crate::fs_key!("format"), "write_mem_cache_size", "")
+                .hset(crate::fs_key!("format"), "disk_cache_paths", "")
+                .hset(crate::fs_key!("format"), "fuse_io_uring_sqpoll_idle_ms", "")
                 .query_async(&mut con)
                 .await
                 .map_err(map_err)?;
@@ -1028,17 +1041,17 @@ impl Filesystem for SqueezefsFilesystem {
 
         info!("FUSE init: loading encryption and compression settings...");
         let compression: String = con
-            .hget("squeezefs:format", "compression")
+            .hget(crate::fs_key!("format"), "compression")
             .await
             .unwrap_or(None)
             .unwrap_or_else(|| "none".to_string());
         let encrypt_algo: String = con
-            .hget("squeezefs:format", "encrypt_algo")
+            .hget(crate::fs_key!("format"), "encrypt_algo")
             .await
             .unwrap_or(None)
             .unwrap_or_else(|| "none".to_string());
         let encrypt_key: Option<String> = con
-            .hget("squeezefs:format", "encrypt_key")
+            .hget(crate::fs_key!("format"), "encrypt_key")
             .await
             .unwrap_or(None);
 
@@ -1051,7 +1064,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         info!("FUSE init: checking database ABI version...");
         let version_str: Option<String> = con
-            .hget("squeezefs:format", "version")
+            .hget(crate::fs_key!("format"), "version")
             .await
             .map_err(map_err)?;
         let version: u64 = version_str.and_then(|v| v.parse().ok()).unwrap_or(1);
@@ -1062,7 +1075,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         info!("FUSE init: loading block size...");
         let block_size_str: Option<String> = con
-            .hget("squeezefs:format", "block_size")
+            .hget(crate::fs_key!("format"), "block_size")
             .await
             .map_err(map_err)?;
         let block_size: u64 = block_size_str
@@ -1085,39 +1098,40 @@ impl Filesystem for SqueezefsFilesystem {
             loop {
                 interval.tick().await;
                 if let Ok(mut con) = redis_client.get_connection().await {
+                    let metrics_key = crate::fs_key!("metrics:daemon");
                     let _: Result<(), redis::RedisError> = redis::pipe()
                         .hset(
-                            "metrics:daemon",
+                            &metrics_key,
                             "fuse_ops",
                             METRICS.fuse_ops.load(Ordering::Relaxed),
                         )
                         .hset(
-                            "metrics:daemon",
+                            &metrics_key,
                             "meta_updates",
                             METRICS.meta_updates.load(Ordering::Relaxed),
                         )
                         .hset(
-                            "metrics:daemon",
+                            &metrics_key,
                             "put_obj",
                             METRICS.put_obj.load(Ordering::Relaxed),
                         )
                         .hset(
-                            "metrics:daemon",
+                            &metrics_key,
                             "get_obj",
                             METRICS.get_obj.load(Ordering::Relaxed),
                         )
                         .hset(
-                            "metrics:daemon",
+                            &metrics_key,
                             "del_obj",
                             METRICS.del_obj.load(Ordering::Relaxed),
                         )
                         .hset(
-                            "metrics:daemon",
+                            &metrics_key,
                             "cache_hits",
                             METRICS.cache_hits.load(Ordering::Relaxed),
                         )
                         .hset(
-                            "metrics:daemon",
+                            &metrics_key,
                             "cache_misses",
                             METRICS.cache_misses.load(Ordering::Relaxed),
                         )
@@ -1155,7 +1169,11 @@ impl Filesystem for SqueezefsFilesystem {
             info!("FUSE init: Starting background POSIX lock recall listener...");
             match dlm_clone.get_pubsub_connection().await {
                 Ok(mut pubsub) => {
-                    let channel = format!("squeezefs:client:{}:recalls", dlm_clone.client_id());
+                    let channel = format!(
+                        "{}:client:{}:recalls",
+                        crate::fs_prefix(),
+                        dlm_clone.client_id()
+                    );
                     if let Err(e) = pubsub.subscribe(&channel).await {
                         error!(
                             "FUSE recall listener: Failed to subscribe to channel {}: {:?}",
@@ -1278,7 +1296,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .get_connection_for_inode(parent)
                     .await
                     .map_err(map_squeezefs_err)?;
-                let dir_key = format!("squeezefs:dir:{}", parent);
+                let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
                 let entries_map: std::collections::HashMap<String, u64> =
                     con.hgetall(&dir_key).await.map_err(map_err)?;
                 let entries_arc = std::sync::Arc::new(entries_map);
@@ -1387,7 +1405,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
 
             // Check if name already exists in parent
-            let dir_key = format!("squeezefs:dir:{}", parent);
+            let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
             let exists: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
             if exists.is_some() {
                 return Err(Errno::from(libc::EEXIST));
@@ -1415,7 +1433,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             // Allocate new inode
             let new_ino: u64 = con
-                .incr("squeezefs:inode_counter", 1)
+                .incr(crate::fs_key!("inode_counter"), 1)
                 .await
                 .map_err(map_err)?;
 
@@ -1425,7 +1443,7 @@ impl Filesystem for SqueezefsFilesystem {
             let sec = now.as_secs() as i64;
             let nsec = now.subsec_nanos();
 
-            let attr_key = format!("squeezefs:attr:{}", new_ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), new_ino);
 
             // Add to parent, set attributes, and save
             let mut pipe = redis::pipe();
@@ -1445,7 +1463,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .hset(&attr_key, "mtime_nsec", nsec)
                 .hset(&attr_key, "ctime_sec", sec)
                 .hset(&attr_key, "ctime_nsec", nsec)
-                .incr("squeezefs:used_inodes", 1);
+                .incr(crate::fs_key!("used_inodes"), 1);
 
             if kind_num == 1 {
                 let meta_key = format!("metadata:inode_{}", new_ino);
@@ -1523,7 +1541,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
 
-            let dir_key = format!("squeezefs:dir:{}", parent);
+            let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO);
@@ -1534,12 +1552,12 @@ impl Filesystem for SqueezefsFilesystem {
             let (inodes_limit_str, used, new_ino): (Option<String>, Option<u64>, u64) =
                 redis::pipe()
                     .cmd("HGET")
-                    .arg("squeezefs:format")
+                    .arg(crate::fs_key!("format"))
                     .arg("inodes")
                     .cmd("GET")
-                    .arg("squeezefs:used_inodes")
+                    .arg(crate::fs_key!("used_inodes"))
                     .cmd("INCRBY")
-                    .arg("squeezefs:inode_counter")
+                    .arg(crate::fs_key!("inode_counter"))
                     .arg(shard_count)
                     .query_async(&mut con)
                     .await
@@ -1557,7 +1575,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .await
                     .map_err(map_squeezefs_err)?;
                 let _: () = redis::cmd("DECRBY")
-                    .arg("squeezefs:inode_counter")
+                    .arg(crate::fs_key!("inode_counter"))
                     .arg(shard_count)
                     .query_async(&mut con_dec)
                     .await
@@ -1577,9 +1595,9 @@ impl Filesystem for SqueezefsFilesystem {
                 return Err(Errno::from(libc::EEXIST));
             }
 
-            let attr_key = format!("squeezefs:attr:{}", new_ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), new_ino);
             let meta_key = format!("metadata:inode_{}", new_ino);
-            let parent_attr_key = format!("squeezefs:attr:{}", parent);
+            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
 
             let mut pipe = redis::pipe();
             pipe.atomic();
@@ -1606,7 +1624,7 @@ impl Filesystem for SqueezefsFilesystem {
                 &meta_key,
                 &[("type", "inline".to_string()), ("size", "0".to_string())],
             );
-            pipe.cmd("INCRBY").arg("squeezefs:used_inodes").arg(1);
+            pipe.cmd("INCRBY").arg(crate::fs_key!("used_inodes")).arg(1);
             pipe.hset_multiple(
                 &parent_attr_key,
                 &[
@@ -1729,7 +1747,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .get_connection_for_inode(ino)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr_key = format!("squeezefs:attr:{}", ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
             let size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
             size_opt.unwrap_or(0)
         };
@@ -1798,7 +1816,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
 
-            let attr_key = format!("squeezefs:attr:{}", ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
             let meta_key = format!("metadata:inode_{}", ino);
             let file_path = format!("inode_{}", ino);
 
@@ -1873,7 +1891,7 @@ impl Filesystem for SqueezefsFilesystem {
                         .arg(&num_blocks);
                 }
                 pipe.cmd("INCRBY")
-                    .arg("squeezefs:used_bytes")
+                    .arg(crate::fs_key!("used_bytes"))
                     .arg(diff.to_string());
             } else {
                 pipe.hset_multiple(
@@ -2000,7 +2018,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
 
-            let dir_key = format!("squeezefs:dir:{}", parent);
+            let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO);
@@ -2011,12 +2029,12 @@ impl Filesystem for SqueezefsFilesystem {
             let (inodes_limit_str, used, new_ino): (Option<String>, Option<u64>, u64) =
                 redis::pipe()
                     .cmd("HGET")
-                    .arg("squeezefs:format")
+                    .arg(crate::fs_key!("format"))
                     .arg("inodes")
                     .cmd("GET")
-                    .arg("squeezefs:used_inodes")
+                    .arg(crate::fs_key!("used_inodes"))
                     .cmd("INCRBY")
-                    .arg("squeezefs:inode_counter")
+                    .arg(crate::fs_key!("inode_counter"))
                     .arg(shard_count)
                     .query_async(&mut con)
                     .await
@@ -2034,7 +2052,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .await
                     .map_err(map_squeezefs_err)?;
                 let _: () = redis::cmd("DECRBY")
-                    .arg("squeezefs:inode_counter")
+                    .arg(crate::fs_key!("inode_counter"))
                     .arg(shard_count)
                     .query_async(&mut con_dec)
                     .await
@@ -2054,10 +2072,10 @@ impl Filesystem for SqueezefsFilesystem {
                 return Err(Errno::from(libc::EEXIST));
             }
 
-            let attr_key = format!("squeezefs:attr:{}", new_ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), new_ino);
             let meta_key = format!("metadata:inode_{}", new_ino);
-            let child_dir_key = format!("squeezefs:dir:{}", new_ino);
-            let parent_attr_key = format!("squeezefs:attr:{}", parent);
+            let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), new_ino);
+            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
 
             let mut pipe = redis::pipe();
             pipe.atomic();
@@ -2088,7 +2106,7 @@ impl Filesystem for SqueezefsFilesystem {
                 &child_dir_key,
                 &[(".", new_ino.to_string()), ("..", parent.to_string())],
             );
-            pipe.cmd("INCRBY").arg("squeezefs:used_inodes").arg(1);
+            pipe.cmd("INCRBY").arg(crate::fs_key!("used_inodes")).arg(1);
             pipe.cmd("HINCRBY")
                 .arg(&parent_attr_key)
                 .arg("nlink")
@@ -2145,7 +2163,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
 
-            let dir_key = format!("squeezefs:dir:{}", parent);
+            let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO);
@@ -2158,7 +2176,7 @@ impl Filesystem for SqueezefsFilesystem {
                 None => return Err(Errno::from(libc::ENOENT)),
             };
 
-            let child_dir_key = format!("squeezefs:dir:{}", ino);
+            let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), ino);
 
             loop {
                 let _: () = redis::cmd("WATCH")
@@ -2191,7 +2209,7 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             }
 
-            let child_attr_key = format!("squeezefs:attr:{}", ino);
+            let child_attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
             let child_meta_key = format!("metadata:inode_{}", ino);
             let child_inline_key = format!("inline_data:inode_{}", ino);
 
@@ -2199,10 +2217,10 @@ impl Filesystem for SqueezefsFilesystem {
             pipe.cmd("DEL").arg(&child_attr_key);
             pipe.cmd("DEL").arg(&child_meta_key);
             pipe.cmd("DEL").arg(&child_inline_key);
-            pipe.cmd("DECR").arg("squeezefs:used_inodes");
+            pipe.cmd("DECR").arg(crate::fs_key!("used_inodes"));
             let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
 
-            let parent_attr_key = format!("squeezefs:attr:{}", parent);
+            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
             let parent_nlink: i64 = con.hget(&parent_attr_key, "nlink").await.unwrap_or(2);
             let mut new_nlink = parent_nlink - 1;
             if new_nlink < 1 {
@@ -2276,7 +2294,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .get_connection_for_inode(ino)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr_key = format!("squeezefs:attr:{}", ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
 
             // Check if inode exists first
             let exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
@@ -2333,10 +2351,10 @@ impl Filesystem for SqueezefsFilesystem {
                 if size > old_size {
                     let diff = size - old_size;
                     self.check_capacity_quota(&mut con, diff).await?;
-                    pipe.incr("squeezefs:used_bytes", diff);
+                    pipe.incr(crate::fs_key!("used_bytes"), diff);
                 } else if size < old_size {
                     let diff = old_size - size;
-                    pipe.decr("squeezefs:used_bytes", diff);
+                    pipe.decr(crate::fs_key!("used_bytes"), diff);
                 }
             }
 
@@ -2410,7 +2428,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
 
             // Check if name already exists in parent
-            let dir_key = format!("squeezefs:dir:{}", parent);
+            let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
             let exists: Option<u64> = con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
             if exists.is_some() {
                 return Err(Errno::from(libc::EEXIST));
@@ -2420,7 +2438,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             // Allocate new inode
             let new_ino: u64 = con
-                .incr("squeezefs:inode_counter", 1)
+                .incr(crate::fs_key!("inode_counter"), 1)
                 .await
                 .map_err(map_err)?;
 
@@ -2430,8 +2448,8 @@ impl Filesystem for SqueezefsFilesystem {
             let sec = now.as_secs() as i64;
             let nsec = now.subsec_nanos();
 
-            let attr_key = format!("squeezefs:attr:{}", new_ino);
-            let symlink_key = format!("squeezefs:symlink:{}", new_ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), new_ino);
+            let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), new_ino);
 
             let _: () = redis::pipe()
                 .hset(&dir_key, &*name_str, new_ino)
@@ -2450,7 +2468,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .hset(&attr_key, "ctime_sec", sec)
                 .hset(&attr_key, "ctime_nsec", nsec)
                 .set(&symlink_key, &*link_str)
-                .incr("squeezefs:used_inodes", 1)
+                .incr(crate::fs_key!("used_inodes"), 1)
                 .query_async(&mut con)
                 .await
                 .map_err(map_err)?;
@@ -2493,7 +2511,7 @@ impl Filesystem for SqueezefsFilesystem {
             .get_connection_for_inode(ino)
             .await
             .map_err(map_squeezefs_err)?;
-        let symlink_key = format!("squeezefs:symlink:{}", ino);
+        let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), ino);
         let target: Option<String> = con.get(&symlink_key).await.map_err(map_err)?;
 
         let target_str = match target {
@@ -2530,14 +2548,14 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
 
             // Check if destination name already exists in new_parent
-            let dir_key = format!("squeezefs:dir:{}", new_parent);
+            let dir_key = format!("{}:dir:{}", crate::fs_prefix(), new_parent);
             let exists: Option<u64> = con.hget(&dir_key, &*new_name_str).await.map_err(map_err)?;
             if exists.is_some() {
                 return Err(Errno::from(libc::EEXIST));
             }
 
             // Check if source exists
-            let attr_key = format!("squeezefs:attr:{}", ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
             let source_exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
             if !source_exists {
                 return Err(Errno::from(libc::ENOENT));
@@ -2625,7 +2643,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
 
-            let dir_key = format!("squeezefs:dir:{}", parent);
+            let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO);
@@ -2647,7 +2665,7 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             };
 
-            let child_attr_key = format!("squeezefs:attr:{}", ino);
+            let child_attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
             let meta_key = format!("metadata:inode_{}", ino);
 
             let mut child_con = self
@@ -2689,7 +2707,7 @@ impl Filesystem for SqueezefsFilesystem {
             let file_size = size_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let file_type = type_str.unwrap_or_else(|| "inline".to_string());
 
-            let parent_attr_key = format!("squeezefs:attr:{}", parent);
+            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
 
             let mut parent_pipe = redis::pipe();
             parent_pipe.hset_multiple(
@@ -2708,7 +2726,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let file_path = format!("inode_{}", ino);
                 let inline_key = format!("inline_data:{}", file_path);
                 let meta_key_del = format!("metadata:{}", file_path);
-                let symlink_key = format!("squeezefs:symlink:{}", ino);
+                let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), ino);
 
                 if file_type != "inline" {
                     self.router
@@ -2731,8 +2749,8 @@ impl Filesystem for SqueezefsFilesystem {
                 let mut global_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
                 let mut global_pipe = redis::pipe();
                 global_pipe
-                    .decr("squeezefs:used_bytes", file_size)
-                    .decr("squeezefs:used_inodes", 1);
+                    .decr(crate::fs_key!("used_bytes"), file_size)
+                    .decr(crate::fs_key!("used_inodes"), 1);
                 let _: () = global_pipe
                     .query_async(&mut global_con)
                     .await
@@ -2802,8 +2820,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
             let mut global_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
 
-            let src_dir_key = format!("squeezefs:dir:{}", parent);
-            let dest_dir_key = format!("squeezefs:dir:{}", new_parent);
+            let src_dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
+            let dest_dir_key = format!("{}:dir:{}", crate::fs_prefix(), new_parent);
 
             let ino_opt: Option<u64> = parent_con
                 .hget(&src_dir_key, &*name_str)
@@ -2814,7 +2832,7 @@ impl Filesystem for SqueezefsFilesystem {
                 None => return Err(Errno::from(libc::ENOENT)),
             };
 
-            let attr_key = format!("squeezefs:attr:{}", ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
             let src_kind: u8 = parent_con
                 .hget(&attr_key, "kind")
                 .await
@@ -2832,7 +2850,7 @@ impl Filesystem for SqueezefsFilesystem {
                     if ancestor == 1 {
                         break;
                     }
-                    let ancestor_dir_key = format!("squeezefs:dir:{}", ancestor);
+                    let ancestor_dir_key = format!("{}:dir:{}", crate::fs_prefix(), ancestor);
                     let mut ancestor_con = self
                         .dlm
                         .get_connection_for_inode(ancestor)
@@ -2861,7 +2879,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_err)?;
             if let Some(dest_ino) = dest_ino_opt {
                 // Overwrite existing file or directory
-                let dest_attr_key = format!("squeezefs:attr:{}", dest_ino);
+                let dest_attr_key = format!("{}:attr:{}", crate::fs_prefix(), dest_ino);
                 let dest_kind: u8 = new_parent_con
                     .hget(&dest_attr_key, "kind")
                     .await
@@ -2879,7 +2897,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let dest_file_path = format!("inode_{}", dest_ino);
                 if dest_kind == 2 {
                     // If it is a directory, it must be empty
-                    let child_dest_dir_key = format!("squeezefs:dir:{}", dest_ino);
+                    let child_dest_dir_key = format!("{}:dir:{}", crate::fs_prefix(), dest_ino);
                     let keys: Vec<String> = new_parent_con
                         .hkeys(&child_dest_dir_key)
                         .await
@@ -2905,7 +2923,7 @@ impl Filesystem for SqueezefsFilesystem {
                 // Delete Redis keys
                 let inline_key = format!("inline_data:{}", dest_file_path);
                 let meta_key = format!("metadata:{}", dest_file_path);
-                let symlink_key = format!("squeezefs:symlink:{}", dest_ino);
+                let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), dest_ino);
 
                 // Fetch target size first to decrement used_bytes
                 let file_size_opt: Option<u64> = new_parent_con
@@ -2926,9 +2944,9 @@ impl Filesystem for SqueezefsFilesystem {
 
                 let mut global_pipe = redis::pipe();
                 if dest_kind != 2 {
-                    global_pipe.decr("squeezefs:used_bytes", file_size);
+                    global_pipe.decr(crate::fs_key!("used_bytes"), file_size);
                 }
-                global_pipe.decr("squeezefs:used_inodes", 1);
+                global_pipe.decr(crate::fs_key!("used_inodes"), 1);
                 let _: () = global_pipe
                     .query_async(&mut global_con)
                     .await
@@ -2958,7 +2976,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             // If renamed inode is a directory, update its ".." entry
             if src_kind == 2 {
-                let child_dir_key = format!("squeezefs:dir:{}", ino);
+                let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), ino);
                 let _: () = parent_con
                     .hset(&child_dir_key, "..", new_parent)
                     .await
@@ -2966,8 +2984,8 @@ impl Filesystem for SqueezefsFilesystem {
 
                 // Adjust link counts if parents changed
                 if parent != new_parent {
-                    let old_parent_attr_key = format!("squeezefs:attr:{}", parent);
-                    let new_parent_attr_key = format!("squeezefs:attr:{}", new_parent);
+                    let old_parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
+                    let new_parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), new_parent);
                     let _: Result<(), redis::RedisError> =
                         parent_con.hincr(&old_parent_attr_key, "nlink", -1).await;
                     let _: Result<(), redis::RedisError> =
@@ -3047,7 +3065,7 @@ impl Filesystem for SqueezefsFilesystem {
             let entries_map = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
                 cached_map
             } else {
-                let dir_key = format!("squeezefs:dir:{}", parent);
+                let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
                 let map: std::collections::HashMap<String, u64> =
                     con.hgetall(&dir_key).await.map_err(map_err)?;
                 let map_arc = std::sync::Arc::new(map);
@@ -3072,7 +3090,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let parent_parent = if parent == 1 {
                     1
                 } else {
-                    let child_dir_key = format!("squeezefs:dir:{}", parent);
+                    let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
                     let p: Option<u64> = con.hget(&child_dir_key, "..").await.unwrap_or(None);
                     p.unwrap_or(1)
                 };
@@ -3124,7 +3142,7 @@ impl Filesystem for SqueezefsFilesystem {
                             continue;
                         }
                     }
-                    let child_attr_key = format!("squeezefs:attr:{}", child_ino);
+                    let child_attr_key = format!("{}:attr:{}", crate::fs_prefix(), child_ino);
                     pipe.hget(&child_attr_key, "kind");
                     inos_to_fetch.push(*child_ino);
                 }
@@ -3207,7 +3225,7 @@ impl Filesystem for SqueezefsFilesystem {
             let entries_map = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
                 cached_map
             } else {
-                let dir_key = format!("squeezefs:dir:{}", parent);
+                let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
                 let map: std::collections::HashMap<String, u64> =
                     con.hgetall(&dir_key).await.map_err(map_err)?;
                 let map_arc = std::sync::Arc::new(map);
@@ -3238,7 +3256,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let parent_parent = if parent == 1 {
                     1
                 } else {
-                    let child_dir_key = format!("squeezefs:dir:{}", parent);
+                    let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
                     let p: Option<u64> = con.hget(&child_dir_key, "..").await.unwrap_or(None);
                     p.unwrap_or(1)
                 };
@@ -3307,7 +3325,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .unwrap_or(false);
 
                 if !is_cached {
-                    pipe.hgetall(format!("squeezefs:attr:{}", child_ino));
+                    pipe.hgetall(format!("{}:attr:{}", crate::fs_prefix(), child_ino));
                     inos_to_fetch.push(*child_ino);
                 }
             }
@@ -3609,7 +3627,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             // Update destination attributes size and times in Garnet
             if let Ok(mut con) = self.dlm.get_connection_for_inode(inode_out).await {
-                let attr_key = format!("squeezefs:attr:{}", inode_out);
+                let attr_key = format!("{}:attr:{}", crate::fs_prefix(), inode_out);
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or(Duration::ZERO);
@@ -3671,7 +3689,7 @@ impl Filesystem for SqueezefsFilesystem {
         let new_dest_size = std::cmp::max(dest_size, off_out + copied_len);
 
         if let Ok(mut con) = self.dlm.get_connection_for_inode(inode_out).await {
-            let attr_key = format!("squeezefs:attr:{}", inode_out);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), inode_out);
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO);
@@ -3705,11 +3723,11 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
             let ub: Option<u64> = shard_con
-                .get("squeezefs:used_bytes")
+                .get(crate::fs_key!("used_bytes"))
                 .await
                 .map_err(map_err)?;
             let ui: Option<u64> = shard_con
-                .get("squeezefs:used_inodes")
+                .get(crate::fs_key!("used_inodes"))
                 .await
                 .map_err(map_err)?;
             used_bytes += ub.unwrap_or(0);
@@ -3717,11 +3735,14 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let bsize = 4096;
-        let format_exists: bool = con.exists("squeezefs:format").await.map_err(map_err)?;
+        let format_exists: bool = con
+            .exists(crate::fs_key!("format"))
+            .await
+            .map_err(map_err)?;
 
         let capacity = if format_exists {
             let cap_str: Option<String> = con
-                .hget("squeezefs:format", "capacity")
+                .hget(crate::fs_key!("format"), "capacity")
                 .await
                 .map_err(map_err)?;
             cap_str
@@ -3733,7 +3754,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         let inodes_limit = if format_exists {
             let limit_str: Option<String> = con
-                .hget("squeezefs:format", "inodes")
+                .hget(crate::fs_key!("format"), "inodes")
                 .await
                 .map_err(map_err)?;
             limit_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
@@ -3897,7 +3918,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .get_connection_for_inode(ino)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr_key = format!("squeezefs:attr:{}", ino);
+            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
 
             // Check if inode exists first
             let exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
@@ -3920,7 +3941,7 @@ impl Filesystem for SqueezefsFilesystem {
                 pipe.hset(&meta_key, "size", target_size);
 
                 let diff = target_size - old_size;
-                pipe.incr("squeezefs:used_bytes", diff);
+                pipe.incr(crate::fs_key!("used_bytes"), diff);
 
                 let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
 
@@ -4287,7 +4308,7 @@ impl Filesystem for SqueezefsFilesystem {
             .get_connection()
             .await
             .map_err(|_| Errno::from(libc::EIO))?;
-        let xattr_key = format!("squeezefs:xattr:{}", inode);
+        let xattr_key = format!("{}:xattr:{}", crate::fs_prefix(), inode);
 
         let _: () = redis::cmd("HSET")
             .arg(&xattr_key)
@@ -4317,7 +4338,7 @@ impl Filesystem for SqueezefsFilesystem {
             .get_connection()
             .await
             .map_err(|_| Errno::from(libc::EIO))?;
-        let xattr_key = format!("squeezefs:xattr:{}", inode);
+        let xattr_key = format!("{}:xattr:{}", crate::fs_prefix(), inode);
         let value: Option<Vec<u8>> = redis::cmd("HGET")
             .arg(&xattr_key)
             .arg(name_str)
@@ -4353,7 +4374,7 @@ impl Filesystem for SqueezefsFilesystem {
             .get_connection()
             .await
             .map_err(|_| Errno::from(libc::EIO))?;
-        let xattr_key = format!("squeezefs:xattr:{}", inode);
+        let xattr_key = format!("{}:xattr:{}", crate::fs_prefix(), inode);
         let keys: Vec<String> = redis::cmd("HKEYS")
             .arg(&xattr_key)
             .query_async(&mut con)
@@ -4386,7 +4407,7 @@ impl Filesystem for SqueezefsFilesystem {
             .get_connection()
             .await
             .map_err(|_| Errno::from(libc::EIO))?;
-        let xattr_key = format!("squeezefs:xattr:{}", inode);
+        let xattr_key = format!("{}:xattr:{}", crate::fs_prefix(), inode);
         let deleted: i32 = redis::cmd("HDEL")
             .arg(&xattr_key)
             .arg(name_str)
@@ -4593,7 +4614,11 @@ pub async fn start_mount<P: AsRef<Path>>(
         };
         if let Ok(json_str) = serde_json::to_string(&info) {
             let _: Result<(), _> = con
-                .hset("squeezefs:active_clients", &client_id_heartbeat, json_str)
+                .hset(
+                    crate::fs_key!("active_clients"),
+                    &client_id_heartbeat,
+                    json_str,
+                )
                 .await;
         }
     }
@@ -4632,7 +4657,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                 };
                 if let Ok(json_str) = serde_json::to_string(&info) {
                     let _: Result<(), _> = con
-                        .hset("squeezefs:active_clients", &client_id_loop, json_str)
+                        .hset(crate::fs_key!("active_clients"), &client_id_loop, json_str)
                         .await;
                 }
             }
@@ -4822,7 +4847,9 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     // Clean up active client registration
     if let Ok(mut con) = dlm_clone.meta_client().get_connection().await {
-        let _: Result<(), _> = con.hdel("squeezefs:active_clients", &client_id_str).await;
+        let _: Result<(), _> = con
+            .hdel(crate::fs_key!("active_clients"), &client_id_str)
+            .await;
     }
 
     // Clean up the mount by unmounting the session if it hasn't been done already.
@@ -5057,11 +5084,7 @@ pub async fn format_volume_ext(
                     );
                     let pb = Arc::new(pb);
 
-                    let num_threads = if wipe_len <= 32 * 1024 * 1024 {
-                        1
-                    } else {
-                        8
-                    };
+                    let num_threads = if wipe_len <= 32 * 1024 * 1024 { 1 } else { 8 };
 
                     let mut handles = vec![];
                     for _ in 0..num_threads {
@@ -5081,7 +5104,9 @@ pub async fn format_volume_ext(
                                 let offset = chunk_idx * chunk_size;
                                 let to_write = std::cmp::min(chunk_size, wipe_len - offset);
 
-                                if let Err(e) = file_clone.write_at(&zeros[..to_write as usize], offset) {
+                                if let Err(e) =
+                                    file_clone.write_at(&zeros[..to_write as usize], offset)
+                                {
                                     log::warn!(
                                         "Failed to write zero block to NVMe target {} at offset {}: {:?}",
                                         target_path_str,
@@ -5156,7 +5181,7 @@ pub async fn format_volume_ext(
 
     // Read existing format configuration before flushing
     let existing_format_fields: std::collections::HashMap<String, String> = first_con
-        .hgetall("squeezefs:format")
+        .hgetall(crate::fs_key!("format"))
         .await
         .unwrap_or_default();
 
@@ -5225,34 +5250,42 @@ pub async fn format_volume_ext(
             .unwrap_or_default();
 
         let mut pipe = redis::pipe();
-        pipe.hset("squeezefs:format", "name", name)
-            .hset("squeezefs:format", "block_size", block_size)
-            .hset("squeezefs:format", "capacity", capacity)
-            .hset("squeezefs:format", "inodes", inodes)
-            .hset("squeezefs:format", "compression", compression)
-            .hset("squeezefs:format", "encrypt_algo", encrypt_algo)
-            .hset("squeezefs:format", "encrypt_key", encrypt_key.unwrap_or(""))
-            .hset("squeezefs:format", "version", 1) // ABI version
-            .hset("squeezefs:format", "mem_cache_size", mem_size)
-            .hset("squeezefs:format", "disk_cache_size", disk_size)
-            .hset("squeezefs:format", "read_cache_size", r_cache)
-            .hset("squeezefs:format", "write_cache_size", w_cache)
-            .hset("squeezefs:format", "read_mem_cache_size", r_mem)
-            .hset("squeezefs:format", "write_mem_cache_size", w_mem)
-            .hset("squeezefs:format", "disk_cache_paths", paths_str)
-            .hset("squeezefs:format", "dismount_wait", d_wait)
-            .hset("squeezefs:format", "upload_delay", u_delay)
+        pipe.hset(crate::fs_key!("format"), "name", name)
+            .hset(crate::fs_key!("format"), "block_size", block_size)
+            .hset(crate::fs_key!("format"), "capacity", capacity)
+            .hset(crate::fs_key!("format"), "inodes", inodes)
+            .hset(crate::fs_key!("format"), "compression", compression)
+            .hset(crate::fs_key!("format"), "encrypt_algo", encrypt_algo)
             .hset(
-                "squeezefs:format",
+                crate::fs_key!("format"),
+                "encrypt_key",
+                encrypt_key.unwrap_or(""),
+            )
+            .hset(crate::fs_key!("format"), "version", 1) // ABI version
+            .hset(crate::fs_key!("format"), "mem_cache_size", mem_size)
+            .hset(crate::fs_key!("format"), "disk_cache_size", disk_size)
+            .hset(crate::fs_key!("format"), "read_cache_size", r_cache)
+            .hset(crate::fs_key!("format"), "write_cache_size", w_cache)
+            .hset(crate::fs_key!("format"), "read_mem_cache_size", r_mem)
+            .hset(crate::fs_key!("format"), "write_mem_cache_size", w_mem)
+            .hset(crate::fs_key!("format"), "disk_cache_paths", paths_str)
+            .hset(crate::fs_key!("format"), "dismount_wait", d_wait)
+            .hset(crate::fs_key!("format"), "upload_delay", u_delay)
+            .hset(
+                crate::fs_key!("format"),
                 "backing_dev",
                 nvme_target_path.unwrap_or(""),
             )
             .hset(
-                "squeezefs:format",
+                crate::fs_key!("format"),
                 "fuse_io_uring_sqpoll_idle_ms",
                 sqpoll_idle_ms,
             )
-            .hset("squeezefs:format", "active_write_backend", "backend_0");
+            .hset(
+                crate::fs_key!("format"),
+                "active_write_backend",
+                "backend_0",
+            );
 
         let _: () = pipe.query_async(&mut con).await?;
     }
@@ -5266,7 +5299,9 @@ pub async fn format_volume_ext(
                 1 => 1 + shard_count as u64,
                 _ => i as u64,
             };
-            let _: () = con.set("squeezefs:inode_counter", initial_counter).await?;
+            let _: () = con
+                .set(crate::fs_key!("inode_counter"), initial_counter)
+                .await?;
 
             if i == 1 {
                 let now = SystemTime::now()
@@ -5276,22 +5311,22 @@ pub async fn format_volume_ext(
                 let nsec = now.subsec_nanos();
 
                 let _: () = redis::pipe()
-                    .hset("squeezefs:attr:1", "ino", 1)
-                    .hset("squeezefs:attr:1", "size", 0)
-                    .hset("squeezefs:attr:1", "blocks", 0)
-                    .hset("squeezefs:attr:1", "kind", 2) // Directory
-                    .hset("squeezefs:attr:1", "perm", 0o777)
-                    .hset("squeezefs:attr:1", "nlink", 2)
-                    .hset("squeezefs:attr:1", "uid", 0)
-                    .hset("squeezefs:attr:1", "gid", 0)
-                    .hset("squeezefs:attr:1", "atime_sec", sec)
-                    .hset("squeezefs:attr:1", "atime_nsec", nsec)
-                    .hset("squeezefs:attr:1", "mtime_sec", sec)
-                    .hset("squeezefs:attr:1", "mtime_nsec", nsec)
-                    .hset("squeezefs:attr:1", "ctime_sec", sec)
-                    .hset("squeezefs:attr:1", "ctime_nsec", nsec)
-                    .set_nx("squeezefs:inode_counter", initial_counter)
-                    .incr("squeezefs:used_inodes", 1)
+                    .hset(crate::fs_key!("attr:1"), "ino", 1)
+                    .hset(crate::fs_key!("attr:1"), "size", 0)
+                    .hset(crate::fs_key!("attr:1"), "blocks", 0)
+                    .hset(crate::fs_key!("attr:1"), "kind", 2) // Directory
+                    .hset(crate::fs_key!("attr:1"), "perm", 0o777)
+                    .hset(crate::fs_key!("attr:1"), "nlink", 2)
+                    .hset(crate::fs_key!("attr:1"), "uid", 0)
+                    .hset(crate::fs_key!("attr:1"), "gid", 0)
+                    .hset(crate::fs_key!("attr:1"), "atime_sec", sec)
+                    .hset(crate::fs_key!("attr:1"), "atime_nsec", nsec)
+                    .hset(crate::fs_key!("attr:1"), "mtime_sec", sec)
+                    .hset(crate::fs_key!("attr:1"), "mtime_nsec", nsec)
+                    .hset(crate::fs_key!("attr:1"), "ctime_sec", sec)
+                    .hset(crate::fs_key!("attr:1"), "ctime_nsec", nsec)
+                    .set_nx(crate::fs_key!("inode_counter"), initial_counter)
+                    .incr(crate::fs_key!("used_inodes"), 1)
                     .query_async(&mut con)
                     .await?;
             }
@@ -5304,7 +5339,8 @@ pub async fn format_volume_ext(
 pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, SqueezefsError> {
     let client = crate::dlm::MetaClient::new(redis_url)?;
     let mut con = client.get_connection().await?;
-    let fields: std::collections::HashMap<String, String> = con.hgetall("squeezefs:format").await?;
+    let fields: std::collections::HashMap<String, String> =
+        con.hgetall(crate::fs_key!("format")).await?;
     if fields.is_empty() {
         return Err(SqueezefsError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -5336,10 +5372,12 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
             .collect()
     };
 
-    let backends_map: std::collections::HashMap<String, String> =
-        con.hgetall("squeezefs:backends").await.unwrap_or_default();
+    let backends_map: std::collections::HashMap<String, String> = con
+        .hgetall(crate::fs_key!("backends"))
+        .await
+        .unwrap_or_default();
     let statuses_map: std::collections::HashMap<String, String> = con
-        .hgetall("squeezefs:backend:status")
+        .hgetall(crate::fs_key!("backend:status"))
         .await
         .unwrap_or_default();
 
@@ -5389,7 +5427,7 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
         .unwrap_or_else(|| "none".to_string());
 
     let raw_clients: std::collections::HashMap<String, String> = con
-        .hgetall("squeezefs:active_clients")
+        .hgetall(crate::fs_key!("active_clients"))
         .await
         .unwrap_or_default();
 
@@ -5405,11 +5443,11 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
                 active_clients.push(info);
             } else {
                 // Stale client cleanup
-                let _: Result<(), _> = con.hdel("squeezefs:active_clients", &cid).await;
+                let _: Result<(), _> = con.hdel(crate::fs_key!("active_clients"), &cid).await;
             }
         } else {
             // Invalid entry cleanup
-            let _: Result<(), _> = con.hdel("squeezefs:active_clients", &cid).await;
+            let _: Result<(), _> = con.hdel(crate::fs_key!("active_clients"), &cid).await;
         }
     }
 
@@ -5652,12 +5690,13 @@ async fn flush_single_active_block(
 
     let block_map_key = format!("block_map:{}", block_map_id);
 
-    let refcounts_key = "squeezefs:block_refcounts";
+    let refcounts_key_str = crate::fs_key!("block_refcounts");
+    let refcounts_key = &refcounts_key_str;
     let mut pipe = redis::pipe();
     pipe.hset(refcounts_key, &stored_block_key, 1)
         .hset(&block_map_key, b.to_string(), &stored_block_key)
         .hset(
-            "squeezefs:block_sizes",
+            crate::fs_key!("block_sizes"),
             &stored_block_key,
             format!("{}:{}", block_bytes.len(), processed_len),
         );
@@ -5684,7 +5723,7 @@ async fn flush_single_active_block(
             if r <= 0 {
                 let _: () = redis::pipe()
                     .hdel(refcounts_key, &bk)
-                    .hdel("squeezefs:block_sizes", &bk)
+                    .hdel(crate::fs_key!("block_sizes"), &bk)
                     .query_async(&mut con)
                     .await?;
                 if let Ok(old_offset) = bk.parse::<u64>() {
@@ -5694,7 +5733,10 @@ async fn flush_single_active_block(
                 let _: () = con.hset(refcounts_key, &bk, r).await?;
             }
         } else {
-            let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
+            let _: () = con
+                .hdel(crate::fs_key!("block_sizes"), &bk)
+                .await
+                .unwrap_or(());
             if let Ok(old_offset) = bk.parse::<u64>() {
                 let _ = router.block_allocator.free_block(old_offset).await;
             }

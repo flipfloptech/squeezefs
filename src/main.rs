@@ -29,15 +29,8 @@ struct Cli {
 enum Commands {
     /// Format Garnet database to initialize squeezefs volume
     Format {
-        /// Garnet/Redis URL
-        #[arg(
-            long,
-            short = 'g',
-            env = "GARNET_URL"
-        )]
-        garnet_url: String,
-        /// Volume name
-        name: String,
+        /// SqueezeFS URI (squeeze://ip:port/filesystemname)
+        squeeze_uri: String,
         /// Block size (e.g. "4M", "1M", default: 4MB)
         #[arg(long, default_value = "4M")]
         block_size: String,
@@ -107,29 +100,15 @@ enum Commands {
     },
     /// Show filesystem status
     Status {
-        /// Garnet/Redis URL
-        #[arg(
-            long,
-            short = 'g',
-            env = "GARNET_URL"
-        )]
-        garnet_url: String,
-        /// Name of the filesystem to check status for
-        fs_name: String,
+        /// SqueezeFS URI (squeeze://ip:port/filesystemname)
+        squeeze_uri: String,
     },
     /// Mount squeezefs at a target path
     Mount {
-        /// Garnet/Redis URL
-        #[arg(
-            long,
-            short = 'g',
-            env = "GARNET_URL"
-        )]
-        garnet_url: String,
+        /// SqueezeFS URI (squeeze://ip:port/filesystemname)
+        squeeze_uri: String,
         /// Path to mount the filesystem at
         mountpoint: PathBuf,
-        /// Name of the filesystem to mount (must match formatted name)
-        fs_name: String,
 
         /// Memory cache limit (e.g., "128GB" or "50%")
         #[arg(long)]
@@ -229,13 +208,15 @@ enum Commands {
     },
     /// Cleanly unmount a squeezefs mountpoint, with options to cancel, wait, or force dismount
     Umount {
-        /// Garnet/Redis URL
+        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL"
+            env = "GARNET_URL",
+            alias = "squeeze-uri",
+            alias = "squeeze_uri"
         )]
-        garnet_url: String,
+        squeeze_uri: Option<String>,
         /// Path to the mountpoint
         mountpoint: PathBuf,
         /// Force unmount immediately without prompting/waiting
@@ -272,13 +253,15 @@ enum Commands {
     },
     /// Clone a file metadata-only (instant Copy-on-Write cloning)
     Clone {
-        /// Garnet/Redis URL
+        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL"
+            env = "GARNET_URL",
+            alias = "squeeze-uri",
+            alias = "squeeze_uri"
         )]
-        garnet_url: String,
+        squeeze_uri: Option<String>,
         /// Source file path
         src: String,
         /// Destination file path
@@ -286,16 +269,15 @@ enum Commands {
     },
     /// Defragment a formatted SqueezeFS volume
     Defrag {
-        /// Garnet/Redis URL
+        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL"
+            env = "GARNET_URL",
+            alias = "squeeze-uri",
+            alias = "squeeze_uri"
         )]
-        garnet_url: String,
-        /// Volume name (filesystem name)
-        #[arg(long, default_value = "default")]
-        name: String,
+        squeeze_uri: Option<String>,
         /// NVMe device path
         #[arg(long)]
         nvme_path: String,
@@ -304,27 +286,29 @@ enum Commands {
     Tune,
     /// Configuration management utility
     Config {
-        /// Garnet/Redis URL
+        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL"
+            env = "GARNET_URL",
+            alias = "squeeze-uri",
+            alias = "squeeze_uri"
         )]
-        garnet_url: String,
-        /// Volume name (filesystem name)
-        fs_name: String,
+        squeeze_uri: Option<String>,
         #[command(subcommand)]
         action: ConfigActions,
     },
     /// Show filesystem disk space usage across all caches and S3
     Df {
-        /// Garnet/Redis URL
+        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL"
+            env = "GARNET_URL",
+            alias = "squeeze-uri",
+            alias = "squeeze_uri"
         )]
-        garnet_url: Option<String>,
+        squeeze_uri: Option<String>,
         /// Optional path to a file or directory
         path: Option<String>,
     },
@@ -673,9 +657,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     if let Commands::Mount {
-        garnet_url,
+        squeeze_uri,
         mountpoint,
-        fs_name,
         mem_cache_size,
         disk_cache_size,
         disk_cache_paths,
@@ -693,6 +676,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..
     } = &cli.command
     {
+        let (redis_url, fs_name) = match parse_squeeze_uri(squeeze_uri) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        };
         let uid = unsafe { libc::getuid() };
         if uid != 0 {
             if !mountpoint.exists() {
@@ -739,9 +729,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let writeback = !no_writeback;
         if let Err(e) = print_mount_diagnostics(
-            garnet_url,
+            &redis_url,
             mountpoint,
-            fs_name,
+            &fs_name,
             *daemon,
             mem_cache_size.as_deref(),
             disk_cache_size.as_deref(),
@@ -1263,8 +1253,7 @@ fn parse_human_readable_size(s: &str) -> Result<u64, String> {
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Format {
-            garnet_url,
-            name,
+            squeeze_uri,
             block_size,
             capacity,
             mem_cache_size,
@@ -1288,9 +1277,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             upload_delay,
             fuse_io_uring_sqpoll_idle_ms,
         } => {
+            let (redis_url, name) = parse_squeeze_uri(&squeeze_uri)?;
             squeezefs::set_fs_prefix(&name);
             let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
-            let redis_url = &garnet_url;
 
             // Check if active clients are connected to the filesystem
             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
@@ -1543,7 +1532,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             squeezefs::fuse_client::format_volume_ext(
-                redis_url,
+                &redis_url,
                 &name,
                 parsed_block_size,
                 parsed_capacity,
@@ -1568,22 +1557,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 quick,
             )
             .await?;
-            let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
+            let status = squeezefs::fuse_client::get_volume_status(&redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Commands::Status {
-            garnet_url,
-            fs_name,
+            squeeze_uri,
         } => {
+            let (redis_url, fs_name) = parse_squeeze_uri(&squeeze_uri)?;
             squeezefs::set_fs_prefix(&fs_name);
-            let redis_url = &garnet_url;
-            let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
+            let status = squeezefs::fuse_client::get_volume_status(&redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Commands::Mount {
-            garnet_url,
+            squeeze_uri,
             mountpoint,
-            fs_name,
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
@@ -1610,9 +1597,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fuse_io_uring_sqpoll_idle_ms,
             fuse_io_uring_sqpoll_cpu,
         } => {
+            let (redis_url_str, fs_name) = parse_squeeze_uri(&squeeze_uri)?;
             squeezefs::set_fs_prefix(&fs_name);
             let writeback = !no_writeback;
-            let redis_url = &garnet_url;
+            let redis_url = &redis_url_str;
 
             log::info!(
                 "Connecting to Garnet (metadata database) at {}...",
@@ -2088,13 +2076,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Commands::Defrag {
-            garnet_url,
-            name,
+            squeeze_uri,
             nvme_path,
         } => {
+            let (redis_url, name) = resolve_squeeze_uri(squeeze_uri.as_deref(), None)?;
             squeezefs::set_fs_prefix(&name);
             println!("Starting defragmentation for volume '{}'", name);
-            squeezefs::defrag::run_defragmentation(&garnet_url, &name, &nvme_path).await?;
+            squeezefs::defrag::run_defragmentation(&redis_url, &name, &nvme_path).await?;
         }
         Commands::Bench {
             path,
@@ -2156,17 +2144,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Clone {
-            garnet_url,
+            squeeze_uri,
             src,
             dest,
         } => {
-            let redis_url = &garnet_url;
+            let (redis_url_str, fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), Some(std::path::Path::new(&src)))?;
+            let redis_url = &redis_url_str;
+            squeezefs::set_fs_prefix(&fs_name);
             let staging_dirs = vec![get_default_staging_dir()];
 
             let dlm = DlmClient::new(redis_url)?;
 
             // Reconstruct block allocator and nvme block dev for clone operation
-            let fs_name = "default".to_string(); // Assuming default fs name for now
             let block_alloc = std::sync::Arc::new(
                 squeezefs::block_allocator::BlockAllocator::new(
                     std::sync::Arc::new(dlm.meta_client().clone()),
@@ -2251,61 +2240,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             router.clone_path(&src, &dest).await?;
             println!("File cloned successfully.");
         }
-        Commands::Df { garnet_url, path } => {
-            let mut resolved_url = garnet_url;
-            if resolved_url.is_none() {
-                // Determine reference path
-                let ref_path = if let Some(ref p) = path {
-                    std::path::Path::new(p).to_path_buf()
-                } else {
-                    std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf())
-                };
-
-                // Helper to search for .config recursively up
-                let mut current = if ref_path.is_file() {
-                    ref_path.parent().unwrap_or(&ref_path).to_path_buf()
-                } else {
-                    ref_path
-                };
-
-                loop {
-                    let config_path = current.join(".config");
-                    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-                        if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                            if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
-                                resolved_url = Some(url_str.to_string());
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(parent) = current.parent() {
-                        current = parent.to_path_buf();
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            // Fallback to active FUSE mountpoints if we still don't have it
-            if resolved_url.is_none() {
-                let mounts = find_squeezefs_mounts();
-                for mount in mounts {
-                    let config_path = mount.join(".config");
-                    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-                        if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                            if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
-                                resolved_url = Some(url_str.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let redis_url = resolved_url.ok_or_else(|| {
-                "Error: Garnet URL must be specified via -g/--garnet-url parameter, GARNET_URL environment variable, or resolved from a mounted squeezefs path"
-            })?;
-
+        Commands::Df { squeeze_uri, path } => {
+            let ref_path = path.as_ref().map(|p| std::path::Path::new(p));
+            let (redis_url, fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), ref_path)?;
+            squeezefs::set_fs_prefix(&fs_name);
             run_df_command(&redis_url, path).await?;
         }
         Commands::Storage { action } => match action {
@@ -2416,10 +2354,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             tune_system()?;
         }
         Commands::Config {
-            garnet_url,
-            fs_name,
+            squeeze_uri,
             action,
         } => {
+            let (redis_url, fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), None)?;
+            let garnet_url = &redis_url;
             squeezefs::set_fs_prefix(&fs_name);
             match action {
                 ConfigActions::Set { key, value } => {
@@ -2555,7 +2494,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Umount {
-            garnet_url,
+            squeeze_uri,
             mountpoint,
             force,
         } => {
@@ -2563,11 +2502,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             use std::io::IsTerminal;
             use std::io::Write;
 
-            let redis_url = &garnet_url;
+            let (redis_url_str, resolved_fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), Some(&mountpoint))?;
+            let redis_url = &redis_url_str;
+            squeezefs::set_fs_prefix(&resolved_fs_name);
 
-            // 1. Try to read mountpoint/.config to resolve staging directories and filesystem name
+            // 1. Try to read mountpoint/.config to resolve staging directories
             let mut staging_dirs = Vec::new();
-            let mut resolved_fs_name = "squeezefs".to_string();
             let config_path = mountpoint.join(".config");
             if let Ok(config_str) = std::fs::read_to_string(&config_path) {
                 if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
@@ -2576,12 +2516,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             staging_dirs = paths_str.split(',').map(PathBuf::from).collect();
                         }
                     }
-                    if let Some(n) = config_json["format"]["name"].as_str() {
-                        resolved_fs_name = n.to_string();
-                    }
                 }
             }
-            squeezefs::set_fs_prefix(&resolved_fs_name);
 
             // 2. Fall back to Garnet format defaults if config file wasn't readable
             if staging_dirs.is_empty() {
@@ -3581,6 +3517,95 @@ mod tests {
             Some(300)
         );
     }
+
+    #[test]
+    fn test_parse_squeeze_uri_valid() {
+        let (redis, name) = parse_squeeze_uri("squeeze://127.0.0.1:6379/myvolume").unwrap();
+        assert_eq!(redis, "redis://127.0.0.1:6379");
+        assert_eq!(name, "myvolume");
+    }
+
+    #[test]
+    fn test_parse_squeeze_uri_redis_fallback() {
+        let (redis, name) = parse_squeeze_uri("redis://127.0.0.1:6379").unwrap();
+        assert_eq!(redis, "redis://127.0.0.1:6379");
+        assert_eq!(name, "squeezefs");
+    }
+
+    #[test]
+    fn test_parse_squeeze_uri_invalid() {
+        assert!(parse_squeeze_uri("http://127.0.0.1").is_err());
+        assert!(parse_squeeze_uri("squeeze://127.0.0.1").is_err());
+        assert!(parse_squeeze_uri("squeeze://127.0.0.1/").is_err());
+    }
+}
+
+fn parse_squeeze_uri(uri: &str) -> Result<(String, String), String> {
+    if uri.starts_with("squeeze://") {
+        let rest = &uri["squeeze://".len()..];
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(format!("Invalid SqueezeFS URI format: expected 'squeeze://host:port/fs_name' (got '{}')", uri));
+        }
+        let redis_url = format!("redis://{}", parts[0]);
+        let fs_name = parts[1].to_string();
+        Ok((redis_url, fs_name))
+    } else if uri.starts_with("redis://") {
+        Ok((uri.to_string(), "squeezefs".to_string()))
+    } else {
+        Err(format!("Invalid SqueezeFS URI scheme: expected 'squeeze://' (got '{}')", uri))
+    }
+}
+
+fn resolve_squeeze_uri(
+    cli_uri: Option<&str>,
+    reference_path: Option<&std::path::Path>,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    if let Some(uri) = cli_uri {
+        return Ok(parse_squeeze_uri(uri)?);
+    }
+    if let Some(ref_path) = reference_path {
+        let mut current = if ref_path.is_file() {
+            ref_path.parent().unwrap_or(ref_path).to_path_buf()
+        } else {
+            ref_path.to_path_buf()
+        };
+        loop {
+            let config_path = current.join(".config");
+            if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+                if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                    if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
+                        let name_str = config_json["format"]["name"].as_str().unwrap_or("squeezefs").to_string();
+                        return Ok((url_str.to_string(), name_str));
+                    }
+                }
+            }
+            if let Some(parent) = current.parent() {
+                current = parent.to_path_buf();
+            } else {
+                break;
+            }
+        }
+    }
+    let mounts = find_squeezefs_mounts();
+    for mount in mounts {
+        let config_path = mount.join(".config");
+        if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
+                    let name_str = config_json["format"]["name"].as_str().unwrap_or("squeezefs").to_string();
+                    return Ok((url_str.to_string(), name_str));
+                }
+            }
+        }
+    }
+    if let Ok(uri) = std::env::var("GARNET_URL") {
+        return Ok(parse_squeeze_uri(&uri)?);
+    }
+    if let Ok(uri) = std::env::var("SQUEEZE_URI") {
+        return Ok(parse_squeeze_uri(&uri)?);
+    }
+    Err("Error: SqueezeFS URI must be specified via parameter, environment variable, or resolved from a squeezefs mountpoint".into())
 }
 
 async fn get_daemon_metrics(redis_url: &str) -> Option<HashMap<String, u64>> {

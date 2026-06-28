@@ -38,6 +38,16 @@ use std::sync::RwLock;
 
 pub static FS_PREFIX: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("squeezefs".to_string()));
 
+pub static WRITE_VERIFICATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn write_verification_enabled() -> bool {
+    WRITE_VERIFICATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_write_verification(enabled: bool) {
+    WRITE_VERIFICATION.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn fs_prefix() -> String {
     FS_PREFIX.read().unwrap().clone()
 }

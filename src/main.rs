@@ -209,6 +209,10 @@ enum Commands {
         /// Limit the background job worker CPU utilization percentage (1 to 100, default: 50)
         #[arg(long, default_value_t = 50)]
         job_cpu_limit: u32,
+
+        /// Enable read-after-write checksum verification on all writes to cache and disk
+        #[arg(long)]
+        write_verification: bool,
     },
     /// Cleanly unmount a squeezefs mountpoint, with options to cancel, wait, or force dismount
     Umount {
@@ -1601,9 +1605,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fuse_io_uring_sqpoll_idle_ms,
             fuse_io_uring_sqpoll_cpu,
             job_cpu_limit,
+            write_verification,
         } => {
             let (redis_url_str, fs_name) = parse_squeeze_uri(&squeeze_uri)?;
             squeezefs::set_fs_prefix(&fs_name);
+            squeezefs::set_write_verification(write_verification);
             let writeback = !no_writeback;
             let redis_url = &redis_url_str;
 

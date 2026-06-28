@@ -80,12 +80,24 @@ pub async fn submit_and_wait_for_job(
     let pb = indicatif::ProgressBar::new(total_tasks as u64);
     pb.set_style(
         indicatif::ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tasks completed ({eta})")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tasks completed ({eta}) {msg}")
             .unwrap()
             .progress_chars("#>-"),
     );
 
+    let paused_key = format!("{}:jobs:{}:paused", fs_name, job_id);
+
     loop {
+        // Check if the job has been paused globally
+        let paused_str: Option<String> = con.get(&paused_key).await.unwrap_or(None);
+        if paused_str.as_deref() == Some("1") {
+            pb.set_message(" - PAUSED (Write Verification Failure)");
+            sleep(Duration::from_millis(1000)).await;
+            continue;
+        } else {
+            pb.set_message("");
+        }
+
         // Query pending and completed counts
         let pending_count: u64 = con.scard(&pending_key).await.unwrap_or(0);
         let completed_count: u64 = con.scard(&completed_key).await.unwrap_or(0);
@@ -107,6 +119,7 @@ pub async fn submit_and_wait_for_job(
     cleanup_pipe.srem(&active_set_key, &job_id);
     cleanup_pipe.del(&pending_key);
     cleanup_pipe.del(&completed_key);
+    cleanup_pipe.del(&paused_key);
     let _: () = cleanup_pipe.query_async(&mut con).await?;
 
     Ok(())
@@ -143,6 +156,13 @@ async fn run_worker_cycle(
     for job_id in active_jobs {
         let pending_key = format!("{}:jobs:{}:pending", fs_name, job_id);
         let completed_key = format!("{}:jobs:{}:completed", fs_name, job_id);
+        let paused_key = format!("{}:jobs:{}:paused", fs_name, job_id);
+
+        // Check if job is paused
+        let paused_str: Option<String> = con.get(&paused_key).await?;
+        if paused_str.as_deref() == Some("1") {
+            continue;
+        }
 
         // Atomic SPOP to grab a task
         let task_json_opt: Option<String> = con.spop(&pending_key).await?;
@@ -166,6 +186,11 @@ async fn run_worker_cycle(
                 }
                 Err(e) => {
                     log::error!("Task {} failed: {:?}", task.task_id, e);
+                    let err_msg = e.to_string();
+                    if err_msg.contains("Write verification failed") {
+                        log::warn!("CRITICAL: Pausing job {} due to write verification failure!", task.job_id);
+                        let _: () = con.set(&paused_key, "1").await?;
+                    }
                     // Push back to pending
                     let _: () = con.sadd(&pending_key, task_json).await?;
                 }

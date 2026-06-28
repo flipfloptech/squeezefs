@@ -124,8 +124,7 @@ async fn test_nvmeof_target_and_initiator_mock_lifecycle() {
     assert!(!link_path.exists());
     assert!(!link_path2.exists());
 
-    // Clean up env and paths
-    std::env::remove_var("SQUEEZEFS_MOCK_NVMEOF");
+    // Clean up paths
     let _ = fs::remove_dir_all(mock_configfs);
     let _ = fs::remove_dir_all(mock_fabrics);
     let _ = fs::remove_dir_all(mock_nvme);
@@ -133,4 +132,40 @@ async fn test_nvmeof_target_and_initiator_mock_lifecycle() {
 
 fn backing_path_to_str(path: &Path) -> &str {
     path.to_str().unwrap()
+}
+
+#[test]
+fn test_nvmeof_target_share_persistence() {
+    let mock_configfs = Path::new("/tmp/squeezefs_nvmet_persist");
+    let mock_fabrics = Path::new("/tmp/squeezefs_nvme_fabrics_persist");
+    let mock_nvme = Path::new("/tmp/squeezefs_nvme_persist");
+
+    // Clean up any stale paths
+    let _ = fs::remove_dir_all(mock_configfs);
+    let _ = fs::remove_dir_all(mock_fabrics);
+    let _ = fs::remove_dir_all(mock_nvme);
+
+    fs::create_dir_all(mock_configfs).unwrap();
+    fs::create_dir_all(mock_fabrics).unwrap();
+    fs::create_dir_all(mock_nvme).unwrap();
+
+    fs::write(mock_fabrics.join("ctl"), "").unwrap();
+
+    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF", "1");
+    std::env::set_var("SQUEEZEFS_TEST_ENV", "1");
+    let temp_config_file = "/tmp/squeezefs_nvmeof_shares_test.json";
+    let _ = fs::remove_file(temp_config_file);
+
+    // Register a mock share
+    squeezefs::nvmeof::register_share("/tmp/test_persist_backing.img", "nqn.test-subsystem-1", 4420, "127.0.0.1").unwrap();
+    
+    // Check restore
+    let res = squeezefs::nvmeof::restore_shares();
+    assert!(res.is_ok());
+
+    // Clean up
+    let _ = fs::remove_dir_all(mock_configfs);
+    let _ = fs::remove_dir_all(mock_fabrics);
+    let _ = fs::remove_dir_all(mock_nvme);
+    let _ = fs::remove_file(temp_config_file);
 }

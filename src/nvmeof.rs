@@ -214,6 +214,8 @@ pub fn share_target(
         std::os::unix::fs::symlink(&sub_dir, &link_dest)?;
     }
 
+    let _ = register_share(backing_path, &subnqn, port, ip);
+
     // Return connect instruction string
     Ok(subnqn)
 }
@@ -273,6 +275,8 @@ pub fn unshare_target(subnqn: &str) -> std::io::Result<()> {
         }
         println!("Detached associated loop device '{}'.", loop_dev);
     }
+
+    let _ = deregister_share(subnqn);
 
     Ok(())
 }
@@ -589,4 +593,81 @@ pub fn extract_nvmeof_connection_details(backing_dev: &str) -> Option<(String, u
         }
     }
     None
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct NvmeofShareConfig {
+    pub backing_path: String,
+    pub subnqn: String,
+    pub port: u16,
+    pub ip: String,
+}
+
+fn get_shares_config_path() -> PathBuf {
+    if std::env::var("SQUEEZEFS_TEST_ENV").is_ok() {
+        return PathBuf::from("/tmp/squeezefs_nvmeof_shares_test.json");
+    }
+    // If running as root, save under /etc/squeezefs/
+    let path = PathBuf::from("/etc/squeezefs/nvmeof_shares.json");
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_ok() && fs::write(&path, "[]").is_ok() {
+            return path;
+        }
+    }
+    // Fallback for non-root / user local path
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(format!("{}/.squeeze/nvmeof_shares.json", home))
+}
+
+fn load_shares() -> Vec<NvmeofShareConfig> {
+    let path = get_shares_config_path();
+    if let Ok(content) = fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+fn save_shares(shares: &[NvmeofShareConfig]) -> std::io::Result<()> {
+    let path = get_shares_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(shares)?;
+    fs::write(path, content)?;
+    Ok(())
+}
+
+pub fn register_share(backing_path: &str, subnqn: &str, port: u16, ip: &str) -> std::io::Result<()> {
+    let mut shares = load_shares();
+    shares.retain(|s| s.subnqn != subnqn);
+    shares.push(NvmeofShareConfig {
+        backing_path: backing_path.to_string(),
+        subnqn: subnqn.to_string(),
+        port,
+        ip: ip.to_string(),
+    });
+    save_shares(&shares)
+}
+
+pub fn deregister_share(subnqn: &str) -> std::io::Result<()> {
+    let mut shares = load_shares();
+    shares.retain(|s| s.subnqn != subnqn);
+    save_shares(&shares)
+}
+
+pub fn restore_shares() -> std::io::Result<()> {
+    let shares = load_shares();
+    if shares.is_empty() {
+        log::info!("No NVMe-oF target shares to restore.");
+        return Ok(());
+    }
+    log::info!("Restoring {} NVMe-oF target shares...", shares.len());
+    for share in shares {
+        log::info!("Restoring shared target {} on port {} (IP: {})...", share.backing_path, share.port, share.ip);
+        if let Err(e) = share_target(&share.backing_path, Some(&share.subnqn), share.port, &share.ip) {
+            log::error!("Failed to restore target share for {}: {:?}", share.subnqn, e);
+        }
+    }
+    Ok(())
 }

@@ -463,6 +463,8 @@ enum NvmeofActions {
     },
     /// List locally shared targets and connected remote fabric disks
     List,
+    /// Restore all locally registered persistent target shares
+    RestoreShares,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -2295,6 +2297,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 NvmeofActions::List => {
                     squeezefs::nvmeof::list_nvmeof()?;
+                }
+                NvmeofActions::RestoreShares => {
+                    squeezefs::nvmeof::restore_shares()?;
+                    println!("All registered persistent target shares restored successfully.");
                 }
             },
         },

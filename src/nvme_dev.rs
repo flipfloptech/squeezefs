@@ -54,7 +54,7 @@ impl NvmeBlockDev {
                 .map_err(|e| crate::error::SqueezefsError::Io(e))?;
             file.sync_data()
                 .map_err(|e| crate::error::SqueezefsError::Io(e))?;
-            Ok(())
+            Ok::<(), crate::error::SqueezefsError>(())
         })
         .await
         .map_err(|e| {
@@ -62,16 +62,20 @@ impl NvmeBlockDev {
                 "Thread join error on write_block: {}",
                 e
             ))
-        })?
+        })??;
+        crate::fuse_client::METRICS
+            .put_obj
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     pub async fn read_block(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
         let file = self.get_file()?;
-        tokio::task::spawn_blocking(move || {
+        let res = tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; size];
             file.read_exact_at(&mut buf, offset)
                 .map_err(|e| crate::error::SqueezefsError::Io(e))?;
-            Ok(buf)
+            Ok::<Vec<u8>, crate::error::SqueezefsError>(buf)
         })
         .await
         .map_err(|e| {
@@ -79,6 +83,10 @@ impl NvmeBlockDev {
                 "Thread join error on read_block: {}",
                 e
             ))
-        })?
+        })??;
+        crate::fuse_client::METRICS
+            .get_obj
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(res)
     }
 }

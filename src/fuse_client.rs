@@ -5143,6 +5143,11 @@ pub async fn format_volume_ext(
             .hset("squeezefs:format", "upload_delay", u_delay)
             .hset(
                 "squeezefs:format",
+                "backing_dev",
+                nvme_target_path.unwrap_or(""),
+            )
+            .hset(
+                "squeezefs:format",
                 "fuse_io_uring_sqpoll_idle_ms",
                 sqpoll_idle_ms,
             )

@@ -55,6 +55,10 @@ impl BlockAllocator {
             .query_async(&mut conn)
             .await?;
 
+        crate::fuse_client::METRICS
+            .del_obj
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         Ok(())
     }
 

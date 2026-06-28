@@ -12,7 +12,7 @@ struct StagedMetadata {
 }
 
 /// Scan NVMe staging segment index, cross-reference pending staged files with Garnet metadata,
-/// and recover/finalize uploads to RustFS S3.
+/// and recover/finalize writes to backing block device.
 /// Returns the number of successfully recovered files.
 pub async fn recover_staging(
     staging_dir: &Path,
@@ -200,7 +200,7 @@ pub async fn recover_staging(
                             if let Err(e) = nvme_writer.write_block(offset, &processed_block).await
                             {
                                 error!(
-                                    "Crash Recovery: Failed to upload active block {} of inode {} to S3: {:?}",
+                                    "Crash Recovery: Failed to write active block {} of inode {} to backing device: {:?}",
                                     b, ino, e
                                 );
                                 continue;
@@ -320,8 +320,7 @@ pub async fn recover_staging(
                     meta.file_path, file_id, data.len(), meta.fencing_token
                 );
 
-                // Upload to RustFS S3
-
+                // Write to backing block device
                 let offset = block_allocator.allocate_block().await?;
                 let recovered_key = offset.to_string();
                 if let Err(e) = nvme_writer

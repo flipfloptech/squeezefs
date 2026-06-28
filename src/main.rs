@@ -69,18 +69,13 @@ enum Commands {
         /// Comma-separated paths to local staging/cache directories
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
-        /// S3 compatible object store endpoint url
-        #[arg(long, alias = "endpoint")]
-        /// S3 compatible object store access key
-        #[arg(long, alias = "access-key")]
-        /// S3 compatible object store secret key
-        #[arg(long, alias = "secret-key")]
-        /// S3 compatible object store bucket name
-        #[arg(long, alias = "bucket")]
+        /// Backing NVMe-oF block device path (e.g. /dev/mypool/myvol)
+        #[arg(long, alias = "backing-dev", alias = "nvme-target")]
+        backing_dev: Option<String>,
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
         force: bool,
-        /// Perform quick format (initialize metadata only, do not wipe object storage buckets)
+        /// Perform quick format (initialize metadata only, do not wipe backing device)
         #[arg(long)]
         quick: bool,
         /// Compression algorithm (lz4, zstd, none, default: none)
@@ -158,14 +153,9 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         local_ips: Option<Vec<std::net::IpAddr>>,
 
-        /// S3 compatible object store endpoint url (overrides stored configuration)
-        #[arg(long, alias = "endpoint")]
-        /// S3 compatible object store access key (overrides stored configuration)
-        #[arg(long, alias = "access-key")]
-        /// S3 compatible object store secret key (overrides stored configuration)
-        #[arg(long, alias = "secret-key")]
-        /// S3 compatible object store bucket name (overrides stored configuration)
-        #[arg(long, alias = "bucket")]
+        /// Backing NVMe-oF block device path (e.g. /dev/mypool/myvol)
+        #[arg(long, alias = "backing-dev", alias = "nvme-target")]
+        backing_dev: Option<String>,
 
         /// Run FUSE daemon in the background (detach from terminal)
         #[arg(long)]
@@ -187,7 +177,7 @@ enum Commands {
         #[arg(long)]
         no_writeback: bool,
 
-        /// Max concurrent background uploads to S3 (default: 16)
+        /// Max concurrent background writes to NVMe-oF backend (default: 16)
         #[arg(long, default_value_t = 16)]
         max_background_uploads: usize,
 
@@ -199,7 +189,7 @@ enum Commands {
         #[arg(long)]
         check_storage: bool,
 
-        /// Time in seconds to wait for staged writes to drain to S3 on dismount (default: 10)
+        /// Time in seconds to wait for staged writes to drain to NVMe-oF backend on dismount (default: 10)
         #[arg(long)]
         dismount_wait: Option<String>,
         /// Delay/interval for background staging write uploads (e.g. "500ms", "5s")
@@ -1212,6 +1202,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
+            backing_dev,
             force,
             quick,
             inodes,
@@ -1409,7 +1400,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 mem_cache_size.as_deref(),
                 disk_cache_size.as_deref(),
                 disk_cache_paths.as_deref(),
-                None, // nvme_target_path
+                backing_dev.as_deref(),
                 read_cache_size.as_deref(),
                 write_cache_size.as_deref(),
                 read_mem_cache_size.as_deref(),
@@ -1434,6 +1425,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
+            backing_dev,
             local_ips,
             daemon: _,
             uid,
@@ -1679,9 +1671,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await?,
             );
 
-            // Assume the first staging dir's nvme backing path
-            let nvme_path = format!("{}/.squeezefs_nvme", active_staging_dirs[0].display());
-            let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path));
+            // Resolve backing device path: CLI override > Garnet format setting > default to local staging path
+            let resolved_backing_dev = backing_dev
+                .or_else(|| {
+                    format_fields
+                        .get("backing_dev")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                })
+                .unwrap_or_else(|| format!("{}/.squeezefs_nvme", active_staging_dirs[0].display()));
+
+            log::info!("Backing Block Device: {}", resolved_backing_dev);
+            let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
+                &resolved_backing_dev,
+            ));
 
             // Read the full format values from Garnet for JSON logging
             let block_size_bytes: u64 = format_fields

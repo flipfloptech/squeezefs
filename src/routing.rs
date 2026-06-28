@@ -764,7 +764,7 @@ impl DataRouter {
                 None
             };
 
-            // Stage write locally (fallback to direct S3 upload if staging is full)
+            // Stage write locally (fallback to direct backend write if staging is full)
             let stage_res = self
                 .cache
                 .nvme
@@ -807,12 +807,12 @@ impl DataRouter {
                     }
                 }
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
-                    log::warn!("NVMe write staging cache full. Falling back to direct synchronous S3 upload for: {}", file_path);
+                    log::warn!("NVMe write staging cache full. Falling back to direct synchronous backend block write for: {}", file_path);
 
                     // 1. Process data (encryption and compression)
                     let processed_data = self.get_crypto().process_write(shared_data.clone())?;
 
-                    // 2. Upload block directly to S3
+                    // 2. Write block directly to backing device
                     let offset = self.block_allocator.allocate_block().await?;
                     let stored_block_key = offset.to_string();
 
@@ -1070,7 +1070,7 @@ impl DataRouter {
         let refcounts_key = "squeezefs:block_refcounts";
 
         // 1. Fill any block gaps: gaps are now supported natively as sparse blocks
-        // (i.e. not written to S3 and mapped to None in block map), so no action is required here.
+        // (i.e. not written to backing device and mapped to None in block map), so no action is required here.
 
         // 2. Fetch all old block keys in a single pipeline
         let mut pipe = redis::pipe();
@@ -1148,7 +1148,7 @@ impl DataRouter {
                     .write_block(offset, &processed_block)
                     .await?;
                 debug!(
-                    "Writeback: Successfully uploaded block {} to S3",
+                    "Writeback: Successfully wrote block {} to backing device",
                     new_block_key
                 );
 

@@ -40,7 +40,9 @@ fn check_root() -> std::io::Result<()> {
 }
 
 fn configfs_path() -> PathBuf {
-    if is_mock() {
+    if let Ok(dir) = std::env::var("SQUEEZEFS_MOCK_NVMEOF_DIR") {
+        PathBuf::from(dir)
+    } else if is_mock() {
         PathBuf::from("/tmp/squeezefs_nvmet")
     } else {
         PathBuf::from("/sys/kernel/config/nvmet")
@@ -48,7 +50,9 @@ fn configfs_path() -> PathBuf {
 }
 
 fn sysfs_fabrics_path() -> PathBuf {
-    if is_mock() {
+    if let Ok(dir) = std::env::var("SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR") {
+        PathBuf::from(dir)
+    } else if is_mock() {
         PathBuf::from("/tmp/squeezefs_nvme_fabrics")
     } else {
         PathBuf::from("/sys/class/nvme-fabrics")
@@ -56,7 +60,9 @@ fn sysfs_fabrics_path() -> PathBuf {
 }
 
 fn sysfs_nvme_path() -> PathBuf {
-    if is_mock() {
+    if let Ok(dir) = std::env::var("SQUEEZEFS_MOCK_NVMEOF_NVME_DIR") {
+        PathBuf::from(dir)
+    } else if is_mock() {
         PathBuf::from("/tmp/squeezefs_nvme")
     } else {
         PathBuf::from("/sys/class/nvme")

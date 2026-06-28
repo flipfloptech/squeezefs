@@ -883,6 +883,10 @@ impl DlmClient {
         &self.client_id
     }
 
+    pub fn redis_url(&self) -> &str {
+        &self.redis_url
+    }
+
     pub async fn get_connection(&self) -> Result<MetaConnection> {
         self.meta_client.get_connection().await
     }

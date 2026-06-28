@@ -22,6 +22,9 @@ use tempfile::tempdir;
 async fn test_nvmeof_target_and_initiator_mock_lifecycle() {
     // 1. Set environment to mock mode
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF", "1");
+    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_DIR", "/tmp/squeezefs_nvmet");
+    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR", "/tmp/squeezefs_nvme_fabrics");
+    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_NVME_DIR", "/tmp/squeezefs_nvme");
 
     // Clean up mock target directories from any previous runs
     let mock_configfs = Path::new("/tmp/squeezefs_nvmet");
@@ -153,6 +156,9 @@ fn test_nvmeof_target_share_persistence() {
 
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF", "1");
     std::env::set_var("SQUEEZEFS_TEST_ENV", "1");
+    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_DIR", "/tmp/squeezefs_nvmet_persist");
+    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR", "/tmp/squeezefs_nvme_fabrics_persist");
+    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_NVME_DIR", "/tmp/squeezefs_nvme_persist");
     let temp_config_file = "/tmp/squeezefs_nvmeof_shares_test.json";
     let _ = fs::remove_file(temp_config_file);
 

@@ -30,19 +30,17 @@ To run benchmarks interactively within the Docker environment:
 3. Inside the container, set up a loopback device and format/mount the filesystem:
    ```bash
    # Create directories
-   mkdir -p /mnt/squeezefs /tmp/squeezefs_staging
+   mkdir -p /mnt/squeezefs /tmp/squeezefs_staging    # Create a mock NVMe loopback file for testing
+    truncate -s 10G /tmp/mock_nvme.img
 
-   # Create a mock NVMe loopback file for testing
-   truncate -s 10G /tmp/mock_nvme.img
+    # Format the volume (uses the squeezefs URI: squeeze://host:port/fs_name)
+    cargo run --release -- format squeeze://127.0.0.1:6379/default --nvme-target-path /tmp/mock_nvme.img
 
-   # Format the volume
-   cargo run --release -- format default --nvme-target-path /tmp/mock_nvme.img
+    # Start squeezefs in the background
+    cargo run --release -- mount squeeze://127.0.0.1:6379/default /mnt/squeezefs --disk-cache-paths /tmp/squeezefs_staging --nvme-path /tmp/mock_nvme.img &
 
-   # Start squeezefs in the background
-   cargo run --release -- mount /mnt/squeezefs --disk-cache-paths /tmp/squeezefs_staging --nvme-path /tmp/mock_nvme.img &
-
-   # Wait a moment for mount to initialize, then run benchmark
-   cargo run --release -- bench --path /mnt/squeezefs --threads 4 --size 64
+    # Wait a moment for mount to initialize, then run benchmark (auto-resolves config from mount path)
+    cargo run --release -- bench /mnt/squeezefs --threads 4 --large-size 64
    ```
 
 ---
@@ -79,33 +77,28 @@ cargo build --release
 
 ### Step 3: Format and Mount Squeezefs
 
-1. **Set up connection environment variables** (so the CLI/daemon knows where Microsoft Garnet is running):
-   ```bash
-   export GARNET_URL="redis://127.0.0.1:6379"
-   ```
-
-2. **Create a storage pool and volume for Squeezefs**:
+1. **Create a storage pool and volume for Squeezefs**:
    ```bash
    # Assuming /dev/nvme0n1 is a local fast NVMe drive dedicated to Squeezefs
    ./target/release/squeezefs storage pool create main-pool /dev/nvme0n1
    ./target/release/squeezefs storage volume create main-pool my-vol --size 1P
    ```
 
-3. **Format the filesystem volume** (this sets up block allocation maps for your NVMe device in Garnet):
+2. **Format the filesystem volume** (this sets up block allocation maps for your NVMe device in Garnet using SqueezeFS URI):
    ```bash
-   ./target/release/squeezefs format squeezefs-volume \
+   ./target/release/squeezefs format squeeze://127.0.0.1:6379/squeezefs-volume \
      --nvme-target-path /dev/main-pool/my-vol
    ```
 
-4. **Create the mount point and local staging directories**:
+3. **Create the mount point and local staging directories**:
    ```bash
    mkdir -p /mnt/squeezefs
    mkdir -p /tmp/squeezefs_staging
    ```
 
-5. **Mount the FUSE daemon** (run in background with daemon mode, specify log file destination, and pass your volume path):
+4. **Mount the FUSE daemon** (run in background with daemon mode, specify log file destination, and pass your volume path):
    ```bash
-   sudo ./target/release/squeezefs mount /mnt/squeezefs \
+   ./target/release/squeezefs mount squeeze://127.0.0.1:6379/squeezefs-volume /mnt/squeezefs \
      --disk-cache-paths /tmp/squeezefs_staging \
      --nvme-path /dev/main-pool/my-vol \
      --daemon \
@@ -114,16 +107,16 @@ cargo build --release
      --gid 1000
    ```
 
-6. **(Optional) Configure quotas at runtime**:
+5. **(Optional) Configure quotas at runtime** (Note: connection and volume settings are auto-resolved from the active FUSE mount!):
    To dynamically adjust size or inode quotas:
    ```bash
    # Change filesystem capacity quota at runtime
-   ./target/release/squeezefs config "redis://127.0.0.1:6379" squeezefs-volume set capacity 10T
+   ./target/release/squeezefs config set capacity 10T
    ```
 
-7. **Run the benchmark tool** in a separate terminal:
+6. **Run the benchmark tool** as the mounting user (Note: running with 'sudo' will be blocked by FUSE unless mounted with 'allow_other'):
    ```bash
-   ./target/release/squeezefs bench --path /mnt/squeezefs --threads 8 --size 128
+   ./target/release/squeezefs bench /mnt/squeezefs --threads 8 --large-size 128
    ```
 
 ---

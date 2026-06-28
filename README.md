@@ -50,11 +50,19 @@ Includes built-in host auto-tuning (`squeezefs tune`) to optimize virtual memory
 
 ## Subcommands & CLI Usage
 
-Squeezefs exposes a clean CLI to manage formats, mounts, status, performance benchmarks, and optimize systems:
+Squeezefs exposes a clean CLI to manage formats, mounts, status, performance benchmarks, and optimize systems. 
+
+### SqueezeFS URI Scheme
+To centralize connections, SqueezeFS utilizes a single connection URI:
+`squeeze://<ip>:<port>/<fs_name>` (e.g. `squeeze://127.0.0.1:6379/myvol`).
+* **Mount & Format**: Require this URI as a primary positional parameter.
+* **Other Subcommands**: Can dynamically resolve connection details from FUSE mount `.config` metadata files, system mount tables, environment variables (`GARNET_URL` / `SQUEEZE_URI`), or parent paths, making the URI completely optional.
+
+---
 
 * **Format Squeezefs Volume:**
   ```bash
-  squeezefs format <name> [options]
+  squeezefs format squeeze://<ip>:<port>/<fs_name> [options]
   ```
   *Options:*
   - `--block-size <bytes>`: Block size in bytes (default: 4MB).
@@ -65,7 +73,7 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
 
 * **Mount Squeezefs:**
   ```bash
-  squeezefs mount <mountpoint> [options]
+  squeezefs mount squeeze://<ip>:<port>/<fs_name> <mountpoint> [options]
   ```
   *Options:*
   - `--disk-cache-paths <paths>`: Comma-separated paths to NVMe cache staging directories.
@@ -76,27 +84,38 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
   - `--uid <id>`: Custom UID owner for the mount (default: current user or SUDO_UID).
   - `--gid <id>`: Custom GID owner for the mount (default: current group or SUDO_GID).
   - `--log-file <path>`: Path to write daemon logs to when running in background.
-  - `--nvme-path <path>`: Local NVMe path or NVMe-oF connected target path (required).
+  - `--nvme-path <path>`: Local NVMe path or NVMe-oF connected target path.
+  - `--job-cpu-limit <percentage>`: Cap background job worker CPU utilization percentage (1 to 100, default: 50).
+  - `--write-verification`: Enable read-after-write checksum verification on all writes to cache and disk.
 
 * **Show filesystem Status:**
   ```bash
-  squeezefs status
+  squeezefs status squeeze://<ip>:<port>/<fs_name>
   ```
 
-* **Defragment Squeezefs Volume:**
+* **Defragment Squeezefs Volume (Cluster-Distributed Job):**
   ```bash
-  squeezefs defrag --name <name> --nvme-path <path>
+  squeezefs defrag --nvme-path <path> [--squeeze-uri <uri>]
   ```
-  Calculates block fragmentation on the NVMe device and performs in-place reallocation to compact blocks and fill holes.
+  Calculates block fragmentation on the NVMe device, generates block migration tasks, and submits them as a cluster-distributed job. All active FUSE client mount nodes poll and execute these block moves in parallel (subject to their configured `--job-cpu-limit`).
 
 * **Benchmark Mountpoint:**
   ```bash
-  squeezefs bench --path <mountpoint> --threads <num> --size <mb>
+  squeezefs bench <mountpoint> [options]
   ```
+  *Options:*
+  - `--threads <num>`: Parallel workload threads (default: 4).
+  - `--iterations <num>`: Run loop count for benchmark runs.
+  - `--large-size <MB>`: Large file workload size.
+  - `--small-size <KB>`: Small file workload size.
+  - `--small-count <count>`: Small file writes count.
+  - `--only <filters>`: Comma-separated list of workloads to run (e.g. `large-seq,small-rand`).
+  - `--skip <filters>`: Skip specific workloads.
+  - `--direct`: Enable Direct I/O (O_DIRECT) path validation.
 
 * **Instant Metadata Clone (CoW):**
   ```bash
-  squeezefs clone <src> <dest>
+  squeezefs clone <src> <dest> [--squeeze-uri <uri>]
   ```
 
 * **Tune Kernel Parameters (requires root):**
@@ -127,7 +146,7 @@ Squeezefs exposes a clean CLI to manage formats, mounts, status, performance ben
 * **Runtime Configuration Management:**
   Configure limits and caches at runtime:
   ```bash
-  squeezefs config <garnet_url> <fs_name> <action>
+  squeezefs config <action> [--squeeze-uri <uri>]
   ```
   *Actions:*
   - `set <key> <value>`: Updates runtime format quotas and cache limits. Supported keys are `capacity` (e.g. "100G", "2T"), `inodes` (e.g. "2000000"), `mem_cache_size`, `read_mem_cache_size`, `write_mem_cache_size`, `disk_cache_size`, `read_cache_size`, and `write_cache_size`.

@@ -18,7 +18,7 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
 
 pub fn pool_create(pool_name: &str, disks: &[String]) -> Result<()> {
     // 1. Run pvcreate on all disks
-    let mut pv_args: Vec<&str> = vec!["-y"]; // Yes to prompts (like wiping signatures)
+    let mut pv_args: Vec<&str> = vec!["-y", "-ff"]; // Yes to prompts and force re-init
     for d in disks {
         pv_args.push(d.as_str());
     }
@@ -39,7 +39,7 @@ pub fn pool_create(pool_name: &str, disks: &[String]) -> Result<()> {
 
 pub fn pool_add(pool_name: &str, disks: &[String]) -> Result<()> {
     // 1. Run pvcreate on new disks
-    let mut pv_args: Vec<&str> = vec!["-y"];
+    let mut pv_args: Vec<&str> = vec!["-y", "-ff"];
     for d in disks {
         pv_args.push(d.as_str());
     }

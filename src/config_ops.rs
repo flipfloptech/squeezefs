@@ -278,10 +278,11 @@ pub async fn add_storage_backend(
     redis_url: &str,
     _fs_name: &str,
     backend_id: &str,
-    endpoint: &str,
-    access_key: &str,
-    secret_key: &str,
-    bucket: &str,
+    backing_dev: Option<&str>,
+    ip: Option<&str>,
+    port: Option<u16>,
+    subnqn: Option<&str>,
+    capacity: Option<u64>,
 ) -> Result<()> {
     let mut con = connect_redis(redis_url).await?;
 
@@ -293,28 +294,112 @@ pub async fn add_storage_backend(
         )));
     }
 
+    let mut resolved_ip = ip.map(|s| s.to_string());
+    let mut resolved_port = port;
+    let mut resolved_subnqn = subnqn.map(|s| s.to_string());
+
+    // Resolve backing_dev using connection parameters if not explicitly provided
+    let resolved_backing_dev = match backing_dev {
+        Some(dev) => {
+            let dev_str = dev.to_string();
+            // Automatically pull NVMe-oF details if possible
+            if let Some((ext_ip, ext_port, ext_subnqn)) = crate::nvmeof::extract_nvmeof_connection_details(&dev_str) {
+                log::info!("Automatically extracted NVMe-oF connection details for {}: {}:{} / {}", dev_str, ext_ip, ext_port, ext_subnqn);
+                if resolved_ip.is_none() { resolved_ip = Some(ext_ip); }
+                if resolved_port.is_none() { resolved_port = Some(ext_port); }
+                if resolved_subnqn.is_none() { resolved_subnqn = Some(ext_subnqn); }
+            }
+            dev_str
+        }
+        None => {
+            if let (Some(ip_val), Some(port_val), Some(nqn_val)) = (ip, port, subnqn) {
+                log::info!("Connecting to NVMe-oF target at {}:{} / {}...", ip_val, port_val, nqn_val);
+                let dev_path = crate::nvmeof::connect_target(ip_val, port_val, nqn_val)
+                    .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to connect to NVMe-oF target: {:?}", e)))?;
+                log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
+                dev_path
+            } else {
+                return Err(SqueezefsError::InvalidOperation(
+                    "Either backing device path or NVMe-oF parameters (ip, port, subnqn) must be specified".to_string()
+                ));
+            }
+        }
+    };
+
+    crate::storage::validate_backing_device(&resolved_backing_dev)?;
+
     let backends_map: std::collections::HashMap<String, String> = con
         .hgetall(crate::fs_key!("backends"))
         .await
         .unwrap_or_default();
     for (be_id, be_json) in backends_map {
         if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
-            let ep = config["endpoint"].as_str().unwrap_or("");
-            let bu = config["bucket"].as_str().unwrap_or("");
-            if ep == endpoint && bu == bucket {
+            let bd = config["backing_dev"].as_str().unwrap_or("");
+            if bd == resolved_backing_dev {
                 return Err(SqueezefsError::InvalidOperation(format!(
-                    "Duplicate backend configuration: S3 endpoint '{}' and bucket '{}' are already registered under name '{}'",
-                    endpoint, bucket, be_id
+                    "Duplicate backend configuration: backing device '{}' is already registered under name '{}'",
+                    resolved_backing_dev, be_id
                 )));
             }
         }
     }
 
+    // Read filesystem metadata to create a correct superblock
+    let block_size: u64 = con
+        .hget(crate::fs_key!("format"), "block_size")
+        .await
+        .unwrap_or(4 * 1024 * 1024);
+    let inodes: u64 = con
+        .hget(crate::fs_key!("format"), "inodes")
+        .await
+        .unwrap_or(1_000_000);
+    
+    // Resolve capacity. If not specified, default to format key capacity
+    let resolved_capacity: u64 = match capacity {
+        Some(cap) => cap,
+        None => con.hget(crate::fs_key!("format"), "capacity").await.unwrap_or(1024 * 1024 * 1024 * 1024),
+    };
+
+    // Auto-initialize the backing device by writing the 4KB SqueezeFS superblock
+    log::info!("Writing SqueezeFS superblock signature to target backend device: {}", resolved_backing_dev);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&resolved_backing_dev)
+        .await
+        .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to open backing device '{}': {:?}", resolved_backing_dev, e)))?;
+    
+    // Construct superblock
+    let mut sb = vec![0u8; 4096];
+    let magic = b"SQUEEZEFS_SUPER\x00";
+    sb[0..magic.len()].copy_from_slice(magic);
+    let name_bytes = _fs_name.as_bytes();
+    let name_len = std::cmp::min(name_bytes.len(), 63);
+    sb[16..16 + name_len].copy_from_slice(&name_bytes[..name_len]);
+    sb[80..88].copy_from_slice(&resolved_capacity.to_be_bytes());
+    sb[88..96].copy_from_slice(&block_size.to_be_bytes());
+    sb[96..104].copy_from_slice(&inodes.to_be_bytes());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    sb[104..112].copy_from_slice(&timestamp.to_be_bytes());
+
+    use tokio::io::AsyncSeekExt;
+    use tokio::io::AsyncWriteExt;
+    file.seek(std::io::SeekFrom::Start(0)).await.map_err(SqueezefsError::Io)?;
+    file.write_all(&sb).await.map_err(SqueezefsError::Io)?;
+    file.sync_all().await.map_err(SqueezefsError::Io)?;
+
+    let (lvm_vg, lvm_loops) = crate::storage::extract_lvm_loop_info(&resolved_backing_dev);
+
     let backend_json = serde_json::json!({
-        "endpoint": endpoint,
-        "access_key": access_key,
-        "secret_key": secret_key,
-        "bucket": bucket,
+        "backing_dev": resolved_backing_dev,
+        "capacity": resolved_capacity,
+        "ip": resolved_ip,
+        "port": resolved_port,
+        "subnqn": resolved_subnqn,
+        "lvm_vg": lvm_vg,
+        "lvm_loops": lvm_loops,
     })
     .to_string();
 

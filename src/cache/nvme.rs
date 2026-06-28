@@ -60,6 +60,7 @@ pub struct NvmeStaging {
     max_read_bytes: u64,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
     pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    pub backend_router: std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
     redis_client: crate::dlm::MetaClient,
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
@@ -189,12 +190,15 @@ impl NvmeStaging {
 
         let (write_tx, write_rx) = mpsc::channel::<PendingStagedWrite>(1000);
 
+        let backend_router = std::sync::Arc::new(once_cell::sync::OnceCell::new());
+
         let staging = Self {
             staging_dirs: staging_dirs.clone(),
             max_write_bytes: actual_max_write_bytes,
             max_read_bytes: actual_max_read_bytes,
             block_allocator: block_allocator.clone(),
             nvme_writer: nvme_writer.clone(),
+            backend_router,
             redis_client: redis_client.clone(),
             write_tx,
             p2p_addr: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -211,6 +215,10 @@ impl NvmeStaging {
         staging.start_merge_worker(write_rx);
 
         Ok(staging)
+    }
+
+    pub fn set_backend_router(&self, router: std::sync::Arc<crate::routing::BackendRouter>) {
+        let _ = self.backend_router.set(router);
     }
 
     pub fn redis_client(&self) -> &crate::dlm::MetaClient {
@@ -408,6 +416,7 @@ impl NvmeStaging {
     fn start_merge_worker(&self, mut write_rx: mpsc::Receiver<PendingStagedWrite>) {
         let block_allocator = self.block_allocator.clone();
         let nvme_writer = self.nvme_writer.clone();
+        let backend_router = self.backend_router.clone();
         let redis_client = self.redis_client.clone();
         let staged_bytes = self.current_staged_write_bytes.clone();
         let space_freed_notify = self.space_freed_notify.clone();
@@ -453,7 +462,7 @@ impl NvmeStaging {
 
                         if current_bytes >= max_batch_bytes {
                             info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &block_allocator, &nvme_writer).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer).await {
                                 error!("Failed to flush NVMe staging batch: {:?}", e);
                             }
                         }
@@ -461,7 +470,7 @@ impl NvmeStaging {
                     _ = &mut sleep => {
                         if !batch.is_empty() {
                             info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &block_allocator, &nvme_writer).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer).await {
                                 error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
                             }
                         }
@@ -478,8 +487,9 @@ impl NvmeStaging {
         current_bytes: &mut u64,
         staged_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
         space_freed_notify: &tokio::sync::Notify,
-        block_allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
-        nvme_writer: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+        backend_router: &std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
+        default_allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        default_writer: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -511,8 +521,18 @@ impl NvmeStaging {
             encrypt_key.as_deref(),
         );
 
+        let (be_id, block_allocator, nvme_writer) = if let Some(router) = backend_router.get() {
+            router.get_active_backend()?
+        } else {
+            ("backend_0".to_string(), default_allocator.clone(), default_writer.clone())
+        };
+
         let offset = block_allocator.allocate_block().await?;
-        let packed_key = offset.to_string();
+        let packed_key = if be_id == "backend_0" {
+            offset.to_string()
+        } else {
+            format!("{}://{}", be_id, offset)
+        };
 
         let mut packed_payload = Vec::new();
         let mut mappings = Vec::new();

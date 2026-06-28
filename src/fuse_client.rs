@@ -4894,6 +4894,9 @@ pub async fn format_volume(
         disk_cache_size,
         disk_cache_paths,
         None,
+        None,
+        None,
+        None,
         read_cache_size,
         write_cache_size,
         read_mem_cache_size,
@@ -4938,6 +4941,9 @@ pub async fn format_volume_ext(
     disk_cache_size: Option<&str>,
     disk_cache_paths: Option<&[std::path::PathBuf]>,
     nvme_target_path: Option<&str>,
+    ip: Option<&str>,
+    port: Option<u16>,
+    subnqn: Option<&str>,
     read_cache_size: Option<&str>,
     write_cache_size: Option<&str>,
     read_mem_cache_size: Option<&str>,
@@ -5275,6 +5281,41 @@ pub async fn format_volume_ext(
                 crate::fs_key!("format"),
                 "backing_dev",
                 nvme_target_path.unwrap_or(""),
+            )
+            .hset(
+                crate::fs_key!("format"),
+                "lvm_vg",
+                if let Some(target) = nvme_target_path {
+                    let (vg, _) = crate::storage::extract_lvm_loop_info(target);
+                    vg.unwrap_or_default()
+                } else {
+                    String::new()
+                },
+            )
+            .hset(
+                crate::fs_key!("format"),
+                "lvm_loops",
+                if let Some(target) = nvme_target_path {
+                    let (_, loops) = crate::storage::extract_lvm_loop_info(target);
+                    serde_json::to_string(&loops).unwrap_or_default()
+                } else {
+                    String::new()
+                },
+            )
+            .hset(
+                crate::fs_key!("format"),
+                "backing_dev_ip",
+                ip.unwrap_or(""),
+            )
+            .hset(
+                crate::fs_key!("format"),
+                "backing_dev_port",
+                port.map(|p| p.to_string()).unwrap_or_default(),
+            )
+            .hset(
+                crate::fs_key!("format"),
+                "backing_dev_subnqn",
+                subnqn.unwrap_or(""),
             )
             .hset(
                 crate::fs_key!("format"),
@@ -5666,10 +5707,10 @@ async fn flush_single_active_block(
     let processed_block = router.get_crypto().process_write(block_bytes.clone())?;
     let processed_len = processed_block.len();
 
-    let offset = router.block_allocator.allocate_block().await?;
+    let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
+    let offset = block_allocator.allocate_block().await?;
 
-    if let Err(e) = router
-        .nvme_writer
+    if let Err(e) = nvme_writer
         .write_block(offset, &processed_block)
         .await
     {
@@ -5677,11 +5718,15 @@ async fn flush_single_active_block(
             "flush_single_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
             b, ino, e
         );
-        let _ = router.block_allocator.free_block(offset).await;
+        let _ = block_allocator.free_block(offset).await;
         return Err(e);
     }
 
-    let stored_block_key = offset.to_string();
+    let stored_block_key = if be_id == "backend_0" {
+        offset.to_string()
+    } else {
+        format!("{}://{}", be_id, offset)
+    };
 
     let block_map_key = format!("block_map:{}", block_map_id);
 
@@ -5721,9 +5766,7 @@ async fn flush_single_active_block(
                     .hdel(crate::fs_key!("block_sizes"), &bk)
                     .query_async(&mut con)
                     .await?;
-                if let Ok(old_offset) = bk.parse::<u64>() {
-                    let _ = router.block_allocator.free_block(old_offset).await;
-                }
+                let _ = router.backend_router.free_block(&bk).await;
             } else {
                 let _: () = con.hset(refcounts_key, &bk, r).await?;
             }
@@ -5732,9 +5775,7 @@ async fn flush_single_active_block(
                 .hdel(crate::fs_key!("block_sizes"), &bk)
                 .await
                 .unwrap_or(());
-            if let Ok(old_offset) = bk.parse::<u64>() {
-                let _ = router.block_allocator.free_block(old_offset).await;
-            }
+            let _ = router.backend_router.free_block(&bk).await;
         }
     }
 

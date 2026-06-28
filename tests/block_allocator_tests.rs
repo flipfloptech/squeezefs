@@ -145,3 +145,72 @@ async fn test_interleaved_alloc_free() {
 
     assert_eq!(new_offsets, freed_offsets, "Freed blocks should be reused");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_backend_router_routing() {
+    let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    {
+        let mut conn = client.get_connection().unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg("test_be_routing:free_blocks")
+            .arg("test_be_routing:highest_block")
+            .arg("test_be_routing:fabrics02:free_blocks")
+            .arg("test_be_routing:fabrics02:highest_block")
+            .query(&mut conn)
+            .unwrap_or_default();
+    }
+    let meta = Arc::new(MetaClient::Single(client));
+
+    // Create temporary backing files for test
+    let dev0_path = "/tmp/squeezefs_test_be_routing_dev0";
+    let dev1_path = "/tmp/squeezefs_test_be_routing_dev1";
+    std::fs::write(dev0_path, vec![0u8; 8 * 1024 * 1024]).unwrap();
+    std::fs::write(dev1_path, vec![0u8; 8 * 1024 * 1024]).unwrap();
+
+    let dev0 = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(dev0_path));
+    let dev1 = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(dev1_path));
+
+    let alloc0 = Arc::new(BlockAllocator::new(meta.clone(), "test_be_routing").await.unwrap());
+    let alloc1 = Arc::new(BlockAllocator::new(meta.clone(), "test_be_routing:fabrics02").await.unwrap());
+
+    let block_size = Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024));
+    let router = squeezefs::routing::BackendRouter::new(alloc0, dev0, block_size);
+
+    // Verify initial active backend is backend_0
+    let (active_id, _, _) = router.get_active_backend().unwrap();
+    assert_eq!(active_id, "backend_0");
+
+    // Register supplementary backend fabrics02
+    router.backends.insert(
+        "fabrics02".to_string(),
+        Arc::new(squeezefs::routing::StorageBackend {
+            device: dev1,
+            block_allocator: alloc1,
+        }),
+    );
+
+    // Switch active write backend to fabrics02
+    *router.active_write_backend.write() = "fabrics02".to_string();
+
+    // Verify active backend is fabrics02
+    let (active_id, active_alloc, active_dev) = router.get_active_backend().unwrap();
+    assert_eq!(active_id, "fabrics02");
+
+    // Write a block to the active backend (fabrics02)
+    let offset = active_alloc.allocate_block().await.unwrap();
+    let stored_key = format!("fabrics02://{}", offset);
+
+    let payload = vec![42u8; 4 * 1024 * 1024];
+    active_dev.write_block(offset, &payload).await.unwrap();
+
+    // Read it back via BackendRouter read_block using the key
+    let read_payload = router.read_block(&stored_key, 4 * 1024 * 1024).await.unwrap();
+    assert_eq!(read_payload, payload);
+
+    // Free the block via BackendRouter free_block using the key
+    router.free_block(&stored_key).await.unwrap();
+
+    // Clean up files
+    let _ = std::fs::remove_file(dev0_path);
+    let _ = std::fs::remove_file(dev1_path);
+}

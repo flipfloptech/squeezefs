@@ -17,6 +17,10 @@ pub struct TieredCache {
 }
 
 impl TieredCache {
+    pub fn set_backend_router(&self, router: std::sync::Arc<crate::routing::BackendRouter>) {
+        self.nvme.set_backend_router(router);
+    }
+
     pub fn new(
         staging_dirs: Vec<PathBuf>,
         read_mem_cache_size: Option<&str>,

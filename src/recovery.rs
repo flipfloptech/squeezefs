@@ -207,7 +207,7 @@ pub async fn recover_staging(
                             }
 
                             let active_be = "backend_0";
-                            let stored_block_key = format!("{}:{}", active_be, new_block_key);
+                            let stored_block_key = format!("{}://{}", active_be, new_block_key);
 
                             let refcounts_key_str = crate::fs_key!("block_refcounts");
                             let refcounts_key = &refcounts_key_str;

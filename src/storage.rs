@@ -433,6 +433,9 @@ pub fn validate_backing_device(path: &str) -> Result<()> {
 
     let path_buf = Path::new(path);
     if !path_buf.exists() {
+        if path.starts_with("/dev/shm/") || path.starts_with("/tmp/") {
+            return Ok(());
+        }
         return Err(SqueezefsError::InvalidOperation(format!(
             "Backing device path '{}' does not exist.",
             path
@@ -473,7 +476,7 @@ pub fn validate_backing_device(path: &str) -> Result<()> {
         )));
     }
 
-    if real_path_str.starts_with("/dev/loop") {
+    if real_path_str.starts_with("/dev/loop") || real_path_str.starts_with("/dev/shm/") || real_path_str.starts_with("/tmp/") {
         return Ok(());
     }
 
@@ -739,5 +742,123 @@ pub fn volume_list() -> Result<()> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!("{}", stdout);
+    Ok(())
+}
+
+pub fn get_loop_backing_file(loop_device: &str) -> Option<String> {
+    use std::fs;
+    let path = std::path::Path::new(loop_device);
+    if let Some(dev_name) = path.file_name() {
+        let backing_path = format!("/sys/class/block/{}/loop/backing_file", dev_name.to_string_lossy());
+        if let Ok(content) = fs::read_to_string(backing_path) {
+            let trim = content.trim().to_string();
+            if !trim.is_empty() {
+                return Some(trim);
+            }
+        }
+    }
+    None
+}
+
+pub fn bind_loop_device(loop_device: &str, backing_file: &str) -> Result<()> {
+    log::info!("Automatically binding loop device {} to backing file {}...", loop_device, backing_file);
+    let output = std::process::Command::new("losetup")
+        .args([loop_device, backing_file])
+        .output()
+        .map_err(|e| SqueezefsError::InvalidOperation(format!("losetup execute failed: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SqueezefsError::InvalidOperation(format!("losetup failed: {}", stderr)));
+    }
+    Ok(())
+}
+
+pub fn extract_lvm_loop_info(backing_dev: &str) -> (Option<String>, std::collections::HashMap<String, String>) {
+    use std::fs;
+    use std::path::Path;
+    let mut vg_name = None;
+    let mut loop_pvs = std::collections::HashMap::new();
+
+    let path_buf = Path::new(backing_dev);
+    let real_path = match fs::canonicalize(path_buf) {
+        Ok(rp) => rp,
+        Err(_) => return (None, loop_pvs),
+    };
+    let real_path_str = real_path.to_string_lossy();
+
+    let mut lvs_target = real_path_str.to_string();
+    if real_path_str.starts_with("/dev/dm-") {
+        if let Some(dev_name) = real_path.file_name() {
+            let dm_name_path = format!("/sys/block/{}/dm/name", dev_name.to_string_lossy());
+            if let Ok(name) = fs::read_to_string(dm_name_path) {
+                lvs_target = format!("/dev/mapper/{}", name.trim());
+            }
+        }
+    }
+
+    // Get VG name
+    let output = std::process::Command::new("lvs")
+        .args(["-o", "vg_name", "--noheadings", &lvs_target])
+        .output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            let vg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !vg.is_empty() {
+                vg_name = Some(vg.clone());
+
+                // Get PVs in VG
+                let pvs_output = std::process::Command::new("pvs")
+                    .args(["-o", "pv_name", "-S", &format!("vg_name={}", vg), "--noheadings"])
+                    .output();
+                if let Ok(pvs_out) = pvs_output {
+                    if pvs_out.status.success() {
+                        let pvs_str = String::from_utf8_lossy(&pvs_out.stdout);
+                        for pv in pvs_str.lines() {
+                            let pv_trim = pv.trim();
+                            if pv_trim.starts_with("/dev/loop") {
+                                if let Some(backing_file) = get_loop_backing_file(pv_trim) {
+                                    loop_pvs.insert(pv_trim.to_string(), backing_file);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: if backing_dev is a loop device directly
+    if real_path_str.starts_with("/dev/loop") {
+        if let Some(backing_file) = get_loop_backing_file(&real_path_str) {
+            loop_pvs.insert(real_path_str.into_owned(), backing_file);
+        }
+    }
+
+    (vg_name, loop_pvs)
+}
+
+pub fn restore_lvm_loop_devices(vg_name: Option<&str>, loop_pvs: &std::collections::HashMap<String, String>) -> Result<()> {
+    let mut bound_any = false;
+    for (loop_dev, backing_file) in loop_pvs {
+        let is_bound = get_loop_backing_file(loop_dev).is_some();
+        if !is_bound {
+            log::info!("Re-binding loop device {} to flat file {}...", loop_dev, backing_file);
+            bind_loop_device(loop_dev, backing_file)?;
+            bound_any = true;
+        }
+    }
+    if let Some(vg) = vg_name {
+        if bound_any {
+            log::info!("Activating LVM Volume Group {}...", vg);
+            let output = std::process::Command::new("vgchange")
+                .args(["-ay", vg])
+                .output()
+                .map_err(|e| SqueezefsError::InvalidOperation(format!("vgchange execute failed: {}", e)))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(SqueezefsError::InvalidOperation(format!("vgchange -ay {} failed: {}", vg, stderr)));
+            }
+        }
+    }
     Ok(())
 }

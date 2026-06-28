@@ -544,3 +544,49 @@ pub fn list_nvmeof() -> std::io::Result<()> {
 
     Ok(())
 }
+
+pub fn extract_nvmeof_connection_details(backing_dev: &str) -> Option<(String, u16, String)> {
+    use std::fs;
+    use std::path::Path;
+
+    let path = Path::new(backing_dev);
+    let real_path = fs::canonicalize(path).ok()?;
+    let real_path_str = real_path.to_string_lossy();
+
+    // Check if it starts with /dev/nvme
+    if real_path_str.starts_with("/dev/nvme") {
+        let parts: Vec<&str> = real_path_str.split('/').collect();
+        if let Some(dev_name) = parts.last() {
+            if dev_name.starts_with("nvme") {
+                // Find index before 'n' (e.g. nvme0n1 -> nvme0)
+                if let Some(end_idx) = dev_name.rfind('n') {
+                    let ctrl = &dev_name[..end_idx];
+                    let subsysnqn_path = format!("/sys/class/nvme/{}/subsysnqn", ctrl);
+                    let address_path = format!("/sys/class/nvme/{}/address", ctrl);
+
+                    if let (Ok(nqn_raw), Ok(addr_raw)) = (fs::read_to_string(subsysnqn_path), fs::read_to_string(address_path)) {
+                        let subnqn = nqn_raw.trim().to_string();
+                        
+                        // Parse address properties: e.g. "traddr=192.168.1.100,trsvcid=4420"
+                        let mut ip = None;
+                        let mut port = None;
+                        for part in addr_raw.split(',') {
+                            let kv: Vec<&str> = part.split('=').collect();
+                            if kv.len() == 2 {
+                                match kv[0].trim() {
+                                    "traddr" => ip = Some(kv[1].trim().to_string()),
+                                    "trsvcid" => port = kv[1].trim().parse::<u16>().ok(),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if let (Some(ip_val), Some(port_val)) = (ip, port) {
+                            return Some((ip_val, port_val, subnqn));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}

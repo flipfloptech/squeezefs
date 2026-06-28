@@ -31,12 +31,120 @@ pub struct CachedMetadata {
     pub data_key: Option<Vec<u8>>,
 }
 
+pub struct StorageBackend {
+    pub device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+}
+
+#[derive(Clone)]
+pub struct BackendRouter {
+    pub default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+    pub default_device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    pub backends: std::sync::Arc<dashmap::DashMap<String, std::sync::Arc<StorageBackend>, ahash::RandomState>>,
+    pub active_write_backend: std::sync::Arc<parking_lot::RwLock<String>>,
+    pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl BackendRouter {
+    pub fn new(
+        default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        default_device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+        block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            default_allocator,
+            default_device,
+            backends: std::sync::Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
+            active_write_backend: std::sync::Arc::new(parking_lot::RwLock::new("backend_0".to_string())),
+            block_size,
+        }
+    }
+
+    pub fn get_active_backend(&self) -> Result<(String, std::sync::Arc<crate::block_allocator::BlockAllocator>, std::sync::Arc<crate::nvme_dev::NvmeBlockDev>)> {
+        let active_be_id = { self.active_write_backend.read().clone() };
+        if active_be_id == "backend_0" {
+            Ok(("backend_0".to_string(), self.default_allocator.clone(), self.default_device.clone()))
+        } else if let Some(be) = self.backends.get(&active_be_id) {
+            Ok((active_be_id.clone(), be.block_allocator.clone(), be.device.clone()))
+        } else {
+            Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "Active write backend '{}' not found",
+                active_be_id
+            )))
+        }
+    }
+
+    pub fn get_backend(&self, be_id: &str) -> Result<(std::sync::Arc<crate::block_allocator::BlockAllocator>, std::sync::Arc<crate::nvme_dev::NvmeBlockDev>)> {
+        if be_id == "backend_0" {
+            Ok((self.default_allocator.clone(), self.default_device.clone()))
+        } else if let Some(be) = self.backends.get(be_id) {
+            Ok((be.block_allocator.clone(), be.device.clone()))
+        } else {
+            Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "Backend '{}' not found",
+                be_id
+            )))
+        }
+    }
+
+    pub async fn read_block(&self, block_key: &str, size: usize) -> Result<Vec<u8>> {
+        let parts: Vec<&str> = block_key.split("://").collect();
+        let (be_id, offset_str) = if parts.len() > 1 {
+            (parts[0], parts[1])
+        } else {
+            ("backend_0", block_key)
+        };
+
+        let offset = offset_str.parse::<u64>().map_err(|_| {
+            crate::error::SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid block offset",
+            ))
+        })?;
+
+        if be_id == "backend_0" {
+            self.default_device.read_block(offset, size).await
+        } else if let Some(be) = self.backends.get(be_id) {
+            be.device.read_block(offset, size).await
+        } else {
+            Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "Storage backend '{}' not found",
+                be_id
+            )))
+        }
+    }
+
+    pub async fn free_block(&self, block_key: &str) -> Result<()> {
+        let parts: Vec<&str> = block_key.split("://").collect();
+        let (be_id, offset_str) = if parts.len() > 1 {
+            (parts[0], parts[1])
+        } else {
+            ("backend_0", block_key)
+        };
+
+        let offset = offset_str.parse::<u64>().map_err(|_| {
+            crate::error::SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid block offset",
+            ))
+        })?;
+
+        if be_id == "backend_0" {
+            let _ = self.default_allocator.free_block(offset).await;
+        } else if let Some(be) = self.backends.get(be_id) {
+            let _ = be.block_allocator.free_block(offset).await;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct DataRouter {
     pub dlm: DlmClient,
     pub cache: TieredCache,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
     pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    pub backend_router: std::sync::Arc<BackendRouter>,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
     pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
@@ -60,10 +168,8 @@ struct InflightBlockReadGuard {
 
 impl Drop for InflightBlockReadGuard {
     fn drop(&mut self) {
-        // If the sender in the map is still ours, remove it
         self.inflight_block_reads
             .remove_if(&self.key, |_, current| current.same_channel(&self.tx));
-        // Notify all waiters by sending a message, ignore errors if no one is listening
         let _ = self.tx.send(());
     }
 }
@@ -75,12 +181,20 @@ impl DataRouter {
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     ) -> Self {
+        let block_size = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024));
+        let backend_router = std::sync::Arc::new(BackendRouter::new(
+            block_allocator.clone(),
+            nvme_writer.clone(),
+            block_size.clone(),
+        ));
+        cache.set_backend_router(backend_router.clone());
         Self {
             dlm,
             cache,
             block_allocator,
             nvme_writer,
-            block_size: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024)),
+            backend_router,
+            block_size,
             metadata_cache: moka::sync::Cache::builder()
                 .max_capacity(100_000)
                 .time_to_live(std::time::Duration::from_secs(60))
@@ -116,15 +230,9 @@ impl DataRouter {
         self.crypto.get().unwrap_or(&*DEFAULT_CRYPTO)
     }
 
-    pub async fn read_nvme_block(&self, offset_str: &str) -> Result<Vec<u8>> {
-        let offset = offset_str.parse::<u64>().map_err(|_| {
-            crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid block offset",
-            ))
-        })?;
+    pub async fn read_nvme_block(&self, block_key: &str) -> Result<Vec<u8>> {
         let size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        self.nvme_writer.read_block(offset, size).await
+        self.backend_router.read_block(block_key, size).await
     }
 
     pub fn set_block_size(&self, block_size: u64) {
@@ -493,9 +601,7 @@ impl DataRouter {
                         .hdel(crate::fs_key!("block_sizes"), &bk)
                         .query_async(con)
                         .await?;
-                    if let Ok(offset_u64) = bk.parse::<u64>() {
-                        let _ = self.block_allocator.free_block(offset_u64).await;
-                    }
+                    let _ = self.backend_router.free_block(&bk).await;
                 } else {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
@@ -504,9 +610,7 @@ impl DataRouter {
                     .hdel(crate::fs_key!("block_sizes"), &bk)
                     .await
                     .unwrap_or(());
-                if let Ok(offset_u64) = bk.parse::<u64>() {
-                    let _ = self.block_allocator.free_block(offset_u64).await;
-                }
+                let _ = self.backend_router.free_block(&bk).await;
             }
         }
         Ok(())
@@ -606,8 +710,16 @@ impl DataRouter {
             while offset_cursor < existing_size {
                 let end = std::cmp::min(offset_cursor + block_size, existing_size);
                 let chunk = existing_bytes.slice(offset_cursor..end);
-                let offset = self.block_allocator.allocate_block().await?;
-                let stored_block_key = offset.to_string();
+                let (be_id, block_allocator, nvme_writer) = match self.backend_router.get_active_backend() {
+                    Ok(res) => res,
+                    Err(e) => return Err(e),
+                };
+                let offset = block_allocator.allocate_block().await?;
+                let stored_block_key = if be_id == "backend_0" {
+                    offset.to_string()
+                } else {
+                    format!("{}://{}", be_id, offset)
+                };
                 let stored_block_key_clone = stored_block_key.clone();
 
                 block_mappings.push((block_count.to_string(), stored_block_key.clone()));
@@ -620,7 +732,6 @@ impl DataRouter {
                 let processed_len = processed.len();
                 sizes_to_register.push((stored_block_key_clone.clone(), chunk_len, processed_len));
 
-                let nvme_writer = self.nvme_writer.clone();
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 tokio::spawn(async move {
@@ -818,10 +929,15 @@ impl DataRouter {
                     let processed_data = self.get_crypto().process_write(shared_data.clone())?;
 
                     // 2. Write block directly to backing device
-                    let offset = self.block_allocator.allocate_block().await?;
-                    let stored_block_key = offset.to_string();
+                    let (be_id, block_allocator, nvme_writer) = self.backend_router.get_active_backend()?;
+                    let offset = block_allocator.allocate_block().await?;
+                    let stored_block_key = if be_id == "backend_0" {
+                        offset.to_string()
+                    } else {
+                        format!("{}://{}", be_id, offset)
+                    };
 
-                    self.nvme_writer
+                    nvme_writer
                         .write_block(offset, &processed_data)
                         .await?;
 
@@ -892,8 +1008,16 @@ impl DataRouter {
             while offset_cursor < new_size {
                 let end = std::cmp::min(offset_cursor + block_size, new_size);
                 let chunk = existing_bytes.slice(offset_cursor..end);
-                let offset = self.block_allocator.allocate_block().await?;
-                let stored_block_key = offset.to_string();
+                let (be_id, block_allocator, nvme_writer) = match self.backend_router.get_active_backend() {
+                    Ok(res) => res,
+                    Err(e) => return Err(e),
+                };
+                let offset = block_allocator.allocate_block().await?;
+                let stored_block_key = if be_id == "backend_0" {
+                    offset.to_string()
+                } else {
+                    format!("{}://{}", be_id, offset)
+                };
                 let stored_block_key_clone = stored_block_key.clone();
 
                 block_mappings.push((block_count.to_string(), stored_block_key.clone()));
@@ -906,7 +1030,6 @@ impl DataRouter {
                 let processed_len = processed.len();
                 sizes_to_register.push((stored_block_key_clone.clone(), chunk_len, processed_len));
 
-                let nvme_writer = self.nvme_writer.clone();
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
                 tokio::spawn(async move {
@@ -990,9 +1113,7 @@ impl DataRouter {
                                 .hdel(crate::fs_key!("block_sizes"), &bk)
                                 .query_async(&mut con)
                                 .await?;
-                            if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                            let _ = self.backend_router.free_block(&bk).await;
                         } else {
                             let _: () = con.hset(refcounts_key, &bk, r).await?;
                         }
@@ -1001,9 +1122,7 @@ impl DataRouter {
                             .hdel(crate::fs_key!("block_sizes"), &bk)
                             .await
                             .unwrap_or(());
-                        if let Ok(offset_u64) = bk.parse::<u64>() {
-                            let _ = self.block_allocator.free_block(offset_u64).await;
-                        }
+                        let _ = self.backend_router.free_block(&bk).await;
                     }
                 }
                 let _: () = con.del(&mapping_key).await.unwrap_or(());
@@ -1143,8 +1262,13 @@ impl DataRouter {
                 let new_block_key =
                     format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
-                let offset = router_clone.block_allocator.allocate_block().await?;
-                let stored_new_block_key = offset.to_string();
+                let (be_id, block_allocator, nvme_writer) = router_clone.backend_router.get_active_backend()?;
+                let offset = block_allocator.allocate_block().await?;
+                let stored_new_block_key = if be_id == "backend_0" {
+                    offset.to_string()
+                } else {
+                    format!("{}://{}", be_id, offset)
+                };
 
                 let block_bytes = bytes::Bytes::copy_from_slice(&block_data);
 
@@ -1154,8 +1278,7 @@ impl DataRouter {
                 let logical_size = block_bytes.len();
                 let processed_block = crypto.process_write(block_bytes)?;
                 let physical_size = processed_block.len();
-                router_clone
-                    .nvme_writer
+                nvme_writer
                     .write_block(offset, &processed_block)
                     .await?;
                 debug!(
@@ -1216,9 +1339,7 @@ impl DataRouter {
                         .hdel(crate::fs_key!("block_sizes"), &bk)
                         .query_async(con)
                         .await?;
-                    if let Ok(offset_u64) = bk.parse::<u64>() {
-                        let _ = self.block_allocator.free_block(offset_u64).await;
-                    }
+                    let _ = self.backend_router.free_block(&bk).await;
                 } else {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
@@ -1227,9 +1348,7 @@ impl DataRouter {
                     .hdel(crate::fs_key!("block_sizes"), &bk)
                     .await
                     .unwrap_or(());
-                if let Ok(offset_u64) = bk.parse::<u64>() {
-                    let _ = self.block_allocator.free_block(offset_u64).await;
-                }
+                let _ = self.backend_router.free_block(&bk).await;
             }
         }
 
@@ -2284,9 +2403,7 @@ impl DataRouter {
                                     .hdel(crate::fs_key!("block_sizes"), &bk)
                                     .query_async(con)
                                     .await?;
-                                if let Ok(offset_u64) = bk.parse::<u64>() {
-                                    let _ = self.block_allocator.free_block(offset_u64).await;
-                                }
+                                let _ = self.backend_router.free_block(&bk).await;
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
@@ -2295,9 +2412,7 @@ impl DataRouter {
                                 .hdel(crate::fs_key!("block_sizes"), &bk)
                                 .await
                                 .unwrap_or(());
-                            if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                            let _ = self.backend_router.free_block(&bk).await;
                         }
                     }
                     let _: () = con.del(&block_map_key).await?;
@@ -2319,9 +2434,7 @@ impl DataRouter {
                                     .hdel(crate::fs_key!("block_sizes"), &bk)
                                     .query_async(con)
                                     .await?;
-                                if let Ok(offset_u64) = bk.parse::<u64>() {
-                                    let _ = self.block_allocator.free_block(offset_u64).await;
-                                }
+                                let _ = self.backend_router.free_block(&bk).await;
                             } else {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
@@ -2330,9 +2443,7 @@ impl DataRouter {
                                 .hdel(crate::fs_key!("block_sizes"), &bk)
                                 .await
                                 .unwrap_or(());
-                            if let Ok(offset_u64) = bk.parse::<u64>() {
-                                let _ = self.block_allocator.free_block(offset_u64).await;
-                            }
+                            let _ = self.backend_router.free_block(&bk).await;
                         }
                     }
                     let _: () = con.del(&mapping_key).await?;

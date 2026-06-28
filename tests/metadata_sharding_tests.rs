@@ -61,7 +61,10 @@ async fn test_sharded_volume_formatting_and_initialization() {
         None,
         None,
         None,
-        None,
+        None, // nvme_target_path
+        None, // ip
+        None, // port
+        None, // subnqn
         None,
         None,
         None,

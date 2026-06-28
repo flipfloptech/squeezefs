@@ -33,8 +33,7 @@ enum Commands {
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            default_value = "redis://127.0.0.1:6379"
+            env = "GARNET_URL"
         )]
         garnet_url: String,
         /// Volume name
@@ -69,9 +68,18 @@ enum Commands {
         /// Comma-separated paths to local staging/cache directories
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
-        /// Backing NVMe-oF block device path (e.g. /dev/mypool/myvol)
+        /// SqueezeFS LVM Volume path (e.g. /dev/mypool/myvol)
         #[arg(long, alias = "backing-dev", alias = "nvme-target")]
-        backing_dev: Option<String>,
+        volume: Option<String>,
+        /// IP address of NVMe-oF target
+        #[arg(long)]
+        ip: Option<String>,
+        /// Port of NVMe-oF target
+        #[arg(long)]
+        port: Option<u16>,
+        /// Subsystem NQN of NVMe-oF target
+        #[arg(long)]
+        subnqn: Option<String>,
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
         force: bool,
@@ -103,8 +111,7 @@ enum Commands {
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            default_value = "redis://127.0.0.1:6379"
+            env = "GARNET_URL"
         )]
         garnet_url: String,
         /// Name of the filesystem to check status for
@@ -116,8 +123,7 @@ enum Commands {
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            default_value = "redis://127.0.0.1:6379"
+            env = "GARNET_URL"
         )]
         garnet_url: String,
         /// Path to mount the filesystem at
@@ -157,9 +163,18 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         local_ips: Option<Vec<std::net::IpAddr>>,
 
-        /// Backing NVMe-oF block device path (e.g. /dev/mypool/myvol)
+        /// SqueezeFS LVM Volume path (e.g. /dev/mypool/myvol)
         #[arg(long, alias = "backing-dev", alias = "nvme-target")]
-        backing_dev: Option<String>,
+        volume: Option<String>,
+        /// IP address of NVMe-oF target
+        #[arg(long)]
+        ip: Option<String>,
+        /// Port of NVMe-oF target
+        #[arg(long)]
+        port: Option<u16>,
+        /// Subsystem NQN of NVMe-oF target
+        #[arg(long)]
+        subnqn: Option<String>,
 
         /// Run FUSE daemon in the background (detach from terminal)
         #[arg(long)]
@@ -218,8 +233,7 @@ enum Commands {
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            default_value = "redis://127.0.0.1:6379"
+            env = "GARNET_URL"
         )]
         garnet_url: String,
         /// Path to the mountpoint
@@ -234,8 +248,7 @@ enum Commands {
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            default_value = "redis://127.0.0.1:6379"
+            env = "GARNET_URL"
         )]
         garnet_url: String,
         /// Path to the mounted filesystem directory
@@ -256,8 +269,7 @@ enum Commands {
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            default_value = "redis://127.0.0.1:6379"
+            env = "GARNET_URL"
         )]
         garnet_url: String,
         /// Source file path
@@ -271,8 +283,7 @@ enum Commands {
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            default_value = "redis://127.0.0.1:6379"
+            env = "GARNET_URL"
         )]
         garnet_url: String,
         /// Volume name (filesystem name)
@@ -290,8 +301,7 @@ enum Commands {
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            default_value = "redis://127.0.0.1:6379"
+            env = "GARNET_URL"
         )]
         garnet_url: String,
         /// Volume name (filesystem name)
@@ -305,8 +315,7 @@ enum Commands {
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            default_value = "redis://127.0.0.1:6379"
+            env = "GARNET_URL"
         )]
         garnet_url: String,
         /// Optional path to a file or directory
@@ -461,6 +470,9 @@ enum ConfigActions {
     /// Manage staging disk caches
     #[command(subcommand, alias = "diskcaches")]
     DiskCache(DiskCacheActions),
+    /// Manage storage volumes
+    #[command(subcommand, alias = "backends", alias = "backend", alias = "volumes")]
+    Volume(VolumeActions),
     /// Set runtime configuration quotas (capacity, inodes, or memory cache sizes)
     Set {
         /// Quota/config key (e.g. "capacity", "inodes", "mem_cache_size", "read_mem_cache_size", "write_mem_cache_size", "fuse_io_uring_sqpoll_idle_ms")
@@ -468,10 +480,49 @@ enum ConfigActions {
         /// New value (e.g. "100G", "2T" or numeric value/0)
         value: String,
     },
-    /// List current configuration (diskcaches, backends, active backend)
+    /// List current configuration (diskcaches, volumes, active volume)
     List,
     /// Consistency check on metadata and block references
     Fsck,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum VolumeActions {
+    /// Add a storage volume
+    Add {
+        /// Volume ID
+        volume_id: String,
+        /// SqueezeFS LVM Volume path (e.g. "/dev/mapper/xai-xai02")
+        #[arg(long, alias = "backing-dev")]
+        volume: Option<String>,
+        /// IP address of NVMe-oF target
+        #[arg(long)]
+        ip: Option<String>,
+        /// Port of NVMe-oF target
+        #[arg(long)]
+        port: Option<u16>,
+        /// Subsystem NQN of NVMe-oF target
+        #[arg(long)]
+        subnqn: Option<String>,
+        /// Optional capacity in bytes (or e.g. "100G", default matches formatted volume capacity)
+        #[arg(long)]
+        capacity: Option<String>,
+    },
+    /// Remove a storage volume
+    Remove {
+        /// Volume ID
+        volume_id: String,
+        /// Force removal ignoring safety checks
+        #[arg(long)]
+        force: bool,
+    },
+    /// List all storage volumes and their status
+    List,
+    /// Set the active write volume
+    SetActive {
+        /// Volume ID
+        volume_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1206,7 +1257,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
-            backing_dev,
+            volume: backing_dev,
+            ip,
+            port,
+            subnqn,
             force,
             quick,
             inodes,
@@ -1396,9 +1450,84 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             squeezefs::cache::parse_duration(&upload_delay)?;
 
-            if let Some(ref path) = backing_dev {
-                squeezefs::storage::validate_backing_device(path)?;
+            let mut resolved_backing_dev = backing_dev.clone();
+
+            // Connect to Redis/Garnet to check if format already exists
+            let mut existing_format = std::collections::HashMap::new();
+            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                    use redis::AsyncCommands;
+                    existing_format = con.hgetall::<_, std::collections::HashMap<String, String>>(squeezefs::fs_key!("format")).await.unwrap_or_default();
+                }
             }
+
+            let mut resolved_ip = ip.clone();
+            let mut resolved_port = port;
+            let mut resolved_subnqn = subnqn.clone();
+
+            if !existing_format.is_empty() {
+                // Pull everything from the existing format metadata if not explicitly provided
+                if resolved_backing_dev.is_none() {
+                    resolved_backing_dev = existing_format.get("backing_dev").filter(|s| !s.is_empty()).cloned();
+                }
+                if resolved_ip.is_none() {
+                    resolved_ip = existing_format.get("backing_dev_ip").filter(|s| !s.is_empty()).cloned();
+                }
+                if resolved_port.is_none() {
+                    resolved_port = existing_format.get("backing_dev_port").and_then(|s| s.parse::<u16>().ok());
+                }
+                if resolved_subnqn.is_none() {
+                    resolved_subnqn = existing_format.get("backing_dev_subnqn").filter(|s| !s.is_empty()).cloned();
+                }
+            }
+
+            let resolved_backing_dev = match resolved_backing_dev {
+                Some(path) => {
+                    // Check if it is the in-memory testing path. If it is and does not exist, recreate it.
+                    if (path.starts_with("/dev/shm/") || path.starts_with("/tmp/")) && !std::path::Path::new(&path).exists() {
+                        log::info!("Re-initializing testing backing device file at {}...", path);
+                        let file = std::fs::File::create(&path).map_err(|e| {
+                            format!("Failed to create backing device file at '{}': {:?}", path, e)
+                        })?;
+                        file.set_len(parsed_capacity).map_err(|e| {
+                            format!("Failed to set size of backing device file at '{}': {:?}", path, e)
+                        })?;
+                    } else {
+                        // Validate loop / LVM / NVMe
+                        squeezefs::storage::validate_backing_device(&path)?;
+                    }
+
+                    // Automatically pull NVMe-oF details if possible
+                    if let Some((ext_ip, ext_port, ext_subnqn)) = squeezefs::nvmeof::extract_nvmeof_connection_details(&path) {
+                        log::info!("Automatically extracted NVMe-oF connection details for {}: {}:{} / {}", path, ext_ip, ext_port, ext_subnqn);
+                        if resolved_ip.is_none() { resolved_ip = Some(ext_ip); }
+                        if resolved_port.is_none() { resolved_port = Some(ext_port); }
+                        if resolved_subnqn.is_none() { resolved_subnqn = Some(ext_subnqn); }
+                    }
+                    path
+                }
+                None => {
+                    if let (Some(ref ip_val), Some(port_val), Some(ref nqn_val)) = (&resolved_ip, resolved_port, &resolved_subnqn) {
+                        log::info!("Connecting to NVMe-oF target at {}:{} / {}...", ip_val, port_val, nqn_val);
+                        let dev_path = squeezefs::nvmeof::connect_target(ip_val, port_val, nqn_val)
+                            .map_err(|e| format!("Failed to connect to NVMe-oF target: {:?}", e))?;
+                        log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
+                        // Also auto-extract details just in case
+                        if let Some((ext_ip, ext_port, ext_subnqn)) = squeezefs::nvmeof::extract_nvmeof_connection_details(&dev_path) {
+                            if resolved_ip.is_none() { resolved_ip = Some(ext_ip); }
+                            if resolved_port.is_none() { resolved_port = Some(ext_port); }
+                            if resolved_subnqn.is_none() { resolved_subnqn = Some(ext_subnqn); }
+                        }
+                        dev_path
+                    } else {
+                        return Err(format!(
+                            "Error: No backing device specified for the first format. \
+                            Please ensure that the backing device is created, online, and specified \
+                            via --volume before the first format."
+                        ).into());
+                    }
+                }
+            };
 
             squeezefs::fuse_client::format_volume_ext(
                 redis_url,
@@ -1412,7 +1541,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 mem_cache_size.as_deref(),
                 disk_cache_size.as_deref(),
                 disk_cache_paths.as_deref(),
-                backing_dev.as_deref(),
+                Some(&resolved_backing_dev),
+                resolved_ip.as_deref(),
+                resolved_port,
+                resolved_subnqn.as_deref(),
                 read_cache_size.as_deref(),
                 write_cache_size.as_deref(),
                 read_mem_cache_size.as_deref(),
@@ -1442,7 +1574,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
-            backing_dev,
+            volume: backing_dev,
+            ip,
+            port,
+            subnqn,
             local_ips,
             daemon: _,
             uid,
@@ -1691,22 +1826,50 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await?,
             );
 
-            let has_explicit_backing =
-                backing_dev.is_some() || format_fields.contains_key("backing_dev");
-
-            // Resolve backing device path: CLI override > Garnet format setting > default to local staging path
-            let resolved_backing_dev = backing_dev
+            // Resolve backing device path: CLI override > Garnet format setting > default to in-memory testing backend
+            let mut resolved_backing_dev = backing_dev
                 .or_else(|| {
                     format_fields
                         .get("backing_dev")
                         .filter(|s| !s.is_empty())
                         .cloned()
                 })
-                .unwrap_or_else(|| format!("{}/.squeezefs_nvme", active_staging_dirs[0].display()));
+                .unwrap_or_else(|| "/dev/shm/squeezefs_default_backend".to_string());
 
-            if has_explicit_backing {
-                squeezefs::storage::validate_backing_device(&resolved_backing_dev)?;
+            // If backing device does not exist, check if we can connect to its NVMe-oF target
+            if !std::path::Path::new(&resolved_backing_dev).exists() {
+                let resolved_ip = ip.clone().or_else(|| format_fields.get("backing_dev_ip").filter(|s| !s.is_empty()).cloned());
+                let resolved_port = port.or_else(|| format_fields.get("backing_dev_port").and_then(|v| v.parse::<u16>().ok()));
+                let resolved_subnqn = subnqn.clone().or_else(|| format_fields.get("backing_dev_subnqn").filter(|s| !s.is_empty()).cloned());
+
+                if let (Some(ip_val), Some(port_val), Some(nqn_val)) = (resolved_ip, resolved_port, resolved_subnqn) {
+                    log::info!("Backing device {} not found. Connecting to NVMe-oF target at {}:{} / {}...", resolved_backing_dev, ip_val, port_val, nqn_val);
+                    if let Ok(dev_path) = squeezefs::nvmeof::connect_target(&ip_val, port_val, &nqn_val) {
+                        log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
+                        resolved_backing_dev = dev_path;
+                    }
+                }
             }
+
+            // If the backing device is an LVM logical volume built on loop physical volumes (flat files), auto-rebind and activate them
+            let lvm_vg = format_fields.get("lvm_vg").filter(|s| !s.is_empty()).map(|s| s.as_str());
+            let lvm_loops_str = format_fields.get("lvm_loops").filter(|s| !s.is_empty());
+            let lvm_loops = lvm_loops_str.and_then(|s| {
+                serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok()
+            }).unwrap_or_default();
+            let _ = squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
+
+            // If the backing device path is in /dev/shm or /tmp and does not exist (e.g. after reboot), auto-recreate it
+            if (resolved_backing_dev.starts_with("/dev/shm/") || resolved_backing_dev.starts_with("/tmp/")) && !std::path::Path::new(&resolved_backing_dev).exists() {
+                let capacity_str = format_fields.get("capacity").cloned().unwrap_or_else(|| "1G".to_string());
+                let capacity_bytes = squeezefs::cache::parse_size_string(&capacity_str, 1024 * 1024 * 1024).unwrap_or(1024 * 1024 * 1024);
+                log::info!("Re-initializing in-memory backing device file at {} with capacity {}...", resolved_backing_dev, capacity_str);
+                if let Ok(file) = std::fs::File::create(&resolved_backing_dev) {
+                    let _ = file.set_len(capacity_bytes);
+                }
+            }
+
+            squeezefs::storage::validate_backing_device(&resolved_backing_dev)?;
 
             log::info!("Backing Block Device: {}", resolved_backing_dev);
             let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
@@ -1803,6 +1966,63 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = cache.nvme.p2p_addr.set(addr.clone());
             }
             let router = DataRouter::new(dlm.clone(), cache, block_alloc.clone(), nvme_dev.clone());
+
+            // Load supplementary backends from Garnet
+            if let Ok(mut con) = dlm.meta_client().get_connection().await {
+                use redis::AsyncCommands;
+                let backends_raw: std::collections::HashMap<String, String> = con
+                    .hgetall(squeezefs::fs_key!("backends"))
+                    .await
+                    .unwrap_or_default();
+                for (be_id, be_json) in backends_raw {
+                    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
+                        if let Some(bd) = config["backing_dev"].as_str() {
+                            let mut resolved_bd = bd.to_string();
+                            if !std::path::Path::new(&resolved_bd).exists() {
+                                let ip_val = config["ip"].as_str();
+                                let port_val = config["port"].as_u64().map(|p| p as u16);
+                                let nqn_val = config["subnqn"].as_str();
+                                if let (Some(ip), Some(port), Some(subnqn)) = (ip_val, port_val, nqn_val) {
+                                    log::info!("Supplementary backend '{}' device not found. Connecting to NVMe-oF target at {}:{} / {}...", be_id, ip, port, subnqn);
+                                    if let Ok(dev_path) = squeezefs::nvmeof::connect_target(ip, port, subnqn) {
+                                        log::info!("Connected supplementary backend '{}' to: {}", be_id, dev_path);
+                                        resolved_bd = dev_path;
+                                    }
+                                }
+                            }
+                            let lvm_vg = config["lvm_vg"].as_str();
+                            let lvm_loops = config["lvm_loops"].as_object().map(|obj| {
+                                obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect::<std::collections::HashMap<String, String>>()
+                            }).unwrap_or_default();
+                            let _ = squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
+                            let _resolved_cap = config["capacity"].as_u64().unwrap_or(1024 * 1024 * 1024 * 1024);
+                            let device = squeezefs::nvme_dev::NvmeBlockDev::new(&resolved_bd);
+                            let dev_arc = std::sync::Arc::new(device);
+                            let be_alloc_name = format!("{}:{}", fs_name, be_id);
+                            if let Ok(allocator) = squeezefs::block_allocator::BlockAllocator::new(
+                                std::sync::Arc::new(dlm.meta_client().clone()),
+                                &be_alloc_name,
+                            ).await {
+                                router.backend_router.backends.insert(
+                                    be_id,
+                                    std::sync::Arc::new(squeezefs::routing::StorageBackend {
+                                        device: dev_arc,
+                                        block_allocator: std::sync::Arc::new(allocator),
+                                    })
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Set active write backend
+                let active_be: String = con
+                    .hget(squeezefs::fs_key!("format"), "active_write_backend")
+                    .await
+                    .unwrap_or(Some("backend_0".to_string()))
+                    .unwrap_or_else(|| "backend_0".to_string());
+                *router.backend_router.active_write_backend.write() = active_be;
+            }
             let resolved_uid = uid.unwrap_or_else(|| {
                 std::env::var("SUDO_UID")
                     .ok()
@@ -1912,6 +2132,63 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 nvme_dev.clone(),
             )?;
             let router = DataRouter::new(dlm, cache, block_alloc.clone(), nvme_dev.clone());
+
+            // Load supplementary backends from Garnet
+            if let Ok(mut con) = router.dlm.meta_client().get_connection().await {
+                use redis::AsyncCommands;
+                let backends_raw: std::collections::HashMap<String, String> = con
+                    .hgetall(squeezefs::fs_key!("backends"))
+                    .await
+                    .unwrap_or_default();
+                for (be_id, be_json) in backends_raw {
+                    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
+                        if let Some(bd) = config["backing_dev"].as_str() {
+                            let mut resolved_bd = bd.to_string();
+                            if !std::path::Path::new(&resolved_bd).exists() {
+                                let ip_val = config["ip"].as_str();
+                                let port_val = config["port"].as_u64().map(|p| p as u16);
+                                let nqn_val = config["subnqn"].as_str();
+                                if let (Some(ip), Some(port), Some(subnqn)) = (ip_val, port_val, nqn_val) {
+                                    log::info!("Supplementary backend '{}' device not found. Connecting to NVMe-oF target at {}:{} / {}...", be_id, ip, port, subnqn);
+                                    if let Ok(dev_path) = squeezefs::nvmeof::connect_target(ip, port, subnqn) {
+                                        log::info!("Connected supplementary backend '{}' to: {}", be_id, dev_path);
+                                        resolved_bd = dev_path;
+                                    }
+                                }
+                            }
+                            let lvm_vg = config["lvm_vg"].as_str();
+                            let lvm_loops = config["lvm_loops"].as_object().map(|obj| {
+                                obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect::<std::collections::HashMap<String, String>>()
+                            }).unwrap_or_default();
+                            let _ = squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
+                            let _resolved_cap = config["capacity"].as_u64().unwrap_or(1024 * 1024 * 1024 * 1024);
+                            let device = squeezefs::nvme_dev::NvmeBlockDev::new(&resolved_bd);
+                            let dev_arc = std::sync::Arc::new(device);
+                            let be_alloc_name = format!("{}:{}", fs_name, be_id);
+                            if let Ok(allocator) = squeezefs::block_allocator::BlockAllocator::new(
+                                std::sync::Arc::new(router.dlm.meta_client().clone()),
+                                &be_alloc_name,
+                            ).await {
+                                router.backend_router.backends.insert(
+                                    be_id,
+                                    std::sync::Arc::new(squeezefs::routing::StorageBackend {
+                                        device: dev_arc,
+                                        block_allocator: std::sync::Arc::new(allocator),
+                                    })
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Set active write backend
+                let active_be: String = con
+                    .hget(squeezefs::fs_key!("format"), "active_write_backend")
+                    .await
+                    .unwrap_or(Some("backend_0".to_string()))
+                    .unwrap_or_else(|| "backend_0".to_string());
+                *router.backend_router.active_write_backend.write() = active_be;
+            }
 
             println!("Cloning file from {} to {}...", src, dest);
             router.clone_path(&src, &dest).await?;
@@ -2086,6 +2363,61 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let list =
                             squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
                         println!("{}", serde_json::to_string_pretty(&list.diskcaches)?);
+                    }
+                },
+                ConfigActions::Volume(action) => match action {
+                    VolumeActions::Add { volume_id, volume: backing_dev, ip, port, subnqn, capacity } => {
+                        let backend_id = volume_id;
+                        let resolved_capacity = if let Some(ref cap_str) = capacity {
+                            if let Ok(bytes) = squeezefs::cache::parse_size_string(cap_str, 0) {
+                                Some(bytes)
+                            } else {
+                                return Err(Box::new(squeezefs::error::SqueezefsError::InvalidOperation(format!(
+                                    "Invalid capacity string: {}",
+                                    cap_str
+                                ))));
+                            }
+                        } else {
+                            None
+                        };
+                        squeezefs::config_ops::add_storage_backend(
+                            &garnet_url,
+                            &fs_name,
+                            &backend_id,
+                            backing_dev.as_deref(),
+                            ip.as_deref(),
+                            port,
+                            subnqn.as_deref(),
+                            resolved_capacity,
+                        )
+                        .await?;
+                        println!("Storage volume '{}' registered/added successfully.", backend_id);
+                    }
+                    VolumeActions::Remove { volume_id, force } => {
+                        let backend_id = volume_id;
+                        squeezefs::config_ops::remove_storage_backend(
+                            &garnet_url,
+                            &fs_name,
+                            &backend_id,
+                            force,
+                        )
+                        .await?;
+                        println!("Storage volume '{}' removed successfully.", backend_id);
+                    }
+                    VolumeActions::List => {
+                        let list =
+                            squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                        println!("{}", serde_json::to_string_pretty(&list.backends)?);
+                    }
+                    VolumeActions::SetActive { volume_id } => {
+                        let backend_id = volume_id;
+                        squeezefs::config_ops::set_active_backend(
+                            &garnet_url,
+                            &fs_name,
+                            &backend_id,
+                        )
+                        .await?;
+                        println!("Active write volume set to '{}' successfully.", backend_id);
                     }
                 },
                 ConfigActions::List => {

@@ -477,8 +477,18 @@ pub fn validate_backing_device(path: &str) -> Result<()> {
         return Ok(());
     }
 
+    let mut lvs_target = real_path_str.to_string();
+    if real_path_str.starts_with("/dev/dm-") {
+        if let Some(dev_name) = real_path.file_name() {
+            let dm_name_path = format!("/sys/block/{}/dm/name", dev_name.to_string_lossy());
+            if let Ok(name) = fs::read_to_string(dm_name_path) {
+                lvs_target = format!("/dev/mapper/{}", name.trim());
+            }
+        }
+    }
+
     let output = std::process::Command::new("lvs")
-        .args(["-o", "vg_name", "--noheadings", &real_path_str])
+        .args(["-o", "vg_name", "--noheadings", &lvs_target])
         .output();
     if let Ok(out) = output {
         if out.status.success() {

@@ -1388,6 +1388,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             squeezefs::cache::parse_duration(&upload_delay)?;
 
+            if let Some(ref path) = backing_dev {
+                squeezefs::storage::validate_backing_device(path)?;
+            }
+
             squeezefs::fuse_client::format_volume_ext(
                 redis_url,
                 &name,
@@ -1671,6 +1675,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await?,
             );
 
+            let has_explicit_backing =
+                backing_dev.is_some() || format_fields.contains_key("backing_dev");
+
             // Resolve backing device path: CLI override > Garnet format setting > default to local staging path
             let resolved_backing_dev = backing_dev
                 .or_else(|| {
@@ -1680,6 +1687,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .cloned()
                 })
                 .unwrap_or_else(|| format!("{}/.squeezefs_nvme", active_staging_dirs[0].display()));
+
+            if has_explicit_backing {
+                squeezefs::storage::validate_backing_device(&resolved_backing_dev)?;
+            }
 
             log::info!("Backing Block Device: {}", resolved_backing_dev);
             let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(

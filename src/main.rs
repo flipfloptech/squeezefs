@@ -668,6 +668,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Commands::Mount {
         garnet_url,
         mountpoint,
+        fs_name,
         mem_cache_size,
         disk_cache_size,
         disk_cache_paths,
@@ -733,6 +734,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = print_mount_diagnostics(
             garnet_url,
             mountpoint,
+            fs_name,
             *daemon,
             mem_cache_size.as_deref(),
             disk_cache_size.as_deref(),
@@ -1006,6 +1008,7 @@ fn halve_size_string(val: &str, default_fallback: &str) -> String {
 fn print_mount_diagnostics(
     garnet_url: &str,
     mountpoint: &Path,
+    fs_name: &str,
     daemon: bool,
     mem_cache_size: Option<&str>,
     disk_cache_size: Option<&str>,
@@ -1022,6 +1025,7 @@ fn print_mount_diagnostics(
     fuse_io_uring_sqpoll_cpu: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use redis::Commands;
+    squeezefs::set_fs_prefix(fs_name);
     let client = redis::Client::open(garnet_url)?;
     let mut con = client.get_connection()?;
     let format_fields: std::collections::HashMap<String, String> =

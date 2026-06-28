@@ -34,8 +34,10 @@ async fn connect_redis(redis_url: &str) -> Result<redis::aio::MultiplexedConnect
 pub async fn list_config(redis_url: &str, _fs_name: &str) -> Result<ConfigList> {
     let mut con = connect_redis(redis_url).await?;
 
-    let format_fields: HashMap<String, String> =
-        con.hgetall("squeezefs:format").await.unwrap_or_default();
+    let format_fields: HashMap<String, String> = con
+        .hgetall(crate::fs_key!("format"))
+        .await
+        .unwrap_or_default();
 
     let active_write_backend = format_fields
         .get("active_write_backend")
@@ -53,7 +55,7 @@ pub async fn list_config(redis_url: &str, _fs_name: &str) -> Result<ConfigList> 
     };
 
     let status_map: HashMap<String, String> = con
-        .hgetall("squeezefs:diskcache:status")
+        .hgetall(crate::fs_key!("diskcache:status"))
         .await
         .unwrap_or_default();
 
@@ -67,11 +69,13 @@ pub async fn list_config(redis_url: &str, _fs_name: &str) -> Result<ConfigList> 
         diskcaches.push(DiskCacheInfo { path: p, status });
     }
 
-    let backends: HashMap<String, String> =
-        con.hgetall("squeezefs:backends").await.unwrap_or_default();
+    let backends: HashMap<String, String> = con
+        .hgetall(crate::fs_key!("backends"))
+        .await
+        .unwrap_or_default();
 
     let mut backend_statuses: HashMap<String, String> = con
-        .hgetall("squeezefs:backend:status")
+        .hgetall(crate::fs_key!("backend:status"))
         .await
         .unwrap_or_default();
 
@@ -93,8 +97,9 @@ pub async fn add_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Path) -
     let mut con = connect_redis(redis_url).await?;
     let path_str = path.to_string_lossy().to_string();
 
-    let current_paths_str: Option<String> =
-        con.hget("squeezefs:format", "disk_cache_paths").await?;
+    let current_paths_str: Option<String> = con
+        .hget(crate::fs_key!("format"), "disk_cache_paths")
+        .await?;
     let mut paths: Vec<String> = current_paths_str
         .as_deref()
         .unwrap_or("")
@@ -111,8 +116,8 @@ pub async fn add_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Path) -
     let new_paths_str = paths.join(",");
 
     let _: () = redis::pipe()
-        .hset("squeezefs:format", "disk_cache_paths", new_paths_str)
-        .hset("squeezefs:diskcache:status", &path_str, "enabled")
+        .hset(crate::fs_key!("format"), "disk_cache_paths", new_paths_str)
+        .hset(crate::fs_key!("diskcache:status"), &path_str, "enabled")
         .query_async(&mut con)
         .await?;
 
@@ -124,13 +129,14 @@ pub async fn disable_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Pat
     let path_str = path.to_string_lossy().to_string();
 
     let exists: bool = con
-        .hexists("squeezefs:diskcache:status", &path_str)
+        .hexists(crate::fs_key!("diskcache:status"), &path_str)
         .await
         .unwrap_or(false);
     if !exists {
         // Double check in format paths
-        let current_paths_str: Option<String> =
-            con.hget("squeezefs:format", "disk_cache_paths").await?;
+        let current_paths_str: Option<String> = con
+            .hget(crate::fs_key!("format"), "disk_cache_paths")
+            .await?;
         let has_path = current_paths_str
             .as_deref()
             .unwrap_or("")
@@ -145,7 +151,7 @@ pub async fn disable_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Pat
     }
 
     let _: () = con
-        .hset("squeezefs:diskcache:status", &path_str, "disabled")
+        .hset(crate::fs_key!("diskcache:status"), &path_str, "disabled")
         .await?;
     Ok(())
 }
@@ -154,8 +160,9 @@ pub async fn enable_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Path
     let mut con = connect_redis(redis_url).await?;
     let path_str = path.to_string_lossy().to_string();
 
-    let current_paths_str: Option<String> =
-        con.hget("squeezefs:format", "disk_cache_paths").await?;
+    let current_paths_str: Option<String> = con
+        .hget(crate::fs_key!("format"), "disk_cache_paths")
+        .await?;
     let has_path = current_paths_str
         .as_deref()
         .unwrap_or("")
@@ -169,7 +176,7 @@ pub async fn enable_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Path
     }
 
     let _: () = con
-        .hset("squeezefs:diskcache:status", &path_str, "enabled")
+        .hset(crate::fs_key!("diskcache:status"), &path_str, "enabled")
         .await?;
     Ok(())
 }
@@ -179,7 +186,9 @@ pub async fn flush_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Path)
     let path_str = path.to_string_lossy().to_string();
 
     // Verification: must be disabled first
-    let status: Option<String> = con.hget("squeezefs:diskcache:status", &path_str).await?;
+    let status: Option<String> = con
+        .hget(crate::fs_key!("diskcache:status"), &path_str)
+        .await?;
     if status.as_deref() != Some("disabled") {
         return Err(SqueezefsError::InvalidOperation(format!(
             "Cannot flush disk cache '{}' because it is not disabled",
@@ -204,8 +213,9 @@ pub async fn remove_disk_cache_path(
     let mut con = connect_redis(redis_url).await?;
     let path_str = path.to_string_lossy().to_string();
 
-    let current_paths_str: Option<String> =
-        con.hget("squeezefs:format", "disk_cache_paths").await?;
+    let current_paths_str: Option<String> = con
+        .hget(crate::fs_key!("format"), "disk_cache_paths")
+        .await?;
     let mut paths: Vec<String> = current_paths_str
         .as_deref()
         .unwrap_or("")
@@ -223,7 +233,9 @@ pub async fn remove_disk_cache_path(
 
     if !force {
         // Verification: must be disabled
-        let status: Option<String> = con.hget("squeezefs:diskcache:status", &path_str).await?;
+        let status: Option<String> = con
+            .hget(crate::fs_key!("diskcache:status"), &path_str)
+            .await?;
         if status.as_deref() != Some("disabled") {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "Cannot remove disk cache '{}' because it is not disabled",
@@ -254,8 +266,8 @@ pub async fn remove_disk_cache_path(
     let new_paths_str = paths.join(",");
 
     let _: () = redis::pipe()
-        .hset("squeezefs:format", "disk_cache_paths", new_paths_str)
-        .hdel("squeezefs:diskcache:status", &path_str)
+        .hset(crate::fs_key!("format"), "disk_cache_paths", new_paths_str)
+        .hdel(crate::fs_key!("diskcache:status"), &path_str)
         .query_async(&mut con)
         .await?;
 
@@ -273,7 +285,7 @@ pub async fn add_storage_backend(
 ) -> Result<()> {
     let mut con = connect_redis(redis_url).await?;
 
-    let name_exists: bool = con.hexists("squeezefs:backends", backend_id).await?;
+    let name_exists: bool = con.hexists(crate::fs_key!("backends"), backend_id).await?;
     if name_exists {
         return Err(SqueezefsError::InvalidOperation(format!(
             "Backend name '{}' already exists in registry",
@@ -281,8 +293,10 @@ pub async fn add_storage_backend(
         )));
     }
 
-    let backends_map: std::collections::HashMap<String, String> =
-        con.hgetall("squeezefs:backends").await.unwrap_or_default();
+    let backends_map: std::collections::HashMap<String, String> = con
+        .hgetall(crate::fs_key!("backends"))
+        .await
+        .unwrap_or_default();
     for (be_id, be_json) in backends_map {
         if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
             let ep = config["endpoint"].as_str().unwrap_or("");
@@ -305,8 +319,8 @@ pub async fn add_storage_backend(
     .to_string();
 
     let _: () = redis::pipe()
-        .hset("squeezefs:backends", backend_id, backend_json)
-        .hset("squeezefs:backend:status", backend_id, "enabled")
+        .hset(crate::fs_key!("backends"), backend_id, backend_json)
+        .hset(crate::fs_key!("backend:status"), backend_id, "enabled")
         .query_async(&mut con)
         .await?;
     Ok(())
@@ -322,8 +336,10 @@ pub async fn remove_storage_backend(
 
     if !force {
         // Verification: cannot delete active write backend
-        let format_fields: HashMap<String, String> =
-            con.hgetall("squeezefs:format").await.unwrap_or_default();
+        let format_fields: HashMap<String, String> = con
+            .hgetall(crate::fs_key!("format"))
+            .await
+            .unwrap_or_default();
         let active_be_id = format_fields
             .get("active_write_backend")
             .cloned()
@@ -401,7 +417,7 @@ pub async fn remove_storage_backend(
         }
     }
 
-    let _: () = con.hdel("squeezefs:backends", backend_id).await?;
+    let _: () = con.hdel(crate::fs_key!("backends"), backend_id).await?;
     Ok(())
 }
 
@@ -410,7 +426,7 @@ pub async fn set_active_backend(redis_url: &str, _fs_name: &str, backend_id: &st
 
     // Check if backend exists
     let exists: bool = con
-        .hexists("squeezefs:backends", backend_id)
+        .hexists(crate::fs_key!("backends"), backend_id)
         .await
         .unwrap_or(false);
     if !exists && backend_id != "backend_0" {
@@ -421,7 +437,7 @@ pub async fn set_active_backend(redis_url: &str, _fs_name: &str, backend_id: &st
     }
 
     let _: () = con
-        .hset("squeezefs:format", "active_write_backend", backend_id)
+        .hset(crate::fs_key!("format"), "active_write_backend", backend_id)
         .await?;
     Ok(())
 }
@@ -431,8 +447,10 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
     let mut issues = Vec::new();
 
     // 1. Fetch all registered backends
-    let backends: HashMap<String, String> =
-        con.hgetall("squeezefs:backends").await.unwrap_or_default();
+    let backends: HashMap<String, String> = con
+        .hgetall(crate::fs_key!("backends"))
+        .await
+        .unwrap_or_default();
 
     // 2. Scan all metadata
     let mut metadata_keys = Vec::new();
@@ -539,7 +557,7 @@ pub async fn enable_storage_backend(
 ) -> Result<()> {
     let mut con = connect_redis(redis_url).await?;
 
-    let exists: bool = con.hexists("squeezefs:backends", backend_id).await?;
+    let exists: bool = con.hexists(crate::fs_key!("backends"), backend_id).await?;
     if !exists && backend_id != "backend_0" {
         return Err(SqueezefsError::InvalidOperation(format!(
             "Backend '{}' does not exist in registry",
@@ -548,7 +566,7 @@ pub async fn enable_storage_backend(
     }
 
     let _: () = con
-        .hset("squeezefs:backend:status", backend_id, "enabled")
+        .hset(crate::fs_key!("backend:status"), backend_id, "enabled")
         .await?;
     Ok(())
 }
@@ -560,7 +578,7 @@ pub async fn disable_storage_backend(
 ) -> Result<()> {
     let mut con = connect_redis(redis_url).await?;
 
-    let exists: bool = con.hexists("squeezefs:backends", backend_id).await?;
+    let exists: bool = con.hexists(crate::fs_key!("backends"), backend_id).await?;
     if !exists && backend_id != "backend_0" {
         return Err(SqueezefsError::InvalidOperation(format!(
             "Backend '{}' does not exist in registry",
@@ -568,10 +586,12 @@ pub async fn disable_storage_backend(
         )));
     }
 
-    let backends_map: std::collections::HashMap<String, String> =
-        con.hgetall("squeezefs:backends").await.unwrap_or_default();
+    let backends_map: std::collections::HashMap<String, String> = con
+        .hgetall(crate::fs_key!("backends"))
+        .await
+        .unwrap_or_default();
     let statuses: std::collections::HashMap<String, String> = con
-        .hgetall("squeezefs:backend:status")
+        .hgetall(crate::fs_key!("backend:status"))
         .await
         .unwrap_or_default();
 
@@ -604,7 +624,7 @@ pub async fn disable_storage_backend(
     }
 
     let _: () = con
-        .hset("squeezefs:backend:status", backend_id, "disabled")
+        .hset(crate::fs_key!("backend:status"), backend_id, "disabled")
         .await?;
     Ok(())
 }
@@ -620,7 +640,9 @@ pub async fn set_config_quota(
     match key.to_lowercase().as_str() {
         "capacity" => {
             let bytes = crate::cache::parse_size_string(value, 0)?;
-            let _: () = con.hset("squeezefs:format", "capacity", bytes).await?;
+            let _: () = con
+                .hset(crate::fs_key!("format"), "capacity", bytes)
+                .await?;
             println!("Configuration quota 'capacity' set to {} bytes.", bytes);
         }
         "inodes" => {
@@ -630,20 +652,20 @@ pub async fn set_config_quota(
                     value, e
                 ))
             })?;
-            let _: () = con.hset("squeezefs:format", "inodes", limit).await?;
+            let _: () = con.hset(crate::fs_key!("format"), "inodes", limit).await?;
             println!("Configuration quota 'inodes' set to {}.", limit);
         }
         "mem_cache_size" | "mem-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
             let _: () = con
-                .hset("squeezefs:format", "mem_cache_size", value)
+                .hset(crate::fs_key!("format"), "mem_cache_size", value)
                 .await?;
             println!("Configuration quota 'mem_cache_size' set to '{}'.", value);
         }
         "read_mem_cache_size" | "read-mem-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
             let _: () = con
-                .hset("squeezefs:format", "read_mem_cache_size", value)
+                .hset(crate::fs_key!("format"), "read_mem_cache_size", value)
                 .await?;
             println!(
                 "Configuration quota 'read_mem_cache_size' set to '{}'.",
@@ -653,7 +675,7 @@ pub async fn set_config_quota(
         "write_mem_cache_size" | "write-mem-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
             let _: () = con
-                .hset("squeezefs:format", "write_mem_cache_size", value)
+                .hset(crate::fs_key!("format"), "write_mem_cache_size", value)
                 .await?;
             println!(
                 "Configuration quota 'write_mem_cache_size' set to '{}'.",
@@ -663,21 +685,21 @@ pub async fn set_config_quota(
         "disk_cache_size" | "disk-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
             let _: () = con
-                .hset("squeezefs:format", "disk_cache_size", value)
+                .hset(crate::fs_key!("format"), "disk_cache_size", value)
                 .await?;
             println!("Configuration quota 'disk_cache_size' set to '{}'.", value);
         }
         "read_cache_size" | "read-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
             let _: () = con
-                .hset("squeezefs:format", "read_cache_size", value)
+                .hset(crate::fs_key!("format"), "read_cache_size", value)
                 .await?;
             println!("Configuration quota 'read_cache_size' set to '{}'.", value);
         }
         "write_cache_size" | "write-cache-size" => {
             let _ = crate::cache::parse_size_string(value, 1024 * 1024 * 1024)?;
             let _: () = con
-                .hset("squeezefs:format", "write_cache_size", value)
+                .hset(crate::fs_key!("format"), "write_cache_size", value)
                 .await?;
             println!("Configuration quota 'write_cache_size' set to '{}'.", value);
         }
@@ -691,7 +713,7 @@ pub async fn set_config_quota(
             let stored_value = if parsed == 0 { "" } else { value };
             let _: () = con
                 .hset(
-                    "squeezefs:format",
+                    crate::fs_key!("format"),
                     "fuse_io_uring_sqpoll_idle_ms",
                     stored_value,
                 )

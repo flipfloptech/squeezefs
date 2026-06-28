@@ -482,14 +482,15 @@ impl DataRouter {
         let mapping_key = format!("mapping:{}", old_id);
         let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
         if let Some(bk) = block_key {
-            let refcounts_key = "squeezefs:block_refcounts";
+            let refcounts_key_str = crate::fs_key!("block_refcounts");
+            let refcounts_key = &refcounts_key_str;
             let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
             if let Some(mut r) = current_ref {
                 r -= 1;
                 if r <= 0 {
                     let _: () = redis::pipe()
                         .hdel(refcounts_key, &bk)
-                        .hdel("squeezefs:block_sizes", &bk)
+                        .hdel(crate::fs_key!("block_sizes"), &bk)
                         .query_async(con)
                         .await?;
                     if let Ok(offset_u64) = bk.parse::<u64>() {
@@ -499,7 +500,10 @@ impl DataRouter {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
             } else {
-                let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
+                let _: () = con
+                    .hdel(crate::fs_key!("block_sizes"), &bk)
+                    .await
+                    .unwrap_or(());
                 if let Ok(offset_u64) = bk.parse::<u64>() {
                     let _ = self.block_allocator.free_block(offset_u64).await;
                 }
@@ -637,7 +641,8 @@ impl DataRouter {
 
             // Register block mappings and reference counts in Garnet
             let block_map_key = format!("block_map:{}", block_map_id);
-            let refcounts_key = "squeezefs:block_refcounts";
+            let refcounts_key_str = crate::fs_key!("block_refcounts");
+            let refcounts_key = &refcounts_key_str;
             let mut pipe_map = redis::pipe();
             for (idx_str, key) in &block_mappings {
                 pipe_map.hset(&block_map_key, idx_str, key);
@@ -645,7 +650,7 @@ impl DataRouter {
             }
             for (key, logical, physical) in &sizes_to_register {
                 pipe_map.hset(
-                    "squeezefs:block_sizes",
+                    crate::fs_key!("block_sizes"),
                     key,
                     format!("{}:{}", logical, physical),
                 );
@@ -849,9 +854,9 @@ impl DataRouter {
                         .hset(&mapping_key, "block", &stored_block_key)
                         .hset(&mapping_key, "offset", 0u64)
                         .hset(&mapping_key, "size", size)
-                        .hset("squeezefs:block_refcounts", &stored_block_key, 1)
+                        .hset(crate::fs_key!("block_refcounts"), &stored_block_key, 1)
                         .hset(
-                            "squeezefs:block_sizes",
+                            crate::fs_key!("block_sizes"),
                             &stored_block_key,
                             format!("{}:{}", shared_data.len(), processed_data.len()),
                         )
@@ -922,7 +927,8 @@ impl DataRouter {
 
             // Register block mappings and reference counts in Garnet
             let block_map_key = format!("block_map:{}", block_map_id);
-            let refcounts_key = "squeezefs:block_refcounts";
+            let refcounts_key_str = crate::fs_key!("block_refcounts");
+            let refcounts_key = &refcounts_key_str;
             let mut pipe_map = redis::pipe();
             for (idx_str, key) in &block_mappings {
                 pipe_map.hset(&block_map_key, idx_str, key);
@@ -930,7 +936,7 @@ impl DataRouter {
             }
             for (key, logical, physical) in &sizes_to_register {
                 pipe_map.hset(
-                    "squeezefs:block_sizes",
+                    crate::fs_key!("block_sizes"),
                     key,
                     format!("{}:{}", logical, physical),
                 );
@@ -981,7 +987,7 @@ impl DataRouter {
                         if r <= 0 {
                             let _: () = redis::pipe()
                                 .hdel(refcounts_key, &bk)
-                                .hdel("squeezefs:block_sizes", &bk)
+                                .hdel(crate::fs_key!("block_sizes"), &bk)
                                 .query_async(&mut con)
                                 .await?;
                             if let Ok(offset_u64) = bk.parse::<u64>() {
@@ -991,7 +997,10 @@ impl DataRouter {
                             let _: () = con.hset(refcounts_key, &bk, r).await?;
                         }
                     } else {
-                        let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
+                        let _: () = con
+                            .hdel(crate::fs_key!("block_sizes"), &bk)
+                            .await
+                            .unwrap_or(());
                         if let Ok(offset_u64) = bk.parse::<u64>() {
                             let _ = self.block_allocator.free_block(offset_u64).await;
                         }
@@ -1033,7 +1042,8 @@ impl DataRouter {
 
                 let new_id = Uuid::new_v4().to_string();
                 let block_map_key = format!("block_map:{}", new_id);
-                let refcounts_key = "squeezefs:block_refcounts";
+                let refcounts_key_str = crate::fs_key!("block_refcounts");
+                let refcounts_key = &refcounts_key_str;
                 let mut pipe = redis::pipe();
                 for i in 0..num_blocks {
                     let old_key = format!("{}/part_{}", block_prefix, i);
@@ -1067,7 +1077,8 @@ impl DataRouter {
         }
 
         let block_map_key = format!("block_map:{}", block_map_id);
-        let refcounts_key = "squeezefs:block_refcounts";
+        let refcounts_key_str = crate::fs_key!("block_refcounts");
+        let refcounts_key = &refcounts_key_str;
 
         // 1. Fill any block gaps: gaps are now supported natively as sparse blocks
         // (i.e. not written to backing device and mapped to None in block map), so no action is required here.
@@ -1182,7 +1193,7 @@ impl DataRouter {
                 .hset(refcounts_key, &new_block_key, 1)
                 .hset(&block_map_key, b.to_string(), &new_block_key)
                 .hset(
-                    "squeezefs:block_sizes",
+                    crate::fs_key!("block_sizes"),
                     &new_block_key,
                     format!("{}:{}", logical_size, physical_size),
                 );
@@ -1202,7 +1213,7 @@ impl DataRouter {
                 if r <= 0 {
                     let _: () = redis::pipe()
                         .hdel(refcounts_key, &bk)
-                        .hdel("squeezefs:block_sizes", &bk)
+                        .hdel(crate::fs_key!("block_sizes"), &bk)
                         .query_async(con)
                         .await?;
                     if let Ok(offset_u64) = bk.parse::<u64>() {
@@ -1212,7 +1223,10 @@ impl DataRouter {
                     let _: () = con.hset(refcounts_key, &bk, r).await?;
                 }
             } else {
-                let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
+                let _: () = con
+                    .hdel(crate::fs_key!("block_sizes"), &bk)
+                    .await
+                    .unwrap_or(());
                 if let Ok(offset_u64) = bk.parse::<u64>() {
                     let _ = self.block_allocator.free_block(offset_u64).await;
                 }
@@ -2110,7 +2124,8 @@ impl DataRouter {
                     .hset(&mapping_dest_key, "size", s);
                 let _: () = map_pipe.query_async(&mut dest_con).await?;
 
-                let refcounts_key = "squeezefs:block_refcounts";
+                let refcounts_key_str = crate::fs_key!("block_refcounts");
+                let refcounts_key = &refcounts_key_str;
                 let current_ref: Option<i32> = con.hget(refcounts_key, bk).await?;
                 let new_ref = current_ref.unwrap_or(1) + 1;
                 let _: () = con.hset(refcounts_key, bk, new_ref).await?;
@@ -2150,7 +2165,8 @@ impl DataRouter {
 
                     let new_id = Uuid::new_v4().to_string();
                     let block_map_key = format!("block_map:{}", new_id);
-                    let refcounts_key = "squeezefs:block_refcounts";
+                    let refcounts_key_str = crate::fs_key!("block_refcounts");
+                    let refcounts_key = &refcounts_key_str;
 
                     let mut map_pipe = redis::pipe();
                     for i in 0..num_blocks {
@@ -2179,7 +2195,8 @@ impl DataRouter {
             let dest_block_map_id = Uuid::new_v4().to_string();
             let src_block_map_key = format!("block_map:{}", src_block_map_id);
             let dest_block_map_key = format!("block_map:{}", dest_block_map_id);
-            let refcounts_key = "squeezefs:block_refcounts";
+            let refcounts_key_str = crate::fs_key!("block_refcounts");
+            let refcounts_key = &refcounts_key_str;
 
             let block_mappings: std::collections::HashMap<String, String> =
                 src_con.hgetall(&src_block_map_key).await?;
@@ -2247,7 +2264,8 @@ impl DataRouter {
                 let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
                 if let Some(block_map_id) = block_map_id_opt {
                     let block_map_key = format!("block_map:{}", block_map_id);
-                    let refcounts_key = "squeezefs:block_refcounts";
+                    let refcounts_key_str = crate::fs_key!("block_refcounts");
+                    let refcounts_key = &refcounts_key_str;
 
                     let block_mappings: std::collections::HashMap<String, String> =
                         con.hgetall(&block_map_key).await?;
@@ -2263,7 +2281,7 @@ impl DataRouter {
                             if r <= 0 {
                                 let _: () = redis::pipe()
                                     .hdel(refcounts_key, &bk)
-                                    .hdel("squeezefs:block_sizes", &bk)
+                                    .hdel(crate::fs_key!("block_sizes"), &bk)
                                     .query_async(con)
                                     .await?;
                                 if let Ok(offset_u64) = bk.parse::<u64>() {
@@ -2273,7 +2291,10 @@ impl DataRouter {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
                         } else {
-                            let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
+                            let _: () = con
+                                .hdel(crate::fs_key!("block_sizes"), &bk)
+                                .await
+                                .unwrap_or(());
                             if let Ok(offset_u64) = bk.parse::<u64>() {
                                 let _ = self.block_allocator.free_block(offset_u64).await;
                             }
@@ -2287,14 +2308,15 @@ impl DataRouter {
                     let mapping_key = format!("mapping:{}", fid);
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     if let Some(bk) = block_key {
-                        let refcounts_key = "squeezefs:block_refcounts";
+                        let refcounts_key_str = crate::fs_key!("block_refcounts");
+                        let refcounts_key = &refcounts_key_str;
                         let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
                         if let Some(mut r) = current_ref {
                             r -= 1;
                             if r <= 0 {
                                 let _: () = redis::pipe()
                                     .hdel(refcounts_key, &bk)
-                                    .hdel("squeezefs:block_sizes", &bk)
+                                    .hdel(crate::fs_key!("block_sizes"), &bk)
                                     .query_async(con)
                                     .await?;
                                 if let Ok(offset_u64) = bk.parse::<u64>() {
@@ -2304,7 +2326,10 @@ impl DataRouter {
                                 let _: () = con.hset(refcounts_key, &bk, r).await?;
                             }
                         } else {
-                            let _: () = con.hdel("squeezefs:block_sizes", &bk).await.unwrap_or(());
+                            let _: () = con
+                                .hdel(crate::fs_key!("block_sizes"), &bk)
+                                .await
+                                .unwrap_or(());
                             if let Ok(offset_u64) = bk.parse::<u64>() {
                                 let _ = self.block_allocator.free_block(offset_u64).await;
                             }
@@ -2356,7 +2381,7 @@ impl DataRouter {
                 continue;
             }
             let mut con = self.dlm.get_connection_for_inode(current_ino).await?;
-            let dir_key = format!("squeezefs:dir:{}", current_ino);
+            let dir_key = format!("{}:dir:{}", crate::fs_prefix(), current_ino);
             let next_ino_opt: Option<u64> = con.hget(&dir_key, part).await?;
             match next_ino_opt {
                 Some(next_ino) => {
@@ -2393,7 +2418,7 @@ impl DataRouter {
         let parent_ino = self.resolve_path_to_inode(parent_str).await?;
 
         let mut parent_con = self.dlm.get_connection_for_inode(parent_ino).await?;
-        let parent_dir_key = format!("squeezefs:dir:{}", parent_ino);
+        let parent_dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent_ino);
 
         // Check if destination already exists
         let exists: bool = parent_con.hexists(&parent_dir_key, file_name).await?;
@@ -2407,12 +2432,12 @@ impl DataRouter {
         // Generate new inode number on parent's shard connection using shard count step increment
         let shard_count = self.dlm.shard_count() as i64;
         let dest_ino: u64 = parent_con
-            .incr("squeezefs:inode_counter", shard_count)
+            .incr(crate::fs_key!("inode_counter"), shard_count)
             .await?;
 
         // Retrieve attributes of source inode on its respective shard
         let mut src_con = self.dlm.get_connection_for_inode(src_ino).await?;
-        let src_attr_key = format!("squeezefs:attr:{}", src_ino);
+        let src_attr_key = format!("{}:attr:{}", crate::fs_prefix(), src_ino);
         let size_opt: Option<u64> = src_con.hget(&src_attr_key, "size").await?;
         let size = size_opt.unwrap_or(0);
         let mode_opt: Option<u32> = src_con.hget(&src_attr_key, "mode").await?;
@@ -2425,7 +2450,7 @@ impl DataRouter {
         let kind = kind_opt.unwrap_or(1); // 1 = Regular file
 
         // Set attributes of destination inode on parent_con (since dest_ino is on the same shard as parent_ino)
-        let dest_attr_key = format!("squeezefs:attr:{}", dest_ino);
+        let dest_attr_key = format!("{}:attr:{}", crate::fs_prefix(), dest_ino);
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);

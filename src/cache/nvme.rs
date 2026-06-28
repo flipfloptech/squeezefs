@@ -426,7 +426,7 @@ impl NvmeStaging {
                 if last_query.elapsed() >= query_interval {
                     if let Ok(mut con) = redis_client.get_connection().await {
                         let delay_str: Option<String> = redis::cmd("HGET")
-                            .arg("squeezefs:format")
+                            .arg(crate::fs_key!("format"))
                             .arg("upload_delay")
                             .query_async(&mut con)
                             .await
@@ -491,17 +491,17 @@ impl NvmeStaging {
         use redis::AsyncCommands;
 
         let compression: String = con
-            .hget("squeezefs:format", "compression")
+            .hget(crate::fs_key!("format"), "compression")
             .await
             .unwrap_or(None)
             .unwrap_or_else(|| "none".to_string());
         let encrypt_algo: String = con
-            .hget("squeezefs:format", "encrypt_algo")
+            .hget(crate::fs_key!("format"), "encrypt_algo")
             .await
             .unwrap_or(None)
             .unwrap_or_else(|| "none".to_string());
         let encrypt_key: Option<String> = con
-            .hget("squeezefs:format", "encrypt_key")
+            .hget(crate::fs_key!("format"), "encrypt_key")
             .await
             .unwrap_or(None);
 
@@ -581,7 +581,8 @@ impl NvmeStaging {
         }
 
         if let Ok(mut con) = redis_client.get_connection().await {
-            let refcounts_key = "squeezefs:block_refcounts";
+            let refcounts_key_str = crate::fs_key!("block_refcounts");
+            let refcounts_key = &refcounts_key_str;
             let _: std::result::Result<(), redis::RedisError> = redis::cmd("HSET")
                 .arg(refcounts_key)
                 .arg(&packed_key)
@@ -590,7 +591,7 @@ impl NvmeStaging {
                 .await;
 
             let _: std::result::Result<(), redis::RedisError> = redis::cmd("HSET")
-                .arg("squeezefs:block_sizes")
+                .arg(crate::fs_key!("block_sizes"))
                 .arg(&packed_key)
                 .arg(format!("{}:{}", total_logical_size, packed_payload_len))
                 .query_async(&mut con)
@@ -677,13 +678,14 @@ impl NvmeStaging {
                         .as_secs();
                     let safe_name = block_key.replace(['/', ':'], "_");
                     let peer_key = format!("block_peers:{}", safe_name);
-                    let peer_blocks_key = format!("squeezefs:peer_blocks:{}", p2p_addr);
+                    let peer_blocks_key =
+                        format!("{}:peer_blocks:{}", crate::fs_prefix(), p2p_addr);
                     let _: std::result::Result<(), redis::RedisError> = redis::pipe()
                         .sadd(&peer_key, &p2p_addr)
                         .expire(&peer_key, 60)
                         .sadd(&peer_blocks_key, &block_key)
                         .cmd("ZADD")
-                        .arg("squeezefs:peer_health_check_schedule")
+                        .arg(crate::fs_key!("peer_health_check_schedule"))
                         .arg(now + 60)
                         .arg(&p2p_addr)
                         .query_async(&mut con)

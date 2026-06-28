@@ -24,7 +24,7 @@ pub struct BoundConnection {
 }
 
 pub fn parse_inode_from_key(key: &str) -> Option<u64> {
-    if key.starts_with("squeezefs:") {
+    if key.starts_with(&format!("{}:", crate::fs_prefix())) {
         let parts: Vec<&str> = key.split(':').collect();
         if parts.len() >= 3 {
             if let Ok(ino) = parts[2].parse::<u64>() {
@@ -985,7 +985,7 @@ impl DlmClient {
     }
 
     pub async fn acquire_delegation(&self, inode: u64, ttl: Duration) -> Result<DelegationResult> {
-        let delegation_key = format!("squeezefs:delegation:inode_{}", inode);
+        let delegation_key = format!("{}:delegation:inode_{}", crate::fs_prefix(), inode);
         let mut con = self.meta_client.get_connection().await.map_err(|e| {
             println!("REDIS ERROR: {:?}", e);
             e
@@ -1045,7 +1045,7 @@ impl DlmClient {
             println!("REDIS ERROR: {:?}", e);
             e
         })?;
-        let channel = format!("squeezefs:client:{}:recalls", target_client_id);
+        let channel = format!("{}:client:{}:recalls", crate::fs_prefix(), target_client_id);
         let _: () = redis::cmd("PUBLISH")
             .arg(&channel)
             .arg(inode)

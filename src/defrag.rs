@@ -43,7 +43,7 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, nvme_path: &str
 
         for key in keys {
             let block_map_id = key
-                .strip_prefix("squeezefs:block_map:")
+                .strip_prefix(&format!("{}:block_map:", crate::fs_prefix()))
                 .unwrap_or(&key)
                 .to_string();
             let mappings: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
@@ -119,7 +119,7 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, nvme_path: &str
                 {
                     // Atomically update block_map
                     let (map_id, idx_str) = highest_file_info;
-                    let key = format!("squeezefs:block_map:{}", map_id);
+                    let key = format!("{}:block_map:{}", crate::fs_prefix(), map_id);
                     let _: () = redis::cmd("HSET")
                         .arg(&key)
                         .arg(&idx_str)

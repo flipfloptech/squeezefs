@@ -107,6 +107,8 @@ enum Commands {
             default_value = "redis://127.0.0.1:6379"
         )]
         garnet_url: String,
+        /// Name of the filesystem to check status for
+        fs_name: String,
     },
     /// Mount squeezefs at a target path
     Mount {
@@ -120,6 +122,8 @@ enum Commands {
         garnet_url: String,
         /// Path to mount the filesystem at
         mountpoint: PathBuf,
+        /// Name of the filesystem to mount (must match formatted name)
+        fs_name: String,
 
         /// Memory cache limit (e.g., "128GB" or "50%")
         #[arg(long)]
@@ -968,7 +972,7 @@ fn print_mount_diagnostics(
     let client = redis::Client::open(garnet_url)?;
     let mut con = client.get_connection()?;
     let format_fields: std::collections::HashMap<String, String> =
-        con.hgetall("squeezefs:format")?;
+        con.hgetall(squeezefs::fs_key!("format"))?;
     if format_fields.is_empty() {
         return Err("Volume not formatted. Please run format command first.".into());
     }
@@ -1217,6 +1221,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             upload_delay,
             fuse_io_uring_sqpoll_idle_ms,
         } => {
+            squeezefs::set_fs_prefix(&name);
             let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
             let redis_url = &garnet_url;
 
@@ -1224,7 +1229,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                 if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
                     let raw_clients: std::collections::HashMap<String, String> = con
-                        .hgetall("squeezefs:active_clients")
+                        .hgetall(squeezefs::fs_key!("active_clients"))
                         .await
                         .unwrap_or_default();
                     let now = std::time::SystemTime::now()
@@ -1264,8 +1269,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if !force {
                 if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                     if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                        let exists_format: bool =
-                            con.exists("squeezefs:format").await.unwrap_or(false);
+                        let exists_format: bool = con
+                            .exists(squeezefs::fs_key!("format"))
+                            .await
+                            .unwrap_or(false);
                         if exists_format {
                             println!(
                                 "{}",
@@ -1419,7 +1426,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
-        Commands::Status { garnet_url } => {
+        Commands::Status {
+            garnet_url,
+            fs_name,
+        } => {
+            squeezefs::set_fs_prefix(&fs_name);
             let redis_url = &garnet_url;
             let status = squeezefs::fuse_client::get_volume_status(redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
@@ -1427,6 +1438,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Mount {
             garnet_url,
             mountpoint,
+            fs_name,
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
@@ -1450,6 +1462,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fuse_io_uring_sqpoll_idle_ms,
             fuse_io_uring_sqpoll_cpu,
         } => {
+            squeezefs::set_fs_prefix(&fs_name);
             let writeback = !no_writeback;
             let redis_url = &garnet_url;
 
@@ -1465,7 +1478,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Retrieve configuration settings from Garnet metadata if formatted
             let format_fields: std::collections::HashMap<String, String> = {
                 if let Ok(mut con) = dlm.meta_client().get_connection().await {
-                    con.hgetall("squeezefs:format").await.unwrap_or_default()
+                    con.hgetall(squeezefs::fs_key!("format"))
+                        .await
+                        .unwrap_or_default()
                 } else {
                     std::collections::HashMap::new()
                 }
@@ -1497,7 +1512,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 squeezefs::cache::parse_duration(delay)?;
                 if let Ok(mut con) = dlm.meta_client().get_connection().await {
                     let _: Result<(), redis::RedisError> = redis::cmd("HSET")
-                        .arg("squeezefs:format")
+                        .arg(squeezefs::fs_key!("format"))
                         .arg("upload_delay")
                         .arg(delay)
                         .query_async(&mut con)
@@ -1590,7 +1605,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut active_staging_dirs = Vec::new();
             if let Ok(mut con) = dlm.meta_client().get_connection().await {
                 let status_map: std::collections::HashMap<String, String> = con
-                    .hgetall("squeezefs:diskcache:status")
+                    .hgetall(squeezefs::fs_key!("diskcache:status"))
                     .await
                     .unwrap_or_default();
                 for dir in staging_dirs {
@@ -1844,6 +1859,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             name,
             nvme_path,
         } => {
+            squeezefs::set_fs_prefix(&name);
             println!("Starting defragmentation for volume '{}'", name);
             squeezefs::defrag::run_defragmentation(&garnet_url, &name, &nvme_path).await?;
         }
@@ -2012,82 +2028,86 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             garnet_url,
             fs_name,
             action,
-        } => match action {
-            ConfigActions::Set { key, value } => {
-                squeezefs::config_ops::set_config_quota(&garnet_url, &fs_name, &key, &value)
-                    .await?;
-            }
-            ConfigActions::DiskCache(action) => match action {
-                DiskCacheActions::Add { path } => {
-                    squeezefs::config_ops::add_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&path),
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' added successfully.", path);
+        } => {
+            squeezefs::set_fs_prefix(&fs_name);
+            match action {
+                ConfigActions::Set { key, value } => {
+                    squeezefs::config_ops::set_config_quota(&garnet_url, &fs_name, &key, &value)
+                        .await?;
                 }
-                DiskCacheActions::Remove { path, force } => {
-                    squeezefs::config_ops::remove_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&path),
-                        force,
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' removed successfully.", path);
-                }
-                DiskCacheActions::Enable { path } => {
-                    squeezefs::config_ops::enable_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&path),
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' enabled successfully.", path);
-                }
-                DiskCacheActions::Disable { path } => {
-                    squeezefs::config_ops::disable_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&path),
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' disabled successfully.", path);
-                }
-                DiskCacheActions::Flush { path } => {
-                    squeezefs::config_ops::flush_disk_cache_path(
-                        &garnet_url,
-                        &fs_name,
-                        Path::new(&path),
-                    )
-                    .await?;
-                    println!("Disk cache path '{}' flushed successfully.", path);
-                }
-                DiskCacheActions::List => {
-                    let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                    println!("{}", serde_json::to_string_pretty(&list.diskcaches)?);
-                }
-            },
-            ConfigActions::List => {
-                let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                println!("{}", serde_json::to_string_pretty(&list)?);
-            }
-            ConfigActions::Fsck => {
-                println!("Running Squeezefs Metadata Consistency Check (FSCK)...");
-                let issues =
-                    squeezefs::config_ops::run_metadata_fsck(&garnet_url, &fs_name).await?;
-                if issues.is_empty() {
-                    println!("FSCK Completed: No consistency issues found.");
-                } else {
-                    println!("FSCK Completed: Found {} issue(s):", issues.len());
-                    for issue in issues {
-                        println!("  - {}", issue);
+                ConfigActions::DiskCache(action) => match action {
+                    DiskCacheActions::Add { path } => {
+                        squeezefs::config_ops::add_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' added successfully.", path);
                     }
-                    std::process::exit(1);
+                    DiskCacheActions::Remove { path, force } => {
+                        squeezefs::config_ops::remove_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                            force,
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' removed successfully.", path);
+                    }
+                    DiskCacheActions::Enable { path } => {
+                        squeezefs::config_ops::enable_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' enabled successfully.", path);
+                    }
+                    DiskCacheActions::Disable { path } => {
+                        squeezefs::config_ops::disable_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' disabled successfully.", path);
+                    }
+                    DiskCacheActions::Flush { path } => {
+                        squeezefs::config_ops::flush_disk_cache_path(
+                            &garnet_url,
+                            &fs_name,
+                            Path::new(&path),
+                        )
+                        .await?;
+                        println!("Disk cache path '{}' flushed successfully.", path);
+                    }
+                    DiskCacheActions::List => {
+                        let list =
+                            squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                        println!("{}", serde_json::to_string_pretty(&list.diskcaches)?);
+                    }
+                },
+                ConfigActions::List => {
+                    let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                    println!("{}", serde_json::to_string_pretty(&list)?);
+                }
+                ConfigActions::Fsck => {
+                    println!("Running Squeezefs Metadata Consistency Check (FSCK)...");
+                    let issues =
+                        squeezefs::config_ops::run_metadata_fsck(&garnet_url, &fs_name).await?;
+                    if issues.is_empty() {
+                        println!("FSCK Completed: No consistency issues found.");
+                    } else {
+                        println!("FSCK Completed: Found {} issue(s):", issues.len());
+                        for issue in issues {
+                            println!("  - {}", issue);
+                        }
+                        std::process::exit(1);
+                    }
                 }
             }
-        },
+        }
         Commands::Umount {
             garnet_url,
             mountpoint,
@@ -2099,8 +2119,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let redis_url = &garnet_url;
 
-            // 1. Try to read mountpoint/.config to resolve staging directories
+            // 1. Try to read mountpoint/.config to resolve staging directories and filesystem name
             let mut staging_dirs = Vec::new();
+            let mut resolved_fs_name = "squeezefs".to_string();
             let config_path = mountpoint.join(".config");
             if let Ok(config_str) = std::fs::read_to_string(&config_path) {
                 if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
@@ -2109,15 +2130,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             staging_dirs = paths_str.split(',').map(PathBuf::from).collect();
                         }
                     }
+                    if let Some(n) = config_json["format"]["name"].as_str() {
+                        resolved_fs_name = n.to_string();
+                    }
                 }
             }
+            squeezefs::set_fs_prefix(&resolved_fs_name);
 
             // 2. Fall back to Garnet format defaults if config file wasn't readable
             if staging_dirs.is_empty() {
                 if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                     if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
                         let paths_str: Option<String> = con
-                            .hget("squeezefs:format", "disk_cache_paths")
+                            .hget(squeezefs::fs_key!("format"), "disk_cache_paths")
                             .await
                             .unwrap_or(None);
                         if let Some(s) = paths_str {
@@ -2139,7 +2164,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                 if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
                     let wait_str: Option<String> = con
-                        .hget("squeezefs:format", "dismount_wait")
+                        .hget(squeezefs::fs_key!("format"), "dismount_wait")
                         .await
                         .unwrap_or(None);
                     if let Some(s) = wait_str {
@@ -2155,7 +2180,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                 if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
                     let size_str: Option<String> = con
-                        .hget("squeezefs:format", "write_disk_limit")
+                        .hget(squeezefs::fs_key!("format"), "write_disk_limit")
                         .await
                         .unwrap_or(None);
                     if let Some(ref s) = size_str {
@@ -2566,7 +2591,7 @@ async fn resolve_path_to_inode(
             continue;
         }
         let mut con = dlm.get_connection_for_inode(current_ino).await?;
-        let dir_key = format!("squeezefs:dir:{}", current_ino);
+        let dir_key = format!("{}:dir:{}", squeezefs::fs_prefix(), current_ino);
         let next_ino_opt: Option<u64> = con.hget(&dir_key, part).await?;
         match next_ino_opt {
             Some(next_ino) => {
@@ -2595,8 +2620,24 @@ async fn run_df_command(
 
     match path_opt {
         None => {
-            let format_fields: HashMap<String, String> =
-                con.hgetall("squeezefs:format").await.unwrap_or_default();
+            let mut resolved_fs_name = "squeezefs".to_string();
+            if !mounts.is_empty() {
+                let config_path = mounts[0].join(".config");
+                if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+                    if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str)
+                    {
+                        if let Some(n) = config_json["format"]["name"].as_str() {
+                            resolved_fs_name = n.to_string();
+                        }
+                    }
+                }
+            }
+            squeezefs::set_fs_prefix(&resolved_fs_name);
+
+            let format_fields: HashMap<String, String> = con
+                .hgetall(squeezefs::fs_key!("format"))
+                .await
+                .unwrap_or_default();
             let capacity_bytes: u64 = format_fields
                 .get("capacity")
                 .and_then(|v| v.parse().ok())
@@ -2628,7 +2669,7 @@ async fn run_df_command(
             }
 
             let block_sizes: HashMap<String, String> = con
-                .hgetall("squeezefs:block_sizes")
+                .hgetall(squeezefs::fs_key!("block_sizes"))
                 .await
                 .unwrap_or_default();
             let mut total_physical_size = 0u64;
@@ -2739,6 +2780,20 @@ async fn run_df_command(
                     break;
                 }
             }
+
+            let mut resolved_fs_name = "squeezefs".to_string();
+            if let Some(ref mnt) = matching_mount {
+                let config_path = mnt.join(".config");
+                if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+                    if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str)
+                    {
+                        if let Some(n) = config_json["format"]["name"].as_str() {
+                            resolved_fs_name = n.to_string();
+                        }
+                    }
+                }
+            }
+            squeezefs::set_fs_prefix(&resolved_fs_name);
 
             let (relative_path_str, stats_json) = if let Some(ref mnt) = matching_mount {
                 let rel = abs_path.strip_prefix(mnt).unwrap_or(&abs_path);
@@ -2954,7 +3009,7 @@ async fn run_df_command(
             } else {
                 let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await?;
                 if let Some(map_id) = block_map_id {
-                    let block_map_key = format!("squeezefs:block_map:{}", map_id);
+                    let block_map_key = format!("{}:block_map:{}", squeezefs::fs_prefix(), map_id);
                     let block_map: HashMap<String, String> =
                         con.hgetall(&block_map_key).await.unwrap_or_default();
 
@@ -2973,7 +3028,7 @@ async fn run_df_command(
                     for idx in indices {
                         if let Some(bk) = block_map.get(&idx.to_string()) {
                             let size_info: Option<String> =
-                                con.hget("squeezefs:block_sizes", bk).await?;
+                                con.hget(squeezefs::fs_key!("block_sizes"), bk).await?;
                             let (log_sz, phys_sz) = if let Some(info) = size_info {
                                 let parts: Vec<&str> = info.split(':').collect();
                                 if parts.len() == 2 {
@@ -3085,7 +3140,10 @@ mod tests {
 async fn get_daemon_metrics(redis_url: &str) -> Option<HashMap<String, u64>> {
     let client = squeezefs::dlm::MetaClient::new(redis_url).ok()?;
     let mut con = client.get_connection().await.ok()?;
-    let metrics: HashMap<String, String> = con.hgetall("metrics:daemon").await.ok()?;
+    let metrics: HashMap<String, String> = con
+        .hgetall(squeezefs::fs_key!("metrics:daemon"))
+        .await
+        .ok()?;
 
     let mut parsed = HashMap::new();
     for (k, v) in metrics {

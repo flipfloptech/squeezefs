@@ -293,23 +293,23 @@ impl SqueezefsFilesystem {
 
         let mut backends = serde_json::Map::new();
         for (be_id, be_json) in backends_raw {
-            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&be_json) {
-                if let Some(obj) = config.as_object_mut() {
-                    if obj.contains_key("secret_key") {
-                        obj.insert(
-                            "secret_key".to_string(),
-                            serde_json::Value::String("******".to_string()),
-                        );
-                    }
-                    if obj.contains_key("access_key") {
-                        obj.insert(
-                            "access_key".to_string(),
-                            serde_json::Value::String("******".to_string()),
-                        );
-                    }
-                }
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
                 backends.insert(be_id, config);
             }
+        }
+
+        if !backends.contains_key("backend_0") {
+            let backing_dev = format_fields
+                .get("backing_dev")
+                .cloned()
+                .unwrap_or_default();
+            backends.insert(
+                "backend_0".to_string(),
+                serde_json::json!({
+                    "backing_dev": backing_dev,
+                    "status": "enabled",
+                }),
+            );
         }
 
         let config_obj = serde_json::json!({
@@ -5395,19 +5395,14 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
         }
     }
 
-    let s3_endpoint = fields.get("s3_endpoint").cloned().unwrap_or_default();
-    let s3_bucket = fields.get("s3_bucket").cloned().unwrap_or_default();
-
     if !storage_backends.contains_key("backend_0") {
+        let backing_dev = fields.get("backing_dev").cloned().unwrap_or_default();
         let status = statuses_map
             .get("backend_0")
             .cloned()
             .unwrap_or_else(|| "enabled".to_string());
         let be_val = serde_json::json!({
-            "endpoint": s3_endpoint,
-            "access_key": "admin",
-            "secret_key": "password",
-            "bucket": s3_bucket,
+            "backing_dev": backing_dev,
             "status": status,
         });
         storage_backends.insert("backend_0".to_string(), be_val);

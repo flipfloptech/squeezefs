@@ -20,6 +20,12 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
+pub static SIMULATE_CORRUPTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_simulate_corruption(val: bool) {
+    SIMULATE_CORRUPTION.store(val, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub struct NvmeBlockDev {
     pub device_path: String,
     file: OnceCell<Arc<File>>,
@@ -48,9 +54,9 @@ impl NvmeBlockDev {
 
     pub async fn write_block(&self, offset: u64, data: &[u8]) -> Result<()> {
         let file = self.get_file()?;
-        let data = data.to_vec();
+        let data_vec = data.to_vec();
         tokio::task::spawn_blocking(move || {
-            file.write_all_at(&data, offset)
+            file.write_all_at(&data_vec, offset)
                 .map_err(|e| crate::error::SqueezefsError::Io(e))?;
             file.sync_data()
                 .map_err(|e| crate::error::SqueezefsError::Io(e))?;
@@ -66,6 +72,22 @@ impl NvmeBlockDev {
         crate::fuse_client::METRICS
             .put_obj
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if crate::write_verification_enabled() {
+            let mut read_data = self.read_block(offset, data.len()).await?;
+            if SIMULATE_CORRUPTION.load(std::sync::atomic::Ordering::Relaxed) {
+                if !read_data.is_empty() {
+                    read_data[0] ^= 0xFF;
+                }
+            }
+            if read_data != data {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "Write verification failed: checksum mismatch at offset {} on device {}",
+                    offset, self.device_path
+                )));
+            }
+        }
+
         Ok(())
     }
 

@@ -1,15 +1,12 @@
 use crate::block_allocator::BlockAllocator;
 use crate::error::Result;
-use crate::nvme_dev::NvmeBlockDev;
-use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::Arc;
 
-pub async fn run_defragmentation(redis_url: &str, fs_name: &str, nvme_path: &str) -> Result<()> {
+pub async fn run_defragmentation(redis_url: &str, fs_name: &str, _nvme_path: &str) -> Result<()> {
     let dlm = crate::dlm::DlmClient::new(redis_url)?;
     let client = Arc::new(dlm.meta_client().clone());
 
     let block_alloc = Arc::new(BlockAllocator::new(client.clone(), fs_name).await?);
-    let nvme_dev = Arc::new(NvmeBlockDev::new(nvme_path));
 
     // 1. Calculate fragmentation
     let (highest_block, used_blocks, free_blocks, frag_percent) =
@@ -82,11 +79,7 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, nvme_path: &str
         return Ok(());
     }
 
-    let pb = ProgressBar::new(free_holes.len() as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} blocks defragmented ({eta})")
-        .unwrap()
-        .progress_chars("#>-"));
+    let mut tasks = Vec::new();
 
     for target_hole_idx in free_holes {
         let (&highest_offset, highest_file_info) = match block_to_file.iter().next_back() {
@@ -107,39 +100,27 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, nvme_path: &str
             .await
             .is_ok()
         {
-            // Read from highest, write to hole
-            if let Ok(data) = nvme_dev
-                .read_block(highest_offset, chunk_size as usize)
-                .await
-            {
-                if nvme_dev
-                    .write_block(target_hole_offset, &data)
-                    .await
-                    .is_ok()
-                {
-                    // Atomically update block_map
-                    let (map_id, idx_str) = highest_file_info;
-                    let key = format!("{}:block_map:{}", crate::fs_prefix(), map_id);
-                    let _: () = redis::cmd("HSET")
-                        .arg(&key)
-                        .arg(&idx_str)
-                        .arg(target_hole_offset.to_string())
-                        .query_async(&mut conn)
-                        .await?;
+            let (map_id, idx_str) = highest_file_info;
+            tasks.push(crate::jobs::TaskType::BlockMove {
+                map_id: map_id.clone(),
+                idx_str: idx_str.clone(),
+                src_offset: highest_offset,
+                dest_offset: target_hole_offset,
+                len: chunk_size as usize,
+            });
 
-                    // Free the old high block
-                    block_alloc.free_block(highest_offset).await?;
-
-                    // Update in-memory map
-                    block_to_file.remove(&highest_offset);
-                    block_to_file.insert(target_hole_offset, (map_id, idx_str));
-                }
-            }
+            // Update in-memory map
+            block_to_file.remove(&highest_offset);
+            block_to_file.insert(target_hole_offset, (map_id, idx_str));
         }
-
-        pb.inc(1);
     }
 
-    pb.finish_with_message("Defragmentation complete");
+    if tasks.is_empty() {
+        println!("No low-index holes to defragment.");
+        return Ok(());
+    }
+
+    println!("Submitting defragmentation job with {} block migrations to the cluster...", tasks.len());
+    crate::jobs::submit_and_wait_for_job(redis_url, fs_name, tasks).await?;
     Ok(())
 }

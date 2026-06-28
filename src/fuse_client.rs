@@ -314,6 +314,7 @@ impl SqueezefsFilesystem {
 
         let config_obj = serde_json::json!({
             "client_version": env!("CARGO_PKG_VERSION"),
+            "garnet_url": self.dlm.redis_url(),
             "format": format_fields,
             "backends": backends,
             "uid": self.uid,

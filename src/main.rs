@@ -250,7 +250,7 @@ enum Commands {
             short = 'g',
             env = "GARNET_URL"
         )]
-        garnet_url: String,
+        garnet_url: Option<String>,
         /// Path to the mounted filesystem directory
         path: PathBuf,
         /// Number of concurrent threads
@@ -2096,12 +2096,44 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             size,
             iterations,
         } => {
-            let redis_url = &garnet_url;
+            let mut resolved_url = garnet_url.clone();
+            let config_path = path.join(".config");
+            let is_squeeze = if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+                if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                    if resolved_url.is_none() {
+                        if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
+                            resolved_url = Some(url_str.to_string());
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !is_squeeze {
+                use colored::Colorize;
+                println!(
+                    "{}",
+                    "Warning: Path does not appear to be a SqueezeFS filesystem (could not read .config)."
+                        .yellow()
+                        .bold()
+                );
+                println!(
+                    "{}",
+                    "Running POSIX-only benchmark override."
+                        .yellow()
+                        .bold()
+                );
+            }
+
             for iter in 1..=iterations {
                 if iterations > 1 {
                     println!("\n--- Benchmark Iteration {}/{} ---", iter, iterations);
                 }
-                run_benchmark(&path, threads, size, redis_url).await?;
+                run_benchmark(&path, threads, size, resolved_url.as_deref()).await?;
             }
         }
         Commands::Clone {
@@ -3500,7 +3532,7 @@ async fn run_benchmark(
     path: &Path,
     threads: usize,
     size_mb: usize,
-    redis_url: &str,
+    redis_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !path.exists() {
         return Err(format!("Benchmark path {:?} does not exist", path).into());
@@ -3520,7 +3552,11 @@ async fn run_benchmark(
     );
 
     // 1. Fetch baseline metrics
-    let baseline_metrics = get_daemon_metrics(redis_url).await;
+    let baseline_metrics = if let Some(url) = redis_url {
+        get_daemon_metrics(url).await
+    } else {
+        None
+    };
 
     let mp = MultiProgress::new();
     let pb_style = ProgressStyle::default_bar()
@@ -3726,7 +3762,11 @@ async fn run_benchmark(
     }
 
     // 2. Fetch post-benchmark metrics
-    let post_metrics = get_daemon_metrics(redis_url).await;
+    let post_metrics = if let Some(url) = redis_url {
+        get_daemon_metrics(url).await
+    } else {
+        None
+    };
 
     // --- CALCULATE PERFORMANCE VALUES ---
     let total_big_bytes = (threads * big_file_bytes) as f64;

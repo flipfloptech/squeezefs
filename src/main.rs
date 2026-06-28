@@ -2124,6 +2124,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     false
                 }
             } else {
+                if let Err(ref e) = std::fs::metadata(&config_path) {
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        use colored::Colorize;
+                        println!(
+                            "{}",
+                            "Error: Permission denied accessing FUSE mountpoint configuration.\n\
+                             Note: FUSE mounts are restricted to the mounting user by default.\n\
+                             Please run the benchmark without 'sudo', or ensure 'allow_other' was set during mount."
+                                .red()
+                                .bold()
+                        );
+                    }
+                }
                 false
             };
 
@@ -3658,8 +3671,16 @@ async fn run_benchmark(
     #[allow(unused_imports)]
     use std::os::unix::fs::OpenOptionsExt;
 
-    if !path.exists() {
-        return Err(format!("Benchmark path {:?} does not exist", path).into());
+    if let Err(e) = std::fs::metadata(path) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return Err(format!(
+                "Permission denied accessing benchmark path {:?}.\n\
+                 Note: FUSE mounts are by default only accessible to the mounting user.\n\
+                 Please run the command as the mounting user (without sudo), or ensure the filesystem was mounted with FUSE options allow_other.",
+                path
+            ).into());
+        }
+        return Err(format!("Benchmark path {:?} does not exist: {:?}", path, e).into());
     }
 
     if direct && (small_size_kb * 1024) % 4096 != 0 {

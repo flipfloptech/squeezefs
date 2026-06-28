@@ -453,7 +453,7 @@ pub fn validate_backing_device(path: &str) -> Result<()> {
             let parts: Vec<&str> = pv_clean.split('/').collect();
             if let Some(dev_name) = parts.last() {
                 if dev_name.starts_with("nvme") {
-                    if let Some(end_idx) = dev_name.find('n') {
+                    if let Some(end_idx) = dev_name.rfind('n') {
                         let ctrl = &dev_name[..end_idx];
                         let nqn_path = format!("/sys/class/nvme/{}/subsysnqn", ctrl);
                         if let Ok(nqn) = fs::read_to_string(nqn_path) {
@@ -467,14 +467,10 @@ pub fn validate_backing_device(path: &str) -> Result<()> {
     };
 
     if real_path_str.starts_with("/dev/nvme") {
-        if is_squeeze_pv(&real_path_str) {
-            return Ok(());
-        } else {
-            return Err(SqueezefsError::InvalidOperation(format!(
-                "Device '{}' is not a SqueezeFS NVMe-oF disk.",
-                path
-            )));
-        }
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Direct writes to raw NVMe device '{}' are not supported. Backing device must be a SqueezeFS LVM Logical Volume.",
+            path
+        )));
     }
 
     if real_path_str.starts_with("/dev/loop") {
@@ -569,7 +565,7 @@ pub fn pool_list() -> Result<()> {
                                     let parts: Vec<&str> = pv_trim.split('/').collect();
                                     if let Some(dev_name) = parts.last() {
                                         if dev_name.starts_with("nvme") {
-                                            if let Some(end_idx) = dev_name.find('n') {
+                                            if let Some(end_idx) = dev_name.rfind('n') {
                                                 let ctrl = &dev_name[..end_idx];
                                                 let nqn_path =
                                                     format!("/sys/class/nvme/{}/subsysnqn", ctrl);
@@ -674,7 +670,7 @@ pub fn volume_list() -> Result<()> {
                                     let parts: Vec<&str> = pv_trim.split('/').collect();
                                     if let Some(dev_name) = parts.last() {
                                         if dev_name.starts_with("nvme") {
-                                            if let Some(end_idx) = dev_name.find('n') {
+                                            if let Some(end_idx) = dev_name.rfind('n') {
                                                 let ctrl = &dev_name[..end_idx];
                                                 let nqn_path =
                                                     format!("/sys/class/nvme/{}/subsysnqn", ctrl);

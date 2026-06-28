@@ -204,7 +204,7 @@ impl GdsCache {
 
     /// Orchestrate a direct RDMA transfer from the object store to a GPU memory address (VRAM).
     /// Bypasses the host OS kernel and system RAM.
-    /// - `object_key`: The RustFS S3 key of the physical payload.
+    /// - `object_key`: The backing block index/offset of the physical payload.
     /// - `vram_address`: The physical address pointer in VRAM.
     /// - `offset`: Offset within the object.
     /// - `size`: Number of bytes to transfer.

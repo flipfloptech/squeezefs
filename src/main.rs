@@ -1217,6 +1217,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             upload_delay,
             fuse_io_uring_sqpoll_idle_ms,
         } => {
+            let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
             let redis_url = &garnet_url;
 
             // Check if active clients are connected to the filesystem
@@ -2092,6 +2093,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             mountpoint,
             force,
         } => {
+            let _ctrl_c_guard = spawn_ctrl_c_handler("unmount");
             use std::io::IsTerminal;
             use std::io::Write;
 
@@ -3567,4 +3569,34 @@ pub fn tune_system() -> Result<(), std::io::Error> {
 
     println!("=== Auto-tuning completed ===\n");
     Ok(())
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn spawn_ctrl_c_handler(action_name: &'static str) -> AbortOnDrop {
+    let handle = tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!(
+                    "\nWARNING: Ctrl+C pressed! If you really want to cancel {}, hit Ctrl+C again.",
+                    action_name
+                );
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        eprintln!("\n{} cancelled by user. Exiting...", action_name);
+                        std::process::exit(130);
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                        eprintln!("\nCancel timeout elapsed. Resuming...");
+                    }
+                }
+            }
+        }
+    });
+    AbortOnDrop(handle)
 }

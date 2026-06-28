@@ -4666,26 +4666,69 @@ pub async fn start_mount<P: AsRef<Path>>(
                 let sigint_opt =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
                 if let (Ok(mut sigterm), Ok(mut sigint)) = (sigterm_opt, sigint_opt) {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Received Ctrl+C, exiting...");
-                        }
-                        _ = sigterm.recv() => {
-                            info!("Received SIGTERM, exiting...");
-                        }
-                        _ = sigint.recv() => {
-                            info!("Received SIGINT, exiting...");
+                    loop {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {
+                                eprintln!("\nWARNING: Ctrl+C pressed! If you really want to unmount/exit, hit Ctrl+C again.");
+                                tokio::select! {
+                                    _ = tokio::signal::ctrl_c() => {
+                                        info!("Received second Ctrl+C, exiting...");
+                                        break;
+                                    }
+                                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                                        eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
+                                    }
+                                }
+                            }
+                            _ = sigterm.recv() => {
+                                info!("Received SIGTERM, exiting...");
+                                break;
+                            }
+                            _ = sigint.recv() => {
+                                eprintln!("\nWARNING: SIGINT received! If you really want to unmount/exit, send SIGINT again.");
+                                tokio::select! {
+                                    _ = sigint.recv() => {
+                                        info!("Received second SIGINT, exiting...");
+                                        break;
+                                    }
+                                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                                        eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
+                                    }
+                                }
+                            }
                         }
                     }
                 } else {
-                    let _ = tokio::signal::ctrl_c().await;
-                    info!("Received Ctrl+C, exiting...");
+                    loop {
+                        let _ = tokio::signal::ctrl_c().await;
+                        eprintln!("\nWARNING: Ctrl+C pressed! If you really want to unmount/exit, hit Ctrl+C again.");
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {
+                                info!("Received second Ctrl+C, exiting...");
+                                break;
+                            }
+                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                                eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
+                            }
+                        }
+                    }
                 }
             }
             #[cfg(not(unix))]
             {
-                let _ = tokio::signal::ctrl_c().await;
-                info!("Received Ctrl+C, exiting...");
+                loop {
+                    let _ = tokio::signal::ctrl_c().await;
+                    eprintln!("\nWARNING: Ctrl+C pressed! If you really want to unmount/exit, hit Ctrl+C again.");
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("Received second Ctrl+C, exiting...");
+                            break;
+                        }
+                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                            eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
+                        }
+                    }
+                }
             }
         };
 
@@ -4969,30 +5012,35 @@ pub async fn format_volume_ext(
     if !quick {
         if let Some(target_path) = nvme_target_path {
             if !target_path.is_empty() && capacity > 0 {
-                log::info!("Wiping NVMe target path: {}", target_path);
+                let wipe_len = std::cmp::min(capacity, 32 * 1024 * 1024);
+                log::info!(
+                    "Wiping first {} bytes of NVMe target path: {}",
+                    wipe_len,
+                    target_path
+                );
                 let file_result = tokio::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
-                    .truncate(true)
+                    .truncate(false)
                     .open(target_path)
                     .await;
 
                 if let Ok(mut file) = file_result {
-                    let pb = indicatif::ProgressBar::new(capacity);
+                    let pb = indicatif::ProgressBar::new(wipe_len);
                     pb.set_style(
-                            indicatif::ProgressStyle::default_bar()
-                                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                                .unwrap()
-                                .progress_chars("#>-"),
-                        );
+                        indicatif::ProgressStyle::default_bar()
+                            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                            .unwrap()
+                            .progress_chars("#>-"),
+                    );
 
                     let chunk_size = 4 * 1024 * 1024;
                     let zeros = vec![0u8; chunk_size];
                     let mut written = 0;
                     use tokio::io::AsyncWriteExt;
 
-                    while written < capacity {
-                        let to_write = std::cmp::min(chunk_size as u64, capacity - written);
+                    while written < wipe_len {
+                        let to_write = std::cmp::min(chunk_size as u64, wipe_len - written);
                         if let Err(e) = file.write_all(&zeros[..to_write as usize]).await {
                             log::warn!("Failed to write zero block to NVMe target: {:?}", e);
                             break;

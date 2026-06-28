@@ -324,7 +324,7 @@ enum Commands {
             short = 'g',
             env = "GARNET_URL"
         )]
-        garnet_url: String,
+        garnet_url: Option<String>,
         /// Optional path to a file or directory
         path: Option<String>,
     },
@@ -2252,8 +2252,61 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("File cloned successfully.");
         }
         Commands::Df { garnet_url, path } => {
-            let redis_url = &garnet_url;
-            run_df_command(redis_url, path).await?;
+            let mut resolved_url = garnet_url;
+            if resolved_url.is_none() {
+                // Determine reference path
+                let ref_path = if let Some(ref p) = path {
+                    std::path::Path::new(p).to_path_buf()
+                } else {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf())
+                };
+
+                // Helper to search for .config recursively up
+                let mut current = if ref_path.is_file() {
+                    ref_path.parent().unwrap_or(&ref_path).to_path_buf()
+                } else {
+                    ref_path
+                };
+
+                loop {
+                    let config_path = current.join(".config");
+                    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+                        if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                            if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
+                                resolved_url = Some(url_str.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(parent) = current.parent() {
+                        current = parent.to_path_buf();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Fallback to active FUSE mountpoints if we still don't have it
+            if resolved_url.is_none() {
+                let mounts = find_squeezefs_mounts();
+                for mount in mounts {
+                    let config_path = mount.join(".config");
+                    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+                        if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                            if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
+                                resolved_url = Some(url_str.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let redis_url = resolved_url.ok_or_else(|| {
+                "Error: Garnet URL must be specified via -g/--garnet-url parameter, GARNET_URL environment variable, or resolved from a mounted squeezefs path"
+            })?;
+
+            run_df_command(&redis_url, path).await?;
         }
         Commands::Storage { action } => match action {
             StorageActions::Pool(pool_action) => match pool_action {

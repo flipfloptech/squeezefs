@@ -389,8 +389,196 @@ pub fn volume_delete(pool_name: &str, vol_name: &str, force_yes: bool) -> Result
     Ok(())
 }
 
+pub fn validate_backing_device(path: &str) -> Result<()> {
+    use std::fs;
+    use std::path::Path;
+
+    let path_buf = Path::new(path);
+    if !path_buf.exists() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Backing device path '{}' does not exist.",
+            path
+        )));
+    }
+
+    let real_path = fs::canonicalize(path_buf).map_err(|e| {
+        SqueezefsError::InvalidOperation(format!("Failed to resolve path '{}': {}", path, e))
+    })?;
+    let real_path_str = real_path.to_string_lossy();
+
+    let is_squeeze_pv = |pv: &str| -> bool {
+        let pv_clean = pv.trim();
+        if pv_clean.starts_with("/dev/loop") {
+            return true;
+        }
+        if pv_clean.starts_with("/dev/nvme") {
+            let parts: Vec<&str> = pv_clean.split('/').collect();
+            if let Some(dev_name) = parts.last() {
+                if dev_name.starts_with("nvme") {
+                    if let Some(end_idx) = dev_name.find('n') {
+                        let ctrl = &dev_name[..end_idx];
+                        let nqn_path = format!("/sys/class/nvme/{}/subsysnqn", ctrl);
+                        if let Ok(nqn) = fs::read_to_string(nqn_path) {
+                            return nqn.trim().starts_with("nqn.2026-06.io.squeezefs:");
+                        }
+                    }
+                }
+            }
+        }
+        false
+    };
+
+    if real_path_str.starts_with("/dev/nvme") {
+        if is_squeeze_pv(&real_path_str) {
+            return Ok(());
+        } else {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "Device '{}' is not a SqueezeFS NVMe-oF disk.",
+                path
+            )));
+        }
+    }
+
+    if real_path_str.starts_with("/dev/loop") {
+        return Ok(());
+    }
+
+    let output = std::process::Command::new("lvs")
+        .args(["-o", "vg_name", "--noheadings", &real_path_str])
+        .output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            let vg_name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !vg_name.is_empty() {
+                let pvs_output = std::process::Command::new("pvs")
+                    .args([
+                        "-o",
+                        "pv_name",
+                        "-S",
+                        &format!("vg_name={}", vg_name),
+                        "--noheadings",
+                    ])
+                    .output();
+                if let Ok(pvs_out) = pvs_output {
+                    if pvs_out.status.success() {
+                        let pvs_str = String::from_utf8_lossy(&pvs_out.stdout);
+                        let mut pvs_checked = 0;
+                        for pv in pvs_str.lines() {
+                            let pv_trim = pv.trim();
+                            if !pv_trim.is_empty() {
+                                pvs_checked += 1;
+                                if !is_squeeze_pv(pv_trim) {
+                                    return Err(SqueezefsError::InvalidOperation(format!(
+                                        "LVM Volume '{}' is built on Physical Volume '{}' which is not a SqueezeFS disk.",
+                                        path, pv_trim
+                                    )));
+                                }
+                            }
+                        }
+                        if pvs_checked > 0 {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(SqueezefsError::InvalidOperation(format!(
+        "Backing device '{}' is not a valid SqueezeFS LVM Volume or NVMe-oF disk.",
+        path
+    )))
+}
+
 pub fn pool_list() -> Result<()> {
     let output = Command::new("vgs")
+        .args(["-o", "vg_name", "--noheadings"])
+        .output()
+        .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to execute vgs: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Command vgs failed: {}",
+            stderr
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut our_vgs = Vec::new();
+    for line in stdout.lines() {
+        let vg = line.trim();
+        if !vg.is_empty() {
+            let pvs_output = Command::new("pvs")
+                .args([
+                    "-o",
+                    "pv_name",
+                    "-S",
+                    &format!("vg_name={}", vg),
+                    "--noheadings",
+                ])
+                .output();
+            if let Ok(pvs_out) = pvs_output {
+                if pvs_out.status.success() {
+                    let pvs_str = String::from_utf8_lossy(&pvs_out.stdout);
+                    let mut is_ours = true;
+                    let mut count = 0;
+                    for pv in pvs_str.lines() {
+                        let pv_trim = pv.trim();
+                        if !pv_trim.is_empty() {
+                            count += 1;
+                            let ok = pv_trim.starts_with("/dev/loop") || {
+                                if pv_trim.starts_with("/dev/nvme") {
+                                    let parts: Vec<&str> = pv_trim.split('/').collect();
+                                    if let Some(dev_name) = parts.last() {
+                                        if dev_name.starts_with("nvme") {
+                                            if let Some(end_idx) = dev_name.find('n') {
+                                                let ctrl = &dev_name[..end_idx];
+                                                let nqn_path =
+                                                    format!("/sys/class/nvme/{}/subsysnqn", ctrl);
+                                                if let Ok(nqn) = std::fs::read_to_string(nqn_path) {
+                                                    nqn.trim()
+                                                        .starts_with("nqn.2026-06.io.squeezefs:")
+                                                } else {
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            };
+                            if !ok {
+                                is_ours = false;
+                                break;
+                            }
+                        }
+                    }
+                    if is_ours && count > 0 {
+                        our_vgs.push(vg.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if our_vgs.is_empty() {
+        println!("No squeezefs storage pools found.");
+        return Ok(());
+    }
+
+    let mut args = vec![];
+    for vg in &our_vgs {
+        args.push(vg.as_str());
+    }
+    let output = Command::new("vgs")
+        .args(&args)
         .output()
         .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to execute vgs: {}", e)))?;
     if !output.status.success() {
@@ -407,6 +595,95 @@ pub fn pool_list() -> Result<()> {
 
 pub fn volume_list() -> Result<()> {
     let output = Command::new("lvs")
+        .args(["-o", "vg_name,lv_name,lv_path", "--noheadings"])
+        .output()
+        .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to execute lvs: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "Command lvs failed: {}",
+            stderr
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut our_lvs = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 {
+            let vg = parts[0];
+            let lv_path = parts[2];
+            let pvs_output = Command::new("pvs")
+                .args([
+                    "-o",
+                    "pv_name",
+                    "-S",
+                    &format!("vg_name={}", vg),
+                    "--noheadings",
+                ])
+                .output();
+            if let Ok(pvs_out) = pvs_output {
+                if pvs_out.status.success() {
+                    let pvs_str = String::from_utf8_lossy(&pvs_out.stdout);
+                    let mut is_ours = true;
+                    let mut count = 0;
+                    for pv in pvs_str.lines() {
+                        let pv_trim = pv.trim();
+                        if !pv_trim.is_empty() {
+                            count += 1;
+                            let ok = pv_trim.starts_with("/dev/loop") || {
+                                if pv_trim.starts_with("/dev/nvme") {
+                                    let parts: Vec<&str> = pv_trim.split('/').collect();
+                                    if let Some(dev_name) = parts.last() {
+                                        if dev_name.starts_with("nvme") {
+                                            if let Some(end_idx) = dev_name.find('n') {
+                                                let ctrl = &dev_name[..end_idx];
+                                                let nqn_path =
+                                                    format!("/sys/class/nvme/{}/subsysnqn", ctrl);
+                                                if let Ok(nqn) = std::fs::read_to_string(nqn_path) {
+                                                    nqn.trim()
+                                                        .starts_with("nqn.2026-06.io.squeezefs:")
+                                                } else {
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            };
+                            if !ok {
+                                is_ours = false;
+                                break;
+                            }
+                        }
+                    }
+                    if is_ours && count > 0 {
+                        our_lvs.push(lv_path.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if our_lvs.is_empty() {
+        println!("No squeezefs storage volumes found.");
+        return Ok(());
+    }
+
+    let mut args = vec![];
+    for lv in &our_lvs {
+        args.push(lv.as_str());
+    }
+    let output = Command::new("lvs")
+        .args(&args)
         .output()
         .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to execute lvs: {}", e)))?;
     if !output.status.success() {

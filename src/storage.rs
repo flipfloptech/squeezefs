@@ -269,6 +269,89 @@ pub fn pool_remove(pool_name: &str, disks: &[String], force_yes: bool) -> Result
     Ok(())
 }
 
+fn auto_cleanup_for_volume(pool_name: &str, vol_name: &str) -> Result<()> {
+    let target_dev_path = format!("/dev/{}/{}", pool_name, vol_name);
+    let alt_dev_path = format!(
+        "/dev/mapper/{}-{}",
+        pool_name.replace('-', "--"),
+        vol_name.replace('-', "--")
+    );
+
+    let is_mock = std::env::var("SQUEEZEFS_MOCK_NVMEOF").is_ok();
+    let config_dir = if is_mock {
+        std::path::PathBuf::from("/tmp/squeezefs_nvmet")
+    } else {
+        std::path::PathBuf::from("/sys/kernel/config/nvmet")
+    };
+
+    let subs_dir = config_dir.join("subsystems");
+    if subs_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(subs_dir) {
+            for entry in entries.flatten() {
+                let subnqn = entry.file_name().to_string_lossy().to_string();
+                let device_path_file = entry
+                    .path()
+                    .join("namespaces")
+                    .join("1")
+                    .join("device_path");
+                if device_path_file.exists() {
+                    if let Ok(dev) = std::fs::read_to_string(device_path_file) {
+                        let dev_trimmed = dev.trim();
+                        if dev_trimmed == target_dev_path || dev_trimmed == alt_dev_path {
+                            println!(
+                                "Auto-cleaning: Unsharing NVMe-oF target '{}' associated with volume '{}'",
+                                subnqn, target_dev_path
+                            );
+                            let _ = crate::nvmeof::unshare_target(&subnqn);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn auto_cleanup_for_pool(pool_name: &str) -> Result<()> {
+    let is_mock = std::env::var("SQUEEZEFS_MOCK_NVMEOF").is_ok();
+    let config_dir = if is_mock {
+        std::path::PathBuf::from("/tmp/squeezefs_nvmet")
+    } else {
+        std::path::PathBuf::from("/sys/kernel/config/nvmet")
+    };
+
+    let subs_dir = config_dir.join("subsystems");
+    if subs_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(subs_dir) {
+            for entry in entries.flatten() {
+                let subnqn = entry.file_name().to_string_lossy().to_string();
+                let device_path_file = entry
+                    .path()
+                    .join("namespaces")
+                    .join("1")
+                    .join("device_path");
+                if device_path_file.exists() {
+                    if let Ok(dev) = std::fs::read_to_string(device_path_file) {
+                        let dev_trimmed = dev.trim();
+                        let prefix1 = format!("/dev/{}/", pool_name);
+                        let prefix2 = format!("/dev/mapper/{}-", pool_name.replace('-', "--"));
+                        if dev_trimmed.starts_with(&prefix1) || dev_trimmed.starts_with(&prefix2) {
+                            println!(
+                                "Auto-cleaning: Unsharing NVMe-oF target '{}' associated with pool '{}'",
+                                subnqn, pool_name
+                            );
+                            let _ = crate::nvmeof::unshare_target(&subnqn);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn pool_delete(pool_name: &str, force_yes: bool) -> Result<()> {
     // 1. Scan logical volumes in VG for SqueezeFS superblocks
     let mut detected_vols = Vec::new();
@@ -326,8 +409,71 @@ pub fn pool_delete(pool_name: &str, force_yes: bool) -> Result<()> {
         ));
     }
 
+    // Auto-unshare target endpoints of LVs in this pool
+    let _ = auto_cleanup_for_pool(pool_name);
+
+    // Get the physical volumes composing this VG to clean them up afterward
+    let mut pv_paths = Vec::new();
+    let pvs_output = Command::new("pvs")
+        .args([
+            "-o",
+            "pv_name",
+            "-S",
+            &format!("vg_name={}", pool_name),
+            "--noheadings",
+        ])
+        .output();
+    if let Ok(out) = pvs_output {
+        if out.status.success() {
+            let stdout_str = String::from_utf8_lossy(&out.stdout);
+            for line in stdout_str.lines() {
+                let pv_path = line.trim().to_string();
+                if !pv_path.is_empty() {
+                    pv_paths.push(pv_path);
+                }
+            }
+        }
+    }
+
     println!("Deleting entire storage pool '{}'...", pool_name);
     run_cmd("vgremove", &["-y", pool_name])?;
+
+    // Post-deletion: pvremove LVM labels, detach loops, and disconnect NVMe-oF targets
+    for pv_path in pv_paths {
+        println!(
+            "Auto-cleaning: Removing LVM metadata label on PV '{}'...",
+            pv_path
+        );
+        let _ = run_cmd("pvremove", &["-y", "-ff", &pv_path]);
+
+        if pv_path.starts_with("/dev/loop") {
+            println!("Auto-cleaning: Detaching loop device '{}'...", pv_path);
+            let _ = Command::new("losetup").args(["-d", &pv_path]).output();
+        }
+
+        if pv_path.starts_with("/dev/nvme") {
+            let parts: Vec<&str> = pv_path.split('/').collect();
+            if let Some(dev_name) = parts.last() {
+                if dev_name.starts_with("nvme") {
+                    if let Some(end_idx) = dev_name.find('n') {
+                        let ctrl = &dev_name[..end_idx];
+                        let nqn_path = format!("/sys/class/nvme/{}/subsysnqn", ctrl);
+                        if let Ok(nqn) = std::fs::read_to_string(nqn_path) {
+                            let nqn_trim = nqn.trim();
+                            if nqn_trim.starts_with("nqn.2026-06.io.squeezefs:") {
+                                println!(
+                                    "Auto-cleaning: Disconnecting NVMe-oF initiator target '{}' for PV '{}'...",
+                                    nqn_trim, pv_path
+                                );
+                                let _ = crate::nvmeof::disconnect_target(nqn_trim);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     println!("Successfully deleted pool.");
     Ok(())
 }
@@ -382,6 +528,9 @@ pub fn volume_delete(pool_name: &str, vol_name: &str, force_yes: bool) -> Result
             ));
         }
     }
+
+    // Auto-unshare target endpoints associated with this volume
+    let _ = auto_cleanup_for_volume(pool_name, vol_name);
 
     println!("Deleting volume '{}'...", lv_path);
     run_cmd("lvremove", &["-y", &lv_path])?;

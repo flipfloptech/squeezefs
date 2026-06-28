@@ -260,6 +260,15 @@ enum Commands {
         /// Number of iterations to run the benchmark
         #[arg(short, long, default_value_t = 1)]
         iterations: usize,
+        /// Run only specific workloads (e.g. metadata, large-seq, small-rand)
+        #[arg(long, value_delimiter = ',')]
+        only: Option<Vec<String>>,
+        /// Skip specific workloads
+        #[arg(long, value_delimiter = ',')]
+        skip: Option<Vec<String>>,
+        /// Enable direct I/O (O_DIRECT)
+        #[arg(long)]
+        direct: bool,
     },
     /// Clone a file metadata-only (instant Copy-on-Write cloning)
     Clone {
@@ -2094,6 +2103,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             small_size,
             small_count,
             iterations,
+            only,
+            skip,
+            direct,
         } => {
             let mut resolved_url = None;
             let config_path = path.join(".config");
@@ -2130,7 +2142,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if iterations > 1 {
                     println!("\n--- Benchmark Iteration {}/{} ---", iter, iterations);
                 }
-                run_benchmark(&path, threads, large_size, small_size, small_count, resolved_url.as_deref()).await?;
+                run_benchmark(
+                    &path,
+                    threads,
+                    large_size,
+                    small_size,
+                    small_count,
+                    resolved_url.as_deref(),
+                    only.as_deref(),
+                    skip.as_deref(),
+                    direct,
+                ).await?;
             }
         }
         Commands::Clone {
@@ -3532,18 +3554,50 @@ async fn run_benchmark(
     small_size_kb: usize,
     small_count: usize,
     redis_url: Option<&str>,
+    only: Option<&[String]>,
+    skip: Option<&[String]>,
+    direct: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncSeekExt, SeekFrom};
+    use rand::seq::SliceRandom;
+    #[allow(unused_imports)]
+    use std::os::unix::fs::OpenOptionsExt;
+
     if !path.exists() {
         return Err(format!("Benchmark path {:?} does not exist", path).into());
     }
+
+    if direct && (small_size_kb * 1024) % 4096 != 0 {
+        return Err("For Direct I/O (--direct), small-size (in KB) must be a multiple of 4 to ensure 4096-byte alignment".into());
+    }
+
+    let is_workload_enabled = |name: &str, group: &str| -> bool {
+        if let Some(only_list) = only {
+            if !only_list.iter().any(|s| {
+                let s_trimmed = s.trim();
+                s_trimmed == name || s_trimmed == group
+            }) {
+                return false;
+            }
+        }
+        if let Some(skip_list) = skip {
+            if skip_list.iter().any(|s| {
+                let s_trimmed = s.trim();
+                s_trimmed == name || s_trimmed == group
+            }) {
+                return false;
+            }
+        }
+        true
+    };
 
     println!(
         "{}",
         "==================================================================================".bold()
     );
     println!(
-        "  Running Squeezefs Benchmark (T={}, Large={}MB, Small={}KB x {})",
-        threads, large_size_mb, small_size_kb, small_count
+        "  Running Squeezefs Benchmark (T={}, Large={}MB, Small={}KB x {}, Direct={})",
+        threads, large_size_mb, small_size_kb, small_count, direct
     );
     println!(
         "{}",
@@ -3566,282 +3620,523 @@ async fn run_benchmark(
     let chunk_size = 1024 * 1024; // 1MB block size
     let num_chunks = large_size_mb;
 
-    // --- WRITE LARGE FILE ---
-    println!("Writing large file ({} MB/thread)...", large_size_mb);
-    let pb_write_large = mp.add(ProgressBar::new((threads * num_chunks) as u64));
-    pb_write_large.set_style(pb_style.clone());
-    pb_write_large.set_message("Write Large File");
+    // Helper for O_DIRECT aligned memory buffer
+    struct AlignedBuf {
+        _raw: Vec<u8>,
+        offset: usize,
+        len: usize,
+    }
 
-    let t_start = Instant::now();
-    let mut write_tasks = Vec::new();
-    for t_id in 0..threads {
-        let path_clone = path.to_path_buf();
-        let pb = pb_write_large.clone();
-        write_tasks.push(tokio::spawn(async move {
-            let file_path = path_clone.join(format!("bench_large_{}.bin", t_id));
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&file_path)
-                .await?;
-            let buf = vec![0u8; chunk_size];
-            for _ in 0..num_chunks {
-                file.write_all(&buf).await?;
-                pb.inc(1);
+    impl AlignedBuf {
+        fn new(size: usize, direct: bool) -> Self {
+            if direct {
+                let raw = vec![0u8; size + 4096];
+                let addr = raw.as_ptr() as usize;
+                let offset = (4096 - (addr % 4096)) % 4096;
+                Self { _raw: raw, offset, len: size }
+            } else {
+                Self { _raw: vec![0u8; size], offset: 0, len: size }
             }
-            file.sync_all().await?;
-            Ok::<_, std::io::Error>(())
-        }));
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            &self._raw[self.offset .. self.offset + self.len]
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            &mut self._raw[self.offset .. self.offset + self.len]
+        }
     }
 
-    for task in write_tasks {
-        task.await??;
-    }
-    pb_write_large.finish_with_message("Done");
-    let d_write_large = t_start.elapsed();
+    let get_open_options = move |read: bool, write: bool, create: bool, truncate: bool| {
+        let mut options = OpenOptions::new();
+        if read { options.read(true); }
+        if write { options.write(true); }
+        if create { options.create(true); }
+        if truncate { options.truncate(true); }
+        #[cfg(target_os = "linux")]
+        if direct {
+            options.custom_flags(libc::O_DIRECT);
+        }
+        options
+    };
 
-    // --- READ LARGE FILE ---
-    println!("Reading large file...");
-    let pb_read_large = mp.add(ProgressBar::new((threads * num_chunks) as u64));
-    pb_read_large.set_style(pb_style.clone());
-    pb_read_large.set_message("Read Large File");
+    // --- 1. WRITE LARGE FILE (SEQUENTIAL) ---
+    let mut d_write_large_seq = None;
+    if is_workload_enabled("large-seq-write", "large-seq") {
+        println!("Writing large file sequentially ({} MB/thread)...", large_size_mb);
+        let pb_write_large_seq = mp.add(ProgressBar::new((threads * num_chunks) as u64));
+        pb_write_large_seq.set_style(pb_style.clone());
+        pb_write_large_seq.set_message("Write Large Seq");
 
-    let t_start = Instant::now();
-    let mut read_tasks = Vec::new();
-    for t_id in 0..threads {
-        let path_clone = path.to_path_buf();
-        let pb = pb_read_large.clone();
-        read_tasks.push(tokio::spawn(async move {
-            let file_path = path_clone.join(format!("bench_large_{}.bin", t_id));
-            let mut file = fs::File::open(&file_path).await?;
-            let mut buf = vec![0u8; chunk_size];
-            for _ in 0..num_chunks {
-                file.read_exact(&mut buf).await?;
-                pb.inc(1);
-            }
-            Ok::<_, std::io::Error>(())
-        }));
-    }
-
-    for task in read_tasks {
-        task.await??;
-    }
-    pb_read_large.finish_with_message("Done");
-    let d_read_large = t_start.elapsed();
-
-    // --- WRITE SMALL FILES ---
-    let small_file_bytes = small_size_kb * 1024;
-    println!(
-        "Writing small files ({} files of {} KB per thread)...",
-        small_count, small_size_kb
-    );
-    let pb_write_small = mp.add(ProgressBar::new((threads * small_count) as u64));
-    pb_write_small.set_style(pb_style.clone());
-    pb_write_small.set_message("Write Small Files");
-
-    let t_start = Instant::now();
-    let mut write_small_tasks = Vec::new();
-    for t_id in 0..threads {
-        let path_clone = path.to_path_buf();
-        let pb = pb_write_small.clone();
-        write_small_tasks.push(tokio::spawn(async move {
-            let buf = vec![1u8; small_file_bytes];
-            for f_id in 0..small_count {
-                let file_path = path_clone.join(format!("bench_small_{}_{}.bin", t_id, f_id));
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&file_path)
-                    .await?;
-                file.write_all(&buf).await?;
+        let t_start = Instant::now();
+        let mut write_tasks = Vec::new();
+        for t_id in 0..threads {
+            let path_clone = path.to_path_buf();
+            let pb = pb_write_large_seq.clone();
+            write_tasks.push(tokio::spawn(async move {
+                let file_path = path_clone.join(format!("bench_large_seq_{}.bin", t_id));
+                let mut file = get_open_options(false, true, true, true).open(&file_path).await?;
+                let buf = AlignedBuf::new(chunk_size, direct);
+                for _ in 0..num_chunks {
+                    file.write_all(buf.as_slice()).await?;
+                    pb.inc(1);
+                }
                 file.sync_all().await?;
-                pb.inc(1);
+                Ok::<_, std::io::Error>(())
+            }));
+        }
+        for task in write_tasks {
+            task.await??;
+        }
+        pb_write_large_seq.finish_with_message("Done");
+        d_write_large_seq = Some(t_start.elapsed());
+    }
+
+    // --- 2. READ LARGE FILE (SEQUENTIAL) ---
+    let mut d_read_large_seq = None;
+    if is_workload_enabled("large-seq-read", "large-seq") {
+        let file_exists = path.join("bench_large_seq_0.bin").exists();
+        if file_exists {
+            println!("Reading large file sequentially...");
+            let pb_read_large_seq = mp.add(ProgressBar::new((threads * num_chunks) as u64));
+            pb_read_large_seq.set_style(pb_style.clone());
+            pb_read_large_seq.set_message("Read Large Seq");
+
+            let t_start = Instant::now();
+            let mut read_tasks = Vec::new();
+            for t_id in 0..threads {
+                let path_clone = path.to_path_buf();
+                let pb = pb_read_large_seq.clone();
+                read_tasks.push(tokio::spawn(async move {
+                    let file_path = path_clone.join(format!("bench_large_seq_{}.bin", t_id));
+                    let mut file = get_open_options(true, false, false, false).open(&file_path).await?;
+                    let mut buf = AlignedBuf::new(chunk_size, direct);
+                    for _ in 0..num_chunks {
+                        file.read_exact(buf.as_mut_slice()).await?;
+                        pb.inc(1);
+                    }
+                    Ok::<_, std::io::Error>(())
+                }));
             }
-            Ok::<_, std::io::Error>(())
-        }));
-    }
-
-    for task in write_small_tasks {
-        task.await??;
-    }
-    pb_write_small.finish_with_message("Done");
-    let d_write_small = t_start.elapsed();
-
-    // --- READ SMALL FILES ---
-    println!("Reading small files...");
-    let pb_read_small = mp.add(ProgressBar::new((threads * small_count) as u64));
-    pb_read_small.set_style(pb_style.clone());
-    pb_read_small.set_message("Read Small Files");
-
-    let t_start = Instant::now();
-    let mut read_small_tasks = Vec::new();
-    for t_id in 0..threads {
-        let path_clone = path.to_path_buf();
-        let pb = pb_read_small.clone();
-        read_small_tasks.push(tokio::spawn(async move {
-            let mut buf = vec![0u8; small_file_bytes];
-            for f_id in 0..small_count {
-                let file_path = path_clone.join(format!("bench_small_{}_{}.bin", t_id, f_id));
-                let mut file = fs::File::open(&file_path).await?;
-                file.read_exact(&mut buf).await?;
-                pb.inc(1);
+            for task in read_tasks {
+                task.await??;
             }
-            Ok::<_, std::io::Error>(())
-        }));
+            pb_read_large_seq.finish_with_message("Done");
+            d_read_large_seq = Some(t_start.elapsed());
+        } else {
+            println!("Skipping Read Large Seq: sequential backing file not found");
+        }
     }
 
-    for task in read_small_tasks {
-        task.await??;
+    // --- 3. WRITE LARGE FILE (RANDOM) ---
+    let mut d_write_large_rand = None;
+    if is_workload_enabled("large-rand-write", "large-rand") {
+        println!("Writing large file randomly ({} MB/thread)...", large_size_mb);
+        let pb_write_large_rand = mp.add(ProgressBar::new((threads * num_chunks) as u64));
+        pb_write_large_rand.set_style(pb_style.clone());
+        pb_write_large_rand.set_message("Write Large Rand");
+
+        let t_start = Instant::now();
+        let mut write_tasks = Vec::new();
+        for t_id in 0..threads {
+            let path_clone = path.to_path_buf();
+            let pb = pb_write_large_rand.clone();
+            let mut rng = rand::thread_rng();
+            let mut indices: Vec<usize> = (0..num_chunks).collect();
+            indices.shuffle(&mut rng);
+            write_tasks.push(tokio::spawn(async move {
+                let file_path = path_clone.join(format!("bench_large_rand_{}.bin", t_id));
+                let mut file = get_open_options(false, true, true, false).open(&file_path).await?;
+                let buf = AlignedBuf::new(chunk_size, direct);
+                for idx in indices {
+                    file.seek(SeekFrom::Start((idx * chunk_size) as u64)).await?;
+                    file.write_all(buf.as_slice()).await?;
+                    pb.inc(1);
+                }
+                file.sync_all().await?;
+                Ok::<_, std::io::Error>(())
+            }));
+        }
+        for task in write_tasks {
+            task.await??;
+        }
+        pb_write_large_rand.finish_with_message("Done");
+        d_write_large_rand = Some(t_start.elapsed());
     }
-    pb_read_small.finish_with_message("Done");
-    let d_read_small = t_start.elapsed();
 
-    // --- STAT SMALL FILES ---
-    println!("Stat small files...");
-    let pb_stat_small = mp.add(ProgressBar::new((threads * small_count) as u64));
-    pb_stat_small.set_style(pb_style.clone());
-    pb_stat_small.set_message("Stat Files");
+    // --- 4. READ LARGE FILE (RANDOM) ---
+    let mut d_read_large_rand = None;
+    if is_workload_enabled("large-rand-read", "large-rand") {
+        let file_exists = path.join("bench_large_rand_0.bin").exists();
+        if file_exists {
+            println!("Reading large file randomly...");
+            let pb_read_large_rand = mp.add(ProgressBar::new((threads * num_chunks) as u64));
+            pb_read_large_rand.set_style(pb_style.clone());
+            pb_read_large_rand.set_message("Read Large Rand");
 
-    let t_start = Instant::now();
-    let mut stat_tasks = Vec::new();
-    for t_id in 0..threads {
-        let path_clone = path.to_path_buf();
-        let pb = pb_stat_small.clone();
-        stat_tasks.push(tokio::spawn(async move {
-            for f_id in 0..small_count {
-                let file_path = path_clone.join(format!("bench_small_{}_{}.bin", t_id, f_id));
-                let _meta = fs::metadata(&file_path).await?;
-                pb.inc(1);
+            let t_start = Instant::now();
+            let mut read_tasks = Vec::new();
+            for t_id in 0..threads {
+                let path_clone = path.to_path_buf();
+                let pb = pb_read_large_rand.clone();
+                let mut rng = rand::thread_rng();
+                let mut indices: Vec<usize> = (0..num_chunks).collect();
+                indices.shuffle(&mut rng);
+                read_tasks.push(tokio::spawn(async move {
+                    let file_path = path_clone.join(format!("bench_large_rand_{}.bin", t_id));
+                    let mut file = get_open_options(true, false, false, false).open(&file_path).await?;
+                    let mut buf = AlignedBuf::new(chunk_size, direct);
+                    for idx in indices {
+                        file.seek(SeekFrom::Start((idx * chunk_size) as u64)).await?;
+                        file.read_exact(buf.as_mut_slice()).await?;
+                        pb.inc(1);
+                    }
+                    Ok::<_, std::io::Error>(())
+                }));
             }
-            Ok::<_, std::io::Error>(())
-        }));
-    }
-
-    for task in stat_tasks {
-        task.await??;
-    }
-    pb_stat_small.finish_with_message("Done");
-    let d_stat = t_start.elapsed();
-
-    // --- MKDIR DIRECTORIES ---
-    println!("Mkdir directories...");
-    let pb_mkdir = mp.add(ProgressBar::new((threads * small_count) as u64));
-    pb_mkdir.set_style(pb_style.clone());
-    pb_mkdir.set_message("Mkdir");
-
-    let t_start = Instant::now();
-    let mut mkdir_tasks = Vec::new();
-    for t_id in 0..threads {
-        let path_clone = path.to_path_buf();
-        let pb = pb_mkdir.clone();
-        mkdir_tasks.push(tokio::spawn(async move {
-            let thread_dir = path_clone.join(format!("bench_dir_{}", t_id));
-            let _ = fs::create_dir_all(&thread_dir).await;
-            for d_id in 0..small_count {
-                let dir_path = thread_dir.join(format!("dir_{}", d_id));
-                fs::create_dir(&dir_path).await?;
-                pb.inc(1);
+            for task in read_tasks {
+                task.await??;
             }
-            Ok::<_, std::io::Error>(())
-        }));
+            pb_read_large_rand.finish_with_message("Done");
+            d_read_large_rand = Some(t_start.elapsed());
+        } else {
+            println!("Skipping Read Large Rand: random backing file not found");
+        }
     }
 
-    for task in mkdir_tasks {
-        task.await??;
+    // --- 5. WRITE SMALL FILES (SEQUENTIAL) ---
+    let small_file_bytes = small_size_kb * 1024;
+    let mut d_write_small_seq = None;
+    if is_workload_enabled("small-seq-write", "small-seq") {
+        println!("Writing small files sequentially ({} files of {} KB/thread)...", small_count, small_size_kb);
+        let pb_write_small_seq = mp.add(ProgressBar::new((threads * small_count) as u64));
+        pb_write_small_seq.set_style(pb_style.clone());
+        pb_write_small_seq.set_message("Write Small Seq");
+
+        let t_start = Instant::now();
+        let mut write_small_tasks = Vec::new();
+        for t_id in 0..threads {
+            let path_clone = path.to_path_buf();
+            let pb = pb_write_small_seq.clone();
+            write_small_tasks.push(tokio::spawn(async move {
+                let mut buf = AlignedBuf::new(small_file_bytes, direct);
+                buf.as_mut_slice().fill(1);
+                for f_id in 0..small_count {
+                    let file_path = path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
+                    let mut file = get_open_options(false, true, true, true).open(&file_path).await?;
+                    file.write_all(buf.as_slice()).await?;
+                    file.sync_all().await?;
+                    pb.inc(1);
+                }
+                Ok::<_, std::io::Error>(())
+            }));
+        }
+        for task in write_small_tasks {
+            task.await??;
+        }
+        pb_write_small_seq.finish_with_message("Done");
+        d_write_small_seq = Some(t_start.elapsed());
     }
-    pb_mkdir.finish_with_message("Done");
-    let d_mkdir = t_start.elapsed();
 
-    // --- READDIR DIRECTORIES ---
-    println!("Readdir directories...");
-    let pb_readdir = mp.add(ProgressBar::new((threads * small_count) as u64));
-    pb_readdir.set_style(pb_style.clone());
-    pb_readdir.set_message("Readdir");
+    // --- 6. READ SMALL FILES (SEQUENTIAL) ---
+    let mut d_read_small_seq = None;
+    if is_workload_enabled("small-seq-read", "small-seq") {
+        let file_exists = path.join("bench_small_seq_0_0.bin").exists();
+        if file_exists {
+            println!("Reading small files sequentially...");
+            let pb_read_small_seq = mp.add(ProgressBar::new((threads * small_count) as u64));
+            pb_read_small_seq.set_style(pb_style.clone());
+            pb_read_small_seq.set_message("Read Small Seq");
 
-    let t_start = Instant::now();
-    let mut readdir_tasks = Vec::new();
-    for t_id in 0..threads {
-        let path_clone = path.to_path_buf();
-        let pb = pb_readdir.clone();
-        readdir_tasks.push(tokio::spawn(async move {
-            let thread_dir = path_clone.join(format!("bench_dir_{}", t_id));
-            for _ in 0..small_count {
-                let mut reader = fs::read_dir(&thread_dir).await?;
-                while let Some(_entry) = reader.next_entry().await? {}
-                pb.inc(1);
+            let t_start = Instant::now();
+            let mut read_small_tasks = Vec::new();
+            for t_id in 0..threads {
+                let path_clone = path.to_path_buf();
+                let pb = pb_read_small_seq.clone();
+                read_small_tasks.push(tokio::spawn(async move {
+                    let mut buf = AlignedBuf::new(small_file_bytes, direct);
+                    for f_id in 0..small_count {
+                        let file_path = path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
+                        let mut file = get_open_options(true, false, false, false).open(&file_path).await?;
+                        file.read_exact(buf.as_mut_slice()).await?;
+                        pb.inc(1);
+                    }
+                    Ok::<_, std::io::Error>(())
+                }));
             }
-            Ok::<_, std::io::Error>(())
-        }));
-    }
-
-    for task in readdir_tasks {
-        task.await??;
-    }
-    pb_readdir.finish_with_message("Done");
-    let d_readdir = t_start.elapsed();
-
-    // --- RMDIR DIRECTORIES ---
-    println!("Rmdir directories...");
-    let pb_rmdir = mp.add(ProgressBar::new((threads * small_count) as u64));
-    pb_rmdir.set_style(pb_style.clone());
-    pb_rmdir.set_message("Rmdir");
-
-    let t_start = Instant::now();
-    let mut rmdir_tasks = Vec::new();
-    for t_id in 0..threads {
-        let path_clone = path.to_path_buf();
-        let pb = pb_rmdir.clone();
-        rmdir_tasks.push(tokio::spawn(async move {
-            let thread_dir = path_clone.join(format!("bench_dir_{}", t_id));
-            for d_id in 0..small_count {
-                let dir_path = thread_dir.join(format!("dir_{}", d_id));
-                fs::remove_dir(&dir_path).await?;
-                pb.inc(1);
+            for task in read_small_tasks {
+                task.await??;
             }
-            let _ = fs::remove_dir(&thread_dir).await;
-            Ok::<_, std::io::Error>(())
-        }));
+            pb_read_small_seq.finish_with_message("Done");
+            d_read_small_seq = Some(t_start.elapsed());
+        } else {
+            println!("Skipping Read Small Seq: sequential small files not found");
+        }
     }
 
-    for task in rmdir_tasks {
-        task.await??;
+    // --- 7. WRITE SMALL FILES (RANDOM) ---
+    let mut d_write_small_rand = None;
+    if is_workload_enabled("small-rand-write", "small-rand") {
+        println!("Writing small files randomly...");
+        let pb_write_small_rand = mp.add(ProgressBar::new((threads * small_count) as u64));
+        pb_write_small_rand.set_style(pb_style.clone());
+        pb_write_small_rand.set_message("Write Small Rand");
+
+        let t_start = Instant::now();
+        let mut write_small_tasks = Vec::new();
+        for t_id in 0..threads {
+            let path_clone = path.to_path_buf();
+            let pb = pb_write_small_rand.clone();
+            let mut rng = rand::thread_rng();
+            let mut indices: Vec<usize> = (0..small_count).collect();
+            indices.shuffle(&mut rng);
+            write_small_tasks.push(tokio::spawn(async move {
+                let mut buf = AlignedBuf::new(small_file_bytes, direct);
+                buf.as_mut_slice().fill(2);
+                for f_id in indices {
+                    let file_path = path_clone.join(format!("bench_small_rand_{}_{}.bin", t_id, f_id));
+                    let mut file = get_open_options(false, true, true, true).open(&file_path).await?;
+                    file.write_all(buf.as_slice()).await?;
+                    file.sync_all().await?;
+                    pb.inc(1);
+                }
+                Ok::<_, std::io::Error>(())
+            }));
+        }
+        for task in write_small_tasks {
+            task.await??;
+        }
+        pb_write_small_rand.finish_with_message("Done");
+        d_write_small_rand = Some(t_start.elapsed());
     }
-    pb_rmdir.finish_with_message("Done");
-    let d_rmdir = t_start.elapsed();
 
-    // --- DELETE FILES ---
-    println!("Deleting small files...");
-    let pb_delete_small = mp.add(ProgressBar::new((threads * small_count) as u64));
-    pb_delete_small.set_style(pb_style.clone());
-    pb_delete_small.set_message("Delete Files");
+    // --- 8. READ SMALL FILES (RANDOM) ---
+    let mut d_read_small_rand = None;
+    if is_workload_enabled("small-rand-read", "small-rand") {
+        let file_exists = path.join("bench_small_rand_0_0.bin").exists();
+        if file_exists {
+            println!("Reading small files randomly...");
+            let pb_read_small_rand = mp.add(ProgressBar::new((threads * small_count) as u64));
+            pb_read_small_rand.set_style(pb_style.clone());
+            pb_read_small_rand.set_message("Read Small Rand");
 
-    let t_start = Instant::now();
-    let mut delete_tasks = Vec::new();
-    for t_id in 0..threads {
-        let path_clone = path.to_path_buf();
-        let pb = pb_delete_small.clone();
-        delete_tasks.push(tokio::spawn(async move {
-            for f_id in 0..small_count {
-                let file_path = path_clone.join(format!("bench_small_{}_{}.bin", t_id, f_id));
-                let _ = fs::remove_file(&file_path).await;
-                pb.inc(1);
+            let t_start = Instant::now();
+            let mut read_small_tasks = Vec::new();
+            for t_id in 0..threads {
+                let path_clone = path.to_path_buf();
+                let pb = pb_read_small_rand.clone();
+                let mut rng = rand::thread_rng();
+                let mut indices: Vec<usize> = (0..small_count).collect();
+                indices.shuffle(&mut rng);
+                read_small_tasks.push(tokio::spawn(async move {
+                    let mut buf = AlignedBuf::new(small_file_bytes, direct);
+                    for f_id in indices {
+                        let file_path = path_clone.join(format!("bench_small_rand_{}_{}.bin", t_id, f_id));
+                        let mut file = get_open_options(true, false, false, false).open(&file_path).await?;
+                        file.read_exact(buf.as_mut_slice()).await?;
+                        pb.inc(1);
+                    }
+                    Ok::<_, std::io::Error>(())
+                }));
             }
-            Ok::<_, std::io::Error>(())
-        }));
+            for task in read_small_tasks {
+                task.await??;
+            }
+            pb_read_small_rand.finish_with_message("Done");
+            d_read_small_rand = Some(t_start.elapsed());
+        } else {
+            println!("Skipping Read Small Rand: random small files not found");
+        }
     }
 
-    for task in delete_tasks {
-        task.await??;
-    }
-    pb_delete_small.finish_with_message("Done");
-    let d_delete = t_start.elapsed();
+    // --- 9. STAT SMALL FILES ---
+    let mut d_stat = None;
+    if is_workload_enabled("metadata-stat", "metadata") {
+        let file_exists = path.join("bench_small_seq_0_0.bin").exists();
+        if file_exists {
+            println!("Stat small files...");
+            let pb_stat_small = mp.add(ProgressBar::new((threads * small_count) as u64));
+            pb_stat_small.set_style(pb_style.clone());
+            pb_stat_small.set_message("Stat Files");
 
-    // Clean up big files
+            let t_start = Instant::now();
+            let mut stat_tasks = Vec::new();
+            for t_id in 0..threads {
+                let path_clone = path.to_path_buf();
+                let pb = pb_stat_small.clone();
+                stat_tasks.push(tokio::spawn(async move {
+                    for f_id in 0..small_count {
+                        let file_path = path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
+                        let _meta = fs::metadata(&file_path).await?;
+                        pb.inc(1);
+                    }
+                    Ok::<_, std::io::Error>(())
+                }));
+            }
+            for task in stat_tasks {
+                task.await??;
+            }
+            pb_stat_small.finish_with_message("Done");
+            d_stat = Some(t_start.elapsed());
+        } else {
+            println!("Skipping Metadata Stat: sequential files for stat not found");
+        }
+    }
+
+    // --- 10. MKDIR DIRECTORIES ---
+    let mut d_mkdir = None;
+    if is_workload_enabled("metadata-mkdir", "metadata") {
+        println!("Mkdir directories...");
+        let pb_mkdir = mp.add(ProgressBar::new((threads * small_count) as u64));
+        pb_mkdir.set_style(pb_style.clone());
+        pb_mkdir.set_message("Mkdir");
+
+        let t_start = Instant::now();
+        let mut mkdir_tasks = Vec::new();
+        for t_id in 0..threads {
+            let path_clone = path.to_path_buf();
+            let pb = pb_mkdir.clone();
+            mkdir_tasks.push(tokio::spawn(async move {
+                let thread_dir = path_clone.join(format!("bench_dir_{}", t_id));
+                let _ = fs::create_dir_all(&thread_dir).await;
+                for d_id in 0..small_count {
+                    let dir_path = thread_dir.join(format!("dir_{}", d_id));
+                    fs::create_dir(&dir_path).await?;
+                    pb.inc(1);
+                }
+                Ok::<_, std::io::Error>(())
+            }));
+        }
+        for task in mkdir_tasks {
+            task.await??;
+        }
+        pb_mkdir.finish_with_message("Done");
+        d_mkdir = Some(t_start.elapsed());
+    }
+
+    // --- 11. READDIR DIRECTORIES ---
+    let mut d_readdir = None;
+    if is_workload_enabled("metadata-readdir", "metadata") {
+        let dir_exists = path.join("bench_dir_0").exists();
+        if dir_exists {
+            println!("Readdir directories...");
+            let pb_readdir = mp.add(ProgressBar::new((threads * small_count) as u64));
+            pb_readdir.set_style(pb_style.clone());
+            pb_readdir.set_message("Readdir");
+
+            let t_start = Instant::now();
+            let mut readdir_tasks = Vec::new();
+            for t_id in 0..threads {
+                let path_clone = path.to_path_buf();
+                let pb = pb_readdir.clone();
+                readdir_tasks.push(tokio::spawn(async move {
+                    let thread_dir = path_clone.join(format!("bench_dir_{}", t_id));
+                    for _ in 0..small_count {
+                        let mut reader = fs::read_dir(&thread_dir).await?;
+                        while let Some(_entry) = reader.next_entry().await? {}
+                        pb.inc(1);
+                    }
+                    Ok::<_, std::io::Error>(())
+                }));
+            }
+            for task in readdir_tasks {
+                task.await??;
+            }
+            pb_readdir.finish_with_message("Done");
+            d_readdir = Some(t_start.elapsed());
+        } else {
+            println!("Skipping Metadata Readdir: directories for readdir not found");
+        }
+    }
+
+    // --- 12. RMDIR DIRECTORIES ---
+    let mut d_rmdir = None;
+    if is_workload_enabled("metadata-rmdir", "metadata") {
+        let dir_exists = path.join("bench_dir_0").exists();
+        if dir_exists {
+            println!("Rmdir directories...");
+            let pb_rmdir = mp.add(ProgressBar::new((threads * small_count) as u64));
+            pb_rmdir.set_style(pb_style.clone());
+            pb_rmdir.set_message("Rmdir");
+
+            let t_start = Instant::now();
+            let mut rmdir_tasks = Vec::new();
+            for t_id in 0..threads {
+                let path_clone = path.to_path_buf();
+                let pb = pb_rmdir.clone();
+                rmdir_tasks.push(tokio::spawn(async move {
+                    let thread_dir = path_clone.join(format!("bench_dir_{}", t_id));
+                    for d_id in 0..small_count {
+                        let dir_path = thread_dir.join(format!("dir_{}", d_id));
+                        fs::remove_dir(&dir_path).await?;
+                        pb.inc(1);
+                    }
+                    let _ = fs::remove_dir(&thread_dir).await;
+                    Ok::<_, std::io::Error>(())
+                }));
+            }
+            for task in rmdir_tasks {
+                task.await??;
+            }
+            pb_rmdir.finish_with_message("Done");
+            d_rmdir = Some(t_start.elapsed());
+        } else {
+            println!("Skipping Metadata Rmdir: directories for rmdir not found");
+        }
+    }
+
+    // --- 13. DELETE FILES ---
+    let mut d_delete = None;
+    if is_workload_enabled("metadata-delete", "metadata") {
+        let seq_exists = path.join("bench_small_seq_0_0.bin").exists();
+        let rand_exists = path.join("bench_small_rand_0_0.bin").exists();
+        if seq_exists || rand_exists {
+            println!("Deleting small files...");
+            let total_deletes = if seq_exists && rand_exists { 2 * small_count } else { small_count };
+            let pb_delete_small = mp.add(ProgressBar::new((threads * total_deletes) as u64));
+            pb_delete_small.set_style(pb_style.clone());
+            pb_delete_small.set_message("Delete Files");
+
+            let t_start = Instant::now();
+            let mut delete_tasks = Vec::new();
+            for t_id in 0..threads {
+                let path_clone = path.to_path_buf();
+                let pb = pb_delete_small.clone();
+                delete_tasks.push(tokio::spawn(async move {
+                    if seq_exists {
+                        for f_id in 0..small_count {
+                            let file_path = path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
+                            let _ = fs::remove_file(&file_path).await;
+                            pb.inc(1);
+                        }
+                    }
+                    if rand_exists {
+                        for f_id in 0..small_count {
+                            let file_path = path_clone.join(format!("bench_small_rand_{}_{}.bin", t_id, f_id));
+                            let _ = fs::remove_file(&file_path).await;
+                            pb.inc(1);
+                        }
+                    }
+                    Ok::<_, std::io::Error>(())
+                }));
+            }
+            for task in delete_tasks {
+                task.await??;
+            }
+            pb_delete_small.finish_with_message("Done");
+            d_delete = Some(t_start.elapsed());
+        } else {
+            println!("Skipping Metadata Delete: small files for delete not found");
+        }
+    }
+
+    // Clean up large files
     for t_id in 0..threads {
-        let file_path = path.join(format!("bench_large_{}.bin", t_id));
-        let _ = fs::remove_file(file_path).await;
+        let file_path1 = path.join(format!("bench_large_seq_{}.bin", t_id));
+        let _ = fs::remove_file(file_path1).await;
+        let file_path2 = path.join(format!("bench_large_rand_{}.bin", t_id));
+        let _ = fs::remove_file(file_path2).await;
     }
 
     // 2. Fetch post-benchmark metrics
@@ -3853,69 +4148,108 @@ async fn run_benchmark(
 
     // --- CALCULATE PERFORMANCE VALUES ---
     let total_large_bytes = (threads * num_chunks * chunk_size) as f64;
-    let write_large_tput = (total_large_bytes / (1024.0 * 1024.0)) / d_write_large.as_secs_f64();
-    let write_large_iops = (threads * num_chunks) as f64 / d_write_large.as_secs_f64();
-    let write_large_cost = (d_write_large.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
-
-    let read_large_tput = (total_large_bytes / (1024.0 * 1024.0)) / d_read_large.as_secs_f64();
-    let read_large_iops = (threads * num_chunks) as f64 / d_read_large.as_secs_f64();
-    let read_large_cost = (d_read_large.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
-
     let total_small_files = (threads * small_count) as f64;
     let total_small_bytes = total_small_files * small_file_bytes as f64;
-    let write_small_tput = (total_small_bytes / (1024.0 * 1024.0)) / d_write_small.as_secs_f64();
-    let write_small_iops = total_small_files / d_write_small.as_secs_f64();
-    let write_small_cost = (d_write_small.as_secs_f64() * 1000.0) / total_small_files;
 
-    let read_small_tput = (total_small_bytes / (1024.0 * 1024.0)) / d_read_small.as_secs_f64();
-    let read_small_iops = total_small_files / d_read_small.as_secs_f64();
-    let read_small_cost = (d_read_small.as_secs_f64() * 1000.0) / total_small_files;
+    let (write_large_seq_tput, write_large_seq_iops, write_large_seq_cost) = if let Some(d) = d_write_large_seq {
+        let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+        let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
+        (Some(tput), Some(iops), Some(cost))
+    } else { (None, None, None) };
 
-    let stat_iops = total_small_files / d_stat.as_secs_f64();
-    let stat_cost = (d_stat.as_secs_f64() * 1000.0) / total_small_files;
+    let (read_large_seq_tput, read_large_seq_iops, read_large_seq_cost) = if let Some(d) = d_read_large_seq {
+        let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+        let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
+        (Some(tput), Some(iops), Some(cost))
+    } else { (None, None, None) };
 
-    let mkdir_iops = total_small_files / d_mkdir.as_secs_f64();
-    let mkdir_cost = (d_mkdir.as_secs_f64() * 1000.0) / total_small_files;
+    let (write_large_rand_tput, write_large_rand_iops, write_large_rand_cost) = if let Some(d) = d_write_large_rand {
+        let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+        let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
+        (Some(tput), Some(iops), Some(cost))
+    } else { (None, None, None) };
 
-    let readdir_iops = total_small_files / d_readdir.as_secs_f64();
-    let readdir_cost = (d_readdir.as_secs_f64() * 1000.0) / total_small_files;
+    let (read_large_rand_tput, read_large_rand_iops, read_large_rand_cost) = if let Some(d) = d_read_large_rand {
+        let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+        let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
+        (Some(tput), Some(iops), Some(cost))
+    } else { (None, None, None) };
 
-    let rmdir_iops = total_small_files / d_rmdir.as_secs_f64();
-    let rmdir_cost = (d_rmdir.as_secs_f64() * 1000.0) / total_small_files;
+    let (write_small_seq_tput, write_small_seq_iops, write_small_seq_cost) = if let Some(d) = d_write_small_seq {
+        let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+        let iops = total_small_files / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+        (Some(tput), Some(iops), Some(cost))
+    } else { (None, None, None) };
 
-    let delete_iops = total_small_files / d_delete.as_secs_f64();
-    let delete_cost = (d_delete.as_secs_f64() * 1000.0) / total_small_files;
+    let (read_small_seq_tput, read_small_seq_iops, read_small_seq_cost) = if let Some(d) = d_read_small_seq {
+        let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+        let iops = total_small_files / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+        (Some(tput), Some(iops), Some(cost))
+    } else { (None, None, None) };
+
+    let (write_small_rand_tput, write_small_rand_iops, write_small_rand_cost) = if let Some(d) = d_write_small_rand {
+        let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+        let iops = total_small_files / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+        (Some(tput), Some(iops), Some(cost))
+    } else { (None, None, None) };
+
+    let (read_small_rand_tput, read_small_rand_iops, read_small_rand_cost) = if let Some(d) = d_read_small_rand {
+        let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+        let iops = total_small_files / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+        (Some(tput), Some(iops), Some(cost))
+    } else { (None, None, None) };
+
+    let (stat_iops, stat_cost) = if let Some(d) = d_stat {
+        let iops = total_small_files / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+        (Some(iops), Some(cost))
+    } else { (None, None) };
+
+    let (mkdir_iops, mkdir_cost) = if let Some(d) = d_mkdir {
+        let iops = total_small_files / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+        (Some(iops), Some(cost))
+    } else { (None, None) };
+
+    let (readdir_iops, readdir_cost) = if let Some(d) = d_readdir {
+        let iops = total_small_files / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+        (Some(iops), Some(cost))
+    } else { (None, None) };
+
+    let (rmdir_iops, rmdir_cost) = if let Some(d) = d_rmdir {
+        let iops = total_small_files / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+        (Some(iops), Some(cost))
+    } else { (None, None) };
+
+    let (delete_iops, delete_cost) = if let Some(d) = d_delete {
+        let count_multiplier = if path.join("bench_small_seq_0_0.bin").exists() && path.join("bench_small_rand_0_0.bin").exists() { 2.0 } else { 1.0 };
+        let iops = (total_small_files * count_multiplier) / d.as_secs_f64();
+        let cost = (d.as_secs_f64() * 1000.0) / (total_small_files * count_multiplier);
+        (Some(iops), Some(cost))
+    } else { (None, None) };
 
     // --- COLOR THRESHOLDS ---
     let format_tput = |val: f64| {
         let s = format!("{:>12.2} MiB/s", val);
-        if val > 100.0 {
-            s.green()
-        } else if val > 50.0 {
-            s.yellow()
-        } else {
-            s.red()
-        }
+        if val > 100.0 { s.green() } else if val > 50.0 { s.yellow() } else { s.red() }
     };
     let format_iops = |val: f64| {
         let s = format!("{:>12.2} ops/s", val);
-        if val > 200.0 {
-            s.green()
-        } else if val > 100.0 {
-            s.yellow()
-        } else {
-            s.red()
-        }
+        if val > 200.0 { s.green() } else if val > 100.0 { s.yellow() } else { s.red() }
     };
     let format_stat_iops = |val: f64| {
         let s = format!("{:>12.2} ops/s", val);
-        if val > 2000.0 {
-            s.green()
-        } else if val > 1000.0 {
-            s.yellow()
-        } else {
-            s.red()
-        }
+        if val > 2000.0 { s.green() } else if val > 1000.0 { s.yellow() } else { s.red() }
     };
 
     println!(
@@ -3930,79 +4264,47 @@ async fn run_benchmark(
         "{}",
         "+----------------------+--------------------+--------------------+--------------------+".bold()
     );
-    println!(
-        "| {:<20} | {} | {} | {:>14.2} ms |",
-        "Write (Large File)",
-        format_tput(write_large_tput),
-        format_iops(write_large_iops),
-        write_large_cost
-    );
-    println!(
-        "| {:<20} | {} | {} | {:>14.2} ms |",
-        "Read (Large File)",
-        format_tput(read_large_tput),
-        format_iops(read_large_iops),
-        read_large_cost
-    );
-    println!(
-        "| {:<20} | {} | {} | {:>14.2} ms |",
-        "Write (Small Files)",
-        format_tput(write_small_tput),
-        format_iops(write_small_iops),
-        write_small_cost
-    );
-    println!(
-        "| {:<20} | {} | {} | {:>14.2} ms |",
-        "Read (Small Files)",
-        format_tput(read_small_tput),
-        format_iops(read_small_iops),
-        read_small_cost
-    );
-    println!(
-        "{}",
-        "+----------------------+--------------------+--------------------+--------------------+".bold()
-    );
-    println!(
-        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
-        "Metadata Stat",
-        "N/A",
-        format_stat_iops(stat_iops),
-        stat_cost
-    );
-    println!(
-        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
-        "Metadata Mkdir",
-        "N/A",
-        format_stat_iops(mkdir_iops),
-        mkdir_cost
-    );
-    println!(
-        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
-        "Metadata Readdir",
-        "N/A",
-        format_stat_iops(readdir_iops),
-        readdir_cost
-    );
-    println!(
-        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
-        "Metadata Rmdir",
-        "N/A",
-        format_stat_iops(rmdir_iops),
-        rmdir_cost
-    );
-    println!(
-        "| {:<20} | {:>18} | {} | {:>14.2} ms |",
-        "Metadata Delete",
-        "N/A",
-        format_stat_iops(delete_iops),
-        delete_cost
-    );
-    println!(
-        "{}",
-        "+----------------------+--------------------+--------------------+--------------------+".bold()
-    );
 
-    // --- RENDER DAEMON METRICS ---
+    let print_row = |name: &str, tput: Option<f64>, iops: Option<f64>, latency: Option<f64>, is_metadata: bool| {
+        let tput_str = if is_metadata {
+            "N/A".normal()
+        } else if let Some(t) = tput {
+            format_tput(t)
+        } else {
+            "Skipped".yellow()
+        };
+        let iops_str = if let Some(i) = iops {
+            if is_metadata { format_stat_iops(i) } else { format_iops(i) }
+        } else {
+            "Skipped".yellow()
+        };
+        let lat_str = if let Some(l) = latency {
+            format!("{:>14.2} ms", l).yellow()
+        } else {
+            "Skipped".yellow()
+        };
+        println!(
+            "| {:<20} | {:>18} | {:>18} | {:>18} |",
+            name, tput_str, iops_str, lat_str
+        );
+    };
+
+    print_row("Write (Large Seq)", write_large_seq_tput, write_large_seq_iops, write_large_seq_cost, false);
+    print_row("Read (Large Seq)", read_large_seq_tput, read_large_seq_iops, read_large_seq_cost, false);
+    print_row("Write (Large Rand)", write_large_rand_tput, write_large_rand_iops, write_large_rand_cost, false);
+    print_row("Read (Large Rand)", read_large_rand_tput, read_large_rand_iops, read_large_rand_cost, false);
+    print_row("Write (Small Seq)", write_small_seq_tput, write_small_seq_iops, write_small_seq_cost, false);
+    print_row("Read (Small Seq)", read_small_seq_tput, read_small_seq_iops, read_small_seq_cost, false);
+    print_row("Write (Small Rand)", write_small_rand_tput, write_small_rand_iops, write_small_rand_cost, false);
+    print_row("Read (Small Rand)", read_small_rand_tput, read_small_rand_iops, read_small_rand_cost, false);
+    println!("{}", "+----------------------+--------------------+--------------------+--------------------+".bold());
+    print_row("Metadata Stat", None, stat_iops, stat_cost, true);
+    print_row("Metadata Mkdir", None, mkdir_iops, mkdir_cost, true);
+    print_row("Metadata Readdir", None, readdir_iops, readdir_cost, true);
+    print_row("Metadata Rmdir", None, rmdir_iops, rmdir_cost, true);
+    print_row("Metadata Delete", None, delete_iops, delete_cost, true);
+    println!("{}", "+----------------------+--------------------+--------------------+--------------------+".bold());
+
     if let (Some(base), Some(post)) = (baseline_metrics, post_metrics) {
         println!(
             "\n{}",

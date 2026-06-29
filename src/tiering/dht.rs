@@ -83,10 +83,12 @@ fn make_server_config() -> std::io::Result<quinn::ServerConfig> {
 
     let mut transport = quinn::TransportConfig::default();
     transport
-        .stream_receive_window(8_388_608u32.into())
-        .receive_window(16_777_216u32.into())
-        .send_window(8_388_608)
-        .max_concurrent_bidi_streams(10_000u32.into());
+        .stream_receive_window(33_554_432u32.into()) // 32MB stream window
+        .receive_window(67_108_864u32.into())        // 64MB connection window
+        .send_window(33_554_432)                     // 32MB send window
+        .max_concurrent_bidi_streams(10_000u32.into())
+        .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
+        .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
     server_config.transport_config(Arc::new(transport));
 
     Ok(server_config)
@@ -105,10 +107,12 @@ fn make_client_config() -> quinn::ClientConfig {
 
     let mut transport = quinn::TransportConfig::default();
     transport
-        .stream_receive_window(8_388_608u32.into())
-        .receive_window(16_777_216u32.into())
-        .send_window(8_388_608)
-        .max_concurrent_bidi_streams(10_000u32.into());
+        .stream_receive_window(33_554_432u32.into()) // 32MB stream window
+        .receive_window(67_108_864u32.into())        // 64MB connection window
+        .send_window(33_554_432)                     // 32MB send window
+        .max_concurrent_bidi_streams(10_000u32.into())
+        .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
+        .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
     client_config.transport_config(Arc::new(transport));
 
     client_config
@@ -270,7 +274,8 @@ where
             value_len,
         } => {
             if has_value {
-                let mut payload = vec![0u8; value_len as usize];
+                let mut payload = Vec::with_capacity(value_len as usize);
+                unsafe { payload.set_len(value_len as usize); }
                 reader.read_exact(&mut payload).await?;
                 Message::ValueResponse {
                     value: Some(Bytes::from(payload)),
@@ -280,7 +285,8 @@ where
             }
         }
         WireMessage::StoreValueHeader { key, value_len } => {
-            let mut payload = vec![0u8; value_len as usize];
+            let mut payload = Vec::with_capacity(value_len as usize);
+            unsafe { payload.set_len(value_len as usize); }
             reader.read_exact(&mut payload).await?;
             Message::StoreValue {
                 key,
@@ -326,8 +332,17 @@ impl DhtNode {
         let peer_id = xxh3_64(peer_addr.as_bytes());
         let socket_addr: SocketAddr = peer_addr.parse().expect("Invalid peer address");
         let server_config = make_server_config().expect("Failed to create server config");
-        let mut endpoint = quinn::Endpoint::server(server_config, socket_addr)
-            .expect("Failed to bind UDP socket for QUIC endpoint");
+        let socket = std::net::UdpSocket::bind(socket_addr).expect("Failed to bind UDP socket");
+        let sock2 = socket2::Socket::from(socket);
+        let _ = sock2.set_send_buffer_size(16 * 1024 * 1024);
+        let _ = sock2.set_recv_buffer_size(16 * 1024 * 1024);
+        let socket = std::net::UdpSocket::from(sock2);
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            std::sync::Arc::new(quinn::TokioRuntime),
+        ).expect("Failed to create QUIC endpoint");
         endpoint.set_default_client_config(make_client_config());
 
         Self {

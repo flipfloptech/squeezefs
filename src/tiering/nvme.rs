@@ -92,7 +92,7 @@ unsafe impl Sync for NvmeCacheReadGuard {}
 
 pub struct NvmeShard {
     inner: RwLock<NvmeShardInner>,
-    _file: File, // Keep file handle alive
+    _file: Option<File>, // Keep file handle alive if file-backed
 }
 
 impl NvmeShard {
@@ -115,7 +115,22 @@ impl NvmeShard {
                 write_offset: 0,
                 capacity,
             }),
-            _file: file,
+            _file: Some(file),
+        })
+    }
+
+    fn new_anon(capacity: usize) -> std::io::Result<Self> {
+        let mmap = MmapMut::map_anon(capacity)?;
+
+        Ok(Self {
+            inner: RwLock::new(NvmeShardInner {
+                mmap,
+                map: HashMap::new(),
+                active_keys: VecDeque::new(),
+                write_offset: 0,
+                capacity,
+            }),
+            _file: None,
         })
     }
 
@@ -337,22 +352,38 @@ impl NvmeCache {
             "Number of shards must be a power of two"
         );
         let mut devices = Vec::new();
-        for (i, (&dir, &capacity)) in dirs.iter().zip(capacities.iter()).enumerate() {
-            std::fs::create_dir_all(dir)?;
+        if dirs.is_empty() {
+            let capacity = capacities.first().copied().unwrap_or(1024 * 1024 * 1024); // default 1GB
             let shard_capacity = capacity / num_shards_per_device;
             let mut shards = Vec::with_capacity(num_shards_per_device);
-            for j in 0..num_shards_per_device {
-                let filename = format!("segment_{}.bin", j);
-                let path = dir.join(filename);
-                shards.push(NvmeShard::new(&path, shard_capacity)?);
+            for _ in 0..num_shards_per_device {
+                shards.push(NvmeShard::new_anon(shard_capacity)?);
             }
             devices.push(Arc::new(NvmeDevice {
-                id: i,
-                path: dir.to_path_buf(),
+                id: 0,
+                path: std::path::PathBuf::from("/memory"),
                 capacity,
                 shards,
                 online: Arc::new(AtomicBool::new(true)),
             }));
+        } else {
+            for (i, (&dir, &capacity)) in dirs.iter().zip(capacities.iter()).enumerate() {
+                std::fs::create_dir_all(dir)?;
+                let shard_capacity = capacity / num_shards_per_device;
+                let mut shards = Vec::with_capacity(num_shards_per_device);
+                for j in 0..num_shards_per_device {
+                    let filename = format!("segment_{}.bin", j);
+                    let path = dir.join(filename);
+                    shards.push(NvmeShard::new(&path, shard_capacity)?);
+                }
+                devices.push(Arc::new(NvmeDevice {
+                    id: i,
+                    path: dir.to_path_buf(),
+                    capacity,
+                    shards,
+                    online: Arc::new(AtomicBool::new(true)),
+                }));
+            }
         }
 
         Ok(Self {

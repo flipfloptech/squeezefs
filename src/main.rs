@@ -1145,12 +1145,14 @@ fn print_mount_diagnostics(
     let staging_dirs = if let Some(dirs) = disk_cache_paths {
         if dirs.is_empty() {
             vec![get_default_staging_dir()]
+        } else if dirs.len() == 1 && (dirs[0] == PathBuf::from("none") || dirs[0] == PathBuf::from("memory") || dirs[0] == PathBuf::from("memory-only") || dirs[0] == PathBuf::from("")) {
+            Vec::new()
         } else {
             dirs.to_vec()
         }
     } else if let Some(paths_str) = format_fields.get("disk_cache_paths") {
-        if paths_str.is_empty() {
-            vec![get_default_staging_dir()]
+        if paths_str.is_empty() || paths_str == "none" || paths_str == "memory" {
+            Vec::new()
         } else {
             paths_str.split(',').map(PathBuf::from).collect()
         }
@@ -1780,12 +1782,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let staging_dirs = if let Some(dirs) = disk_cache_paths {
                 if dirs.is_empty() {
                     vec![get_default_staging_dir()]
+                } else if dirs.len() == 1 && (dirs[0] == PathBuf::from("none") || dirs[0] == PathBuf::from("memory") || dirs[0] == PathBuf::from("memory-only") || dirs[0] == PathBuf::from("")) {
+                    Vec::new()
                 } else {
                     dirs
                 }
             } else if let Some(paths_str) = format_fields.get("disk_cache_paths") {
-                if paths_str.is_empty() {
-                    vec![get_default_staging_dir()]
+                if paths_str.is_empty() || paths_str == "none" || paths_str == "memory" {
+                    Vec::new()
                 } else {
                     paths_str.split(',').map(PathBuf::from).collect()
                 }

@@ -53,6 +53,42 @@ fn check_disk_free_safeguard(path: &std::path::Path) -> bool {
     true
 }
 
+struct StagedMetadata {
+    fencing_token: u64,
+    original_size: u64,
+    file_path: String,
+}
+
+impl StagedMetadata {
+    fn serialize(&self) -> Vec<u8> {
+        let path_bytes = self.file_path.as_bytes();
+        let mut buf = Vec::with_capacity(20 + path_bytes.len());
+        buf.extend_from_slice(&self.fencing_token.to_be_bytes());
+        buf.extend_from_slice(&self.original_size.to_be_bytes());
+        buf.extend_from_slice(&(path_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(path_bytes);
+        buf
+    }
+
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 20 {
+            return None;
+        }
+        let fencing_token = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let original_size = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let path_len = u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        if bytes.len() < 20 + path_len {
+            return None;
+        }
+        let file_path = String::from_utf8(bytes[20..20 + path_len].to_vec()).ok()?;
+        Some(Self {
+            fencing_token,
+            original_size,
+            file_path,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct NvmeStaging {
     staging_dirs: Vec<PathBuf>,
@@ -240,13 +276,14 @@ impl NvmeStaging {
         data: &[u8],
         fencing_token: u64,
     ) -> Result<()> {
-        let meta_content = serde_json::json!({
-            "file_path": file_path,
-            "fencing_token": fencing_token,
-            "original_size": data.len()
-        });
-        let meta_json_bytes = serde_json::to_vec(&meta_content).unwrap();
-        let unpadded_len = 8 + meta_json_bytes.len() + data.len();
+        let meta = StagedMetadata {
+            fencing_token,
+            original_size: data.len() as u64,
+            file_path: file_path.to_string(),
+        };
+        let meta_bytes = meta.serialize();
+        let meta_len = meta_bytes.len() as u64;
+        let unpadded_len = 8 + meta_bytes.len() + data.len();
         let padded_size = unpadded_len as u64;
 
         let target_dir = self.staging_dirs.first().ok_or_else(|| {
@@ -290,11 +327,10 @@ impl NvmeStaging {
         }
 
         let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
-        let meta_len = meta_json_bytes.len() as u64;
 
         let mut packed_payload = Vec::with_capacity(unpadded_len);
         packed_payload.extend_from_slice(&meta_len.to_be_bytes());
-        packed_payload.extend_from_slice(&meta_json_bytes);
+        packed_payload.extend_from_slice(&meta_bytes);
         packed_payload.extend_from_slice(data);
 
         let payload_bytes = Bytes::from(packed_payload);
@@ -329,17 +365,17 @@ impl NvmeStaging {
 
     /// Put a packed active block write to staging_nvme_cache.
     pub fn put_active_block(&self, key: &str, data: &[u8], fencing_token: u64) {
-        let meta_content = serde_json::json!({
-            "file_path": key,
-            "fencing_token": fencing_token,
-            "original_size": data.len()
-        });
-        let meta_json_bytes = serde_json::to_vec(&meta_content).unwrap();
-        let unpadded_len = 8 + meta_json_bytes.len() + data.len();
+        let meta = StagedMetadata {
+            fencing_token,
+            original_size: data.len() as u64,
+            file_path: key.to_string(),
+        };
+        let meta_bytes = meta.serialize();
+        let meta_len = meta_bytes.len() as u64;
+        let unpadded_len = 8 + meta_bytes.len() + data.len();
         let mut packed_payload = Vec::with_capacity(unpadded_len);
-        let meta_len = meta_json_bytes.len() as u64;
         packed_payload.extend_from_slice(&meta_len.to_be_bytes());
-        packed_payload.extend_from_slice(&meta_json_bytes);
+        packed_payload.extend_from_slice(&meta_bytes);
         packed_payload.extend_from_slice(data);
 
         let key_bytes = Bytes::copy_from_slice(key.as_bytes());
@@ -369,16 +405,11 @@ impl NvmeStaging {
         if bytes.len() >= 8 {
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() >= 8 + meta_len {
-                if let Ok(meta_json) =
-                    serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len])
-                {
-                    if let Some(orig_size) = meta_json.get("original_size").and_then(|v| v.as_u64())
-                    {
-                        let data_start = 8 + meta_len;
-                        let data_end = data_start + orig_size as usize;
-                        if bytes.len() >= data_end {
-                            return Some(bytes[data_start..data_end].to_vec());
-                        }
+                if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
+                    let data_start = 8 + meta_len;
+                    let data_end = data_start + meta.original_size as usize;
+                    if bytes.len() >= data_end {
+                        return Some(bytes[data_start..data_end].to_vec());
                     }
                 }
             }
@@ -397,18 +428,13 @@ impl NvmeStaging {
         if bytes.len() >= 8 {
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() >= 8 + meta_len {
-                if let Ok(meta_json) =
-                    serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len])
-                {
-                    if let Some(orig_size) = meta_json.get("original_size").and_then(|v| v.as_u64())
-                    {
-                        let data_start = 8 + meta_len;
-                        let data_end = data_start + orig_size as usize;
-                        if bytes.len() >= data_end {
-                            guard.offset += data_start;
-                            guard.len = orig_size as usize;
-                            return Some(guard);
-                        }
+                if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
+                    let data_start = 8 + meta_len;
+                    let data_end = data_start + meta.original_size as usize;
+                    if bytes.len() >= data_end {
+                        guard.offset += data_start;
+                        guard.len = meta.original_size as usize;
+                        return Some(guard);
                     }
                 }
             }
@@ -556,19 +582,11 @@ impl NvmeStaging {
                     let meta_len =
                         u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
                     if bytes.len() >= 8 + meta_len {
-                        if let Ok(meta_json) =
-                            serde_json::from_slice::<serde_json::Value>(&bytes[8..8 + meta_len])
-                        {
-                            if let Some(orig_size) =
-                                meta_json.get("original_size").and_then(|v| v.as_u64())
-                            {
-                                let data_start = 8 + meta_len;
-                                let data_end = data_start + orig_size as usize;
-                                if bytes.len() >= data_end {
-                                    Some(bytes[data_start..data_end].to_vec())
-                                } else {
-                                    None
-                                }
+                        if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
+                            let data_start = 8 + meta_len;
+                            let data_end = data_start + meta.original_size as usize;
+                            if bytes.len() >= data_end {
+                                Some(bytes[data_start..data_end].to_vec())
                             } else {
                                 None
                             }

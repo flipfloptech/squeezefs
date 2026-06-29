@@ -38,6 +38,7 @@ hyper-rustls-024 = { package = "hyper-rustls", version = "0.24", features = ["we
 moka = { version = "0.12.15", features = ["sync"] }
 fastrand = "2.0"
 core_affinity = "0.8"
+socket2 = "0.5"
 dhat = { version = "0.3.3", optional = true }
 coz = { version = "0.1", optional = true }
 lz4_flex = "0.11"

@@ -104,6 +104,14 @@ When deploying on a multi-node cluster where hosts are equipped with multiple ph
                      +-----------------+
 ```
 
+### Share a Target via user-space SPDK
+To share a local backing file or NVMe block device using the high-performance user-space SPDK target (`nvmf_tgt` listener):
+```bash
+# Share a backing disk as SPDK NVMe-oF subsystem target
+sudo ./target/release/squeezefs nvmeof share /dev/nvme0n1 --spdk --port 4420 --ip 10.10.10.50
+```
+This sends JSON-RPC requests directly to the SPDK daemon listening at `/var/tmp/spdk.sock` to construct bdevs, subsystems, namespaces, and bind TCP listeners, achieving bare-metal polling throughput.
+
 ### Connect to Remote NVMe-oF Storage
 To connect to an NVMe over Fabrics target device (fully compatible with standard Linux targets and user-space SPDK targets) before mounting:
 ```bash

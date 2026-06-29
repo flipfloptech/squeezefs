@@ -263,3 +263,33 @@ async fn test_nvmeof_multirail_mock_connect() {
     let _ = fs::remove_dir_all(mock_fabrics);
     let _ = fs::remove_dir_all(mock_nvme);
 }
+
+#[test]
+fn test_nvmeof_spdk_target_mock_lifecycle() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF", "1");
+    std::env::set_var("SQUEEZEFS_TEST_ENV", "1");
+    let temp_config_file = "/tmp/squeezefs_nvmeof_shares_test.json";
+    let _ = fs::remove_file(temp_config_file);
+
+    // 1. Share via SPDK
+    let subnqn = squeezefs::nvmeof::share_target_spdk(
+        "/tmp/test_spdk_backing.img",
+        None,
+        4420,
+        "127.0.0.1",
+    )
+    .expect("Share SPDK target should succeed in mock mode");
+
+    assert!(subnqn.starts_with("nqn.2026-06.io.squeezefs:spdk-subsystem-"));
+
+    // 2. Check restore
+    let res = squeezefs::nvmeof::restore_shares();
+    assert!(res.is_ok());
+
+    // 3. Unshare via standard target dispatcher (should auto-detect SPDK share)
+    squeezefs::nvmeof::unshare_target(&subnqn)
+        .expect("Unsharing SPDK target should succeed");
+
+    let _ = fs::remove_file(temp_config_file);
+}

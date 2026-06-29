@@ -226,8 +226,189 @@ pub fn share_target(
     Ok(subnqn)
 }
 
+pub fn call_spdk_rpc(method: &str, params: serde_json::Value) -> std::io::Result<serde_json::Value> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let socket_path = std::env::var("SQUEEZEFS_SPDK_SOCK")
+        .unwrap_or_else(|_| "/var/tmp/spdk.sock".to_string());
+    
+    if is_mock() {
+        return Ok(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": true
+        }));
+    }
+
+    let mut stream = UnixStream::connect(&socket_path)?;
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params
+    });
+    
+    let req_str = request.to_string();
+    stream.write_all(req_str.as_bytes())?;
+    stream.flush()?;
+    
+    let mut response_bytes = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        response_bytes.extend_from_slice(&buf[..n]);
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&response_bytes) {
+            if val.get("result").is_some() || val.get("error").is_some() {
+                return Ok(val);
+            }
+        }
+    }
+    
+    let val: serde_json::Value = serde_json::from_slice(&response_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(val)
+}
+
+pub fn share_target_spdk(
+    backing_path: &str,
+    subnqn_opt: Option<&str>,
+    port: u16,
+    ip: &str,
+) -> std::io::Result<String> {
+    let subnqn = match subnqn_opt {
+        Some(s) => s.to_string(),
+        None => format!("nqn.2026-06.io.squeezefs:spdk-subsystem-{}", Uuid::new_v4()),
+    };
+
+    // 1. Create transport (ignore if already exists)
+    let _ = call_spdk_rpc("nvmf_create_transport", serde_json::json!({
+        "trtype": "TCP"
+    }));
+
+    // 2. Create bdev from backing path
+    let bdev_name = format!("bdev_{}", Uuid::new_v4().simple());
+    
+    let res = call_spdk_rpc("bdev_aio_create", serde_json::json!({
+        "name": bdev_name,
+        "filename": backing_path,
+        "block_size": 4096
+    }))?;
+    
+    if let Some(err) = res.get("error") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to create SPDK AIO bdev: {}", err),
+        ));
+    }
+
+    // 3. Create subsystem
+    let res = call_spdk_rpc("nvmf_create_subsystem", serde_json::json!({
+        "nqn": subnqn,
+        "allow_any_host": true,
+        "serial_number": format!("SQ{}", &Uuid::new_v4().to_string()[..10])
+    }))?;
+    
+    if let Some(err) = res.get("error") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to create SPDK NVMe-oF subsystem: {}", err),
+        ));
+    }
+
+    // 4. Add namespace using our bdev
+    let res = call_spdk_rpc("nvmf_subsystem_add_ns", serde_json::json!({
+        "nqn": subnqn,
+        "namespace": {
+            "bdev_name": bdev_name
+        }
+    }))?;
+    
+    if let Some(err) = res.get("error") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to add bdev to SPDK subsystem namespace: {}", err),
+        ));
+    }
+
+    // 5. Add listener to expose the port/IP
+    let res = call_spdk_rpc("nvmf_subsystem_add_listener", serde_json::json!({
+        "nqn": subnqn,
+        "listen_address": {
+            "trtype": "TCP",
+            "adrfam": "IPv4",
+            "traddr": ip,
+            "trsvcid": port.to_string()
+        }
+    }))?;
+    
+    if let Some(err) = res.get("error") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to expose SPDK subsystem listener: {}", err),
+        ));
+    }
+
+    let _ = register_share_ext(backing_path, &subnqn, port, ip, true);
+
+    Ok(subnqn)
+}
+
+pub fn unshare_target_spdk(subnqn: &str) -> std::io::Result<()> {
+    // 1. Get subsystems to identify associated bdev name
+    let res = call_spdk_rpc("nvmf_get_subsystems", serde_json::json!({}))?;
+    let mut bdev_to_delete = None;
+    if let Some(result_arr) = res.get("result").and_then(|r| r.as_array()) {
+        for sub in result_arr {
+            if sub.get("nqn").and_then(|n| n.as_str()) == Some(subnqn) {
+                if let Some(namespaces) = sub.get("namespaces").and_then(|ns| ns.as_array()) {
+                    if let Some(ns1) = namespaces.first() {
+                        if let Some(name) = ns1.get("name").and_then(|n| n.as_str()) {
+                            bdev_to_delete = Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Delete the subsystem
+    let res = call_spdk_rpc("nvmf_delete_subsystem", serde_json::json!({
+        "nqn": subnqn
+    }))?;
+    if let Some(err) = res.get("error") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to delete SPDK subsystem: {}", err),
+        ));
+    }
+
+    // 3. Delete the associated bdev if we found it
+    if let Some(bdev_name) = bdev_to_delete {
+        let _ = call_spdk_rpc("bdev_aio_delete", serde_json::json!({
+            "name": bdev_name
+        }));
+    }
+
+    let _ = deregister_share(subnqn);
+
+    Ok(())
+}
+
 pub fn unshare_target(subnqn: &str) -> std::io::Result<()> {
     check_root()?;
+
+    // Check if shared via SPDK
+    let shares = load_shares();
+    if let Some(share) = shares.iter().find(|s| s.subnqn == subnqn) {
+        if share.is_spdk.unwrap_or(false) {
+            return unshare_target_spdk(subnqn);
+        }
+    }
+
     let config_dir = configfs_path();
     let sub_dir = config_dir.join("subsystems").join(subnqn);
     if !sub_dir.exists() {
@@ -718,6 +899,7 @@ pub struct NvmeofShareConfig {
     pub subnqn: String,
     pub port: u16,
     pub ip: String,
+    pub is_spdk: Option<bool>,
 }
 
 fn get_shares_config_path() -> PathBuf {
@@ -761,6 +943,16 @@ pub fn register_share(
     port: u16,
     ip: &str,
 ) -> std::io::Result<()> {
+    register_share_ext(backing_path, subnqn, port, ip, false)
+}
+
+pub fn register_share_ext(
+    backing_path: &str,
+    subnqn: &str,
+    port: u16,
+    ip: &str,
+    is_spdk: bool,
+) -> std::io::Result<()> {
     let mut shares = load_shares();
     shares.retain(|s| s.subnqn != subnqn);
     shares.push(NvmeofShareConfig {
@@ -768,6 +960,7 @@ pub fn register_share(
         subnqn: subnqn.to_string(),
         port,
         ip: ip.to_string(),
+        is_spdk: Some(is_spdk),
     });
     save_shares(&shares)
 }
@@ -792,12 +985,22 @@ pub fn restore_shares() -> std::io::Result<()> {
             share.port,
             share.ip
         );
-        if let Err(e) = share_target(
-            &share.backing_path,
-            Some(&share.subnqn),
-            share.port,
-            &share.ip,
-        ) {
+        let res = if share.is_spdk.unwrap_or(false) {
+            share_target_spdk(
+                &share.backing_path,
+                Some(&share.subnqn),
+                share.port,
+                &share.ip,
+            )
+        } else {
+            share_target(
+                &share.backing_path,
+                Some(&share.subnqn),
+                share.port,
+                &share.ip,
+            ).map(|_| share.subnqn.clone())
+        };
+        if let Err(e) = res {
             log::error!(
                 "Failed to restore target share for {}: {:?}",
                 share.subnqn,

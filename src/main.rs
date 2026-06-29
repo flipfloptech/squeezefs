@@ -442,11 +442,17 @@ enum NvmeofActions {
         /// IP address to bind target to (default: 0.0.0.0)
         #[arg(long, default_value = "0.0.0.0")]
         ip: String,
+        /// Share target via user-space SPDK instead of kernel configfs
+        #[arg(long)]
+        spdk: bool,
     },
     /// Stop sharing an NVMe-oF target subsystem
     Unshare {
         /// Subsystem NQN to unshare
         subnqn: String,
+        /// Unshare target from user-space SPDK instead of kernel configfs
+        #[arg(long)]
+        spdk: bool,
     },
     /// Connect local client to a remote NVMe-oF target
     Connect {
@@ -2568,14 +2574,28 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     subnqn,
                     port,
                     ip,
+                    spdk,
                 } => {
-                    let resolved_nqn = squeezefs::nvmeof::share_target(
-                        &backing_path,
-                        subnqn.as_deref(),
-                        port,
-                        &ip,
-                    )?;
-                    println!("Successfully shared '{}' as NVMe-oF target.", backing_path);
+                    let resolved_nqn = if spdk {
+                        squeezefs::nvmeof::share_target_spdk(
+                            &backing_path,
+                            subnqn.as_deref(),
+                            port,
+                            &ip,
+                        )?
+                    } else {
+                        squeezefs::nvmeof::share_target(
+                            &backing_path,
+                            subnqn.as_deref(),
+                            port,
+                            &ip,
+                        )?
+                    };
+                    println!(
+                        "Successfully shared '{}' as {}NVMe-oF target.",
+                        backing_path,
+                        if spdk { "SPDK " } else { "" }
+                    );
                     println!("Subsystem NQN: {}", resolved_nqn);
                     println!("Connection string for client nodes:");
                     println!(
@@ -2583,8 +2603,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         port, resolved_nqn
                     );
                 }
-                NvmeofActions::Unshare { subnqn } => {
-                    squeezefs::nvmeof::unshare_target(&subnqn)?;
+                NvmeofActions::Unshare { subnqn, spdk } => {
+                    if spdk {
+                        squeezefs::nvmeof::unshare_target_spdk(&subnqn)?;
+                    } else {
+                        squeezefs::nvmeof::unshare_target(&subnqn)?;
+                    }
                     println!("Successfully stopped sharing target NQN '{}'.", subnqn);
                 }
                 NvmeofActions::Connect {

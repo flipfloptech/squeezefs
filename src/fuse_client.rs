@@ -5768,7 +5768,7 @@ async fn flush_single_active_block(
     use redis::AsyncCommands;
     let mut con = dlm.get_connection_for_inode(ino).await?;
 
-    let block_bytes = bytes::Bytes::from(block_data.clone());
+    let block_bytes = bytes::Bytes::from(block_data);
     let processed_block = router.get_crypto().process_write(block_bytes.clone())?;
     let processed_len = processed_block.len();
 

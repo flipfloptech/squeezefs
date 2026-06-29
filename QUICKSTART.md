@@ -137,3 +137,29 @@ This applies the following optimizations:
 - **`vm.dirty_ratio = 40`** & **`vm.dirty_background_ratio = 10`**: Aggressively buffers writes in memory before flushing.
 - **`net.core.rmem_max`** & **`net.core.wmem_max` to `67108864` (64MB)**: Expands TCP socket buffers for massive parallel streams.
 - **FUSE Connection Limits**: Increases `max_background` to `64` and `congestion_threshold` to `48` to prevent FUSE queue starvation.
+
+---
+
+## 4. Developer Micro-Benchmarks & Disk-less Mode
+
+### Running in Disk-less (Memory-only) Staging Mode
+If you do not have a dedicated local NVMe staging drive or want to evaluate SqueezeFS core logic bypassing all physical drive write amplification, you can configure staging to run entirely in system RAM:
+```bash
+./target/release/squeezefs mount squeeze://127.0.0.1:6379/squeezefs-volume /mnt/squeezefs \
+  --disk-cache-paths memory \
+  --nvme-path /dev/main-pool/my-vol \
+  --daemon
+```
+* **Memory Staging:** Specifying `memory` (or `none`) directs SqueezeFS to spin up virtual `MmapMut::map_anon` segments in RAM, completely bypassing local disk operations.
+
+### Running the High-Concurrency Micro-Benchmark Suite
+SqueezeFS includes a Criterion-based micro-benchmark suite to stress-test locks, writes, reads, and memory allocations under high parallel task loads:
+```bash
+# Run the concurrent micro-benchmarks
+cargo bench --bench high_concurrency_bench
+```
+This suite profiles:
+- **`concurrent_writes_16_tasks`**: Measures concurrent chunk writes to distinct files.
+- **`concurrent_reads_16_tasks_same_file`**: Measures concurrent reads from a shared file.
+- **`concurrent_locks_16_tasks`**: Measures DLM lock acquisition/release contention.
+- **`concurrent_pool_alloc_16_tasks`**: Measures allocation/deallocation concurrency in the unified buffer pool.

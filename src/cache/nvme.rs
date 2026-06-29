@@ -90,12 +90,6 @@ impl NvmeStaging {
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
         redis_client: crate::dlm::MetaClient,
     ) -> Result<Self> {
-        if staging_dirs.is_empty() {
-            return Err(SqueezefsError::InvalidOperation(
-                "At least one staging directory must be specified".to_string(),
-            ));
-        }
-
         // Initialize directories for segments
         let mut read_cache_dirs = Vec::new();
         let mut staging_segment_dirs = Vec::new();
@@ -139,8 +133,12 @@ impl NvmeStaging {
 
         let read_cache_dirs_refs: Vec<&std::path::Path> =
             read_cache_dirs.iter().map(|p| p.as_path()).collect();
-        let read_cap = actual_max_read_bytes as usize / staging_dirs.len();
-        let read_capacities = vec![read_cap; staging_dirs.len()];
+        let read_capacities = if staging_dirs.is_empty() {
+            vec![actual_max_read_bytes as usize]
+        } else {
+            let read_cap = actual_max_read_bytes as usize / staging_dirs.len();
+            vec![read_cap; staging_dirs.len()]
+        };
         let read_nvme_cache = Arc::new(crate::tiering::nvme::NvmeCache::new(
             &read_cache_dirs_refs,
             &read_capacities,
@@ -167,8 +165,12 @@ impl NvmeStaging {
 
         let staging_dirs_refs: Vec<&std::path::Path> =
             staging_segment_dirs.iter().map(|p| p.as_path()).collect();
-        let write_cap = actual_max_write_bytes as usize / staging_dirs.len();
-        let write_capacities = vec![write_cap; staging_dirs.len()];
+        let write_capacities = if staging_dirs.is_empty() {
+            vec![actual_max_write_bytes as usize]
+        } else {
+            let write_cap = actual_max_write_bytes as usize / staging_dirs.len();
+            vec![write_cap; staging_dirs.len()]
+        };
         let staging_nvme_cache = Arc::new(crate::tiering::nvme::NvmeCache::new(
             &staging_dirs_refs,
             &write_capacities,

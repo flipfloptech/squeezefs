@@ -45,7 +45,7 @@ async fn test_bound_connection_rwlock_concurrency() {
     };
 
     let bound = BoundConnection {
-        conn: Arc::new(tokio::sync::RwLock::new(conn)),
+        conn: Arc::new(parking_lot::RwLock::new(conn)),
         local_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379),
         conn_info: client.get_connection_info().clone(),
@@ -57,7 +57,7 @@ async fn test_bound_connection_rwlock_concurrency() {
         let bound_clone = bound.clone();
         let handle = tokio::spawn(async move {
             // Read-locking bound.conn should be completely concurrent (no blocking)
-            let _conn_clone = bound_clone.conn.read().await.clone();
+            let _conn_clone = bound_clone.conn.read().clone();
         });
         handles.push(handle);
     }

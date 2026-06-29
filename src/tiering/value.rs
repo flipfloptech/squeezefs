@@ -3,7 +3,7 @@ use bytes::Bytes;
 use std::ops::Deref;
 
 /// Unified zero-copy reference to cached bytes.
-/// Dereferences to `&[u8]` to enable zero-copy reads across Memory, NVMe, and S3/Network tiers.
+/// Dereferences to `&[u8]` to enable zero-copy reads across Memory, NVMe, and NVMe-oF Backend tiers.
 pub enum CacheValue<'a> {
     Memory(Bytes),
     Nvme(NvmeReadGuard<'a>),

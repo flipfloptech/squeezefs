@@ -318,8 +318,13 @@ fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
     if !nvme_path.exists() {
         return Ok(None);
     }
+    let mut entries = Vec::new();
     for entry in fs::read_dir(nvme_path)? {
-        let entry = entry?;
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
         let path = entry.path();
         let dev_name = entry.file_name().to_string_lossy().to_string();
         if dev_name.starts_with("nvme") {
@@ -328,8 +333,13 @@ fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
                 let current_nqn = fs::read_to_string(nqn_file)?.trim().to_string();
                 if current_nqn == subnqn {
                     // Check if namespace block device dir exists (e.g. nvme0n1)
+                    let mut sub_entries = Vec::new();
                     for sub_entry in fs::read_dir(&path)? {
-                        let sub_entry = sub_entry?;
+                        sub_entries.push(sub_entry?);
+                    }
+                    sub_entries.sort_by_key(|e| e.file_name());
+
+                    for sub_entry in sub_entries {
                         let sub_name = sub_entry.file_name().to_string_lossy().to_string();
                         if sub_name.starts_with(&dev_name) && sub_name.contains('n') {
                             return Ok(Some(format!("/dev/{}", sub_name)));
@@ -343,7 +353,14 @@ fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
     Ok(None)
 }
 
-pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<String> {
+static MOCK_WRITE_MUTEX: once_cell::sync::Lazy<std::sync::Mutex<()>> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
+
+fn connect_target_single(
+    ip: &str,
+    port: u16,
+    subnqn: &str,
+    local_ip: Option<std::net::IpAddr>,
+) -> std::io::Result<()> {
     check_root()?;
     if !is_mock() {
         let _ = execute_cmd("modprobe", &["nvme-tcp"]);
@@ -354,11 +371,31 @@ pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<Stri
 
     if has_nvme_cli {
         let port_str = port.to_string();
-        let _ = Command::new("nvme")
-            .args([
-                "connect", "-t", "tcp", "-a", ip, "-s", &port_str, "-n", subnqn,
-            ])
+        let mut args = vec![
+            "connect".to_string(),
+            "-t".to_string(),
+            "tcp".to_string(),
+            "-a".to_string(),
+            ip.to_string(),
+            "-s".to_string(),
+            port_str,
+            "-n".to_string(),
+            subnqn.to_string(),
+        ];
+        if let Some(host_ip) = local_ip {
+            args.push("-p".to_string());
+            args.push(host_ip.to_string());
+        }
+        let output = Command::new("nvme")
+            .args(&args)
             .output()?;
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("nvme connect failed: {}", err_msg),
+            ));
+        }
     } else {
         // Fallback to direct fabrics write
         let target_file = if is_mock() {
@@ -378,15 +415,33 @@ pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<Stri
 
         let hostnqn = get_host_nqn();
         let hostid = get_host_id();
-        let ctrl_conn_str = format!(
+        let mut ctrl_conn_str = format!(
             "transport=tcp,traddr={},trsvcid={},nqn={},hostnqn={},hostid={}",
             ip, port, subnqn, hostnqn, hostid
         );
+        if let Some(host_ip) = local_ip {
+            ctrl_conn_str = format!("{},host_traddr={}", ctrl_conn_str, host_ip);
+        }
 
         if is_mock() {
-            fs::write(&target_file, &ctrl_conn_str)?;
-            // Create a mock controller dir
-            let ctrl_dir = sysfs_nvme_path().join("nvme0");
+            let _lock = MOCK_WRITE_MUTEX.lock().unwrap();
+            let mut ctl_content = String::new();
+            if target_file.exists() {
+                ctl_content = fs::read_to_string(&target_file)?;
+            }
+            if !ctl_content.is_empty() {
+                ctl_content.push('\n');
+            }
+            ctl_content.push_str(&ctrl_conn_str);
+            fs::write(&target_file, &ctl_content)?;
+
+            // Find next available controller name (e.g. nvme0, nvme1, ...)
+            let mut ctrl_index = 0;
+            let nvme_path = sysfs_nvme_path();
+            while nvme_path.join(format!("nvme{}", ctrl_index)).exists() {
+                ctrl_index += 1;
+            }
+            let ctrl_dir = nvme_path.join(format!("nvme{}", ctrl_index));
             fs::create_dir_all(&ctrl_dir)?;
             fs::write(ctrl_dir.join("subsysnqn"), subnqn)?;
             fs::write(
@@ -396,10 +451,64 @@ pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<Stri
             fs::write(ctrl_dir.join("delete_controller"), "")?;
 
             // Create mock namespace
-            let ns_dev_dir = ctrl_dir.join("nvme0n1");
+            let ns_dev_dir = ctrl_dir.join(format!("nvme{}n1", ctrl_index));
             fs::create_dir_all(&ns_dev_dir)?;
         } else {
             fs::write(&target_file, &ctrl_conn_str)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<String> {
+    connect_target_with_local_ips(ip, port, subnqn, &[])
+}
+
+pub fn connect_target_with_local_ips(
+    ip: &str,
+    port: u16,
+    subnqn: &str,
+    local_ips: &[std::net::IpAddr],
+) -> std::io::Result<String> {
+    if local_ips.is_empty() {
+        connect_target_single(ip, port, subnqn, None)?;
+    } else {
+        let mut handles = Vec::new();
+        for &local_ip in local_ips {
+            let ip = ip.to_string();
+            let subnqn = subnqn.to_string();
+            let handle = std::thread::spawn(move || {
+                connect_target_single(&ip, port, &subnqn, Some(local_ip))
+            });
+            handles.push(handle);
+        }
+
+        let mut last_err = None;
+        let mut success = false;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {
+                    success = true;
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(e);
+                }
+                Err(_) => {
+                    last_err = Some(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Thread join failed",
+                    ));
+                }
+            }
+        }
+
+        if !success {
+            return Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Failed to connect via any local IP address",
+                )
+            }));
         }
     }
 

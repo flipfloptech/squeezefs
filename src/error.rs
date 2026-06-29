@@ -9,8 +9,8 @@ pub enum SqueezefsError {
     #[error("Redis / Garnet error: {0}")]
     Redis(#[from] redis::RedisError),
 
-    #[error("S3 error: {0}")]
-    S3(String),
+    #[error("NVMe-oF error: {0}")]
+    NvmeOfBackend(String),
 
     #[error("Lock acquisition failed: {reason}")]
     LockFailed { reason: String },
@@ -51,7 +51,7 @@ impl SqueezefsError {
                 }
             }
             SqueezefsError::Redis(_) => libc::ECOMM,
-            SqueezefsError::S3(_) => libc::EIO,
+            SqueezefsError::NvmeOfBackend(_) => libc::EIO,
             SqueezefsError::LockFailed { .. } => libc::EAGAIN,
             SqueezefsError::FencingTokenExpired { .. } => libc::EACCES,
             SqueezefsError::InvalidOperation(_) => libc::EINVAL,

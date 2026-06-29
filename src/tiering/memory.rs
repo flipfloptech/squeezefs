@@ -33,7 +33,7 @@ impl MemoryCacheShard {
         }
     }
 
-    fn get(&self, key: &Bytes) -> Option<Bytes> {
+    fn get(&self, key: &[u8]) -> Option<Bytes> {
         if let Some(&idx) = self.map.get(key) {
             if let Some(ref node) = self.arena[idx] {
                 node.referenced.store(true, Ordering::Relaxed);
@@ -127,7 +127,7 @@ impl MemoryCacheShard {
         }
     }
 
-    fn remove(&mut self, key: &Bytes) -> Option<Bytes> {
+    fn remove(&mut self, key: &[u8]) -> Option<Bytes> {
         if let Some(idx) = self.map.remove(key) {
             if let Some(node) = self.arena[idx].take() {
                 self.free_slots.push(idx);
@@ -168,14 +168,14 @@ impl MemoryCache {
     }
 
     #[inline]
-    fn get_shard_idx(&self, key: &Bytes) -> usize {
+    fn get_shard_idx(&self, key: &[u8]) -> usize {
         let hash = xxh3_64(key);
         (hash as usize) & self.shard_mask
     }
 
     /// Retrieves an item from the cache. Clones the `Bytes` pointer (O(1), zero-copy).
     /// Uses only a read lock to avoid lock contention under high concurrent read workloads.
-    pub fn get(&self, key: &Bytes) -> Option<Bytes> {
+    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         let idx = self.get_shard_idx(key);
         self.shards[idx].read().get(key)
     }
@@ -189,7 +189,7 @@ impl MemoryCache {
     }
 
     /// Removes an item from the cache, returning the value if it existed.
-    pub fn remove(&self, key: &Bytes) -> Option<Bytes> {
+    pub fn remove(&self, key: &[u8]) -> Option<Bytes> {
         let idx = self.get_shard_idx(key);
         self.shards[idx].write().remove(key)
     }

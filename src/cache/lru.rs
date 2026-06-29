@@ -73,8 +73,7 @@ impl LruCache {
 
     /// Retrieve an entry from the cache, updating its clock status.
     pub fn get(&self, key: &str) -> Option<Bytes> {
-        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-        self.inner.get(&key_bytes)
+        self.inner.get(key.as_bytes())
     }
 
     /// Insert an entry into the cache, executing Clock eviction if maximum capacity is exceeded.
@@ -91,8 +90,7 @@ impl LruCache {
     }
 
     pub fn remove(&self, key: &str) {
-        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-        self.inner.remove(&key_bytes);
+        self.inner.remove(key.as_bytes());
     }
 
     pub fn current_bytes(&self) -> u64 {

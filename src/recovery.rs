@@ -331,7 +331,7 @@ pub async fn recover_staging(
                     .await
                 {
                     error!(
-                        "Crash Recovery: Failed to upload recovered block to RustFS: {:?}",
+                        "Crash Recovery: Failed to write recovered block to NVMe-oF backend: {:?}",
                         e
                     );
                     continue;

@@ -756,7 +756,7 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
             .unwrap();
 
             let addr = format!("127.0.0.1:{}", 26300 + i);
-            let server = squeezefs::p2p::P2pServer::new(addr.clone(), cache.nvme.clone());
+            let server = squeezefs::p2p::P2pServer::new(addr.clone(), cache.clone());
 
             // Spawn P2P server
             tokio::spawn(async move {

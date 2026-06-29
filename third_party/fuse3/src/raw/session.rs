@@ -82,6 +82,11 @@ impl MountHandle {
             .inner_unmount()
             .await
     }
+
+    #[cfg(unix)]
+    pub fn fd(&self) -> Option<std::os::fd::RawFd> {
+        self.inner.as_ref().map(|inner| inner.fd)
+    }
 }
 
 impl Drop for MountHandle {
@@ -111,6 +116,8 @@ struct MountHandleInner {
     destroy_notify: Arc<async_notify::Notify>,
     #[cfg(all(target_os = "linux", feature = "unprivileged"))]
     unprivileged: bool,
+    #[cfg(unix)]
+    fd: std::os::fd::RawFd,
 }
 
 impl MountHandleInner {
@@ -340,6 +347,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         )
         .await?;
 
+        let fd = fuse_connection.as_fd().as_raw_fd();
         self.fuse_connection.replace(Arc::new(fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
@@ -352,6 +360,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 unprivileged: true,
+                #[cfg(unix)]
+                fd,
             }),
         })
     }
@@ -403,6 +413,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 destroy_notify: notify,
                 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
                 unprivileged: false,
+                #[cfg(unix)]
+                fd,
             }),
         })
     }

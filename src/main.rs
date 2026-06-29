@@ -480,11 +480,21 @@ enum NvmeofActions {
     RestoreShares,
     /// Install SPDK from source and set up dependencies
     SpdkInstall,
-    /// Configure hugepages and bind devices to user-space drivers
+    /// Configure hugepages (e.g. 2GB or 4GB)
     SpdkSetup {
         /// Memory to allocate for hugepages (e.g. "2GB" or "4GB")
         #[arg(long, default_value = "2GB")]
         hugepages: String,
+    },
+    /// Bind a specific PCIe NVMe device to SPDK user-space driver
+    SpdkBind {
+        /// PCIe address of the device to bind (e.g. 0000:01:00.0)
+        pci: String,
+    },
+    /// Unbind a specific PCIe NVMe device from SPDK and return it to kernel control
+    SpdkUnbind {
+        /// PCIe address of the device to unbind (e.g. 0000:01:00.0)
+        pci: String,
     },
     /// Start the SPDK NVMe-oF target daemon (nvmf_tgt) in the background
     SpdkStart,
@@ -2668,6 +2678,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     squeezefs::nvmeof::spdk_setup(mb)?;
+                }
+                NvmeofActions::SpdkBind { pci } => {
+                    squeezefs::nvmeof::spdk_bind(&pci)?;
+                }
+                NvmeofActions::SpdkUnbind { pci } => {
+                    squeezefs::nvmeof::spdk_unbind(&pci)?;
                 }
                 NvmeofActions::SpdkStart => {
                     squeezefs::nvmeof::spdk_start()?;

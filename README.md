@@ -124,13 +124,16 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
   ```
 
 * **NVMe-oF Utilities:**
-  Share and dismantle NVMe-oF targets (supporting both standard kernel configfs and user-space SPDK) via `squeezefs nvmeof`.
+  Share and dismantle NVMe-oF targets, and install/configure user-space SPDK via `squeezefs nvmeof`.
   ```bash
   squeezefs nvmeof share <path> [--spdk] [--port <port>] [--ip <ip>]
   squeezefs nvmeof connect --ip <ip> --subnqn <nqn> [--port <port>]
   squeezefs nvmeof disconnect <nqn>
   squeezefs nvmeof unshare <nqn> [--spdk]
   squeezefs nvmeof list
+  squeezefs nvmeof spdk-install
+  squeezefs nvmeof spdk-setup [--hugepages-mb <MB>]
+  squeezefs nvmeof spdk-start
   ```
 
 * **Storage Pool & Volume Management:**

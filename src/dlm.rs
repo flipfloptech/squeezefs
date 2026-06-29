@@ -929,31 +929,24 @@ impl DlmClient {
         // Generate a monotonic fencing token key
         let fencing_gen_key = format!("fencing_generator:{}", file_path);
 
-        // Perform atomic lock acquire + fencing token increment via Lua
-        let acquired: Option<String> = redis::cmd("SET")
+        // Perform atomic lock acquire + fencing token increment via pipeline
+        let mut pipe = redis::pipe();
+        pipe.cmd("SET")
             .arg(&lock_key)
             .arg(&self.client_id)
             .arg("NX")
             .arg("PX")
-            .arg(ttl_ms)
-            .query_async(&mut con)
-            .await
-            .map_err(|e| {
-                println!("REDIS ERROR: {:?}", e);
+            .arg(ttl_ms);
+        pipe.cmd("INCR").arg(&fencing_gen_key);
+
+        let (acquired, fencing_token): (Option<String>, u64) =
+            pipe.query_async(&mut con).await.map_err(|e| {
+                println!("REDIS ERROR (Pipeline): {:?}", e);
                 e
             })?;
 
-        let fencing_token: Option<u64> = if acquired.is_some() {
-            Some(
-                redis::cmd("INCR")
-                    .arg(&fencing_gen_key)
-                    .query_async(&mut con)
-                    .await
-                    .map_err(|e| {
-                        println!("REDIS ERROR: {:?}", e);
-                        e
-                    })?,
-            )
+        let fencing_token = if acquired.is_some() {
+            Some(fencing_token)
         } else {
             None
         };

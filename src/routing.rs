@@ -285,24 +285,20 @@ impl DataRouter {
         Ok(pooled)
     }
 
-    pub async fn get_cached_or_fetch_block(&self, block_key: &str) -> Result<PooledBuf> {
+    pub async fn get_cached_or_fetch_block(
+        &self,
+        block_key: &str,
+    ) -> Result<crate::cache::pool::ReadBlockValue> {
         if let Some(cached_block) = self.cache.read_lru.get(block_key) {
             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-            let mut pooled = BUFFER_POOL.alloc();
-            pooled.resize(cached_block.len(), 0);
-            pooled.copy_from_slice(&cached_block);
-            return Ok(pooled);
+            return Ok(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
         }
 
         if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-            self.cache
-                .read_lru
-                .put(block_key, bytes::Bytes::from(cached_block.clone()));
-            let mut pooled = BUFFER_POOL.alloc();
-            pooled.resize(cached_block.len(), 0);
-            pooled.copy_from_slice(&cached_block);
-            return Ok(pooled);
+            let bytes = bytes::Bytes::from(cached_block);
+            self.cache.read_lru.put(block_key, bytes.clone());
+            return Ok(crate::cache::pool::ReadBlockValue::Bytes(bytes));
         }
 
         let (tx, _rx) = tokio::sync::broadcast::channel(1);
@@ -326,7 +322,7 @@ impl DataRouter {
                 self.cache
                     .read_lru
                     .put(block_key, bytes::Bytes::copy_from_slice(&downloaded));
-                Ok(downloaded)
+                Ok(crate::cache::pool::ReadBlockValue::Pooled(downloaded))
             }
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 let tx = entry.get().clone();
@@ -335,20 +331,13 @@ impl DataRouter {
                 let _ = rx.recv().await;
                 if let Some(cached_block) = self.cache.read_lru.get(block_key) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    let mut pooled = BUFFER_POOL.alloc();
-                    pooled.resize(cached_block.len(), 0);
-                    pooled.copy_from_slice(&cached_block);
-                    return Ok(pooled);
+                    return Ok(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
                 }
                 if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    self.cache
-                        .read_lru
-                        .put(block_key, bytes::Bytes::from(cached_block.clone()));
-                    let mut pooled = BUFFER_POOL.alloc();
-                    pooled.resize(cached_block.len(), 0);
-                    pooled.copy_from_slice(&cached_block);
-                    return Ok(pooled);
+                    let bytes = bytes::Bytes::from(cached_block);
+                    self.cache.read_lru.put(block_key, bytes.clone());
+                    return Ok(crate::cache::pool::ReadBlockValue::Bytes(bytes));
                 }
                 Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -1272,7 +1261,15 @@ impl DataRouter {
             tasks.push(tokio::spawn(async move {
                 let mut block_data = if needs_existing {
                     if let Some(ref bk) = old_block_key {
-                        router_clone.get_cached_or_fetch_block(bk).await?
+                        match router_clone.get_cached_or_fetch_block(bk).await? {
+                            crate::cache::pool::ReadBlockValue::Pooled(p) => p,
+                            crate::cache::pool::ReadBlockValue::Bytes(b) => {
+                                let mut pooled = BUFFER_POOL.alloc();
+                                pooled.resize(b.len(), 0);
+                                pooled.copy_from_slice(&b);
+                                pooled
+                            }
+                        }
                     } else {
                         let mut pooled = BUFFER_POOL.alloc();
                         pooled.resize(rel_end, 0);
@@ -1573,7 +1570,7 @@ impl DataRouter {
                         } else {
                             let mut buf = BUFFER_POOL.alloc();
                             buf.resize(block_size as usize, 0);
-                            Ok(buf)
+                            Ok(crate::cache::pool::ReadBlockValue::Pooled(buf))
                         }
                     });
                     futures.push(task);

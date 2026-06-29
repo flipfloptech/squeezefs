@@ -132,7 +132,9 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
   squeezefs nvmeof unshare <nqn> [--spdk]
   squeezefs nvmeof list
   squeezefs nvmeof spdk-install
-  squeezefs nvmeof spdk-setup [--hugepages-mb <MB>]
+  squeezefs nvmeof spdk-setup [--hugepages <2GB/4GB>]
+  squeezefs nvmeof spdk-bind --pci <pci_addr>
+  squeezefs nvmeof spdk-unbind --pci <pci_addr>
   squeezefs nvmeof spdk-start
   ```
 

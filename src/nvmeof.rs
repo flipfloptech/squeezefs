@@ -1044,6 +1044,25 @@ pub fn spdk_install() -> std::io::Result<()> {
         return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to install SPDK dependencies"));
     }
 
+    // Install Python dependencies (tabulate)
+    println!("Installing required Python modules (tabulate)...");
+    let pip_status = std::process::Command::new("pip3")
+        .args(&["install", "tabulate", "--break-system-packages"])
+        .status();
+    if pip_status.is_err() || !pip_status.unwrap().success() {
+        let pip_status2 = std::process::Command::new("pip")
+            .args(&["install", "tabulate"])
+            .status();
+        if pip_status2.is_err() || !pip_status2.unwrap().success() {
+            let apt_status = std::process::Command::new("apt-get")
+                .args(&["install", "-y", "python3-tabulate"])
+                .status();
+            if apt_status.is_err() || !apt_status.unwrap().success() {
+                println!("Warning: Could not install python 'tabulate' library. Compilation might fail.");
+            }
+        }
+    }
+
     println!("Configuring SPDK...");
     let status = std::process::Command::new("./configure")
         .current_dir("/opt/spdk")

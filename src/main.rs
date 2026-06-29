@@ -482,9 +482,9 @@ enum NvmeofActions {
     SpdkInstall,
     /// Configure hugepages and bind devices to user-space drivers
     SpdkSetup {
-        /// Memory to allocate for hugepages in MB (default: 2048)
-        #[arg(long, default_value_t = 2048)]
-        hugepages_mb: usize,
+        /// Memory to allocate for hugepages (e.g. "2GB" or "4GB")
+        #[arg(long, default_value = "2GB")]
+        hugepages: String,
     },
     /// Start the SPDK NVMe-oF target daemon (nvmf_tgt) in the background
     SpdkStart,
@@ -2656,8 +2656,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 NvmeofActions::SpdkInstall => {
                     squeezefs::nvmeof::spdk_install()?;
                 }
-                NvmeofActions::SpdkSetup { hugepages_mb } => {
-                    squeezefs::nvmeof::spdk_setup(hugepages_mb)?;
+                NvmeofActions::SpdkSetup { hugepages } => {
+                    let mb = match hugepages.as_str() {
+                        "2GB" | "2gb" => 2048,
+                        "4GB" | "4gb" => 4096,
+                        other => {
+                            return Err(format!(
+                                "Invalid hugepages value '{}'. Must be '2GB' or '4GB'.",
+                                other
+                            ).into());
+                        }
+                    };
+                    squeezefs::nvmeof::spdk_setup(mb)?;
                 }
                 NvmeofActions::SpdkStart => {
                     squeezefs::nvmeof::spdk_start()?;

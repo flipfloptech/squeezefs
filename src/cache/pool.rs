@@ -67,3 +67,24 @@ pub static BUFFER_POOL: Lazy<Arc<BufferPool>> = Lazy::new(|| {
     let capacity = std::cmp::max(cores * 16, 512);
     Arc::new(BufferPool::new(capacity, 4 * 1024 * 1024))
 });
+
+pub enum ReadBlockValue {
+    Pooled(PooledBuf),
+    Bytes(bytes::Bytes),
+}
+
+impl Deref for ReadBlockValue {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            ReadBlockValue::Pooled(p) => &**p,
+            ReadBlockValue::Bytes(b) => b.as_ref(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for ReadBlockValue {
+    fn as_ref(&self) -> &[u8] {
+        self.deref()
+    }
+}

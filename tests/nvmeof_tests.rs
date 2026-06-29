@@ -301,5 +301,7 @@ fn test_nvmeof_spdk_helpers_mock() {
     
     assert!(squeezefs::nvmeof::spdk_install().is_ok());
     assert!(squeezefs::nvmeof::spdk_setup(1024).is_ok());
+    assert!(squeezefs::nvmeof::spdk_bind("0000:01:00.0").is_ok());
+    assert!(squeezefs::nvmeof::spdk_unbind("0000:01:00.0").is_ok());
     assert!(squeezefs::nvmeof::spdk_start().is_ok());
 }

@@ -1070,41 +1070,96 @@ pub fn spdk_install() -> std::io::Result<()> {
 
 pub fn spdk_setup(hugepages_mb: usize) -> std::io::Result<()> {
     check_root()?;
-    println!("Configuring hugepages ({}MB) and binding devices...", hugepages_mb);
+    println!("Configuring hugepages ({}MB)...", hugepages_mb);
     if is_mock() {
-        println!("MOCK: Writing to /sys/kernel/mm/hugepages/... and running /opt/spdk/scripts/setup.sh");
+        println!("MOCK: Configuring hugepages.");
         return Ok(());
     }
 
-    // Allocate hugepages
+    // 1. Allocate hugepages via sysfs
     let pages = hugepages_mb / 2; // 2MB pages
     let nr_hugepages_path = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
     if std::path::Path::new(nr_hugepages_path).exists() {
         fs::write(nr_hugepages_path, pages.to_string())?;
+        println!("Successfully allocated {} x 2MB hugepages.", pages);
     } else {
-        println!("Warning: 2MB hugepages sysfs path not found. Proceeding with SPDK setup script allocation...");
+        // Fallback to setup.sh config_huge
+        let setup_script = "/opt/spdk/scripts/setup.sh";
+        if std::path::Path::new(setup_script).exists() {
+            let status = std::process::Command::new(setup_script)
+                .arg("config_huge")
+                .env("HUGEMEM", hugepages_mb.to_string())
+                .status()?;
+            if !status.success() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "SPDK setup.sh config_huge failed.",
+                ));
+            }
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "SPDK setup.sh not found at /opt/spdk/scripts/setup.sh.",
+            ));
+        }
     }
 
-    // Run SPDK setup script
+    println!("Successfully configured hugepages.");
+    Ok(())
+}
+
+pub fn spdk_bind(pci_addr: &str) -> std::io::Result<()> {
+    check_root()?;
+    println!("Binding device at PCI address {} to SPDK user-space driver...", pci_addr);
+    if is_mock() {
+        println!("MOCK: Binding device {} to SPDK.", pci_addr);
+        return Ok(());
+    }
+
     let setup_script = "/opt/spdk/scripts/setup.sh";
     if std::path::Path::new(setup_script).exists() {
         let status = std::process::Command::new(setup_script)
-            .env("HUGEMEM", hugepages_mb.to_string())
+            .arg("bind")
+            .arg(pci_addr)
             .status()?;
         if !status.success() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "SPDK setup.sh failed. Ensure you are running as root.",
+                format!("Failed to bind device {} using SPDK setup.sh", pci_addr),
             ));
         }
     } else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "SPDK setup.sh not found at /opt/spdk/scripts/setup.sh. Run 'squeezefs nvmeof spdk-install' first.",
+            "SPDK setup.sh not found. Run 'squeezefs nvmeof spdk-install' first.",
         ));
     }
 
-    println!("Successfully configured hugepages and bound NVMe devices to user-space drivers.");
+    println!("Successfully bound device {} to SPDK.", pci_addr);
+    Ok(())
+}
+
+pub fn spdk_unbind(pci_addr: &str) -> std::io::Result<()> {
+    check_root()?;
+    println!("Unbinding device at PCI address {} from SPDK...", pci_addr);
+    if is_mock() {
+        println!("MOCK: Unbinding device {} from SPDK.", pci_addr);
+        return Ok(());
+    }
+
+    // Unbind from SPDK driver (vfio-pci or uio_pci_generic) via sysfs
+    let unbind_path = format!("/sys/bus/pci/devices/{}/driver/unbind", pci_addr);
+    if std::path::Path::new(&unbind_path).exists() {
+        let _ = fs::write(&unbind_path, pci_addr);
+    }
+
+    // Trigger driver probe to return it to the kernel NVMe driver
+    let probe_path = "/sys/bus/pci/drivers_probe";
+    if std::path::Path::new(probe_path).exists() {
+        let _ = fs::write(probe_path, pci_addr);
+    }
+
+    println!("Successfully unbound device {} from SPDK.", pci_addr);
     Ok(())
 }
 

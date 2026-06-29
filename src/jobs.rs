@@ -48,7 +48,7 @@ pub async fn submit_and_wait_for_job(
 ) -> Result<()> {
     let dlm = crate::dlm::DlmClient::new(redis_url)?;
     let mut con = dlm.get_connection().await?;
-    
+
     let job_id = uuid::Uuid::new_v4().to_string();
     let pending_key = format!("{}:jobs:{}:pending", fs_name, job_id);
     let completed_key = format!("{}:jobs:{}:completed", fs_name, job_id);
@@ -133,7 +133,7 @@ pub fn start_job_worker(
 ) {
     tokio::spawn(async move {
         let cpu_limit = cpu_limit_pct.clamp(1, 100);
-        
+
         loop {
             if let Err(e) = run_worker_cycle(&router, &fs_name, cpu_limit).await {
                 log::debug!("Job worker cycle error: {:?}", e);
@@ -143,11 +143,7 @@ pub fn start_job_worker(
     });
 }
 
-async fn run_worker_cycle(
-    router: &DataRouter,
-    fs_name: &str,
-    cpu_limit: u32,
-) -> Result<()> {
+async fn run_worker_cycle(router: &DataRouter, fs_name: &str, cpu_limit: u32) -> Result<()> {
     let mut con = router.dlm.get_connection().await?;
     let active_set_key = format!("{}:active_jobs", fs_name);
 
@@ -188,7 +184,10 @@ async fn run_worker_cycle(
                     log::error!("Task {} failed: {:?}", task.task_id, e);
                     let err_msg = e.to_string();
                     if err_msg.contains("Write verification failed") {
-                        log::warn!("CRITICAL: Pausing job {} due to write verification failure!", task.job_id);
+                        log::warn!(
+                            "CRITICAL: Pausing job {} due to write verification failure!",
+                            task.job_id
+                        );
                         let _: () = con.set(&paused_key, "1").await?;
                     }
                     // Push back to pending
@@ -222,7 +221,7 @@ async fn execute_task(router: &DataRouter, task_type: &TaskType) -> Result<()> {
         } => {
             // Read block from primary device
             let data = router.nvme_writer.read_block(*src_offset, *len).await?;
-            
+
             // Write block to destination offset
             router.nvme_writer.write_block(*dest_offset, &data).await?;
 

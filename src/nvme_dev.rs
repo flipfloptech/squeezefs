@@ -20,7 +20,8 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
-pub static SIMULATE_CORRUPTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static SIMULATE_CORRUPTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_simulate_corruption(val: bool) {
     SIMULATE_CORRUPTION.store(val, std::sync::atomic::Ordering::Relaxed);

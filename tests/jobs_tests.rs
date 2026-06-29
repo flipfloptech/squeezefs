@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
+use once_cell::sync::Lazy;
 use squeezefs::block_allocator::BlockAllocator;
+use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
-use squeezefs::cache::TieredCache;
 use std::sync::Arc;
-use tempfile::tempdir;
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
+use tempfile::tempdir;
 
 static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -52,7 +52,11 @@ async fn test_distributed_job_execution() {
 
     let dlm = DlmClient::new(redis_url).unwrap();
     let meta_client = Arc::new(dlm.meta_client().clone());
-    let block_alloc = Arc::new(BlockAllocator::new(meta_client.clone(), fs_name).await.unwrap());
+    let block_alloc = Arc::new(
+        BlockAllocator::new(meta_client.clone(), fs_name)
+            .await
+            .unwrap(),
+    );
 
     // Allocate a low-index block hole and a high block to move
     let src_block_idx = 10u64;
@@ -71,11 +75,14 @@ async fn test_distributed_job_execution() {
             .unwrap();
     }
 
-    block_alloc.allocate_specific_block(dest_block_idx).await.unwrap();
+    block_alloc
+        .allocate_specific_block(dest_block_idx)
+        .await
+        .unwrap();
 
     let temp_dir = tempdir().unwrap();
     let block_file = temp_dir.path().join("mock_block.img");
-    
+
     // Create mock 100MB sparse file
     let file = std::fs::File::create(&block_file).unwrap();
     file.set_len(100 * 1024 * 1024).unwrap();
@@ -115,10 +122,16 @@ async fn test_distributed_job_execution() {
         len: 4096,
     };
 
-    squeezefs::jobs::submit_and_wait_for_job(redis_url, fs_name, vec![task]).await.unwrap();
+    squeezefs::jobs::submit_and_wait_for_job(redis_url, fs_name, vec![task])
+        .await
+        .unwrap();
 
     // 4. Verify data was successfully moved to dest_offset
-    let read_back = router.nvme_writer.read_block(dest_offset, 4096).await.unwrap();
+    let read_back = router
+        .nvme_writer
+        .read_block(dest_offset, 4096)
+        .await
+        .unwrap();
     assert_eq!(read_back, mock_data);
 
     // Verify metadata was updated
@@ -159,7 +172,11 @@ async fn test_write_verification_failure_pauses_job() {
 
     let dlm = DlmClient::new(redis_url).unwrap();
     let meta_client = Arc::new(dlm.meta_client().clone());
-    let block_alloc = Arc::new(BlockAllocator::new(meta_client.clone(), fs_name).await.unwrap());
+    let block_alloc = Arc::new(
+        BlockAllocator::new(meta_client.clone(), fs_name)
+            .await
+            .unwrap(),
+    );
 
     let src_block_idx = 10u64;
     let dest_block_idx = 1u64;
@@ -176,11 +193,14 @@ async fn test_write_verification_failure_pauses_job() {
             .unwrap();
     }
 
-    block_alloc.allocate_specific_block(dest_block_idx).await.unwrap();
+    block_alloc
+        .allocate_specific_block(dest_block_idx)
+        .await
+        .unwrap();
 
     let temp_dir = tempdir().unwrap();
     let block_file = temp_dir.path().join("mock_block.img");
-    
+
     let file = std::fs::File::create(&block_file).unwrap();
     file.set_len(100 * 1024 * 1024).unwrap();
 
@@ -235,15 +255,29 @@ async fn test_write_verification_failure_pauses_job() {
         task_type: task,
     };
     let task_json = serde_json::to_string(&task_wrapper).unwrap();
-    
+
     // Add to active and pending
-    let _: () = redis::cmd("SADD").arg(&pending_key).arg(&task_json).query_async(&mut con).await.unwrap();
-    let _: () = redis::cmd("SADD").arg(&active_set_key).arg(&job_id).query_async(&mut con).await.unwrap();
+    let _: () = redis::cmd("SADD")
+        .arg(&pending_key)
+        .arg(&task_json)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SADD")
+        .arg(&active_set_key)
+        .arg(&job_id)
+        .query_async(&mut con)
+        .await
+        .unwrap();
 
     // Check if the worker runs, fails the task, and pauses the job
     let mut paused = false;
     for _ in 0..20 {
-        let is_paused: Option<String> = redis::cmd("GET").arg(&paused_key).query_async(&mut con).await.unwrap_or(None);
+        let is_paused: Option<String> = redis::cmd("GET")
+            .arg(&paused_key)
+            .query_async(&mut con)
+            .await
+            .unwrap_or(None);
         if is_paused.as_deref() == Some("1") {
             paused = true;
             break;
@@ -254,5 +288,8 @@ async fn test_write_verification_failure_pauses_job() {
     squeezefs::nvme_dev::set_simulate_corruption(false);
     squeezefs::set_write_verification(false);
 
-    assert!(paused, "Job should be paused globally due to write verification failure");
+    assert!(
+        paused,
+        "Job should be paused globally due to write verification failure"
+    );
 }

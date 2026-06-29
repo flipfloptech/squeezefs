@@ -60,7 +60,8 @@ pub struct NvmeStaging {
     max_read_bytes: u64,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
     pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
-    pub backend_router: std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
+    pub backend_router:
+        std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
     redis_client: crate::dlm::MetaClient,
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
@@ -489,7 +490,9 @@ impl NvmeStaging {
         current_bytes: &mut u64,
         staged_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
         space_freed_notify: &tokio::sync::Notify,
-        backend_router: &std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
+        backend_router: &std::sync::Arc<
+            once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>,
+        >,
         default_allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
         default_writer: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     ) -> Result<()> {
@@ -526,7 +529,11 @@ impl NvmeStaging {
         let (be_id, block_allocator, nvme_writer) = if let Some(router) = backend_router.get() {
             router.get_active_backend()?
         } else {
-            ("backend_0".to_string(), default_allocator.clone(), default_writer.clone())
+            (
+                "backend_0".to_string(),
+                default_allocator.clone(),
+                default_writer.clone(),
+            )
         };
 
         let offset = block_allocator.allocate_block().await?;

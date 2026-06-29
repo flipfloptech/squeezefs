@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use squeezefs::tiering::dht::{DhtNode, LocalCacheReader, ClusterSecurityConfig};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use squeezefs::tiering::dht::{ClusterSecurityConfig, DhtNode, LocalCacheReader};
 use std::sync::Arc;
-use rcgen::{Certificate, CertificateParams, DnType, IsCa, KeyUsagePurpose, BasicConstraints};
 
 struct DummyCache;
 impl LocalCacheReader for DummyCache {
@@ -18,14 +18,17 @@ impl LocalCacheReader for DummyCache {
 fn generate_test_ca() -> (Vec<u8>, Vec<u8>) {
     let mut ca_params = CertificateParams::default();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.distinguished_name.push(DnType::CommonName, "SqueezeFS Test CA");
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "SqueezeFS Cluster CA");
     ca_params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::DigitalSignature,
     ];
-    let ca_cert = Certificate::from_params(ca_params).unwrap();
-    let cert_der = ca_cert.serialize_der().unwrap();
-    let key_der = ca_cert.serialize_private_key_der();
+    let ca_key_pair = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key_pair).unwrap();
+    let cert_der = ca_cert.der().to_vec();
+    let key_der = ca_key_pair.serialize_der();
     (cert_der, key_der)
 }
 
@@ -99,5 +102,8 @@ async fn test_mtls_unauthorized_connection() {
         .fetch_remote_value("127.0.0.1:23204", Bytes::from("hello"))
         .await;
 
-    assert!(result.is_err(), "Connection from node2 should be rejected because certificates do not match CA");
+    assert!(
+        result.is_err(),
+        "Connection from node2 should be rejected because certificates do not match CA"
+    );
 }

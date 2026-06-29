@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
+use once_cell::sync::Lazy;
 use std::fs;
 use std::path::Path;
-use tempfile::tempdir;
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
+use tempfile::tempdir;
 
 static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -28,7 +28,10 @@ async fn test_nvmeof_target_and_initiator_mock_lifecycle() {
     // 1. Set environment to mock mode
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF", "1");
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_DIR", "/tmp/squeezefs_nvmet");
-    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR", "/tmp/squeezefs_nvme_fabrics");
+    std::env::set_var(
+        "SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR",
+        "/tmp/squeezefs_nvme_fabrics",
+    );
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_NVME_DIR", "/tmp/squeezefs_nvme");
 
     // Clean up mock target directories from any previous runs
@@ -163,14 +166,26 @@ fn test_nvmeof_target_share_persistence() {
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF", "1");
     std::env::set_var("SQUEEZEFS_TEST_ENV", "1");
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_DIR", "/tmp/squeezefs_nvmet_persist");
-    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR", "/tmp/squeezefs_nvme_fabrics_persist");
-    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_NVME_DIR", "/tmp/squeezefs_nvme_persist");
+    std::env::set_var(
+        "SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR",
+        "/tmp/squeezefs_nvme_fabrics_persist",
+    );
+    std::env::set_var(
+        "SQUEEZEFS_MOCK_NVMEOF_NVME_DIR",
+        "/tmp/squeezefs_nvme_persist",
+    );
     let temp_config_file = "/tmp/squeezefs_nvmeof_shares_test.json";
     let _ = fs::remove_file(temp_config_file);
 
     // Register a mock share
-    squeezefs::nvmeof::register_share("/tmp/test_persist_backing.img", "nqn.test-subsystem-1", 4420, "127.0.0.1").unwrap();
-    
+    squeezefs::nvmeof::register_share(
+        "/tmp/test_persist_backing.img",
+        "nqn.test-subsystem-1",
+        4420,
+        "127.0.0.1",
+    )
+    .unwrap();
+
     // Check restore
     let res = squeezefs::nvmeof::restore_shares();
     assert!(res.is_ok());
@@ -188,7 +203,10 @@ async fn test_nvmeof_multirail_mock_connect() {
     // 1. Set environment to mock mode
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF", "1");
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_DIR", "/tmp/squeezefs_nvmet_mr");
-    std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR", "/tmp/squeezefs_nvme_fabrics_mr");
+    std::env::set_var(
+        "SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR",
+        "/tmp/squeezefs_nvme_fabrics_mr",
+    );
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF_NVME_DIR", "/tmp/squeezefs_nvme_mr");
 
     let mock_configfs = Path::new("/tmp/squeezefs_nvmet_mr");
@@ -217,8 +235,9 @@ async fn test_nvmeof_multirail_mock_connect() {
         "127.0.0.1".parse::<IpAddr>().unwrap(),
         "127.0.0.2".parse::<IpAddr>().unwrap(),
     ];
-    let dev = squeezefs::nvmeof::connect_target_with_local_ips("127.0.0.1", 4420, &subnqn, &local_ips)
-        .expect("Multi-rail connect target should succeed");
+    let dev =
+        squeezefs::nvmeof::connect_target_with_local_ips("127.0.0.1", 4420, &subnqn, &local_ips)
+            .expect("Multi-rail connect target should succeed");
 
     assert_eq!(dev, "/dev/nvme0n1");
 

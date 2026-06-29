@@ -303,19 +303,43 @@ pub async fn add_storage_backend(
         Some(dev) => {
             let dev_str = dev.to_string();
             // Automatically pull NVMe-oF details if possible
-            if let Some((ext_ip, ext_port, ext_subnqn)) = crate::nvmeof::extract_nvmeof_connection_details(&dev_str) {
-                log::info!("Automatically extracted NVMe-oF connection details for {}: {}:{} / {}", dev_str, ext_ip, ext_port, ext_subnqn);
-                if resolved_ip.is_none() { resolved_ip = Some(ext_ip); }
-                if resolved_port.is_none() { resolved_port = Some(ext_port); }
-                if resolved_subnqn.is_none() { resolved_subnqn = Some(ext_subnqn); }
+            if let Some((ext_ip, ext_port, ext_subnqn)) =
+                crate::nvmeof::extract_nvmeof_connection_details(&dev_str)
+            {
+                log::info!(
+                    "Automatically extracted NVMe-oF connection details for {}: {}:{} / {}",
+                    dev_str,
+                    ext_ip,
+                    ext_port,
+                    ext_subnqn
+                );
+                if resolved_ip.is_none() {
+                    resolved_ip = Some(ext_ip);
+                }
+                if resolved_port.is_none() {
+                    resolved_port = Some(ext_port);
+                }
+                if resolved_subnqn.is_none() {
+                    resolved_subnqn = Some(ext_subnqn);
+                }
             }
             dev_str
         }
         None => {
             if let (Some(ip_val), Some(port_val), Some(nqn_val)) = (ip, port, subnqn) {
-                log::info!("Connecting to NVMe-oF target at {}:{} / {}...", ip_val, port_val, nqn_val);
-                let dev_path = crate::nvmeof::connect_target(ip_val, port_val, nqn_val)
-                    .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to connect to NVMe-oF target: {:?}", e)))?;
+                log::info!(
+                    "Connecting to NVMe-oF target at {}:{} / {}...",
+                    ip_val,
+                    port_val,
+                    nqn_val
+                );
+                let dev_path =
+                    crate::nvmeof::connect_target(ip_val, port_val, nqn_val).map_err(|e| {
+                        SqueezefsError::InvalidOperation(format!(
+                            "Failed to connect to NVMe-oF target: {:?}",
+                            e
+                        ))
+                    })?;
                 log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
                 dev_path
             } else {
@@ -353,21 +377,32 @@ pub async fn add_storage_backend(
         .hget(crate::fs_key!("format"), "inodes")
         .await
         .unwrap_or(1_000_000);
-    
+
     // Resolve capacity. If not specified, default to format key capacity
     let resolved_capacity: u64 = match capacity {
         Some(cap) => cap,
-        None => con.hget(crate::fs_key!("format"), "capacity").await.unwrap_or(1024 * 1024 * 1024 * 1024),
+        None => con
+            .hget(crate::fs_key!("format"), "capacity")
+            .await
+            .unwrap_or(1024 * 1024 * 1024 * 1024),
     };
 
     // Auto-initialize the backing device by writing the 4KB SqueezeFS superblock
-    log::info!("Writing SqueezeFS superblock signature to target backend device: {}", resolved_backing_dev);
+    log::info!(
+        "Writing SqueezeFS superblock signature to target backend device: {}",
+        resolved_backing_dev
+    );
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .open(&resolved_backing_dev)
         .await
-        .map_err(|e| SqueezefsError::InvalidOperation(format!("Failed to open backing device '{}': {:?}", resolved_backing_dev, e)))?;
-    
+        .map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "Failed to open backing device '{}': {:?}",
+                resolved_backing_dev, e
+            ))
+        })?;
+
     // Construct superblock
     let mut sb = vec![0u8; 4096];
     let magic = b"SQUEEZEFS_SUPER\x00";
@@ -386,7 +421,9 @@ pub async fn add_storage_backend(
 
     use tokio::io::AsyncSeekExt;
     use tokio::io::AsyncWriteExt;
-    file.seek(std::io::SeekFrom::Start(0)).await.map_err(SqueezefsError::Io)?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(SqueezefsError::Io)?;
     file.write_all(&sb).await.map_err(SqueezefsError::Io)?;
     file.sync_all().await.map_err(SqueezefsError::Io)?;
 

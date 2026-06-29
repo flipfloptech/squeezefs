@@ -120,7 +120,10 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, _nvme_path: &st
         return Ok(());
     }
 
-    println!("Submitting defragmentation job with {} block migrations to the cluster...", tasks.len());
+    println!(
+        "Submitting defragmentation job with {} block migrations to the cluster...",
+        tasks.len()
+    );
     crate::jobs::submit_and_wait_for_job(redis_url, fs_name, tasks).await?;
     Ok(())
 }

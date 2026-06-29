@@ -105,18 +105,21 @@ When deploying on a multi-node cluster where hosts are equipped with multiple ph
 ```
 
 ### Automatic SPDK Compilation, Setup, and Execution
-To compile SPDK from source, set up local hugepages and device drivers, and launch the user-space target daemon (`nvmf_tgt` listener) in the background:
+To compile SPDK from source, set up local hugepages, selectively bind target NVMe SSDs to user-space, and launch the user-space target daemon (`nvmf_tgt` listener) in the background:
 ```bash
 # 1. Compile SPDK from source and install system dependencies to /opt/spdk
 sudo ./target/release/squeezefs nvmeof spdk-install
 
-# 2. Configure hugepages (e.g. 2048MB) and bind local PCIe NVMe devices to user-space
-sudo ./target/release/squeezefs nvmeof spdk-setup --hugepages-mb 2048
+# 2. Configure hugepages safely (defaults to 2GB, supports 4GB) without unbinding system disks
+sudo ./target/release/squeezefs nvmeof spdk-setup --hugepages 2GB
 
-# 3. Start the background SPDK target daemon (nvmf_tgt)
+# 3. Selectively bind only a specific secondary NVMe SSD PCIe controller to SPDK
+sudo ./target/release/squeezefs nvmeof spdk-bind --pci 0000:02:00.0
+
+# 4. Start the background SPDK target daemon (nvmf_tgt)
 sudo ./target/release/squeezefs nvmeof spdk-start
 ```
-This sets up a running user-space target instance listening for RPC requests at `/var/tmp/spdk.sock` and maps physical NVMe drives to SPDK polled user-space drivers.
+This maps only the selected data NVMe drives to SPDK polled user-space drivers while keeping your system OS disk safe under kernel control.
 
 ### Share a Target via user-space SPDK
 To share a local backing file or NVMe block device using the high-performance user-space SPDK target (`nvmf_tgt` listener):

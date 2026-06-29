@@ -105,7 +105,7 @@ When deploying on a multi-node cluster where hosts are equipped with multiple ph
 ```
 
 ### Connect to Remote NVMe-oF Storage
-To connect to an NVMe over Fabrics target device before mounting:
+To connect to an NVMe over Fabrics target device (fully compatible with standard Linux targets and user-space SPDK targets) before mounting:
 ```bash
 # Connect to the remote storage cluster
 sudo ./target/release/squeezefs nvmeof connect --ip 10.10.10.50 --subnqn nqn.2026-06.org.squeezefs:data

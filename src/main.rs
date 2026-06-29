@@ -478,6 +478,16 @@ enum NvmeofActions {
     List,
     /// Restore all locally registered persistent target shares
     RestoreShares,
+    /// Install SPDK from source and set up dependencies
+    SpdkInstall,
+    /// Configure hugepages and bind devices to user-space drivers
+    SpdkSetup {
+        /// Memory to allocate for hugepages in MB (default: 2048)
+        #[arg(long, default_value_t = 2048)]
+        hugepages_mb: usize,
+    },
+    /// Start the SPDK NVMe-oF target daemon (nvmf_tgt) in the background
+    SpdkStart,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -2642,6 +2652,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 NvmeofActions::RestoreShares => {
                     squeezefs::nvmeof::restore_shares()?;
                     println!("All registered persistent target shares restored successfully.");
+                }
+                NvmeofActions::SpdkInstall => {
+                    squeezefs::nvmeof::spdk_install()?;
+                }
+                NvmeofActions::SpdkSetup { hugepages_mb } => {
+                    squeezefs::nvmeof::spdk_setup(hugepages_mb)?;
+                }
+                NvmeofActions::SpdkStart => {
+                    squeezefs::nvmeof::spdk_start()?;
                 }
             },
         },

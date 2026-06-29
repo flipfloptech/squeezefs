@@ -1010,3 +1010,142 @@ pub fn restore_shares() -> std::io::Result<()> {
     }
     Ok(())
 }
+
+pub fn spdk_install() -> std::io::Result<()> {
+    check_root()?;
+    println!("Installing SPDK dependencies and compiling from source...");
+    if is_mock() {
+        println!("MOCK: Cloning spdk, running pkgdep.sh, configuring, and building via make.");
+        return Ok(());
+    }
+
+    // 1. Clone
+    println!("Cloning SPDK repo to /opt/spdk...");
+    let status = std::process::Command::new("git")
+        .args(&["clone", "https://github.com/spdk/spdk.git", "/opt/spdk"])
+        .status()?;
+    if !status.success() {
+        println!("SPDK repo already exists at /opt/spdk or git clone failed. Proceeding with update...");
+    }
+
+    let status = std::process::Command::new("git")
+        .current_dir("/opt/spdk")
+        .args(&["submodule", "update", "--init"])
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to update SPDK submodules"));
+    }
+
+    println!("Running pkgdep.sh to install system dependencies...");
+    let status = std::process::Command::new("./scripts/pkgdep.sh")
+        .current_dir("/opt/spdk")
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to install SPDK dependencies"));
+    }
+
+    println!("Configuring SPDK...");
+    let status = std::process::Command::new("./configure")
+        .current_dir("/opt/spdk")
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to configure SPDK"));
+    }
+
+    println!("Building SPDK (this may take a few minutes)...");
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let status = std::process::Command::new("make")
+        .arg(format!("-j{}", cores))
+        .current_dir("/opt/spdk")
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to compile SPDK"));
+    }
+
+    println!("Successfully installed and compiled SPDK at /opt/spdk.");
+    Ok(())
+}
+
+pub fn spdk_setup(hugepages_mb: usize) -> std::io::Result<()> {
+    check_root()?;
+    println!("Configuring hugepages ({}MB) and binding devices...", hugepages_mb);
+    if is_mock() {
+        println!("MOCK: Writing to /sys/kernel/mm/hugepages/... and running /opt/spdk/scripts/setup.sh");
+        return Ok(());
+    }
+
+    // Allocate hugepages
+    let pages = hugepages_mb / 2; // 2MB pages
+    let nr_hugepages_path = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
+    if std::path::Path::new(nr_hugepages_path).exists() {
+        fs::write(nr_hugepages_path, pages.to_string())?;
+    } else {
+        println!("Warning: 2MB hugepages sysfs path not found. Proceeding with SPDK setup script allocation...");
+    }
+
+    // Run SPDK setup script
+    let setup_script = "/opt/spdk/scripts/setup.sh";
+    if std::path::Path::new(setup_script).exists() {
+        let status = std::process::Command::new(setup_script)
+            .env("HUGEMEM", hugepages_mb.to_string())
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "SPDK setup.sh failed. Ensure you are running as root.",
+            ));
+        }
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "SPDK setup.sh not found at /opt/spdk/scripts/setup.sh. Run 'squeezefs nvmeof spdk-install' first.",
+        ));
+    }
+
+    println!("Successfully configured hugepages and bound NVMe devices to user-space drivers.");
+    Ok(())
+}
+
+pub fn spdk_start() -> std::io::Result<()> {
+    check_root()?;
+    println!("Starting SPDK NVMe-oF target daemon (nvmf_tgt)...");
+    if is_mock() {
+        println!("MOCK: Spawning /opt/spdk/build/bin/nvmf_tgt in background.");
+        return Ok(());
+    }
+
+    let bin_path = "/opt/spdk/build/bin/nvmf_tgt";
+    if !std::path::Path::new(bin_path).exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "SPDK target binary not found. Run 'squeezefs nvmeof spdk-install' first.",
+        ));
+    }
+
+    // Check if nvmf_tgt is already running
+    let check = std::process::Command::new("pgrep")
+        .arg("nvmf_tgt")
+        .status();
+    if let Ok(status) = check {
+        if status.success() {
+            println!("SPDK target daemon (nvmf_tgt) is already running.");
+            return Ok(());
+        }
+    }
+
+    // Spawn daemon in background
+    let child = std::process::Command::new(bin_path)
+        .arg("-i")
+        .arg("0")
+        .arg("-m")
+        .arg("0x1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    
+    println!("Spawned SPDK nvmf_tgt in background (PID: {}).", child.id());
+    println!("JSON-RPC socket listening at /var/tmp/spdk.sock");
+    Ok(())
+}

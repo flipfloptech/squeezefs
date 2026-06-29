@@ -51,14 +51,11 @@ impl NvmeBlockDev {
             })
             .cloned()
     }
-
     pub async fn write_block(&self, offset: u64, data: &[u8]) -> Result<()> {
         let file = self.get_file()?;
         let data_vec = data.to_vec();
         tokio::task::spawn_blocking(move || {
             file.write_all_at(&data_vec, offset)
-                .map_err(|e| crate::error::SqueezefsError::Io(e))?;
-            file.sync_data()
                 .map_err(|e| crate::error::SqueezefsError::Io(e))?;
             Ok::<(), crate::error::SqueezefsError>(())
         })

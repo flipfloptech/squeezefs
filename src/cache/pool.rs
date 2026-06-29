@@ -18,9 +18,7 @@ impl BufferPool {
     }
 
     pub fn alloc(self: &Arc<Self>) -> PooledBuf {
-        let mut buf = self.queue.pop().unwrap_or_else(|| vec![0u8; self.buf_size]);
-        // Zero-out the buffer to ensure clean slate for subsequent users
-        buf.fill(0);
+        let buf = self.queue.pop().unwrap_or_else(|| vec![0u8; self.buf_size]);
         PooledBuf {
             buf: Some(buf),
             pool: Some(self.clone()),
@@ -66,6 +64,6 @@ pub static BUFFER_POOL: Lazy<Arc<BufferPool>> = Lazy::new(|| {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(16);
-    let capacity = std::cmp::max(cores * 4, 64);
+    let capacity = std::cmp::max(cores * 16, 512);
     Arc::new(BufferPool::new(capacity, 4 * 1024 * 1024))
 });

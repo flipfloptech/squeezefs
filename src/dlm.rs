@@ -17,7 +17,7 @@ pub static SENTINEL_CONN_POOL: Lazy<
 
 #[derive(Clone)]
 pub struct BoundConnection {
-    pub conn: std::sync::Arc<tokio::sync::RwLock<redis::aio::MultiplexedConnection>>,
+    pub conn: std::sync::Arc<parking_lot::RwLock<redis::aio::MultiplexedConnection>>,
     pub local_ip: IpAddr,
     pub remote_addr: SocketAddr,
     pub conn_info: redis::ConnectionInfo,
@@ -99,7 +99,7 @@ async fn reconnect_bound(bound: &BoundConnection) -> Result<redis::aio::Multiple
             e
         })?;
     tokio::spawn(driver);
-    *bound.conn.write().await = new_conn.clone();
+    *bound.conn.write() = new_conn.clone();
     Ok(new_conn)
 }
 
@@ -485,7 +485,7 @@ impl MetaClient {
                                 Ok((conn, driver)) => {
                                     tokio::spawn(driver);
                                     bound_conns.push(BoundConnection {
-                                        conn: std::sync::Arc::new(tokio::sync::RwLock::new(conn)),
+                                        conn: std::sync::Arc::new(parking_lot::RwLock::new(conn)),
                                         local_ip: ip,
                                         remote_addr,
                                         conn_info: conn_info.clone(),
@@ -551,7 +551,7 @@ impl MetaClient {
                 if !bound_conns.is_empty() {
                     let idx = current_idx.fetch_add(1, Ordering::Relaxed);
                     let bound = bound_conns[idx % bound_conns.len()].clone();
-                    let conn_val = bound.conn.read().await.clone();
+                    let conn_val = bound.conn.read().clone();
                     return Ok(MetaConnection::Single {
                         conn: conn_val,
                         client: Some(client.clone()),

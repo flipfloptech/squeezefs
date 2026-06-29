@@ -591,7 +591,7 @@ impl NvmeStaging {
         }
 
         let packed_payload_len = packed_payload.len();
-        info!("NVMe Staging: Uploading packed block {} (size {} bytes) to RustFS with fencing token {}.", packed_key, packed_payload_len, highest_fencing_token);
+        info!("NVMe Staging: Writing packed block {} (size {} bytes) to NVMe-oF backend volume with fencing token {}.", packed_key, packed_payload_len, highest_fencing_token);
         if let Err(e) = nvme_writer
             .write_block(offset, &bytes::Bytes::from(packed_payload))
             .await

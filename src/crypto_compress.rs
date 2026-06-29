@@ -202,11 +202,14 @@ impl CryptoCompressState {
         })?;
 
         let mut in_out = ciphertext_payload.to_vec();
-        let decrypted_slice = less_safe_key
-            .open_in_place(nonce, ring::aead::Aad::empty(), &mut in_out)
-            .map_err(|_| SqueezefsError::InvalidOperation("AEAD open failed".to_string()))?;
-
-        Ok(decrypted_slice.to_vec())
+        let decrypted_len = {
+            let decrypted_slice = less_safe_key
+                .open_in_place(nonce, ring::aead::Aad::empty(), &mut in_out)
+                .map_err(|_| SqueezefsError::InvalidOperation("AEAD open failed".to_string()))?;
+            decrypted_slice.len()
+        };
+        in_out.truncate(decrypted_len);
+        Ok(in_out)
     }
 
     pub fn process_write(&self, data: bytes::Bytes) -> Result<bytes::Bytes, SqueezefsError> {
@@ -228,12 +231,20 @@ impl CryptoCompressState {
     }
 
     pub fn process_read(&self, data: &[u8]) -> Result<Vec<u8>, SqueezefsError> {
-        let decrypted = if self.encrypt_algo != "none" && !self.encrypt_algo.is_empty() {
-            self.decrypt(data)?
+        let compression = self.compression.trim();
+        let encrypt_algo = self.encrypt_algo.trim();
+        if (compression == "none" || compression.is_empty())
+            && (encrypt_algo == "none" || encrypt_algo.is_empty())
+        {
+            Ok(data.to_vec())
         } else {
-            data.to_vec()
-        };
-        self.decompress(&decrypted)
+            let decrypted = if encrypt_algo != "none" && !encrypt_algo.is_empty() {
+                self.decrypt(data)?
+            } else {
+                data.to_vec()
+            };
+            self.decompress(&decrypted)
+        }
     }
 }
 

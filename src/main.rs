@@ -88,7 +88,7 @@ enum Commands {
         /// Path to RSA private key PEM file for client-side encryption
         #[arg(long)]
         encrypt_key: Option<String>,
-        /// Time in seconds to wait for staged writes to drain to S3 on dismount (default: 10)
+        /// Time in seconds to wait for staged writes to drain to NVMe-oF backend on dismount (default: 10)
         #[arg(long)]
         dismount_wait: Option<String>,
         /// Delay/interval for background staging write uploads (e.g. "500ms", "5s", default: "500ms")
@@ -100,6 +100,11 @@ enum Commands {
     },
     /// Show filesystem status
     Status {
+        /// SqueezeFS URI (squeeze://ip:port/filesystemname)
+        squeeze_uri: String,
+    },
+    /// List all active clients that have the filesystem mounted
+    Clients {
         /// SqueezeFS URI (squeeze://ip:port/filesystemname)
         squeeze_uri: String,
     },
@@ -306,7 +311,7 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigActions,
     },
-    /// Show filesystem disk space usage across all caches and S3
+    /// Show filesystem disk space usage across all caches and NVMe-oF backend
     Df {
         /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
         #[arg(
@@ -454,6 +459,9 @@ enum NvmeofActions {
         /// Remote target Subsystem NQN
         #[arg(long)]
         subnqn: String,
+        /// Comma-separated list of local source IP interfaces for multi-rail connection
+        #[arg(long, value_delimiter = ',')]
+        local_ips: Option<Vec<std::net::IpAddr>>,
     },
     /// Disconnect local client from a remote NVMe-oF target
     Disconnect {
@@ -654,7 +662,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 | Commands::Umount { .. }
                 | Commands::Config { .. }
                 | Commands::Tune
-                | Commands::Status { .. } => {
+                | Commands::Status { .. }
+                | Commands::Clients { .. } => {
                     eprintln!("Error: This command must be run as root (or with sudo).");
                     std::process::exit(1);
                 }
@@ -1033,8 +1042,11 @@ fn print_mount_diagnostics(
     squeezefs::set_fs_prefix(fs_name);
     let client = redis::Client::open(garnet_url)?;
     let mut con = client.get_connection()?;
+    let key = squeezefs::fs_key!("format");
+    log::info!("print_mount_diagnostics: Querying format key '{}' on Redis '{}'", key, garnet_url);
     let format_fields: std::collections::HashMap<String, String> =
-        con.hgetall(squeezefs::fs_key!("format"))?;
+        con.hgetall(&key)?;
+    log::info!("print_mount_diagnostics: Retrieved format fields: {:?}", format_fields);
     if format_fields.is_empty() {
         return Err("Volume not formatted. Please run format command first.".into());
     }
@@ -1289,78 +1301,78 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::set_fs_prefix(&name);
             let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
 
+            // Fail-fast connection to Redis/Garnet
+            let client = redis::Client::open(redis_url.as_str())
+                .map_err(|e| format!("Failed to open Redis client at {}: {:?}", redis_url, e))?;
+            let mut con = client.get_multiplexed_tokio_connection().await
+                .map_err(|e| format!("Failed to connect to metadata database at {}: {:?}", redis_url, e))?;
+
             // Check if active clients are connected to the filesystem
-            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                    let raw_clients: std::collections::HashMap<String, String> = con
-                        .hgetall(squeezefs::fs_key!("active_clients"))
-                        .await
-                        .unwrap_or_default();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let mut active_clients = Vec::new();
-                    for (_, json_str) in raw_clients {
-                        if let Ok(info) =
-                            serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str)
-                        {
-                            if now.saturating_sub(info.last_heartbeat) <= 6 {
-                                active_clients.push(info);
-                            }
-                        }
-                    }
-                    if !active_clients.is_empty() {
-                        use colored::Colorize;
-                        println!(
-                            "{}",
-                            "ERROR: Cannot format filesystem because active clients are connected:"
-                                .red()
-                                .bold()
-                        );
-                        for client in active_clients {
-                            println!(
-                                "  - Client ID: {} | Host: {} | PID: {} | Mount: {}",
-                                client.client_id, client.hostname, client.pid, client.mountpoint
-                            );
-                        }
-                        return Err("Active clients are connected".into());
+            let raw_clients: std::collections::HashMap<String, String> = con
+                .hgetall(squeezefs::fs_key!("active_clients"))
+                .await
+                .unwrap_or_default();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut active_clients = Vec::new();
+            for (_, json_str) in raw_clients {
+                if let Ok(info) =
+                    serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str)
+                {
+                    if now.saturating_sub(info.last_heartbeat) <= 6 {
+                        active_clients.push(info);
                     }
                 }
+            }
+            if !active_clients.is_empty() {
+                use colored::Colorize;
+                println!(
+                    "{}",
+                    "ERROR: Cannot format filesystem because active clients are connected:"
+                        .red()
+                        .bold()
+                );
+                for client in active_clients {
+                    println!(
+                        "  - Client ID: {} | Host: {} | PID: {} | Mount: {}",
+                        client.client_id, client.hostname, client.pid, client.mountpoint
+                    );
+                }
+                return Err("Active clients are connected".into());
             }
 
             // Check if squeezefs volume is already formatted on the database
             if !force {
-                if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-                    if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                        let exists_format: bool = con
-                            .exists(squeezefs::fs_key!("format"))
-                            .await
-                            .unwrap_or(false);
-                        if exists_format {
-                            println!(
-                                "{}",
-                                "WARNING: A squeezefs volume is already formatted on this database."
-                                    .yellow()
-                                    .bold()
-                            );
-                            println!(
-                                "{}",
-                                "Formatting will delete all existing metadata and files!"
-                                    .yellow()
-                                    .bold()
-                            );
-                            print!("Are you sure you want to proceed? [y/N]: ");
-                            use std::io::Write;
-                            let _ = std::io::stdout().flush();
-                            let mut input = String::new();
-                            let _ = std::io::stdin().read_line(&mut input);
-                            let trimmed = input.trim().to_lowercase();
-                            if trimmed != "y" && trimmed != "yes" {
-                                println!("Format aborted.");
-                                return Ok(());
-                            }
-                        }
+                let key = squeezefs::fs_key!("format");
+                log::info!("Format command: checking if key '{}' exists on Redis '{}'", key, redis_url);
+                let exists_format: bool = con
+                    .exists(&key)
+                    .await
+                    .unwrap_or(false);
+                if exists_format {
+                    println!(
+                        "{}",
+                        "WARNING: A squeezefs volume is already formatted on this database."
+                            .yellow()
+                            .bold()
+                    );
+                    println!(
+                        "{}",
+                        "Formatting will delete all existing metadata and files!"
+                            .yellow()
+                            .bold()
+                    );
+                    print!("Are you sure you want to proceed? [y/N]: ");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    let mut input = String::new();
+                    let _ = std::io::stdin().read_line(&mut input);
+                    let trimmed = input.trim().to_lowercase();
+                    if trimmed != "y" && trimmed != "yes" {
+                        println!("Format aborted.");
+                        return Ok(());
                     }
                 }
             }
@@ -1462,14 +1474,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let mut resolved_backing_dev = backing_dev.clone();
 
-            // Connect to Redis/Garnet to check if format already exists
-            let mut existing_format = std::collections::HashMap::new();
-            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                    use redis::AsyncCommands;
-                    existing_format = con.hgetall::<_, std::collections::HashMap<String, String>>(squeezefs::fs_key!("format")).await.unwrap_or_default();
-                }
-            }
+            // Check if format already exists
+            use redis::AsyncCommands;
+            let existing_format = con
+                .hgetall::<_, std::collections::HashMap<String, String>>(squeezefs::fs_key!("format"))
+                .await
+                .unwrap_or_default();
 
             let mut resolved_ip = ip.clone();
             let mut resolved_port = port;
@@ -1575,6 +1585,40 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::set_fs_prefix(&fs_name);
             let status = squeezefs::fuse_client::get_volume_status(&redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Commands::Clients {
+            squeeze_uri,
+        } => {
+            let (redis_url, name) = parse_squeeze_uri(&squeeze_uri)?;
+            squeezefs::set_fs_prefix(&name);
+            let client = squeezefs::dlm::MetaClient::new(&redis_url)?;
+            let mut con = client.get_connection().await?;
+            let raw_clients: std::collections::HashMap<String, String> = con
+                .hgetall(squeezefs::fs_key!("active_clients"))
+                .await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut active_clients = Vec::new();
+            for (_, json_str) in raw_clients {
+                if let Ok(info) = serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str) {
+                    if now.saturating_sub(info.last_heartbeat) <= 6 {
+                        active_clients.push(info);
+                    }
+                }
+            }
+            if active_clients.is_empty() {
+                println!("No active clients connected.");
+            } else {
+                println!("Active clients connected to volume '{}':", name);
+                for client in active_clients {
+                    println!(
+                        "  - Client ID: {} | Host: {} | PID: {} | Mountpoint: {}",
+                        client.client_id, client.hostname, client.pid, client.mountpoint
+                    );
+                }
+            }
         }
         Commands::Mount {
             squeeze_uri,
@@ -2070,7 +2114,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref addr) = p2p_addr {
                 let server = squeezefs::p2p::P2pServer::new(
                     addr.clone(),
-                    fs_engine.router.cache.nvme.clone(),
+                    fs_engine.router.cache.clone(),
                 );
                 tokio::spawn(async move {
                     if let Err(e) = server.run().await {
@@ -2118,6 +2162,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
                     if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
                         resolved_url = Some(url_str.to_string());
+                    }
+                    if let Some(format_obj) = config_json.get("format").and_then(|v| v.as_object()) {
+                        if let Some(name_str) = format_obj.get("name").and_then(|v| v.as_str()) {
+                            squeezefs::set_fs_prefix(name_str);
+                        }
                     }
                     true
                 } else {
@@ -2357,9 +2406,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     squeezefs::nvmeof::unshare_target(&subnqn)?;
                     println!("Successfully stopped sharing target NQN '{}'.", subnqn);
                 }
-                NvmeofActions::Connect { ip, port, subnqn } => {
+                NvmeofActions::Connect { ip, port, subnqn, local_ips } => {
                     println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
-                    let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn)?;
+                    let local_ips_vec = local_ips.unwrap_or_default();
+                    let dev = squeezefs::nvmeof::connect_target_with_local_ips(&ip, port, &subnqn, &local_ips_vec)?;
                     if dev.starts_with("/dev/") {
                         println!("{}", "Connection successful!".green().bold());
                         println!("Attached Remote Disk: {}", dev.cyan().bold());
@@ -2653,7 +2703,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!("Other nodes will NOT see this data if you unmount now.");
                 println!("\nChoose an option:");
-                println!("  [w] Wait for staged files to drain/flush to S3 (recommended)");
+                println!("  [w] Wait for staged files to drain/flush to NVMe-oF backend (recommended)");
                 println!("  [c] Continue/force unmount immediately (unsafe - may lose data)");
                 println!("  [a] Abort unmount");
                 print!("Select option [w/c/a]: ");
@@ -3109,7 +3159,7 @@ async fn run_df_command(
             println!("--------------------------------------------------");
             println!("Capacity:            {}", capacity_str);
             println!("Logical File Size:   {}", format_size(total_logical_size));
-            println!("Physical S3 Size:    {}", format_size(total_physical_size));
+            println!("Physical Backend Size: {}", format_size(total_physical_size));
             println!("Compression Ratio:   {}", ratio_str);
             println!();
 
@@ -3391,7 +3441,7 @@ async fn run_df_command(
                             locations.push("NVMe");
                         }
                         if locations.is_empty() {
-                            locations.push("S3");
+                            locations.push("NVMe-oF Backend");
                         }
                         let residency = locations.join(", ");
 
@@ -3469,7 +3519,7 @@ async fn run_df_command(
                                 locations.push("NVMe");
                             }
                             if locations.is_empty() {
-                                locations.push("S3");
+                                locations.push("NVMe-oF Backend");
                             }
                             let residency = locations.join(", ");
 
@@ -4445,9 +4495,9 @@ async fn run_benchmark(
 
         show_metric("FUSE Operations", "fuse_ops");
         show_metric("Metadata Updates", "meta_updates");
-        show_metric("S3 Put Object", "put_obj");
-        show_metric("S3 Get Object", "get_obj");
-        show_metric("S3 Delete Object", "del_obj");
+        show_metric("NVMe-oF Write Block", "put_obj");
+        show_metric("NVMe-oF Read Block", "get_obj");
+        show_metric("NVMe-oF Delete Block", "del_obj");
         show_metric("Cache Hits (RAM)", "cache_hits");
         show_metric("Cache Misses", "cache_misses");
         println!(

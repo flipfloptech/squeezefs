@@ -1,4 +1,4 @@
-use crate::cache::nvme::NvmeStaging;
+use crate::cache::TieredCache;
 use crate::error::{Result, SqueezefsError};
 use bytes::Bytes;
 use log::{error, info};
@@ -8,32 +8,48 @@ use std::time::Duration;
 use xxhash_rust::xxh3::xxh3_64;
 
 struct SqueezefsLocalCacheReader {
-    cache: NvmeStaging,
+    cache: TieredCache,
 }
 
 impl crate::tiering::dht::LocalCacheReader for SqueezefsLocalCacheReader {
     fn get_local(&self, key: &Bytes) -> Option<Bytes> {
-        let guard = self.cache.read_nvme_cache.get(key)?;
-        Some(Bytes::copy_from_slice(
-            &guard.guard.mmap[guard.offset..guard.offset + guard.len],
-        ))
+        let key_str = String::from_utf8_lossy(key).to_string();
+
+        // 1. Try RAM LRU cache (Tier 2)
+        if let Some(data) = self.cache.read_lru.get(&key_str) {
+            return Some(data.clone());
+        }
+
+        // 2. Try staging NVMe cache (Tier 3)
+        if let Some(staged) = self.cache.nvme.read_staged(&key_str) {
+            return Some(Bytes::from(staged));
+        }
+
+        // 3. Try read NVMe cache (Tier 3)
+        if let Some(guard) = self.cache.nvme.read_nvme_cache.get(key) {
+            return Some(Bytes::copy_from_slice(
+                &guard.guard.mmap[guard.offset..guard.offset + guard.len],
+            ));
+        }
+
+        None
     }
 
     fn put_local(&self, key: Bytes, value: Bytes) {
         let block_key = String::from_utf8_lossy(&key).to_string();
-        let _ = self.cache.cache_read_block(&block_key, &value);
+        let _ = self.cache.nvme.cache_read_block(&block_key, &value);
     }
 }
 
 #[derive(Clone)]
 pub struct P2pServer {
     addr: String,
-    cache: NvmeStaging,
+    cache: TieredCache,
 }
 
 impl Drop for P2pServer {
     fn drop(&mut self) {
-        let redis_client = self.cache.redis_client().clone();
+        let redis_client = self.cache.nvme.redis_client().clone();
         let addr = self.addr.clone();
         tokio::spawn(async move {
             if let Ok(mut con) = redis_client.get_connection().await {
@@ -48,7 +64,7 @@ impl Drop for P2pServer {
 }
 
 impl P2pServer {
-    pub fn new(addr: String, cache: NvmeStaging) -> Self {
+    pub fn new(addr: String, cache: TieredCache) -> Self {
         Self { addr, cache }
     }
 
@@ -60,7 +76,7 @@ impl P2pServer {
         let dht_node = Arc::new(crate::tiering::dht::DhtNode::new(self.addr.clone(), reader));
 
         // Store DhtNode in NvmeStaging so clients can retrieve it
-        let _ = self.cache.dht_node.set(dht_node.clone());
+        let _ = self.cache.nvme.dht_node.set(dht_node.clone());
 
         // Start DHT TCP listener
         dht_node.clone().start().await.map_err(|e| {
@@ -74,7 +90,7 @@ impl P2pServer {
         info!("P2P DHT Server: Listening on {}", self.addr);
 
         // Start heartbeat and peer discovery loop
-        let redis_client = self.cache.redis_client().clone();
+        let redis_client = self.cache.nvme.redis_client().clone();
         let p2p_addr = self.addr.clone();
         let dht_clone = dht_node.clone();
 

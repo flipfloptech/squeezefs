@@ -5,6 +5,8 @@ use crate::fuse_client::METRICS;
 use log::debug;
 use redis::AsyncCommands;
 use std::sync::atomic::Ordering;
+static STRIPE_WRITE_SEMAPHORE: once_cell::sync::Lazy<std::sync::Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(32)));
 
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -1032,7 +1034,9 @@ impl DataRouter {
 
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
+                let permit = STRIPE_WRITE_SEMAPHORE.clone().acquire_owned().await.unwrap();
                 tokio::spawn(async move {
+                    let _permit_guard = permit;
                     if let Err(e) = nvme_writer.write_block(offset, &processed).await {
                         log::error!(
                             "Background Stripe upload task failed for block {}: {:?}",
@@ -1446,7 +1450,7 @@ impl DataRouter {
                     );
                     staged_data
                 } else {
-                    // NVMe staging file was flushed/merged. Read the packed block from S3
+                    // NVMe staging file was flushed/merged. Read the packed block from NVMe-oF backend
                     debug!(
                         "Routing: Staged file '{}' (ID: {}) already merged. Reading packed block.",
                         file_path, file_id
@@ -1477,7 +1481,7 @@ impl DataRouter {
                 }
             }
             "striped" => {
-                // Large File: fetch blocks from S3 in parallel
+                // Large File: fetch blocks from NVMe-oF backend in parallel
                 debug!(
                     "Routing: Striped file '{}' reading blocks in parallel.",
                     file_path

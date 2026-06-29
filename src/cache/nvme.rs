@@ -63,7 +63,7 @@ pub struct NvmeStaging {
     pub backend_router:
         std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
     redis_client: crate::dlm::MetaClient,
-    write_tx: mpsc::Sender<PendingStagedWrite>,
+    write_tx: mpsc::UnboundedSender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
     pub current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub space_freed_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -191,7 +191,7 @@ impl NvmeStaging {
 
         let initial_write_bytes = staging_nvme_cache.current_bytes() as u64;
 
-        let (write_tx, write_rx) = mpsc::channel::<PendingStagedWrite>(1000);
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<PendingStagedWrite>();
 
         let backend_router = std::sync::Arc::new(once_cell::sync::OnceCell::new());
 
@@ -317,7 +317,7 @@ impl NvmeStaging {
             padded_size,
         };
 
-        self.write_tx.send(pending).await.map_err(|e| {
+        self.write_tx.send(pending).map_err(|e| {
             SqueezefsError::Io(std::io::Error::other(format!(
                 "Failed to notify merge worker: {:?}",
                 e
@@ -416,7 +416,7 @@ impl NvmeStaging {
         None
     }
 
-    fn start_merge_worker(&self, mut write_rx: mpsc::Receiver<PendingStagedWrite>) {
+    fn start_merge_worker(&self, mut write_rx: mpsc::UnboundedReceiver<PendingStagedWrite>) {
         let block_allocator = self.block_allocator.clone();
         let nvme_writer = self.nvme_writer.clone();
         let backend_router = self.backend_router.clone();

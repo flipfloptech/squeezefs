@@ -3,11 +3,11 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use fuse3::raw::prelude::*;
 use fuse3::raw::Request;
+use squeezefs::cache::pool::BufferPool;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::routing::DataRouter;
-use squeezefs::cache::pool::BufferPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,16 +110,21 @@ fn bench_squeezefs_concurrency(c: &mut Criterion) {
         let router_ref = &router;
         b.to_async(&rt).iter(|| {
             let base = counter.fetch_add(16, Ordering::Relaxed);
-            let futures: Vec<_> = (0..16).map(|i| {
-                let name = format!("bench_concurrent_w_{}.bin", base + i);
-                let router = router_ref.clone();
-                let data = data_ref.clone();
-                tokio::spawn(async move {
-                    router.write_file(&name, 0, &data, (base + i) as u64).await.unwrap();
-                    let mut con = router.dlm.get_connection().await.unwrap();
-                    let _ = router.delete_file(&name, &mut con).await;
+            let futures: Vec<_> = (0..16)
+                .map(|i| {
+                    let name = format!("bench_concurrent_w_{}.bin", base + i);
+                    let router = router_ref.clone();
+                    let data = data_ref.clone();
+                    tokio::spawn(async move {
+                        router
+                            .write_file(&name, 0, &data, (base + i) as u64)
+                            .await
+                            .unwrap();
+                        let mut con = router.dlm.get_connection().await.unwrap();
+                        let _ = router.delete_file(&name, &mut con).await;
+                    })
                 })
-            }).collect();
+                .collect();
             async move {
                 for f in futures {
                     f.await.unwrap();
@@ -131,21 +136,26 @@ fn bench_squeezefs_concurrency(c: &mut Criterion) {
     // 2. Concurrent reads: 16 tasks concurrently reading from the same file (contended reads)
     let read_file_name = "routing_concurrent_read.bin".to_string();
     rt.block_on(async {
-        router.write_file(&read_file_name, 0, &vec![9u8; 128 * 1024], 9999).await.unwrap();
+        router
+            .write_file(&read_file_name, 0, &vec![9u8; 128 * 1024], 9999)
+            .await
+            .unwrap();
     });
     group.throughput(Throughput::Bytes(128 * 1024 * 16));
     group.bench_function("concurrent_reads_16_tasks_same_file", |b| {
         let router_ref = &router;
         let filename = read_file_name.clone();
         b.to_async(&rt).iter(|| {
-            let futures: Vec<_> = (0..16).map(|_| {
-                let router = router_ref.clone();
-                let fname = filename.clone();
-                tokio::spawn(async move {
-                    let data = router.read_file(&fname).await.unwrap();
-                    assert_eq!(data.len(), 128 * 1024);
+            let futures: Vec<_> = (0..16)
+                .map(|_| {
+                    let router = router_ref.clone();
+                    let fname = filename.clone();
+                    tokio::spawn(async move {
+                        let data = router.read_file(&fname).await.unwrap();
+                        assert_eq!(data.len(), 128 * 1024);
+                    })
                 })
-            }).collect();
+                .collect();
             async move {
                 for f in futures {
                     f.await.unwrap();
@@ -159,15 +169,20 @@ fn bench_squeezefs_concurrency(c: &mut Criterion) {
     group.bench_function("concurrent_locks_16_tasks", |b| {
         let dlm = dlm_ref.clone();
         b.to_async(&rt).iter(|| {
-            let futures: Vec<_> = (0..16).map(|i| {
-                let dlm = dlm.clone();
-                tokio::spawn(async move {
-                    let lock_key = format!("lock_{}", i);
-                    let lease = dlm.acquire_lock(&lock_key, None, Duration::from_secs(3)).await.unwrap();
-                    assert!(lease.fencing_token() > 0);
-                    lease.release().await.unwrap();
+            let futures: Vec<_> = (0..16)
+                .map(|i| {
+                    let dlm = dlm.clone();
+                    tokio::spawn(async move {
+                        let lock_key = format!("lock_{}", i);
+                        let lease = dlm
+                            .acquire_lock(&lock_key, None, Duration::from_secs(3))
+                            .await
+                            .unwrap();
+                        assert!(lease.fencing_token() > 0);
+                        lease.release().await.unwrap();
+                    })
                 })
-            }).collect();
+                .collect();
             async move {
                 for f in futures {
                     f.await.unwrap();
@@ -181,14 +196,16 @@ fn bench_squeezefs_concurrency(c: &mut Criterion) {
     group.bench_function("concurrent_pool_alloc_16_tasks", |b| {
         let pool = pool.clone();
         b.to_async(&rt).iter(|| {
-            let futures: Vec<_> = (0..16).map(|_| {
-                let pool = pool.clone();
-                tokio::spawn(async move {
-                    let mut buf = pool.alloc();
-                    assert_eq!(buf.len(), 1024 * 1024);
-                    buf[0] = 42;
+            let futures: Vec<_> = (0..16)
+                .map(|_| {
+                    let pool = pool.clone();
+                    tokio::spawn(async move {
+                        let mut buf = pool.alloc();
+                        assert_eq!(buf.len(), 1024 * 1024);
+                        buf[0] = 42;
+                    })
                 })
-            }).collect();
+                .collect();
             async move {
                 for f in futures {
                     f.await.unwrap();

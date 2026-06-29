@@ -4,48 +4,7 @@ This guide describes how to get Squeezefs up and running, execute its built-in m
 
 ---
 
-## 1. Quick Start via Docker (Sandbox/Testing)
-
-Docker is the easiest way to spin up the metadata service (Microsoft Garnet) and mount the FUSE daemon to execute automated tests.
-
-> [!NOTE]
-> Running FUSE inside a container requires FUSE privileges on the host system. You must have `/dev/fuse` accessible and run with elevated capabilities.
-
-### Step 1: Run Integration Tests & Build Sandbox
-To compile the client daemon and execute the integration suite in the mock container sandbox:
-```bash
-docker compose up --build squeezefs-test
-```
-
-### Step 2: Interactive Benchmarking inside Docker
-To run benchmarks interactively within the Docker environment:
-1. Spin up the Garnet metadata backend service:
-   ```bash
-   docker compose up -d garnet
-   ```
-2. Run a shell in a container configured with FUSE access:
-   ```bash
-   docker compose run --rm --entrypoint bash squeezefs-test
-   ```
-3. Inside the container, set up a loopback device and format/mount the filesystem:
-   ```bash
-   # Create directories
-   mkdir -p /mnt/squeezefs /tmp/squeezefs_staging    # Create a mock NVMe loopback file for testing
-    truncate -s 10G /tmp/mock_nvme.img
-
-    # Format the volume (uses the squeezefs URI: squeeze://host:port/fs_name)
-    cargo run --release -- format squeeze://127.0.0.1:6379/default --nvme-target-path /tmp/mock_nvme.img
-
-    # Start squeezefs in the background
-    cargo run --release -- mount squeeze://127.0.0.1:6379/default /mnt/squeezefs --disk-cache-paths /tmp/squeezefs_staging --nvme-path /tmp/mock_nvme.img &
-
-    # Wait a moment for mount to initialize, then run benchmark (auto-resolves config from mount path)
-    cargo run --release -- bench /mnt/squeezefs --threads 4 --large-size 64
-   ```
-
----
-
-## 2. Bare-Metal Execution (Real Hardware Setup)
+## 1. Bare-Metal Execution (Real Hardware Setup)
 
 To avoid containerization network bridges or WSL virtualization overheads and measure true hardware capacity, run Squeezefs directly on the host system.
 
@@ -121,7 +80,7 @@ cargo build --release
 
 ---
 
-## 3. High-Performance Multi-Rail Configuration (NVMe-oF & 6-Node Mellanox Setup)
+## 2. High-Performance Multi-Rail Configuration (NVMe-oF & 6-Node Mellanox Setup)
 
 When deploying on a multi-node cluster where hosts are equipped with multiple physical NICs (e.g. 2 Mellanox NICs per host), configure Multi-Rail bonding to balance network packets over NVMe-oF at the application socket layer.
 
@@ -165,7 +124,7 @@ sudo ./target/release/squeezefs mount /mnt/squeezefs --nvme-path /dev/fabric-poo
 
 ---
 
-## 4. Kernel Tuning for Bare Metal (Auto-Tune)
+## 3. Kernel Tuning for Bare Metal (Auto-Tune)
 
 For maximum HPC file throughput, Squeezefs includes an auto-tuning command. This script adjusts FUSE congestion thresholds, virtual memory dirty page ratios, and network socket maximum buffer sizes to matches the requirements of high-speed fabrics.
 

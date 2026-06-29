@@ -30,15 +30,16 @@ macro_rules! coz_progress {
 }
 pub mod block_allocator;
 pub mod defrag;
-pub mod storage;
 pub mod jobs;
+pub mod storage;
 
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
 
 pub static FS_PREFIX: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("squeezefs".to_string()));
 
-pub static WRITE_VERIFICATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static WRITE_VERIFICATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub fn write_verification_enabled() -> bool {
     WRITE_VERIFICATION.load(std::sync::atomic::Ordering::Relaxed)

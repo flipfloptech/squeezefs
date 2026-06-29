@@ -476,7 +476,10 @@ pub fn validate_backing_device(path: &str) -> Result<()> {
         )));
     }
 
-    if real_path_str.starts_with("/dev/loop") || real_path_str.starts_with("/dev/shm/") || real_path_str.starts_with("/tmp/") {
+    if real_path_str.starts_with("/dev/loop")
+        || real_path_str.starts_with("/dev/shm/")
+        || real_path_str.starts_with("/tmp/")
+    {
         return Ok(());
     }
 
@@ -749,7 +752,10 @@ pub fn get_loop_backing_file(loop_device: &str) -> Option<String> {
     use std::fs;
     let path = std::path::Path::new(loop_device);
     if let Some(dev_name) = path.file_name() {
-        let backing_path = format!("/sys/class/block/{}/loop/backing_file", dev_name.to_string_lossy());
+        let backing_path = format!(
+            "/sys/class/block/{}/loop/backing_file",
+            dev_name.to_string_lossy()
+        );
         if let Ok(content) = fs::read_to_string(backing_path) {
             let trim = content.trim().to_string();
             if !trim.is_empty() {
@@ -761,19 +767,28 @@ pub fn get_loop_backing_file(loop_device: &str) -> Option<String> {
 }
 
 pub fn bind_loop_device(loop_device: &str, backing_file: &str) -> Result<()> {
-    log::info!("Automatically binding loop device {} to backing file {}...", loop_device, backing_file);
+    log::info!(
+        "Automatically binding loop device {} to backing file {}...",
+        loop_device,
+        backing_file
+    );
     let output = std::process::Command::new("losetup")
         .args([loop_device, backing_file])
         .output()
         .map_err(|e| SqueezefsError::InvalidOperation(format!("losetup execute failed: {}", e)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SqueezefsError::InvalidOperation(format!("losetup failed: {}", stderr)));
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "losetup failed: {}",
+            stderr
+        )));
     }
     Ok(())
 }
 
-pub fn extract_lvm_loop_info(backing_dev: &str) -> (Option<String>, std::collections::HashMap<String, String>) {
+pub fn extract_lvm_loop_info(
+    backing_dev: &str,
+) -> (Option<String>, std::collections::HashMap<String, String>) {
     use std::fs;
     use std::path::Path;
     let mut vg_name = None;
@@ -808,7 +823,13 @@ pub fn extract_lvm_loop_info(backing_dev: &str) -> (Option<String>, std::collect
 
                 // Get PVs in VG
                 let pvs_output = std::process::Command::new("pvs")
-                    .args(["-o", "pv_name", "-S", &format!("vg_name={}", vg), "--noheadings"])
+                    .args([
+                        "-o",
+                        "pv_name",
+                        "-S",
+                        &format!("vg_name={}", vg),
+                        "--noheadings",
+                    ])
                     .output();
                 if let Ok(pvs_out) = pvs_output {
                     if pvs_out.status.success() {
@@ -837,12 +858,19 @@ pub fn extract_lvm_loop_info(backing_dev: &str) -> (Option<String>, std::collect
     (vg_name, loop_pvs)
 }
 
-pub fn restore_lvm_loop_devices(vg_name: Option<&str>, loop_pvs: &std::collections::HashMap<String, String>) -> Result<()> {
+pub fn restore_lvm_loop_devices(
+    vg_name: Option<&str>,
+    loop_pvs: &std::collections::HashMap<String, String>,
+) -> Result<()> {
     let mut bound_any = false;
     for (loop_dev, backing_file) in loop_pvs {
         let is_bound = get_loop_backing_file(loop_dev).is_some();
         if !is_bound {
-            log::info!("Re-binding loop device {} to flat file {}...", loop_dev, backing_file);
+            log::info!(
+                "Re-binding loop device {} to flat file {}...",
+                loop_dev,
+                backing_file
+            );
             bind_loop_device(loop_dev, backing_file)?;
             bound_any = true;
         }
@@ -853,10 +881,15 @@ pub fn restore_lvm_loop_devices(vg_name: Option<&str>, loop_pvs: &std::collectio
             let output = std::process::Command::new("vgchange")
                 .args(["-ay", vg])
                 .output()
-                .map_err(|e| SqueezefsError::InvalidOperation(format!("vgchange execute failed: {}", e)))?;
+                .map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!("vgchange execute failed: {}", e))
+                })?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(SqueezefsError::InvalidOperation(format!("vgchange -ay {} failed: {}", vg, stderr)));
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "vgchange -ay {} failed: {}",
+                    vg, stderr
+                )));
             }
         }
     }

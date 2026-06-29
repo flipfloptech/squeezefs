@@ -42,7 +42,9 @@ pub struct StorageBackend {
 pub struct BackendRouter {
     pub default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
     pub default_device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
-    pub backends: std::sync::Arc<dashmap::DashMap<String, std::sync::Arc<StorageBackend>, ahash::RandomState>>,
+    pub backends: std::sync::Arc<
+        dashmap::DashMap<String, std::sync::Arc<StorageBackend>, ahash::RandomState>,
+    >,
     pub active_write_backend: std::sync::Arc<parking_lot::RwLock<String>>,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -57,17 +59,33 @@ impl BackendRouter {
             default_allocator,
             default_device,
             backends: std::sync::Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
-            active_write_backend: std::sync::Arc::new(parking_lot::RwLock::new("backend_0".to_string())),
+            active_write_backend: std::sync::Arc::new(parking_lot::RwLock::new(
+                "backend_0".to_string(),
+            )),
             block_size,
         }
     }
 
-    pub fn get_active_backend(&self) -> Result<(String, std::sync::Arc<crate::block_allocator::BlockAllocator>, std::sync::Arc<crate::nvme_dev::NvmeBlockDev>)> {
+    pub fn get_active_backend(
+        &self,
+    ) -> Result<(
+        String,
+        std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    )> {
         let active_be_id = { self.active_write_backend.read().clone() };
         if active_be_id == "backend_0" {
-            Ok(("backend_0".to_string(), self.default_allocator.clone(), self.default_device.clone()))
+            Ok((
+                "backend_0".to_string(),
+                self.default_allocator.clone(),
+                self.default_device.clone(),
+            ))
         } else if let Some(be) = self.backends.get(&active_be_id) {
-            Ok((active_be_id.clone(), be.block_allocator.clone(), be.device.clone()))
+            Ok((
+                active_be_id.clone(),
+                be.block_allocator.clone(),
+                be.device.clone(),
+            ))
         } else {
             Err(crate::error::SqueezefsError::InvalidOperation(format!(
                 "Active write backend '{}' not found",
@@ -76,7 +94,13 @@ impl BackendRouter {
         }
     }
 
-    pub fn get_backend(&self, be_id: &str) -> Result<(std::sync::Arc<crate::block_allocator::BlockAllocator>, std::sync::Arc<crate::nvme_dev::NvmeBlockDev>)> {
+    pub fn get_backend(
+        &self,
+        be_id: &str,
+    ) -> Result<(
+        std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    )> {
         if be_id == "backend_0" {
             Ok((self.default_allocator.clone(), self.default_device.clone()))
         } else if let Some(be) = self.backends.get(be_id) {
@@ -712,10 +736,11 @@ impl DataRouter {
             while offset_cursor < existing_size {
                 let end = std::cmp::min(offset_cursor + block_size, existing_size);
                 let chunk = existing_bytes.slice(offset_cursor..end);
-                let (be_id, block_allocator, nvme_writer) = match self.backend_router.get_active_backend() {
-                    Ok(res) => res,
-                    Err(e) => return Err(e),
-                };
+                let (be_id, block_allocator, nvme_writer) =
+                    match self.backend_router.get_active_backend() {
+                        Ok(res) => res,
+                        Err(e) => return Err(e),
+                    };
                 let offset = block_allocator.allocate_block().await?;
                 let stored_block_key = if be_id == "backend_0" {
                     offset.to_string()
@@ -931,7 +956,8 @@ impl DataRouter {
                     let processed_data = self.get_crypto().process_write(shared_data.clone())?;
 
                     // 2. Write block directly to backing device
-                    let (be_id, block_allocator, nvme_writer) = self.backend_router.get_active_backend()?;
+                    let (be_id, block_allocator, nvme_writer) =
+                        self.backend_router.get_active_backend()?;
                     let offset = block_allocator.allocate_block().await?;
                     let stored_block_key = if be_id == "backend_0" {
                         offset.to_string()
@@ -939,9 +965,7 @@ impl DataRouter {
                         format!("{}://{}", be_id, offset)
                     };
 
-                    nvme_writer
-                        .write_block(offset, &processed_data)
-                        .await?;
+                    nvme_writer.write_block(offset, &processed_data).await?;
 
                     // 3. Register type as staged, file_id, and mapping in Garnet
                     let mut pipe = redis::pipe();
@@ -1010,10 +1034,11 @@ impl DataRouter {
             while offset_cursor < new_size {
                 let end = std::cmp::min(offset_cursor + block_size, new_size);
                 let chunk = existing_bytes.slice(offset_cursor..end);
-                let (be_id, block_allocator, nvme_writer) = match self.backend_router.get_active_backend() {
-                    Ok(res) => res,
-                    Err(e) => return Err(e),
-                };
+                let (be_id, block_allocator, nvme_writer) =
+                    match self.backend_router.get_active_backend() {
+                        Ok(res) => res,
+                        Err(e) => return Err(e),
+                    };
                 let offset = block_allocator.allocate_block().await?;
                 let stored_block_key = if be_id == "backend_0" {
                     offset.to_string()
@@ -1034,7 +1059,11 @@ impl DataRouter {
 
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
-                let permit = STRIPE_WRITE_SEMAPHORE.clone().acquire_owned().await.unwrap();
+                let permit = STRIPE_WRITE_SEMAPHORE
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .unwrap();
                 tokio::spawn(async move {
                     let _permit_guard = permit;
                     if let Err(e) = nvme_writer.write_block(offset, &processed).await {
@@ -1266,7 +1295,8 @@ impl DataRouter {
                 let new_block_key =
                     format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
 
-                let (be_id, block_allocator, nvme_writer) = router_clone.backend_router.get_active_backend()?;
+                let (be_id, block_allocator, nvme_writer) =
+                    router_clone.backend_router.get_active_backend()?;
                 let offset = block_allocator.allocate_block().await?;
                 let stored_new_block_key = if be_id == "backend_0" {
                     offset.to_string()
@@ -1282,9 +1312,7 @@ impl DataRouter {
                 let logical_size = block_bytes.len();
                 let processed_block = crypto.process_write(block_bytes)?;
                 let physical_size = processed_block.len();
-                nvme_writer
-                    .write_block(offset, &processed_block)
-                    .await?;
+                nvme_writer.write_block(offset, &processed_block).await?;
                 debug!(
                     "Writeback: Successfully wrote block {} to backing device",
                     new_block_key
@@ -1984,17 +2012,22 @@ impl DataRouter {
                         .await?;
                     if let Some((_, b_key_opt)) = block_keys.first() {
                         if let Some(ref b_key) = b_key_opt {
-                            if let Some(guard) = self.cache.nvme.get_cached_read_block_range_zero_copy(
-                                b_key,
-                                slice_start,
-                                slice_len,
-                            ) {
+                            if let Some(guard) =
+                                self.cache.nvme.get_cached_read_block_range_zero_copy(
+                                    b_key,
+                                    slice_start,
+                                    slice_len,
+                                )
+                            {
                                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                                 let slice: &[u8] = &guard;
                                 let data = unsafe {
-                                    bytes::Bytes::from_static(
-                                        std::mem::transmute::<&[u8], &'static [u8]>(slice),
-                                    )
+                                    bytes::Bytes::from_static(std::mem::transmute::<
+                                        &[u8],
+                                        &'static [u8],
+                                    >(
+                                        slice
+                                    ))
                                 };
                                 return Ok((data, Some(std::sync::Arc::new(guard))));
                             } else {
@@ -2005,7 +2038,11 @@ impl DataRouter {
                                     (slice_start + slice_len as u64) as usize,
                                     downloaded.len(),
                                 );
-                                if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
+                                if self.should_prefetch_after_striped_read(
+                                    file_path,
+                                    start_block,
+                                    end_block,
+                                ) {
                                     self.schedule_striped_prefetch(
                                         file_path.to_string(),
                                         meta.clone(),
@@ -2015,9 +2052,12 @@ impl DataRouter {
                                 }
                                 let slice: &[u8] = &downloaded[start..end];
                                 let data = unsafe {
-                                    bytes::Bytes::from_static(
-                                        std::mem::transmute::<&[u8], &'static [u8]>(slice),
-                                    )
+                                    bytes::Bytes::from_static(std::mem::transmute::<
+                                        &[u8],
+                                        &'static [u8],
+                                    >(
+                                        slice
+                                    ))
                                 };
                                 return Ok((data, Some(std::sync::Arc::new(downloaded))));
                             }

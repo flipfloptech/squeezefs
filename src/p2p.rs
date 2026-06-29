@@ -45,6 +45,7 @@ impl crate::tiering::dht::LocalCacheReader for SqueezefsLocalCacheReader {
 pub struct P2pServer {
     addr: String,
     cache: TieredCache,
+    security_config: crate::tiering::dht::ClusterSecurityConfig,
 }
 
 impl Drop for P2pServer {
@@ -64,8 +65,16 @@ impl Drop for P2pServer {
 }
 
 impl P2pServer {
-    pub fn new(addr: String, cache: TieredCache) -> Self {
-        Self { addr, cache }
+    pub fn new(
+        addr: String,
+        cache: TieredCache,
+        security_config: crate::tiering::dht::ClusterSecurityConfig,
+    ) -> Self {
+        Self {
+            addr,
+            cache,
+            security_config,
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -73,7 +82,11 @@ impl P2pServer {
             cache: self.cache.clone(),
         });
 
-        let dht_node = Arc::new(crate::tiering::dht::DhtNode::new(self.addr.clone(), reader));
+        let dht_node = Arc::new(crate::tiering::dht::DhtNode::new_with_security(
+            self.addr.clone(),
+            reader,
+            self.security_config.clone(),
+        ));
 
         // Store DhtNode in NvmeStaging so clients can retrieve it
         let _ = self.cache.nvme.dht_node.set(dht_node.clone());

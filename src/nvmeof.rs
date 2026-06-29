@@ -353,7 +353,8 @@ fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
     Ok(None)
 }
 
-static MOCK_WRITE_MUTEX: once_cell::sync::Lazy<std::sync::Mutex<()>> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
+static MOCK_WRITE_MUTEX: once_cell::sync::Lazy<std::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
 
 fn connect_target_single(
     ip: &str,
@@ -386,9 +387,7 @@ fn connect_target_single(
             args.push("-p".to_string());
             args.push(host_ip.to_string());
         }
-        let output = Command::new("nvme")
-            .args(&args)
-            .output()?;
+        let output = Command::new("nvme").args(&args).output()?;
         if !output.status.success() {
             let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(std::io::Error::new(
@@ -683,9 +682,12 @@ pub fn extract_nvmeof_connection_details(backing_dev: &str) -> Option<(String, u
                     let subsysnqn_path = format!("/sys/class/nvme/{}/subsysnqn", ctrl);
                     let address_path = format!("/sys/class/nvme/{}/address", ctrl);
 
-                    if let (Ok(nqn_raw), Ok(addr_raw)) = (fs::read_to_string(subsysnqn_path), fs::read_to_string(address_path)) {
+                    if let (Ok(nqn_raw), Ok(addr_raw)) = (
+                        fs::read_to_string(subsysnqn_path),
+                        fs::read_to_string(address_path),
+                    ) {
                         let subnqn = nqn_raw.trim().to_string();
-                        
+
                         // Parse address properties: e.g. "traddr=192.168.1.100,trsvcid=4420"
                         let mut ip = None;
                         let mut port = None;
@@ -753,7 +755,12 @@ fn save_shares(shares: &[NvmeofShareConfig]) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn register_share(backing_path: &str, subnqn: &str, port: u16, ip: &str) -> std::io::Result<()> {
+pub fn register_share(
+    backing_path: &str,
+    subnqn: &str,
+    port: u16,
+    ip: &str,
+) -> std::io::Result<()> {
     let mut shares = load_shares();
     shares.retain(|s| s.subnqn != subnqn);
     shares.push(NvmeofShareConfig {
@@ -779,9 +786,23 @@ pub fn restore_shares() -> std::io::Result<()> {
     }
     log::info!("Restoring {} NVMe-oF target shares...", shares.len());
     for share in shares {
-        log::info!("Restoring shared target {} on port {} (IP: {})...", share.backing_path, share.port, share.ip);
-        if let Err(e) = share_target(&share.backing_path, Some(&share.subnqn), share.port, &share.ip) {
-            log::error!("Failed to restore target share for {}: {:?}", share.subnqn, e);
+        log::info!(
+            "Restoring shared target {} on port {} (IP: {})...",
+            share.backing_path,
+            share.port,
+            share.ip
+        );
+        if let Err(e) = share_target(
+            &share.backing_path,
+            Some(&share.subnqn),
+            share.port,
+            &share.ip,
+        ) {
+            log::error!(
+                "Failed to restore target share for {}: {:?}",
+                share.subnqn,
+                e
+            );
         }
     }
     Ok(())

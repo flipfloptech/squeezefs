@@ -1043,10 +1043,16 @@ fn print_mount_diagnostics(
     let client = redis::Client::open(garnet_url)?;
     let mut con = client.get_connection()?;
     let key = squeezefs::fs_key!("format");
-    log::info!("print_mount_diagnostics: Querying format key '{}' on Redis '{}'", key, garnet_url);
-    let format_fields: std::collections::HashMap<String, String> =
-        con.hgetall(&key)?;
-    log::info!("print_mount_diagnostics: Retrieved format fields: {:?}", format_fields);
+    log::info!(
+        "print_mount_diagnostics: Querying format key '{}' on Redis '{}'",
+        key,
+        garnet_url
+    );
+    let format_fields: std::collections::HashMap<String, String> = con.hgetall(&key)?;
+    log::info!(
+        "print_mount_diagnostics: Retrieved format fields: {:?}",
+        format_fields
+    );
     if format_fields.is_empty() {
         return Err("Volume not formatted. Please run format command first.".into());
     }
@@ -1145,7 +1151,12 @@ fn print_mount_diagnostics(
     let staging_dirs = if let Some(dirs) = disk_cache_paths {
         if dirs.is_empty() {
             vec![get_default_staging_dir()]
-        } else if dirs.len() == 1 && (dirs[0] == PathBuf::from("none") || dirs[0] == PathBuf::from("memory") || dirs[0] == PathBuf::from("memory-only") || dirs[0] == PathBuf::from("")) {
+        } else if dirs.len() == 1
+            && (dirs[0] == PathBuf::from("none")
+                || dirs[0] == PathBuf::from("memory")
+                || dirs[0] == PathBuf::from("memory-only")
+                || dirs[0] == PathBuf::from(""))
+        {
             Vec::new()
         } else {
             dirs.to_vec()
@@ -1306,8 +1317,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Fail-fast connection to Redis/Garnet
             let client = redis::Client::open(redis_url.as_str())
                 .map_err(|e| format!("Failed to open Redis client at {}: {:?}", redis_url, e))?;
-            let mut con = client.get_multiplexed_tokio_connection().await
-                .map_err(|e| format!("Failed to connect to metadata database at {}: {:?}", redis_url, e))?;
+            let mut con = client
+                .get_multiplexed_tokio_connection()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to connect to metadata database at {}: {:?}",
+                        redis_url, e
+                    )
+                })?;
 
             // Check if active clients are connected to the filesystem
             let raw_clients: std::collections::HashMap<String, String> = con
@@ -1348,11 +1366,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Check if squeezefs volume is already formatted on the database
             if !force {
                 let key = squeezefs::fs_key!("format");
-                log::info!("Format command: checking if key '{}' exists on Redis '{}'", key, redis_url);
-                let exists_format: bool = con
-                    .exists(&key)
-                    .await
-                    .unwrap_or(false);
+                log::info!(
+                    "Format command: checking if key '{}' exists on Redis '{}'",
+                    key,
+                    redis_url
+                );
+                let exists_format: bool = con.exists(&key).await.unwrap_or(false);
                 if exists_format {
                     println!(
                         "{}",
@@ -1479,7 +1498,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Check if format already exists
             use redis::AsyncCommands;
             let existing_format = con
-                .hgetall::<_, std::collections::HashMap<String, String>>(squeezefs::fs_key!("format"))
+                .hgetall::<_, std::collections::HashMap<String, String>>(squeezefs::fs_key!(
+                    "format"
+                ))
                 .await
                 .unwrap_or_default();
 
@@ -1490,29 +1511,48 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if !existing_format.is_empty() {
                 // Pull everything from the existing format metadata if not explicitly provided
                 if resolved_backing_dev.is_none() {
-                    resolved_backing_dev = existing_format.get("backing_dev").filter(|s| !s.is_empty()).cloned();
+                    resolved_backing_dev = existing_format
+                        .get("backing_dev")
+                        .filter(|s| !s.is_empty())
+                        .cloned();
                 }
                 if resolved_ip.is_none() {
-                    resolved_ip = existing_format.get("backing_dev_ip").filter(|s| !s.is_empty()).cloned();
+                    resolved_ip = existing_format
+                        .get("backing_dev_ip")
+                        .filter(|s| !s.is_empty())
+                        .cloned();
                 }
                 if resolved_port.is_none() {
-                    resolved_port = existing_format.get("backing_dev_port").and_then(|s| s.parse::<u16>().ok());
+                    resolved_port = existing_format
+                        .get("backing_dev_port")
+                        .and_then(|s| s.parse::<u16>().ok());
                 }
                 if resolved_subnqn.is_none() {
-                    resolved_subnqn = existing_format.get("backing_dev_subnqn").filter(|s| !s.is_empty()).cloned();
+                    resolved_subnqn = existing_format
+                        .get("backing_dev_subnqn")
+                        .filter(|s| !s.is_empty())
+                        .cloned();
                 }
             }
 
             let resolved_backing_dev = match resolved_backing_dev {
                 Some(path) => {
                     // Check if it is the in-memory testing path. If it is and does not exist, recreate it.
-                    if (path.starts_with("/dev/shm/") || path.starts_with("/tmp/")) && !std::path::Path::new(&path).exists() {
+                    if (path.starts_with("/dev/shm/") || path.starts_with("/tmp/"))
+                        && !std::path::Path::new(&path).exists()
+                    {
                         log::info!("Re-initializing testing backing device file at {}...", path);
                         let file = std::fs::File::create(&path).map_err(|e| {
-                            format!("Failed to create backing device file at '{}': {:?}", path, e)
+                            format!(
+                                "Failed to create backing device file at '{}': {:?}",
+                                path, e
+                            )
                         })?;
                         file.set_len(parsed_capacity).map_err(|e| {
-                            format!("Failed to set size of backing device file at '{}': {:?}", path, e)
+                            format!(
+                                "Failed to set size of backing device file at '{}': {:?}",
+                                path, e
+                            )
                         })?;
                     } else {
                         // Validate loop / LVM / NVMe
@@ -1520,25 +1560,54 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Automatically pull NVMe-oF details if possible
-                    if let Some((ext_ip, ext_port, ext_subnqn)) = squeezefs::nvmeof::extract_nvmeof_connection_details(&path) {
-                        log::info!("Automatically extracted NVMe-oF connection details for {}: {}:{} / {}", path, ext_ip, ext_port, ext_subnqn);
-                        if resolved_ip.is_none() { resolved_ip = Some(ext_ip); }
-                        if resolved_port.is_none() { resolved_port = Some(ext_port); }
-                        if resolved_subnqn.is_none() { resolved_subnqn = Some(ext_subnqn); }
+                    if let Some((ext_ip, ext_port, ext_subnqn)) =
+                        squeezefs::nvmeof::extract_nvmeof_connection_details(&path)
+                    {
+                        log::info!(
+                            "Automatically extracted NVMe-oF connection details for {}: {}:{} / {}",
+                            path,
+                            ext_ip,
+                            ext_port,
+                            ext_subnqn
+                        );
+                        if resolved_ip.is_none() {
+                            resolved_ip = Some(ext_ip);
+                        }
+                        if resolved_port.is_none() {
+                            resolved_port = Some(ext_port);
+                        }
+                        if resolved_subnqn.is_none() {
+                            resolved_subnqn = Some(ext_subnqn);
+                        }
                     }
                     path
                 }
                 None => {
-                    if let (Some(ref ip_val), Some(port_val), Some(ref nqn_val)) = (&resolved_ip, resolved_port, &resolved_subnqn) {
-                        log::info!("Connecting to NVMe-oF target at {}:{} / {}...", ip_val, port_val, nqn_val);
+                    if let (Some(ref ip_val), Some(port_val), Some(ref nqn_val)) =
+                        (&resolved_ip, resolved_port, &resolved_subnqn)
+                    {
+                        log::info!(
+                            "Connecting to NVMe-oF target at {}:{} / {}...",
+                            ip_val,
+                            port_val,
+                            nqn_val
+                        );
                         let dev_path = squeezefs::nvmeof::connect_target(ip_val, port_val, nqn_val)
                             .map_err(|e| format!("Failed to connect to NVMe-oF target: {:?}", e))?;
                         log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
                         // Also auto-extract details just in case
-                        if let Some((ext_ip, ext_port, ext_subnqn)) = squeezefs::nvmeof::extract_nvmeof_connection_details(&dev_path) {
-                            if resolved_ip.is_none() { resolved_ip = Some(ext_ip); }
-                            if resolved_port.is_none() { resolved_port = Some(ext_port); }
-                            if resolved_subnqn.is_none() { resolved_subnqn = Some(ext_subnqn); }
+                        if let Some((ext_ip, ext_port, ext_subnqn)) =
+                            squeezefs::nvmeof::extract_nvmeof_connection_details(&dev_path)
+                        {
+                            if resolved_ip.is_none() {
+                                resolved_ip = Some(ext_ip);
+                            }
+                            if resolved_port.is_none() {
+                                resolved_port = Some(ext_port);
+                            }
+                            if resolved_subnqn.is_none() {
+                                resolved_subnqn = Some(ext_subnqn);
+                            }
                         }
                         dev_path
                     } else {
@@ -1580,31 +1649,28 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let status = squeezefs::fuse_client::get_volume_status(&redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
-        Commands::Status {
-            squeeze_uri,
-        } => {
+        Commands::Status { squeeze_uri } => {
             let (redis_url, fs_name) = parse_squeeze_uri(&squeeze_uri)?;
             squeezefs::set_fs_prefix(&fs_name);
             let status = squeezefs::fuse_client::get_volume_status(&redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
-        Commands::Clients {
-            squeeze_uri,
-        } => {
+        Commands::Clients { squeeze_uri } => {
             let (redis_url, name) = parse_squeeze_uri(&squeeze_uri)?;
             squeezefs::set_fs_prefix(&name);
             let client = squeezefs::dlm::MetaClient::new(&redis_url)?;
             let mut con = client.get_connection().await?;
-            let raw_clients: std::collections::HashMap<String, String> = con
-                .hgetall(squeezefs::fs_key!("active_clients"))
-                .await?;
+            let raw_clients: std::collections::HashMap<String, String> =
+                con.hgetall(squeezefs::fs_key!("active_clients")).await?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             let mut active_clients = Vec::new();
             for (_, json_str) in raw_clients {
-                if let Ok(info) = serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str) {
+                if let Ok(info) =
+                    serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str)
+                {
                     if now.saturating_sub(info.last_heartbeat) <= 6 {
                         active_clients.push(info);
                     }
@@ -1782,7 +1848,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let staging_dirs = if let Some(dirs) = disk_cache_paths {
                 if dirs.is_empty() {
                     vec![get_default_staging_dir()]
-                } else if dirs.len() == 1 && (dirs[0] == PathBuf::from("none") || dirs[0] == PathBuf::from("memory") || dirs[0] == PathBuf::from("memory-only") || dirs[0] == PathBuf::from("")) {
+                } else if dirs.len() == 1
+                    && (dirs[0] == PathBuf::from("none")
+                        || dirs[0] == PathBuf::from("memory")
+                        || dirs[0] == PathBuf::from("memory-only")
+                        || dirs[0] == PathBuf::from(""))
+                {
                     Vec::new()
                 } else {
                     dirs
@@ -1898,13 +1969,31 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // If backing device does not exist, check if we can connect to its NVMe-oF target
             if !std::path::Path::new(&resolved_backing_dev).exists() {
-                let resolved_ip = ip.clone().or_else(|| format_fields.get("backing_dev_ip").filter(|s| !s.is_empty()).cloned());
-                let resolved_port = port.or_else(|| format_fields.get("backing_dev_port").and_then(|v| v.parse::<u16>().ok()));
-                let resolved_subnqn = subnqn.clone().or_else(|| format_fields.get("backing_dev_subnqn").filter(|s| !s.is_empty()).cloned());
+                let resolved_ip = ip.clone().or_else(|| {
+                    format_fields
+                        .get("backing_dev_ip")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                });
+                let resolved_port = port.or_else(|| {
+                    format_fields
+                        .get("backing_dev_port")
+                        .and_then(|v| v.parse::<u16>().ok())
+                });
+                let resolved_subnqn = subnqn.clone().or_else(|| {
+                    format_fields
+                        .get("backing_dev_subnqn")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                });
 
-                if let (Some(ip_val), Some(port_val), Some(nqn_val)) = (resolved_ip, resolved_port, resolved_subnqn) {
+                if let (Some(ip_val), Some(port_val), Some(nqn_val)) =
+                    (resolved_ip, resolved_port, resolved_subnqn)
+                {
                     log::info!("Backing device {} not found. Connecting to NVMe-oF target at {}:{} / {}...", resolved_backing_dev, ip_val, port_val, nqn_val);
-                    if let Ok(dev_path) = squeezefs::nvmeof::connect_target(&ip_val, port_val, &nqn_val) {
+                    if let Ok(dev_path) =
+                        squeezefs::nvmeof::connect_target(&ip_val, port_val, &nqn_val)
+                    {
                         log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
                         resolved_backing_dev = dev_path;
                     }
@@ -1912,18 +2001,35 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // If the backing device is an LVM logical volume built on loop physical volumes (flat files), auto-rebind and activate them
-            let lvm_vg = format_fields.get("lvm_vg").filter(|s| !s.is_empty()).map(|s| s.as_str());
+            let lvm_vg = format_fields
+                .get("lvm_vg")
+                .filter(|s| !s.is_empty())
+                .map(|s| s.as_str());
             let lvm_loops_str = format_fields.get("lvm_loops").filter(|s| !s.is_empty());
-            let lvm_loops = lvm_loops_str.and_then(|s| {
-                serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok()
-            }).unwrap_or_default();
+            let lvm_loops = lvm_loops_str
+                .and_then(|s| {
+                    serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok()
+                })
+                .unwrap_or_default();
             let _ = squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
 
             // If the backing device path is in /dev/shm or /tmp and does not exist (e.g. after reboot), auto-recreate it
-            if (resolved_backing_dev.starts_with("/dev/shm/") || resolved_backing_dev.starts_with("/tmp/")) && !std::path::Path::new(&resolved_backing_dev).exists() {
-                let capacity_str = format_fields.get("capacity").cloned().unwrap_or_else(|| "1G".to_string());
-                let capacity_bytes = squeezefs::cache::parse_size_string(&capacity_str, 1024 * 1024 * 1024).unwrap_or(1024 * 1024 * 1024);
-                log::info!("Re-initializing in-memory backing device file at {} with capacity {}...", resolved_backing_dev, capacity_str);
+            if (resolved_backing_dev.starts_with("/dev/shm/")
+                || resolved_backing_dev.starts_with("/tmp/"))
+                && !std::path::Path::new(&resolved_backing_dev).exists()
+            {
+                let capacity_str = format_fields
+                    .get("capacity")
+                    .cloned()
+                    .unwrap_or_else(|| "1G".to_string());
+                let capacity_bytes =
+                    squeezefs::cache::parse_size_string(&capacity_str, 1024 * 1024 * 1024)
+                        .unwrap_or(1024 * 1024 * 1024);
+                log::info!(
+                    "Re-initializing in-memory backing device file at {} with capacity {}...",
+                    resolved_backing_dev,
+                    capacity_str
+                );
                 if let Ok(file) = std::fs::File::create(&resolved_backing_dev) {
                     let _ = file.set_len(capacity_bytes);
                 }
@@ -2042,33 +2148,53 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 let ip_val = config["ip"].as_str();
                                 let port_val = config["port"].as_u64().map(|p| p as u16);
                                 let nqn_val = config["subnqn"].as_str();
-                                if let (Some(ip), Some(port), Some(subnqn)) = (ip_val, port_val, nqn_val) {
+                                if let (Some(ip), Some(port), Some(subnqn)) =
+                                    (ip_val, port_val, nqn_val)
+                                {
                                     log::info!("Supplementary backend '{}' device not found. Connecting to NVMe-oF target at {}:{} / {}...", be_id, ip, port, subnqn);
-                                    if let Ok(dev_path) = squeezefs::nvmeof::connect_target(ip, port, subnqn) {
-                                        log::info!("Connected supplementary backend '{}' to: {}", be_id, dev_path);
+                                    if let Ok(dev_path) =
+                                        squeezefs::nvmeof::connect_target(ip, port, subnqn)
+                                    {
+                                        log::info!(
+                                            "Connected supplementary backend '{}' to: {}",
+                                            be_id,
+                                            dev_path
+                                        );
                                         resolved_bd = dev_path;
                                     }
                                 }
                             }
                             let lvm_vg = config["lvm_vg"].as_str();
-                            let lvm_loops = config["lvm_loops"].as_object().map(|obj| {
-                                obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect::<std::collections::HashMap<String, String>>()
-                            }).unwrap_or_default();
-                            let _ = squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
-                            let _resolved_cap = config["capacity"].as_u64().unwrap_or(1024 * 1024 * 1024 * 1024);
+                            let lvm_loops = config["lvm_loops"]
+                                .as_object()
+                                .map(|obj| {
+                                    obj.iter()
+                                        .map(|(k, v)| {
+                                            (k.clone(), v.as_str().unwrap_or_default().to_string())
+                                        })
+                                        .collect::<std::collections::HashMap<String, String>>()
+                                })
+                                .unwrap_or_default();
+                            let _ =
+                                squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
+                            let _resolved_cap = config["capacity"]
+                                .as_u64()
+                                .unwrap_or(1024 * 1024 * 1024 * 1024);
                             let device = squeezefs::nvme_dev::NvmeBlockDev::new(&resolved_bd);
                             let dev_arc = std::sync::Arc::new(device);
                             let be_alloc_name = format!("{}:{}", fs_name, be_id);
                             if let Ok(allocator) = squeezefs::block_allocator::BlockAllocator::new(
                                 std::sync::Arc::new(dlm.meta_client().clone()),
                                 &be_alloc_name,
-                            ).await {
+                            )
+                            .await
+                            {
                                 router.backend_router.backends.insert(
                                     be_id,
                                     std::sync::Arc::new(squeezefs::routing::StorageBackend {
                                         device: dev_arc,
                                         block_allocator: std::sync::Arc::new(allocator),
-                                    })
+                                    }),
                                 );
                             }
                         }
@@ -2115,10 +2241,40 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Daemonization has already happened at the start of main() prior to Tokio runtime initialization.
 
+            let ca_cert_hex = format_fields.get("ca_cert");
+            let ca_key_hex = format_fields.get("ca_key");
+
+            let ca_cert = ca_cert_hex.and_then(|hex| {
+                let mut bytes = Vec::new();
+                for i in (0..hex.len()).step_by(2) {
+                    if let Ok(b) = u8::from_str_radix(&hex[i..i + 2], 16) {
+                        bytes.push(b);
+                    } else {
+                        return None;
+                    }
+                }
+                Some(bytes)
+            });
+            let ca_key = ca_key_hex.and_then(|hex| {
+                let mut bytes = Vec::new();
+                for i in (0..hex.len()).step_by(2) {
+                    if let Ok(b) = u8::from_str_radix(&hex[i..i + 2], 16) {
+                        bytes.push(b);
+                    } else {
+                        return None;
+                    }
+                }
+                Some(bytes)
+            });
+
+            let security_config =
+                squeezefs::tiering::dht::ClusterSecurityConfig { ca_cert, ca_key };
+
             if let Some(ref addr) = p2p_addr {
                 let server = squeezefs::p2p::P2pServer::new(
                     addr.clone(),
                     fs_engine.router.cache.clone(),
+                    security_config,
                 );
                 tokio::spawn(async move {
                     if let Err(e) = server.run().await {
@@ -2167,7 +2323,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
                         resolved_url = Some(url_str.to_string());
                     }
-                    if let Some(format_obj) = config_json.get("format").and_then(|v| v.as_object()) {
+                    if let Some(format_obj) = config_json.get("format").and_then(|v| v.as_object())
+                    {
                         if let Some(name_str) = format_obj.get("name").and_then(|v| v.as_str()) {
                             squeezefs::set_fs_prefix(name_str);
                         }
@@ -2203,9 +2360,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!(
                     "{}",
-                    "Running POSIX-only benchmark override."
-                        .yellow()
-                        .bold()
+                    "Running POSIX-only benchmark override.".yellow().bold()
                 );
             }
 
@@ -2223,7 +2378,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     only.as_deref(),
                     skip.as_deref(),
                     direct,
-                ).await?;
+                )
+                .await?;
             }
         }
         Commands::Clone {
@@ -2231,7 +2387,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             src,
             dest,
         } => {
-            let (redis_url_str, fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), Some(std::path::Path::new(&src)))?;
+            let (redis_url_str, fs_name) =
+                resolve_squeeze_uri(squeeze_uri.as_deref(), Some(std::path::Path::new(&src)))?;
             let redis_url = &redis_url_str;
             squeezefs::set_fs_prefix(&fs_name);
             let staging_dirs = vec![get_default_staging_dir()];
@@ -2277,33 +2434,53 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 let ip_val = config["ip"].as_str();
                                 let port_val = config["port"].as_u64().map(|p| p as u16);
                                 let nqn_val = config["subnqn"].as_str();
-                                if let (Some(ip), Some(port), Some(subnqn)) = (ip_val, port_val, nqn_val) {
+                                if let (Some(ip), Some(port), Some(subnqn)) =
+                                    (ip_val, port_val, nqn_val)
+                                {
                                     log::info!("Supplementary backend '{}' device not found. Connecting to NVMe-oF target at {}:{} / {}...", be_id, ip, port, subnqn);
-                                    if let Ok(dev_path) = squeezefs::nvmeof::connect_target(ip, port, subnqn) {
-                                        log::info!("Connected supplementary backend '{}' to: {}", be_id, dev_path);
+                                    if let Ok(dev_path) =
+                                        squeezefs::nvmeof::connect_target(ip, port, subnqn)
+                                    {
+                                        log::info!(
+                                            "Connected supplementary backend '{}' to: {}",
+                                            be_id,
+                                            dev_path
+                                        );
                                         resolved_bd = dev_path;
                                     }
                                 }
                             }
                             let lvm_vg = config["lvm_vg"].as_str();
-                            let lvm_loops = config["lvm_loops"].as_object().map(|obj| {
-                                obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect::<std::collections::HashMap<String, String>>()
-                            }).unwrap_or_default();
-                            let _ = squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
-                            let _resolved_cap = config["capacity"].as_u64().unwrap_or(1024 * 1024 * 1024 * 1024);
+                            let lvm_loops = config["lvm_loops"]
+                                .as_object()
+                                .map(|obj| {
+                                    obj.iter()
+                                        .map(|(k, v)| {
+                                            (k.clone(), v.as_str().unwrap_or_default().to_string())
+                                        })
+                                        .collect::<std::collections::HashMap<String, String>>()
+                                })
+                                .unwrap_or_default();
+                            let _ =
+                                squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
+                            let _resolved_cap = config["capacity"]
+                                .as_u64()
+                                .unwrap_or(1024 * 1024 * 1024 * 1024);
                             let device = squeezefs::nvme_dev::NvmeBlockDev::new(&resolved_bd);
                             let dev_arc = std::sync::Arc::new(device);
                             let be_alloc_name = format!("{}:{}", fs_name, be_id);
                             if let Ok(allocator) = squeezefs::block_allocator::BlockAllocator::new(
                                 std::sync::Arc::new(router.dlm.meta_client().clone()),
                                 &be_alloc_name,
-                            ).await {
+                            )
+                            .await
+                            {
                                 router.backend_router.backends.insert(
                                     be_id,
                                     std::sync::Arc::new(squeezefs::routing::StorageBackend {
                                         device: dev_arc,
                                         block_allocator: std::sync::Arc::new(allocator),
-                                    })
+                                    }),
                                 );
                             }
                         }
@@ -2410,10 +2587,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     squeezefs::nvmeof::unshare_target(&subnqn)?;
                     println!("Successfully stopped sharing target NQN '{}'.", subnqn);
                 }
-                NvmeofActions::Connect { ip, port, subnqn, local_ips } => {
+                NvmeofActions::Connect {
+                    ip,
+                    port,
+                    subnqn,
+                    local_ips,
+                } => {
                     println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
                     let local_ips_vec = local_ips.unwrap_or_default();
-                    let dev = squeezefs::nvmeof::connect_target_with_local_ips(&ip, port, &subnqn, &local_ips_vec)?;
+                    let dev = squeezefs::nvmeof::connect_target_with_local_ips(
+                        &ip,
+                        port,
+                        &subnqn,
+                        &local_ips_vec,
+                    )?;
                     if dev.starts_with("/dev/") {
                         println!("{}", "Connection successful!".green().bold());
                         println!("Attached Remote Disk: {}", dev.cyan().bold());
@@ -2503,16 +2690,25 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
                 ConfigActions::Volume(action) => match action {
-                    VolumeActions::Add { volume_id, volume: backing_dev, ip, port, subnqn, capacity } => {
+                    VolumeActions::Add {
+                        volume_id,
+                        volume: backing_dev,
+                        ip,
+                        port,
+                        subnqn,
+                        capacity,
+                    } => {
                         let backend_id = volume_id;
                         let resolved_capacity = if let Some(ref cap_str) = capacity {
                             if let Ok(bytes) = squeezefs::cache::parse_size_string(cap_str, 0) {
                                 Some(bytes)
                             } else {
-                                return Err(Box::new(squeezefs::error::SqueezefsError::InvalidOperation(format!(
-                                    "Invalid capacity string: {}",
-                                    cap_str
-                                ))));
+                                return Err(Box::new(
+                                    squeezefs::error::SqueezefsError::InvalidOperation(format!(
+                                        "Invalid capacity string: {}",
+                                        cap_str
+                                    )),
+                                ));
                             }
                         } else {
                             None
@@ -2528,7 +2724,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             resolved_capacity,
                         )
                         .await?;
-                        println!("Storage volume '{}' registered/added successfully.", backend_id);
+                        println!(
+                            "Storage volume '{}' registered/added successfully.",
+                            backend_id
+                        );
                     }
                     VolumeActions::Remove { volume_id, force } => {
                         let backend_id = volume_id;
@@ -2586,7 +2785,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             use std::io::IsTerminal;
             use std::io::Write;
 
-            let (redis_url_str, resolved_fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), Some(&mountpoint))?;
+            let (redis_url_str, resolved_fs_name) =
+                resolve_squeeze_uri(squeeze_uri.as_deref(), Some(&mountpoint))?;
             let redis_url = &redis_url_str;
             squeezefs::set_fs_prefix(&resolved_fs_name);
 
@@ -2707,7 +2907,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!("Other nodes will NOT see this data if you unmount now.");
                 println!("\nChoose an option:");
-                println!("  [w] Wait for staged files to drain/flush to NVMe-oF backend (recommended)");
+                println!(
+                    "  [w] Wait for staged files to drain/flush to NVMe-oF backend (recommended)"
+                );
                 println!("  [c] Continue/force unmount immediately (unsafe - may lose data)");
                 println!("  [a] Abort unmount");
                 print!("Select option [w/c/a]: ");
@@ -3163,7 +3365,10 @@ async fn run_df_command(
             println!("--------------------------------------------------");
             println!("Capacity:            {}", capacity_str);
             println!("Logical File Size:   {}", format_size(total_logical_size));
-            println!("Physical Backend Size: {}", format_size(total_physical_size));
+            println!(
+                "Physical Backend Size: {}",
+                format_size(total_physical_size)
+            );
             println!("Compression Ratio:   {}", ratio_str);
             println!();
 
@@ -3629,7 +3834,10 @@ fn parse_squeeze_uri(uri: &str) -> Result<(String, String), String> {
         let rest = &uri["squeeze://".len()..];
         let parts: Vec<&str> = rest.splitn(2, '/').collect();
         if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-            return Err(format!("Invalid SqueezeFS URI format: expected 'squeeze://host:port/fs_name' (got '{}')", uri));
+            return Err(format!(
+                "Invalid SqueezeFS URI format: expected 'squeeze://host:port/fs_name' (got '{}')",
+                uri
+            ));
         }
         let redis_url = format!("redis://{}", parts[0]);
         let fs_name = parts[1].to_string();
@@ -3637,7 +3845,10 @@ fn parse_squeeze_uri(uri: &str) -> Result<(String, String), String> {
     } else if uri.starts_with("redis://") {
         Ok((uri.to_string(), "squeezefs".to_string()))
     } else {
-        Err(format!("Invalid SqueezeFS URI scheme: expected 'squeeze://' (got '{}')", uri))
+        Err(format!(
+            "Invalid SqueezeFS URI scheme: expected 'squeeze://' (got '{}')",
+            uri
+        ))
     }
 }
 
@@ -3659,7 +3870,10 @@ fn resolve_squeeze_uri(
             if let Ok(config_str) = std::fs::read_to_string(&config_path) {
                 if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
                     if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
-                        let name_str = config_json["format"]["name"].as_str().unwrap_or("squeezefs").to_string();
+                        let name_str = config_json["format"]["name"]
+                            .as_str()
+                            .unwrap_or("squeezefs")
+                            .to_string();
                         return Ok((url_str.to_string(), name_str));
                     }
                 }
@@ -3677,7 +3891,10 @@ fn resolve_squeeze_uri(
         if let Ok(config_str) = std::fs::read_to_string(&config_path) {
             if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
                 if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
-                    let name_str = config_json["format"]["name"].as_str().unwrap_or("squeezefs").to_string();
+                    let name_str = config_json["format"]["name"]
+                        .as_str()
+                        .unwrap_or("squeezefs")
+                        .to_string();
                     return Ok((url_str.to_string(), name_str));
                 }
             }
@@ -3720,10 +3937,10 @@ async fn run_benchmark(
     skip: Option<&[String]>,
     direct: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::io::{AsyncSeekExt, SeekFrom};
     use rand::seq::SliceRandom;
     #[allow(unused_imports)]
     use std::os::unix::fs::OpenOptionsExt;
+    use tokio::io::{AsyncSeekExt, SeekFrom};
 
     if let Err(e) = std::fs::metadata(path) {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -3803,27 +4020,43 @@ async fn run_benchmark(
                 let raw = vec![0u8; size + 4096];
                 let addr = raw.as_ptr() as usize;
                 let offset = (4096 - (addr % 4096)) % 4096;
-                Self { _raw: raw, offset, len: size }
+                Self {
+                    _raw: raw,
+                    offset,
+                    len: size,
+                }
             } else {
-                Self { _raw: vec![0u8; size], offset: 0, len: size }
+                Self {
+                    _raw: vec![0u8; size],
+                    offset: 0,
+                    len: size,
+                }
             }
         }
 
         fn as_slice(&self) -> &[u8] {
-            &self._raw[self.offset .. self.offset + self.len]
+            &self._raw[self.offset..self.offset + self.len]
         }
 
         fn as_mut_slice(&mut self) -> &mut [u8] {
-            &mut self._raw[self.offset .. self.offset + self.len]
+            &mut self._raw[self.offset..self.offset + self.len]
         }
     }
 
     let get_open_options = move |read: bool, write: bool, create: bool, truncate: bool| {
         let mut options = OpenOptions::new();
-        if read { options.read(true); }
-        if write { options.write(true); }
-        if create { options.create(true); }
-        if truncate { options.truncate(true); }
+        if read {
+            options.read(true);
+        }
+        if write {
+            options.write(true);
+        }
+        if create {
+            options.create(true);
+        }
+        if truncate {
+            options.truncate(true);
+        }
         #[cfg(target_os = "linux")]
         if direct {
             options.custom_flags(libc::O_DIRECT);
@@ -3834,7 +4067,10 @@ async fn run_benchmark(
     // --- 1. WRITE LARGE FILE (SEQUENTIAL) ---
     let mut d_write_large_seq = None;
     if is_workload_enabled("large-seq-write", "large-seq") {
-        println!("Writing large file sequentially ({} MB/thread)...", large_size_mb);
+        println!(
+            "Writing large file sequentially ({} MB/thread)...",
+            large_size_mb
+        );
         let pb_write_large_seq = mp.add(ProgressBar::new((threads * num_chunks) as u64));
         pb_write_large_seq.set_style(pb_style.clone());
         pb_write_large_seq.set_message("Write Large Seq");
@@ -3846,7 +4082,9 @@ async fn run_benchmark(
             let pb = pb_write_large_seq.clone();
             write_tasks.push(tokio::spawn(async move {
                 let file_path = path_clone.join(format!("bench_large_seq_{}.bin", t_id));
-                let mut file = get_open_options(false, true, true, true).open(&file_path).await?;
+                let mut file = get_open_options(false, true, true, true)
+                    .open(&file_path)
+                    .await?;
                 let buf = AlignedBuf::new(chunk_size, direct);
                 for _ in 0..num_chunks {
                     file.write_all(buf.as_slice()).await?;
@@ -3880,7 +4118,9 @@ async fn run_benchmark(
                 let pb = pb_read_large_seq.clone();
                 read_tasks.push(tokio::spawn(async move {
                     let file_path = path_clone.join(format!("bench_large_seq_{}.bin", t_id));
-                    let mut file = get_open_options(true, false, false, false).open(&file_path).await?;
+                    let mut file = get_open_options(true, false, false, false)
+                        .open(&file_path)
+                        .await?;
                     let mut buf = AlignedBuf::new(chunk_size, direct);
                     for _ in 0..num_chunks {
                         file.read_exact(buf.as_mut_slice()).await?;
@@ -3902,7 +4142,10 @@ async fn run_benchmark(
     // --- 3. WRITE LARGE FILE (RANDOM) ---
     let mut d_write_large_rand = None;
     if is_workload_enabled("large-rand-write", "large-rand") {
-        println!("Writing large file randomly ({} MB/thread)...", large_size_mb);
+        println!(
+            "Writing large file randomly ({} MB/thread)...",
+            large_size_mb
+        );
         let pb_write_large_rand = mp.add(ProgressBar::new((threads * num_chunks) as u64));
         pb_write_large_rand.set_style(pb_style.clone());
         pb_write_large_rand.set_message("Write Large Rand");
@@ -3917,10 +4160,13 @@ async fn run_benchmark(
             indices.shuffle(&mut rng);
             write_tasks.push(tokio::spawn(async move {
                 let file_path = path_clone.join(format!("bench_large_rand_{}.bin", t_id));
-                let mut file = get_open_options(false, true, true, false).open(&file_path).await?;
+                let mut file = get_open_options(false, true, true, false)
+                    .open(&file_path)
+                    .await?;
                 let buf = AlignedBuf::new(chunk_size, direct);
                 for idx in indices {
-                    file.seek(SeekFrom::Start((idx * chunk_size) as u64)).await?;
+                    file.seek(SeekFrom::Start((idx * chunk_size) as u64))
+                        .await?;
                     file.write_all(buf.as_slice()).await?;
                     pb.inc(1);
                 }
@@ -3955,10 +4201,13 @@ async fn run_benchmark(
                 indices.shuffle(&mut rng);
                 read_tasks.push(tokio::spawn(async move {
                     let file_path = path_clone.join(format!("bench_large_rand_{}.bin", t_id));
-                    let mut file = get_open_options(true, false, false, false).open(&file_path).await?;
+                    let mut file = get_open_options(true, false, false, false)
+                        .open(&file_path)
+                        .await?;
                     let mut buf = AlignedBuf::new(chunk_size, direct);
                     for idx in indices {
-                        file.seek(SeekFrom::Start((idx * chunk_size) as u64)).await?;
+                        file.seek(SeekFrom::Start((idx * chunk_size) as u64))
+                            .await?;
                         file.read_exact(buf.as_mut_slice()).await?;
                         pb.inc(1);
                     }
@@ -3979,7 +4228,10 @@ async fn run_benchmark(
     let small_file_bytes = small_size_kb * 1024;
     let mut d_write_small_seq = None;
     if is_workload_enabled("small-seq-write", "small-seq") {
-        println!("Writing small files sequentially ({} files of {} KB/thread)...", small_count, small_size_kb);
+        println!(
+            "Writing small files sequentially ({} files of {} KB/thread)...",
+            small_count, small_size_kb
+        );
         let pb_write_small_seq = mp.add(ProgressBar::new((threads * small_count) as u64));
         pb_write_small_seq.set_style(pb_style.clone());
         pb_write_small_seq.set_message("Write Small Seq");
@@ -3993,8 +4245,11 @@ async fn run_benchmark(
                 let mut buf = AlignedBuf::new(small_file_bytes, direct);
                 buf.as_mut_slice().fill(1);
                 for f_id in 0..small_count {
-                    let file_path = path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
-                    let mut file = get_open_options(false, true, true, true).open(&file_path).await?;
+                    let file_path =
+                        path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
+                    let mut file = get_open_options(false, true, true, true)
+                        .open(&file_path)
+                        .await?;
                     file.write_all(buf.as_slice()).await?;
                     file.sync_all().await?;
                     pb.inc(1);
@@ -4027,8 +4282,11 @@ async fn run_benchmark(
                 read_small_tasks.push(tokio::spawn(async move {
                     let mut buf = AlignedBuf::new(small_file_bytes, direct);
                     for f_id in 0..small_count {
-                        let file_path = path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
-                        let mut file = get_open_options(true, false, false, false).open(&file_path).await?;
+                        let file_path =
+                            path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
+                        let mut file = get_open_options(true, false, false, false)
+                            .open(&file_path)
+                            .await?;
                         file.read_exact(buf.as_mut_slice()).await?;
                         pb.inc(1);
                     }
@@ -4065,8 +4323,11 @@ async fn run_benchmark(
                 let mut buf = AlignedBuf::new(small_file_bytes, direct);
                 buf.as_mut_slice().fill(2);
                 for f_id in indices {
-                    let file_path = path_clone.join(format!("bench_small_rand_{}_{}.bin", t_id, f_id));
-                    let mut file = get_open_options(false, true, true, true).open(&file_path).await?;
+                    let file_path =
+                        path_clone.join(format!("bench_small_rand_{}_{}.bin", t_id, f_id));
+                    let mut file = get_open_options(false, true, true, true)
+                        .open(&file_path)
+                        .await?;
                     file.write_all(buf.as_slice()).await?;
                     file.sync_all().await?;
                     pb.inc(1);
@@ -4102,8 +4363,11 @@ async fn run_benchmark(
                 read_small_tasks.push(tokio::spawn(async move {
                     let mut buf = AlignedBuf::new(small_file_bytes, direct);
                     for f_id in indices {
-                        let file_path = path_clone.join(format!("bench_small_rand_{}_{}.bin", t_id, f_id));
-                        let mut file = get_open_options(true, false, false, false).open(&file_path).await?;
+                        let file_path =
+                            path_clone.join(format!("bench_small_rand_{}_{}.bin", t_id, f_id));
+                        let mut file = get_open_options(true, false, false, false)
+                            .open(&file_path)
+                            .await?;
                         file.read_exact(buf.as_mut_slice()).await?;
                         pb.inc(1);
                     }
@@ -4137,7 +4401,8 @@ async fn run_benchmark(
                 let pb = pb_stat_small.clone();
                 stat_tasks.push(tokio::spawn(async move {
                     for f_id in 0..small_count {
-                        let file_path = path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
+                        let file_path =
+                            path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
                         let _meta = fs::metadata(&file_path).await?;
                         pb.inc(1);
                     }
@@ -4263,7 +4528,11 @@ async fn run_benchmark(
         let rand_exists = path.join("bench_small_rand_0_0.bin").exists();
         if seq_exists || rand_exists {
             println!("Deleting small files...");
-            let total_deletes = if seq_exists && rand_exists { 2 * small_count } else { small_count };
+            let total_deletes = if seq_exists && rand_exists {
+                2 * small_count
+            } else {
+                small_count
+            };
             let pb_delete_small = mp.add(ProgressBar::new((threads * total_deletes) as u64));
             pb_delete_small.set_style(pb_style.clone());
             pb_delete_small.set_message("Delete Files");
@@ -4276,14 +4545,16 @@ async fn run_benchmark(
                 delete_tasks.push(tokio::spawn(async move {
                     if seq_exists {
                         for f_id in 0..small_count {
-                            let file_path = path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
+                            let file_path =
+                                path_clone.join(format!("bench_small_seq_{}_{}.bin", t_id, f_id));
                             let _ = fs::remove_file(&file_path).await;
                             pb.inc(1);
                         }
                     }
                     if rand_exists {
                         for f_id in 0..small_count {
-                            let file_path = path_clone.join(format!("bench_small_rand_{}_{}.bin", t_id, f_id));
+                            let file_path =
+                                path_clone.join(format!("bench_small_rand_{}_{}.bin", t_id, f_id));
                             let _ = fs::remove_file(&file_path).await;
                             pb.inc(1);
                         }
@@ -4321,110 +4592,169 @@ async fn run_benchmark(
     let total_small_files = (threads * small_count) as f64;
     let total_small_bytes = total_small_files * small_file_bytes as f64;
 
-    let (write_large_seq_tput, write_large_seq_iops, write_large_seq_cost) = if let Some(d) = d_write_large_seq {
-        let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
-        let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
-        let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
-        (Some(tput), Some(iops), Some(cost))
-    } else { (None, None, None) };
+    let (write_large_seq_tput, write_large_seq_iops, write_large_seq_cost) =
+        if let Some(d) = d_write_large_seq {
+            let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+            let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
+            let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
+            (Some(tput), Some(iops), Some(cost))
+        } else {
+            (None, None, None)
+        };
 
-    let (read_large_seq_tput, read_large_seq_iops, read_large_seq_cost) = if let Some(d) = d_read_large_seq {
-        let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
-        let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
-        let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
-        (Some(tput), Some(iops), Some(cost))
-    } else { (None, None, None) };
+    let (read_large_seq_tput, read_large_seq_iops, read_large_seq_cost) =
+        if let Some(d) = d_read_large_seq {
+            let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+            let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
+            let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
+            (Some(tput), Some(iops), Some(cost))
+        } else {
+            (None, None, None)
+        };
 
-    let (write_large_rand_tput, write_large_rand_iops, write_large_rand_cost) = if let Some(d) = d_write_large_rand {
-        let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
-        let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
-        let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
-        (Some(tput), Some(iops), Some(cost))
-    } else { (None, None, None) };
+    let (write_large_rand_tput, write_large_rand_iops, write_large_rand_cost) =
+        if let Some(d) = d_write_large_rand {
+            let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+            let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
+            let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
+            (Some(tput), Some(iops), Some(cost))
+        } else {
+            (None, None, None)
+        };
 
-    let (read_large_rand_tput, read_large_rand_iops, read_large_rand_cost) = if let Some(d) = d_read_large_rand {
-        let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
-        let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
-        let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
-        (Some(tput), Some(iops), Some(cost))
-    } else { (None, None, None) };
+    let (read_large_rand_tput, read_large_rand_iops, read_large_rand_cost) =
+        if let Some(d) = d_read_large_rand {
+            let tput = (total_large_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+            let iops = (threads * num_chunks) as f64 / d.as_secs_f64();
+            let cost = (d.as_secs_f64() * 1000.0) / (threads * num_chunks) as f64;
+            (Some(tput), Some(iops), Some(cost))
+        } else {
+            (None, None, None)
+        };
 
-    let (write_small_seq_tput, write_small_seq_iops, write_small_seq_cost) = if let Some(d) = d_write_small_seq {
-        let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
-        let iops = total_small_files / d.as_secs_f64();
-        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
-        (Some(tput), Some(iops), Some(cost))
-    } else { (None, None, None) };
+    let (write_small_seq_tput, write_small_seq_iops, write_small_seq_cost) =
+        if let Some(d) = d_write_small_seq {
+            let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+            let iops = total_small_files / d.as_secs_f64();
+            let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+            (Some(tput), Some(iops), Some(cost))
+        } else {
+            (None, None, None)
+        };
 
-    let (read_small_seq_tput, read_small_seq_iops, read_small_seq_cost) = if let Some(d) = d_read_small_seq {
-        let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
-        let iops = total_small_files / d.as_secs_f64();
-        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
-        (Some(tput), Some(iops), Some(cost))
-    } else { (None, None, None) };
+    let (read_small_seq_tput, read_small_seq_iops, read_small_seq_cost) =
+        if let Some(d) = d_read_small_seq {
+            let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+            let iops = total_small_files / d.as_secs_f64();
+            let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+            (Some(tput), Some(iops), Some(cost))
+        } else {
+            (None, None, None)
+        };
 
-    let (write_small_rand_tput, write_small_rand_iops, write_small_rand_cost) = if let Some(d) = d_write_small_rand {
-        let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
-        let iops = total_small_files / d.as_secs_f64();
-        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
-        (Some(tput), Some(iops), Some(cost))
-    } else { (None, None, None) };
+    let (write_small_rand_tput, write_small_rand_iops, write_small_rand_cost) =
+        if let Some(d) = d_write_small_rand {
+            let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+            let iops = total_small_files / d.as_secs_f64();
+            let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+            (Some(tput), Some(iops), Some(cost))
+        } else {
+            (None, None, None)
+        };
 
-    let (read_small_rand_tput, read_small_rand_iops, read_small_rand_cost) = if let Some(d) = d_read_small_rand {
-        let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
-        let iops = total_small_files / d.as_secs_f64();
-        let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
-        (Some(tput), Some(iops), Some(cost))
-    } else { (None, None, None) };
+    let (read_small_rand_tput, read_small_rand_iops, read_small_rand_cost) =
+        if let Some(d) = d_read_small_rand {
+            let tput = (total_small_bytes / (1024.0 * 1024.0)) / d.as_secs_f64();
+            let iops = total_small_files / d.as_secs_f64();
+            let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
+            (Some(tput), Some(iops), Some(cost))
+        } else {
+            (None, None, None)
+        };
 
     let (stat_iops, stat_cost) = if let Some(d) = d_stat {
         let iops = total_small_files / d.as_secs_f64();
         let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
         (Some(iops), Some(cost))
-    } else { (None, None) };
+    } else {
+        (None, None)
+    };
 
     let (mkdir_iops, mkdir_cost) = if let Some(d) = d_mkdir {
         let iops = total_small_files / d.as_secs_f64();
         let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
         (Some(iops), Some(cost))
-    } else { (None, None) };
+    } else {
+        (None, None)
+    };
 
     let (readdir_iops, readdir_cost) = if let Some(d) = d_readdir {
         let iops = total_small_files / d.as_secs_f64();
         let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
         (Some(iops), Some(cost))
-    } else { (None, None) };
+    } else {
+        (None, None)
+    };
 
     let (rmdir_iops, rmdir_cost) = if let Some(d) = d_rmdir {
         let iops = total_small_files / d.as_secs_f64();
         let cost = (d.as_secs_f64() * 1000.0) / total_small_files;
         (Some(iops), Some(cost))
-    } else { (None, None) };
+    } else {
+        (None, None)
+    };
 
     let (delete_iops, delete_cost) = if let Some(d) = d_delete {
-        let count_multiplier = if path.join("bench_small_seq_0_0.bin").exists() && path.join("bench_small_rand_0_0.bin").exists() { 2.0 } else { 1.0 };
+        let count_multiplier = if path.join("bench_small_seq_0_0.bin").exists()
+            && path.join("bench_small_rand_0_0.bin").exists()
+        {
+            2.0
+        } else {
+            1.0
+        };
         let iops = (total_small_files * count_multiplier) / d.as_secs_f64();
         let cost = (d.as_secs_f64() * 1000.0) / (total_small_files * count_multiplier);
         (Some(iops), Some(cost))
-    } else { (None, None) };
+    } else {
+        (None, None)
+    };
 
     // --- COLOR THRESHOLDS ---
     let format_tput = |val: f64| {
         let s = format!("{:>12.2} MiB/s", val);
-        if val > 100.0 { s.green() } else if val > 50.0 { s.yellow() } else { s.red() }
+        if val > 100.0 {
+            s.green()
+        } else if val > 50.0 {
+            s.yellow()
+        } else {
+            s.red()
+        }
     };
     let format_iops = |val: f64| {
         let s = format!("{:>12.2} ops/s", val);
-        if val > 200.0 { s.green() } else if val > 100.0 { s.yellow() } else { s.red() }
+        if val > 200.0 {
+            s.green()
+        } else if val > 100.0 {
+            s.yellow()
+        } else {
+            s.red()
+        }
     };
     let format_stat_iops = |val: f64| {
         let s = format!("{:>12.2} ops/s", val);
-        if val > 2000.0 { s.green() } else if val > 1000.0 { s.yellow() } else { s.red() }
+        if val > 2000.0 {
+            s.green()
+        } else if val > 1000.0 {
+            s.yellow()
+        } else {
+            s.red()
+        }
     };
 
     println!(
         "\n{}",
-        "+----------------------+--------------------+--------------------+--------------------+".bold()
+        "+----------------------+--------------------+--------------------+--------------------+"
+            .bold()
     );
     println!(
         "| {:<20} | {:<18} | {:<18} | {:<18} |",
@@ -4432,10 +4762,15 @@ async fn run_benchmark(
     );
     println!(
         "{}",
-        "+----------------------+--------------------+--------------------+--------------------+".bold()
+        "+----------------------+--------------------+--------------------+--------------------+"
+            .bold()
     );
 
-    let print_row = |name: &str, tput: Option<f64>, iops: Option<f64>, latency: Option<f64>, is_metadata: bool| {
+    let print_row = |name: &str,
+                     tput: Option<f64>,
+                     iops: Option<f64>,
+                     latency: Option<f64>,
+                     is_metadata: bool| {
         let tput_str = if is_metadata {
             "N/A".normal()
         } else if let Some(t) = tput {
@@ -4444,7 +4779,11 @@ async fn run_benchmark(
             "Skipped".yellow()
         };
         let iops_str = if let Some(i) = iops {
-            if is_metadata { format_stat_iops(i) } else { format_iops(i) }
+            if is_metadata {
+                format_stat_iops(i)
+            } else {
+                format_iops(i)
+            }
         } else {
             "Skipped".yellow()
         };
@@ -4459,21 +4798,77 @@ async fn run_benchmark(
         );
     };
 
-    print_row("Write (Large Seq)", write_large_seq_tput, write_large_seq_iops, write_large_seq_cost, false);
-    print_row("Read (Large Seq)", read_large_seq_tput, read_large_seq_iops, read_large_seq_cost, false);
-    print_row("Write (Large Rand)", write_large_rand_tput, write_large_rand_iops, write_large_rand_cost, false);
-    print_row("Read (Large Rand)", read_large_rand_tput, read_large_rand_iops, read_large_rand_cost, false);
-    print_row("Write (Small Seq)", write_small_seq_tput, write_small_seq_iops, write_small_seq_cost, false);
-    print_row("Read (Small Seq)", read_small_seq_tput, read_small_seq_iops, read_small_seq_cost, false);
-    print_row("Write (Small Rand)", write_small_rand_tput, write_small_rand_iops, write_small_rand_cost, false);
-    print_row("Read (Small Rand)", read_small_rand_tput, read_small_rand_iops, read_small_rand_cost, false);
-    println!("{}", "+----------------------+--------------------+--------------------+--------------------+".bold());
+    print_row(
+        "Write (Large Seq)",
+        write_large_seq_tput,
+        write_large_seq_iops,
+        write_large_seq_cost,
+        false,
+    );
+    print_row(
+        "Read (Large Seq)",
+        read_large_seq_tput,
+        read_large_seq_iops,
+        read_large_seq_cost,
+        false,
+    );
+    print_row(
+        "Write (Large Rand)",
+        write_large_rand_tput,
+        write_large_rand_iops,
+        write_large_rand_cost,
+        false,
+    );
+    print_row(
+        "Read (Large Rand)",
+        read_large_rand_tput,
+        read_large_rand_iops,
+        read_large_rand_cost,
+        false,
+    );
+    print_row(
+        "Write (Small Seq)",
+        write_small_seq_tput,
+        write_small_seq_iops,
+        write_small_seq_cost,
+        false,
+    );
+    print_row(
+        "Read (Small Seq)",
+        read_small_seq_tput,
+        read_small_seq_iops,
+        read_small_seq_cost,
+        false,
+    );
+    print_row(
+        "Write (Small Rand)",
+        write_small_rand_tput,
+        write_small_rand_iops,
+        write_small_rand_cost,
+        false,
+    );
+    print_row(
+        "Read (Small Rand)",
+        read_small_rand_tput,
+        read_small_rand_iops,
+        read_small_rand_cost,
+        false,
+    );
+    println!(
+        "{}",
+        "+----------------------+--------------------+--------------------+--------------------+"
+            .bold()
+    );
     print_row("Metadata Stat", None, stat_iops, stat_cost, true);
     print_row("Metadata Mkdir", None, mkdir_iops, mkdir_cost, true);
     print_row("Metadata Readdir", None, readdir_iops, readdir_cost, true);
     print_row("Metadata Rmdir", None, rmdir_iops, rmdir_cost, true);
     print_row("Metadata Delete", None, delete_iops, delete_cost, true);
-    println!("{}", "+----------------------+--------------------+--------------------+--------------------+".bold());
+    println!(
+        "{}",
+        "+----------------------+--------------------+--------------------+--------------------+"
+            .bold()
+    );
 
     if let (Some(base), Some(post)) = (baseline_metrics, post_metrics) {
         println!(

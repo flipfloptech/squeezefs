@@ -76,8 +76,6 @@ impl<L: Default, const N: usize> StripeLocks<L, N> {
 pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
     Lazy::new(|| StripeLocks::new());
 
-
-
 #[derive(Default)]
 pub struct ProbabilisticAtomic {
     inner: AtomicU64,
@@ -673,7 +671,11 @@ impl SqueezefsFilesystem {
             && (write_start > block_start || write_end < existing_block_end)
     }
 
-    async fn flush_memory_buffers_for_inode(&self, ino: u64, fencing_token: u64) -> Result<(), SqueezefsError> {
+    async fn flush_memory_buffers_for_inode(
+        &self,
+        ino: u64,
+        fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
         let mut keys_to_flush = Vec::new();
         for r in self.active_block_buffers.iter() {
             let key = r.key();
@@ -692,7 +694,11 @@ impl SqueezefsFilesystem {
                         let key_clone = key.clone();
                         let block_data_clone = block_data.clone();
                         tokio::task::spawn_blocking(move || {
-                            nvme_clone.put_active_block(&key_clone, &block_data_clone, fencing_token);
+                            nvme_clone.put_active_block(
+                                &key_clone,
+                                &block_data_clone,
+                                fencing_token,
+                            );
                         })
                         .await
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -774,7 +780,8 @@ impl SqueezefsFilesystem {
                             None => {
                                 let meta_key = format!("metadata:{}", file_path);
                                 let mut con = self.dlm.get_connection_for_inode(ino).await?;
-                                let id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
+                                let id_opt: Option<String> =
+                                    con.hget(&meta_key, "block_map_id").await?;
                                 id_opt
                             }
                         };
@@ -821,7 +828,8 @@ impl SqueezefsFilesystem {
                                     // NVMe-oF backend read path
                                     let get_res = async {
                                         let raw = self.router.read_nvme_block(&bk).await?;
-                                        let decompressed = self.router.get_crypto().process_read(&raw)?;
+                                        let decompressed =
+                                            self.router.get_crypto().process_read(&raw)?;
                                         Ok::<Vec<u8>, SqueezefsError>(decompressed)
                                     }
                                     .await;
@@ -835,7 +843,8 @@ impl SqueezefsFilesystem {
                                     let bk_clone = bk.clone();
                                     let decompressed_clone = decompressed.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        let _ = nvme_clone.cache_read_block(&bk_clone, &decompressed_clone);
+                                        let _ = nvme_clone
+                                            .cache_read_block(&bk_clone, &decompressed_clone);
                                     });
                                     decompressed
                                 };
@@ -861,7 +870,11 @@ impl SqueezefsFilesystem {
                     let block_data_clone = block_data.clone();
                     let fencing_token_val = _fencing_token;
                     tokio::task::spawn_blocking(move || {
-                        nvme_clone.put_active_block(&cache_key_clone, &block_data_clone, fencing_token_val);
+                        nvme_clone.put_active_block(
+                            &cache_key_clone,
+                            &block_data_clone,
+                            fencing_token_val,
+                        );
                     })
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -874,7 +887,8 @@ impl SqueezefsFilesystem {
                     let _ = self.writeback_tx.send(req);
                     self.active_block_buffers.remove(&cache_key);
                 } else {
-                    self.active_block_buffers.insert(cache_key.clone(), block_data);
+                    self.active_block_buffers
+                        .insert(cache_key.clone(), block_data);
                 }
 
                 Ok::<(), SqueezefsError>(())
@@ -3876,7 +3890,9 @@ impl Filesystem for SqueezefsFilesystem {
             .map_err(map_squeezefs_err)?;
 
         // 2. Flush the staging blocks concurrently to NVMe-oF backend volume
-        let _ = self.flush_memory_buffers_for_inode(ino, fencing_token).await;
+        let _ = self
+            .flush_memory_buffers_for_inode(ino, fencing_token)
+            .await;
         if let Err(e) = self
             .flush_active_blocks_with_retry(ino, fencing_token)
             .await
@@ -3904,7 +3920,9 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Flush any remaining active staging blocks before releasing the lease
         if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
-            let _ = self.flush_memory_buffers_for_inode(ino, fencing_token).await;
+            let _ = self
+                .flush_memory_buffers_for_inode(ino, fencing_token)
+                .await;
             let _ = self
                 .flush_active_blocks_with_retry(ino, fencing_token)
                 .await;
@@ -3956,7 +3974,9 @@ impl Filesystem for SqueezefsFilesystem {
             .map_err(map_squeezefs_err)?;
 
         // 2. Flush the staging blocks concurrently to NVMe-oF backend volume
-        let _ = self.flush_memory_buffers_for_inode(ino, fencing_token).await;
+        let _ = self
+            .flush_memory_buffers_for_inode(ino, fencing_token)
+            .await;
         if let Err(e) = self
             .flush_active_blocks_with_retry(ino, fencing_token)
             .await
@@ -5337,8 +5357,34 @@ pub async fn format_volume_ext(
             })
             .unwrap_or_default();
 
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "SqueezeFS Cluster CA");
+        let ca_key_pair = KeyPair::generate().map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("Failed to generate CA key: {}", e))
+        })?;
+        let ca_cert = ca_params.self_signed(&ca_key_pair).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("Failed to sign CA cert: {}", e))
+        })?;
+        let ca_cert_der = ca_cert.der().to_vec();
+        let ca_key_der = ca_key_pair.serialize_der();
+
+        let ca_cert_hex = ca_cert_der
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let ca_key_hex = ca_key_der
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
         let mut pipe = redis::pipe();
         pipe.hset(crate::fs_key!("format"), "name", name)
+            .hset(crate::fs_key!("format"), "ca_cert", ca_cert_hex)
+            .hset(crate::fs_key!("format"), "ca_key", ca_key_hex)
             .hset(crate::fs_key!("format"), "block_size", block_size)
             .hset(crate::fs_key!("format"), "capacity", capacity)
             .hset(crate::fs_key!("format"), "inodes", inodes)
@@ -5384,11 +5430,7 @@ pub async fn format_volume_ext(
                     String::new()
                 },
             )
-            .hset(
-                crate::fs_key!("format"),
-                "backing_dev_ip",
-                ip.unwrap_or(""),
-            )
+            .hset(crate::fs_key!("format"), "backing_dev_ip", ip.unwrap_or(""))
             .hset(
                 crate::fs_key!("format"),
                 "backing_dev_port",
@@ -5748,7 +5790,6 @@ async fn flush_single_active_block(
 
     let _block_guard = block_lock.lock().await;
 
-
     let lock_opt = if !locked {
         Some(active_inode_locks.get_inode_lock(ino))
     } else {
@@ -5775,10 +5816,7 @@ async fn flush_single_active_block(
     let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
     let offset = block_allocator.allocate_block().await?;
 
-    if let Err(e) = nvme_writer
-        .write_block(offset, &processed_block)
-        .await
-    {
+    if let Err(e) = nvme_writer.write_block(offset, &processed_block).await {
         error!(
             "flush_single_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
             b, ino, e
@@ -5947,16 +5985,16 @@ async fn load_locks_from_redis(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_allocator::BlockAllocator;
+    use crate::cache::TieredCache;
+    use crate::dlm::DlmClient;
+    use crate::nvme_dev::NvmeBlockDev;
+    use crate::routing::DataRouter;
+    use bytes::Bytes;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
     use tempfile::NamedTempFile;
-    use crate::dlm::DlmClient;
-    use crate::cache::TieredCache;
-    use crate::routing::DataRouter;
-    use crate::nvme_dev::NvmeBlockDev;
-    use crate::block_allocator::BlockAllocator;
-    use bytes::Bytes;
 
     fn get_redis_url() -> String {
         std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
@@ -6002,22 +6040,32 @@ mod tests {
         backing_file.set_len(16 * 1024 * 1024).unwrap(); // 16MB virtual block device
 
         let nvme_dev = Arc::new(NvmeBlockDev::new(backing_path.to_str().unwrap()));
-        let block_alloc = Arc::new(BlockAllocator::new(Arc::new(dlm.meta_client().clone()), "test_write_buffering").await.unwrap());
+        let block_alloc = Arc::new(
+            BlockAllocator::new(Arc::new(dlm.meta_client().clone()), "test_write_buffering")
+                .await
+                .unwrap(),
+        );
 
         // Set up TieredCache with temporary staging directories
         let temp_staging_dir = tempdir().unwrap();
         let cache = TieredCache::new(
             vec![temp_staging_dir.path().to_path_buf()],
-            Some("64MB"), // read RAM limit
-            Some("64MB"), // write RAM limit
+            Some("64MB"),  // read RAM limit
+            Some("64MB"),  // write RAM limit
             Some("256MB"), // read NVMe limit
             Some("256MB"), // write NVMe limit
             dlm.meta_client().clone(),
             block_alloc.clone(),
             nvme_dev.clone(),
-        ).unwrap();
+        )
+        .unwrap();
 
-        let router = DataRouter::new(dlm.clone(), cache.clone(), block_alloc.clone(), nvme_dev.clone());
+        let router = DataRouter::new(
+            dlm.clone(),
+            cache.clone(),
+            block_alloc.clone(),
+            nvme_dev.clone(),
+        );
         router.set_block_size(4 * 1024 * 1024); // 4MB blocks
 
         // Mock initialize active block buffers
@@ -6042,7 +6090,9 @@ mod tests {
         let cache_key = "active_block:inode_1:block_0";
 
         // 1. Write 1MB of 0xAA sequentially (partial block write)
-        fs.write_file_staged(1, 0, &vec![0xAA; 1024 * 1024], 0, 1).await.unwrap();
+        fs.write_file_staged(1, 0, &vec![0xAA; 1024 * 1024], 0, 1)
+            .await
+            .unwrap();
 
         // Verify RAM staging contains the partial write
         assert_eq!(fs.active_block_buffers.len(), 1);
@@ -6053,7 +6103,9 @@ mod tests {
         assert!(fs.router.cache.nvme.read_staged(cache_key).is_none());
 
         // 2. Write another 1MB of 0xBB sequentially
-        fs.write_file_staged(1, 1024 * 1024, &vec![0xBB; 1024 * 1024], 1024 * 1024, 1).await.unwrap();
+        fs.write_file_staged(1, 1024 * 1024, &vec![0xBB; 1024 * 1024], 1024 * 1024, 1)
+            .await
+            .unwrap();
         assert_eq!(fs.active_block_buffers.len(), 1);
         let buf2 = fs.active_block_buffers.get(cache_key).unwrap().clone();
         assert_eq!(buf2[1024 * 1024], 0xBB);
@@ -6061,12 +6113,25 @@ mod tests {
         assert!(fs.router.cache.nvme.read_staged(cache_key).is_none());
 
         // 3. Write remaining 2MB of 0xCC to complete the 4MB block
-        fs.write_file_staged(1, 2 * 1024 * 1024, &vec![0xCC; 2 * 1024 * 1024], 2 * 1024 * 1024, 1).await.unwrap();
+        fs.write_file_staged(
+            1,
+            2 * 1024 * 1024,
+            &vec![0xCC; 2 * 1024 * 1024],
+            2 * 1024 * 1024,
+            1,
+        )
+        .await
+        .unwrap();
 
         // Verify RAM buffer is removed because block is completed
         assert!(fs.active_block_buffers.is_empty());
         // Verify it has been flushed to NVMe staging
-        let staged_data = fs.router.cache.nvme.read_staged(cache_key).expect("Should be flushed to NVMe staging");
+        let staged_data = fs
+            .router
+            .cache
+            .nvme
+            .read_staged(cache_key)
+            .expect("Should be flushed to NVMe staging");
         assert_eq!(staged_data.len(), block_size);
         assert_eq!(staged_data[0], 0xAA);
         assert_eq!(staged_data[1024 * 1024], 0xBB);
@@ -6075,20 +6140,39 @@ mod tests {
         // 4. Test FUSE flush/sync path on partial write
         let cache_key_block_1 = "active_block:inode_1:block_1";
         // Write 1MB of 0xDD to block 1
-        fs.write_file_staged(1, 4 * 1024 * 1024, &vec![0xDD; 1024 * 1024], 4 * 1024 * 1024, 1).await.unwrap();
+        fs.write_file_staged(
+            1,
+            4 * 1024 * 1024,
+            &vec![0xDD; 1024 * 1024],
+            4 * 1024 * 1024,
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(fs.active_block_buffers.len(), 1);
 
         // Explicitly call flush_memory_buffers_for_inode
         fs.flush_memory_buffers_for_inode(1, 1).await.unwrap();
         assert!(fs.active_block_buffers.is_empty());
-        let staged_data_block_1 = fs.router.cache.nvme.read_staged(cache_key_block_1).expect("Should be flushed to NVMe staging on flush");
+        let staged_data_block_1 = fs
+            .router
+            .cache
+            .nvme
+            .read_staged(cache_key_block_1)
+            .expect("Should be flushed to NVMe staging on flush");
         assert_eq!(staged_data_block_1[0], 0xDD);
 
         // 5. Test P2P local cache reader integration
-        let p2p_server = crate::p2p::P2pServer::new("127.0.0.1:27000".to_string(), cache.clone());
-        
+        let p2p_server = crate::p2p::P2pServer::new(
+            "127.0.0.1:27000".to_string(),
+            cache.clone(),
+            crate::tiering::dht::ClusterSecurityConfig::default(),
+        );
+
         // Put a dummy block in read LRU RAM cache
-        cache.read_lru.put("test_lru_key", Bytes::from(vec![0xEE; 100]));
+        cache
+            .read_lru
+            .put("test_lru_key", Bytes::from(vec![0xEE; 100]));
 
         // Query both LRU and staging cache via the local reader interface
         let server_run = p2p_server.run();
@@ -6098,9 +6182,11 @@ mod tests {
         }
 
         let dht_node = cache.nvme.dht_node.get().unwrap();
-        
+
         // Retrieve LRU block from local peer cache
-        let lru_val = dht_node.get_local_value(&Bytes::from("test_lru_key")).unwrap();
+        let lru_val = dht_node
+            .get_local_value(&Bytes::from("test_lru_key"))
+            .unwrap();
         assert_eq!(lru_val, vec![0xEE; 100]);
 
         // Retrieve staged block from local peer cache

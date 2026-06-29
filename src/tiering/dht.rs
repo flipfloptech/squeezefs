@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -7,6 +8,12 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Once};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xxhash_rust::xxh3::xxh3_64;
+
+#[derive(Clone, Debug, Default)]
+pub struct ClusterSecurityConfig {
+    pub ca_cert: Option<Vec<u8>>,
+    pub ca_key: Option<Vec<u8>>,
+}
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -60,21 +67,78 @@ impl ServerCertVerifier for DummyVerifier {
     }
 }
 
-fn make_server_config() -> std::io::Result<quinn::ServerConfig> {
-    init_rustls();
-    let cert =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
-            .map_err(std::io::Error::other)?;
-    let cert_der = cert.cert.der().to_vec();
-    let key_der = cert.key_pair.serialize_der();
-
-    let certs = vec![CertificateDer::from(cert_der)];
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
-
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
+fn generate_node_cert_signed_by_ca(
+    ca_cert_der: &[u8],
+    ca_key_der: &[u8],
+) -> std::io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let ca_key_pair = KeyPair::try_from(ca_key_der.to_vec())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "SqueezeFS Cluster CA");
+    let ca_cert = ca_params
+        .self_signed(&ca_key_pair)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let mut node_params =
+        CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    node_params
+        .distinguished_name
+        .push(DnType::CommonName, "SqueezeFS Node");
+
+    let node_key_pair = KeyPair::generate()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let node_cert = node_params
+        .signed_by(&node_key_pair, &ca_cert, &ca_key_pair)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let certs = vec![
+        CertificateDer::from(node_cert.der().to_vec()),
+        CertificateDer::from(ca_cert_der.to_vec()),
+    ];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(node_key_pair.serialize_der()));
+
+    Ok((certs, key))
+}
+
+fn make_server_config(security: &ClusterSecurityConfig) -> std::io::Result<quinn::ServerConfig> {
+    init_rustls();
+
+    let server_config = if let Some(ref ca_cert_der) = security.ca_cert {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca_cert_der.clone()))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let client_cert_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        let (certs, key) =
+            generate_node_cert_signed_by_ca(ca_cert_der, security.ca_key.as_ref().unwrap())?;
+
+        rustls::ServerConfig::builder()
+            .with_client_cert_verifier(client_cert_verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+    } else {
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .map_err(std::io::Error::other)?;
+        let certs = vec![CertificateDer::from(cert.cert.der().to_vec())];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+    };
 
     let quinn_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
         .map_err(std::io::Error::other)?;
@@ -84,8 +148,8 @@ fn make_server_config() -> std::io::Result<quinn::ServerConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport
         .stream_receive_window(33_554_432u32.into()) // 32MB stream window
-        .receive_window(67_108_864u32.into())        // 64MB connection window
-        .send_window(33_554_432)                     // 32MB send window
+        .receive_window(67_108_864u32.into()) // 64MB connection window
+        .send_window(33_554_432) // 32MB send window
         .max_concurrent_bidi_streams(10_000u32.into())
         .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
         .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
@@ -94,28 +158,45 @@ fn make_server_config() -> std::io::Result<quinn::ServerConfig> {
     Ok(server_config)
 }
 
-fn make_client_config() -> quinn::ClientConfig {
+fn make_client_config(security: &ClusterSecurityConfig) -> std::io::Result<quinn::ClientConfig> {
     init_rustls();
-    let client_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(DummyVerifier))
-        .with_no_client_auth();
 
-    let quinn_client_config =
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_config).unwrap();
+    let client_config = if let Some(ref ca_cert_der) = security.ca_cert {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca_cert_der.clone()))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        let (certs, key) =
+            generate_node_cert_signed_by_ca(ca_cert_der, security.ca_key.as_ref().unwrap())?;
+
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+    } else {
+        let client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(DummyVerifier))
+            .with_no_client_auth();
+        client_config
+    };
+
+    let quinn_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quinn_client_config));
 
     let mut transport = quinn::TransportConfig::default();
     transport
         .stream_receive_window(33_554_432u32.into()) // 32MB stream window
-        .receive_window(67_108_864u32.into())        // 64MB connection window
-        .send_window(33_554_432)                     // 32MB send window
+        .receive_window(67_108_864u32.into()) // 64MB connection window
+        .send_window(33_554_432) // 32MB send window
         .max_concurrent_bidi_streams(10_000u32.into())
         .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
         .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
     client_config.transport_config(Arc::new(transport));
 
-    client_config
+    Ok(client_config)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -275,7 +356,9 @@ where
         } => {
             if has_value {
                 let mut payload = Vec::with_capacity(value_len as usize);
-                unsafe { payload.set_len(value_len as usize); }
+                unsafe {
+                    payload.set_len(value_len as usize);
+                }
                 reader.read_exact(&mut payload).await?;
                 Message::ValueResponse {
                     value: Some(Bytes::from(payload)),
@@ -286,7 +369,9 @@ where
         }
         WireMessage::StoreValueHeader { key, value_len } => {
             let mut payload = Vec::with_capacity(value_len as usize);
-            unsafe { payload.set_len(value_len as usize); }
+            unsafe {
+                payload.set_len(value_len as usize);
+            }
             reader.read_exact(&mut payload).await?;
             Message::StoreValue {
                 key,
@@ -317,11 +402,20 @@ pub struct DhtNode {
     local_ip_counter: AtomicUsize,
     endpoint: quinn::Endpoint,
     connection_pool: Mutex<HashMap<String, quinn::Connection>>,
+    pub security_config: ClusterSecurityConfig,
 }
 
 impl DhtNode {
     pub fn new(peer_addr: String, local_reader: Arc<dyn LocalCacheReader>) -> Self {
-        Self::new_with_ips(peer_addr, local_reader, Vec::new())
+        Self::new_with_security(peer_addr, local_reader, ClusterSecurityConfig::default())
+    }
+
+    pub fn new_with_security(
+        peer_addr: String,
+        local_reader: Arc<dyn LocalCacheReader>,
+        security_config: ClusterSecurityConfig,
+    ) -> Self {
+        Self::new_with_ips_and_security(peer_addr, local_reader, Vec::new(), security_config)
     }
 
     pub fn new_with_ips(
@@ -329,9 +423,24 @@ impl DhtNode {
         local_reader: Arc<dyn LocalCacheReader>,
         local_ips: Vec<IpAddr>,
     ) -> Self {
+        Self::new_with_ips_and_security(
+            peer_addr,
+            local_reader,
+            local_ips,
+            ClusterSecurityConfig::default(),
+        )
+    }
+
+    pub fn new_with_ips_and_security(
+        peer_addr: String,
+        local_reader: Arc<dyn LocalCacheReader>,
+        local_ips: Vec<IpAddr>,
+        security_config: ClusterSecurityConfig,
+    ) -> Self {
         let peer_id = xxh3_64(peer_addr.as_bytes());
         let socket_addr: SocketAddr = peer_addr.parse().expect("Invalid peer address");
-        let server_config = make_server_config().expect("Failed to create server config");
+        let server_config =
+            make_server_config(&security_config).expect("Failed to create server config");
         let socket = std::net::UdpSocket::bind(socket_addr).expect("Failed to bind UDP socket");
         let sock2 = socket2::Socket::from(socket);
         let _ = sock2.set_send_buffer_size(16 * 1024 * 1024);
@@ -342,8 +451,11 @@ impl DhtNode {
             Some(server_config),
             socket,
             std::sync::Arc::new(quinn::TokioRuntime),
-        ).expect("Failed to create QUIC endpoint");
-        endpoint.set_default_client_config(make_client_config());
+        )
+        .expect("Failed to create QUIC endpoint");
+        endpoint.set_default_client_config(
+            make_client_config(&security_config).expect("Failed to create client config"),
+        );
 
         Self {
             peer_addr,
@@ -355,6 +467,7 @@ impl DhtNode {
             local_ip_counter: AtomicUsize::new(0),
             endpoint,
             connection_pool: Mutex::new(HashMap::new()),
+            security_config,
         }
     }
 

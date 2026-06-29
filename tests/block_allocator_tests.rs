@@ -170,8 +170,16 @@ async fn test_backend_router_routing() {
     let dev0 = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(dev0_path));
     let dev1 = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(dev1_path));
 
-    let alloc0 = Arc::new(BlockAllocator::new(meta.clone(), "test_be_routing").await.unwrap());
-    let alloc1 = Arc::new(BlockAllocator::new(meta.clone(), "test_be_routing:fabrics02").await.unwrap());
+    let alloc0 = Arc::new(
+        BlockAllocator::new(meta.clone(), "test_be_routing")
+            .await
+            .unwrap(),
+    );
+    let alloc1 = Arc::new(
+        BlockAllocator::new(meta.clone(), "test_be_routing:fabrics02")
+            .await
+            .unwrap(),
+    );
 
     let block_size = Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024));
     let router = squeezefs::routing::BackendRouter::new(alloc0, dev0, block_size);
@@ -204,7 +212,10 @@ async fn test_backend_router_routing() {
     active_dev.write_block(offset, &payload).await.unwrap();
 
     // Read it back via BackendRouter read_block using the key
-    let read_payload = router.read_block(&stored_key, 4 * 1024 * 1024).await.unwrap();
+    let read_payload = router
+        .read_block(&stored_key, 4 * 1024 * 1024)
+        .await
+        .unwrap();
     assert_eq!(read_payload, payload);
 
     // Free the block via BackendRouter free_block using the key

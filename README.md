@@ -41,7 +41,7 @@ Translates POSIX FUSE locks to cluster-wide locks in Garnet using `SETNX` comman
 - **Tier 3 (Local NVMe Staging):** Staging directory (`.staging`) for async writes and local caching of read blocks to avoid RTT latency.
 
 ### 5. Multi-NIC (Multi-Rail) Network Load Balancing & HA
-Binds outbound client connections to multiple configured physical interfaces (source IPs). Distributes traffic round-robin across NICs and automatically fails over on interface drops.
+Binds outbound client connections to multiple configured physical interfaces (source IPs). Distributes traffic round-robin across NICs and automatically fails over on interface drops. Fully compatible with all standard-compliant NVMe-oF targets, including user-space storage engines like SPDK (Storage Performance Development Kit).
 
 ### 6. Built-in HPC Auto-Tuning
 Includes built-in host auto-tuning (`squeezefs tune`) to optimize virtual memory dirty page ratios, TCP socket buffers, and FUSE connection thresholds.

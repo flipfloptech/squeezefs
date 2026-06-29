@@ -1982,20 +1982,56 @@ impl DataRouter {
                     let block_keys = self
                         .load_striped_block_keys(file_path, &meta, start_block, end_block)
                         .await?;
-                    if let Some((_, Some(ref b_key))) = block_keys.first() {
-                        if let Some(guard) = self.cache.nvme.get_cached_read_block_range_zero_copy(
-                            b_key,
-                            slice_start,
-                            slice_len,
-                        ) {
-                            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                            let slice: &[u8] = &guard;
+                    if let Some((_, b_key_opt)) = block_keys.first() {
+                        if let Some(ref b_key) = b_key_opt {
+                            if let Some(guard) = self.cache.nvme.get_cached_read_block_range_zero_copy(
+                                b_key,
+                                slice_start,
+                                slice_len,
+                            ) {
+                                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                let slice: &[u8] = &guard;
+                                let data = unsafe {
+                                    bytes::Bytes::from_static(
+                                        std::mem::transmute::<&[u8], &'static [u8]>(slice),
+                                    )
+                                };
+                                return Ok((data, Some(std::sync::Arc::new(guard))));
+                            } else {
+                                // Single block cache miss: download directly in-line (zero-copy, no spawn)
+                                let downloaded = self.get_cached_or_fetch_block(b_key).await?;
+                                let start = std::cmp::min(slice_start as usize, downloaded.len());
+                                let end = std::cmp::min(
+                                    (slice_start + slice_len as u64) as usize,
+                                    downloaded.len(),
+                                );
+                                if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
+                                    self.schedule_striped_prefetch(
+                                        file_path.to_string(),
+                                        meta.clone(),
+                                        end_block.saturating_add(1),
+                                        block_size,
+                                    );
+                                }
+                                let slice: &[u8] = &downloaded[start..end];
+                                let data = unsafe {
+                                    bytes::Bytes::from_static(
+                                        std::mem::transmute::<&[u8], &'static [u8]>(slice),
+                                    )
+                                };
+                                return Ok((data, Some(std::sync::Arc::new(downloaded))));
+                            }
+                        } else {
+                            // Hole support: return zero-filled slice
+                            let mut hole_pooled = BUFFER_POOL.alloc();
+                            hole_pooled.resize(slice_len as usize, 0);
+                            let slice: &[u8] = &hole_pooled;
                             let data = unsafe {
                                 bytes::Bytes::from_static(
                                     std::mem::transmute::<&[u8], &'static [u8]>(slice),
                                 )
                             };
-                            return Ok((data, Some(std::sync::Arc::new(guard))));
+                            return Ok((data, Some(std::sync::Arc::new(hole_pooled))));
                         }
                     }
                 }

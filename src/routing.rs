@@ -113,7 +113,7 @@ impl BackendRouter {
         }
     }
 
-    pub async fn read_block(&self, block_key: &str, size: usize) -> Result<Vec<u8>> {
+    pub async fn read_block(&self, block_key: &str, size: usize) -> Result<bytes::Bytes> {
         let parts: Vec<&str> = block_key.split("://").collect();
         let (be_id, offset_str) = if parts.len() > 1 {
             (parts[0], parts[1])
@@ -283,7 +283,7 @@ impl DataRouter {
         self.crypto.get().unwrap_or(&*DEFAULT_CRYPTO)
     }
 
-    pub async fn read_nvme_block(&self, block_key: &str) -> Result<Vec<u8>> {
+    pub async fn read_nvme_block(&self, block_key: &str) -> Result<bytes::Bytes> {
         let size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
         self.backend_router.read_block(block_key, size).await
     }
@@ -297,7 +297,7 @@ impl DataRouter {
         let raw = if let Some(dht) = self.cache.nvme.dht_node.get() {
             let client = crate::p2p::P2pClient::new();
             if let Ok(data) = client.download_block_from_peer(dht, block_key).await {
-                data
+                bytes::Bytes::from(data)
             } else {
                 self.read_nvme_block(block_key).await?
             }

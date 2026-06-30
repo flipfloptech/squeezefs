@@ -132,7 +132,7 @@ async fn test_distributed_job_execution() {
         .read_block(dest_offset, 4096)
         .await
         .unwrap();
-    assert_eq!(read_back, mock_data);
+    assert_eq!(read_back.as_ref(), mock_data.as_slice());
 
     // Verify metadata was updated
     let mut con = router.dlm.get_connection().await.unwrap();

@@ -94,10 +94,12 @@ impl NvmeBlockDev {
                 let mut read_data = self.read_block(offset, data.len()).await?;
                 if SIMULATE_CORRUPTION.load(std::sync::atomic::Ordering::Relaxed) {
                     if !read_data.is_empty() {
-                        read_data[0] ^= 0xFF;
+                        let mut temp = read_data.to_vec();
+                        temp[0] ^= 0xFF;
+                        read_data = bytes::Bytes::from(temp);
                     }
                 }
-                if read_data != data {
+                if read_data.as_ref() != data {
                     return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                         "Write verification failed: checksum mismatch at offset {} on device {}",
                         offset, self.device_path
@@ -159,10 +161,12 @@ impl NvmeBlockDev {
             let mut read_data = self.read_block(offset, data.len()).await?;
             if SIMULATE_CORRUPTION.load(std::sync::atomic::Ordering::Relaxed) {
                 if !read_data.is_empty() {
-                    read_data[0] ^= 0xFF;
+                    let mut temp = read_data.to_vec();
+                    temp[0] ^= 0xFF;
+                    read_data = bytes::Bytes::from(temp);
                 }
             }
-            if read_data != data {
+            if read_data.as_ref() != data {
                 return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                     "Write verification failed: checksum mismatch at offset {} on device {}",
                     offset, self.device_path
@@ -173,31 +177,20 @@ impl NvmeBlockDev {
         Ok(())
     }
 
-    pub async fn read_block(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
+    pub async fn read_block(&self, offset: u64, size: usize) -> Result<bytes::Bytes> {
         let file = self.get_file()?;
         let res = tokio::task::spawn_blocking(move || {
-            let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
-            let alignment = 4096;
-            let aligned_size = (size + 4095) & !4095;
-            let mut result_vec = vec![0u8; size];
+            let mut buffer = vec![0u8; size + 4096];
+            let ptr = buffer.as_ptr() as usize;
+            let aligned_ptr = (ptr + 4095) & !4095;
+            let align_offset = aligned_ptr - ptr;
 
-            unsafe {
-                if libc::posix_memalign(&mut buf_ptr, alignment, aligned_size) == 0 {
-                    let aligned_slice = std::slice::from_raw_parts_mut(buf_ptr as *mut u8, aligned_size);
-                    
-                    let res = file.read_exact_at(aligned_slice, offset);
-                    if res.is_ok() {
-                        libc::memcpy(result_vec.as_mut_ptr() as *mut libc::c_void, buf_ptr, size);
-                    }
-                    libc::free(buf_ptr);
-                    
-                    res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
-                } else {
-                    file.read_exact_at(&mut result_vec, offset)
-                        .map_err(|e| crate::error::SqueezefsError::Io(e))?;
-                }
-            }
-            Ok::<Vec<u8>, crate::error::SqueezefsError>(result_vec)
+            file.read_exact_at(&mut buffer[align_offset..align_offset + size], offset)
+                .map_err(|e| crate::error::SqueezefsError::Io(e))?;
+
+            let bytes = bytes::Bytes::from(buffer);
+            let aligned_bytes = bytes.slice(align_offset..align_offset + size);
+            Ok::<bytes::Bytes, crate::error::SqueezefsError>(aligned_bytes)
         })
         .await
         .map_err(|e| {

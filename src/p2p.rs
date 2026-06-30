@@ -37,7 +37,7 @@ impl crate::tiering::dht::LocalCacheReader for SqueezefsLocalCacheReader {
 
     fn put_local(&self, key: Bytes, value: Bytes) {
         let block_key = String::from_utf8_lossy(&key).to_string();
-        let _ = self.cache.nvme.cache_read_block(&block_key, &value);
+        let _ = self.cache.nvme.cache_read_block(&block_key, value);
     }
 }
 

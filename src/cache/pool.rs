@@ -52,6 +52,12 @@ impl DerefMut for PooledBuf {
     }
 }
 
+impl PooledBuf {
+    pub fn into_inner(mut self) -> Vec<u8> {
+        self.buf.take().unwrap()
+    }
+}
+
 impl Drop for PooledBuf {
     fn drop(&mut self) {
         if let (Some(buf), Some(pool)) = (self.buf.take(), &self.pool) {

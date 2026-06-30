@@ -170,3 +170,17 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
 ## Quick Start & Verification
 
 To get up and running quickly or deploy directly onto physical bare-metal hardware over NVMe-oF, see the [QUICKSTART.md](QUICKSTART.md) guide.
+
+---
+
+## Garnet C# Custom Command Extensions
+
+To operating-system-level filesystem requests (such as `unlink`, `rename`, `create`, or `truncate`) that ordinarily require multiple sequential round-trips over the network to the database, SqueezeFS supports consolidation via **Garnet C# Custom Command Extensions**.
+
+### Why C# Extensions Instead of Lua?
+Microsoft Garnet is architected for latch-free, epoch-based multi-threaded execution. Interpreting dynamic Lua scripts halts worker execution and breaks Garnet's concurrency guarantees. By using native C# extensions:
+1. **Compilation to IL/Native Code**: Custom transaction classes are compiled directly into a C# DLL and loaded in-process.
+2. **Latch-Free Concurrency**: Commands run directly at memory speed using the native storage APIs, avoiding interpreter lock bottlenecks.
+3. **Atomic Operations**: Namespace operations (e.g. updating parent entries, decrementing child file link counts, and removing mapping keys) occur atomically inside a single server-side execution loop.
+
+For details on how to build, deploy, and verify Garnet Custom Commands for SqueezeFS, refer to the [QUICKSTART.md](QUICKSTART.md) guide.

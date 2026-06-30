@@ -669,7 +669,7 @@ impl DataRouter {
                 let inline_key = format!("inline_data:{}", file_path);
                 let bytes: Option<Vec<u8>> = con.get(&inline_key).await?;
                 if let Some(b) = bytes {
-                    self.get_crypto().process_read(&b)?
+                    self.get_crypto().process_read(&b)?.into_owned()
                 } else {
                     Vec::new()
                 }
@@ -696,7 +696,7 @@ impl DataRouter {
                                 .nvme_writer
                                 .read_block(offset_u64 + off, sz as usize)
                                 .await?;
-                            self.get_crypto().process_read(&raw)?
+                            self.get_crypto().process_read(&raw)?.into_owned()
                         } else {
                             Vec::new()
                         }
@@ -1464,7 +1464,7 @@ impl DataRouter {
                 );
                 let inline_key = format!("inline_data:{}", file_path);
                 let bytes: Vec<u8> = con.get(&inline_key).await?;
-                self.get_crypto().process_read(&bytes)?
+                self.get_crypto().process_read(&bytes)?.into_owned()
             }
             "staged" => {
                 // Small File: check Tier 3 (NVMe Staging) first
@@ -1502,7 +1502,7 @@ impl DataRouter {
                             .nvme_writer
                             .read_block(offset_u64 + off, sz as usize)
                             .await?;
-                        self.get_crypto().process_read(&raw)?
+                        self.get_crypto().process_read(&raw)?.into_owned()
                     } else {
                         return Err(SqueezefsError::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,

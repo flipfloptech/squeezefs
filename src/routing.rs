@@ -162,6 +162,33 @@ impl BackendRouter {
         }
         Ok(())
     }
+
+    pub async fn free_blocks(&self, block_keys: &[&str]) -> Result<()> {
+        if block_keys.is_empty() {
+            return Ok(());
+        }
+        let mut backend_groups: std::collections::HashMap<&str, Vec<u64>> = std::collections::HashMap::new();
+        for &block_key in block_keys {
+            let parts: Vec<&str> = block_key.split("://").collect();
+            let (be_id, offset_str) = if parts.len() > 1 {
+                (parts[0], parts[1])
+            } else {
+                ("backend_0", block_key)
+            };
+            if let Ok(offset) = offset_str.parse::<u64>() {
+                backend_groups.entry(be_id).or_default().push(offset);
+            }
+        }
+
+        for (be_id, offsets) in backend_groups {
+            if be_id == "backend_0" {
+                let _ = self.default_allocator.free_blocks(&offsets).await;
+            } else if let Some(be) = self.backends.get(be_id) {
+                let _ = be.block_allocator.free_blocks(&offsets).await;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -2481,7 +2508,7 @@ impl DataRouter {
 
                         // 2. Pipeline updates/deletes
                         let mut update_pipe = redis::pipe();
-                        let mut free_futures = Vec::new();
+                        let mut blocks_to_free = Vec::new();
                         let mut has_updates = false;
                         for ((_, bk), ref_opt) in block_mappings.iter().zip(refcounts) {
                             if let Some(mut r) = ref_opt {
@@ -2490,7 +2517,7 @@ impl DataRouter {
                                     update_pipe
                                         .hdel(refcounts_key, bk)
                                         .hdel(crate::fs_key!("block_sizes"), bk);
-                                    free_futures.push(self.backend_router.free_block(bk));
+                                    blocks_to_free.push(bk.as_str());
                                     has_updates = true;
                                 } else {
                                     update_pipe.hset(refcounts_key, bk, r);
@@ -2498,14 +2525,14 @@ impl DataRouter {
                                 }
                             } else {
                                 update_pipe.hdel(crate::fs_key!("block_sizes"), bk);
-                                free_futures.push(self.backend_router.free_block(bk));
+                                blocks_to_free.push(bk.as_str());
                                 has_updates = true;
                             }
                         }
                         if has_updates {
                             let _: () = update_pipe.query_async(con).await?;
                         }
-                        futures::future::join_all(free_futures).await;
+                        self.backend_router.free_blocks(&blocks_to_free).await?;
                     }
                     let _: () = con.del(&block_map_key).await?;
                 }

@@ -3377,6 +3377,10 @@ fn find_uri_from_proc(target_path: &std::path::Path) -> Option<String> {
     let target_abs = target_path
         .canonicalize()
         .unwrap_or_else(|_| target_path.to_path_buf());
+    let norm_target = target_abs
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
     let dir = std::fs::read_dir("/proc").ok()?;
     for entry in dir.flatten() {
         let path = entry.path();
@@ -3404,12 +3408,18 @@ fn find_uri_from_proc(target_path: &std::path::Path) -> Option<String> {
                                 found_uri = Some(arg.clone());
                             } else if arg.starts_with("/") {
                                 let arg_path = std::path::Path::new(arg);
-                                if let Ok(abs_arg) = arg_path.canonicalize() {
-                                    if target_abs.starts_with(&abs_arg) {
-                                        found_mountpoint = Some(abs_arg);
-                                    }
-                                } else if target_abs.starts_with(arg_path) {
-                                    found_mountpoint = Some(arg_path.to_path_buf());
+                                let norm_arg = arg.trim_end_matches('/');
+                                let matches = if let Ok(abs_arg) = arg_path.canonicalize() {
+                                    let norm_abs_arg =
+                                        abs_arg.to_string_lossy().trim_end_matches('/').to_string();
+                                    norm_target == norm_abs_arg
+                                        || norm_target.starts_with(&format!("{}/", norm_abs_arg))
+                                } else {
+                                    norm_target == norm_arg
+                                        || norm_target.starts_with(&format!("{}/", norm_arg))
+                                };
+                                if matches {
+                                    found_mountpoint = Some(std::path::PathBuf::from(norm_arg));
                                 }
                             }
                         }
@@ -3429,6 +3439,23 @@ fn is_squeezefs_mount(path: &std::path::Path) -> bool {
         return true;
     }
     find_uri_from_proc(path).is_some()
+}
+
+fn resolve_fs_name_from_mount(mnt: &std::path::Path) -> Option<String> {
+    let config_path = mnt.join(".config");
+    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+        if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+            if let Some(n) = config_json["format"]["name"].as_str() {
+                return Some(n.to_string());
+            }
+        }
+    }
+    if let Some(uri) = find_uri_from_proc(mnt) {
+        if let Ok((_, fs_name)) = parse_squeeze_uri(&uri) {
+            return Some(fs_name);
+        }
+    }
+    None
 }
 
 fn find_squeezefs_mounts() -> Vec<PathBuf> {
@@ -3483,27 +3510,69 @@ async fn run_df_command(
     redis_url: &str,
     path_opt: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path_opt = match path_opt {
-        Some(ref p) if is_uri(p) => None,
-        other => other,
+    let mounts = find_squeezefs_mounts();
+    let (path_opt, target_mount) = match path_opt {
+        Some(ref p) if is_uri(p) => (None, None),
+        Some(ref p) => {
+            let abs_path = std::path::Path::new(p);
+            let norm_p = abs_path.to_string_lossy().trim_end_matches('/').to_string();
+
+            let matched_mnt = mounts.iter().find(|mnt| {
+                let norm_mnt = mnt.to_string_lossy().trim_end_matches('/').to_string();
+                norm_p == norm_mnt
+            });
+
+            if let Some(mnt) = matched_mnt {
+                (None, Some(mnt.clone()))
+            } else {
+                let containing_mnt = mounts.iter().find(|mnt| {
+                    let norm_mnt = mnt.to_string_lossy().trim_end_matches('/').to_string();
+                    norm_p.starts_with(&format!("{}/", norm_mnt))
+                });
+                if containing_mnt.is_some() {
+                    (Some(p.clone()), None)
+                } else {
+                    let mut matching_mount = None;
+                    let mut current = std::path::PathBuf::from(p);
+                    loop {
+                        if current.join(".stats").exists() && current.join(".config").exists() {
+                            matching_mount = Some(current.clone());
+                            break;
+                        }
+                        if !current.pop() {
+                            break;
+                        }
+                    }
+                    let is_mount_query = if let Some(ref mnt) = matching_mount {
+                        let norm_mnt = mnt.to_string_lossy().trim_end_matches('/').to_string();
+                        norm_p == norm_mnt
+                    } else {
+                        false
+                    };
+                    if is_mount_query {
+                        (None, matching_mount)
+                    } else {
+                        (Some(p.clone()), None)
+                    }
+                }
+            }
+        }
+        None => (None, None),
     };
     let dlm = DlmClient::new(redis_url)?;
     let mut con = dlm.get_connection().await?;
 
-    let mounts = find_squeezefs_mounts();
-
     match path_opt {
         None => {
             let mut resolved_fs_name = "squeezefs".to_string();
-            if !mounts.is_empty() {
-                let config_path = mounts[0].join(".config");
-                if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-                    if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str)
-                    {
-                        if let Some(n) = config_json["format"]["name"].as_str() {
-                            resolved_fs_name = n.to_string();
-                        }
-                    }
+            let mounts_to_use = if let Some(ref mnt) = target_mount {
+                vec![mnt.clone()]
+            } else {
+                mounts.clone()
+            };
+            if !mounts_to_use.is_empty() {
+                if let Some(name) = resolve_fs_name_from_mount(&mounts_to_use[0]) {
+                    resolved_fs_name = name;
                 }
             }
             squeezefs::set_fs_prefix(&resolved_fs_name);
@@ -3657,28 +3726,32 @@ async fn run_df_command(
                 .canonicalize()
                 .unwrap_or_else(|_| std::path::PathBuf::from(&path_str));
 
-            let mut matching_mount = None;
-            let mut current = abs_path.clone();
-            loop {
-                if current.join(".stats").exists() && current.join(".config").exists() {
-                    matching_mount = Some(current.clone());
-                    break;
-                }
-                if !current.pop() {
-                    break;
+            let norm_p = abs_path.to_string_lossy().trim_end_matches('/').to_string();
+            let mut matching_mount = mounts
+                .iter()
+                .find(|mnt| {
+                    let norm_mnt = mnt.to_string_lossy().trim_end_matches('/').to_string();
+                    norm_p.starts_with(&format!("{}/", norm_mnt))
+                })
+                .cloned();
+
+            if matching_mount.is_none() {
+                let mut current = abs_path.clone();
+                loop {
+                    if current.join(".stats").exists() && current.join(".config").exists() {
+                        matching_mount = Some(current.clone());
+                        break;
+                    }
+                    if !current.pop() {
+                        break;
+                    }
                 }
             }
 
             let mut resolved_fs_name = "squeezefs".to_string();
             if let Some(ref mnt) = matching_mount {
-                let config_path = mnt.join(".config");
-                if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-                    if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str)
-                    {
-                        if let Some(n) = config_json["format"]["name"].as_str() {
-                            resolved_fs_name = n.to_string();
-                        }
-                    }
+                if let Some(name) = resolve_fs_name_from_mount(mnt) {
+                    resolved_fs_name = name;
                 }
             }
             squeezefs::set_fs_prefix(&resolved_fs_name);
@@ -4147,6 +4220,10 @@ fn resolve_squeeze_uri(
                         .to_string();
                     return Ok((url_str.to_string(), name_str));
                 }
+            }
+        } else if let Some(uri) = find_uri_from_proc(&mount) {
+            if let Ok(res) = parse_squeeze_uri(&uri) {
+                return Ok(res);
             }
         }
     }

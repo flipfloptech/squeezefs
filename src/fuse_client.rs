@@ -5849,11 +5849,6 @@ async fn flush_single_active_block(
         None
     };
 
-    let mut _inode_guard = None;
-    if let Some(ref l) = lock_opt {
-        _inode_guard = Some(l.read().await);
-    }
-
     let block_data_guard = match router.cache.nvme.read_staged_zero_copy(&cache_key) {
         Some(g) => g,
         None => return Ok(()),
@@ -5880,6 +5875,11 @@ async fn flush_single_active_block(
         );
         let _ = block_allocator.free_block(offset).await;
         return Err(e);
+    }
+
+    let mut _inode_guard = None;
+    if let Some(ref l) = lock_opt {
+        _inode_guard = Some(l.read().await);
     }
 
     let stored_block_key = if be_id == "backend_0" {

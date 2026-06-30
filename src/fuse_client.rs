@@ -765,8 +765,8 @@ impl SqueezefsFilesystem {
                 let _block_guard = block_lock.lock().await;
 
                 // 1. Get existing block data (either from memory cache, NVMe staging cache, or read from backend/cache)
-                let mut block_data = if let Some(buf) = self.active_block_buffers.get(&cache_key) {
-                    buf.clone()
+                let mut block_data = if let Some((_, buf)) = self.active_block_buffers.remove(&cache_key) {
+                    buf
                 } else {
                     let mut data = if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
                         d
@@ -892,7 +892,6 @@ impl SqueezefsFilesystem {
                         fencing_token: _fencing_token,
                     };
                     let _ = self.writeback_tx.send(req);
-                    self.active_block_buffers.remove(&cache_key);
                 } else {
                     self.active_block_buffers
                         .insert(cache_key.clone(), block_data);
@@ -5829,7 +5828,7 @@ async fn flush_due_active_blocks_for_inode(
 async fn flush_single_active_block(
     ino: u64,
     b: u32,
-    _fencing_token: u64,
+    fencing_token: u64,
     router: &DataRouter,
     dlm: &DlmClient,
     active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
@@ -5855,21 +5854,25 @@ async fn flush_single_active_block(
         _inode_guard = Some(l.read().await);
     }
 
-    let block_data = match router.cache.nvme.read_staged(&cache_key) {
-        Some(d) => d,
+    let block_data_guard = match router.cache.nvme.read_staged_zero_copy(&cache_key) {
+        Some(g) => g,
         None => return Ok(()),
     };
 
     use redis::AsyncCommands;
     let mut con = dlm.get_connection_for_inode(ino).await?;
 
-    let block_bytes = bytes::Bytes::from(block_data);
+    let slice: &[u8] = &block_data_guard;
+    let block_bytes = unsafe {
+        bytes::Bytes::from_static(std::mem::transmute::<&[u8], &'static [u8]>(slice))
+    };
     let processed_block = router.get_crypto().process_write(block_bytes.clone())?;
     let processed_len = processed_block.len();
 
     let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
     let offset = block_allocator.allocate_block().await?;
 
+    let _guard_arc = std::sync::Arc::new(block_data_guard);
     if let Err(e) = nvme_writer.write_block(offset, &processed_block).await {
         error!(
             "flush_single_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
@@ -5937,9 +5940,9 @@ async fn flush_single_active_block(
     }
 
     // ONLY remove active write block from cache if it hasn't been modified by a newer write
-    let current_staged = router.cache.nvme.read_staged(&cache_key);
-    if let Some(ref cur) = current_staged {
-        if cur == &block_bytes[..] {
+    let current_token = router.cache.nvme.get_staged_fencing_token(&cache_key);
+    if let Some(tok) = current_token {
+        if tok == fencing_token {
             router.cache.nvme.remove_active_block(&cache_key);
         }
     } else {

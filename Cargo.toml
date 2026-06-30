@@ -83,4 +83,3 @@ tikv-jemallocator = "0.5"
 
 [profile.release]
 debug = true
-force-frame-pointers = true

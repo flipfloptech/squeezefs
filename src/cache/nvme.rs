@@ -375,10 +375,11 @@ impl NvmeStaging {
         };
         let meta_bytes = meta.serialize();
         let meta_len = meta_bytes.len() as u64;
-        let unpadded_len = 8 + meta_bytes.len() + data.len();
-        let mut packed_payload = Vec::with_capacity(unpadded_len);
+
+        let mut packed_payload = Vec::with_capacity(4096 + data.len());
         packed_payload.extend_from_slice(&meta_len.to_be_bytes());
         packed_payload.extend_from_slice(&meta_bytes);
+        packed_payload.resize(4096, 0); // Pad header up to 4KB page boundary
         packed_payload.extend_from_slice(data);
 
         let key_bytes = Bytes::copy_from_slice(key.as_bytes());
@@ -409,11 +410,27 @@ impl NvmeStaging {
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() >= 8 + meta_len {
                 if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
-                    let data_start = 8 + meta_len;
+                    let data_start = if file_id.starts_with("active_block:") { 4096 } else { 8 + meta_len };
                     let data_end = data_start + meta.original_size as usize;
                     if bytes.len() >= data_end {
                         return Some(bytes[data_start..data_end].to_vec());
                     }
+                }
+            }
+        }
+        None
+    }
+
+    /// Read staged fencing token directly from staging_nvme_cache memory-mapped segments without copying data.
+    pub fn get_staged_fencing_token(&self, file_id: &str) -> Option<u64> {
+        let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
+        let guard = self.staging_nvme_cache.get(&key_bytes)?;
+        let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+        if bytes.len() >= 8 {
+            let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+            if bytes.len() >= 8 + meta_len {
+                if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
+                    return Some(meta.fencing_token);
                 }
             }
         }
@@ -432,7 +449,7 @@ impl NvmeStaging {
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() >= 8 + meta_len {
                 if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
-                    let data_start = 8 + meta_len;
+                    let data_start = if file_id.starts_with("active_block:") { 4096 } else { 8 + meta_len };
                     let data_end = data_start + meta.original_size as usize;
                     if bytes.len() >= data_end {
                         guard.offset += data_start;

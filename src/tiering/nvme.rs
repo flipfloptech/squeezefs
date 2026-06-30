@@ -154,7 +154,8 @@ impl NvmeShard {
                     .unwrap(),
             ) as usize;
 
-            let val_start = meta.offset + HEADER_SIZE + key_len;
+            let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
+            let val_start = (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
             Some(NvmeReadGuard {
                 guard: inner,
                 offset: val_start,
@@ -168,9 +169,15 @@ impl NvmeShard {
     pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes)> {
         let key_len = key.len();
         let val_len = value.len();
-        let block_size = HEADER_SIZE + key_len + val_len;
 
         let mut inner = self.inner.write();
+        let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
+
+        // Ensure target_offset starts aligned
+        let mut target_offset = (inner.write_offset + alignment - 1) & !(alignment - 1);
+        let val_offset = (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+        let block_size = (val_offset - target_offset) + val_len;
+
         if block_size > inner.capacity {
             return Vec::new();
         }
@@ -178,13 +185,17 @@ impl NvmeShard {
         let mut evicted = Vec::new();
 
         // Check if we need to wrap around
-        let mut target_offset = inner.write_offset;
         let capacity = inner.capacity;
         if target_offset + block_size > capacity {
             // Evict anything at the end of the file that we are skipping
             inner.evict_overlapping(target_offset, capacity, &mut evicted);
             target_offset = 0;
         }
+
+        // Recompute after wrap-around to ensure aligned
+        let target_offset = (target_offset + alignment - 1) & !(alignment - 1);
+        let val_offset = (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+        let block_size = (val_offset - target_offset) + val_len;
 
         // Evict overlapping blocks in the target range
         inner.evict_overlapping(target_offset, target_offset + block_size, &mut evicted);
@@ -201,7 +212,7 @@ impl NvmeShard {
         inner.mmap[target_offset + HEADER_SIZE..target_offset + HEADER_SIZE + key_len]
             .copy_from_slice(&key);
         // Write val
-        inner.mmap[target_offset + HEADER_SIZE + key_len..target_offset + block_size]
+        inner.mmap[val_offset..val_offset + val_len]
             .copy_from_slice(&value);
 
         // Update tracking
@@ -237,7 +248,8 @@ impl NvmeShard {
                     .try_into()
                     .unwrap(),
             ) as usize;
-            let val_start = meta.offset + HEADER_SIZE + key_len;
+            let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
+            let val_start = (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
             let val_end = val_start + val_len;
             let val = Bytes::copy_from_slice(&inner.mmap[val_start..val_end]);
 

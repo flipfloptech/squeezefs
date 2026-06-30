@@ -1294,11 +1294,6 @@ impl DataRouter {
 
                 block_data[rel_start..rel_end].copy_from_slice(&data_slice);
 
-                let file_uuid = Uuid::new_v4().to_string();
-                let block_write_uuid = Uuid::new_v4().to_string();
-                let new_block_key =
-                    format!("blocks/{}/block_{}_{}", file_uuid, b, block_write_uuid);
-
                 let (be_id, block_allocator, nvme_writer) =
                     router_clone.backend_router.get_active_backend()?;
                 let offset = block_allocator.allocate_block().await?;
@@ -1319,7 +1314,7 @@ impl DataRouter {
                 nvme_writer.write_block(offset, &processed_block).await?;
                 debug!(
                     "Writeback: Successfully wrote block {} to backing device",
-                    new_block_key
+                    stored_new_block_key
                 );
 
                 Ok::<_, SqueezefsError>((

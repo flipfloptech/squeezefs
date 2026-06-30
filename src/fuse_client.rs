@@ -244,12 +244,11 @@ impl SqueezefsFilesystem {
             writeback_rx: std::sync::Mutex::new(Some(writeback_rx)),
             client_id: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             mountpoint: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
-            max_background_uploads: std::cmp::max(
+            max_background_uploads: std::cmp::min(
                 16,
                 std::thread::available_parallelism()
                     .map(|p| p.get())
-                    .unwrap_or(8)
-                    * 2,
+                    .unwrap_or(8),
             ),
             active_block_buffers: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),

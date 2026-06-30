@@ -568,13 +568,41 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
     let mut con = connect_redis(redis_url).await?;
     let mut issues = Vec::new();
 
-    // 1. Fetch all registered backends
+    // Helper to parse block index from block key (e.g. "backend_0://4194304")
+    let parse_block_index = |bk: &str| -> Option<(String, u64)> {
+        let parts: Vec<&str> = bk.split("://").collect();
+        if parts.len() == 2 {
+            let backend = parts[0].to_string();
+            if let Ok(offset) = parts[1].parse::<u64>() {
+                let chunk_size = 4 * 1024 * 1024;
+                return Some((backend, offset / chunk_size));
+            }
+        }
+        None
+    };
+
+    // 1. Fetch block allocator status (highest_block, free_blocks, refcounts)
+    let highest_block: u64 = con
+        .get(crate::fs_key!("highest_block"))
+        .await
+        .unwrap_or(0);
+    let free_blocks_vec: Vec<u64> = con
+        .smembers(crate::fs_key!("free_blocks"))
+        .await
+        .unwrap_or_default();
+    let free_blocks_set: std::collections::HashSet<u64> = free_blocks_vec.into_iter().collect();
+    let db_refcounts: HashMap<String, String> = con
+        .hgetall(crate::fs_key!("block_refcounts"))
+        .await
+        .unwrap_or_default();
+
+    // 2. Fetch all registered backends
     let backends: HashMap<String, String> = con
         .hgetall(crate::fs_key!("backends"))
         .await
         .unwrap_or_default();
 
-    // 2. Scan all metadata
+    // 3. Scan all metadata keys
     let mut metadata_keys = Vec::new();
     let mut cursor = 0u64;
     loop {
@@ -583,7 +611,7 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
             .arg("MATCH")
             .arg("metadata:*")
             .arg("COUNT")
-            .arg(100)
+            .arg(1000)
             .query_async(&mut con)
             .await?;
         metadata_keys.extend(chunk);
@@ -593,40 +621,33 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
         }
     }
 
-    for meta_key in metadata_keys {
+    // 4. Batch pipeline fetching of metadata attributes
+    let mut metadata_attrs = Vec::new();
+    let batch_size = 500;
+    for chunk in metadata_keys.chunks(batch_size) {
+        let mut pipe = redis::pipe();
+        for key in chunk {
+            pipe.hgetall(key);
+        }
+        let res: Vec<HashMap<String, String>> = pipe.query_async(&mut con).await?;
+        for (key, fields) in chunk.iter().zip(res.into_iter()) {
+            metadata_attrs.push((key.clone(), fields));
+        }
+    }
+
+    let mut striped_files = Vec::new(); // Vec<(file_path, block_map_key)>
+    let mut staged_files = Vec::new(); // Vec<(file_path, mapping_key)>
+
+    for (meta_key, fields) in &metadata_attrs {
         let file_path = meta_key
             .strip_prefix("metadata:")
-            .unwrap_or(&meta_key)
+            .unwrap_or(meta_key)
             .to_string();
-        let meta_type: Option<String> = con.hget(&meta_key, "type").await?;
-
-        match meta_type.as_deref() {
+        let meta_type = fields.get("type").map(|s| s.as_str());
+        match meta_type {
             Some("striped") => {
-                let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await?;
-                if let Some(bmid) = block_map_id {
-                    let map_key = format!("block_map:{}", bmid);
-                    let block_keys: HashMap<String, String> =
-                        con.hgetall(&map_key).await.unwrap_or_default();
-                    if block_keys.is_empty() {
-                        issues.push(format!(
-                            "File '{}' block map '{}' is empty or missing",
-                            file_path, map_key
-                        ));
-                    }
-                    for (b_idx, bk) in block_keys {
-                        let parts: Vec<&str> = bk.split("://").collect();
-                        let be_id = if parts.len() > 1 {
-                            parts[0].to_string()
-                        } else {
-                            "backend_0".to_string()
-                        };
-                        if be_id != "backend_0" && !backends.contains_key(&be_id) {
-                            issues.push(format!(
-                                "File '{}' block '{}' references unregistered backend '{}' (key: {})",
-                                file_path, b_idx, be_id, bk
-                            ));
-                        }
-                    }
+                if let Some(bmid) = fields.get("block_map_id") {
+                    striped_files.push((file_path, format!("block_map:{}", bmid)));
                 } else {
                     issues.push(format!(
                         "File '{}' has type 'striped' but missing 'block_map' reference",
@@ -635,29 +656,8 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
                 }
             }
             Some("staged") => {
-                let file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
-                if let Some(fid) = file_id {
-                    let mapping_key = format!("mapping:{}", fid);
-                    let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
-                    if let Some(bk) = block_key {
-                        let parts: Vec<&str> = bk.split("://").collect();
-                        let be_id = if parts.len() > 1 {
-                            parts[0].to_string()
-                        } else {
-                            "backend_0".to_string()
-                        };
-                        if be_id != "backend_0" && !backends.contains_key(&be_id) {
-                            issues.push(format!(
-                                "File '{}' staged block references unregistered backend '{}' (key: {})",
-                                file_path, be_id, bk
-                            ));
-                        }
-                    } else {
-                        issues.push(format!(
-                            "File '{}' staged mapping '{}' is missing or has no 'block' field",
-                            file_path, mapping_key
-                        ));
-                    }
+                if let Some(fid) = fields.get("file_id") {
+                    staged_files.push((file_path, format!("mapping:{}", fid)));
                 } else {
                     issues.push(format!(
                         "File '{}' has type 'staged' but missing 'file_id' field",
@@ -666,6 +666,136 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
                 }
             }
             _ => {}
+        }
+    }
+
+    // 5. Batch pipeline fetching of block_map tables
+    let mut block_maps = HashMap::new(); // block_map_key -> HashMap<String, String>
+    for chunk in striped_files.chunks(batch_size) {
+        let mut pipe = redis::pipe();
+        for (_, map_key) in chunk {
+            pipe.hgetall(map_key);
+        }
+        let res: Vec<HashMap<String, String>> = pipe.query_async(&mut con).await?;
+        for ((_, map_key), map_data) in chunk.iter().zip(res.into_iter()) {
+            block_maps.insert(map_key.clone(), map_data);
+        }
+    }
+
+    // 6. Batch pipeline fetching of staged mappings
+    let mut staged_mappings = HashMap::new(); // mapping_key -> Option<String>
+    for chunk in staged_files.chunks(batch_size) {
+        let mut pipe = redis::pipe();
+        for (_, mapping_key) in chunk {
+            pipe.hget(mapping_key, "block");
+        }
+        let res: Vec<Option<String>> = pipe.query_async(&mut con).await?;
+        for ((_, mapping_key), block_opt) in chunk.iter().zip(res.into_iter()) {
+            staged_mappings.insert(mapping_key.clone(), block_opt);
+        }
+    }
+
+    let mut actual_refcounts: HashMap<String, usize> = HashMap::new();
+
+    // 7. Audit block references
+    for (file_path, map_key) in &striped_files {
+        if let Some(block_keys) = block_maps.get(map_key) {
+            if block_keys.is_empty() {
+                issues.push(format!(
+                    "File '{}' block map '{}' is empty or missing",
+                    file_path, map_key
+                ));
+            }
+            for (b_idx, bk) in block_keys {
+                if let Some((be_id, _)) = parse_block_index(bk) {
+                    if be_id != "backend_0" && !backends.contains_key(&be_id) {
+                        issues.push(format!(
+                            "File '{}' block '{}' references unregistered backend '{}' (key: {})",
+                            file_path, b_idx, be_id, bk
+                        ));
+                    }
+                    if be_id == "backend_0" {
+                        *actual_refcounts.entry(bk.clone()).or_insert(0) += 1;
+                    }
+                } else {
+                    issues.push(format!(
+                        "File '{}' block '{}' has invalid block key format: {}",
+                        file_path, b_idx, bk
+                    ));
+                }
+            }
+        }
+    }
+
+    for (file_path, mapping_key) in &staged_files {
+        if let Some(block_opt) = staged_mappings.get(mapping_key) {
+            if let Some(bk) = block_opt {
+                if let Some((be_id, _)) = parse_block_index(bk) {
+                    if be_id != "backend_0" && !backends.contains_key(&be_id) {
+                        issues.push(format!(
+                            "File '{}' staged block references unregistered backend '{}' (key: {})",
+                            file_path, be_id, bk
+                        ));
+                    }
+                    if be_id == "backend_0" {
+                        *actual_refcounts.entry(bk.clone()).or_insert(0) += 1;
+                    }
+                } else {
+                    issues.push(format!(
+                        "File '{}' staged block has invalid block key format: {}",
+                        file_path, bk
+                    ));
+                }
+            } else {
+                issues.push(format!(
+                    "File '{}' staged mapping '{}' is missing or has no 'block' field",
+                    file_path, mapping_key
+                ));
+            }
+        }
+    }
+
+    // 8. Cross-reference block counts against free_blocks, highest_block, and refcounts
+    for (bk, &actual_ref) in &actual_refcounts {
+        if let Some((be_id, block_idx)) = parse_block_index(bk) {
+            if be_id == "backend_0" {
+                if block_idx > highest_block {
+                    issues.push(format!(
+                        "Block index {} (key: {}) is referenced by files but exceeds highest_block ({})",
+                        block_idx, bk, highest_block
+                    ));
+                }
+                if free_blocks_set.contains(&block_idx) {
+                    issues.push(format!(
+                        "CRITICAL: Block index {} (key: {}) is referenced by files but is marked as FREE in database",
+                        block_idx, bk
+                    ));
+                }
+                let db_ref = db_refcounts
+                    .get(bk)
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0);
+                if db_ref != actual_ref as i32 {
+                    issues.push(format!(
+                        "Reference count mismatch for block key '{}': DB has {}, actual is {}",
+                        bk, db_ref, actual_ref
+                    ));
+                }
+            }
+        }
+    }
+
+    // Detect leaked blocks
+    for idx in 1..=highest_block {
+        if !free_blocks_set.contains(&idx) {
+            let offset = idx * 4 * 1024 * 1024;
+            let bk = format!("backend_0://{}", offset);
+            if !actual_refcounts.contains_key(&bk) {
+                issues.push(format!(
+                    "Leaked block detected: Block index {} (key: {}) is not in free set and is not referenced by any file",
+                    idx, bk
+                ));
+            }
         }
     }
 

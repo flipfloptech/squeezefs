@@ -172,7 +172,7 @@ async fn test_cluster_client_initialization() {
 
     // Single-node mode
     let single_client = MetaClient::new("redis://127.0.0.1:6379").unwrap();
-    assert!(matches!(single_client, MetaClient::Single(_)));
+    assert!(matches!(single_client, MetaClient::Single { .. }));
 
     // Cluster mode via comma-separated list
     let cluster_client_comma =

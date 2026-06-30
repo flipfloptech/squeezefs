@@ -180,9 +180,7 @@ enum Commands {
         #[arg(long)]
         no_writeback: bool,
 
-        /// Max concurrent background writes to NVMe-oF backend (default: 16)
-        #[arg(long, default_value_t = 16)]
-        max_background_uploads: usize,
+
 
         /// Allow other users to access the mount
         #[arg(long)]
@@ -707,7 +705,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         disk_cache_paths,
         daemon,
         no_writeback,
-        max_background_uploads,
         allow_other,
         options,
         read_cache_size,
@@ -784,7 +781,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_mem_cache_size.as_deref(),
             disk_cache_paths.as_deref(),
             writeback,
-            *max_background_uploads,
             *allow_other,
             options.as_deref(),
             *fuse_io_uring_sqpoll_idle_ms,
@@ -1062,7 +1058,6 @@ fn print_mount_diagnostics(
     write_mem_cache_size: Option<&str>,
     disk_cache_paths: Option<&[PathBuf]>,
     writeback: bool,
-    max_background_uploads: usize,
     allow_other: bool,
     options: Option<&str>,
     fuse_io_uring_sqpoll_idle_ms: Option<u32>,
@@ -1236,7 +1231,14 @@ fn print_mount_diagnostics(
     println!("  Mountpoint: {:?}", mountpoint);
     println!("  Daemon: {}", daemon);
     println!("  Writeback: {}", writeback);
-    println!("  Max Background Uploads: {}", max_background_uploads);
+    let resolved_max_uploads = std::cmp::max(
+        16,
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(8)
+            * 2,
+    );
+    println!("  Max Background Uploads: {}", resolved_max_uploads);
     println!("  Allow Other: {}", allow_other);
     if let Some(opts) = options {
         println!("  Custom Options: {:?}", opts);
@@ -1797,7 +1799,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             gid,
             p2p_addr,
             no_writeback,
-            max_background_uploads,
             allow_other,
             check_storage: _check_storage,
             options,
@@ -2317,7 +2318,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let mut fs_engine = SqueezefsFilesystem::new(router, dlm, resolved_uid, resolved_gid);
             fs_engine.dismount_wait = resolved_dismount_wait;
-            fs_engine.max_background_uploads = max_background_uploads;
 
             squeezefs::jobs::start_job_worker(
                 std::sync::Arc::new(fs_engine.router.clone()),

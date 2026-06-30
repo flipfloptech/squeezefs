@@ -15,7 +15,7 @@ FROM ghcr.io/microsoft/garnet:latest
 WORKDIR /app
 
 # Copy the compiled DLL from Stage 1
-COPY --from=build-env /app/out/SqueezeExtensions.dll /app/SqueezeExtensions.dll
+COPY --from=build-env /app/out/SqueezeExtensions.dll /app/extensions/SqueezeExtensions.dll
 
 # Run Garnet loading the SqueezeFS extensions automatically
-ENTRYPOINT ["/app/GarnetServer", "--aof", "--extension-bin-paths", "/app/SqueezeExtensions.dll"]
+ENTRYPOINT ["/app/GarnetServer", "--aof", "--extension-bin-paths", "/app/extensions"]

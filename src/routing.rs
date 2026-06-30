@@ -711,7 +711,13 @@ impl DataRouter {
         // 3. Patch the in-memory buffer
         let end_offset = (offset as usize) + data.len();
 
-        if end_offset > 4 * 1024 * 1024 && file_type.as_deref() != Some("striped") {
+        let stripe_threshold = if self.cache.nvme.staging_dirs().is_empty() {
+            64 * 1024
+        } else {
+            4 * 1024 * 1024
+        };
+
+        if end_offset > stripe_threshold && file_type.as_deref() != Some("striped") {
             // Transition the existing data (which is at most 4MB) to striped layout
             let file_uuid = Uuid::new_v4().to_string();
             let block_map_id = Uuid::new_v4().to_string();
@@ -886,7 +892,7 @@ impl DataRouter {
 
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
-        } else if new_size <= 4 * 1024 * 1024 {
+        } else if !self.cache.nvme.staging_dirs().is_empty() && new_size <= 4 * 1024 * 1024 {
             // Layout: staged
             let new_file_id = Uuid::new_v4().to_string();
 

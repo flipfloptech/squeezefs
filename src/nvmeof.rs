@@ -88,9 +88,28 @@ pub fn share_target(
     backing_path: &str,
     subnqn_opt: Option<&str>,
     port: u16,
-    ip: &str,
+    ips: &[String],
 ) -> std::io::Result<String> {
     check_root()?;
+
+    // Prevent duplicate sharing of the same backing path
+    let canonical_target = fs::canonicalize(backing_path)
+        .unwrap_or_else(|_| PathBuf::from(backing_path));
+    
+    let shares = load_shares();
+    for share in &shares {
+        let share_canonical = fs::canonicalize(&share.backing_path)
+            .unwrap_or_else(|_| PathBuf::from(&share.backing_path));
+        if canonical_target == share_canonical {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "Backing path '{}' is already shared under subsystem '{}'",
+                    backing_path, share.subnqn
+                ),
+            ));
+        }
+    }
     // 1. Check/create backing path if it's a regular file path
     let backing_path_buf = PathBuf::from(backing_path);
     if !backing_path_buf.exists() {
@@ -184,43 +203,44 @@ pub fn share_target(
         let _ = fs::write(sub_dir.join("associated_loop_device"), loop_dev);
     }
 
-    // 6. Setup Port
-    // Try port index 1 to 100 to find a free or existing match
-    let mut port_exists = false;
-    let mut port_id = 1;
-    let mut port_dir = config_dir.join("ports").join(port_id.to_string());
-    while port_dir.exists() {
-        // Read active address and port svc ID to see if it is our IP and port
-        if let Ok(addr) = fs::read_to_string(port_dir.join("addr_traddr")) {
-            if let Ok(svc) = fs::read_to_string(port_dir.join("addr_trsvcid")) {
-                if addr.trim() == ip && svc.trim() == port.to_string() {
-                    port_exists = true;
-                    break; // Port already exists and matches!
+    // 6. Setup Ports
+    for ip in ips {
+        let mut port_exists = false;
+        let mut port_id = 1;
+        let mut port_dir = config_dir.join("ports").join(port_id.to_string());
+        while port_dir.exists() {
+            // Read active address and port svc ID to see if it is our IP and port
+            if let Ok(addr) = fs::read_to_string(port_dir.join("addr_traddr")) {
+                if let Ok(svc) = fs::read_to_string(port_dir.join("addr_trsvcid")) {
+                    if addr.trim() == ip && svc.trim() == port.to_string() {
+                        port_exists = true;
+                        break; // Port already exists and matches!
+                    }
                 }
             }
+            port_id += 1;
+            port_dir = config_dir.join("ports").join(port_id.to_string());
         }
-        port_id += 1;
-        port_dir = config_dir.join("ports").join(port_id.to_string());
+
+        if !port_exists {
+            fs::create_dir_all(&port_dir)?;
+            fs::write(port_dir.join("addr_traddr"), ip)?;
+            fs::write(port_dir.join("addr_trtype"), "tcp")?;
+            fs::write(port_dir.join("addr_trsvcid"), port.to_string())?;
+            fs::write(port_dir.join("addr_adrfam"), "ipv4")?;
+        }
+
+        // Link subsystem to port
+        let link_dest = port_dir.join("subsystems").join(&subnqn);
+        fs::create_dir_all(port_dir.join("subsystems"))?;
+
+        #[cfg(unix)]
+        if !link_dest.exists() {
+            std::os::unix::fs::symlink(&sub_dir, &link_dest)?;
+        }
     }
 
-    if !port_exists {
-        fs::create_dir_all(&port_dir)?;
-        fs::write(port_dir.join("addr_traddr"), ip)?;
-        fs::write(port_dir.join("addr_trtype"), "tcp")?;
-        fs::write(port_dir.join("addr_trsvcid"), port.to_string())?;
-        fs::write(port_dir.join("addr_adrfam"), "ipv4")?;
-    }
-
-    // Link subsystem to port
-    let link_dest = port_dir.join("subsystems").join(&subnqn);
-    fs::create_dir_all(port_dir.join("subsystems"))?;
-
-    #[cfg(unix)]
-    if !link_dest.exists() {
-        std::os::unix::fs::symlink(&sub_dir, &link_dest)?;
-    }
-
-    let _ = register_share(backing_path, &subnqn, port, ip);
+    let _ = register_share(backing_path, &subnqn, port, ips);
 
     // Return connect instruction string
     Ok(subnqn)
@@ -277,8 +297,52 @@ pub fn share_target_spdk(
     backing_path: &str,
     subnqn_opt: Option<&str>,
     port: u16,
-    ip: &str,
+    ips: &[String],
 ) -> std::io::Result<String> {
+    // Prevent duplicate sharing of the same backing path via local configuration
+    let canonical_target = fs::canonicalize(backing_path)
+        .unwrap_or_else(|_| PathBuf::from(backing_path));
+    
+    let shares = load_shares();
+    for share in &shares {
+        let share_canonical = fs::canonicalize(&share.backing_path)
+            .unwrap_or_else(|_| PathBuf::from(&share.backing_path));
+        if canonical_target == share_canonical {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "Backing path '{}' is already shared under subsystem '{}'",
+                    backing_path, share.subnqn
+                ),
+            ));
+        }
+    }
+
+    // Double check active SPDK bdevs directly
+    if let Ok(res) = call_spdk_rpc("bdev_get_bdevs", serde_json::json!({})) {
+        if let Some(bdevs) = res.get("result").and_then(|r| r.as_array()) {
+            for bdev in bdevs {
+                if let Some(driver_specific) = bdev.get("driver_specific") {
+                    if let Some(aio) = driver_specific.get("aio") {
+                        if let Some(filename) = aio.get("filename").and_then(|f| f.as_str()) {
+                            let canonical_existing = fs::canonicalize(filename)
+                                .unwrap_or_else(|_| PathBuf::from(filename));
+                            if canonical_target == canonical_existing {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::AlreadyExists,
+                                    format!(
+                                        "Backing path '{}' is already shared by active SPDK bdev '{}'",
+                                        backing_path,
+                                        bdev.get("name").and_then(|n| n.as_str()).unwrap_or("unknown")
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let subnqn = match subnqn_opt {
         Some(s) => s.to_string(),
         None => format!("nqn.2026-06.io.squeezefs:spdk-subsystem-{}", Uuid::new_v4()),
@@ -334,25 +398,27 @@ pub fn share_target_spdk(
         ));
     }
 
-    // 5. Add listener to expose the port/IP
-    let res = call_spdk_rpc("nvmf_subsystem_add_listener", serde_json::json!({
-        "nqn": subnqn,
-        "listen_address": {
-            "trtype": "TCP",
-            "adrfam": "IPv4",
-            "traddr": ip,
-            "trsvcid": port.to_string()
+    // 5. Add listener to expose the port/IP for each address
+    for ip in ips {
+        let res = call_spdk_rpc("nvmf_subsystem_add_listener", serde_json::json!({
+            "nqn": subnqn,
+            "listen_address": {
+                "trtype": "TCP",
+                "adrfam": "IPv4",
+                "traddr": ip,
+                "trsvcid": port.to_string()
+            }
+        }))?;
+        
+        if let Some(err) = res.get("error") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to expose SPDK subsystem listener on {}:{}: {}", ip, port, err),
+            ));
         }
-    }))?;
-    
-    if let Some(err) = res.get("error") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to expose SPDK subsystem listener: {}", err),
-        ));
     }
 
-    let _ = register_share_ext(backing_path, &subnqn, port, ip, true);
+    let _ = register_share_ext(backing_path, &subnqn, port, ips, true);
 
     Ok(subnqn)
 }
@@ -804,6 +870,52 @@ pub fn list_nvmeof() -> std::io::Result<()> {
             targets_found = true;
         }
     }
+
+    // SPDK Target Subsystems
+    if let Ok(res) = call_spdk_rpc("nvmf_get_subsystems", serde_json::json!({})) {
+        if let Some(result_arr) = res.get("result").and_then(|r| r.as_array()) {
+            for sub in result_arr {
+                let nqn = sub.get("nqn").and_then(|n| n.as_str()).unwrap_or_default();
+                if nqn == "nqn.2014-08.org.nvmexpress.discovery" {
+                    continue; // Skip discovery subsystem
+                }
+                
+                // Backing bdev
+                let mut backing = "unknown".to_string();
+                if let Some(namespaces) = sub.get("namespaces").and_then(|n| n.as_array()) {
+                    if let Some(ns) = namespaces.first() {
+                        if let Some(bdev_name) = ns.get("bdev_name").and_then(|b| b.as_str()) {
+                            backing = bdev_name.to_string();
+                        }
+                    }
+                }
+                
+                // Listen addresses
+                let mut listen_str = Vec::new();
+                if let Some(listeners) = sub.get("listen_addresses").and_then(|l| l.as_array()) {
+                    for listener in listeners {
+                        let ip = listener.get("traddr").and_then(|i| i.as_str()).unwrap_or("");
+                        let port = listener.get("trsvcid").and_then(|p| p.as_str()).unwrap_or("");
+                        if !ip.is_empty() && !port.is_empty() {
+                            listen_str.push(format!("{}:{}", ip, port));
+                        }
+                    }
+                }
+                let bound_addr = if listen_str.is_empty() {
+                    "none".to_string()
+                } else {
+                    listen_str.join(", ")
+                };
+
+                println!("  NQN:    {}", nqn);
+                println!("  Backing: {} (SPDK)", backing);
+                println!("  Listen:  {}", bound_addr);
+                println!();
+                targets_found = true;
+            }
+        }
+    }
+
     if !targets_found {
         println!("  No shared NVMe-oF targets configured.");
     }
@@ -941,16 +1053,16 @@ pub fn register_share(
     backing_path: &str,
     subnqn: &str,
     port: u16,
-    ip: &str,
+    ips: &[String],
 ) -> std::io::Result<()> {
-    register_share_ext(backing_path, subnqn, port, ip, false)
+    register_share_ext(backing_path, subnqn, port, ips, false)
 }
 
 pub fn register_share_ext(
     backing_path: &str,
     subnqn: &str,
     port: u16,
-    ip: &str,
+    ips: &[String],
     is_spdk: bool,
 ) -> std::io::Result<()> {
     let mut shares = load_shares();
@@ -959,7 +1071,7 @@ pub fn register_share_ext(
         backing_path: backing_path.to_string(),
         subnqn: subnqn.to_string(),
         port,
-        ip: ip.to_string(),
+        ip: ips.join(","),
         is_spdk: Some(is_spdk),
     });
     save_shares(&shares)
@@ -980,24 +1092,25 @@ pub fn restore_shares() -> std::io::Result<()> {
     log::info!("Restoring {} NVMe-oF target shares...", shares.len());
     for share in shares {
         log::info!(
-            "Restoring shared target {} on port {} (IP: {})...",
+            "Restoring shared target {} on port {} (IPs: {})...",
             share.backing_path,
             share.port,
             share.ip
         );
+        let ips: Vec<String> = share.ip.split(',').map(|s| s.trim().to_string()).collect();
         let res = if share.is_spdk.unwrap_or(false) {
             share_target_spdk(
                 &share.backing_path,
                 Some(&share.subnqn),
                 share.port,
-                &share.ip,
+                &ips,
             )
         } else {
             share_target(
                 &share.backing_path,
                 Some(&share.subnqn),
                 share.port,
-                &share.ip,
+                &ips,
             ).map(|_| share.subnqn.clone())
         };
         if let Err(e) = res {

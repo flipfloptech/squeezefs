@@ -51,7 +51,7 @@ async fn test_nvmeof_target_and_initiator_mock_lifecycle() {
         backing_path_to_str(&backing_file),
         None,
         4420,
-        "127.0.0.1",
+        &["127.0.0.1".to_string()],
     )
     .expect("Share target should succeed");
 
@@ -63,7 +63,7 @@ async fn test_nvmeof_target_and_initiator_mock_lifecycle() {
         backing_path_to_str(&backing_file2),
         None,
         4420,
-        "127.0.0.1",
+        &["127.0.0.1".to_string()],
     )
     .expect("Sharing second target on same port/IP should succeed");
 
@@ -182,7 +182,7 @@ fn test_nvmeof_target_share_persistence() {
         "/tmp/test_persist_backing.img",
         "nqn.test-subsystem-1",
         4420,
-        "127.0.0.1",
+        &["127.0.0.1".to_string()],
     )
     .unwrap();
 
@@ -225,7 +225,7 @@ async fn test_nvmeof_multirail_mock_connect() {
         backing_path_to_str(&backing_file),
         None,
         4420,
-        "127.0.0.1",
+        &["127.0.0.1".to_string()],
     )
     .expect("Share target should succeed");
 
@@ -277,7 +277,7 @@ fn test_nvmeof_spdk_target_mock_lifecycle() {
         "/tmp/test_spdk_backing.img",
         None,
         4420,
-        "127.0.0.1",
+        &["127.0.0.1".to_string()],
     )
     .expect("Share SPDK target should succeed in mock mode");
 

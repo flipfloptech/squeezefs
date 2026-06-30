@@ -15,10 +15,8 @@
  */
 
 use crate::error::Result;
-use once_cell::sync::OnceCell;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
 
 pub static SIMULATE_CORRUPTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -29,35 +27,84 @@ pub fn set_simulate_corruption(val: bool) {
 
 pub struct NvmeBlockDev {
     pub device_path: String,
-    file: OnceCell<Arc<File>>,
 }
 
 impl NvmeBlockDev {
     pub fn new(device_path: &str) -> Self {
         Self {
             device_path: device_path.to_string(),
-            file: OnceCell::new(),
         }
     }
 
-    fn get_file(&self) -> Result<Arc<File>> {
-        self.file
-            .get_or_try_init(|| {
-                let std_file = OpenOptions::new()
+    fn get_file(&self) -> Result<File> {
+        let mut std_file = {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&self.device_path)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(&self.device_path)
-                    .map_err(|e| crate::error::SqueezefsError::Io(e))?;
-                Ok(Arc::new(std_file))
-            })
-            .cloned()
+            }
+        };
+
+        // Fallback to standard open without O_DIRECT if it fails
+        if std_file.is_err() {
+            std_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.device_path);
+        }
+
+        std_file.map_err(|e| crate::error::SqueezefsError::Io(e))
     }
+
     pub async fn write_block(&self, offset: u64, data: &[u8]) -> Result<()> {
         let file = self.get_file()?;
-        let data_vec = data.to_vec();
+        let data_len = data.len();
+        let alignment = 4096;
+        let aligned_len = (data_len + 4095) & !4095;
+
+        // Allocate page-aligned buffer once on calling thread
+        let buf_addr = {
+            let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
+            unsafe {
+                if libc::posix_memalign(&mut buf_ptr, alignment, aligned_len) == 0 {
+                    // Copy data directly to the aligned buffer once
+                    libc::memcpy(buf_ptr, data.as_ptr() as *const libc::c_void, data_len);
+                    if aligned_len > data_len {
+                        libc::memset(
+                            (buf_ptr as usize + data_len) as *mut libc::c_void,
+                            0,
+                            aligned_len - data_len,
+                        );
+                    }
+                    buf_ptr as usize
+                } else {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(
+                        "posix_memalign failed for write block".to_string(),
+                    ));
+                }
+            }
+        };
+
         tokio::task::spawn_blocking(move || {
-            file.write_all_at(&data_vec, offset)
-                .map_err(|e| crate::error::SqueezefsError::Io(e))?;
+            let aligned_slice = unsafe {
+                std::slice::from_raw_parts(buf_addr as *const u8, aligned_len)
+            };
+            let res = file.write_all_at(aligned_slice, offset);
+            unsafe {
+                libc::free(buf_addr as *mut libc::c_void);
+            }
+            res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
             Ok::<(), crate::error::SqueezefsError>(())
         })
         .await
@@ -67,6 +114,7 @@ impl NvmeBlockDev {
                 e
             ))
         })??;
+
         crate::fuse_client::METRICS
             .put_obj
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -92,10 +140,28 @@ impl NvmeBlockDev {
     pub async fn read_block(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
         let file = self.get_file()?;
         let res = tokio::task::spawn_blocking(move || {
-            let mut buf = vec![0u8; size];
-            file.read_exact_at(&mut buf, offset)
-                .map_err(|e| crate::error::SqueezefsError::Io(e))?;
-            Ok::<Vec<u8>, crate::error::SqueezefsError>(buf)
+            let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
+            let alignment = 4096;
+            let aligned_size = (size + 4095) & !4095;
+            let mut result_vec = vec![0u8; size];
+
+            unsafe {
+                if libc::posix_memalign(&mut buf_ptr, alignment, aligned_size) == 0 {
+                    let aligned_slice = std::slice::from_raw_parts_mut(buf_ptr as *mut u8, aligned_size);
+                    
+                    let res = file.read_exact_at(aligned_slice, offset);
+                    if res.is_ok() {
+                        libc::memcpy(result_vec.as_mut_ptr() as *mut libc::c_void, buf_ptr, size);
+                    }
+                    libc::free(buf_ptr);
+                    
+                    res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
+                } else {
+                    file.read_exact_at(&mut result_vec, offset)
+                        .map_err(|e| crate::error::SqueezefsError::Io(e))?;
+                }
+            }
+            Ok::<Vec<u8>, crate::error::SqueezefsError>(result_vec)
         })
         .await
         .map_err(|e| {

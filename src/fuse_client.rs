@@ -5166,11 +5166,37 @@ pub async fn format_volume_ext(
                 );
             }
 
-            let file_result = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(target_path);
+            let mut file_result = {
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .custom_flags(libc::O_DIRECT)
+                        .open(target_path)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(target_path)
+                }
+            };
+
+            let mut is_direct = file_result.is_ok();
+            if file_result.is_err() {
+                // Fallback to standard open without O_DIRECT
+                file_result = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(target_path);
+                is_direct = false;
+            }
 
             match file_result {
                 Ok(file) => {
@@ -5183,7 +5209,7 @@ pub async fn format_volume_ext(
                     let total_chunks = wipe_len.div_ceil(chunk_size);
                     let next_chunk = Arc::new(AtomicU64::new(0));
 
-                    let pb = indicatif::ProgressBar::new(wipe_len);
+                    let pb = indicatif::ProgressBar::new(capacity);
                     pb.set_style(
                         indicatif::ProgressStyle::default_bar()
                             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -5192,7 +5218,7 @@ pub async fn format_volume_ext(
                     );
                     let pb = Arc::new(pb);
 
-                    let num_threads = if wipe_len <= 32 * 1024 * 1024 { 1 } else { 8 };
+                    let num_threads = if wipe_len <= 32 * 1024 * 1024 { 1 } else { 4 };
 
                     let mut handles = vec![];
                     for _ in 0..num_threads {
@@ -5202,7 +5228,21 @@ pub async fn format_volume_ext(
                         let target_path_str = target_path.to_string();
 
                         let handle = std::thread::spawn(move || {
-                            let zeros = vec![0u8; chunk_size as usize];
+                            let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
+                            let alignment = 4096;
+                            let size = chunk_size as usize;
+                            
+                            let zeros_slice = unsafe {
+                                if is_direct && libc::posix_memalign(&mut buf_ptr, alignment, size) == 0 {
+                                    libc::memset(buf_ptr, 0, size);
+                                    std::slice::from_raw_parts(buf_ptr as *const u8, size)
+                                } else {
+                                    // Fallback to standard vector allocation
+                                    buf_ptr = std::ptr::null_mut();
+                                    &vec![0u8; size]
+                                }
+                            };
+
                             loop {
                                 let chunk_idx = next_chunk_clone.fetch_add(1, Ordering::Relaxed);
                                 if chunk_idx >= total_chunks {
@@ -5213,7 +5253,7 @@ pub async fn format_volume_ext(
                                 let to_write = std::cmp::min(chunk_size, wipe_len - offset);
 
                                 if let Err(e) =
-                                    file_clone.write_at(&zeros[..to_write as usize], offset)
+                                    file_clone.write_at(&zeros_slice[..to_write as usize], offset)
                                 {
                                     log::warn!(
                                         "Failed to write zero block to NVMe target {} at offset {}: {:?}",
@@ -5224,6 +5264,12 @@ pub async fn format_volume_ext(
                                     break;
                                 }
                                 pb_clone.inc(to_write);
+                            }
+
+                            if !buf_ptr.is_null() {
+                                unsafe {
+                                    libc::free(buf_ptr);
+                                }
                             }
                         });
                         handles.push(handle);

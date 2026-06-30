@@ -62,6 +62,28 @@ impl BlockAllocator {
         Ok(())
     }
 
+    pub async fn free_blocks(&self, offsets: &[u64]) -> Result<()> {
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        let chunk_size = 4 * 1024 * 1024;
+        let free_set_key = format!("{}:free_blocks", self.volume_id);
+
+        let mut conn = self.client.get_connection().await?;
+        let mut pipe = redis::pipe();
+        for &offset in offsets {
+            let block_idx = offset / chunk_size;
+            pipe.cmd("SADD").arg(&free_set_key).arg(block_idx);
+        }
+        let _: () = pipe.query_async(&mut conn).await?;
+
+        crate::fuse_client::METRICS
+            .del_obj
+            .fetch_add(offsets.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
     pub async fn calculate_fragmentation(&self) -> Result<(u64, u64, u64, f64)> {
         let free_set_key = format!("{}:free_blocks", self.volume_id);
         let max_block_key = format!("{}:highest_block", self.volume_id);

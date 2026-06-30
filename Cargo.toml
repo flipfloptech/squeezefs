@@ -52,6 +52,7 @@ twox-hash = "1.6"
 bytes = { version = "1.5", features = ["serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crossbeam = "0.8"
+scc = "3.8.3"
 
 [features]
 default = []

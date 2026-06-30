@@ -21,12 +21,20 @@ sudo apt update && sudo apt install -y \
 ```
 
 ### Step 1: Start Metadata Service
-For performance evaluation, you can run Garnet in Docker on the target hosts, or deploy it directly to your cluster:
+For performance evaluation, you can run Garnet on the target hosts, or deploy it directly to your cluster:
 
-* **Microsoft Garnet (Metadata):**
+* **Option A: Custom SqueezeFS-Garnet Container (Recommended for Max Performance):**
+  Builds the custom C# transaction extensions automatically:
   ```bash
-  docker run -d --name squeezefs-garnet --network host ghcr.io/microsoft/garnet:latest --lua
+  podman build -t squeezefs-garnet -f docker/Dockerfile.garnet docker/
+  podman run -d --rm --replace --name squeezefs-garnet -p 6379:6379 squeezefs-garnet
   ```
+
+* **Option B: Standard Microsoft Garnet Container (Fallback):**
+  ```bash
+  podman run -d --rm --replace --name squeezefs-garnet -p 6379:6379 ghcr.io/microsoft/garnet:latest
+  ```
+  *(Note: Standard Garnet does not support C# extensions out-of-the-box. SqueezeFS will automatically fall back to standard pipelined metadata deletion).*
 
 ### Step 2: Build Squeezefs Client
 Clone and compile the repository with optimizations:
@@ -193,20 +201,18 @@ This suite profiles:
 
 ## 5. Deploying Garnet C# Custom Command Extensions
 
-To simplify deployment and avoid forcing administrators to manually compile C# projects and manage DLL paths, SqueezeFS provides a pre-packaged docker container build config under the `docker/` folder.
+To simplify deployment and avoid forcing administrators to manually compile C# projects or manage DLL paths, SqueezeFS automates the C# transaction deployment.
 
-### 1. Build the Custom Garnet Image
-Run the following build command in the root of the squeezefs repository. This leverages a multi-stage Dockerfile that fetches the standard .NET SDK, compiles the extensions, and copies the resulting binary into the Garnet runtime base image:
+### 1. Build and Run the Custom Image
+The multi-stage `docker/Dockerfile.garnet` extracts the exact assembly binaries from the base Garnet image, references them in C#, builds the project under .NET 10 SDK, and places the compiled `SqueezeExtensions.dll` inside the `/app/extensions` folder. It starts the server with `--enable-module-command yes` and `--extension-allow-unsigned`:
 ```bash
-docker build -t squeezefs-garnet -f docker/Dockerfile.garnet docker/
+podman build -t squeezefs-garnet -f docker/Dockerfile.garnet docker/
+podman run -d --rm --replace --name squeezefs-garnet -p 6379:6379 squeezefs-garnet
 ```
 
-### 2. Run the Container
-Launch the container as a drop-in replacement for the standard Microsoft Garnet image:
-```bash
-docker run -d \
-  --name squeezefs-garnet \
-  --network host \
-  squeezefs-garnet
+### 2. Automatic Registration
+Upon the first file deletion request, the SqueezeFS client daemon automatically sends a `REGISTERCS` command to the Garnet server:
+```text
+REGISTERCS TXN SqueezeUnlink 6 SqueezeUnlink SRC /app/extensions/SqueezeExtensions.dll
 ```
-The custom container automatically starts Garnet with the compiled SqueezeFS extensions preloaded and registered, allowing the filesystem daemon to execute namespace and deallocation transactions in a single RESP round-trip.
+This registers the transaction on the fly. No manual registration CLI calls or configuration file edits are required from system administrators. If registration fails or standard Garnet is used, the client seamlessly falls back to standard pipelined metadata deletion.

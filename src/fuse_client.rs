@@ -1394,14 +1394,11 @@ impl Filesystem for SqueezefsFilesystem {
                     .await
                     .map_err(map_squeezefs_err)?;
                 let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
-                let entries_map: std::collections::HashMap<String, u64> =
-                    con.hgetall(&dir_key).await.map_err(map_err)?;
-                let entries_arc = std::sync::Arc::new(entries_map);
-                self.dir_entry_cache.insert(parent, entries_arc.clone());
-                if let Some(&ino) = entries_arc.get(&*name_str) {
-                    ino
-                } else {
-                    return Err(Errno::from(libc::ENOENT));
+                let ino_str: Option<String> =
+                    con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
+                match ino_str {
+                    Some(s) => s.parse::<u64>().unwrap_or(0),
+                    None => return Err(Errno::from(libc::ENOENT)),
                 }
             };
 
@@ -2737,19 +2734,15 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let unlink_future = async {
-            let mut con = self
-                .dlm
-                .get_connection_for_inode(parent)
-                .await
-                .map_err(map_squeezefs_err)?;
-
             let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
+            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO);
             let sec = now.as_secs() as i64;
             let nsec = now.subsec_nanos();
 
+            // 1. Get child inode (from cache or parent directory lookup)
             let ino = if let Some(cached_ino) = self
                 .dir_entry_cache
                 .get(&parent)
@@ -2757,6 +2750,11 @@ impl Filesystem for SqueezefsFilesystem {
             {
                 cached_ino
             } else {
+                let mut con = self
+                    .dlm
+                    .get_connection_for_inode(parent)
+                    .await
+                    .map_err(map_squeezefs_err)?;
                 let ino_str: Option<String> =
                     con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
                 match ino_str {
@@ -2768,99 +2766,156 @@ impl Filesystem for SqueezefsFilesystem {
             let child_attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
             let meta_key = format!("metadata:inode_{}", ino);
 
-            let mut child_con = self
-                .dlm
-                .get_connection_for_inode(ino)
-                .await
-                .map_err(map_squeezefs_err)?;
+            // 2. Perform parent directory entry deletion and child stats modification concurrently
+            let parent_fut = async {
+                let mut con = self
+                    .dlm
+                    .get_connection_for_inode(parent)
+                    .await
+                    .map_err(map_squeezefs_err)?;
+                let mut parent_pipe = redis::pipe();
+                parent_pipe.hdel(&dir_key, &*name_str);
+                parent_pipe.hset_multiple(
+                    &parent_attr_key,
+                    &[
+                        ("mtime_sec", sec.to_string()),
+                        ("mtime_nsec", nsec.to_string()),
+                        ("ctime_sec", sec.to_string()),
+                        ("ctime_nsec", nsec.to_string()),
+                    ],
+                );
+                let (deleted, _): (i64, ()) = parent_pipe.query_async(&mut con).await.map_err(map_err)?;
+                if deleted == 0 {
+                    return Err(Errno::from(libc::ENOENT));
+                }
+                Ok::<(), Errno>(())
+            };
 
-            let mut pipe = redis::pipe();
-            pipe.cmd("HGET").arg(&child_attr_key).arg("kind");
-            pipe.cmd("HGET").arg(&child_attr_key).arg("size");
-            pipe.cmd("HGET").arg(&meta_key).arg("type");
-            let (kind_str, size_str, type_str): (Option<String>, Option<String>, Option<String>) =
-                pipe.query_async(&mut child_con).await.map_err(map_err)?;
+            let cached_attr = self.attr_cache.get(&ino).map(|e| e.value().0);
+            let cached_type = self.router.metadata_cache.get(&format!("inode_{}", ino)).map(|e| e.file_type.clone());
 
-            let kind = kind_str.and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
-            if kind == 2 {
+            let child_fut = async {
+                let mut child_con = self
+                    .dlm
+                    .get_connection_for_inode(ino)
+                    .await
+                    .map_err(map_squeezefs_err)?;
+
+                let (kind, size, file_type, new_nlink) = match (cached_attr, cached_type) {
+                    (Some(attr), Some(t)) => {
+                        let new_nlink = child_con
+                            .hincr(&child_attr_key, "nlink", -1)
+                            .await
+                            .map_err(map_err)?;
+                        (attr.kind, attr.size, t, new_nlink)
+                    }
+                    _ => {
+                        let mut child_pipe = redis::pipe();
+                        child_pipe.cmd("HGET").arg(&child_attr_key).arg("kind");
+                        child_pipe.cmd("HGET").arg(&child_attr_key).arg("size");
+                        child_pipe.cmd("HGET").arg(&meta_key).arg("type");
+                        child_pipe.hincr(&child_attr_key, "nlink", -1);
+                        let (kind_str, size_str, type_str, new_nlink): (Option<String>, Option<String>, Option<String>, i64) =
+                            child_pipe.query_async(&mut child_con).await.map_err(map_err)?;
+                        let kind_num = kind_str.and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+                        let kind = if kind_num == 2 { FileType::Directory } else { FileType::RegularFile };
+                        let size = size_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                        let file_type = type_str.unwrap_or_else(|| "inline".to_string());
+                        (kind, size, file_type, new_nlink)
+                    }
+                };
+                Ok::<_, Errno>((kind, size, file_type, new_nlink))
+            };
+
+            let (_, (kind, file_size, file_type, mut new_nlink)) =
+                tokio::try_join!(parent_fut, child_fut)?;
+
+            if kind == FileType::Directory {
                 return Err(Errno::from(libc::EISDIR));
             }
 
-            let deleted: i64 = con.hdel(&dir_key, &*name_str).await.map_err(map_err)?;
-            if deleted == 0 {
-                return Err(Errno::from(libc::ENOENT));
-            }
-
-            let mut new_nlink: i64 = child_con
-                .hincr(&child_attr_key, "nlink", -1)
-                .await
-                .map_err(map_err)?;
-
             if new_nlink < 0 {
                 new_nlink = 0;
+                let mut child_con = self
+                    .dlm
+                    .get_connection_for_inode(ino)
+                    .await
+                    .map_err(map_squeezefs_err)?;
                 let _: () = child_con
                     .hset(&child_attr_key, "nlink", 0)
                     .await
                     .map_err(map_err)?;
             }
 
-            let file_size = size_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            let file_type = type_str.unwrap_or_else(|| "inline".to_string());
-
-            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
-
-            let mut parent_pipe = redis::pipe();
-            parent_pipe.hset_multiple(
-                &parent_attr_key,
-                &[
-                    ("mtime_sec", sec.to_string()),
-                    ("mtime_nsec", nsec.to_string()),
-                    ("ctime_sec", sec.to_string()),
-                    ("ctime_nsec", nsec.to_string()),
-                ],
-            );
-            let _: () = parent_pipe.query_async(&mut con).await.map_err(map_err)?;
-
             if new_nlink == 0 {
-                // Delete metadata and data completely
                 let file_path = format!("inode_{}", ino);
                 let inline_key = format!("inline_data:{}", file_path);
                 let meta_key_del = format!("metadata:{}", file_path);
                 let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), ino);
 
-                if file_type != "inline" {
-                    self.router
-                        .delete_file(&file_path, &mut child_con)
+                // 3. Delete blocks, delete keys, update global limits, and release leases concurrently
+                let delete_blocks_fut = async {
+                    if file_type != "inline" {
+                        let mut child_con = self
+                            .dlm
+                            .get_connection_for_inode(ino)
+                            .await
+                            .map_err(map_squeezefs_err)?;
+                        self.router
+                            .delete_file(&file_path, &mut child_con)
+                            .await
+                            .map_err(map_squeezefs_err)?;
+                    }
+                    Ok::<(), Errno>(())
+                };
+
+                let delete_keys_fut = async {
+                    let mut child_con = self
+                        .dlm
+                        .get_connection_for_inode(ino)
                         .await
                         .map_err(map_squeezefs_err)?;
-                }
+                    let mut child_del_pipe = redis::pipe();
+                    child_del_pipe
+                        .del(&child_attr_key)
+                        .del(&inline_key)
+                        .del(&meta_key_del)
+                        .del(&symlink_key);
+                    let _: () = child_del_pipe
+                        .query_async(&mut child_con)
+                        .await
+                        .map_err(map_err)?;
+                    Ok::<(), Errno>(())
+                };
 
-                let mut child_del_pipe = redis::pipe();
-                child_del_pipe
-                    .del(&child_attr_key)
-                    .del(&inline_key)
-                    .del(&meta_key_del)
-                    .del(&symlink_key);
-                let _: () = child_del_pipe
-                    .query_async(&mut child_con)
-                    .await
-                    .map_err(map_err)?;
+                let global_update_fut = async {
+                    let mut global_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+                    let mut global_pipe = redis::pipe();
+                    global_pipe
+                        .decr(crate::fs_key!("used_bytes"), file_size)
+                        .decr(crate::fs_key!("used_inodes"), 1);
+                    let _: () = global_pipe
+                        .query_async(&mut global_con)
+                        .await
+                        .map_err(map_err)?;
+                    Ok::<(), Errno>(())
+                };
 
-                let mut global_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
-                let mut global_pipe = redis::pipe();
-                global_pipe
-                    .decr(crate::fs_key!("used_bytes"), file_size)
-                    .decr(crate::fs_key!("used_inodes"), 1);
-                let _: () = global_pipe
-                    .query_async(&mut global_con)
-                    .await
-                    .map_err(map_err)?;
+                let lease_release_fut = async {
+                    if let Some((_, lease)) = self.active_leases.remove(&ino) {
+                        let _ = lease.release().await;
+                    }
+                    self.active_inode_locks.remove(&ino);
+                    self.active_posix_locks.retain(|key, _| key.0 != ino);
+                    Ok::<(), Errno>(())
+                };
 
-                if let Some((_, lease)) = self.active_leases.remove(&ino) {
-                    let _ = lease.release().await;
-                }
-                self.active_inode_locks.remove(&ino);
-                self.active_posix_locks.retain(|key, _| key.0 != ino);
+                tokio::try_join!(
+                    delete_blocks_fut,
+                    delete_keys_fut,
+                    global_update_fut,
+                    lease_release_fut
+                )?;
             }
 
             // Invalidate attr_cache, router metadata_cache, and dir_entry_cache

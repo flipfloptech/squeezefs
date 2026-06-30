@@ -2464,31 +2464,48 @@ impl DataRouter {
                     let block_mappings: std::collections::HashMap<String, String> =
                         con.hgetall(&block_map_key).await?;
 
-                    for (idx_str, bk) in block_mappings {
-                        if let Ok(idx) = idx_str.parse::<u32>() {
-                            self.block_map_cache
-                                .invalidate(&(block_map_id.clone(), idx));
-                        }
-                        let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
-                        if let Some(mut r) = current_ref {
-                            r -= 1;
-                            if r <= 0 {
-                                let _: () = redis::pipe()
-                                    .hdel(refcounts_key, &bk)
-                                    .hdel(crate::fs_key!("block_sizes"), &bk)
-                                    .query_async(con)
-                                    .await?;
-                                let _ = self.backend_router.free_block(&bk).await;
-                            } else {
-                                let _: () = con.hset(refcounts_key, &bk, r).await?;
+                    if !block_mappings.is_empty() {
+                        for (idx_str, _) in &block_mappings {
+                            if let Ok(idx) = idx_str.parse::<u32>() {
+                                self.block_map_cache
+                                    .invalidate(&(block_map_id.clone(), idx));
                             }
-                        } else {
-                            let _: () = con
-                                .hdel(crate::fs_key!("block_sizes"), &bk)
-                                .await
-                                .unwrap_or(());
-                            let _ = self.backend_router.free_block(&bk).await;
                         }
+
+                        // 1. Pipeline query all refcounts
+                        let mut get_pipe = redis::pipe();
+                        for (_, bk) in &block_mappings {
+                            get_pipe.hget(refcounts_key, bk);
+                        }
+                        let refcounts: Vec<Option<i32>> = get_pipe.query_async(con).await?;
+
+                        // 2. Pipeline updates/deletes
+                        let mut update_pipe = redis::pipe();
+                        let mut free_futures = Vec::new();
+                        let mut has_updates = false;
+                        for ((_, bk), ref_opt) in block_mappings.iter().zip(refcounts) {
+                            if let Some(mut r) = ref_opt {
+                                r -= 1;
+                                if r <= 0 {
+                                    update_pipe
+                                        .hdel(refcounts_key, bk)
+                                        .hdel(crate::fs_key!("block_sizes"), bk);
+                                    free_futures.push(self.backend_router.free_block(bk));
+                                    has_updates = true;
+                                } else {
+                                    update_pipe.hset(refcounts_key, bk, r);
+                                    has_updates = true;
+                                }
+                            } else {
+                                update_pipe.hdel(crate::fs_key!("block_sizes"), bk);
+                                free_futures.push(self.backend_router.free_block(bk));
+                                has_updates = true;
+                            }
+                        }
+                        if has_updates {
+                            let _: () = update_pipe.query_async(con).await?;
+                        }
+                        futures::future::join_all(free_futures).await;
                     }
                     let _: () = con.del(&block_map_key).await?;
                 }

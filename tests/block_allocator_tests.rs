@@ -249,7 +249,10 @@ async fn test_pipelined_block_free() {
     let offset3 = allocator.allocate_block().await.unwrap();
 
     // Call pipelined free_blocks
-    allocator.free_blocks(&[offset1, offset2, offset3]).await.expect("Failed batch free");
+    allocator
+        .free_blocks(&[offset1, offset2, offset3])
+        .await
+        .expect("Failed batch free");
 
     // Verify they are added to the free blocks set
     let client2 = redis::Client::open("redis://127.0.0.1:6379").unwrap();
@@ -364,4 +367,3 @@ async fn test_delete_file_with_fallback() {
 
     let _ = std::fs::remove_file(dev0_path);
 }
-

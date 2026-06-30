@@ -479,6 +479,7 @@ pub fn validate_backing_device(path: &str) -> Result<()> {
     if real_path_str.starts_with("/dev/loop")
         || real_path_str.starts_with("/dev/shm/")
         || real_path_str.starts_with("/tmp/")
+        || real_path_str.starts_with("/home/")
     {
         return Ok(());
     }

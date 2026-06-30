@@ -230,20 +230,21 @@ impl CryptoCompressState {
         }
     }
 
-    pub fn process_read(&self, data: &[u8]) -> Result<Vec<u8>, SqueezefsError> {
+    pub fn process_read<'a>(&self, data: &'a [u8]) -> Result<std::borrow::Cow<'a, [u8]>, SqueezefsError> {
         let compression = self.compression.trim();
         let encrypt_algo = self.encrypt_algo.trim();
         if (compression == "none" || compression.is_empty())
             && (encrypt_algo == "none" || encrypt_algo.is_empty())
         {
-            Ok(data.to_vec())
+            Ok(std::borrow::Cow::Borrowed(data))
         } else {
             let decrypted = if encrypt_algo != "none" && !encrypt_algo.is_empty() {
                 self.decrypt(data)?
             } else {
                 data.to_vec()
             };
-            self.decompress(&decrypted)
+            let decompressed = self.decompress(&decrypted)?;
+            Ok(std::borrow::Cow::Owned(decompressed))
         }
     }
 }

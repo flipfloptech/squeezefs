@@ -829,7 +829,7 @@ impl SqueezefsFilesystem {
                                     let get_res = async {
                                         let raw = self.router.read_nvme_block(&bk).await?;
                                         let decompressed =
-                                            self.router.get_crypto().process_read(&raw)?;
+                                            self.router.get_crypto().process_read(&raw)?.into_owned();
                                         Ok::<Vec<u8>, SqueezefsError>(decompressed)
                                     }
                                     .await;
@@ -2008,6 +2008,7 @@ impl Filesystem for SqueezefsFilesystem {
                             .get_crypto()
                             .process_read(&b)
                             .map_err(map_squeezefs_err)?
+                            .into_owned()
                     } else {
                         Vec::new()
                     }

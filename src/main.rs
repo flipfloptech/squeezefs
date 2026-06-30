@@ -981,7 +981,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let core_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    if !core_ids.is_empty() {
+        rt_builder.worker_threads(core_ids.len());
+    }
+    let rt = rt_builder
         .enable_all()
         .max_blocking_threads(8192)
         .on_thread_start(move || {

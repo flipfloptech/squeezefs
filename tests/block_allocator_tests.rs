@@ -15,7 +15,7 @@ async fn test_allocate_and_free_block() {
             .query(&mut conn)
             .unwrap_or_default();
     }
-    let meta = Arc::new(MetaClient::Single(client));
+    let meta = Arc::new(MetaClient::new_single(client));
 
     let allocator = BlockAllocator::new(meta, "test_vol_1")
         .await
@@ -62,7 +62,7 @@ async fn test_concurrent_allocations() {
             .query(&mut conn)
             .unwrap_or_default();
     }
-    let meta = Arc::new(MetaClient::Single(client));
+    let meta = Arc::new(MetaClient::new_single(client));
 
     let allocator = Arc::new(
         BlockAllocator::new(meta, "test_vol_concurrent")
@@ -106,7 +106,7 @@ async fn test_interleaved_alloc_free() {
             .query(&mut conn)
             .unwrap_or_default();
     }
-    let meta = Arc::new(MetaClient::Single(client));
+    let meta = Arc::new(MetaClient::new_single(client));
 
     let allocator = Arc::new(
         BlockAllocator::new(meta, "test_vol_interleaved")
@@ -159,7 +159,7 @@ async fn test_backend_router_routing() {
             .query(&mut conn)
             .unwrap_or_default();
     }
-    let meta = Arc::new(MetaClient::Single(client));
+    let meta = Arc::new(MetaClient::new_single(client));
 
     // Create temporary backing files for test
     let dev0_path = "/tmp/squeezefs_test_be_routing_dev0";

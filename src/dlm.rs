@@ -7,9 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
-static SINGLE_CONN_POOL: Lazy<
-    dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>,
-> = Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
+pub struct ConnectionPool {
+    pub conns: Vec<std::sync::Arc<parking_lot::RwLock<redis::aio::MultiplexedConnection>>>,
+    pub counter: AtomicUsize,
+}
+
+
 
 pub static SENTINEL_CONN_POOL: Lazy<
     dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>,
@@ -54,7 +57,10 @@ pub fn parse_inode_from_key(key: &str) -> Option<u64> {
 
 #[derive(Clone)]
 pub enum MetaClient {
-    Single(redis::Client),
+    Single {
+        client: redis::Client,
+        pool: std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<ConnectionPool>>>,
+    },
     SingleBound {
         client: redis::Client,
         bound_conns: Vec<BoundConnection>,
@@ -78,6 +84,7 @@ pub enum MetaConnection {
         sentinel_client:
             Option<std::sync::Arc<tokio::sync::Mutex<redis::sentinel::SentinelClient>>>,
         service_name: Option<String>,
+        pool_index: Option<(std::sync::Arc<ConnectionPool>, usize)>,
     },
     Cluster(redis::cluster_async::ClusterConnection),
 }
@@ -115,11 +122,13 @@ impl ConnectionLike for MetaConnection {
                 bound_conn,
                 sentinel_client,
                 service_name,
+                pool_index,
             } => {
                 let client_opt = client.clone();
                 let bound_conn_opt = bound_conn.clone();
                 let sentinel_opt = sentinel_client.clone();
                 let service_name_opt = service_name.clone();
+                let pool_index_opt = pool_index.clone();
                 Box::pin(async move {
                     let res = conn.req_packed_command(cmd).await;
                     if let Err(ref e) = res {
@@ -127,7 +136,7 @@ impl ConnectionLike for MetaConnection {
                         {
                             if let Some(bound) = &bound_conn_opt {
                                 warn!(
-                                    "Cached SingleBound connection broken: {:?}. Reconnecting...",
+                                    "Cached SingleBound connection broken: {:?}",
                                     e
                                 );
                                 match reconnect_bound(bound).await {
@@ -144,7 +153,7 @@ impl ConnectionLike for MetaConnection {
                                 }
                             } else if let Some(sentinel) = &sentinel_opt {
                                 warn!(
-                                    "Cached Sentinel connection broken: {:?}. Reconnecting...",
+                                    "Cached Sentinel connection broken: {:?}",
                                     e
                                 );
                                 let mut guard = sentinel.lock().await;
@@ -161,19 +170,20 @@ impl ConnectionLike for MetaConnection {
                                         error!("Failed to reconnect Sentinel: {:?}", reconnect_err);
                                     }
                                 }
-                            } else if let Some(client_ref) = &client_opt {
-                                warn!("Cached Redis connection broken: {:?}. Reconnecting...", e);
-                                let db = client_ref.get_connection_info().redis.db;
-                                let addr_str =
-                                    format!("{:?}/{}", client_ref.get_connection_info().addr, db);
-                                match client_ref.get_multiplexed_tokio_connection().await {
-                                    Ok(new_conn) => {
-                                        SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
-                                        *conn = new_conn;
-                                        return conn.req_packed_command(cmd).await;
-                                    }
-                                    Err(reconnect_err) => {
-                                        error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                            } else if let Some((pool, pool_idx)) = &pool_index_opt {
+                                warn!("Cached Redis pool connection {} broken: {:?}", pool_idx, e);
+                                if let Some(client_ref) = &client_opt {
+                                    match client_ref.get_multiplexed_tokio_connection().await {
+                                        Ok(new_conn) => {
+                                            if *pool_idx < pool.conns.len() {
+                                                *pool.conns[*pool_idx].write() = new_conn.clone();
+                                            }
+                                            *conn = new_conn;
+                                            return conn.req_packed_command(cmd).await;
+                                        }
+                                        Err(reconnect_err) => {
+                                            error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                                        }
                                     }
                                 }
                             }
@@ -199,18 +209,20 @@ impl ConnectionLike for MetaConnection {
                 bound_conn,
                 sentinel_client,
                 service_name,
+                pool_index,
             } => {
                 let client_opt = client.clone();
                 let bound_conn_opt = bound_conn.clone();
                 let sentinel_opt = sentinel_client.clone();
                 let service_name_opt = service_name.clone();
+                let pool_index_opt = pool_index.clone();
                 Box::pin(async move {
                     let res = conn.req_packed_commands(cmd, offset, count).await;
                     if let Err(ref e) = res {
                         if e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()
                         {
                             if let Some(bound) = &bound_conn_opt {
-                                warn!("Cached SingleBound connection broken in pipeline: {:?}. Reconnecting...", e);
+                                warn!("Cached SingleBound connection broken in pipeline: {:?}", e);
                                 match reconnect_bound(bound).await {
                                     Ok(new_conn) => {
                                         *conn = new_conn;
@@ -224,7 +236,7 @@ impl ConnectionLike for MetaConnection {
                                     }
                                 }
                             } else if let Some(sentinel) = &sentinel_opt {
-                                warn!("Cached Sentinel connection broken in pipeline: {:?}. Reconnecting...", e);
+                                warn!("Cached Sentinel connection broken in pipeline: {:?}", e);
                                 let mut guard = sentinel.lock().await;
                                 match guard.get_async_connection().await {
                                     Ok(new_conn) => {
@@ -239,19 +251,20 @@ impl ConnectionLike for MetaConnection {
                                         error!("Failed to reconnect Sentinel: {:?}", reconnect_err);
                                     }
                                 }
-                            } else if let Some(client_ref) = &client_opt {
-                                warn!("Cached Redis connection broken in pipeline: {:?}. Reconnecting...", e);
-                                let db = client_ref.get_connection_info().redis.db;
-                                let addr_str =
-                                    format!("{:?}/{}", client_ref.get_connection_info().addr, db);
-                                match client_ref.get_multiplexed_tokio_connection().await {
-                                    Ok(new_conn) => {
-                                        SINGLE_CONN_POOL.insert(addr_str.clone(), new_conn.clone());
-                                        *conn = new_conn;
-                                        return conn.req_packed_commands(cmd, offset, count).await;
-                                    }
-                                    Err(reconnect_err) => {
-                                        error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                            } else if let Some((pool, pool_idx)) = &pool_index_opt {
+                                warn!("Cached Redis pool connection {} broken in pipeline: {:?}", pool_idx, e);
+                                if let Some(client_ref) = &client_opt {
+                                    match client_ref.get_multiplexed_tokio_connection().await {
+                                        Ok(new_conn) => {
+                                            if *pool_idx < pool.conns.len() {
+                                                *pool.conns[*pool_idx].write() = new_conn.clone();
+                                            }
+                                            *conn = new_conn;
+                                            return conn.req_packed_commands(cmd, offset, count).await;
+                                        }
+                                        Err(reconnect_err) => {
+                                            error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                                        }
                                     }
                                 }
                             }
@@ -375,7 +388,17 @@ impl MetaClient {
             })
         } else {
             let client = redis::Client::open(redis_url)?;
-            Ok(Self::Single(client))
+            Ok(Self::Single {
+                client,
+                pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            })
+        }
+    }
+
+    pub fn new_single(client: redis::Client) -> Self {
+        Self::Single {
+            client,
+            pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -457,13 +480,19 @@ impl MetaClient {
         } else {
             let client = redis::Client::open(redis_url)?;
             if local_ips.is_empty() {
-                Ok(Self::Single(client))
+                Ok(Self::Single {
+                    client,
+                    pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+                })
             } else {
                 let remote_addr = match resolve_redis_addr(redis_url) {
                     Ok(addr) => addr,
                     Err(e) => {
                         warn!("Could not resolve Redis address: {:?}. Falling back to default client.", e);
-                        return Ok(Self::Single(client));
+                        return Ok(Self::Single {
+                            client,
+                            pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+                        });
                     }
                 };
 
@@ -504,7 +533,10 @@ impl MetaClient {
 
                 if bound_conns.is_empty() {
                     warn!("Failed to connect on all interfaces. Falling back to default routing.");
-                    Ok(Self::Single(client))
+                    Ok(Self::Single {
+                        client,
+                        pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+                    })
                 } else {
                     Ok(Self::SingleBound {
                         client,
@@ -518,29 +550,40 @@ impl MetaClient {
 
     pub async fn get_connection(&self) -> Result<MetaConnection> {
         match self {
-            Self::Single(client) => {
-                let db = client.get_connection_info().redis.db;
-                let addr_str = format!("{:?}/{}", client.get_connection_info().addr, db);
-                let conn = if let Some(conn) = SINGLE_CONN_POOL.get(&addr_str).map(|r| r.clone()) {
-                    conn
-                } else {
-                    let new_conn =
-                        client
-                            .get_multiplexed_tokio_connection()
-                            .await
-                            .map_err(|e| {
-                                println!("REDIS ERROR: {:?}", e);
-                                e
-                            })?;
-                    SINGLE_CONN_POOL.insert(addr_str, new_conn.clone());
-                    new_conn
-                };
+            Self::Single { client, pool } => {
+                let pool_arc = pool.get_or_init(|| async {
+                    let cores = std::thread::available_parallelism()
+                        .map(|p| p.get())
+                        .unwrap_or(8);
+                    let pool_size = std::cmp::max(16, cores * 2);
+                    let mut conns = Vec::new();
+                    for _ in 0..pool_size {
+                        if let Ok(new_conn) = client.get_multiplexed_tokio_connection().await {
+                            conns.push(std::sync::Arc::new(parking_lot::RwLock::new(new_conn)));
+                        }
+                    }
+                    std::sync::Arc::new(ConnectionPool {
+                        conns,
+                        counter: AtomicUsize::new(0),
+                    })
+                }).await;
+
+                if pool_arc.conns.is_empty() {
+                    return Err(SqueezefsError::InvalidOperation(
+                        "Connection pool is empty".to_string(),
+                    ));
+                }
+
+                let idx = pool_arc.counter.fetch_add(1, Ordering::Relaxed);
+                let pool_idx = idx % pool_arc.conns.len();
+                let conn = pool_arc.conns[pool_idx].read().clone();
                 Ok(MetaConnection::Single {
                     conn,
                     client: Some(client.clone()),
                     bound_conn: None,
                     sentinel_client: None,
                     service_name: None,
+                    pool_index: Some((pool_arc.clone(), pool_idx)),
                 })
             }
             Self::SingleBound {
@@ -558,6 +601,7 @@ impl MetaClient {
                         bound_conn: Some(Box::new(bound)),
                         sentinel_client: None,
                         service_name: None,
+                        pool_index: None,
                     });
                 }
                 Err(SqueezefsError::InvalidOperation(
@@ -593,6 +637,7 @@ impl MetaClient {
                     bound_conn: None,
                     sentinel_client: Some(client.clone()),
                     service_name: Some(service_name.clone()),
+                    pool_index: None,
                 })
             }
             Self::Sharded { shards } => {
@@ -869,7 +914,7 @@ impl DlmClient {
 
     pub fn connection_count(&self) -> usize {
         match &self.meta_client {
-            MetaClient::Single(_) => 1,
+            MetaClient::Single { pool, .. } => pool.get().map(|p| p.conns.len()).unwrap_or(1),
             MetaClient::SingleBound { bound_conns, .. } => bound_conns.len(),
             _ => 1,
         }

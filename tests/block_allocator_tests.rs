@@ -216,7 +216,7 @@ async fn test_backend_router_routing() {
         .read_block(&stored_key, 4 * 1024 * 1024)
         .await
         .unwrap();
-    assert_eq!(read_payload, payload);
+    assert_eq!(read_payload.as_ref(), payload.as_slice());
 
     // Free the block via BackendRouter free_block using the key
     router.free_block(&stored_key).await.unwrap();

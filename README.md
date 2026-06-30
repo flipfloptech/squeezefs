@@ -1,5 +1,7 @@
 # Squeezefs
 
+![SqueezeFS Header](github.jpeg)
+
 Squeezefs is a slimmed-down, high-performance distributed filesystem featuring a decoupled metadata store backend (Garnet) and a local or NVMe-oF block device client.
 
 Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal file throughput by leveraging asynchronous network and file architectures, client-side caching, and multi-rail network load balancing over NVMe-oF fabrics.
@@ -134,7 +136,7 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
   squeezefs nvmeof spdk-install
   squeezefs nvmeof spdk-setup [--hugepages <2GB/4GB>]
   squeezefs nvmeof spdk-bind --pci <pci_addr>
-  squeezefs nvmeof spdk-unbind --pci <pci_addr>
+  squeezefs nvmeof unbind --pci <pci_addr>
   squeezefs nvmeof spdk-start
   ```
 
@@ -170,17 +172,3 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
 ## Quick Start & Verification
 
 To get up and running quickly or deploy directly onto physical bare-metal hardware over NVMe-oF, see the [QUICKSTART.md](QUICKSTART.md) guide.
-
----
-
-## Garnet C# Custom Command Extensions
-
-To operating-system-level filesystem requests (such as `unlink`, `rename`, `create`, or `truncate`) that ordinarily require multiple sequential round-trips over the network to the database, SqueezeFS supports consolidation via **Garnet C# Custom Command Extensions**.
-
-### Why C# Extensions Instead of Lua?
-Microsoft Garnet is architected for latch-free, epoch-based multi-threaded execution. Interpreting dynamic Lua scripts halts worker execution and breaks Garnet's concurrency guarantees. By using native C# extensions:
-1. **Compilation to IL/Native Code**: Custom transaction classes are compiled directly into a C# DLL and loaded in-process.
-2. **Latch-Free Concurrency**: Commands run directly at memory speed using the native storage APIs, avoiding interpreter lock bottlenecks.
-3. **Atomic Operations**: Namespace operations (e.g. updating parent entries, decrementing child file link counts, and removing mapping keys) occur atomically inside a single server-side execution loop.
-
-To simplify deployment, SqueezeFS provides a pre-configured multi-stage `Dockerfile.garnet` that automatically compiles the C# extensions against the running server version. The client daemon dynamically registers these custom C# procedures (`SqueezeUnlink`) on startup via the `REGISTERCS` protocol, requiring zero manual configuration or registration CLI steps from system administrators. For details, refer to the [QUICKSTART.md](QUICKSTART.md) guide.

@@ -410,7 +410,11 @@ impl NvmeStaging {
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() >= 8 + meta_len {
                 if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
-                    let data_start = if file_id.starts_with("active_block:") { 4096 } else { 8 + meta_len };
+                    let data_start = if file_id.starts_with("active_block:") {
+                        4096
+                    } else {
+                        8 + meta_len
+                    };
                     let data_end = data_start + meta.original_size as usize;
                     if bytes.len() >= data_end {
                         return Some(bytes[data_start..data_end].to_vec());
@@ -449,7 +453,11 @@ impl NvmeStaging {
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() >= 8 + meta_len {
                 if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
-                    let data_start = if file_id.starts_with("active_block:") { 4096 } else { 8 + meta_len };
+                    let data_start = if file_id.starts_with("active_block:") {
+                        4096
+                    } else {
+                        8 + meta_len
+                    };
                     let data_end = data_start + meta.original_size as usize;
                     if bytes.len() >= data_end {
                         guard.offset += data_start;

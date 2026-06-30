@@ -155,7 +155,8 @@ impl NvmeShard {
             ) as usize;
 
             let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
-            let val_start = (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+            let val_start =
+                (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
             Some(NvmeReadGuard {
                 guard: inner,
                 offset: val_start,
@@ -212,26 +213,7 @@ impl NvmeShard {
         inner.mmap[target_offset + HEADER_SIZE..target_offset + HEADER_SIZE + key_len]
             .copy_from_slice(&key);
         // Write val
-        #[cfg(target_os = "linux")]
-        {
-            let mut spliced = false;
-            if let Some(file) = &self._file {
-                use std::os::fd::AsRawFd;
-                let fd = file.as_raw_fd();
-                if let Err(_e) = splice_write_to_file(fd, val_offset, &value) {
-                    log::debug!("splice_write_to_file failed: {:?}, falling back to copy_from_slice", _e);
-                } else {
-                    spliced = true;
-                }
-            }
-            if !spliced {
-                inner.mmap[val_offset..val_offset + val_len].copy_from_slice(&value);
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            inner.mmap[val_offset..val_offset + val_len].copy_from_slice(&value);
-        }
+        inner.mmap[val_offset..val_offset + val_len].copy_from_slice(&value);
 
         // Update tracking
         let meta = BlockMeta {
@@ -267,7 +249,8 @@ impl NvmeShard {
                     .unwrap(),
             ) as usize;
             let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
-            let val_start = (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+            let val_start =
+                (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
             let val_end = val_start + val_len;
             let val = Bytes::copy_from_slice(&inner.mmap[val_start..val_end]);
 
@@ -729,77 +712,4 @@ mod tests {
         assert!(cache.get(&k1).is_some());
         assert!(cache.get(&k2).is_some());
     }
-}
-
-#[cfg(target_os = "linux")]
-thread_local! {
-    static PIPE: std::cell::RefCell<Option<(std::os::fd::RawFd, std::os::fd::RawFd)>> = std::cell::RefCell::new(None);
-}
-
-#[cfg(target_os = "linux")]
-fn get_thread_pipe() -> Option<(std::os::fd::RawFd, std::os::fd::RawFd)> {
-    PIPE.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        if opt.is_none() {
-            let mut fds = [0; 2];
-            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == 0 {
-                unsafe {
-                    libc::fcntl(fds[1], libc::F_SETPIPE_SZ, 4 * 1024 * 1024);
-                }
-                *opt = Some((fds[0], fds[1]));
-            }
-        }
-        *opt
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn splice_write_to_file(file_fd: std::os::fd::RawFd, offset: usize, data: &[u8]) -> std::io::Result<()> {
-    let (pipe_rd, pipe_wr) = match get_thread_pipe() {
-        Some(p) => p,
-        None => return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to initialize thread-local pipe")),
-    };
-
-    let mut total_written = 0;
-    while total_written < data.len() {
-        let chunk_iov = libc::iovec {
-            iov_base: unsafe { data.as_ptr().add(total_written) } as *mut libc::c_void,
-            iov_len: data.len() - total_written,
-        };
-        let vmsplice_res = unsafe {
-            libc::vmsplice(
-                pipe_wr,
-                &chunk_iov,
-                1,
-                libc::SPLICE_F_GIFT,
-            )
-        };
-        if vmsplice_res < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let written = vmsplice_res as usize;
-
-        let mut total_spliced = 0;
-        while total_spliced < written {
-            let mut file_offset = (offset + total_written + total_spliced) as libc::loff_t;
-            let splice_res = unsafe {
-                libc::splice(
-                    pipe_rd,
-                    std::ptr::null_mut(),
-                    file_fd,
-                    &mut file_offset,
-                    written - total_spliced,
-                    libc::SPLICE_F_MOVE,
-                )
-            };
-            if splice_res < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            total_spliced += splice_res as usize;
-        }
-
-        total_written += written;
-    }
-
-    Ok(())
 }

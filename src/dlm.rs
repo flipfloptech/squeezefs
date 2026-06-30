@@ -12,8 +12,6 @@ pub struct ConnectionPool {
     pub counter: AtomicUsize,
 }
 
-
-
 pub static SENTINEL_CONN_POOL: Lazy<
     dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>,
 > = Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
@@ -135,10 +133,7 @@ impl ConnectionLike for MetaConnection {
                         if e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()
                         {
                             if let Some(bound) = &bound_conn_opt {
-                                warn!(
-                                    "Cached SingleBound connection broken: {:?}",
-                                    e
-                                );
+                                warn!("Cached SingleBound connection broken: {:?}", e);
                                 match reconnect_bound(bound).await {
                                     Ok(new_conn) => {
                                         *conn = new_conn;
@@ -152,10 +147,7 @@ impl ConnectionLike for MetaConnection {
                                     }
                                 }
                             } else if let Some(sentinel) = &sentinel_opt {
-                                warn!(
-                                    "Cached Sentinel connection broken: {:?}",
-                                    e
-                                );
+                                warn!("Cached Sentinel connection broken: {:?}", e);
                                 let mut guard = sentinel.lock().await;
                                 match guard.get_async_connection().await {
                                     Ok(new_conn) => {
@@ -182,7 +174,10 @@ impl ConnectionLike for MetaConnection {
                                             return conn.req_packed_command(cmd).await;
                                         }
                                         Err(reconnect_err) => {
-                                            error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                                            error!(
+                                                "Failed to reconnect to Redis: {:?}",
+                                                reconnect_err
+                                            );
                                         }
                                     }
                                 }
@@ -252,7 +247,10 @@ impl ConnectionLike for MetaConnection {
                                     }
                                 }
                             } else if let Some((pool, pool_idx)) = &pool_index_opt {
-                                warn!("Cached Redis pool connection {} broken in pipeline: {:?}", pool_idx, e);
+                                warn!(
+                                    "Cached Redis pool connection {} broken in pipeline: {:?}",
+                                    pool_idx, e
+                                );
                                 if let Some(client_ref) = &client_opt {
                                     match client_ref.get_multiplexed_tokio_connection().await {
                                         Ok(new_conn) => {
@@ -260,10 +258,15 @@ impl ConnectionLike for MetaConnection {
                                                 *pool.conns[*pool_idx].write() = new_conn.clone();
                                             }
                                             *conn = new_conn;
-                                            return conn.req_packed_commands(cmd, offset, count).await;
+                                            return conn
+                                                .req_packed_commands(cmd, offset, count)
+                                                .await;
                                         }
                                         Err(reconnect_err) => {
-                                            error!("Failed to reconnect to Redis: {:?}", reconnect_err);
+                                            error!(
+                                                "Failed to reconnect to Redis: {:?}",
+                                                reconnect_err
+                                            );
                                         }
                                     }
                                 }
@@ -314,6 +317,13 @@ fn resolve_redis_addr(redis_url: &str) -> Result<SocketAddr> {
         std::io::ErrorKind::AddrNotAvailable,
         format!("No resolved addresses for host: {}", host),
     )))
+}
+
+async fn register_custom_commands(
+    _con: &mut redis::aio::MultiplexedConnection,
+) -> std::result::Result<(), redis::RedisError> {
+    log::info!("Bypassing custom C# transactions registration to force fallback Redis pipelines.");
+    Ok(())
 }
 
 impl MetaClient {
@@ -551,22 +561,31 @@ impl MetaClient {
     pub async fn get_connection(&self) -> Result<MetaConnection> {
         match self {
             Self::Single { client, pool } => {
-                let pool_arc = pool.get_or_init(|| async {
-                    let cores = std::thread::available_parallelism()
-                        .map(|p| p.get())
-                        .unwrap_or(8);
-                    let pool_size = std::cmp::max(16, cores * 2);
-                    let mut conns = Vec::new();
-                    for _ in 0..pool_size {
-                        if let Ok(new_conn) = client.get_multiplexed_tokio_connection().await {
-                            conns.push(std::sync::Arc::new(parking_lot::RwLock::new(new_conn)));
+                let pool_arc = pool
+                    .get_or_init(|| async {
+                        let cores = std::thread::available_parallelism()
+                            .map(|p| p.get())
+                            .unwrap_or(8);
+                        let pool_size = std::cmp::max(16, cores * 2);
+                        let mut conns = Vec::new();
+                        for _ in 0..pool_size {
+                            if let Ok(new_conn) = client.get_multiplexed_tokio_connection().await {
+                                conns.push(std::sync::Arc::new(parking_lot::RwLock::new(new_conn)));
+                            }
                         }
-                    }
-                    std::sync::Arc::new(ConnectionPool {
-                        conns,
-                        counter: AtomicUsize::new(0),
+                        if !conns.is_empty() {
+                            if let Ok(mut reg_conn) =
+                                client.get_multiplexed_tokio_connection().await
+                            {
+                                let _ = register_custom_commands(&mut reg_conn).await;
+                            }
+                        }
+                        std::sync::Arc::new(ConnectionPool {
+                            conns,
+                            counter: AtomicUsize::new(0),
+                        })
                     })
-                }).await;
+                    .await;
 
                 if pool_arc.conns.is_empty() {
                     return Err(SqueezefsError::InvalidOperation(
@@ -1023,6 +1042,40 @@ impl DlmClient {
             heartbeat_tx: Some(tx),
             meta_client: self.meta_client.clone(),
             range,
+        })
+    }
+
+    /// Acquire a lease for a file-level or byte-range lock with adaptive spin-lock backoff and jittered retries.
+    pub async fn acquire_lock_with_retry(
+        &self,
+        file_path: &str,
+        range: Option<(u64, u64)>,
+        ttl: Duration,
+        max_attempts: usize,
+    ) -> Result<LockLease> {
+        let mut backoff = Duration::from_millis(5);
+        for attempt in 0..max_attempts {
+            match self.acquire_lock(file_path, range, ttl).await {
+                Ok(lease) => return Ok(lease),
+                Err(SqueezefsError::LockFailed { reason }) => {
+                    if attempt + 1 == max_attempts {
+                        return Err(SqueezefsError::LockFailed { reason });
+                    }
+                    // Sleep with random jitter
+                    let jitter_limit = backoff.as_micros() as u32;
+                    let jitter = if jitter_limit > 0 {
+                        fastrand::u32(0..jitter_limit / 2)
+                    } else {
+                        0
+                    };
+                    tokio::time::sleep(backoff + Duration::from_micros(jitter as u64)).await;
+                    backoff = std::cmp::min(backoff * 2, Duration::from_millis(100));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SqueezefsError::LockFailed {
+            reason: "Max lock attempts exceeded".to_string(),
         })
     }
 

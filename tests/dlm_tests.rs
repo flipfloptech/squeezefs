@@ -97,6 +97,48 @@ async fn test_lock_drop_auto_release() {
 }
 
 #[tokio::test]
+async fn test_lock_acquisition_retry() {
+    let client = match get_client().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
+            return;
+        }
+    };
+
+    let file_path = "test_file_retry.txt";
+    let mut con = client.meta_client().get_connection().await.unwrap();
+    let lock_key = format!("lock:{}", file_path);
+    let _: () = redis::cmd("DEL")
+        .arg(&lock_key)
+        .query_async(&mut con)
+        .await
+        .unwrap_or_default();
+
+    // 1. Acquire lock first to hold it
+    let lease1 = client
+        .acquire_lock(file_path, None, Duration::from_secs(2))
+        .await
+        .expect("Should acquire first lock");
+
+    // Spawn a background task to release it after 50ms
+    let client_clone = client.clone();
+    let file_path_str = file_path.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = lease1.release().await;
+    });
+
+    // 2. Try to acquire the lock with retry (should succeed after first lease is released)
+    let lease2 = client_clone
+        .acquire_lock_with_retry(&file_path_str, None, Duration::from_secs(2), 5)
+        .await
+        .expect("Should eventually acquire lock via retry");
+
+    lease2.release().await.expect("Should release");
+}
+
+#[tokio::test]
 async fn test_fencing_token_monotony() {
     let client = match get_client().await {
         Some(c) => c,
@@ -182,4 +224,68 @@ async fn test_cluster_client_initialization() {
     // Cluster mode via protocol prefix
     let cluster_client_proto = MetaClient::new("redis+cluster://127.0.0.1:6379").unwrap();
     assert!(matches!(cluster_client_proto, MetaClient::Cluster(_)));
+}
+
+#[tokio::test]
+async fn test_fencing_token_validation_on_write() {
+    use std::sync::Arc;
+    let client = match get_client().await {
+        Some(c) => c,
+        None => {
+            println!("Skipping test: Redis/Garnet not available");
+            return;
+        }
+    };
+
+    let dev_path = "/tmp/squeezefs_test_fencing_dev";
+    std::fs::write(dev_path, vec![0u8; 8 * 1024 * 1024]).unwrap();
+    let dev = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(dev_path));
+    let meta = Arc::new(squeezefs::dlm::MetaClient::new_single(
+        redis::Client::open(get_redis_url()).unwrap(),
+    ));
+    let alloc = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new(meta.clone(), "test_fence_vol")
+            .await
+            .unwrap(),
+    );
+    let cache = squeezefs::cache::TieredCache::new(
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        (*meta).clone(),
+        alloc.clone(),
+        dev.clone(),
+    )
+    .unwrap();
+    let router = squeezefs::routing::DataRouter::new(client.clone(), cache, alloc, dev);
+
+    let file_path = "inode_999";
+    let meta_key = format!("metadata:{}", file_path);
+
+    let mut con = router.dlm.get_connection().await.unwrap();
+    let _: () = redis::cmd("DEL")
+        .arg(&meta_key)
+        .query_async(&mut con)
+        .await
+        .unwrap_or_default();
+
+    // 1. Initial write with fencing token = 10
+    let res1 = router.write_file(file_path, 0, b"hello", 10).await;
+    assert!(res1.is_ok());
+
+    // 2. Stale write with fencing token = 5 (should be rejected)
+    let res2 = router.write_file(file_path, 0, b"world", 5).await;
+    assert!(res2.is_err());
+    assert!(matches!(
+        res2.unwrap_err(),
+        squeezefs::error::SqueezefsError::FencingTokenExpired { .. }
+    ));
+
+    // 3. Newer write with fencing token = 15 (should succeed)
+    let res3 = router.write_file(file_path, 0, b"world", 15).await;
+    assert!(res3.is_ok());
+
+    let _ = std::fs::remove_file(dev_path);
 }

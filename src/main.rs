@@ -100,8 +100,8 @@ enum Commands {
     },
     /// Show filesystem status
     Status {
-        /// SqueezeFS URI (squeeze://ip:port/filesystemname)
-        squeeze_uri: String,
+        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname) or mount point path
+        squeeze_uri: Option<String>,
     },
     /// List all active clients that have the filesystem mounted
     Clients {
@@ -179,8 +179,6 @@ enum Commands {
         /// Disable FUSE writeback cache (enabled by default)
         #[arg(long)]
         no_writeback: bool,
-
-
 
         /// Allow other users to access the mount
         #[arg(long)]
@@ -1288,7 +1286,7 @@ fn print_mount_diagnostics(
 fn get_backing_device_size(path: &str) -> std::io::Result<u64> {
     use std::fs::File;
     use std::io::Seek;
-    
+
     let mut file = File::open(path)?;
     // Try seeking to the end
     if let Ok(size) = file.seek(std::io::SeekFrom::End(0)) {
@@ -1296,7 +1294,7 @@ fn get_backing_device_size(path: &str) -> std::io::Result<u64> {
             return Ok(size);
         }
     }
-    
+
     // Fallback to metadata length if seek returns 0 or fails
     let meta = std::fs::metadata(path)?;
     Ok(meta.len())
@@ -1578,18 +1576,22 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let parsed_capacity = if let Some(ref cap_str) = capacity {
                 parse_human_readable_size(cap_str)?
             } else {
-                let backing_path = backing_dev.as_ref()
+                let backing_path = backing_dev
+                    .as_ref()
                     .or_else(|| existing_format.get("backing_dev"))
                     .map(|s| s.as_str());
-                
+
                 if let Some(path) = backing_path {
                     if std::path::Path::new(path).exists() {
                         match get_backing_device_size(path) {
                             Ok(size) if size > 0 => {
-                                println!("Auto-detected volume capacity: {}", format_size_human(size));
+                                println!(
+                                    "Auto-detected volume capacity: {}",
+                                    format_size_human(size)
+                                );
                                 size
                             }
-                            _ => parse_human_readable_size("1P")?
+                            _ => parse_human_readable_size("1P")?,
                         }
                     } else {
                         parse_human_readable_size("1P")?
@@ -1745,7 +1747,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Commands::Status { squeeze_uri } => {
-            let (redis_url, fs_name) = parse_squeeze_uri(&squeeze_uri)?;
+            let ref_path = squeeze_uri.as_ref().map(|p| std::path::Path::new(p));
+            let (redis_url, fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), ref_path)?;
             squeezefs::set_fs_prefix(&fs_name);
             let status = squeezefs::fuse_client::get_volume_status(&redis_url).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
@@ -2687,8 +2690,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!("Connection string for client nodes:");
                     println!(
                         "  squeezefs storage nvmeof connect --ip {} --port {} --subnqn {}",
-                        ip.first().cloned().unwrap_or_else(|| "<your-target-ip>".to_string()),
-                        port, resolved_nqn
+                        ip.first()
+                            .cloned()
+                            .unwrap_or_else(|| "<your-target-ip>".to_string()),
+                        port,
+                        resolved_nqn
                     );
                 }
                 NvmeofActions::Unshare { subnqn, spdk } => {
@@ -2742,7 +2748,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             return Err(format!(
                                 "Invalid hugepages value '{}'. Must be '2GB' or '4GB'.",
                                 other
-                            ).into());
+                            )
+                            .into());
                         }
                     };
                     squeezefs::nvmeof::spdk_setup(mb)?;
@@ -3418,6 +3425,10 @@ async fn run_df_command(
     redis_url: &str,
     path_opt: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let path_opt = match path_opt {
+        Some(ref p) if is_uri(p) => None,
+        other => other,
+    };
     let dlm = DlmClient::new(redis_url)?;
     let mut con = dlm.get_connection().await?;
 
@@ -3964,6 +3975,26 @@ mod tests {
         assert!(parse_squeeze_uri("squeeze://127.0.0.1").is_err());
         assert!(parse_squeeze_uri("squeeze://127.0.0.1/").is_err());
     }
+
+    #[test]
+    fn test_resolve_squeeze_uri_direct_uri() {
+        let (redis, name) =
+            resolve_squeeze_uri(Some("squeeze://127.0.0.1:6379/vol"), None).unwrap();
+        assert_eq!(redis, "redis://127.0.0.1:6379");
+        assert_eq!(name, "vol");
+
+        let (redis, name) = resolve_squeeze_uri(
+            None,
+            Some(std::path::Path::new("squeeze://127.0.0.1:6379/vol")),
+        )
+        .unwrap();
+        assert_eq!(redis, "redis://127.0.0.1:6379");
+        assert_eq!(name, "vol");
+    }
+}
+
+fn is_uri(s: &str) -> bool {
+    s.starts_with("squeeze://") || s.starts_with("redis://") || s.starts_with("redis+cluster://")
 }
 
 fn parse_squeeze_uri(uri: &str) -> Result<(String, String), String> {
@@ -3994,9 +4025,19 @@ fn resolve_squeeze_uri(
     reference_path: Option<&std::path::Path>,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
     if let Some(uri) = cli_uri {
-        return Ok(parse_squeeze_uri(uri)?);
+        if is_uri(uri) {
+            return Ok(parse_squeeze_uri(uri)?);
+        } else {
+            let path = std::path::Path::new(uri);
+            return resolve_squeeze_uri(None, Some(path));
+        }
     }
     if let Some(ref_path) = reference_path {
+        if let Some(path_str) = ref_path.to_str() {
+            if is_uri(path_str) {
+                return Ok(parse_squeeze_uri(path_str)?);
+            }
+        }
         let mut current = if ref_path.is_file() {
             ref_path.parent().unwrap_or(ref_path).to_path_buf()
         } else {
@@ -5131,10 +5172,10 @@ pub fn tune_system() -> Result<(), std::io::Error> {
                         }
                         if is_root {
                             println!(
-                                "Applying optimized read_ahead_kb = 16384 (16MB) for connection {}...",
+                                "Applying optimized read_ahead_kb = 0 (disabled) for connection {}...",
                                 conn_id_str
                             );
-                            let _ = std::fs::write(bdi_path, "16384\n");
+                            let _ = std::fs::write(bdi_path, "0\n");
                         }
                     }
                 }

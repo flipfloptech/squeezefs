@@ -93,9 +93,9 @@ pub fn share_target(
     check_root()?;
 
     // Prevent duplicate sharing of the same backing path
-    let canonical_target = fs::canonicalize(backing_path)
-        .unwrap_or_else(|_| PathBuf::from(backing_path));
-    
+    let canonical_target =
+        fs::canonicalize(backing_path).unwrap_or_else(|_| PathBuf::from(backing_path));
+
     let shares = load_shares();
     for share in &shares {
         let share_canonical = fs::canonicalize(&share.backing_path)
@@ -246,13 +246,16 @@ pub fn share_target(
     Ok(subnqn)
 }
 
-pub fn call_spdk_rpc(method: &str, params: serde_json::Value) -> std::io::Result<serde_json::Value> {
+pub fn call_spdk_rpc(
+    method: &str,
+    params: serde_json::Value,
+) -> std::io::Result<serde_json::Value> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
-    let socket_path = std::env::var("SQUEEZEFS_SPDK_SOCK")
-        .unwrap_or_else(|_| "/var/tmp/spdk.sock".to_string());
-    
+    let socket_path =
+        std::env::var("SQUEEZEFS_SPDK_SOCK").unwrap_or_else(|_| "/var/tmp/spdk.sock".to_string());
+
     if is_mock() {
         return Ok(serde_json::json!({
             "jsonrpc": "2.0",
@@ -268,11 +271,11 @@ pub fn call_spdk_rpc(method: &str, params: serde_json::Value) -> std::io::Result
         "method": method,
         "params": params
     });
-    
+
     let req_str = request.to_string();
     stream.write_all(req_str.as_bytes())?;
     stream.flush()?;
-    
+
     let mut response_bytes = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -287,7 +290,7 @@ pub fn call_spdk_rpc(method: &str, params: serde_json::Value) -> std::io::Result
             }
         }
     }
-    
+
     let val: serde_json::Value = serde_json::from_slice(&response_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(val)
@@ -300,9 +303,9 @@ pub fn share_target_spdk(
     ips: &[String],
 ) -> std::io::Result<String> {
     // Prevent duplicate sharing of the same backing path via local configuration
-    let canonical_target = fs::canonicalize(backing_path)
-        .unwrap_or_else(|_| PathBuf::from(backing_path));
-    
+    let canonical_target =
+        fs::canonicalize(backing_path).unwrap_or_else(|_| PathBuf::from(backing_path));
+
     let shares = load_shares();
     for share in &shares {
         let share_canonical = fs::canonicalize(&share.backing_path)
@@ -349,19 +352,25 @@ pub fn share_target_spdk(
     };
 
     // 1. Create transport (ignore if already exists)
-    let _ = call_spdk_rpc("nvmf_create_transport", serde_json::json!({
-        "trtype": "TCP"
-    }));
+    let _ = call_spdk_rpc(
+        "nvmf_create_transport",
+        serde_json::json!({
+            "trtype": "TCP"
+        }),
+    );
 
     // 2. Create bdev from backing path
     let bdev_name = format!("bdev_{}", Uuid::new_v4().simple());
-    
-    let res = call_spdk_rpc("bdev_aio_create", serde_json::json!({
-        "name": bdev_name,
-        "filename": backing_path,
-        "block_size": 4096
-    }))?;
-    
+
+    let res = call_spdk_rpc(
+        "bdev_aio_create",
+        serde_json::json!({
+            "name": bdev_name,
+            "filename": backing_path,
+            "block_size": 4096
+        }),
+    )?;
+
     if let Some(err) = res.get("error") {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -370,12 +379,15 @@ pub fn share_target_spdk(
     }
 
     // 3. Create subsystem
-    let res = call_spdk_rpc("nvmf_create_subsystem", serde_json::json!({
-        "nqn": subnqn,
-        "allow_any_host": true,
-        "serial_number": format!("SQ{}", &Uuid::new_v4().to_string()[..10])
-    }))?;
-    
+    let res = call_spdk_rpc(
+        "nvmf_create_subsystem",
+        serde_json::json!({
+            "nqn": subnqn,
+            "allow_any_host": true,
+            "serial_number": format!("SQ{}", &Uuid::new_v4().to_string()[..10])
+        }),
+    )?;
+
     if let Some(err) = res.get("error") {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -384,13 +396,16 @@ pub fn share_target_spdk(
     }
 
     // 4. Add namespace using our bdev
-    let res = call_spdk_rpc("nvmf_subsystem_add_ns", serde_json::json!({
-        "nqn": subnqn,
-        "namespace": {
-            "bdev_name": bdev_name
-        }
-    }))?;
-    
+    let res = call_spdk_rpc(
+        "nvmf_subsystem_add_ns",
+        serde_json::json!({
+            "nqn": subnqn,
+            "namespace": {
+                "bdev_name": bdev_name
+            }
+        }),
+    )?;
+
     if let Some(err) = res.get("error") {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -400,20 +415,26 @@ pub fn share_target_spdk(
 
     // 5. Add listener to expose the port/IP for each address
     for ip in ips {
-        let res = call_spdk_rpc("nvmf_subsystem_add_listener", serde_json::json!({
-            "nqn": subnqn,
-            "listen_address": {
-                "trtype": "TCP",
-                "adrfam": "IPv4",
-                "traddr": ip,
-                "trsvcid": port.to_string()
-            }
-        }))?;
-        
+        let res = call_spdk_rpc(
+            "nvmf_subsystem_add_listener",
+            serde_json::json!({
+                "nqn": subnqn,
+                "listen_address": {
+                    "trtype": "TCP",
+                    "adrfam": "IPv4",
+                    "traddr": ip,
+                    "trsvcid": port.to_string()
+                }
+            }),
+        )?;
+
         if let Some(err) = res.get("error") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to expose SPDK subsystem listener on {}:{}: {}", ip, port, err),
+                format!(
+                    "Failed to expose SPDK subsystem listener on {}:{}: {}",
+                    ip, port, err
+                ),
             ));
         }
     }
@@ -442,9 +463,12 @@ pub fn unshare_target_spdk(subnqn: &str) -> std::io::Result<()> {
     }
 
     // 2. Delete the subsystem
-    let res = call_spdk_rpc("nvmf_delete_subsystem", serde_json::json!({
-        "nqn": subnqn
-    }))?;
+    let res = call_spdk_rpc(
+        "nvmf_delete_subsystem",
+        serde_json::json!({
+            "nqn": subnqn
+        }),
+    )?;
     if let Some(err) = res.get("error") {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -454,9 +478,12 @@ pub fn unshare_target_spdk(subnqn: &str) -> std::io::Result<()> {
 
     // 3. Delete the associated bdev if we found it
     if let Some(bdev_name) = bdev_to_delete {
-        let _ = call_spdk_rpc("bdev_aio_delete", serde_json::json!({
-            "name": bdev_name
-        }));
+        let _ = call_spdk_rpc(
+            "bdev_aio_delete",
+            serde_json::json!({
+                "name": bdev_name
+            }),
+        );
     }
 
     let _ = deregister_share(subnqn);
@@ -879,7 +906,7 @@ pub fn list_nvmeof() -> std::io::Result<()> {
                 if nqn == "nqn.2014-08.org.nvmexpress.discovery" {
                     continue; // Skip discovery subsystem
                 }
-                
+
                 // Backing bdev
                 let mut backing = "unknown".to_string();
                 if let Some(namespaces) = sub.get("namespaces").and_then(|n| n.as_array()) {
@@ -889,13 +916,19 @@ pub fn list_nvmeof() -> std::io::Result<()> {
                         }
                     }
                 }
-                
+
                 // Listen addresses
                 let mut listen_str = Vec::new();
                 if let Some(listeners) = sub.get("listen_addresses").and_then(|l| l.as_array()) {
                     for listener in listeners {
-                        let ip = listener.get("traddr").and_then(|i| i.as_str()).unwrap_or("");
-                        let port = listener.get("trsvcid").and_then(|p| p.as_str()).unwrap_or("");
+                        let ip = listener
+                            .get("traddr")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or("");
+                        let port = listener
+                            .get("trsvcid")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("");
                         if !ip.is_empty() && !port.is_empty() {
                             listen_str.push(format!("{}:{}", ip, port));
                         }
@@ -1099,19 +1132,10 @@ pub fn restore_shares() -> std::io::Result<()> {
         );
         let ips: Vec<String> = share.ip.split(',').map(|s| s.trim().to_string()).collect();
         let res = if share.is_spdk.unwrap_or(false) {
-            share_target_spdk(
-                &share.backing_path,
-                Some(&share.subnqn),
-                share.port,
-                &ips,
-            )
+            share_target_spdk(&share.backing_path, Some(&share.subnqn), share.port, &ips)
         } else {
-            share_target(
-                &share.backing_path,
-                Some(&share.subnqn),
-                share.port,
-                &ips,
-            ).map(|_| share.subnqn.clone())
+            share_target(&share.backing_path, Some(&share.subnqn), share.port, &ips)
+                .map(|_| share.subnqn.clone())
         };
         if let Err(e) = res {
             log::error!(
@@ -1138,7 +1162,9 @@ pub fn spdk_install() -> std::io::Result<()> {
         .args(&["clone", "https://github.com/spdk/spdk.git", "/opt/spdk"])
         .status()?;
     if !status.success() {
-        println!("SPDK repo already exists at /opt/spdk or git clone failed. Proceeding with update...");
+        println!(
+            "SPDK repo already exists at /opt/spdk or git clone failed. Proceeding with update..."
+        );
     }
 
     let status = std::process::Command::new("git")
@@ -1146,7 +1172,10 @@ pub fn spdk_install() -> std::io::Result<()> {
         .args(&["submodule", "update", "--init"])
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to update SPDK submodules"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to update SPDK submodules",
+        ));
     }
 
     println!("Running pkgdep.sh to install system dependencies...");
@@ -1154,7 +1183,10 @@ pub fn spdk_install() -> std::io::Result<()> {
         .current_dir("/opt/spdk")
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to install SPDK dependencies"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to install SPDK dependencies",
+        ));
     }
 
     // Install Python dependencies (tabulate)
@@ -1171,7 +1203,9 @@ pub fn spdk_install() -> std::io::Result<()> {
                 .args(&["install", "-y", "python3-tabulate"])
                 .status();
             if apt_status.is_err() || !apt_status.unwrap().success() {
-                println!("Warning: Could not install python 'tabulate' library. Compilation might fail.");
+                println!(
+                    "Warning: Could not install python 'tabulate' library. Compilation might fail."
+                );
             }
         }
     }
@@ -1181,7 +1215,10 @@ pub fn spdk_install() -> std::io::Result<()> {
         .current_dir("/opt/spdk")
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to configure SPDK"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to configure SPDK",
+        ));
     }
 
     println!("Building SPDK (this may take a few minutes)...");
@@ -1193,7 +1230,10 @@ pub fn spdk_install() -> std::io::Result<()> {
         .current_dir("/opt/spdk")
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to compile SPDK"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to compile SPDK",
+        ));
     }
 
     println!("Successfully installed and compiled SPDK at /opt/spdk.");
@@ -1242,7 +1282,10 @@ pub fn spdk_setup(hugepages_mb: usize) -> std::io::Result<()> {
 
 pub fn spdk_bind(pci_addr: &str) -> std::io::Result<()> {
     check_root()?;
-    println!("Binding device at PCI address {} to SPDK user-space driver...", pci_addr);
+    println!(
+        "Binding device at PCI address {} to SPDK user-space driver...",
+        pci_addr
+    );
     if is_mock() {
         println!("MOCK: Binding device {} to SPDK.", pci_addr);
         return Ok(());
@@ -1312,9 +1355,7 @@ pub fn spdk_start() -> std::io::Result<()> {
     }
 
     // Check if nvmf_tgt is already running
-    let check = std::process::Command::new("pgrep")
-        .arg("nvmf_tgt")
-        .status();
+    let check = std::process::Command::new("pgrep").arg("nvmf_tgt").status();
     if let Ok(status) = check {
         if status.success() {
             println!("SPDK target daemon (nvmf_tgt) is already running.");
@@ -1331,7 +1372,7 @@ pub fn spdk_start() -> std::io::Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    
+
     println!("Spawned SPDK nvmf_tgt in background (PID: {}).", child.id());
     println!("JSON-RPC socket listening at /var/tmp/spdk.sock");
     Ok(())

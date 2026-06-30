@@ -45,7 +45,7 @@ async fn test_distributed_job_execution() {
             .arg("test_vol_jobs:free_blocks")
             .arg("test_vol_jobs:highest_block")
             .arg("test_vol_jobs:block_refcounts")
-            .arg("test_vol_jobs:block_map:test_map_1")
+            .arg("block_map:test_map_1")
             .query(&mut conn)
             .unwrap_or_default();
     }
@@ -115,6 +115,7 @@ async fn test_distributed_job_execution() {
 
     // 3. Submit a BlockMove task
     let task = squeezefs::jobs::TaskType::BlockMove {
+        ino: 1,
         map_id: "test_map_1".to_string(),
         idx_str: "0".to_string(),
         src_offset,
@@ -136,7 +137,7 @@ async fn test_distributed_job_execution() {
 
     // Verify metadata was updated
     let mut con = router.dlm.get_connection().await.unwrap();
-    let block_map_key = format!("test_vol_jobs:block_map:test_map_1");
+    let block_map_key = format!("block_map:test_map_1");
     let mapped_offset: String = redis::cmd("HGET")
         .arg(&block_map_key)
         .arg("0")
@@ -235,6 +236,7 @@ async fn test_write_verification_failure_pauses_job() {
 
     // 3. Submit a BlockMove task
     let task = squeezefs::jobs::TaskType::BlockMove {
+        ino: 2,
         map_id: "test_map_2".to_string(),
         idx_str: "0".to_string(),
         src_offset,

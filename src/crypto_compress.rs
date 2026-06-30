@@ -230,7 +230,10 @@ impl CryptoCompressState {
         }
     }
 
-    pub fn process_read<'a>(&self, data: &'a [u8]) -> Result<std::borrow::Cow<'a, [u8]>, SqueezefsError> {
+    pub fn process_read<'a>(
+        &self,
+        data: &'a [u8],
+    ) -> Result<std::borrow::Cow<'a, [u8]>, SqueezefsError> {
         let compression = self.compression.trim();
         let encrypt_algo = self.encrypt_algo.trim();
         if (compression == "none" || compression.is_empty())

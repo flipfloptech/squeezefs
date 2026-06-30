@@ -53,7 +53,7 @@ impl SqueezefsError {
             SqueezefsError::Redis(_) => libc::ECOMM,
             SqueezefsError::NvmeOfBackend(_) => libc::EIO,
             SqueezefsError::LockFailed { .. } => libc::EAGAIN,
-            SqueezefsError::FencingTokenExpired { .. } => libc::EACCES,
+            SqueezefsError::FencingTokenExpired { .. } => libc::EIO,
             SqueezefsError::InvalidOperation(_) => libc::EINVAL,
             SqueezefsError::GdsError(_) => libc::EIO,
             SqueezefsError::CacheOverflow => libc::ENOMEM,

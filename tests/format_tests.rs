@@ -1,6 +1,6 @@
+use squeezefs::fuse_client::format_volume_ext;
 use std::fs::File;
 use tempfile::tempdir;
-use squeezefs::fuse_client::format_volume_ext;
 
 #[test]
 fn test_format_size_human() {
@@ -37,13 +37,13 @@ fn test_format_size_human() {
 async fn test_format_volume_quick_and_full() {
     let temp_dir = tempdir().unwrap();
     let backing_file = temp_dir.path().join("test_backing.img");
-    
+
     // Create an 8MB file for testing
     let file = File::create(&backing_file).unwrap();
     file.set_len(8 * 1024 * 1024).unwrap();
 
     let redis_url = "redis://127.0.0.1:6379/9"; // Use db 9 for test isolation
-    
+
     // Clear test db first
     let client = redis::Client::open(redis_url).unwrap();
     if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
@@ -111,5 +111,9 @@ async fn test_format_volume_quick_and_full() {
     )
     .await;
 
-    assert!(res_full.is_ok(), "Full format of 8MB should succeed: {:?}", res_full.err());
+    assert!(
+        res_full.is_ok(),
+        "Full format of 8MB should succeed: {:?}",
+        res_full.err()
+    );
 }

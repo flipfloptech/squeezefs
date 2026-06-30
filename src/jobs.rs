@@ -25,6 +25,7 @@ use tokio::time::sleep;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum TaskType {
     BlockMove {
+        ino: u64,
         map_id: String,
         idx_str: String,
         src_offset: u64,
@@ -213,12 +214,20 @@ async fn run_worker_cycle(router: &DataRouter, fs_name: &str, cpu_limit: u32) ->
 async fn execute_task(router: &DataRouter, task_type: &TaskType) -> Result<()> {
     match task_type {
         TaskType::BlockMove {
+            ino,
             map_id,
             idx_str,
             src_offset,
             dest_offset,
             len,
         } => {
+            // Acquire lease on file being moved to serialize against concurrent FUSE client writes
+            let lock_name = format!("inode_{}", ino);
+            let lease = router
+                .dlm
+                .acquire_lock_with_retry(&lock_name, None, Duration::from_secs(10), 10)
+                .await?;
+
             // Read block from primary device
             let data = router.nvme_writer.read_block(*src_offset, *len).await?;
 
@@ -227,11 +236,14 @@ async fn execute_task(router: &DataRouter, task_type: &TaskType) -> Result<()> {
 
             // Atomically update block_map metadata in database
             let mut con = router.dlm.get_connection().await?;
-            let key = format!("{}:block_map:{}", crate::fs_prefix(), map_id);
+            let key = format!("block_map:{}", map_id);
             let _: () = con.hset(&key, idx_str, dest_offset.to_string()).await?;
 
             // Free the old high block
             router.block_allocator.free_block(*src_offset).await?;
+
+            // Release lease
+            let _ = lease.release().await;
         }
     }
     Ok(())

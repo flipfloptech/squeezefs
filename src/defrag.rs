@@ -24,33 +24,52 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, _nvme_path: &st
     // 2. Build reverse block map
     println!("Scanning metadata to build reverse block map...");
     let mut conn = client.get_connection().await?;
-    let mut block_to_file: std::collections::BTreeMap<u64, (String, String)> =
+    let mut block_to_file: std::collections::BTreeMap<u64, (u64, String, String)> =
         std::collections::BTreeMap::new();
 
     let mut cursor: u64 = 0;
+    let match_pattern = "metadata:inode_*";
     loop {
         let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
             .arg("MATCH")
-            .arg("squeezefs:block_map:*")
+            .arg(match_pattern)
             .arg("COUNT")
             .arg(1000)
             .query_async(&mut conn)
             .await?;
 
         for key in keys {
-            let block_map_id = key
-                .strip_prefix(&format!("{}:block_map:", crate::fs_prefix()))
-                .unwrap_or(&key)
-                .to_string();
-            let mappings: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
-                .arg(&key)
-                .query_async(&mut conn)
-                .await?;
+            // Parse inode number
+            let inode_str = key.strip_prefix("metadata:inode_").unwrap_or(&key);
+            let ino = match inode_str.parse::<u64>() {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
 
-            for (block_idx_str, offset_str) in mappings {
-                if let Ok(offset) = offset_str.parse::<u64>() {
-                    block_to_file.insert(offset, (block_map_id.clone(), block_idx_str));
+            // Get block_map_id and layout type from metadata
+            let (file_type, block_map_id_opt): (Option<String>, Option<String>) =
+                redis::cmd("HMGET")
+                    .arg(&key)
+                    .arg("type")
+                    .arg("block_map_id")
+                    .query_async(&mut conn)
+                    .await?;
+
+            if file_type.as_deref() == Some("striped") {
+                if let Some(block_map_id) = block_map_id_opt {
+                    let block_map_key = format!("block_map:{}", block_map_id);
+                    let mappings: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
+                        .arg(&block_map_key)
+                        .query_async(&mut conn)
+                        .await?;
+
+                    for (block_idx_str, offset_str) in mappings {
+                        if let Ok(offset) = offset_str.parse::<u64>() {
+                            block_to_file
+                                .insert(offset, (ino, block_map_id.clone(), block_idx_str));
+                        }
+                    }
                 }
             }
         }
@@ -100,8 +119,9 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, _nvme_path: &st
             .await
             .is_ok()
         {
-            let (map_id, idx_str) = highest_file_info;
+            let (ino, map_id, idx_str) = highest_file_info;
             tasks.push(crate::jobs::TaskType::BlockMove {
+                ino,
                 map_id: map_id.clone(),
                 idx_str: idx_str.clone(),
                 src_offset: highest_offset,
@@ -111,7 +131,7 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, _nvme_path: &st
 
             // Update in-memory map
             block_to_file.remove(&highest_offset);
-            block_to_file.insert(target_hole_offset, (map_id, idx_str));
+            block_to_file.insert(target_hole_offset, (ino, map_id, idx_str));
         }
     }
 

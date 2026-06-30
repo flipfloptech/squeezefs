@@ -76,16 +76,20 @@ impl NvmeBlockDev {
         if (data.as_ptr() as usize) % alignment == 0 && data_len % alignment == 0 {
             let data_ptr = data.as_ptr() as usize;
             tokio::task::spawn_blocking(move || {
-                let aligned_slice = unsafe {
-                    std::slice::from_raw_parts(data_ptr as *const u8, data_len)
-                };
+                let aligned_slice =
+                    unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
                 let res = file.write_all_at(aligned_slice, offset);
                 res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
                 Ok::<(), crate::error::SqueezefsError>(())
             })
             .await
-            .map_err(|e| crate::error::SqueezefsError::InvalidOperation(format!("Block write task panicked: {:?}", e)))??;
-            
+            .map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "Block write task panicked: {:?}",
+                    e
+                ))
+            })??;
+
             crate::fuse_client::METRICS
                 .put_obj
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -135,9 +139,8 @@ impl NvmeBlockDev {
         };
 
         tokio::task::spawn_blocking(move || {
-            let aligned_slice = unsafe {
-                std::slice::from_raw_parts(buf_addr as *const u8, aligned_len)
-            };
+            let aligned_slice =
+                unsafe { std::slice::from_raw_parts(buf_addr as *const u8, aligned_len) };
             let res = file.write_all_at(aligned_slice, offset);
             unsafe {
                 libc::free(buf_addr as *mut libc::c_void);

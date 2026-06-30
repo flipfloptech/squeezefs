@@ -288,8 +288,7 @@ fn test_nvmeof_spdk_target_mock_lifecycle() {
     assert!(res.is_ok());
 
     // 3. Unshare via standard target dispatcher (should auto-detect SPDK share)
-    squeezefs::nvmeof::unshare_target(&subnqn)
-        .expect("Unsharing SPDK target should succeed");
+    squeezefs::nvmeof::unshare_target(&subnqn).expect("Unsharing SPDK target should succeed");
 
     let _ = fs::remove_file(temp_config_file);
 }
@@ -298,7 +297,7 @@ fn test_nvmeof_spdk_target_mock_lifecycle() {
 fn test_nvmeof_spdk_helpers_mock() {
     let _guard = TEST_MUTEX.lock().unwrap();
     std::env::set_var("SQUEEZEFS_MOCK_NVMEOF", "1");
-    
+
     assert!(squeezefs::nvmeof::spdk_install().is_ok());
     assert!(squeezefs::nvmeof::spdk_setup(1024).is_ok());
     assert!(squeezefs::nvmeof::spdk_bind("0000:01:00.0").is_ok());

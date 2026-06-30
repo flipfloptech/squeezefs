@@ -167,7 +167,8 @@ impl BackendRouter {
         if block_keys.is_empty() {
             return Ok(());
         }
-        let mut backend_groups: std::collections::HashMap<&str, Vec<u64>> = std::collections::HashMap::new();
+        let mut backend_groups: std::collections::HashMap<&str, Vec<u64>> =
+            std::collections::HashMap::new();
         for &block_key in block_keys {
             let parts: Vec<&str> = block_key.split("://").collect();
             let (be_id, offset_str) = if parts.len() > 1 {
@@ -347,9 +348,7 @@ impl DataRouter {
                 tokio::task::spawn_blocking(move || {
                     let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
                 });
-                self.cache
-                    .read_lru
-                    .put(block_key, downloaded_bytes.clone());
+                self.cache.read_lru.put(block_key, downloaded_bytes.clone());
                 Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes))
             }
             dashmap::mapref::entry::Entry::Occupied(entry) => {
@@ -674,6 +673,16 @@ impl DataRouter {
             .get_connection_for_inode(parse_inode_from_path(file_path))
             .await?;
         let meta_key = format!("metadata:{}", file_path);
+
+        let current_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await?;
+        if let Some(cf) = current_fencing {
+            if fencing_token < cf {
+                return Err(SqueezefsError::FencingTokenExpired {
+                    token: fencing_token,
+                    expected: cf,
+                });
+            }
+        }
 
         let file_type: Option<String> = con.hget(&meta_key, "type").await?;
 
@@ -2128,9 +2137,7 @@ impl DataRouter {
 
                     futures.push(tokio::spawn(async move {
                         let cache_key = format!("active_block:{}:block_{}", file_path_clone, b_idx);
-                        if let Some(active_data) =
-                            router.cache.nvme.read_staged(&cache_key)
-                        {
+                        if let Some(active_data) = router.cache.nvme.read_staged(&cache_key) {
                             let start = std::cmp::min(rel_start, active_data.len());
                             let end = std::cmp::min(rel_start + copy_len, active_data.len());
                             let actual_copy = end - start;
@@ -2238,14 +2245,27 @@ impl DataRouter {
     /// If it's staged, copy the staging folder/files and mapping.
     /// If it's striped, copy the block map and increment all block reference counts.
     pub async fn clone_file(&self, src: &str, dest: &str) -> Result<()> {
-        let _src_lock = self
-            .dlm
-            .acquire_lock(src, None, std::time::Duration::from_secs(5))
-            .await?;
-        let dest_lock = self
-            .dlm
-            .acquire_lock(dest, None, std::time::Duration::from_secs(5))
-            .await?;
+        let (_src_lock, dest_lock) = if src < dest {
+            let l1 = self
+                .dlm
+                .acquire_lock_with_retry(src, None, std::time::Duration::from_secs(5), 5)
+                .await?;
+            let l2 = self
+                .dlm
+                .acquire_lock_with_retry(dest, None, std::time::Duration::from_secs(5), 5)
+                .await?;
+            (l1, l2)
+        } else {
+            let l1 = self
+                .dlm
+                .acquire_lock_with_retry(dest, None, std::time::Duration::from_secs(5), 5)
+                .await?;
+            let l2 = self
+                .dlm
+                .acquire_lock_with_retry(src, None, std::time::Duration::from_secs(5), 5)
+                .await?;
+            (l2, l1)
+        };
 
         let mut src_con =
             if let Some(src_ino) = crate::dlm::parse_inode_from_key(&format!("metadata:{}", src)) {
@@ -2478,25 +2498,6 @@ impl DataRouter {
         file_path: &str,
         con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
-        static GARNET_COMMAND_REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !GARNET_COMMAND_REGISTERED.load(std::sync::atomic::Ordering::Relaxed) {
-            let reg_res = redis::cmd("REGISTERCS")
-                .arg("TXN")
-                .arg("SqueezeUnlink")
-                .arg(6)
-                .arg("SqueezeUnlink")
-                .arg("SRC")
-                .arg("/app/extensions/SqueezeExtensions.dll")
-                .query_async::<_, ()>(con)
-                .await;
-            if let Err(ref e) = reg_res {
-                log::warn!("Failed to register SqueezeUnlink custom transaction on Garnet server: {:?}", e);
-            } else {
-                log::debug!("SqueezeUnlink custom transaction registered successfully");
-            }
-            GARNET_COMMAND_REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
         let meta_key = format!("metadata:{}", file_path);
         let file_type: Option<String> = con.hget(&meta_key, "type").await?;
         if let Some(t) = file_type {
@@ -2506,56 +2507,19 @@ impl DataRouter {
                     let block_map_key = format!("block_map:{}", block_map_id);
                     let refcounts_key_str = crate::fs_key!("block_refcounts");
                     let refcounts_key = &refcounts_key_str;
-                    let sizes_key_str = crate::fs_key!("block_sizes");
-                    let sizes_key = &sizes_key_str;
-                    let free_blocks_key_str = crate::fs_key!("free_blocks");
-                    let free_blocks_key = &free_blocks_key_str;
-
-                    // Try calling the custom command SqueezeUnlink
-                    let custom_res: std::result::Result<Vec<String>, redis::RedisError> = redis::cmd("SqueezeUnlink")
-                        .arg(&meta_key)
-                        .arg(&block_map_key)
-                        .arg(refcounts_key)
-                        .arg(sizes_key)
-                        .arg(free_blocks_key)
-                        .arg("type")
-                        .query_async(con)
-                        .await;
-
-
-                    let blocks_to_free = match custom_res {
-                        Ok(blocks) => {
-                            // Invalidate local client-side caches for the deleted mappings
-                            let block_mappings: std::collections::HashMap<String, String> =
-                                con.hgetall(&block_map_key).await.unwrap_or_default();
-                            for (idx_str, _) in &block_mappings {
-                                if let Ok(idx) = idx_str.parse::<u32>() {
-                                    self.block_map_cache.invalidate(&(block_map_id.clone(), idx));
-                                }
-                            }
-                            blocks
-                        }
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            if err_msg.contains("unknown command") || err_msg.contains("ERR unknown command") {
-                                log::debug!("SqueezeUnlink fallback path running. Reason: {}", err_msg);
-                                // Fallback to standard pipelined client-side implementation
-                                self.delete_file_striped_fallback(
-                                    &meta_key,
-                                    &block_map_id,
-                                    &block_map_key,
-                                    refcounts_key,
-                                    con,
-                                ).await?
-                            } else {
-
-                                return Err(e.into());
-                            }
-                        }
-                    };
+                    let blocks_to_free = self
+                        .delete_file_striped_fallback(
+                            &meta_key,
+                            &block_map_id,
+                            &block_map_key,
+                            refcounts_key,
+                            con,
+                        )
+                        .await?;
 
                     if !blocks_to_free.is_empty() {
-                        let blocks_str: Vec<&str> = blocks_to_free.iter().map(|s| s.as_str()).collect();
+                        let blocks_str: Vec<&str> =
+                            blocks_to_free.iter().map(|s| s.as_str()).collect();
                         self.backend_router.free_blocks(&blocks_str).await?;
                     }
                     let _: () = con.del(&block_map_key).await.unwrap_or_default();

@@ -287,7 +287,10 @@ impl NvmeStaging {
         let padded_size = unpadded_len as u64;
 
         let target_dir = self.staging_dirs.first().ok_or_else(|| {
-            SqueezefsError::InvalidOperation("No staging directories configured".to_string())
+            SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "No staging directories configured (memory mode)",
+            ))
         })?;
 
         if !check_disk_free_safeguard(target_dir) {

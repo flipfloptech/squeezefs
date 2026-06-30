@@ -34,9 +34,9 @@ enum Commands {
         /// Block size (e.g. "4M", "1M", default: 4MB)
         #[arg(long, default_value = "4M")]
         block_size: String,
-        /// Maximum capacity of the volume (e.g. "1P", "100G", default: 1PB)
-        #[arg(long, default_value = "1P")]
-        capacity: String,
+        /// Maximum capacity of the volume (e.g. "1P", "100G", default: auto-detected from volume or 1PB)
+        #[arg(long)]
+        capacity: Option<String>,
         /// Hard quota limiting the number of inodes (default: 1000000)
         #[arg(long, default_value = "1000000")]
         inodes: u64,
@@ -76,9 +76,9 @@ enum Commands {
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
         force: bool,
-        /// Perform quick format (initialize metadata only, do not wipe backing device)
+        /// Perform full zero-wiping of the entire backing device capacity (slow)
         #[arg(long)]
-        quick: bool,
+        full: bool,
         /// Compression algorithm (lz4, zstd, none, default: none)
         #[arg(long, default_value = "none")]
         compression: String,
@@ -439,9 +439,9 @@ enum NvmeofActions {
         /// Port to bind target listener to (default: 4420)
         #[arg(long, default_value_t = 4420)]
         port: u16,
-        /// IP address to bind target to (default: 0.0.0.0)
-        #[arg(long, default_value = "0.0.0.0")]
-        ip: String,
+        /// IP address(es) to bind target to (comma-separated or multiple flags)
+        #[arg(long, required = true, value_delimiter = ',')]
+        ip: Vec<String>,
         /// Share target via user-space SPDK instead of kernel configfs
         #[arg(long)]
         spdk: bool,
@@ -1279,6 +1279,45 @@ fn print_mount_diagnostics(
     Ok(())
 }
 
+fn get_backing_device_size(path: &str) -> std::io::Result<u64> {
+    use std::fs::File;
+    use std::io::Seek;
+    
+    let mut file = File::open(path)?;
+    // Try seeking to the end
+    if let Ok(size) = file.seek(std::io::SeekFrom::End(0)) {
+        if size > 0 {
+            return Ok(size);
+        }
+    }
+    
+    // Fallback to metadata length if seek returns 0 or fails
+    let meta = std::fs::metadata(path)?;
+    Ok(meta.len())
+}
+
+fn format_size_human(bytes: u64) -> String {
+    let kib = bytes as f64 / 1024.0;
+    let mib = kib / 1024.0;
+    let gib = mib / 1024.0;
+    let tib = gib / 1024.0;
+    let pib = tib / 1024.0;
+
+    if pib >= 1.0 {
+        format!("{:.2} PiB", pib)
+    } else if tib >= 1.0 {
+        format!("{:.2} TiB", tib)
+    } else if gib >= 1.0 {
+        format!("{:.2} GiB", gib)
+    } else if mib >= 1.0 {
+        format!("{:.2} MiB", mib)
+    } else if kib >= 1.0 {
+        format!("{:.2} KiB", kib)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn parse_human_readable_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -1323,7 +1362,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             port,
             subnqn,
             force,
-            quick,
+            full,
             inodes,
             compression,
             encrypt_algo,
@@ -1339,6 +1378,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let (redis_url, name) = parse_squeeze_uri(&squeeze_uri)?;
             squeezefs::set_fs_prefix(&name);
             let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
+            let quick = !full;
 
             // Fail-fast connection to Redis/Garnet
             let client = redis::Client::open(redis_url.as_str())
@@ -1515,7 +1555,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let parsed_block_size = parse_human_readable_size(&block_size)?;
-            let parsed_capacity = parse_human_readable_size(&capacity)?;
 
             squeezefs::cache::parse_duration(&upload_delay)?;
 
@@ -1529,6 +1568,30 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ))
                 .await
                 .unwrap_or_default();
+
+            let parsed_capacity = if let Some(ref cap_str) = capacity {
+                parse_human_readable_size(cap_str)?
+            } else {
+                let backing_path = backing_dev.as_ref()
+                    .or_else(|| existing_format.get("backing_dev"))
+                    .map(|s| s.as_str());
+                
+                if let Some(path) = backing_path {
+                    if std::path::Path::new(path).exists() {
+                        match get_backing_device_size(path) {
+                            Ok(size) if size > 0 => {
+                                println!("Auto-detected volume capacity: {}", format_size_human(size));
+                                size
+                            }
+                            _ => parse_human_readable_size("1P")?
+                        }
+                    } else {
+                        parse_human_readable_size("1P")?
+                    }
+                } else {
+                    parse_human_readable_size("1P")?
+                }
+            };
 
             let mut resolved_ip = ip.clone();
             let mut resolved_port = port;
@@ -2619,7 +2682,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!("Subsystem NQN: {}", resolved_nqn);
                     println!("Connection string for client nodes:");
                     println!(
-                        "  squeezefs storage nvmeof connect --ip <your-target-ip> --port {} --subnqn {}",
+                        "  squeezefs storage nvmeof connect --ip {} --port {} --subnqn {}",
+                        ip.first().cloned().unwrap_or_else(|| "<your-target-ip>".to_string()),
                         port, resolved_nqn
                     );
                 }

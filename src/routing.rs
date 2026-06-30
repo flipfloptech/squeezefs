@@ -2478,6 +2478,25 @@ impl DataRouter {
         file_path: &str,
         con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
+        static GARNET_COMMAND_REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !GARNET_COMMAND_REGISTERED.load(std::sync::atomic::Ordering::Relaxed) {
+            let reg_res = redis::cmd("REGISTERCS")
+                .arg("TXN")
+                .arg("SqueezeUnlink")
+                .arg(6)
+                .arg("SqueezeUnlink")
+                .arg("SRC")
+                .arg("/app/extensions/SqueezeExtensions.dll")
+                .query_async::<_, ()>(con)
+                .await;
+            if let Err(ref e) = reg_res {
+                log::warn!("Failed to register SqueezeUnlink custom transaction on Garnet server: {:?}", e);
+            } else {
+                log::debug!("SqueezeUnlink custom transaction registered successfully");
+            }
+            GARNET_COMMAND_REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let meta_key = format!("metadata:{}", file_path);
         let file_type: Option<String> = con.hget(&meta_key, "type").await?;
         if let Some(t) = file_type {
@@ -2487,54 +2506,59 @@ impl DataRouter {
                     let block_map_key = format!("block_map:{}", block_map_id);
                     let refcounts_key_str = crate::fs_key!("block_refcounts");
                     let refcounts_key = &refcounts_key_str;
+                    let sizes_key_str = crate::fs_key!("block_sizes");
+                    let sizes_key = &sizes_key_str;
+                    let free_blocks_key_str = crate::fs_key!("free_blocks");
+                    let free_blocks_key = &free_blocks_key_str;
 
-                    let block_mappings: std::collections::HashMap<String, String> =
-                        con.hgetall(&block_map_key).await?;
+                    // Try calling the custom command SqueezeUnlink
+                    let custom_res: std::result::Result<Vec<String>, redis::RedisError> = redis::cmd("SqueezeUnlink")
+                        .arg(&meta_key)
+                        .arg(&block_map_key)
+                        .arg(refcounts_key)
+                        .arg(sizes_key)
+                        .arg(free_blocks_key)
+                        .arg("type")
+                        .query_async(con)
+                        .await;
 
-                    if !block_mappings.is_empty() {
-                        for (idx_str, _) in &block_mappings {
-                            if let Ok(idx) = idx_str.parse::<u32>() {
-                                self.block_map_cache
-                                    .invalidate(&(block_map_id.clone(), idx));
-                            }
-                        }
 
-                        // 1. Pipeline query all refcounts
-                        let mut get_pipe = redis::pipe();
-                        for (_, bk) in &block_mappings {
-                            get_pipe.hget(refcounts_key, bk);
-                        }
-                        let refcounts: Vec<Option<i32>> = get_pipe.query_async(con).await?;
-
-                        // 2. Pipeline updates/deletes
-                        let mut update_pipe = redis::pipe();
-                        let mut blocks_to_free = Vec::new();
-                        let mut has_updates = false;
-                        for ((_, bk), ref_opt) in block_mappings.iter().zip(refcounts) {
-                            if let Some(mut r) = ref_opt {
-                                r -= 1;
-                                if r <= 0 {
-                                    update_pipe
-                                        .hdel(refcounts_key, bk)
-                                        .hdel(crate::fs_key!("block_sizes"), bk);
-                                    blocks_to_free.push(bk.as_str());
-                                    has_updates = true;
-                                } else {
-                                    update_pipe.hset(refcounts_key, bk, r);
-                                    has_updates = true;
+                    let blocks_to_free = match custom_res {
+                        Ok(blocks) => {
+                            // Invalidate local client-side caches for the deleted mappings
+                            let block_mappings: std::collections::HashMap<String, String> =
+                                con.hgetall(&block_map_key).await.unwrap_or_default();
+                            for (idx_str, _) in &block_mappings {
+                                if let Ok(idx) = idx_str.parse::<u32>() {
+                                    self.block_map_cache.invalidate(&(block_map_id.clone(), idx));
                                 }
+                            }
+                            blocks
+                        }
+                        Err(e) => {
+                            let err_msg = e.to_string();
+                            if err_msg.contains("unknown command") || err_msg.contains("ERR unknown command") {
+                                log::debug!("SqueezeUnlink fallback path running. Reason: {}", err_msg);
+                                // Fallback to standard pipelined client-side implementation
+                                self.delete_file_striped_fallback(
+                                    &meta_key,
+                                    &block_map_id,
+                                    &block_map_key,
+                                    refcounts_key,
+                                    con,
+                                ).await?
                             } else {
-                                update_pipe.hdel(crate::fs_key!("block_sizes"), bk);
-                                blocks_to_free.push(bk.as_str());
-                                has_updates = true;
+
+                                return Err(e.into());
                             }
                         }
-                        if has_updates {
-                            let _: () = update_pipe.query_async(con).await?;
-                        }
-                        self.backend_router.free_blocks(&blocks_to_free).await?;
+                    };
+
+                    if !blocks_to_free.is_empty() {
+                        let blocks_str: Vec<&str> = blocks_to_free.iter().map(|s| s.as_str()).collect();
+                        self.backend_router.free_blocks(&blocks_str).await?;
                     }
-                    let _: () = con.del(&block_map_key).await?;
+                    let _: () = con.del(&block_map_key).await.unwrap_or_default();
                 }
             } else if t == "staged" {
                 let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;
@@ -2600,6 +2624,62 @@ impl DataRouter {
         self.cache.read_lru.remove(file_path);
         self.metadata_cache.invalidate(file_path);
         Ok(())
+    }
+
+    async fn delete_file_striped_fallback(
+        &self,
+        _meta_key: &str,
+        block_map_id: &str,
+        block_map_key: &str,
+        refcounts_key: &str,
+        con: &mut crate::dlm::MetaConnection,
+    ) -> Result<Vec<String>> {
+        let block_mappings: std::collections::HashMap<String, String> =
+            con.hgetall(block_map_key).await?;
+
+        let mut blocks_to_free = Vec::new();
+        if !block_mappings.is_empty() {
+            for (idx_str, _) in &block_mappings {
+                if let Ok(idx) = idx_str.parse::<u32>() {
+                    self.block_map_cache
+                        .invalidate(&(block_map_id.to_string(), idx));
+                }
+            }
+
+            // 1. Pipeline query all refcounts
+            let mut get_pipe = redis::pipe();
+            for (_, bk) in &block_mappings {
+                get_pipe.hget(refcounts_key, bk);
+            }
+            let refcounts: Vec<Option<i32>> = get_pipe.query_async(con).await?;
+
+            // 2. Pipeline updates/deletes
+            let mut update_pipe = redis::pipe();
+            let mut has_updates = false;
+            for ((_, bk), ref_opt) in block_mappings.iter().zip(refcounts) {
+                if let Some(mut r) = ref_opt {
+                    r -= 1;
+                    if r <= 0 {
+                        update_pipe
+                            .hdel(refcounts_key, bk)
+                            .hdel(crate::fs_key!("block_sizes"), bk);
+                        blocks_to_free.push(bk.clone());
+                        has_updates = true;
+                    } else {
+                        update_pipe.hset(refcounts_key, bk, r);
+                        has_updates = true;
+                    }
+                } else {
+                    update_pipe.hdel(crate::fs_key!("block_sizes"), bk);
+                    blocks_to_free.push(bk.clone());
+                    has_updates = true;
+                }
+            }
+            if has_updates {
+                let _: () = update_pipe.query_async(con).await?;
+            }
+        }
+        Ok(blocks_to_free)
     }
 
     /// Resolve a logical filesystem path (e.g., "/dir1/file.txt") to its FUSE inode number.

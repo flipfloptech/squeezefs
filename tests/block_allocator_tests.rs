@@ -260,3 +260,108 @@ async fn test_pipelined_block_free() {
         .unwrap();
     assert_eq!(free_count, 3);
 }
+
+#[tokio::test]
+async fn test_delete_file_with_fallback() {
+    squeezefs::set_fs_prefix("test_del_fallback");
+    let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    {
+        let mut conn = client.get_connection().unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg("test_del_fallback:free_blocks")
+            .arg("test_del_fallback:highest_block")
+            .arg("test_del_fallback:block_refcounts")
+            .arg("test_del_fallback:block_sizes")
+            .query(&mut conn)
+            .unwrap_or_default();
+    }
+    let meta = Arc::new(MetaClient::new_single(client));
+
+    let dev0_path = "/tmp/squeezefs_test_del_fallback_dev0";
+    std::fs::write(dev0_path, vec![0u8; 8 * 1024 * 1024]).unwrap();
+
+    let dev0 = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(dev0_path));
+    let alloc0 = Arc::new(
+        BlockAllocator::new(meta.clone(), "test_del_fallback")
+            .await
+            .unwrap(),
+    );
+
+    let _block_size = Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024));
+    let dlm = squeezefs::dlm::DlmClient::new("redis://127.0.0.1:6379").unwrap();
+    let cache = squeezefs::cache::TieredCache::new(
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        dlm.meta_client().clone(),
+        alloc0.clone(),
+        dev0.clone(),
+    )
+    .unwrap();
+    let router = squeezefs::routing::DataRouter::new(dlm, cache, alloc0, dev0);
+
+    let mut con = router.dlm.get_connection().await.unwrap();
+    let file_path = "test_del_file";
+    let meta_key = format!("metadata:{}", file_path);
+    let block_map_id = "test_map_123";
+    let block_map_key = format!("block_map:{}", block_map_id);
+
+    let _: () = redis::cmd("HSET")
+        .arg(&meta_key)
+        .arg("type")
+        .arg("striped")
+        .arg("block_map_id")
+        .arg(block_map_id)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let _: () = redis::cmd("HSET")
+        .arg(&block_map_key)
+        .arg("0")
+        .arg("backend_0://0")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let refcounts_key = "test_del_fallback:block_refcounts";
+    let sizes_key = "test_del_fallback:block_sizes";
+    let _: () = redis::cmd("HSET")
+        .arg(refcounts_key)
+        .arg("backend_0://0")
+        .arg("1")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(sizes_key)
+        .arg("backend_0://0")
+        .arg("4194304")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // Call delete_file.
+    router.delete_file(file_path, &mut con).await.unwrap();
+
+    // Verify metadata and mappings were deleted
+    let size_exists: bool = redis::cmd("HEXISTS")
+        .arg(sizes_key)
+        .arg("backend_0://0")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(!size_exists);
+
+    let map_exists: bool = redis::cmd("EXISTS")
+        .arg(&block_map_key)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(!map_exists);
+
+    let _ = std::fs::remove_file(dev0_path);
+}
+

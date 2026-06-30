@@ -71,6 +71,42 @@ impl NvmeBlockDev {
         let file = self.get_file()?;
         let data_len = data.len();
         let alignment = 4096;
+
+        // If the data is already page-aligned and is a multiple of 4096 bytes, we bypass allocation and copying completely!
+        if (data.as_ptr() as usize) % alignment == 0 && data_len % alignment == 0 {
+            let data_ptr = data.as_ptr() as usize;
+            tokio::task::spawn_blocking(move || {
+                let aligned_slice = unsafe {
+                    std::slice::from_raw_parts(data_ptr as *const u8, data_len)
+                };
+                let res = file.write_all_at(aligned_slice, offset);
+                res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
+                Ok::<(), crate::error::SqueezefsError>(())
+            })
+            .await
+            .map_err(|e| crate::error::SqueezefsError::InvalidOperation(format!("Block write task panicked: {:?}", e)))??;
+            
+            crate::fuse_client::METRICS
+                .put_obj
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if crate::write_verification_enabled() {
+                let mut read_data = self.read_block(offset, data.len()).await?;
+                if SIMULATE_CORRUPTION.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !read_data.is_empty() {
+                        read_data[0] ^= 0xFF;
+                    }
+                }
+                if read_data != data {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                        "Write verification failed: checksum mismatch at offset {} on device {}",
+                        offset, self.device_path
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
         let aligned_len = (data_len + 4095) & !4095;
 
         // Allocate page-aligned buffer once on calling thread

@@ -210,6 +210,8 @@ pub struct SqueezefsFilesystem {
     pub mountpoint: std::sync::Arc<std::sync::Mutex<String>>,
     pub max_background_uploads: usize,
     pub active_block_buffers: std::sync::Arc<dashmap::DashMap<String, Vec<u8>, ahash::RandomState>>,
+    pub open_virtual_files: dashmap::DashMap<u64, Vec<u8>, ahash::RandomState>,
+    pub next_virtual_fh: std::sync::atomic::AtomicU64,
 }
 
 impl SqueezefsFilesystem {
@@ -253,6 +255,8 @@ impl SqueezefsFilesystem {
             active_block_buffers: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            open_virtual_files: dashmap::DashMap::with_hasher(ahash::RandomState::new()),
+            next_virtual_fh: std::sync::atomic::AtomicU64::new(0x1000_0000_0000_0000),
         }
     }
 
@@ -1781,6 +1785,17 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Open: inode = {}", inode);
 
+        if inode == STATS_INODE || inode == CONFIG_INODE {
+            let content = if inode == STATS_INODE {
+                self.generate_stats_json().await
+            } else {
+                self.generate_config_json().await
+            };
+            let fh = self.next_virtual_fh.fetch_add(1, Ordering::Relaxed);
+            self.open_virtual_files.insert(fh, content.into_bytes());
+            return Ok(ReplyOpen { fh, flags: 0 });
+        }
+
         // File handle is just the inode number for simplicity in this design
         Ok(ReplyOpen {
             fh: inode,
@@ -1814,8 +1829,11 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         if ino == CONFIG_INODE {
-            let config_data = self.generate_config_json().await;
-            let bytes = config_data.into_bytes();
+            let bytes = if let Some(cached) = self.open_virtual_files.get(&fh) {
+                cached.clone()
+            } else {
+                self.generate_config_json().await.into_bytes()
+            };
             if offset >= bytes.len() as u64 {
                 return Ok(ReplyData {
                     data: Vec::new().into(),
@@ -1831,8 +1849,11 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         if ino == STATS_INODE {
-            let stats_data = self.generate_stats_json().await;
-            let bytes = stats_data.into_bytes();
+            let bytes = if let Some(cached) = self.open_virtual_files.get(&fh) {
+                cached.clone()
+            } else {
+                self.generate_stats_json().await.into_bytes()
+            };
             if offset >= bytes.len() as u64 {
                 return Ok(ReplyData {
                     data: Vec::new().into(),
@@ -4013,13 +4034,18 @@ impl Filesystem for SqueezefsFilesystem {
         &self,
         _req: Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _flags: u32,
         _lock_owner: u64,
         _flush: bool,
     ) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Release: ino = {}", ino);
+
+        if ino == STATS_INODE || ino == CONFIG_INODE {
+            self.open_virtual_files.remove(&fh);
+            return Ok(());
+        }
 
         // Flush any remaining active staging blocks before releasing the lease
         if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {

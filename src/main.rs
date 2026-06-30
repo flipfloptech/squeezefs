@@ -3373,6 +3373,64 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn find_uri_from_proc(target_path: &std::path::Path) -> Option<String> {
+    let target_abs = target_path
+        .canonicalize()
+        .unwrap_or_else(|_| target_path.to_path_buf());
+    let dir = std::fs::read_dir("/proc").ok()?;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            if name.chars().all(|c| c.is_ascii_digit()) {
+                let cmdline_path = path.join("cmdline");
+                if let Ok(mut bytes) = std::fs::read(cmdline_path) {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if bytes.last() == Some(&0) {
+                        bytes.pop();
+                    }
+                    let args: Vec<String> = bytes
+                        .split(|&b| b == 0)
+                        .map(|slice| String::from_utf8_lossy(slice).into_owned())
+                        .collect();
+                    if args.iter().any(|arg| arg.contains("squeezefs"))
+                        && args.iter().any(|arg| arg == "mount")
+                    {
+                        let mut found_uri = None;
+                        let mut found_mountpoint = None;
+                        for arg in &args {
+                            if arg.starts_with("squeeze://") || arg.starts_with("redis://") {
+                                found_uri = Some(arg.clone());
+                            } else if arg.starts_with("/") {
+                                let arg_path = std::path::Path::new(arg);
+                                if let Ok(abs_arg) = arg_path.canonicalize() {
+                                    if target_abs.starts_with(&abs_arg) {
+                                        found_mountpoint = Some(abs_arg);
+                                    }
+                                } else if target_abs.starts_with(arg_path) {
+                                    found_mountpoint = Some(arg_path.to_path_buf());
+                                }
+                            }
+                        }
+                        if let (Some(uri), Some(_)) = (found_uri, found_mountpoint) {
+                            return Some(uri);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_squeezefs_mount(path: &std::path::Path) -> bool {
+    if path.join(".stats").exists() && path.join(".config").exists() {
+        return true;
+    }
+    find_uri_from_proc(path).is_some()
+}
+
 fn find_squeezefs_mounts() -> Vec<PathBuf> {
     let mut mounts = Vec::new();
     if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
@@ -3383,7 +3441,7 @@ fn find_squeezefs_mounts() -> Vec<PathBuf> {
                 let mnt_type = parts[2];
                 if mnt_type.starts_with("fuse") {
                     let path = PathBuf::from(mnt_dir);
-                    if path.join(".stats").exists() && path.join(".config").exists() {
+                    if is_squeezefs_mount(&path) {
                         mounts.push(path);
                     }
                 }
@@ -3535,50 +3593,61 @@ async fn run_df_command(
                 println!("{}", "-".repeat(100));
                 for mnt in &mounts {
                     let stats_path = mnt.join(".stats");
-                    if let Ok(stats_str) = std::fs::read_to_string(&stats_path) {
-                        if let Ok(stats_json) =
-                            serde_json::from_str::<serde_json::Value>(&stats_str)
-                        {
-                            let cap = &stats_json["cache_capacities"];
-                            let ram_read_curr = cap["read_lru_current_bytes"].as_u64().unwrap_or(0);
-                            let ram_read_max = cap["read_lru_max_bytes"].as_u64().unwrap_or(0);
-                            let ram_write_curr =
-                                cap["write_lru_current_bytes"].as_u64().unwrap_or(0);
-                            let ram_write_max = cap["write_lru_max_bytes"].as_u64().unwrap_or(0);
-                            let nvme_read_curr =
-                                cap["nvme_read_cache_current_bytes"].as_u64().unwrap_or(0);
-                            let nvme_read_max =
-                                cap["nvme_read_cache_max_bytes"].as_u64().unwrap_or(0);
-                            let nvme_stage_curr =
-                                cap["nvme_staging_current_bytes"].as_u64().unwrap_or(0);
-                            let nvme_stage_max =
-                                cap["nvme_staging_max_bytes"].as_u64().unwrap_or(0);
+                    match std::fs::read_to_string(&stats_path) {
+                        Ok(stats_str) => {
+                            if let Ok(stats_json) =
+                                serde_json::from_str::<serde_json::Value>(&stats_str)
+                            {
+                                let cap = &stats_json["cache_capacities"];
+                                let ram_read_curr =
+                                    cap["read_lru_current_bytes"].as_u64().unwrap_or(0);
+                                let ram_read_max = cap["read_lru_max_bytes"].as_u64().unwrap_or(0);
+                                let ram_write_curr =
+                                    cap["write_lru_current_bytes"].as_u64().unwrap_or(0);
+                                let ram_write_max =
+                                    cap["write_lru_max_bytes"].as_u64().unwrap_or(0);
+                                let nvme_read_curr =
+                                    cap["nvme_read_cache_current_bytes"].as_u64().unwrap_or(0);
+                                let nvme_read_max =
+                                    cap["nvme_read_cache_max_bytes"].as_u64().unwrap_or(0);
+                                let nvme_stage_curr =
+                                    cap["nvme_staging_current_bytes"].as_u64().unwrap_or(0);
+                                let nvme_stage_max =
+                                    cap["nvme_staging_max_bytes"].as_u64().unwrap_or(0);
 
+                                println!(
+                                    "{:<20} {:<20} {:<20} {:<20} {:<20}",
+                                    mnt.to_string_lossy(),
+                                    format!(
+                                        "{} / {}",
+                                        format_size(ram_read_curr),
+                                        format_size(ram_read_max)
+                                    ),
+                                    format!(
+                                        "{} / {}",
+                                        format_size(ram_write_curr),
+                                        format_size(ram_write_max)
+                                    ),
+                                    format!(
+                                        "{} / {}",
+                                        format_size(nvme_read_curr),
+                                        format_size(nvme_read_max)
+                                    ),
+                                    format!(
+                                        "{} / {}",
+                                        format_size(nvme_stage_curr),
+                                        format_size(nvme_stage_max)
+                                    )
+                                );
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                             println!(
-                                "{:<20} {:<20} {:<20} {:<20} {:<20}",
-                                mnt.to_string_lossy(),
-                                format!(
-                                    "{} / {}",
-                                    format_size(ram_read_curr),
-                                    format_size(ram_read_max)
-                                ),
-                                format!(
-                                    "{} / {}",
-                                    format_size(ram_write_curr),
-                                    format_size(ram_write_max)
-                                ),
-                                format!(
-                                    "{} / {}",
-                                    format_size(nvme_read_curr),
-                                    format_size(nvme_read_max)
-                                ),
-                                format!(
-                                    "{} / {}",
-                                    format_size(nvme_stage_curr),
-                                    format_size(nvme_stage_max)
-                                )
+                                "{:<20} [Permission Denied - run without sudo to view cache stats]",
+                                mnt.to_string_lossy()
                             );
                         }
+                        Err(_) => {}
                     }
                 }
             }
@@ -4037,6 +4106,9 @@ fn resolve_squeeze_uri(
             if is_uri(path_str) {
                 return Ok(parse_squeeze_uri(path_str)?);
             }
+        }
+        if let Some(uri) = find_uri_from_proc(ref_path) {
+            return Ok(parse_squeeze_uri(&uri)?);
         }
         let mut current = if ref_path.is_file() {
             ref_path.parent().unwrap_or(ref_path).to_path_buf()

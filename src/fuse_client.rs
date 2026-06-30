@@ -83,11 +83,19 @@ pub struct ProbabilisticAtomic {
 
 impl ProbabilisticAtomic {
     pub fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
-        if fastrand::u8(..) < 3 {
-            self.inner.fetch_add(val * 100, order)
-        } else {
-            self.inner.load(order)
+        thread_local! {
+            static BATCH_COUNTER: std::cell::Cell<u64> = std::cell::Cell::new(0);
         }
+        BATCH_COUNTER.with(|c| {
+            let next = c.get() + val;
+            if next >= 128 {
+                c.set(0);
+                self.inner.fetch_add(next, order)
+            } else {
+                c.set(next);
+                self.inner.load(order)
+            }
+        })
     }
 
     pub fn load(&self, order: Ordering) -> u64 {

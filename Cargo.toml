@@ -82,4 +82,5 @@ fuse3 = { path = "third_party/fuse3" }
 tikv-jemallocator = "0.5"
 
 [profile.release]
-debug = 1
+debug = true
+force-frame-pointers = true

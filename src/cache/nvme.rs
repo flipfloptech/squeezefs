@@ -695,9 +695,9 @@ impl NvmeStaging {
     }
 
     /// Cache a block of read data on local NVMe using read_nvme_cache.
-    pub fn cache_read_block(&self, block_key: &str, data: &[u8]) -> Result<()> {
+    pub fn cache_read_block(&self, block_key: &str, data: Bytes) -> Result<()> {
         let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
-        let val_bytes = Bytes::copy_from_slice(data);
+        let val_bytes = data;
         self.read_nvme_cache
             .put(key_bytes.clone(), val_bytes.clone());
 

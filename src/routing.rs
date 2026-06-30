@@ -313,16 +313,17 @@ impl DataRouter {
                 };
 
                 let downloaded = self.fetch_block_from_remote(block_key).await?;
+                let downloaded_bytes = bytes::Bytes::from(downloaded.into_inner());
                 let nvme_clone = self.cache.nvme.clone();
                 let bk_clone = block_key.to_string();
-                let dl_clone = downloaded.clone();
+                let dl_clone = downloaded_bytes.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _ = nvme_clone.cache_read_block(&bk_clone, &dl_clone);
+                    let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
                 });
                 self.cache
                     .read_lru
-                    .put(block_key, bytes::Bytes::copy_from_slice(&downloaded));
-                Ok(crate::cache::pool::ReadBlockValue::Pooled(downloaded))
+                    .put(block_key, downloaded_bytes.clone());
+                Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes))
             }
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 let tx = entry.get().clone();
@@ -1307,7 +1308,7 @@ impl DataRouter {
                     format!("{}://{}", be_id, offset)
                 };
 
-                let block_bytes = bytes::Bytes::copy_from_slice(&block_data);
+                let block_bytes = bytes::Bytes::from(block_data.into_inner());
 
                 // Cache newly written block in RAM - dehydrated to NVMe on eviction
                 read_lru.put(&stored_new_block_key, block_bytes.clone());
@@ -2084,64 +2085,77 @@ impl DataRouter {
                     .load_striped_block_keys(file_path, &meta, start_block, end_block)
                     .await?;
 
+                let mut final_buf = BUFFER_POOL.alloc();
+                let final_len = (end_offset - offset) as usize;
+                final_buf.resize(final_len, 0);
+                let raw_ptr = final_buf.as_mut_ptr() as usize;
+
                 // Spawn concurrent tasks to download block data in parallel
                 let mut futures = Vec::new();
                 for (b_idx, b_key_opt) in block_keys {
                     let router = self.clone();
                     let b_start_offset = b_idx as u64 * block_size;
                     let b_end_offset = b_start_offset + block_size;
-                    let slice_start = std::cmp::max(offset, b_start_offset) - b_start_offset;
+                    let slice_start = std::cmp::max(offset, b_start_offset);
                     let slice_end = std::cmp::min(end_offset, b_end_offset);
-                    let rel_end = slice_end - b_start_offset;
-                    let slice_len = (rel_end - slice_start) as u32;
+                    let dest_start = (slice_start - offset) as usize;
+                    let copy_len = (slice_end - slice_start) as usize;
+
+                    let rel_start = (slice_start - b_start_offset) as usize;
                     let file_path_clone = file_path.to_string();
+
                     futures.push(tokio::spawn(async move {
                         let cache_key = format!("active_block:{}:block_{}", file_path_clone, b_idx);
-                        let block_data = if let Some(active_data) =
+                        if let Some(active_data) =
                             router.cache.nvme.read_staged(&cache_key)
                         {
-                            let start = std::cmp::min(slice_start as usize, active_data.len());
-                            let end = std::cmp::min(
-                                (slice_start + slice_len as u64) as usize,
-                                active_data.len(),
-                            );
-                            let mut sliced_pooled = BUFFER_POOL.alloc();
-                            sliced_pooled.resize(slice_len as usize, 0);
-                            sliced_pooled[0..end - start].copy_from_slice(&active_data[start..end]);
-                            sliced_pooled
+                            let start = std::cmp::min(rel_start, active_data.len());
+                            let end = std::cmp::min(rel_start + copy_len, active_data.len());
+                            let actual_copy = end - start;
+                            if actual_copy > 0 {
+                                unsafe {
+                                    let dest = (raw_ptr + dest_start) as *mut u8;
+                                    std::ptr::copy_nonoverlapping(
+                                        active_data[start..end].as_ptr(),
+                                        dest,
+                                        actual_copy,
+                                    );
+                                }
+                            }
                         } else if let Some(ref b_key) = b_key_opt {
                             if let Some(cached_block) = router.cache.read_lru.get(b_key) {
                                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                let start = std::cmp::min(slice_start as usize, cached_block.len());
-                                let end = std::cmp::min(
-                                    (slice_start + slice_len as u64) as usize,
-                                    cached_block.len(),
-                                );
-                                let mut sliced_pooled = BUFFER_POOL.alloc();
-                                sliced_pooled.resize(slice_len as usize, 0);
-                                sliced_pooled[0..end - start]
-                                    .copy_from_slice(&cached_block[start..end]);
-                                sliced_pooled
+                                let start = std::cmp::min(rel_start, cached_block.len());
+                                let end = std::cmp::min(rel_start + copy_len, cached_block.len());
+                                let actual_copy = end - start;
+                                if actual_copy > 0 {
+                                    unsafe {
+                                        let dest = (raw_ptr + dest_start) as *mut u8;
+                                        std::ptr::copy_nonoverlapping(
+                                            cached_block[start..end].as_ptr(),
+                                            dest,
+                                            actual_copy,
+                                        );
+                                    }
+                                }
                             } else {
                                 let downloaded = router.get_cached_or_fetch_block(b_key).await?;
-                                let start = std::cmp::min(slice_start as usize, downloaded.len());
-                                let end = std::cmp::min(
-                                    (slice_start + slice_len as u64) as usize,
-                                    downloaded.len(),
-                                );
-                                let mut sliced_pooled = BUFFER_POOL.alloc();
-                                sliced_pooled.resize(slice_len as usize, 0);
-                                sliced_pooled[0..end - start]
-                                    .copy_from_slice(&downloaded[start..end]);
-                                sliced_pooled
+                                let start = std::cmp::min(rel_start, downloaded.len());
+                                let end = std::cmp::min(rel_start + copy_len, downloaded.len());
+                                let actual_copy = end - start;
+                                if actual_copy > 0 {
+                                    unsafe {
+                                        let dest = (raw_ptr + dest_start) as *mut u8;
+                                        std::ptr::copy_nonoverlapping(
+                                            downloaded[start..end].as_ptr(),
+                                            dest,
+                                            actual_copy,
+                                        );
+                                    }
+                                }
                             }
-                        } else {
-                            // Hole support: return zero-filled block
-                            let mut hole_pooled = BUFFER_POOL.alloc();
-                            hole_pooled.resize(slice_len as usize, 0);
-                            hole_pooled
-                        };
-                        Ok::<_, SqueezefsError>((b_idx, block_data))
+                        }
+                        Ok::<(), SqueezefsError>(())
                     }));
                 }
 
@@ -2152,25 +2166,8 @@ impl DataRouter {
                     )))
                 })?;
 
-                let mut results_sorted = Vec::new();
                 for res in results {
-                    results_sorted.push(res?);
-                }
-                results_sorted.sort_by_key(|r| r.0);
-
-                let mut final_buf = BUFFER_POOL.alloc();
-                final_buf.resize((end_offset - offset) as usize, 0);
-                for (b_idx, block_data) in results_sorted {
-                    let b_start_offset = b_idx as u64 * block_size;
-                    let b_end_offset = b_start_offset + block_size;
-                    let slice_start = std::cmp::max(offset, b_start_offset);
-                    let slice_end = std::cmp::min(end_offset, b_end_offset);
-                    let dest_start = (slice_start - offset) as usize;
-                    let dest_end = (slice_end - offset) as usize;
-                    let copy_len = dest_end - dest_start;
-                    let src_len = std::cmp::min(copy_len, block_data.len());
-                    final_buf[dest_start..dest_start + src_len]
-                        .copy_from_slice(&block_data[..src_len]);
+                    res?;
                 }
 
                 if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
@@ -2182,7 +2179,7 @@ impl DataRouter {
                     );
                 }
 
-                let slice: &[u8] = &final_buf[..(end_offset - offset) as usize];
+                let slice: &[u8] = &final_buf[..final_len];
                 let data = unsafe {
                     bytes::Bytes::from_static(std::mem::transmute::<&[u8], &'static [u8]>(slice))
                 };

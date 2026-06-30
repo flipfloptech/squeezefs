@@ -700,11 +700,10 @@ impl SqueezefsFilesystem {
                     if let Ok(b) = parts[1].parse::<u32>() {
                         let nvme_clone = self.router.cache.nvme.clone();
                         let key_clone = key.clone();
-                        let block_data_clone = block_data.clone();
                         tokio::task::spawn_blocking(move || {
                             nvme_clone.put_active_block(
                                 &key_clone,
-                                &block_data_clone,
+                                &block_data,
                                 fencing_token,
                             );
                         })
@@ -843,18 +842,19 @@ impl SqueezefsFilesystem {
                                     .await;
 
                                     let decompressed = get_res?;
+                                    let decompressed_bytes = bytes::Bytes::from(decompressed);
                                     self.router
                                         .cache
                                         .read_lru
-                                        .put(&bk, bytes::Bytes::from(decompressed.clone()));
+                                        .put(&bk, decompressed_bytes.clone());
                                     let nvme_clone = self.router.cache.nvme.clone();
                                     let bk_clone = bk.clone();
-                                    let decompressed_clone = decompressed.clone();
+                                    let decompressed_clone = decompressed_bytes.clone();
                                     tokio::task::spawn_blocking(move || {
                                         let _ = nvme_clone
-                                            .cache_read_block(&bk_clone, &decompressed_clone);
+                                            .cache_read_block(&bk_clone, decompressed_clone);
                                     });
-                                    decompressed
+                                    decompressed_bytes.to_vec()
                                 };
                             }
                         }
@@ -875,12 +875,11 @@ impl SqueezefsFilesystem {
                 if is_block_complete {
                     let nvme_clone = self.router.cache.nvme.clone();
                     let cache_key_clone = cache_key.clone();
-                    let block_data_clone = block_data.clone();
                     let fencing_token_val = _fencing_token;
                     tokio::task::spawn_blocking(move || {
                         nvme_clone.put_active_block(
                             &cache_key_clone,
-                            &block_data_clone,
+                            &block_data,
                             fencing_token_val,
                         );
                     })

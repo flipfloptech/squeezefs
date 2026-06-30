@@ -111,7 +111,7 @@ impl TieredCache {
                             let key_clone = key.clone();
                             let data_clone = data.clone();
                             let _ = tokio::task::spawn_blocking(move || {
-                                nvme_clone_inner.cache_read_block(&key_clone, &data_clone)
+                                nvme_clone_inner.cache_read_block(&key_clone, data_clone)
                             })
                             .await;
                         }

@@ -54,10 +54,11 @@ async fn test_read_block_from_offset() {
     let read_result = writer.read_block(offset, 4 * 1024 * 1024).await;
     assert!(read_result.is_ok(), "Reading block should succeed");
 
-    let read_data = read_result.unwrap();
+    let read_data: bytes::Bytes = read_result.unwrap();
     assert_eq!(read_data.len(), data.len(), "Read data length should match");
     assert_eq!(
-        read_data, data,
+        read_data.as_ref(),
+        data.as_slice(),
         "Data read from block device should match exactly"
     );
 }

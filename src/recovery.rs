@@ -160,6 +160,17 @@ pub async fn recover_staging(
                         let meta_key = format!("metadata:inode_{}", ino);
                         let exists: bool = con.exists(&meta_key).await.unwrap_or(false);
                         if exists {
+                            let db_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await.unwrap_or(None);
+                            if let Some(df) = db_fencing {
+                                if meta.fencing_token < df {
+                                    warn!(
+                                        "Crash Recovery: Stale fencing token {} detected for inode {} (database has {}). Discarding entry.",
+                                        meta.fencing_token, ino, df
+                                    );
+                                    cache.remove(&key_bytes);
+                                    continue;
+                                }
+                            }
                             let block_map_id_opt: Option<String> =
                                 con.hget(&meta_key, "block_map_id").await?;
                             let mut block_map_id = block_map_id_opt.unwrap_or_default();
@@ -313,9 +324,22 @@ pub async fn recover_staging(
             let meta_key = format!("metadata:{}", meta.file_path);
             let redis_file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
             let redis_file_type: Option<String> = con.hget(&meta_key, "type").await?;
+            let db_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await.unwrap_or(None);
 
-            let should_recover = redis_file_type.as_deref() == Some("staged")
+            let mut should_recover = redis_file_type.as_deref() == Some("staged")
                 && redis_file_id.as_deref() == Some(&file_id);
+
+            if should_recover {
+                if let Some(df) = db_fencing {
+                    if meta.fencing_token < df {
+                        warn!(
+                            "Crash Recovery: Stale fencing token {} detected for staged file '{}' (database has {}). Discarding entry.",
+                            meta.fencing_token, meta.file_path, df
+                        );
+                        should_recover = false;
+                    }
+                }
+            }
 
             if should_recover {
                 info!(

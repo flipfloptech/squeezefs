@@ -225,3 +225,38 @@ async fn test_backend_router_routing() {
     let _ = std::fs::remove_file(dev0_path);
     let _ = std::fs::remove_file(dev1_path);
 }
+
+#[tokio::test]
+async fn test_pipelined_block_free() {
+    let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    {
+        let mut conn = client.get_connection().unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg("test_vol_pipelining:free_blocks")
+            .arg("test_vol_pipelining:highest_block")
+            .query(&mut conn)
+            .unwrap_or_default();
+    }
+    let meta = Arc::new(MetaClient::new_single(client));
+
+    let allocator = BlockAllocator::new(meta, "test_vol_pipelining")
+        .await
+        .expect("Failed to create allocator");
+
+    // Allocate 3 blocks
+    let offset1 = allocator.allocate_block().await.unwrap();
+    let offset2 = allocator.allocate_block().await.unwrap();
+    let offset3 = allocator.allocate_block().await.unwrap();
+
+    // Call pipelined free_blocks
+    allocator.free_blocks(&[offset1, offset2, offset3]).await.expect("Failed batch free");
+
+    // Verify they are added to the free blocks set
+    let client2 = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    let mut conn = client2.get_connection().unwrap();
+    let free_count: u64 = redis::cmd("SCARD")
+        .arg("test_vol_pipelining:free_blocks")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(free_count, 3);
+}

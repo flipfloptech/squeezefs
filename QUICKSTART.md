@@ -188,3 +188,40 @@ This suite profiles:
 - **`concurrent_reads_16_tasks_same_file`**: Measures concurrent reads from a shared file.
 - **`concurrent_locks_16_tasks`**: Measures DLM lock acquisition/release contention.
 - **`concurrent_pool_alloc_16_tasks`**: Measures allocation/deallocation concurrency in the unified buffer pool.
+
+---
+
+## 5. Deploying Garnet C# Custom Command Extensions
+
+To deploy C# Custom Commands to optimize SqueezeFS metadata operations:
+
+### 1. Implement the Custom Transaction (C#)
+Define a class that inherits from `CustomTransactionProcedure` inside a C# project referencing `Garnet.server`:
+
+```csharp
+using Garnet.server;
+
+public class SqueezeUnlink : CustomTransactionProcedure
+{
+    public override bool Main<TGarnetApi>(TGarnetApi api, ArgSlice input, out byte[] output)
+    {
+        // Example logic: atomic resolution, link decrement, and cleanup
+        // API provides direct methods like api.HashDelete, api.KeyDelete, etc.
+        output = System.Text.Encoding.ASCII.GetBytes("SUCCESS");
+        return true;
+    }
+}
+```
+
+### 2. Compile the Extension DLL
+Build the project targeting the standard .NET framework version matching your Garnet server:
+```bash
+dotnet build -c Release
+```
+
+### 3. Load and Register the Extension in Garnet
+Register the compiled DLL (e.g. `SqueezeExtensions.dll`) when starting the Garnet server:
+```bash
+garnet --aof --extension-bin-paths /path/to/SqueezeExtensions.dll
+```
+Once registered, FUSE clients can call this custom command using standard RESP protocol clients, resolving complex namespace changes in exactly **1 round-trip**.

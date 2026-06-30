@@ -12,6 +12,9 @@ pub struct CryptoCompressState {
     pub private_key: Option<Arc<RsaPrivateKey>>,
     pub unwrap_cache: moka::sync::Cache<Vec<u8>, Vec<u8>>,
     pub key_unwrap_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub prewrapped_key: Option<(Vec<u8>, [u8; 32])>,
+    pub nonce_counter: Arc<std::sync::atomic::AtomicU64>,
+    pub salt: [u8; 4],
 }
 
 impl CryptoCompressState {
@@ -29,6 +32,25 @@ impl CryptoCompressState {
             }
         });
 
+        let mut prewrapped_key = None;
+        if let Some(ref priv_key) = private_key {
+            let algo_trim = encrypt_algo.trim();
+            if algo_trim != "none" && !algo_trim.is_empty() {
+                let mut key_bytes = [0u8; 32];
+                let mut rng = rand::thread_rng();
+                if SystemRandom::new().fill(&mut key_bytes).is_ok() {
+                    let public_key = priv_key.to_public_key();
+                    if let Ok(wrapped) = public_key.encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes) {
+                        prewrapped_key = Some((wrapped, key_bytes));
+                    }
+                }
+            }
+        }
+
+        let mut salt = [0u8; 4];
+        let _ = SystemRandom::new().fill(&mut salt);
+        let nonce_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let unwrap_cache = moka::sync::Cache::builder().max_capacity(10000).build();
 
         Self {
@@ -37,6 +59,9 @@ impl CryptoCompressState {
             private_key,
             unwrap_cache,
             key_unwrap_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            prewrapped_key,
+            nonce_counter,
+            salt,
         }
     }
 
@@ -83,29 +108,35 @@ impl CryptoCompressState {
     }
 
     pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, SqueezefsError> {
-        let mut key_bytes = [0u8; 32];
-        SystemRandom::new().fill(&mut key_bytes).map_err(|_| {
-            SqueezefsError::InvalidOperation("Failed to generate random data key".to_string())
-        })?;
-
-        let private_key = self.private_key.as_ref().ok_or_else(|| {
-            SqueezefsError::InvalidOperation(
-                "RSA Private Key is required for encryption but not configured".to_string(),
-            )
-        })?;
-        let public_key = private_key.to_public_key();
-
-        let mut rng = rand::thread_rng();
-        let wrapped_key = public_key
-            .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes)
-            .map_err(|e| {
-                SqueezefsError::InvalidOperation(format!("RSA key wrap failed: {:?}", e))
+        let (wrapped_key, key_bytes) = if let Some((ref wrapped, key)) = self.prewrapped_key {
+            (wrapped.clone(), key)
+        } else {
+            let mut key_bytes = [0u8; 32];
+            SystemRandom::new().fill(&mut key_bytes).map_err(|_| {
+                SqueezefsError::InvalidOperation("Failed to generate random data key".to_string())
             })?;
 
+            let private_key = self.private_key.as_ref().ok_or_else(|| {
+                SqueezefsError::InvalidOperation(
+                    "RSA Private Key is required for encryption but not configured".to_string(),
+                )
+            })?;
+            let public_key = private_key.to_public_key();
+
+            let mut rng = rand::thread_rng();
+            let wrapped_key = public_key
+                .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes)
+                .map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!("RSA key wrap failed: {:?}", e))
+                })?;
+            (wrapped_key, key_bytes)
+        };
+
+        // Monotonic sequence-based nonce to bypass OS random system calls
+        let seq = self.nonce_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut nonce_bytes = [0u8; 12];
-        SystemRandom::new().fill(&mut nonce_bytes).map_err(|_| {
-            SqueezefsError::InvalidOperation("Failed to generate random nonce".to_string())
-        })?;
+        nonce_bytes[0..4].copy_from_slice(&self.salt);
+        nonce_bytes[4..12].copy_from_slice(&seq.to_be_bytes());
 
         let algorithm = match self.encrypt_algo.as_str() {
             "aes256gcm-rsa" => &AES_256_GCM,
@@ -126,7 +157,11 @@ impl CryptoCompressState {
             SqueezefsError::InvalidOperation("Failed to construct nonce".to_string())
         })?;
 
-        let mut in_out = data.to_vec();
+        // Pre-allocate vector capacity to avoid intermediate reallocations on AEAD seal
+        let tag_len = algorithm.tag_len();
+        let mut in_out = Vec::with_capacity(data.len() + tag_len);
+        in_out.extend_from_slice(data);
+
         less_safe_key
             .seal_in_place_append_tag(nonce, ring::aead::Aad::empty(), &mut in_out)
             .map_err(|_| SqueezefsError::InvalidOperation("AEAD seal failed".to_string()))?;

@@ -95,15 +95,8 @@ impl NvmeBlockDev {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             if crate::write_verification_enabled() {
-                let mut read_data = self.read_block(offset, data.len()).await?;
-                if SIMULATE_CORRUPTION.load(std::sync::atomic::Ordering::Relaxed) {
-                    if !read_data.is_empty() {
-                        let mut temp = read_data.to_vec();
-                        temp[0] ^= 0xFF;
-                        read_data = bytes::Bytes::from(temp);
-                    }
-                }
-                if read_data.as_ref() != data {
+                let verified = self.verify_write_block(offset, data).await?;
+                if !verified {
                     return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                         "Write verification failed: checksum mismatch at offset {} on device {}",
                         offset, self.device_path
@@ -161,15 +154,8 @@ impl NvmeBlockDev {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if crate::write_verification_enabled() {
-            let mut read_data = self.read_block(offset, data.len()).await?;
-            if SIMULATE_CORRUPTION.load(std::sync::atomic::Ordering::Relaxed) {
-                if !read_data.is_empty() {
-                    let mut temp = read_data.to_vec();
-                    temp[0] ^= 0xFF;
-                    read_data = bytes::Bytes::from(temp);
-                }
-            }
-            if read_data.as_ref() != data {
+            let verified = self.verify_write_block(offset, data).await?;
+            if !verified {
                 return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                     "Write verification failed: checksum mismatch at offset {} on device {}",
                     offset, self.device_path
@@ -178,6 +164,55 @@ impl NvmeBlockDev {
         }
 
         Ok(())
+    }
+
+    pub async fn verify_write_block(&self, offset: u64, expected: &[u8]) -> Result<bool> {
+        let file = self.get_file()?;
+        let expected_len = expected.len();
+        let aligned_len = (expected_len + 4095) & !4095;
+        let alignment = 4096;
+        let expected_ptr = expected.as_ptr() as usize;
+
+        tokio::task::spawn_blocking(move || {
+            let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
+            unsafe {
+                if libc::posix_memalign(&mut buf_ptr, alignment, aligned_len) != 0 {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(
+                        "posix_memalign failed for verify_write_block".to_string(),
+                    ));
+                }
+            }
+
+            let aligned_slice = unsafe {
+                std::slice::from_raw_parts_mut(buf_ptr as *mut u8, aligned_len)
+            };
+
+            let res = file.read_exact_at(&mut aligned_slice[0..expected_len], offset);
+
+            let matched = if res.is_ok() {
+                if SIMULATE_CORRUPTION.load(std::sync::atomic::Ordering::Relaxed) {
+                    aligned_slice[0] ^= 0xFF;
+                }
+                let expected_slice = unsafe {
+                    std::slice::from_raw_parts(expected_ptr as *const u8, expected_len)
+                };
+                aligned_slice[0..expected_len] == *expected_slice
+            } else {
+                false
+            };
+
+            unsafe {
+                libc::free(buf_ptr);
+            }
+            Ok(matched)
+        })
+        .await
+        .map_err(|e| {
+            crate::error::SqueezefsError::InvalidOperation(format!(
+                "Thread join error on verify_write_block: {}",
+                e
+            ))
+        })?
     }
 
     pub async fn read_block(&self, offset: u64, size: usize) -> Result<bytes::Bytes> {

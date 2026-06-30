@@ -1,0 +1,21 @@
+# Stage 1: Build the C# extensions
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build-env
+WORKDIR /app
+
+# Copy project files and restore
+COPY SqueezeExtensions.csproj ./
+RUN dotnet restore
+
+# Copy source and publish
+COPY SqueezeUnlink.cs ./
+RUN dotnet publish -c Release -o out
+
+# Stage 2: Create the custom Garnet image
+FROM ghcr.io/microsoft/garnet:latest
+WORKDIR /app
+
+# Copy the compiled DLL from Stage 1
+COPY --from=build-env /app/out/SqueezeExtensions.dll /app/SqueezeExtensions.dll
+
+# Run Garnet loading the SqueezeFS extensions automatically
+ENTRYPOINT ["/app/GarnetServer", "--aof", "--extension-bin-paths", "/app/SqueezeExtensions.dll"]

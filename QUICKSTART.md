@@ -193,35 +193,20 @@ This suite profiles:
 
 ## 5. Deploying Garnet C# Custom Command Extensions
 
-To deploy C# Custom Commands to optimize SqueezeFS metadata operations:
+To simplify deployment and avoid forcing administrators to manually compile C# projects and manage DLL paths, SqueezeFS provides a pre-packaged docker container build config under the `docker/` folder.
 
-### 1. Implement the Custom Transaction (C#)
-Define a class that inherits from `CustomTransactionProcedure` inside a C# project referencing `Garnet.server`:
-
-```csharp
-using Garnet.server;
-
-public class SqueezeUnlink : CustomTransactionProcedure
-{
-    public override bool Main<TGarnetApi>(TGarnetApi api, ArgSlice input, out byte[] output)
-    {
-        // Example logic: atomic resolution, link decrement, and cleanup
-        // API provides direct methods like api.HashDelete, api.KeyDelete, etc.
-        output = System.Text.Encoding.ASCII.GetBytes("SUCCESS");
-        return true;
-    }
-}
-```
-
-### 2. Compile the Extension DLL
-Build the project targeting the standard .NET framework version matching your Garnet server:
+### 1. Build the Custom Garnet Image
+Run the following build command in the root of the squeezefs repository. This leverages a multi-stage Dockerfile that fetches the standard .NET SDK, compiles the extensions, and copies the resulting binary into the Garnet runtime base image:
 ```bash
-dotnet build -c Release
+docker build -t squeezefs-garnet -f docker/Dockerfile.garnet docker/
 ```
 
-### 3. Load and Register the Extension in Garnet
-Register the compiled DLL (e.g. `SqueezeExtensions.dll`) when starting the Garnet server:
+### 2. Run the Container
+Launch the container as a drop-in replacement for the standard Microsoft Garnet image:
 ```bash
-garnet --aof --extension-bin-paths /path/to/SqueezeExtensions.dll
+docker run -d \
+  --name squeezefs-garnet \
+  --network host \
+  squeezefs-garnet
 ```
-Once registered, FUSE clients can call this custom command using standard RESP protocol clients, resolving complex namespace changes in exactly **1 round-trip**.
+The custom container automatically starts Garnet with the compiled SqueezeFS extensions preloaded and registered, allowing the filesystem daemon to execute namespace and deallocation transactions in a single RESP round-trip.

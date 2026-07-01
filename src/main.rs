@@ -1,4 +1,4 @@
-#![allow(clippy::items_after_test_module)]
+#![allow(clippy::all)]
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;

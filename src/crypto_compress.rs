@@ -10,9 +10,10 @@ pub struct CryptoCompressState {
     pub compression: String,
     pub encrypt_algo: String,
     pub private_key: Option<Arc<RsaPrivateKey>>,
-    pub unwrap_cache: moka::sync::Cache<Vec<u8>, Vec<u8>>,
+    pub unwrap_cache: moka::sync::Cache<Vec<u8>, Arc<LessSafeKey>>,
     pub key_unwrap_count: Arc<std::sync::atomic::AtomicUsize>,
     pub prewrapped_key: Option<(Vec<u8>, [u8; 32])>,
+    pub precomputed_encrypt_key: Option<Arc<LessSafeKey>>,
     pub nonce_counter: Arc<std::sync::atomic::AtomicU64>,
     pub salt: [u8; 4],
 }
@@ -40,9 +41,26 @@ impl CryptoCompressState {
                 let mut rng = rand::thread_rng();
                 if SystemRandom::new().fill(&mut key_bytes).is_ok() {
                     let public_key = priv_key.to_public_key();
-                    if let Ok(wrapped) = public_key.encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes) {
+                    if let Ok(wrapped) =
+                        public_key.encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes)
+                    {
                         prewrapped_key = Some((wrapped, key_bytes));
                     }
+                }
+            }
+        }
+
+        let mut precomputed_encrypt_key = None;
+        if let Some((_, ref key_bytes)) = prewrapped_key {
+            let algo_trim = encrypt_algo.trim();
+            if algo_trim != "none" && !algo_trim.is_empty() {
+                let algorithm = match algo_trim {
+                    "aes256gcm-rsa" => &AES_256_GCM,
+                    "chacha20-rsa" => &CHACHA20_POLY1305,
+                    _ => &AES_256_GCM,
+                };
+                if let Ok(unbound_key) = UnboundKey::new(algorithm, key_bytes) {
+                    precomputed_encrypt_key = Some(Arc::new(LessSafeKey::new(unbound_key)));
                 }
             }
         }
@@ -60,24 +78,28 @@ impl CryptoCompressState {
             unwrap_cache,
             key_unwrap_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             prewrapped_key,
+            precomputed_encrypt_key,
             nonce_counter,
             salt,
         }
     }
 
-    pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>, SqueezefsError> {
+    pub fn compress<'a>(
+        &self,
+        data: &'a [u8],
+    ) -> Result<std::borrow::Cow<'a, [u8]>, SqueezefsError> {
         match self.compression.as_str() {
             "lz4" => {
                 let compressed = lz4_flex::compress_prepend_size(data);
-                Ok(compressed)
+                Ok(std::borrow::Cow::Owned(compressed))
             }
             "zstd" => {
                 let compressed = zstd::encode_all(std::io::Cursor::new(data), 3).map_err(|e| {
                     SqueezefsError::InvalidOperation(format!("ZSTD compression failed: {:?}", e))
                 })?;
-                Ok(compressed)
+                Ok(std::borrow::Cow::Owned(compressed))
             }
-            "none" | "" => Ok(data.to_vec()),
+            "none" | "" => Ok(std::borrow::Cow::Borrowed(data)),
             _ => Err(SqueezefsError::InvalidOperation(format!(
                 "Unsupported compression algorithm: {}",
                 self.compression
@@ -85,21 +107,24 @@ impl CryptoCompressState {
         }
     }
 
-    pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, SqueezefsError> {
+    pub fn decompress<'a>(
+        &self,
+        data: &'a [u8],
+    ) -> Result<std::borrow::Cow<'a, [u8]>, SqueezefsError> {
         match self.compression.as_str() {
             "lz4" => {
                 let decompressed = lz4_flex::decompress_size_prepended(data).map_err(|e| {
                     SqueezefsError::InvalidOperation(format!("LZ4 decompression failed: {:?}", e))
                 })?;
-                Ok(decompressed)
+                Ok(std::borrow::Cow::Owned(decompressed))
             }
             "zstd" => {
                 let decompressed = zstd::decode_all(std::io::Cursor::new(data)).map_err(|e| {
                     SqueezefsError::InvalidOperation(format!("ZSTD decompression failed: {:?}", e))
                 })?;
-                Ok(decompressed)
+                Ok(std::borrow::Cow::Owned(decompressed))
             }
-            "none" | "" => Ok(data.to_vec()),
+            "none" | "" => Ok(std::borrow::Cow::Borrowed(data)),
             _ => Err(SqueezefsError::InvalidOperation(format!(
                 "Unsupported compression algorithm: {}",
                 self.compression
@@ -108,32 +133,60 @@ impl CryptoCompressState {
     }
 
     pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, SqueezefsError> {
-        let (wrapped_key, key_bytes) = if let Some((ref wrapped, key)) = self.prewrapped_key {
-            (wrapped.clone(), key)
+        let (wrapped_key, less_safe_key) = if let Some(ref key) = self.precomputed_encrypt_key {
+            let wrapped = self
+                .prewrapped_key
+                .as_ref()
+                .map(|(w, _)| w.clone())
+                .unwrap_or_default();
+            (wrapped, key.clone())
         } else {
-            let mut key_bytes = [0u8; 32];
-            SystemRandom::new().fill(&mut key_bytes).map_err(|_| {
-                SqueezefsError::InvalidOperation("Failed to generate random data key".to_string())
-            })?;
-
-            let private_key = self.private_key.as_ref().ok_or_else(|| {
-                SqueezefsError::InvalidOperation(
-                    "RSA Private Key is required for encryption but not configured".to_string(),
-                )
-            })?;
-            let public_key = private_key.to_public_key();
-
-            let mut rng = rand::thread_rng();
-            let wrapped_key = public_key
-                .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes)
-                .map_err(|e| {
-                    SqueezefsError::InvalidOperation(format!("RSA key wrap failed: {:?}", e))
+            let (wrapped_key, key_bytes) = if let Some((ref wrapped, key)) = self.prewrapped_key {
+                (wrapped.clone(), key)
+            } else {
+                let mut key_bytes = [0u8; 32];
+                SystemRandom::new().fill(&mut key_bytes).map_err(|_| {
+                    SqueezefsError::InvalidOperation(
+                        "Failed to generate random data key".to_string(),
+                    )
                 })?;
-            (wrapped_key, key_bytes)
+
+                let private_key = self.private_key.as_ref().ok_or_else(|| {
+                    SqueezefsError::InvalidOperation(
+                        "RSA Private Key is required for encryption but not configured".to_string(),
+                    )
+                })?;
+                let public_key = private_key.to_public_key();
+
+                let mut rng = rand::thread_rng();
+                let wrapped_key = public_key
+                    .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes)
+                    .map_err(|e| {
+                        SqueezefsError::InvalidOperation(format!("RSA key wrap failed: {:?}", e))
+                    })?;
+                (wrapped_key, key_bytes)
+            };
+
+            let algorithm = match self.encrypt_algo.as_str() {
+                "aes256gcm-rsa" => &AES_256_GCM,
+                "chacha20-rsa" => &CHACHA20_POLY1305,
+                _ => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "Unsupported encryption algo: {}",
+                        self.encrypt_algo
+                    )))
+                }
+            };
+
+            let unbound_key = UnboundKey::new(algorithm, &key_bytes).map_err(|_| {
+                SqueezefsError::InvalidOperation("Failed to create unbound key".to_string())
+            })?;
+            (wrapped_key, Arc::new(LessSafeKey::new(unbound_key)))
         };
 
-        // Monotonic sequence-based nonce to bypass OS random system calls
-        let seq = self.nonce_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = self
+            .nonce_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[0..4].copy_from_slice(&self.salt);
         nonce_bytes[4..12].copy_from_slice(&seq.to_be_bytes());
@@ -149,15 +202,10 @@ impl CryptoCompressState {
             }
         };
 
-        let unbound_key = UnboundKey::new(algorithm, &key_bytes).map_err(|_| {
-            SqueezefsError::InvalidOperation("Failed to create unbound key".to_string())
-        })?;
-        let less_safe_key = LessSafeKey::new(unbound_key);
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| {
             SqueezefsError::InvalidOperation("Failed to construct nonce".to_string())
         })?;
 
-        // Pre-allocate vector capacity to avoid intermediate reallocations on AEAD seal
         let tag_len = algorithm.tag_len();
         let mut in_out = Vec::with_capacity(data.len() + tag_len);
         in_out.extend_from_slice(data);
@@ -197,7 +245,7 @@ impl CryptoCompressState {
         let nonce_bytes = &data[3 + wrapped_key_len..3 + wrapped_key_len + nonce_len];
         let ciphertext_payload = &data[3 + wrapped_key_len + nonce_len..];
 
-        let key_bytes = if let Some(cached_key) = self.unwrap_cache.get(wrapped_key) {
+        let less_safe_key = if let Some(cached_key) = self.unwrap_cache.get(wrapped_key) {
             cached_key
         } else {
             let private_key = self.private_key.as_ref().ok_or_else(|| {
@@ -210,28 +258,29 @@ impl CryptoCompressState {
                 .map_err(|e| {
                     SqueezefsError::InvalidOperation(format!("RSA key unwrap failed: {:?}", e))
                 })?;
-            self.unwrap_cache
-                .insert(wrapped_key.to_vec(), decrypted_key.clone());
+
+            let algorithm = match self.encrypt_algo.as_str() {
+                "aes256gcm-rsa" => &AES_256_GCM,
+                "chacha20-rsa" => &CHACHA20_POLY1305,
+                _ => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "Unsupported encryption algo: {}",
+                        self.encrypt_algo
+                    )))
+                }
+            };
+
+            let unbound_key = UnboundKey::new(algorithm, &decrypted_key).map_err(|_| {
+                SqueezefsError::InvalidOperation("Failed to create unbound key".to_string())
+            })?;
+            let key = Arc::new(LessSafeKey::new(unbound_key));
+
+            self.unwrap_cache.insert(wrapped_key.to_vec(), key.clone());
             self.key_unwrap_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            decrypted_key
+            key
         };
 
-        let algorithm = match self.encrypt_algo.as_str() {
-            "aes256gcm-rsa" => &AES_256_GCM,
-            "chacha20-rsa" => &CHACHA20_POLY1305,
-            _ => {
-                return Err(SqueezefsError::InvalidOperation(format!(
-                    "Unsupported encryption algo: {}",
-                    self.encrypt_algo
-                )))
-            }
-        };
-
-        let unbound_key = UnboundKey::new(algorithm, &key_bytes).map_err(|_| {
-            SqueezefsError::InvalidOperation("Failed to create unbound key".to_string())
-        })?;
-        let less_safe_key = LessSafeKey::new(unbound_key);
         let nonce = Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| {
             SqueezefsError::InvalidOperation("Failed to construct nonce".to_string())
         })?;
@@ -260,7 +309,7 @@ impl CryptoCompressState {
                 let encrypted = self.encrypt(&compressed)?;
                 Ok(bytes::Bytes::from(encrypted))
             } else {
-                Ok(bytes::Bytes::from(compressed))
+                Ok(bytes::Bytes::from(compressed.into_owned()))
             }
         }
     }
@@ -277,12 +326,18 @@ impl CryptoCompressState {
             Ok(std::borrow::Cow::Borrowed(data))
         } else {
             let decrypted = if encrypt_algo != "none" && !encrypt_algo.is_empty() {
-                self.decrypt(data)?
+                Some(self.decrypt(data)?)
             } else {
-                data.to_vec()
+                None
             };
-            let decompressed = self.decompress(&decrypted)?;
-            Ok(std::borrow::Cow::Owned(decompressed))
+
+            match decrypted {
+                Some(v) => {
+                    let decompressed = self.decompress(&v)?;
+                    Ok(std::borrow::Cow::Owned(decompressed.into_owned()))
+                }
+                None => self.decompress(data),
+            }
         }
     }
 }

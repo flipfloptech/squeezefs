@@ -1,56 +1,108 @@
 use crate::dlm::MetaClient;
 use crate::error::Result;
+use crossbeam::queue::ArrayQueue;
+use crossbeam::utils::CachePadded;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+const LOCAL_BATCH: u64 = 256;
+
+struct Reservoir {
+    local: ArrayQueue<u64>,
+    next_inline: AtomicU64,
+    inline_end: AtomicU64,
+}
 
 pub struct BlockAllocator {
     client: Arc<MetaClient>,
-    volume_id: String,
+    _volume_id: Box<str>,
+    free_set_key: Box<str>,
+    max_block_key: Box<str>,
+    reservoirs: Vec<CachePadded<Reservoir>>,
+    chunk_size: u64,
 }
 
 impl BlockAllocator {
     pub async fn new(client: Arc<MetaClient>, volume_id: &str) -> Result<Self> {
+        let free_set_key = format!("{}:free_blocks", volume_id).into_boxed_str();
+        let max_block_key = format!("{}:highest_block", volume_id).into_boxed_str();
+
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let num_reservoirs = std::cmp::max(cores, 4);
+
+        let mut reservoirs = Vec::with_capacity(num_reservoirs);
+        for _ in 0..num_reservoirs {
+            reservoirs.push(CachePadded::new(Reservoir {
+                local: ArrayQueue::new(LOCAL_BATCH as usize),
+                next_inline: AtomicU64::new(0),
+                inline_end: AtomicU64::new(0),
+            }));
+        }
+
         Ok(Self {
             client,
-            volume_id: volume_id.to_string(),
+            _volume_id: volume_id.to_string().into_boxed_str(),
+            free_set_key,
+            max_block_key,
+            reservoirs,
+            chunk_size: 4 * 1024 * 1024, // 4MB
         })
     }
 
     pub async fn allocate_block(&self) -> Result<u64> {
-        let free_set_key = format!("{}:free_blocks", self.volume_id);
-        let max_block_key = format!("{}:highest_block", self.volume_id);
-
-        let mut conn = self.client.get_connection().await?;
-
-        // 1. Try to pop a freed block
-        let popped: Option<u64> = redis::cmd("SPOP")
-            .arg(&free_set_key)
-            .query_async(&mut conn)
-            .await?;
-        let block_idx = match popped {
-            Some(idx) => idx,
-            None => {
-                let new_max: u64 = redis::cmd("INCR")
-                    .arg(&max_block_key)
-                    .query_async(&mut conn)
-                    .await?;
-                // INCR returns the value after incrementing (1-based). We start index from 1 to reserve block 0 for superblock.
-                new_max
+        let rs = self.current_reservoir();
+        loop {
+            // 1. Fast path: lock-free local queue pop (no Redis, no syscalls).
+            if let Some(idx) = rs.local.pop() {
+                return Ok(idx * self.chunk_size);
             }
-        };
 
-        let chunk_size = 4 * 1024 * 1024; // 4MB
-        Ok(block_idx * chunk_size)
+            // 2. Medium path: serve from the contiguous inline run with fetch_add.
+            let cur = rs.next_inline.load(Ordering::Relaxed);
+            let end = rs.inline_end.load(Ordering::Acquire);
+            if cur < end {
+                if rs
+                    .next_inline
+                    .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Ok(cur * self.chunk_size);
+                }
+                continue;
+            }
+
+            // 3. Slow path: refill reservoirs.
+            let mut conn = self.client.get_connection().await?;
+            let (spopped, incrbed): (Vec<u64>, u64) = redis::pipe()
+                .atomic()
+                .cmd("SPOP")
+                .arg(&*self.free_set_key)
+                .arg(LOCAL_BATCH as usize)
+                .cmd("INCRBY")
+                .arg(&*self.max_block_key)
+                .arg(LOCAL_BATCH)
+                .query_async(&mut conn)
+                .await?;
+
+            let new_end = incrbed + 1; // INCRBY returns post-increment
+            rs.inline_end.store(new_end, Ordering::Release);
+            rs.next_inline
+                .store(incrbed - LOCAL_BATCH + 1, Ordering::Release);
+
+            for idx in spopped {
+                let _ = rs.local.push(idx);
+            }
+        }
     }
 
     pub async fn free_block(&self, offset: u64) -> Result<()> {
-        let chunk_size = 4 * 1024 * 1024;
-        let block_idx = offset / chunk_size;
-
-        let free_set_key = format!("{}:free_blocks", self.volume_id);
+        let block_idx = offset / self.chunk_size;
 
         let mut conn = self.client.get_connection().await?;
         let _: () = redis::cmd("SADD")
-            .arg(&free_set_key)
+            .arg(&*self.free_set_key)
             .arg(block_idx)
             .query_async(&mut conn)
             .await?;
@@ -66,14 +118,12 @@ impl BlockAllocator {
         if offsets.is_empty() {
             return Ok(());
         }
-        let chunk_size = 4 * 1024 * 1024;
-        let free_set_key = format!("{}:free_blocks", self.volume_id);
 
         let mut conn = self.client.get_connection().await?;
         let mut pipe = redis::pipe();
         for &offset in offsets {
-            let block_idx = offset / chunk_size;
-            pipe.cmd("SADD").arg(&free_set_key).arg(block_idx);
+            let block_idx = offset / self.chunk_size;
+            pipe.cmd("SADD").arg(&*self.free_set_key).arg(block_idx);
         }
         let _: () = pipe.query_async(&mut conn).await?;
 
@@ -85,18 +135,16 @@ impl BlockAllocator {
     }
 
     pub async fn calculate_fragmentation(&self) -> Result<(u64, u64, u64, f64)> {
-        let free_set_key = format!("{}:free_blocks", self.volume_id);
-        let max_block_key = format!("{}:highest_block", self.volume_id);
         let mut conn = self.client.get_connection().await?;
 
         let highest_block: Option<u64> = redis::cmd("GET")
-            .arg(&max_block_key)
+            .arg(&*self.max_block_key)
             .query_async(&mut conn)
             .await?;
         let highest_block = highest_block.unwrap_or(0);
 
         let free_blocks: u64 = redis::cmd("SCARD")
-            .arg(&free_set_key)
+            .arg(&*self.free_set_key)
             .query_async(&mut conn)
             .await?;
 
@@ -111,10 +159,9 @@ impl BlockAllocator {
     }
 
     pub async fn allocate_specific_block(&self, block_idx: u64) -> Result<()> {
-        let free_set_key = format!("{}:free_blocks", self.volume_id);
         let mut conn = self.client.get_connection().await?;
         let removed: u64 = redis::cmd("SREM")
-            .arg(&free_set_key)
+            .arg(&*self.free_set_key)
             .arg(block_idx)
             .query_async(&mut conn)
             .await?;
@@ -129,13 +176,17 @@ impl BlockAllocator {
     }
 
     pub async fn get_free_blocks(&self) -> Result<Vec<u64>> {
-        let free_set_key = format!("{}:free_blocks", self.volume_id);
         let mut conn = self.client.get_connection().await?;
         let mut free_blocks: Vec<u64> = redis::cmd("SMEMBERS")
-            .arg(&free_set_key)
+            .arg(&*self.free_set_key)
             .query_async(&mut conn)
             .await?;
         free_blocks.sort_unstable();
         Ok(free_blocks)
+    }
+
+    fn current_reservoir(&self) -> &Reservoir {
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) as usize };
+        &self.reservoirs[tid % self.reservoirs.len()]
     }
 }

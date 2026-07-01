@@ -1,141 +1,126 @@
 use bytes::Bytes;
-use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// A node in the Clock cache.
 struct ClockNode {
-    key: Bytes,
     value: Bytes,
     referenced: AtomicBool,
 }
 
+struct EvictionState {
+    queue: VecDeque<Bytes>,
+}
+
 /// A single thread-safe shard of the Clock cache.
 struct MemoryCacheShard {
-    map: HashMap<Bytes, usize>,
-    arena: Vec<Option<ClockNode>>,
-    free_slots: Vec<usize>,
-    clock_hand: usize,
-    current_bytes: usize,
+    map: scc::HashIndex<Bytes, std::sync::Arc<ClockNode>>,
+    eviction_state: parking_lot::Mutex<EvictionState>,
+    current_bytes: AtomicUsize,
     max_bytes: usize,
 }
 
 impl MemoryCacheShard {
     fn new(max_bytes: usize) -> Self {
         Self {
-            map: HashMap::new(),
-            arena: Vec::new(),
-            free_slots: Vec::new(),
-            clock_hand: 0,
-            current_bytes: 0,
+            map: scc::HashIndex::default(),
+            eviction_state: parking_lot::Mutex::new(EvictionState {
+                queue: VecDeque::new(),
+            }),
+            current_bytes: AtomicUsize::new(0),
             max_bytes,
         }
     }
 
     fn get(&self, key: &[u8]) -> Option<Bytes> {
-        if let Some(&idx) = self.map.get(key) {
-            if let Some(ref node) = self.arena[idx] {
-                node.referenced.store(true, Ordering::Relaxed);
-                Some(node.value.clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        let entry = self.map.get_sync(key)?;
+        let node = entry.get();
+        node.referenced.store(true, Ordering::Relaxed);
+        Some(node.value.clone())
     }
 
-    fn put(&mut self, key: Bytes, value: Bytes, evicted: &mut Vec<(Bytes, Bytes)>) {
+    fn put(&self, key: Bytes, value: Bytes, evicted: &mut Vec<(Bytes, Bytes)>) {
         let val_len = value.len();
         if val_len > self.max_bytes {
             // Value itself is larger than the entire shard capacity
             return;
         }
 
-        if let Some(&idx) = self.map.get(&key) {
-            // Update existing
-            let old_len = if let Some(ref mut node) = self.arena[idx] {
-                let old = node.value.len();
-                node.value = value;
-                node.referenced.store(true, Ordering::Relaxed);
-                old
-            } else {
-                self.arena[idx] = Some(ClockNode {
-                    key: key.clone(),
-                    value: value.clone(),
-                    referenced: AtomicBool::new(true),
-                });
-                0
-            };
-            self.current_bytes = (self.current_bytes + val_len).saturating_sub(old_len);
-        } else {
-            // Insert new node
-            let idx = if let Some(free_idx) = self.free_slots.pop() {
-                self.arena[free_idx] = Some(ClockNode {
-                    key: key.clone(),
-                    value,
-                    referenced: AtomicBool::new(true),
-                });
-                free_idx
-            } else {
-                let free_idx = self.arena.len();
-                self.arena.push(Some(ClockNode {
-                    key: key.clone(),
-                    value,
-                    referenced: AtomicBool::new(true),
-                }));
-                free_idx
-            };
+        let node = std::sync::Arc::new(ClockNode {
+            value: value.clone(),
+            referenced: AtomicBool::new(true),
+        });
 
-            self.map.insert(key, idx);
-            self.current_bytes += val_len;
+        let mut state = self.eviction_state.lock();
+
+        let mut old_len = None;
+        if let Some(existing) = self.map.get_sync(&key) {
+            old_len = Some(existing.get().value.len());
+        } // existing guard dropped here
+
+        if let Some(len) = old_len {
+            self.map.remove_sync(&key);
+            let _ = self.map.insert_sync(key.clone(), node);
+            self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
+            self.current_bytes.fetch_sub(len, Ordering::Relaxed);
+        } else {
+            let _ = self.map.insert_sync(key.clone(), node);
+            state.queue.push_back(key);
+            self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
         }
 
         // Perform Clock eviction if over capacity
-        let total_slots = self.arena.len();
         let mut loops = 0;
-        while self.current_bytes > self.max_bytes && total_slots > 0 {
-            if self.clock_hand >= total_slots {
-                self.clock_hand = 0;
-                loops += 1;
-                if loops > 2 {
-                    // Prevent infinite loop in edge cases where all nodes are referenced or pinned
-                    break;
-                }
-            }
-
-            if let Some(ref node) = self.arena[self.clock_hand] {
-                if node.referenced.load(Ordering::Relaxed) {
-                    node.referenced.store(false, Ordering::Relaxed);
-                    self.clock_hand += 1;
-                } else {
-                    // Evict this node
-                    let idx = self.clock_hand;
-                    if let Some(evicted_node) = self.arena[idx].take() {
-                        self.map.remove(&evicted_node.key);
-                        self.free_slots.push(idx);
-                        self.current_bytes =
-                            self.current_bytes.saturating_sub(evicted_node.value.len());
-                        evicted.push((evicted_node.key, evicted_node.value));
+        let max_loops = state.queue.len() * 2;
+        while self.current_bytes.load(Ordering::Relaxed) > self.max_bytes
+            && !state.queue.is_empty()
+            && loops < max_loops
+        {
+            loops += 1;
+            if let Some(evict_key) = state.queue.pop_front() {
+                let mut should_evict = false;
+                let mut len = 0;
+                let mut val = None;
+                if let Some(entry) = self.map.get_sync(&evict_key) {
+                    let node = entry.get();
+                    if node.referenced.load(Ordering::Relaxed) {
+                        node.referenced.store(false, Ordering::Relaxed);
+                        state.queue.push_back(evict_key.clone());
+                    } else {
+                        should_evict = true;
+                        len = node.value.len();
+                        val = Some(node.value.clone());
                     }
-                    self.clock_hand += 1;
+                } // entry guard dropped here
+
+                if should_evict {
+                    self.map.remove_sync(&evict_key);
+                    self.current_bytes.fetch_sub(len, Ordering::Relaxed);
+                    if let Some(v) = val {
+                        evicted.push((evict_key, v));
+                    }
                 }
             } else {
-                self.clock_hand += 1;
+                break;
             }
         }
     }
 
-    fn remove(&mut self, key: &[u8]) -> Option<Bytes> {
-        if let Some(idx) = self.map.remove(key) {
-            if let Some(node) = self.arena[idx].take() {
-                self.free_slots.push(idx);
-                self.current_bytes = self.current_bytes.saturating_sub(node.value.len());
-                Some(node.value)
-            } else {
-                None
-            }
+    fn remove(&self, key: &[u8]) -> Option<Bytes> {
+        let _state = self.eviction_state.lock();
+        let mut val = None;
+        let mut len = 0;
+        if let Some(entry) = self.map.get_sync(key) {
+            let node = entry.get();
+            val = Some(node.value.clone());
+            len = node.value.len();
+        } // entry guard dropped here
+
+        if let Some(v) = val {
+            self.map.remove_sync(key);
+            self.current_bytes.fetch_sub(len, Ordering::Relaxed);
+            Some(v)
         } else {
             None
         }
@@ -144,7 +129,7 @@ impl MemoryCacheShard {
 
 /// A highly concurrent, sharded in-memory cache using the Clock (second-chance) eviction policy.
 pub struct MemoryCache {
-    shards: Vec<RwLock<MemoryCacheShard>>,
+    shards: Vec<MemoryCacheShard>,
     shard_mask: usize,
 }
 
@@ -159,7 +144,7 @@ impl MemoryCache {
         let shard_capacity = max_bytes / num_shards;
         let mut shards = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            shards.push(RwLock::new(MemoryCacheShard::new(shard_capacity)));
+            shards.push(MemoryCacheShard::new(shard_capacity));
         }
         Self {
             shards,
@@ -169,42 +154,53 @@ impl MemoryCache {
 
     #[inline]
     fn get_shard_idx(&self, key: &[u8]) -> usize {
-        let hash = xxh3_64(key);
+        let hash = if key.len() <= 32 {
+            use std::hash::Hasher;
+            let mut h = ahash::AHasher::default();
+            h.write(key);
+            h.finish()
+        } else {
+            xxh3_64(key)
+        };
         (hash as usize) & self.shard_mask
     }
 
     /// Retrieves an item from the cache. Clones the `Bytes` pointer (O(1), zero-copy).
-    /// Uses only a read lock to avoid lock contention under high concurrent read workloads.
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         let idx = self.get_shard_idx(key);
-        self.shards[idx].read().get(key)
+        self.shards[idx].get(key)
     }
 
     /// Inserts an item into the cache. Returns any items evicted from the cache.
     pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes)> {
         let idx = self.get_shard_idx(&key);
         let mut evicted = Vec::new();
-        self.shards[idx].write().put(key, value, &mut evicted);
+        self.shards[idx].put(key, value, &mut evicted);
         evicted
     }
 
     /// Removes an item from the cache, returning the value if it existed.
     pub fn remove(&self, key: &[u8]) -> Option<Bytes> {
         let idx = self.get_shard_idx(key);
-        self.shards[idx].write().remove(key)
+        self.shards[idx].remove(key)
     }
 
     /// Get current total memory usage in bytes.
     pub fn current_bytes(&self) -> usize {
-        self.shards.iter().map(|s| s.read().current_bytes).sum()
+        self.shards
+            .iter()
+            .map(|s| s.current_bytes.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Get all keys in the cache.
     pub fn keys(&self) -> Vec<Bytes> {
         let mut keys = Vec::new();
         for shard in &self.shards {
-            let guard = shard.read();
-            keys.extend(guard.map.keys().cloned());
+            shard.map.iter_sync(|k, _| {
+                keys.push(k.clone());
+                true
+            });
         }
         keys
     }
@@ -212,12 +208,10 @@ impl MemoryCache {
     /// Clear all keys from the cache.
     pub fn clear(&self) {
         for shard in &self.shards {
-            let mut guard = shard.write();
-            guard.map.clear();
-            guard.arena.clear();
-            guard.free_slots.clear();
-            guard.clock_hand = 0;
-            guard.current_bytes = 0;
+            shard.map.clear_sync();
+            let mut state = shard.eviction_state.lock();
+            state.queue.clear();
+            shard.current_bytes.store(0, Ordering::Relaxed);
         }
     }
 
@@ -279,5 +273,14 @@ mod tests {
         assert_eq!(cache.get(&k1), None);
         assert_eq!(cache.get(&k2), Some(v2));
         assert_eq!(cache.get(&k3), Some(v3));
+    }
+
+    #[test]
+    fn test_scc_api() {
+        let index: scc::HashIndex<String, std::sync::Arc<u32>> = scc::HashIndex::default();
+        let _ = index.insert_sync("key".to_string(), std::sync::Arc::new(42));
+        let entry = index.get_sync("key");
+        assert!(entry.is_some());
+        assert_eq!(**entry.unwrap().get(), 42);
     }
 }

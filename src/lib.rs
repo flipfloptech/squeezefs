@@ -1,8 +1,4 @@
-#![allow(
-    clippy::type_complexity,
-    clippy::too_many_arguments,
-    clippy::redundant_closure
-)]
+#![allow(clippy::all)]
 pub mod nvme_dev;
 pub mod tiering;
 
@@ -33,9 +29,9 @@ pub mod defrag;
 pub mod jobs;
 pub mod storage;
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
-pub static FS_PREFIX: OnceLock<&'static str> = OnceLock::new();
+pub static FS_PREFIX: Mutex<Option<&'static str>> = Mutex::new(None);
 
 pub static WRITE_VERIFICATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -49,21 +45,29 @@ pub fn set_write_verification(enabled: bool) {
 }
 
 pub fn fs_prefix() -> &'static str {
-    *FS_PREFIX.get().unwrap_or(&"squeezefs")
+    FS_PREFIX.lock().unwrap().unwrap_or("squeezefs")
 }
 
 pub fn set_fs_prefix(prefix: &str) {
     if !prefix.is_empty() {
         let leaked = Box::leak(prefix.to_string().into_boxed_str());
-        // Ignore error if it's already set (OnceLock set can fail if already initialized)
-        let _ = FS_PREFIX.set(leaked);
+        *FS_PREFIX.lock().unwrap() = Some(leaked);
     }
+}
+
+pub fn build_fs_key(suffix: &str) -> String {
+    let prefix = fs_prefix();
+    let mut s = String::with_capacity(prefix.len() + 1 + suffix.len());
+    s.push_str(prefix);
+    s.push(':');
+    s.push_str(suffix);
+    s
 }
 
 #[macro_export]
 macro_rules! fs_key {
     ($suffix:expr) => {
-        format!("{}:{}", $crate::fs_prefix(), $suffix)
+        $crate::build_fs_key(&$suffix)
     };
 }
 
@@ -77,4 +81,3 @@ mod tests {
         assert!(!prefix.is_empty());
     }
 }
-

@@ -59,6 +59,16 @@ impl<L: Default, const N: usize> StripeLocks<L, N> {
     }
 
     #[inline]
+    pub fn get_lock_ref(&self, ino: u64, key: u32) -> &L {
+        let mut hasher = ahash::AHasher::default();
+        use std::hash::Hash;
+        (ino, key).hash(&mut hasher);
+        use std::hash::Hasher;
+        let idx = (hasher.finish() as usize) % N;
+        &self.locks[idx]
+    }
+
+    #[inline]
     pub fn get_inode_lock(&self, ino: u64) -> std::sync::Arc<L> {
         let mut hasher = ahash::AHasher::default();
         use std::hash::Hash;
@@ -68,13 +78,44 @@ impl<L: Default, const N: usize> StripeLocks<L, N> {
         self.locks[idx].clone()
     }
 
+    #[inline]
+    pub fn get_inode_lock_ref(&self, ino: u64) -> &L {
+        let mut hasher = ahash::AHasher::default();
+        use std::hash::Hash;
+        ino.hash(&mut hasher);
+        use std::hash::Hasher;
+        let idx = (hasher.finish() as usize) % N;
+        &self.locks[idx]
+    }
+
     pub fn remove(&self, _ino: &u64) {
         // No-op for stripe locks
     }
 }
 
+#[inline]
+fn osstr_to_cow(name: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
+    name.to_str()
+        .map(std::borrow::Cow::Borrowed)
+        .unwrap_or_else(|| name.to_string_lossy())
+}
 pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
     Lazy::new(|| StripeLocks::new());
+
+struct ThreadLocalState {
+    count: u64,
+    target: *const AtomicU64,
+}
+
+impl Drop for ThreadLocalState {
+    fn drop(&mut self) {
+        if self.count > 0 && !self.target.is_null() {
+            unsafe {
+                (*self.target).fetch_add(self.count, Ordering::Relaxed);
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct ProbabilisticAtomic {
@@ -84,15 +125,22 @@ pub struct ProbabilisticAtomic {
 impl ProbabilisticAtomic {
     pub fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
         thread_local! {
-            static BATCH_COUNTER: std::cell::Cell<u64> = std::cell::Cell::new(0);
+            static STATE: std::cell::RefCell<ThreadLocalState> = std::cell::RefCell::new(ThreadLocalState {
+                count: 0,
+                target: std::ptr::null(),
+            });
         }
-        BATCH_COUNTER.with(|c| {
-            let next = c.get() + val;
-            if next >= 128 {
-                c.set(0);
-                self.inner.fetch_add(next, order)
+        STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            if state.target.is_null() {
+                state.target = &self.inner as *const AtomicU64;
+            }
+            state.count += val;
+            if state.count >= 128 {
+                let to_add = state.count;
+                state.count = 0;
+                self.inner.fetch_add(to_add, order)
             } else {
-                c.set(next);
                 self.inner.load(order)
             }
         })
@@ -103,19 +151,35 @@ impl ProbabilisticAtomic {
     }
 }
 
+#[repr(align(64))]
+#[derive(Default)]
+pub struct Align64<T>(pub T);
+
+impl<T> std::ops::Deref for Align64<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Align64<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 #[derive(Default)]
 pub struct Metrics {
-    pub fuse_ops: ProbabilisticAtomic,
-    pub meta_updates: AtomicU64,
-    pub put_obj: AtomicU64,
-    pub get_obj: AtomicU64,
-    pub del_obj: AtomicU64,
-    pub cache_hits: AtomicU64,
-    pub cache_misses: AtomicU64,
+    pub fuse_ops: Align64<ProbabilisticAtomic>,
+    pub meta_updates: Align64<AtomicU64>,
+    pub put_obj: Align64<AtomicU64>,
+    pub get_obj: Align64<AtomicU64>,
+    pub del_obj: Align64<AtomicU64>,
+    pub cache_hits: Align64<AtomicU64>,
+    pub cache_misses: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
-
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct ClientInfo {
     pub client_id: String,
@@ -150,11 +214,15 @@ fn get_hostname() -> String {
         .unwrap_or_else(|_| std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string()))
 }
 
+#[cold]
+#[inline(never)]
 fn map_err(e: redis::RedisError) -> Errno {
     error!("Garnet Database error: {:?}", e);
     Errno::from(libc::ECOMM)
 }
 
+#[cold]
+#[inline(never)]
 fn map_squeezefs_err(e: SqueezefsError) -> Errno {
     error!("Squeezefs operational error: {:?}", e);
     Errno::from(e.to_errno())
@@ -192,17 +260,14 @@ pub struct SqueezefsFilesystem {
     uid: u32,
     gid: u32,
     active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease, ahash::RandomState>>,
-    lease_locks: std::sync::Arc<
-        dashmap::DashMap<u64, std::sync::Arc<tokio::sync::Mutex<()>>, ahash::RandomState>,
-    >,
+    lease_locks: std::sync::Arc<StripeLocks<tokio::sync::Mutex<()>, 4096>>,
     active_posix_locks:
         std::sync::Arc<dashmap::DashMap<(Inode, u64, u64, u64), PosixLock, ahash::RandomState>>,
     active_delegations:
         std::sync::Arc<dashmap::DashMap<Inode, crate::dlm::DelegationLease, ahash::RandomState>>,
     pub active_inode_locks: std::sync::Arc<StripeLocks<tokio::sync::RwLock<()>, 4096>>,
     pub attr_cache: dashmap::DashMap<u64, (FileAttr, std::time::Instant), ahash::RandomState>,
-    pub dir_entry_cache:
-        moka::sync::Cache<u64, std::sync::Arc<std::collections::HashMap<String, u64>>>,
+    pub dir_entry_cache: moka::sync::Cache<u64, std::sync::Arc<[(std::boxed::Box<str>, u64)]>>,
     pub dismount_wait: u64,
     writeback_tx: tokio::sync::mpsc::UnboundedSender<WritebackRequest>,
     writeback_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<WritebackRequest>>>,
@@ -212,16 +277,51 @@ pub struct SqueezefsFilesystem {
     pub active_block_buffers: std::sync::Arc<dashmap::DashMap<String, Vec<u8>, ahash::RandomState>>,
     pub open_virtual_files: dashmap::DashMap<u64, Vec<u8>, ahash::RandomState>,
     pub next_virtual_fh: std::sync::atomic::AtomicU64,
-    pub latest_stats_json: std::sync::Mutex<Option<Vec<u8>>>,
-    pub latest_config_json: std::sync::Mutex<Option<Vec<u8>>>,
+    pub latest_stats_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
+    pub latest_config_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
+}
+
+impl Clone for SqueezefsFilesystem {
+    fn clone(&self) -> Self {
+        Self {
+            router: self.router.clone(),
+            dlm: self.dlm.clone(),
+            uid: self.uid,
+            gid: self.gid,
+            active_leases: self.active_leases.clone(),
+            lease_locks: self.lease_locks.clone(),
+            active_posix_locks: self.active_posix_locks.clone(),
+            active_delegations: self.active_delegations.clone(),
+            active_inode_locks: self.active_inode_locks.clone(),
+            attr_cache: self.attr_cache.clone(),
+            dir_entry_cache: self.dir_entry_cache.clone(),
+            dismount_wait: self.dismount_wait,
+            writeback_tx: self.writeback_tx.clone(),
+            writeback_rx: std::sync::Mutex::new(None),
+            client_id: self.client_id.clone(),
+            mountpoint: self.mountpoint.clone(),
+            max_background_uploads: self.max_background_uploads,
+            active_block_buffers: self.active_block_buffers.clone(),
+            open_virtual_files: self.open_virtual_files.clone(),
+            next_virtual_fh: std::sync::atomic::AtomicU64::new(
+                self.next_virtual_fh.load(Ordering::Relaxed),
+            ),
+            latest_stats_json: arc_swap::ArcSwap::new(self.latest_stats_json.load_full()),
+            latest_config_json: arc_swap::ArcSwap::new(self.latest_config_json.load_full()),
+        }
+    }
 }
 
 impl SqueezefsFilesystem {
     pub fn new(router: DataRouter, dlm: DlmClient, uid: u32, gid: u32) -> Self {
         let (writeback_tx, writeback_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let total_memory = sys.total_memory();
+        let dir_entry_capacity = std::cmp::max(50_000, total_memory / 200_000);
         let dir_entry_cache = moka::sync::Cache::builder()
-            .max_capacity(50000)
-            .time_to_live(Duration::from_secs(1))
+            .max_capacity(dir_entry_capacity)
+            .time_to_live(Duration::from_secs(300))
             .build();
         Self {
             router,
@@ -231,9 +331,7 @@ impl SqueezefsFilesystem {
             active_leases: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
-            lease_locks: std::sync::Arc::new(dashmap::DashMap::with_hasher(
-                ahash::RandomState::new(),
-            )),
+            lease_locks: std::sync::Arc::new(StripeLocks::new()),
             active_posix_locks: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
@@ -259,8 +357,8 @@ impl SqueezefsFilesystem {
             )),
             open_virtual_files: dashmap::DashMap::with_hasher(ahash::RandomState::new()),
             next_virtual_fh: std::sync::atomic::AtomicU64::new(0x1000_0000_0000_0000),
-            latest_stats_json: std::sync::Mutex::new(None),
-            latest_config_json: std::sync::Mutex::new(None),
+            latest_stats_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
+            latest_config_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
         }
     }
 
@@ -601,16 +699,16 @@ impl SqueezefsFilesystem {
         self.active_inode_locks.get_inode_lock(ino)
     }
 
+    pub fn get_inode_lock_ref(&self, ino: u64) -> &tokio::sync::RwLock<()> {
+        self.active_inode_locks.get_inode_lock_ref(ino)
+    }
+
     async fn get_or_acquire_lease(&self, ino: u64) -> Result<u64, SqueezefsError> {
         if let Some(lease) = self.active_leases.get(&ino) {
             return Ok(lease.fencing_token());
         }
 
-        let lock_arc = self
-            .lease_locks
-            .entry(ino)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock_arc = self.lease_locks.get_lock(ino, 0);
         let _guard = lock_arc.lock().await;
 
         if let Some(lease) = self.active_leases.get(&ino) {
@@ -971,6 +1069,172 @@ impl SqueezefsFilesystem {
             .await?;
         }
 
+        Ok(())
+    }
+
+    pub async fn flush_all_memory_buffers_to_staging(&self) -> Result<(), SqueezefsError> {
+        info!("FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...");
+        let keys_to_flush: Vec<String> = self
+            .active_block_buffers
+            .iter()
+            .map(|r| r.key().clone())
+            .collect();
+
+        for key in keys_to_flush {
+            if let Some((_, block_data)) = self.active_block_buffers.remove(&key) {
+                let parts: Vec<&str> = key.split(":block_").collect();
+                if parts.len() == 2 {
+                    let ino_parts: Vec<&str> = parts[0].split("inode_").collect();
+                    if ino_parts.len() == 2 {
+                        if let (Ok(ino), Ok(b)) =
+                            (ino_parts[1].parse::<u64>(), parts[1].parse::<u32>())
+                        {
+                            let meta_key = format!("metadata:inode_{}", ino);
+                            let fencing_token = match self.dlm.get_connection().await {
+                                Ok(mut con) => {
+                                    let token_opt: Option<u64> =
+                                        con.hget(&meta_key, "fencing_token").await.unwrap_or(None);
+                                    token_opt.unwrap_or(0)
+                                }
+                                Err(_) => 0,
+                            };
+
+                            let nvme_clone = self.router.cache.nvme.clone();
+                            let key_clone = key.clone();
+                            if let Err(e) = tokio::task::spawn_blocking(move || {
+                                nvme_clone.put_active_block(&key_clone, &block_data, fencing_token);
+                            })
+                            .await
+                            {
+                                error!("Failed to write active block to NVMe staging during dismount: {:?}", e);
+                                continue;
+                            }
+
+                            let req = WritebackRequest {
+                                ino,
+                                block_idx: b,
+                                fencing_token,
+                            };
+                            let _ = self.writeback_tx.send(req);
+                        }
+                    }
+                }
+            }
+        }
+        info!("FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.");
+        Ok(())
+    }
+
+    pub async fn flush_all_staged_blocks_to_backend(&self) -> Result<(), SqueezefsError> {
+        info!("FUSE Daemon: Force flushing all staged active blocks to NVMe-oF backend...");
+        let keys = self.router.cache.nvme.list_staged_files();
+
+        let mut active_keys = Vec::new();
+        for key in keys {
+            if key.starts_with("active_block:") {
+                active_keys.push(key);
+            }
+        }
+
+        if active_keys.is_empty() {
+            info!("FUSE Daemon: No staged active blocks to flush.");
+            return Ok(());
+        }
+
+        info!(
+            "FUSE Daemon: Found {} staged active blocks to flush.",
+            active_keys.len()
+        );
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+        let mut tasks = futures::stream::FuturesUnordered::new();
+
+        for key in active_keys {
+            let sem_clone = sem.clone();
+            let router_clone = self.router.clone();
+            let dlm_clone = self.dlm.clone();
+            let locks_clone = self.active_inode_locks.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem_clone.acquire().await.ok();
+
+                let parts: Vec<&str> = key.split(":block_").collect();
+                if parts.len() != 2 {
+                    return Ok(());
+                }
+                let ino_parts: Vec<&str> = parts[0].split("inode_").collect();
+                if ino_parts.len() != 2 {
+                    return Ok(());
+                }
+                let ino = match ino_parts[1].parse::<u64>() {
+                    Ok(i) => i,
+                    Err(_) => return Ok(()),
+                };
+                let b = match parts[1].parse::<u32>() {
+                    Ok(idx) => idx,
+                    Err(_) => return Ok(()),
+                };
+
+                let mut con = dlm_clone.get_connection().await?;
+                let meta_key = format!("metadata:inode_{}", ino);
+
+                let (file_type_opt, block_map_id_opt, fencing_token_opt): (
+                    Option<String>,
+                    Option<String>,
+                    Option<u64>,
+                ) = redis::pipe()
+                    .hget(&meta_key, "type")
+                    .hget(&meta_key, "block_map_id")
+                    .hget(&meta_key, "fencing_token")
+                    .query_async(&mut con)
+                    .await?;
+
+                let file_type = file_type_opt.unwrap_or_else(|| "inline".to_string());
+                let is_striped = file_type == "striped";
+                let mut block_map_id = block_map_id_opt.unwrap_or_default();
+                if block_map_id.is_empty() {
+                    block_map_id = uuid::Uuid::new_v4().to_string();
+                    let _: Result<(), _> = con.hset(&meta_key, "block_map_id", &block_map_id).await;
+                }
+                let fencing_token = fencing_token_opt.unwrap_or(0);
+
+                let block_map_key = format!("block_map:{}", block_map_id);
+                let old_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
+
+                flush_single_active_block(
+                    ino,
+                    b,
+                    fencing_token,
+                    &router_clone,
+                    &dlm_clone,
+                    &locks_clone,
+                    is_striped,
+                    &block_map_id,
+                    old_key,
+                    false,
+                )
+                .await?;
+
+                Ok::<(), SqueezefsError>(())
+            }));
+        }
+
+        use futures::StreamExt;
+        while let Some(res) = tasks.next().await {
+            if let Err(e) = res {
+                error!("Task panicked during dismount active block flush: {:?}", e);
+            } else if let Some(Err(e)) = res.ok() {
+                error!("Error flushing active block during dismount: {:?}", e);
+            }
+        }
+
+        info!("FUSE Daemon: Force flush of staged active blocks completed.");
+        Ok(())
+    }
+
+    pub async fn force_flush_all_staged_data(&self) -> Result<(), SqueezefsError> {
+        let _ = self.flush_all_memory_buffers_to_staging().await;
+        let _ = self.flush_all_staged_blocks_to_backend().await;
         Ok(())
     }
 
@@ -1348,7 +1612,10 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn destroy(&self, _req: Request) {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        info!("FUSE Daemon: Destroying mount. Checking for pending staged writes...");
+        info!("FUSE Daemon: Destroying mount. Force flushing all staged and memory data...");
+
+        // Phase 1 & 2: Force flush memory buffers to staging, then staged blocks to NVMe-oF backend
+        let _ = self.force_flush_all_staged_data().await;
 
         // Gracefully wait up to self.dismount_wait seconds for background workers to drain staged writes and active writes to NVMe-oF backend
         let start_wait = std::time::Instant::now();
@@ -1367,7 +1634,16 @@ impl Filesystem for SqueezefsFilesystem {
             if (current_staged == 0 && current_active == 0) || start_wait.elapsed() >= max_wait {
                 break (current_staged, current_active);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let remaining = max_wait.saturating_sub(start_wait.elapsed());
+            if remaining.is_zero() {
+                break (current_staged, current_active);
+            }
+            let notify = self.router.cache.nvme.space_freed_notify.clone();
+            let _ = tokio::time::timeout(
+                std::cmp::min(remaining, std::time::Duration::from_millis(100)),
+                notify.notified(),
+            )
+            .await;
         };
 
         if staged_count > 0 || active_writes_count > 0 {
@@ -1383,14 +1659,15 @@ impl Filesystem for SqueezefsFilesystem {
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_lookup");
-        let name_str = name.to_string_lossy();
+        let name_str = osstr_to_cow(name);
         debug!("FUSE Lookup: parent = {}, name = {}", parent, name_str);
 
         if parent == 1 && name_str == ".config" {
             let config_data = self.generate_config_json().await;
             let bytes = config_data.into_bytes();
             let size = bytes.len() as u64;
-            *self.latest_config_json.lock().unwrap() = Some(bytes);
+            self.latest_config_json
+                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
             let attr = self.get_config_attr(size);
             return Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
@@ -1403,7 +1680,8 @@ impl Filesystem for SqueezefsFilesystem {
             let stats_data = self.generate_stats_json().await;
             let bytes = stats_data.into_bytes();
             let size = bytes.len() as u64;
-            *self.latest_stats_json.lock().unwrap() = Some(bytes);
+            self.latest_stats_json
+                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
             let attr = self.get_stats_attr(size);
             return Ok(ReplyEntry {
                 ttl: Duration::from_secs(0), // dynamic stats shouldn't be cached long
@@ -1413,11 +1691,10 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let lookup_future = async {
-            let child_ino = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
-                if let Some(&ino) = cached_map.get(&*name_str) {
-                    ino
-                } else {
-                    return Err(Errno::from(libc::ENOENT));
+            let child_ino = if let Some(entries) = self.dir_entry_cache.get(&parent) {
+                match entries.binary_search_by(|(n, _)| n.as_ref().cmp(&*name_str)) {
+                    Ok(idx) => entries[idx].1,
+                    Err(_) => return Err(Errno::from(libc::ENOENT)),
                 }
             } else {
                 let mut con = self
@@ -1472,7 +1749,8 @@ impl Filesystem for SqueezefsFilesystem {
             let config_data = self.generate_config_json().await;
             let bytes = config_data.into_bytes();
             let size = bytes.len() as u64;
-            *self.latest_config_json.lock().unwrap() = Some(bytes);
+            self.latest_config_json
+                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
             let attr = self.get_config_attr(size);
             return Ok(ReplyAttr {
                 ttl: Duration::from_secs(1),
@@ -1484,7 +1762,8 @@ impl Filesystem for SqueezefsFilesystem {
             let stats_data = self.generate_stats_json().await;
             let bytes = stats_data.into_bytes();
             let size = bytes.len() as u64;
-            *self.latest_stats_json.lock().unwrap() = Some(bytes);
+            self.latest_stats_json
+                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
             let attr = self.get_stats_attr(size);
             return Ok(ReplyAttr {
                 ttl: Duration::from_secs(0),
@@ -1523,7 +1802,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
-        let name_str = name.to_string_lossy();
+        let name_str = osstr_to_cow(name);
         info!(
             "FUSE mknod: parent = {}, name = {}, mode = {:o}, rdev = {}",
             parent, name_str, mode, rdev
@@ -1659,7 +1938,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_create");
-        let name_str = name.to_string_lossy();
+        let name_str = osstr_to_cow(name);
         info!(
             "FUSE Create: parent = {}, name = {}, mode = {:o}, flags = {}",
             parent, name_str, mode, flags
@@ -1803,16 +2082,16 @@ impl Filesystem for SqueezefsFilesystem {
 
         if inode == STATS_INODE || inode == CONFIG_INODE {
             let content = if inode == STATS_INODE {
-                let maybe_bytes = self.latest_stats_json.lock().unwrap().take();
-                if let Some(bytes) = maybe_bytes {
-                    bytes
+                let old_val = self.latest_stats_json.swap(std::sync::Arc::new(None));
+                if let Some(bytes_arc) = &*old_val {
+                    (**bytes_arc).clone()
                 } else {
                     self.generate_stats_json().await.into_bytes()
                 }
             } else {
-                let maybe_bytes = self.latest_config_json.lock().unwrap().take();
-                if let Some(bytes) = maybe_bytes {
-                    bytes
+                let old_val = self.latest_config_json.swap(std::sync::Arc::new(None));
+                if let Some(bytes_arc) = &*old_val {
+                    (**bytes_arc).clone()
                 } else {
                     self.generate_config_json().await.into_bytes()
                 }
@@ -1868,8 +2147,10 @@ impl Filesystem for SqueezefsFilesystem {
             }
             let start = offset as usize;
             let end = std::cmp::min(bytes.len(), start + size as usize);
+            // SAFETY: start < bytes.len() checked on line 2144, and end is clamped to bytes.len()
+            let slice = unsafe { bytes.get_unchecked(start..end) };
             return Ok(ReplyData {
-                data: bytes[start..end].to_vec().into(),
+                data: slice.to_vec().into(),
                 backing: None,
             });
         }
@@ -1888,8 +2169,10 @@ impl Filesystem for SqueezefsFilesystem {
             }
             let start = offset as usize;
             let end = std::cmp::min(bytes.len(), start + size as usize);
+            // SAFETY: start < bytes.len() checked on line 2166, and end is clamped to bytes.len()
+            let slice = unsafe { bytes.get_unchecked(start..end) };
             return Ok(ReplyData {
-                data: bytes[start..end].to_vec().into(),
+                data: slice.to_vec().into(),
                 backing: None,
             });
         }
@@ -2032,7 +2315,6 @@ impl Filesystem for SqueezefsFilesystem {
 
             // Call the custom transaction SqueezeMetadataWrite
             let mut pipe = redis::pipe();
-            pipe.atomic();
 
             if expected_new_size > old_size {
                 pipe.hset_multiple(
@@ -2090,12 +2372,17 @@ impl Filesystem for SqueezefsFilesystem {
                 if offset as usize + data.len() > final_data.len() {
                     final_data.resize(offset as usize + data.len(), 0);
                 }
-                final_data[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+                // SAFETY: We resized final_data if needed, ensuring offset + data.len() <= final_data.len()
+                unsafe {
+                    final_data
+                        .get_unchecked_mut(offset as usize..offset as usize + data.len())
+                        .copy_from_slice(data);
+                }
 
                 let packed = self
                     .router
                     .get_crypto()
-                    .process_write(bytes::Bytes::copy_from_slice(&final_data))
+                    .process_write(bytes::Bytes::from(final_data))
                     .map_err(map_squeezefs_err)?;
                 let inline_key = format!("inline_data:{}", file_path);
 
@@ -2136,7 +2423,7 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             // Update local attr_cache securely by briefly acquiring the lock
-            let lock = self.get_inode_lock(ino);
+            let lock = self.get_inode_lock_ref(ino);
             let _guard = lock.write().await;
             if let Some(mut entry) = self.attr_cache.get_mut(&ino) {
                 entry.value_mut().0.size = expected_new_size;
@@ -2171,7 +2458,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
-        let name_str = name.to_string_lossy();
+        let name_str = osstr_to_cow(name);
         debug!(
             "FUSE mkdir: parent = {}, name = {}, mode = {:o}",
             parent, name_str, mode
@@ -2319,7 +2606,7 @@ impl Filesystem for SqueezefsFilesystem {
     async fn rmdir(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
-        let name_str = name.to_string_lossy();
+        let name_str = osstr_to_cow(name);
         debug!("FUSE rmdir: parent = {}, name = {}", parent, name_str);
 
         let rmdir_future = async {
@@ -2454,7 +2741,7 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let setattr_future = async {
-            let lock = self.get_inode_lock(ino);
+            let lock = self.get_inode_lock_ref(ino);
             let _guard = lock.write().await;
 
             let mut con = self
@@ -2553,9 +2840,6 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
 
             drop(_guard);
-            if std::sync::Arc::strong_count(&lock) <= 2 {
-                self.active_inode_locks.remove(&ino);
-            }
 
             Ok(ReplyAttr {
                 ttl: Duration::from_secs(1),
@@ -2581,8 +2865,8 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
-        let name_str = name.to_string_lossy();
-        let link_str = link.to_string_lossy();
+        let name_str = osstr_to_cow(name);
+        let link_str = osstr_to_cow(link);
         debug!(
             "FUSE symlink: parent = {}, name = {}, link = {}",
             parent, name_str, link_str
@@ -2702,7 +2986,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
-        let new_name_str = new_name.to_string_lossy();
+        let new_name_str = osstr_to_cow(new_name);
         debug!(
             "FUSE link: ino = {}, new_parent = {}, new_name = {}",
             ino, new_parent, new_name_str
@@ -2797,7 +3081,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_unlink");
-        let name_str = name.to_string_lossy();
+        let name_str = osstr_to_cow(name);
         debug!("FUSE unlink: parent = {}, name = {}", parent, name_str);
 
         if parent == 1 && name_str == ".config" {
@@ -2814,12 +3098,11 @@ impl Filesystem for SqueezefsFilesystem {
             let nsec = now.subsec_nanos();
 
             // 1. Get child inode (from cache or parent directory lookup)
-            let ino = if let Some(cached_ino) = self
-                .dir_entry_cache
-                .get(&parent)
-                .and_then(|map| map.get(&*name_str).copied())
-            {
-                cached_ino
+            let ino = if let Some(entries) = self.dir_entry_cache.get(&parent) {
+                match entries.binary_search_by(|(n, _)| n.as_ref().cmp(&*name_str)) {
+                    Ok(idx) => entries[idx].1,
+                    Err(_) => return Err(Errno::from(libc::ENOENT)),
+                }
             } else {
                 let mut con = self
                     .dlm
@@ -3039,8 +3322,8 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
-        let name_str = name.to_string_lossy();
-        let new_name_str = new_name.to_string_lossy();
+        let name_str = osstr_to_cow(name);
+        let new_name_str = osstr_to_cow(new_name);
         debug!(
             "FUSE rename: parent = {}, name = {}, new_parent = {}, new_name = {}",
             parent, name_str, new_parent, new_name_str
@@ -3314,7 +3597,13 @@ impl Filesystem for SqueezefsFilesystem {
                 let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
                 let map: std::collections::HashMap<String, u64> =
                     con.hgetall(&dir_key).await.map_err(map_err)?;
-                let map_arc = std::sync::Arc::new(map);
+                let mut sorted_entries: Vec<(std::boxed::Box<str>, u64)> = map
+                    .into_iter()
+                    .map(|(k, v)| (k.into_boxed_str(), v))
+                    .collect();
+                sorted_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let map_arc: std::sync::Arc<[(std::boxed::Box<str>, u64)]> =
+                    std::sync::Arc::from(sorted_entries.into_boxed_slice());
                 self.dir_entry_cache.insert(parent, map_arc.clone());
                 map_arc
             };
@@ -3322,8 +3611,21 @@ impl Filesystem for SqueezefsFilesystem {
             // Convert entries_map to a list of DirectoryEntry
             let mut entries = Vec::new();
 
+            let has_dot = entries_map
+                .binary_search_by(|(n, _)| n.as_ref().cmp("."))
+                .is_ok();
+            let has_dotdot = entries_map
+                .binary_search_by(|(n, _)| n.as_ref().cmp(".."))
+                .is_ok();
+            let has_config = entries_map
+                .binary_search_by(|(n, _)| n.as_ref().cmp(".config"))
+                .is_ok();
+            let has_stats = entries_map
+                .binary_search_by(|(n, _)| n.as_ref().cmp(".stats"))
+                .is_ok();
+
             // Standard "." and ".." entries should be added if not already in Garnet
-            if !entries_map.contains_key(".") {
+            if !has_dot {
                 entries.push(DirectoryEntry {
                     name: ".".into(),
                     kind: FileType::Directory,
@@ -3331,7 +3633,7 @@ impl Filesystem for SqueezefsFilesystem {
                     offset: 1,
                 });
             }
-            if !entries_map.contains_key("..") {
+            if !has_dotdot {
                 // Find parent directory from root/parent key, or just default to root 1 if not exists
                 let parent_parent = if parent == 1 {
                     1
@@ -3348,7 +3650,7 @@ impl Filesystem for SqueezefsFilesystem {
                 });
             }
 
-            if parent == 1 && !entries_map.contains_key(".config") {
+            if parent == 1 && !has_config {
                 let offset = (entries.len() + 1) as i64;
                 entries.push(DirectoryEntry {
                     name: ".config".into(),
@@ -3358,7 +3660,7 @@ impl Filesystem for SqueezefsFilesystem {
                 });
             }
 
-            if parent == 1 && !entries_map.contains_key(".stats") {
+            if parent == 1 && !has_stats {
                 let offset = (entries.len() + 1) as i64;
                 entries.push(DirectoryEntry {
                     name: ".stats".into(),
@@ -3368,12 +3670,25 @@ impl Filesystem for SqueezefsFilesystem {
                 });
             }
 
+            let temp_entries = std::mem::take(&mut entries);
+            for entry in temp_entries {
+                if entry.offset >= offset {
+                    entries.push(entry);
+                }
+            }
+
+            let mut current_offset = (entries.len() + 1) as i64;
             let mut child_inos = Vec::new();
             for (name, child_ino) in entries_map.iter() {
-                if name == "." || name == ".." {
+                if name.as_ref() == "." || name.as_ref() == ".." {
+                    continue;
+                }
+                if current_offset < offset as i64 {
+                    current_offset += 1;
                     continue;
                 }
                 child_inos.push(*child_ino);
+                current_offset += 1;
             }
 
             let mut kind_map = std::collections::HashMap::new();
@@ -3414,7 +3729,11 @@ impl Filesystem for SqueezefsFilesystem {
 
             let mut current_offset = (entries.len() + 1) as i64;
             for (name, child_ino) in entries_map.iter() {
-                if name == "." || name == ".." {
+                if name.as_ref() == "." || name.as_ref() == ".." {
+                    continue;
+                }
+                if current_offset < offset as i64 {
+                    current_offset += 1;
                     continue;
                 }
                 let kind = kind_map
@@ -3423,7 +3742,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .unwrap_or(FileType::RegularFile);
 
                 entries.push(DirectoryEntry {
-                    name: name.clone().into(),
+                    name: name.as_ref().into(),
                     kind,
                     inode: *child_ino,
                     offset: current_offset,
@@ -3431,13 +3750,9 @@ impl Filesystem for SqueezefsFilesystem {
                 current_offset += 1;
             }
 
-            // Apply offset filtering: skip the first `offset` entries
-            let filtered_entries: Vec<DirectoryEntry> =
-                entries.into_iter().skip(offset as usize).collect();
-
             // Convert to BoxStream
             use futures::stream::{self, StreamExt};
-            let stream = stream::iter(filtered_entries.into_iter().map(Ok)).boxed();
+            let stream = stream::iter(entries.into_iter().map(Ok)).boxed();
 
             Ok(ReplyDirectory { entries: stream })
         };
@@ -3474,15 +3789,34 @@ impl Filesystem for SqueezefsFilesystem {
                 let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
                 let map: std::collections::HashMap<String, u64> =
                     con.hgetall(&dir_key).await.map_err(map_err)?;
-                let map_arc = std::sync::Arc::new(map);
+                let mut sorted_entries: Vec<(std::boxed::Box<str>, u64)> = map
+                    .into_iter()
+                    .map(|(k, v)| (k.into_boxed_str(), v))
+                    .collect();
+                sorted_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let map_arc: std::sync::Arc<[(std::boxed::Box<str>, u64)]> =
+                    std::sync::Arc::from(sorted_entries.into_boxed_slice());
                 self.dir_entry_cache.insert(parent, map_arc.clone());
                 map_arc
             };
 
             let mut entries = Vec::new();
 
+            let has_dot = entries_map
+                .binary_search_by(|(n, _)| n.as_ref().cmp("."))
+                .is_ok();
+            let has_dotdot = entries_map
+                .binary_search_by(|(n, _)| n.as_ref().cmp(".."))
+                .is_ok();
+            let has_config = entries_map
+                .binary_search_by(|(n, _)| n.as_ref().cmp(".config"))
+                .is_ok();
+            let has_stats = entries_map
+                .binary_search_by(|(n, _)| n.as_ref().cmp(".stats"))
+                .is_ok();
+
             // Standard "." and ".." entries
-            if !entries_map.contains_key(".") {
+            if !has_dot {
                 let attr = self
                     .get_attr_internal(parent)
                     .await
@@ -3498,7 +3832,7 @@ impl Filesystem for SqueezefsFilesystem {
                     offset: 1,
                 });
             }
-            if !entries_map.contains_key("..") {
+            if !has_dotdot {
                 let parent_parent = if parent == 1 {
                     1
                 } else {
@@ -3522,7 +3856,7 @@ impl Filesystem for SqueezefsFilesystem {
                 });
             }
 
-            if parent == 1 && !entries_map.contains_key(".config") {
+            if parent == 1 && !has_config {
                 let config_data = self.generate_config_json().await;
                 let attr = self.get_config_attr(config_data.len() as u64);
                 let offset = (entries.len() + 1) as i64;
@@ -3538,7 +3872,7 @@ impl Filesystem for SqueezefsFilesystem {
                 });
             }
 
-            if parent == 1 && !entries_map.contains_key(".stats") {
+            if parent == 1 && !has_stats {
                 let stats_data = self.generate_stats_json().await;
                 let attr = self.get_stats_attr(stats_data.len() as u64);
                 let offset = (entries.len() + 1) as i64;
@@ -3554,12 +3888,24 @@ impl Filesystem for SqueezefsFilesystem {
                 });
             }
 
+            let temp_entries = std::mem::take(&mut entries);
+            for entry in temp_entries {
+                if (entry.offset as u64) >= offset {
+                    entries.push(entry);
+                }
+            }
+
+            let mut current_offset = (entries.len() + 1) as i64;
             // 1. Gather all inodes we need attributes for that AREN'T in local cache
             let mut pipe = redis::pipe();
             let mut inos_to_fetch = Vec::new();
 
             for (name, child_ino) in entries_map.iter() {
-                if name == "." || name == ".." {
+                if name.as_ref() == "." || name.as_ref() == ".." {
+                    continue;
+                }
+                if current_offset < offset as i64 {
+                    current_offset += 1;
                     continue;
                 }
 
@@ -3574,6 +3920,7 @@ impl Filesystem for SqueezefsFilesystem {
                     pipe.hgetall(format!("{}:attr:{}", crate::fs_prefix(), child_ino));
                     inos_to_fetch.push(*child_ino);
                 }
+                current_offset += 1;
             }
 
             // 2. Fetch them ALL in exactly ONE network round-trip!
@@ -3677,7 +4024,11 @@ impl Filesystem for SqueezefsFilesystem {
 
             let mut current_offset = (entries.len() + 1) as i64;
             for (name, child_ino) in entries_map.iter() {
-                if name == "." || name == ".." {
+                if name.as_ref() == "." || name.as_ref() == ".." {
+                    continue;
+                }
+                if current_offset < offset as i64 {
+                    current_offset += 1;
                     continue;
                 }
                 let attr = match self.get_attr_internal(*child_ino).await {
@@ -3687,13 +4038,14 @@ impl Filesystem for SqueezefsFilesystem {
                             "readdirplus failed to get attr for child {}: {:?}",
                             child_ino, e
                         );
+                        current_offset += 1;
                         continue;
                     }
                 };
                 let kind = attr.kind;
 
                 entries.push(DirectoryEntryPlus {
-                    name: name.clone().into(),
+                    name: name.as_ref().into(),
                     kind,
                     inode: *child_ino,
                     generation: 1,
@@ -3705,11 +4057,8 @@ impl Filesystem for SqueezefsFilesystem {
                 current_offset += 1;
             }
 
-            let filtered_entries: Vec<DirectoryEntryPlus> =
-                entries.into_iter().skip(offset as usize).collect();
-
             use futures::stream::{self, StreamExt};
-            let stream = stream::iter(filtered_entries.into_iter().map(Ok)).boxed();
+            let stream = stream::iter(entries.into_iter().map(Ok)).boxed();
 
             Ok(ReplyDirectoryPlus { entries: stream })
         };
@@ -4839,7 +5188,7 @@ pub async fn start_mount<P: AsRef<Path>>(
         }
     }
 
-    let dismount_wait = fs.dismount_wait;
+    let _dismount_wait = fs.dismount_wait;
     let nvme_cache = fs.router.cache.nvme.clone();
 
     let client_id_str = uuid::Uuid::new_v4().to_string();
@@ -4933,15 +5282,15 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     #[cfg(target_os = "linux")]
     let mut handle = if unsafe { libc::getuid() } == 0 {
-        session.mount(fs, mount_path.clone()).await?
+        session.mount(fs.clone(), mount_path.clone()).await?
     } else {
         session
-            .mount_with_unprivileged(fs, mount_path.clone())
+            .mount_with_unprivileged(fs.clone(), mount_path.clone())
             .await?
     };
 
     #[cfg(not(target_os = "linux"))]
-    let mut handle = session.mount(fs, mount_path.clone()).await?;
+    let mut handle = session.mount(fs.clone(), mount_path.clone()).await?;
 
     println!("\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}", mount_path);
 
@@ -5037,7 +5386,13 @@ pub async fn start_mount<P: AsRef<Path>>(
                 use std::io::Write;
                 use std::io::IsTerminal;
 
-                info!("Received shutdown signal. Checking staging status...");
+                info!("Received shutdown signal. Force flushing memory buffers to staging...");
+                // Phase 1: Force flush RAM buffers to staging (cancellation NOT allowed)
+                if let Err(e) = fs.flush_all_memory_buffers_to_staging().await {
+                    error!("Error flushing memory buffers to staging: {:?}", e);
+                }
+
+                // Check staging status
                 let mut staged_count = 0;
                 let mut active_writes_count = 0;
                 for key in nvme_cache.list_staged_files() {
@@ -5049,56 +5404,50 @@ pub async fn start_mount<P: AsRef<Path>>(
                 }
 
                 let has_unflushed = staged_count > 0 || active_writes_count > 0;
-                if has_unflushed && std::io::stdin().is_terminal() {
-                    println!("\n{}", "WARNING: There are unflushed staged writes on this node!".red().bold());
-                    println!("Remaining local staged files: {}", staged_count);
-                    println!("Active write transaction directories: {}", active_writes_count);
-                    println!("If you unmount now, other nodes will not see this data.");
-                    println!("\nChoose an option:");
-                    println!("  [w] Wait for staged files to drain/flush to NVMe-oF backend");
-                    println!("  [c] Continue/force unmount immediately (unsafe)");
-                    println!("  [a] Abort unmount and continue running mount");
-                    print!("Select option [w/c/a]: ");
-                    let _ = std::io::stdout().flush();
+                if has_unflushed {
+                    if std::io::stdin().is_terminal() {
+                        println!("\n{}", "WARNING: There are unflushed staged writes on this node!".red().bold());
+                        println!("Remaining local staged files: {}", staged_count);
+                        println!("Active write transaction directories: {}", active_writes_count);
+                        println!("If you unmount now, other nodes will not see this data.");
+                        println!("\nChoose an option:");
+                        println!("  [w] Wait for staged files to drain/flush to NVMe-oF backend");
+                        println!("  [c] Continue/force unmount immediately (unsafe)");
+                        println!("  [a] Abort unmount and continue running mount");
+                        print!("Select option [w/c/a]: ");
+                        let _ = std::io::stdout().flush();
 
-                    let mut input = String::new();
-                    let choice = if std::io::stdin().read_line(&mut input).is_ok() {
-                        input.trim().to_lowercase()
-                    } else {
-                        "c".to_string()
-                    };
+                        let mut input = String::new();
+                        let choice = if std::io::stdin().read_line(&mut input).is_ok() {
+                            input.trim().to_lowercase()
+                        } else {
+                            "c".to_string()
+                        };
 
-                    if choice == "a" || choice == "abort" {
-                        println!("Aborting exit. Resuming squeezefs mount.");
-                        continue;
-                    } else if choice == "w" || choice == "wait" {
-                        println!("Waiting for staged writes to drain. Press Ctrl+C again to force exit.");
-                        let start_wait = std::time::Instant::now();
-                        let max_wait = std::time::Duration::from_secs(dismount_wait);
-                        loop {
-                            let mut current_staged = 0;
-                            let mut current_active = 0;
-                            for key in nvme_cache.list_staged_files() {
-                                if key.starts_with("active_block:") {
-                                    current_active += 1;
-                                } else {
-                                    current_staged += 1;
+                        if choice == "a" || choice == "abort" {
+                            println!("Aborting exit. Resuming squeezefs mount.");
+                            continue;
+                        } else if choice == "w" || choice == "wait" {
+                            println!("Waiting for staged writes to drain. Press Ctrl+C again to force exit.");
+                            tokio::select! {
+                                res = fs.flush_all_staged_blocks_to_backend() => {
+                                    if let Err(e) = res {
+                                        error!("Error flushing staged blocks to backend: {:?}", e);
+                                    } else {
+                                        println!("\nAll staged files and active writes drained cleanly!");
+                                    }
+                                }
+                                _ = tokio::signal::ctrl_c() => {
+                                    println!("\nCtrl+C received. Cancelling staging flush to NVMe-oF backend and exiting immediately...");
                                 }
                             }
-                            if current_staged == 0 && current_active == 0 {
-                                println!("\nAll staged files and active writes drained cleanly!");
-                                break;
-                            }
-                            if start_wait.elapsed() >= max_wait {
-                                println!("\nGrace period expired. Unmounting with remaining staged files: {}, active writes: {}", current_staged, current_active);
-                                break;
-                            }
-                            print!("\rRemaining staged files: {}, active writes: {}... (elapsed: {}s / limit: {}s)", current_staged, current_active, start_wait.elapsed().as_secs(), dismount_wait);
-                            let _ = std::io::stdout().flush();
-                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        } else {
+                            println!("Continuing with unmount.");
                         }
                     } else {
-                        println!("Continuing with unmount.");
+                        // Non-interactive/daemon mode: flush all staged files automatically before exiting
+                        info!("FUSE Daemon: Non-interactive shutdown. Automatically flushing staged files to backend...");
+                        let _ = fs.flush_all_staged_blocks_to_backend().await;
                     }
                 }
                 should_exit = true;

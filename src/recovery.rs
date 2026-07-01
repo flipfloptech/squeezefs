@@ -160,7 +160,8 @@ pub async fn recover_staging(
                         let meta_key = format!("metadata:inode_{}", ino);
                         let exists: bool = con.exists(&meta_key).await.unwrap_or(false);
                         if exists {
-                            let db_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await.unwrap_or(None);
+                            let db_fencing: Option<u64> =
+                                con.hget(&meta_key, "fencing_token").await.unwrap_or(None);
                             if let Some(df) = db_fencing {
                                 if meta.fencing_token < df {
                                     warn!(
@@ -324,7 +325,8 @@ pub async fn recover_staging(
             let meta_key = format!("metadata:{}", meta.file_path);
             let redis_file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
             let redis_file_type: Option<String> = con.hget(&meta_key, "type").await?;
-            let db_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await.unwrap_or(None);
+            let db_fencing: Option<u64> =
+                con.hget(&meta_key, "fencing_token").await.unwrap_or(None);
 
             let mut should_recover = redis_file_type.as_deref() == Some("staged")
                 && redis_file_id.as_deref() == Some(&file_id);

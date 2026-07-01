@@ -25,18 +25,39 @@ pub fn set_simulate_corruption(val: bool) {
     SIMULATE_CORRUPTION.store(val, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[derive(Clone)]
 pub struct NvmeBlockDev {
     pub device_path: String,
+    file_pool: std::sync::Arc<once_cell::sync::OnceCell<crossbeam::queue::ArrayQueue<File>>>,
 }
 
 impl NvmeBlockDev {
     pub fn new(device_path: &str) -> Self {
         Self {
             device_path: device_path.to_string(),
+            file_pool: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
         }
     }
 
-    fn get_file(&self) -> Result<File> {
+    fn get_pool(&self) -> &crossbeam::queue::ArrayQueue<File> {
+        self.file_pool.get_or_init(|| {
+            let cores = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            let pool_size = std::cmp::max(cores * 2, 8);
+            let queue = crossbeam::queue::ArrayQueue::new(pool_size);
+            
+            // Try to pre-populate with file handles
+            for _ in 0..pool_size {
+                if let Ok(file) = self.open_file_handle() {
+                    let _ = queue.push(file);
+                }
+            }
+            queue
+        })
+    }
+
+    fn open_file_handle(&self) -> Result<File> {
         let mut std_file = {
             #[cfg(target_os = "linux")]
             {
@@ -67,20 +88,33 @@ impl NvmeBlockDev {
         std_file.map_err(|e| crate::error::SqueezefsError::Io(e))
     }
 
+    fn borrow_file(&self) -> Result<File> {
+        let pool = self.get_pool();
+        if let Some(file) = pool.pop() {
+            Ok(file)
+        } else {
+            self.open_file_handle()
+        }
+    }
+
+    fn return_file(&self, file: File) {
+        let pool = self.get_pool();
+        let _ = pool.push(file);
+    }
+
     pub async fn write_block(&self, offset: u64, data: &[u8]) -> Result<()> {
-        let file = self.get_file()?;
+        let file = self.borrow_file()?;
         let data_len = data.len();
         let alignment = 4096;
 
         // If the data is already page-aligned and is a multiple of 4096 bytes, we bypass allocation and copying completely!
         if (data.as_ptr() as usize) % alignment == 0 && data_len % alignment == 0 {
             let data_ptr = data.as_ptr() as usize;
-            tokio::task::spawn_blocking(move || {
+            let (res, file) = tokio::task::spawn_blocking(move || {
                 let aligned_slice =
                     unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
                 let res = file.write_all_at(aligned_slice, offset);
-                res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
-                Ok::<(), crate::error::SqueezefsError>(())
+                (res, file)
             })
             .await
             .map_err(|e| {
@@ -88,7 +122,9 @@ impl NvmeBlockDev {
                     "Block write task panicked: {:?}",
                     e
                 ))
-            })??;
+            })?;
+            self.return_file(file);
+            res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
 
             crate::fuse_client::METRICS
                 .put_obj
@@ -124,6 +160,7 @@ impl NvmeBlockDev {
                     }
                     buf_ptr as usize
                 } else {
+                    self.return_file(file);
                     return Err(crate::error::SqueezefsError::InvalidOperation(
                         "posix_memalign failed for write block".to_string(),
                     ));
@@ -131,15 +168,14 @@ impl NvmeBlockDev {
             }
         };
 
-        tokio::task::spawn_blocking(move || {
+        let (res, file) = tokio::task::spawn_blocking(move || {
             let aligned_slice =
                 unsafe { std::slice::from_raw_parts(buf_addr as *const u8, aligned_len) };
             let res = file.write_all_at(aligned_slice, offset);
             unsafe {
                 libc::free(buf_addr as *mut libc::c_void);
             }
-            res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
-            Ok::<(), crate::error::SqueezefsError>(())
+            (res, file)
         })
         .await
         .map_err(|e| {
@@ -147,7 +183,9 @@ impl NvmeBlockDev {
                 "Thread join error on write_block: {}",
                 e
             ))
-        })??;
+        })?;
+        self.return_file(file);
+        res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
 
         crate::fuse_client::METRICS
             .put_obj
@@ -167,19 +205,19 @@ impl NvmeBlockDev {
     }
 
     pub async fn verify_write_block(&self, offset: u64, expected: &[u8]) -> Result<bool> {
-        let file = self.get_file()?;
+        let file = self.borrow_file()?;
         let expected_len = expected.len();
         let aligned_len = (expected_len + 4095) & !4095;
         let alignment = 4096;
         let expected_ptr = expected.as_ptr() as usize;
 
-        tokio::task::spawn_blocking(move || {
+        let (res, file) = tokio::task::spawn_blocking(move || {
             let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
             unsafe {
                 if libc::posix_memalign(&mut buf_ptr, alignment, aligned_len) != 0 {
-                    return Err(crate::error::SqueezefsError::InvalidOperation(
+                    return (Err(crate::error::SqueezefsError::InvalidOperation(
                         "posix_memalign failed for verify_write_block".to_string(),
-                    ));
+                    )), file);
                 }
             }
 
@@ -204,7 +242,7 @@ impl NvmeBlockDev {
             unsafe {
                 libc::free(buf_ptr);
             }
-            Ok(matched)
+            (Ok(matched), file)
         })
         .await
         .map_err(|e| {
@@ -212,23 +250,30 @@ impl NvmeBlockDev {
                 "Thread join error on verify_write_block: {}",
                 e
             ))
-        })?
+        })?;
+        self.return_file(file);
+        res
     }
 
     pub async fn read_block(&self, offset: u64, size: usize) -> Result<bytes::Bytes> {
-        let file = self.get_file()?;
-        let res = tokio::task::spawn_blocking(move || {
+        let file = self.borrow_file()?;
+        let (res, file) = tokio::task::spawn_blocking(move || {
             let mut buffer = vec![0u8; size + 4096];
             let ptr = buffer.as_ptr() as usize;
             let aligned_ptr = (ptr + 4095) & !4095;
             let align_offset = aligned_ptr - ptr;
 
-            file.read_exact_at(&mut buffer[align_offset..align_offset + size], offset)
-                .map_err(|e| crate::error::SqueezefsError::Io(e))?;
+            let res = file.read_exact_at(&mut buffer[align_offset..align_offset + size], offset)
+                .map_err(|e| crate::error::SqueezefsError::Io(e));
 
-            let bytes = bytes::Bytes::from(buffer);
-            let aligned_bytes = bytes.slice(align_offset..align_offset + size);
-            Ok::<bytes::Bytes, crate::error::SqueezefsError>(aligned_bytes)
+            match res {
+                Ok(_) => {
+                    let bytes = bytes::Bytes::from(buffer);
+                    let aligned_bytes = bytes.slice(align_offset..align_offset + size);
+                    (Ok(aligned_bytes), file)
+                }
+                Err(e) => (Err(e), file),
+            }
         })
         .await
         .map_err(|e| {
@@ -236,10 +281,13 @@ impl NvmeBlockDev {
                 "Thread join error on read_block: {}",
                 e
             ))
-        })??;
+        })?;
+        self.return_file(file);
+
+        let res_val = res?;
         crate::fuse_client::METRICS
             .get_obj
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(res)
+        Ok(res_val)
     }
 }

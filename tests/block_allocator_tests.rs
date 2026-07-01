@@ -133,6 +133,11 @@ async fn test_interleaved_alloc_free() {
         handle.await.unwrap();
     }
 
+    // Exhaust the remaining 246 blocks in the current thread's inline reservoir run
+    for _ in 0..246 {
+        let _ = allocator.allocate_block().await.unwrap();
+    }
+
     // Allocate 5 more, they should reuse the freed ones
     let mut new_offsets = vec![];
     for _ in 0..5 {

@@ -568,12 +568,14 @@ impl MetaClient {
             Self::Single { client, pool } => {
                 let info = client.get_connection_info();
                 if let Some(conn) = LOCAL_CONN.with(|cache| {
-                    cache.borrow().iter()
+                    cache
+                        .borrow()
+                        .iter()
                         .find(|(cached_info, _)| {
-                            cached_info.addr == info.addr 
-                            && cached_info.redis.db == info.redis.db
-                            && cached_info.redis.username == info.redis.username
-                            && cached_info.redis.password == info.redis.password
+                            cached_info.addr == info.addr
+                                && cached_info.redis.db == info.redis.db
+                                && cached_info.redis.username == info.redis.username
+                                && cached_info.redis.password == info.redis.password
                         })
                         .map(|(_, conn)| conn.clone())
                 }) {

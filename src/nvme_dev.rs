@@ -15,8 +15,35 @@
  */
 
 use crate::error::Result;
+use io_uring::{opcode, types::Fd, IoUring};
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
+
+thread_local! {
+    static RING: RefCell<Option<IoUring>> = RefCell::new(None);
+}
+
+fn with_ring<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce(&mut IoUring) -> std::io::Result<T>,
+{
+    RING.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow.is_none() {
+            let ring = IoUring::builder()
+                .setup_sqpoll(1000)
+                .build(1024)
+                .or_else(|_| IoUring::new(1024))
+                .map_err(|e| {
+                    log::error!("Failed to initialize io_uring: {:?}", e);
+                    e
+                })?;
+            *borrow = Some(ring);
+        }
+        f(borrow.as_mut().unwrap()).map_err(|e| crate::error::SqueezefsError::Io(e))
+    })
+}
 
 pub static SIMULATE_CORRUPTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -46,7 +73,7 @@ impl NvmeBlockDev {
                 .unwrap_or(4);
             let pool_size = std::cmp::max(cores * 2, 8);
             let queue = crossbeam::queue::ArrayQueue::new(pool_size);
-            
+
             // Try to pre-populate with file handles
             for _ in 0..pool_size {
                 if let Ok(file) = self.open_file_handle() {
@@ -79,6 +106,10 @@ impl NvmeBlockDev {
 
         // Fallback to standard open without O_DIRECT if it fails
         if std_file.is_err() {
+            log::warn!(
+                "WARNING: Failed to open NVMe block device {:?} with O_DIRECT. Falling back to standard buffered I/O, which may pollute page cache.",
+                self.device_path
+            );
             std_file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -113,7 +144,39 @@ impl NvmeBlockDev {
             let (res, file) = tokio::task::spawn_blocking(move || {
                 let aligned_slice =
                     unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
-                let res = file.write_all_at(aligned_slice, offset);
+
+                let res = with_ring(|ring| {
+                    let fd = Fd(file.as_raw_fd());
+                    let write_e = opcode::Write::new(fd, aligned_slice.as_ptr(), data_len as _)
+                        .offset(offset)
+                        .build()
+                        .user_data(1);
+                    unsafe {
+                        ring.submission().push(&write_e).map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::Other, "Submission queue full")
+                        })?;
+                    }
+                    ring.submit_and_wait(1)?;
+
+                    let mut cq = ring.completion();
+                    cq.sync();
+                    let mut write_res = Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "io_uring write CQE not found",
+                    ));
+                    for cqe in cq {
+                        if cqe.user_data() == 1 {
+                            let res = cqe.result();
+                            write_res = if res < 0 {
+                                Err(std::io::Error::from_raw_os_error(-res))
+                            } else {
+                                Ok(())
+                            };
+                            break;
+                        }
+                    }
+                    write_res
+                });
                 (res, file)
             })
             .await
@@ -124,7 +187,7 @@ impl NvmeBlockDev {
                 ))
             })?;
             self.return_file(file);
-            res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
+            res?;
 
             crate::fuse_client::METRICS
                 .put_obj
@@ -169,9 +232,38 @@ impl NvmeBlockDev {
         };
 
         let (res, file) = tokio::task::spawn_blocking(move || {
-            let aligned_slice =
-                unsafe { std::slice::from_raw_parts(buf_addr as *const u8, aligned_len) };
-            let res = file.write_all_at(aligned_slice, offset);
+            let res = with_ring(|ring| {
+                let fd = Fd(file.as_raw_fd());
+                let write_e = opcode::Write::new(fd, buf_addr as *const u8, aligned_len as _)
+                    .offset(offset)
+                    .build()
+                    .user_data(4);
+                unsafe {
+                    ring.submission().push(&write_e).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "Submission queue full")
+                    })?;
+                }
+                ring.submit_and_wait(1)?;
+
+                let mut cq = ring.completion();
+                cq.sync();
+                let mut write_res = Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "io_uring write unaligned CQE not found",
+                ));
+                for cqe in cq {
+                    if cqe.user_data() == 4 {
+                        let res = cqe.result();
+                        write_res = if res < 0 {
+                            Err(std::io::Error::from_raw_os_error(-res))
+                        } else {
+                            Ok(())
+                        };
+                        break;
+                    }
+                }
+                write_res
+            });
             unsafe {
                 libc::free(buf_addr as *mut libc::c_void);
             }
@@ -185,7 +277,7 @@ impl NvmeBlockDev {
             ))
         })?;
         self.return_file(file);
-        res.map_err(|e| crate::error::SqueezefsError::Io(e))?;
+        res?;
 
         crate::fuse_client::METRICS
             .put_obj
@@ -215,25 +307,57 @@ impl NvmeBlockDev {
             let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
             unsafe {
                 if libc::posix_memalign(&mut buf_ptr, alignment, aligned_len) != 0 {
-                    return (Err(crate::error::SqueezefsError::InvalidOperation(
-                        "posix_memalign failed for verify_write_block".to_string(),
-                    )), file);
+                    return (
+                        Err(crate::error::SqueezefsError::InvalidOperation(
+                            "posix_memalign failed for verify_write_block".to_string(),
+                        )),
+                        file,
+                    );
                 }
             }
 
-            let aligned_slice = unsafe {
-                std::slice::from_raw_parts_mut(buf_ptr as *mut u8, aligned_len)
-            };
+            let aligned_slice =
+                unsafe { std::slice::from_raw_parts_mut(buf_ptr as *mut u8, aligned_len) };
 
-            let res = file.read_exact_at(&mut aligned_slice[0..expected_len], offset);
+            let res = with_ring(|ring| {
+                let fd = Fd(file.as_raw_fd());
+                let read_e = opcode::Read::new(fd, aligned_slice.as_mut_ptr(), expected_len as _)
+                    .offset(offset)
+                    .build()
+                    .user_data(3);
+                unsafe {
+                    ring.submission().push(&read_e).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "Submission queue full")
+                    })?;
+                }
+                ring.submit_and_wait(1)?;
+
+                let mut cq = ring.completion();
+                cq.sync();
+                let mut read_res = Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "io_uring verify CQE not found",
+                ));
+                for cqe in cq {
+                    if cqe.user_data() == 3 {
+                        let res = cqe.result();
+                        read_res = if res < 0 {
+                            Err(std::io::Error::from_raw_os_error(-res))
+                        } else {
+                            Ok(())
+                        };
+                        break;
+                    }
+                }
+                read_res
+            });
 
             let matched = if res.is_ok() {
                 if SIMULATE_CORRUPTION.load(std::sync::atomic::Ordering::Relaxed) {
                     aligned_slice[0] ^= 0xFF;
                 }
-                let expected_slice = unsafe {
-                    std::slice::from_raw_parts(expected_ptr as *const u8, expected_len)
-                };
+                let expected_slice =
+                    unsafe { std::slice::from_raw_parts(expected_ptr as *const u8, expected_len) };
                 aligned_slice[0..expected_len] == *expected_slice
             } else {
                 false
@@ -258,13 +382,44 @@ impl NvmeBlockDev {
     pub async fn read_block(&self, offset: u64, size: usize) -> Result<bytes::Bytes> {
         let file = self.borrow_file()?;
         let (res, file) = tokio::task::spawn_blocking(move || {
-            let mut buffer = vec![0u8; size + 4096];
+            let buffer = vec![0u8; size + 4096];
             let ptr = buffer.as_ptr() as usize;
             let aligned_ptr = (ptr + 4095) & !4095;
             let align_offset = aligned_ptr - ptr;
+            let buf_ptr = aligned_ptr as *mut u8;
 
-            let res = file.read_exact_at(&mut buffer[align_offset..align_offset + size], offset)
-                .map_err(|e| crate::error::SqueezefsError::Io(e));
+            let res = with_ring(|ring| {
+                let fd = Fd(file.as_raw_fd());
+                let read_e = opcode::Read::new(fd, buf_ptr, size as _)
+                    .offset(offset)
+                    .build()
+                    .user_data(2);
+                unsafe {
+                    ring.submission().push(&read_e).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "Submission queue full")
+                    })?;
+                }
+                ring.submit_and_wait(1)?;
+
+                let mut cq = ring.completion();
+                cq.sync();
+                let mut read_res = Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "io_uring read CQE not found",
+                ));
+                for cqe in cq {
+                    if cqe.user_data() == 2 {
+                        let res = cqe.result();
+                        read_res = if res < 0 {
+                            Err(std::io::Error::from_raw_os_error(-res))
+                        } else {
+                            Ok(())
+                        };
+                        break;
+                    }
+                }
+                read_res
+            });
 
             match res {
                 Ok(_) => {

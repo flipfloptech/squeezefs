@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn test_defragmentation_under_lock() {
+    let _ = env_logger::try_init();
     let redis_url = "redis://127.0.0.1:6379";
     let client = match redis::Client::open(redis_url) {
         Ok(c) => c,
@@ -24,6 +25,53 @@ async fn test_defragmentation_under_lock() {
     // Clear out keys
     {
         let mut conn = client.get_connection().unwrap();
+
+        // Scan and delete all metadata:inode_* keys
+        let mut cursor: u64 = 0;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("metadata:inode_*")
+                .arg("COUNT")
+                .arg(1000)
+                .query(&mut conn)
+                .unwrap_or((0, vec![]));
+            for key in keys {
+                let _: () = redis::cmd("DEL")
+                    .arg(&key)
+                    .query(&mut conn)
+                    .unwrap_or_default();
+            }
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        // Scan and delete all block_map:* keys
+        cursor = 0;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("block_map:*")
+                .arg("COUNT")
+                .arg(1000)
+                .query(&mut conn)
+                .unwrap_or((0, vec![]));
+            for key in keys {
+                let _: () = redis::cmd("DEL")
+                    .arg(&key)
+                    .query(&mut conn)
+                    .unwrap_or_default();
+            }
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+
         let _: () = redis::cmd("DEL")
             .arg(format!("{}:free_blocks", fs_name))
             .arg(format!("{}:highest_block", fs_name))

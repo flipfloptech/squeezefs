@@ -74,7 +74,6 @@ pub static BUFFER_POOL: Lazy<Arc<BufferPool>> = Lazy::new(|| {
     Arc::new(BufferPool::new(capacity, 4 * 1024 * 1024))
 });
 
-
 pub enum ReadBlockValue {
     Pooled(PooledBuf),
     Bytes(bytes::Bytes),

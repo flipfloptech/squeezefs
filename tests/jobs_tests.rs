@@ -21,14 +21,13 @@ use squeezefs::dlm::DlmClient;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tempfile::tempdir;
 
-static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static TEST_MUTEX: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_distributed_job_execution() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = TEST_MUTEX.lock().await;
     squeezefs::set_write_verification(false);
     squeezefs::nvme_dev::set_simulate_corruption(false);
 
@@ -137,7 +136,7 @@ async fn test_distributed_job_execution() {
 
     // Verify metadata was updated
     let mut con = router.dlm.get_connection().await.unwrap();
-    let block_map_key = format!("block_map:test_map_1");
+    let block_map_key = "block_map:test_map_1".to_string();
     let mapped_offset: String = redis::cmd("HGET")
         .arg(&block_map_key)
         .arg("0")
@@ -149,7 +148,7 @@ async fn test_distributed_job_execution() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_write_verification_failure_pauses_job() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = TEST_MUTEX.lock().await;
     let redis_url = "redis://127.0.0.1:6379";
     let fs_name = "test_vol_jobs_fail";
     squeezefs::set_fs_prefix(fs_name);

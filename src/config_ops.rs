@@ -582,10 +582,7 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
     };
 
     // 1. Fetch block allocator status (highest_block, free_blocks, refcounts)
-    let highest_block: u64 = con
-        .get(crate::fs_key!("highest_block"))
-        .await
-        .unwrap_or(0);
+    let highest_block: u64 = con.get(crate::fs_key!("highest_block")).await.unwrap_or(0);
     let free_blocks_vec: Vec<u64> = con
         .smembers(crate::fs_key!("free_blocks"))
         .await

@@ -188,7 +188,9 @@ async fn test_fsck_and_recovery_flow() {
 
     assert!(issues.iter().any(|i| i.contains("exceeds highest_block")));
     assert!(issues.iter().any(|i| i.contains("marked as FREE")));
-    assert!(issues.iter().any(|i| i.contains("Reference count mismatch")));
+    assert!(issues
+        .iter()
+        .any(|i| i.contains("Reference count mismatch")));
     assert!(issues.iter().any(|i| i.contains("Leaked block detected")));
 
     // ==========================================
@@ -240,12 +242,9 @@ async fn test_fsck_and_recovery_flow() {
         .unwrap();
 
     // Write mock staged active blocks to NvmeCache
-    let cache = squeezefs::tiering::nvme::NvmeCache::new(
-        &[&staging_segment_dir],
-        &[100 * 1024 * 1024],
-        1,
-    )
-    .unwrap();
+    let cache =
+        squeezefs::tiering::nvme::NvmeCache::new(&[&staging_segment_dir], &[100 * 1024 * 1024], 1)
+            .unwrap();
 
     // Prepare payload bytes
     let create_payload = |f_token: u64| -> bytes::Bytes {
@@ -290,9 +289,9 @@ async fn test_fsck_and_recovery_flow() {
     );
 
     let temp_backing_file = tempfile::NamedTempFile::new().unwrap();
-    let nvme_writer = Arc::new(
-        squeezefs::nvme_dev::NvmeBlockDev::new(temp_backing_file.path().to_str().unwrap()),
-    );
+    let nvme_writer = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
+        temp_backing_file.path().to_str().unwrap(),
+    ));
 
     // Drop the cache instance to sync mappings to segment files
     drop(cache);
@@ -316,7 +315,10 @@ async fn test_fsck_and_recovery_flow() {
     let bmap_opt: Option<String> = con.hget("metadata:inode_10", "block_map_id").await.unwrap();
     assert!(bmap_opt.is_some());
     let bmap_id = bmap_opt.unwrap();
-    let block_val: Option<String> = con.hget(format!("block_map:{}", bmap_id), "0").await.unwrap();
+    let block_val: Option<String> = con
+        .hget(format!("block_map:{}", bmap_id), "0")
+        .await
+        .unwrap();
     assert!(block_val.is_some());
     assert!(block_val.unwrap().starts_with("backend_0://"));
 

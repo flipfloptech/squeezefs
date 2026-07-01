@@ -116,10 +116,7 @@ fn bench_squeezefs_concurrency(c: &mut Criterion) {
                     let router = router_ref.clone();
                     let data = data_ref.clone();
                     tokio::spawn(async move {
-                        router
-                            .write_file(&name, 0, &data, (base + i) as u64)
-                            .await
-                            .unwrap();
+                        router.write_file(&name, 0, &data, base + i).await.unwrap();
                         let mut con = router.dlm.get_connection().await.unwrap();
                         let _ = router.delete_file(&name, &mut con).await;
                     })

@@ -202,11 +202,9 @@ pub struct DataRouter {
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
     pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
-    inflight_block_reads: std::sync::Arc<
-        dashmap::DashMap<String, tokio::sync::broadcast::Sender<()>, ahash::RandomState>,
-    >,
-    sequential_read_state:
-        std::sync::Arc<dashmap::DashMap<String, (u32, std::time::Instant), ahash::RandomState>>,
+    inflight_block_reads:
+        std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<()>>>,
+    sequential_read_state: moka::sync::Cache<String, (u32, std::time::Instant)>,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
     pub prefetcher: std::sync::Arc<IoUringPrefetcher>,
@@ -214,16 +212,15 @@ pub struct DataRouter {
 
 struct InflightBlockReadGuard {
     key: String,
-    inflight_block_reads: std::sync::Arc<
-        dashmap::DashMap<String, tokio::sync::broadcast::Sender<()>, ahash::RandomState>,
-    >,
+    inflight_block_reads:
+        std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<()>>>,
     tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl Drop for InflightBlockReadGuard {
     fn drop(&mut self) {
         self.inflight_block_reads
-            .remove_if(&self.key, |_, current| current.same_channel(&self.tx));
+            .remove_if_sync(&self.key, |current| current.same_channel(&self.tx));
         let _ = self.tx.send(());
     }
 }
@@ -242,6 +239,13 @@ impl DataRouter {
             block_size.clone(),
         ));
         cache.set_backend_router(backend_router.clone());
+
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let total_memory = sys.total_memory();
+        let metadata_capacity = std::cmp::max(10_000, total_memory / 200_000);
+        let block_map_capacity = std::cmp::max(50_000, total_memory / 50_000);
+
         Self {
             dlm,
             cache,
@@ -250,19 +254,18 @@ impl DataRouter {
             backend_router,
             block_size,
             metadata_cache: moka::sync::Cache::builder()
-                .max_capacity(100_000)
-                .time_to_live(std::time::Duration::from_secs(60))
+                .max_capacity(metadata_capacity)
+                .time_to_live(std::time::Duration::from_secs(300))
                 .build(),
             block_map_cache: moka::sync::Cache::builder()
-                .max_capacity(500_000)
-                .time_to_live(std::time::Duration::from_secs(60))
+                .max_capacity(block_map_capacity)
+                .time_to_live(std::time::Duration::from_secs(300))
                 .build(),
-            inflight_block_reads: std::sync::Arc::new(dashmap::DashMap::with_hasher(
-                ahash::RandomState::new(),
-            )),
-            sequential_read_state: std::sync::Arc::new(dashmap::DashMap::with_hasher(
-                ahash::RandomState::new(),
-            )),
+            inflight_block_reads: std::sync::Arc::new(scc::HashIndex::new()),
+            sequential_read_state: moka::sync::Cache::builder()
+                .max_capacity(100000)
+                .time_to_live(std::time::Duration::from_secs(5))
+                .build(),
             crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
             prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
         }
@@ -330,31 +333,11 @@ impl DataRouter {
         }
 
         let (tx, _rx) = tokio::sync::broadcast::channel(1);
-        match self.inflight_block_reads.entry(block_key.to_string()) {
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-                entry.insert(tx.clone());
-                let _guard = InflightBlockReadGuard {
-                    key: block_key.to_string(),
-                    inflight_block_reads: self.inflight_block_reads.clone(),
-                    tx,
-                };
-
-                let downloaded = self.fetch_block_from_remote(block_key).await?;
-                let downloaded_bytes = bytes::Bytes::from(downloaded.into_inner());
-                let nvme_clone = self.cache.nvme.clone();
-                let bk_clone = block_key.to_string();
-                let dl_clone = downloaded_bytes.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
-                });
-                self.cache.read_lru.put(block_key, downloaded_bytes.clone());
-                Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes))
-            }
-            dashmap::mapref::entry::Entry::Occupied(entry) => {
+        loop {
+            if let Some(entry) = self.inflight_block_reads.get_sync(block_key) {
                 let tx = entry.get().clone();
+                drop(entry);
                 let mut rx = tx.subscribe();
-                drop(entry); // Drop the dashmap lock before awaiting!
                 let _ = rx.recv().await;
                 if let Some(cached_block) = self.cache.read_lru.get(block_key) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -366,10 +349,38 @@ impl DataRouter {
                     self.cache.read_lru.put(block_key, bytes.clone());
                     return Ok(crate::cache::pool::ReadBlockValue::Bytes(bytes));
                 }
-                Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "Block fetch failed by the primary fetcher task",
-                )))
+                )));
+            }
+
+            match self
+                .inflight_block_reads
+                .insert_sync(block_key.to_string(), tx.clone())
+            {
+                Ok(_) => {
+                    METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    let _guard = InflightBlockReadGuard {
+                        key: block_key.to_string(),
+                        inflight_block_reads: self.inflight_block_reads.clone(),
+                        tx,
+                    };
+
+                    let downloaded = self.fetch_block_from_remote(block_key).await?;
+                    let downloaded_bytes = bytes::Bytes::from(downloaded.into_inner());
+                    let nvme_clone = self.cache.nvme.clone();
+                    let bk_clone = block_key.to_string();
+                    let dl_clone = downloaded_bytes.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
+                    });
+                    self.cache.read_lru.put(block_key, downloaded_bytes.clone());
+                    return Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes));
+                }
+                Err(_) => {
+                    continue;
+                }
             }
         }
     }
@@ -508,7 +519,7 @@ impl DataRouter {
 
         if !should_prefetch {
             if let Some(previous) = self.sequential_read_state.get(file_path) {
-                let (prev_end_block, prev_seen_at) = *previous.value();
+                let (prev_end_block, prev_seen_at) = previous;
                 should_prefetch = prev_seen_at.elapsed() < Duration::from_secs(2)
                     && start_block == prev_end_block.saturating_add(1);
             }
@@ -1274,10 +1285,43 @@ impl DataRouter {
         }
         let old_block_keys: Vec<Option<String>> = pipe.query_async(con).await?;
 
-        // 3. Spawn tasks to modify affected blocks concurrently
-        let mut tasks = Vec::new();
+        // 3. Pre-resolve cache hits on the main thread and spawn tasks to modify affected blocks concurrently
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let tasks = FuturesUnordered::new();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16)); // Max 16 concurrent block writes
+
+        let mut pre_resolved_blocks = Vec::with_capacity(old_block_keys.len());
         for (idx, b) in (start_block..=end_block).enumerate() {
-            let old_block_key = old_block_keys[idx].clone();
+            let block_start_file_offset = b as u64 * block_size;
+            let block_end_file_offset = block_start_file_offset + block_size;
+            let overlap_start = std::cmp::max(block_start_file_offset, offset);
+            let overlap_end = std::cmp::min(block_end_file_offset, end_pos);
+            let needs_existing = {
+                let existing_block_end = std::cmp::min(existing_size, block_end_file_offset);
+                existing_block_end > block_start_file_offset
+                    && (overlap_start > block_start_file_offset || overlap_end < existing_block_end)
+            };
+
+            let mut resolved = None;
+            if needs_existing {
+                if let Some(ref bk) = old_block_keys[idx] {
+                    if let Some(cached_block) = self.cache.read_lru.get(bk) {
+                        resolved = Some(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
+                    } else if let Some(cached_block) = self.cache.nvme.read_cached_block(bk) {
+                        let bytes = bytes::Bytes::from(cached_block);
+                        self.cache.read_lru.put(bk, bytes.clone());
+                        resolved = Some(crate::cache::pool::ReadBlockValue::Bytes(bytes));
+                    }
+                }
+            }
+            pre_resolved_blocks.push(resolved);
+        }
+
+        let mut old_keys_iter = old_block_keys.into_iter();
+        let mut pre_resolved_iter = pre_resolved_blocks.into_iter();
+        for b in start_block..=end_block {
+            let old_block_key = old_keys_iter.next().unwrap();
+            let pre_resolved = pre_resolved_iter.next().unwrap();
 
             let block_start_file_offset = b as u64 * block_size;
             let block_end_file_offset = block_start_file_offset + block_size;
@@ -1301,9 +1345,27 @@ impl DataRouter {
                     && (overlap_start > block_start_file_offset || overlap_end < existing_block_end)
             };
 
+            let sem_clone = sem.clone();
             tasks.push(tokio::spawn(async move {
+                let _permit = sem_clone.acquire().await.map_err(|e| {
+                    SqueezefsError::Io(std::io::Error::other(format!(
+                        "Semaphore acquire error: {:?}",
+                        e
+                    )))
+                })?;
+
                 let mut block_data = if needs_existing {
-                    if let Some(ref bk) = old_block_key {
+                    if let Some(resolved) = pre_resolved {
+                        match resolved {
+                            crate::cache::pool::ReadBlockValue::Pooled(p) => p,
+                            crate::cache::pool::ReadBlockValue::Bytes(b) => {
+                                let mut pooled = BUFFER_POOL.alloc();
+                                pooled.resize(b.len(), 0);
+                                pooled.copy_from_slice(&b);
+                                pooled
+                            }
+                        }
+                    } else if let Some(ref bk) = old_block_key {
                         match router_clone.get_cached_or_fetch_block(bk).await? {
                             crate::cache::pool::ReadBlockValue::Pooled(p) => p,
                             crate::cache::pool::ReadBlockValue::Bytes(b) => {
@@ -1364,8 +1426,9 @@ impl DataRouter {
         }
 
         let mut results = Vec::new();
-        for task in tasks {
-            let res = task.await.map_err(|e| {
+        let mut tasks_stream = tasks;
+        while let Some(task_res) = tasks_stream.next().await {
+            let res = task_res.map_err(|e| {
                 SqueezefsError::Io(std::io::Error::other(format!(
                     "Block write task panicked: {:?}",
                     e
@@ -1914,9 +1977,9 @@ impl DataRouter {
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     )> {
         // Tier 2 check: System RAM LRU Caches
-        let mut cached_opt = self.cache.write_lru.get(file_path);
+        let mut cached_opt = self.cache.read_lru.get(file_path);
         if cached_opt.is_none() {
-            cached_opt = self.cache.read_lru.get(file_path);
+            cached_opt = self.cache.write_lru.get(file_path);
         }
         if let Some(cached_data) = cached_opt {
             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -2603,7 +2666,7 @@ impl DataRouter {
 
         let mut blocks_to_free = Vec::new();
         if !block_mappings.is_empty() {
-            for (idx_str, _) in &block_mappings {
+            for idx_str in block_mappings.keys() {
                 if let Ok(idx) = idx_str.parse::<u32>() {
                     self.block_map_cache
                         .invalidate(&(block_map_id.to_string(), idx));
@@ -2612,7 +2675,7 @@ impl DataRouter {
 
             // 1. Pipeline query all refcounts
             let mut get_pipe = redis::pipe();
-            for (_, bk) in &block_mappings {
+            for bk in block_mappings.values() {
                 get_pipe.hget(refcounts_key, bk);
             }
             let refcounts: Vec<Option<i32>> = get_pipe.query_async(con).await?;

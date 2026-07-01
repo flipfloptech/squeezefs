@@ -82,6 +82,8 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, _nvme_path: &st
 
     // 3. Defragment high blocks
     let chunk_size = 4 * 1024 * 1024;
+    let used_blocks = block_to_file.len() as u64;
+
     let free_set_key = format!("{}:free_blocks", fs_name);
     let all_free: Vec<u64> = redis::cmd("SMEMBERS")
         .arg(&free_set_key)
@@ -89,7 +91,7 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, _nvme_path: &st
         .await?;
     let mut free_holes: Vec<u64> = all_free
         .into_iter()
-        .filter(|&idx| idx < used_blocks)
+        .filter(|&idx| idx <= used_blocks)
         .collect();
     free_holes.sort();
 

@@ -69,10 +69,11 @@ impl Drop for PooledBuf {
 pub static BUFFER_POOL: Lazy<Arc<BufferPool>> = Lazy::new(|| {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(16);
-    let capacity = std::cmp::max(cores * 16, 512);
+        .unwrap_or(4);
+    let capacity = std::cmp::max(cores * 16, 64);
     Arc::new(BufferPool::new(capacity, 4 * 1024 * 1024))
 });
+
 
 pub enum ReadBlockValue {
     Pooled(PooledBuf),

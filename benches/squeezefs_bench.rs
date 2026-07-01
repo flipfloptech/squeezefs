@@ -808,7 +808,7 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
     rt.block_on(async {
         node4_cache
             .nvme
-            .cache_read_block("scale_bench_block_0", &val)
+            .cache_read_block("scale_bench_block_0", val.clone())
             .unwrap();
     });
 
@@ -828,7 +828,7 @@ fn bench_squeezefs_dht_and_p2p_at_scale(c: &mut Criterion) {
                 let block_key = format!("scale_bench_block_{}", id);
                 rt.block_on(async {
                     // Cache the block on Node 4
-                    node4_cache.nvme.cache_read_block(&block_key, &val).unwrap();
+                    node4_cache.nvme.cache_read_block(&block_key, val.clone()).unwrap();
 
                     // Poll the primary owner node until the async push is completed
                     let dht0 = node0_cache.nvme.dht_node.get().unwrap();

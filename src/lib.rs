@@ -33,10 +33,9 @@ pub mod defrag;
 pub mod jobs;
 pub mod storage;
 
-use once_cell::sync::Lazy;
-use std::sync::RwLock;
+use std::sync::OnceLock;
 
-pub static FS_PREFIX: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("squeezefs".to_string()));
+pub static FS_PREFIX: OnceLock<&'static str> = OnceLock::new();
 
 pub static WRITE_VERIFICATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -49,14 +48,15 @@ pub fn set_write_verification(enabled: bool) {
     WRITE_VERIFICATION.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn fs_prefix() -> String {
-    FS_PREFIX.read().unwrap().clone()
+pub fn fs_prefix() -> &'static str {
+    *FS_PREFIX.get().unwrap_or(&"squeezefs")
 }
 
 pub fn set_fs_prefix(prefix: &str) {
     if !prefix.is_empty() {
-        let mut guard = FS_PREFIX.write().unwrap();
-        *guard = prefix.to_string();
+        let leaked = Box::leak(prefix.to_string().into_boxed_str());
+        // Ignore error if it's already set (OnceLock set can fail if already initialized)
+        let _ = FS_PREFIX.set(leaked);
     }
 }
 
@@ -66,3 +66,15 @@ macro_rules! fs_key {
         format!("{}:{}", $crate::fs_prefix(), $suffix)
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fs_prefix_default() {
+        let prefix = fs_prefix();
+        assert!(!prefix.is_empty());
+    }
+}
+

@@ -7,6 +7,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
+thread_local! {
+    static LOCAL_CONN: std::cell::RefCell<Vec<(redis::ConnectionInfo, redis::aio::MultiplexedConnection)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
 pub struct ConnectionPool {
     pub conns: Vec<std::sync::Arc<parking_lot::RwLock<redis::aio::MultiplexedConnection>>>,
     pub counter: AtomicUsize,
@@ -561,12 +566,33 @@ impl MetaClient {
     pub async fn get_connection(&self) -> Result<MetaConnection> {
         match self {
             Self::Single { client, pool } => {
+                let info = client.get_connection_info();
+                if let Some(conn) = LOCAL_CONN.with(|cache| {
+                    cache.borrow().iter()
+                        .find(|(cached_info, _)| {
+                            cached_info.addr == info.addr 
+                            && cached_info.redis.db == info.redis.db
+                            && cached_info.redis.username == info.redis.username
+                            && cached_info.redis.password == info.redis.password
+                        })
+                        .map(|(_, conn)| conn.clone())
+                }) {
+                    return Ok(MetaConnection::Single {
+                        conn,
+                        client: Some(client.clone()),
+                        bound_conn: None,
+                        sentinel_client: None,
+                        service_name: None,
+                        pool_index: None,
+                    });
+                }
+
                 let pool_arc = pool
                     .get_or_init(|| async {
                         let cores = std::thread::available_parallelism()
                             .map(|p| p.get())
-                            .unwrap_or(8);
-                        let pool_size = std::cmp::max(16, cores * 2);
+                            .unwrap_or(4);
+                        let pool_size = std::cmp::max(8, cores * 2);
                         let mut conns = Vec::new();
                         for _ in 0..pool_size {
                             if let Ok(new_conn) = client.get_multiplexed_tokio_connection().await {
@@ -596,6 +622,12 @@ impl MetaClient {
                 let idx = pool_arc.counter.fetch_add(1, Ordering::Relaxed);
                 let pool_idx = idx % pool_arc.conns.len();
                 let conn = pool_arc.conns[pool_idx].read().clone();
+
+                // Cache connection in thread-local cache
+                LOCAL_CONN.with(|cache| {
+                    cache.borrow_mut().push((info.clone(), conn.clone()));
+                });
+
                 Ok(MetaConnection::Single {
                     conn,
                     client: Some(client.clone()),

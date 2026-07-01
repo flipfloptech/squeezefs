@@ -16,33 +16,39 @@
 
 use crate::error::Result;
 use io_uring::{opcode, types::Fd, IoUring};
-use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 
-thread_local! {
-    static RING: RefCell<Option<IoUring>> = RefCell::new(None);
-}
+static RING_POOL: once_cell::sync::Lazy<
+    crossbeam::queue::ArrayQueue<std::sync::Arc<std::sync::Mutex<IoUring>>>,
+> = once_cell::sync::Lazy::new(|| {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(16);
+    let pool = crossbeam::queue::ArrayQueue::new(cores);
+    for _ in 0..cores {
+        if let Ok(ring) = IoUring::builder().build(256) {
+            let _ = pool.push(std::sync::Arc::new(std::sync::Mutex::new(ring)));
+        }
+    }
+    pool
+});
 
 fn with_ring<F, T>(f: F) -> Result<T>
 where
     F: FnOnce(&mut IoUring) -> std::io::Result<T>,
 {
-    RING.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        if borrow.is_none() {
-            let ring = IoUring::builder()
-                .setup_sqpoll(1000)
-                .build(1024)
-                .or_else(|_| IoUring::new(1024))
-                .map_err(|e| {
-                    log::error!("Failed to initialize io_uring: {:?}", e);
-                    e
-                })?;
-            *borrow = Some(ring);
-        }
-        f(borrow.as_mut().unwrap()).map_err(|e| crate::error::SqueezefsError::Io(e))
-    })
+    let ring_arc = RING_POOL.pop().ok_or_else(|| {
+        crate::error::SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "io_uring pool empty",
+        ))
+    })?;
+    let mut ring = ring_arc.lock().unwrap();
+    let result = f(&mut ring);
+    drop(ring);
+    let _ = RING_POOL.push(ring_arc);
+    result.map_err(crate::error::SqueezefsError::Io)
 }
 
 pub static SIMULATE_CORRUPTION: std::sync::atomic::AtomicBool =

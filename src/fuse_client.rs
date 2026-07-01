@@ -248,12 +248,12 @@ impl SqueezefsFilesystem {
             writeback_rx: std::sync::Mutex::new(Some(writeback_rx)),
             client_id: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             mountpoint: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
-            max_background_uploads: std::cmp::min(
-                16,
-                std::thread::available_parallelism()
+            max_background_uploads: {
+                let cores = std::thread::available_parallelism()
                     .map(|p| p.get())
-                    .unwrap_or(8),
-            ),
+                    .unwrap_or(4);
+                std::cmp::max(16, cores * 2)
+            },
             active_block_buffers: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
@@ -4798,7 +4798,7 @@ pub async fn start_mount<P: AsRef<Path>>(
         options.custom_options(parsed);
     } else {
         // default custom option
-        options.custom_options("max_read=1048576");
+        options.custom_options("max_read=1048576,max_write=1048576,max_pages=256,max_readahead=4194304,max_background=64,congestion_threshold=48,async_read");
     }
 
     info!(

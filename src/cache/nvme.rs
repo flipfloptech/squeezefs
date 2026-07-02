@@ -121,7 +121,8 @@ pub struct NvmeStaging {
     pub backend_router:
         std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
     redis_client: crate::dlm::MetaClient,
-    write_tx: mpsc::UnboundedSender<PendingStagedWrite>,
+    /// Bounded merge-queue sender (P1-1). Full → StorageFull / backpressure.
+    write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
     pub current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub space_freed_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -251,7 +252,9 @@ impl NvmeStaging {
 
         let initial_write_bytes = staging_nvme_cache.current_bytes() as u64;
 
-        let (write_tx, write_rx) = mpsc::unbounded_channel::<PendingStagedWrite>();
+        // P1-1: bound the merge worker queue to avoid unbounded RAM growth under write storms.
+        const STAGING_MERGE_QUEUE_CAP: usize = 1024;
+        let (write_tx, write_rx) = mpsc::channel::<PendingStagedWrite>(STAGING_MERGE_QUEUE_CAP);
 
         let backend_router = std::sync::Arc::new(once_cell::sync::OnceCell::new());
 
@@ -368,7 +371,8 @@ impl NvmeStaging {
 
         let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
         // Memory-mapped copy (lock-free, zero disk syscall wait)
-        self.staging_nvme_cache.put(key_bytes, payload_bytes);
+        self.staging_nvme_cache
+            .put(key_bytes.clone(), payload_bytes);
 
         self.current_staged_write_bytes
             .fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
@@ -390,14 +394,37 @@ impl NvmeStaging {
             padded_size,
         };
 
-        self.write_tx.send(pending).map_err(|e| {
-            SqueezefsError::Io(std::io::Error::other(format!(
-                "Failed to notify merge worker: {:?}",
-                e
-            )))
-        })?;
-
-        Ok(())
+        // Non-blocking backpressure: full queue maps to StorageFull so callers can
+        // fall back to the synchronous backend write path. Roll back the cache put
+        // so we do not leave an un-notified staged blob.
+        match self.write_tx.try_send(pending) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                let _ = self.staging_nvme_cache.remove(&key_bytes);
+                self.current_staged_write_bytes
+                    .fetch_sub(padded_size, std::sync::atomic::Ordering::Relaxed);
+                if is_new {
+                    self.staged_writes_in_flight
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "Staging merge queue full; apply backpressure / fallback",
+                )))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                let _ = self.staging_nvme_cache.remove(&key_bytes);
+                self.current_staged_write_bytes
+                    .fetch_sub(padded_size, std::sync::atomic::Ordering::Relaxed);
+                if is_new {
+                    self.staged_writes_in_flight
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(SqueezefsError::Io(std::io::Error::other(
+                    "Staging merge worker channel closed",
+                )))
+            }
+        }
     }
 
     /// Put a packed active block write to staging_nvme_cache.
@@ -516,7 +543,7 @@ impl NvmeStaging {
         None
     }
 
-    fn start_merge_worker(&self, mut write_rx: mpsc::UnboundedReceiver<PendingStagedWrite>) {
+    fn start_merge_worker(&self, mut write_rx: mpsc::Receiver<PendingStagedWrite>) {
         let block_allocator = self.block_allocator.clone();
         let nvme_writer = self.nvme_writer.clone();
         let backend_router = self.backend_router.clone();

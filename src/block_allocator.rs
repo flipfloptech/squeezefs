@@ -5,6 +5,8 @@ use crossbeam::utils::CachePadded;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Client-side free-block reservoir size (P1-7). Refill amortizes Garnet RTTs across
+/// this many allocations so multi-mount load does not issue one SPOP/INCR per 4MB block.
 const LOCAL_BATCH: u64 = 256;
 
 struct Reservoir {

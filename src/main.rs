@@ -2304,7 +2304,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .await
                     .unwrap_or(Some("backend_0".to_string()))
                     .unwrap_or_else(|| "backend_0".to_string());
-                *router.backend_router.active_write_backend.write() = active_be;
+                router
+                    .backend_router
+                    .active_write_backend
+                    .store(std::sync::Arc::new(active_be));
             }
             let resolved_uid = uid.unwrap_or_else(|| {
                 std::env::var("SUDO_UID")
@@ -2589,7 +2592,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .await
                     .unwrap_or(Some("backend_0".to_string()))
                     .unwrap_or_else(|| "backend_0".to_string());
-                *router.backend_router.active_write_backend.write() = active_be;
+                router
+                    .backend_router
+                    .active_write_backend
+                    .store(std::sync::Arc::new(active_be));
             }
 
             println!("Cloning file from {} to {}...", src, dest);

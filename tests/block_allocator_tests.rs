@@ -203,7 +203,9 @@ async fn test_backend_router_routing() {
     );
 
     // Switch active write backend to fabrics02
-    *router.active_write_backend.write() = "fabrics02".to_string();
+    router
+        .active_write_backend
+        .store(std::sync::Arc::new("fabrics02".to_string()));
 
     // Verify active backend is fabrics02
     let (active_id, active_alloc, active_dev) = router.get_active_backend().unwrap();

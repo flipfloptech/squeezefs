@@ -86,9 +86,12 @@ struct UringWorker {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// P1-6: bound io_uring request queue to apply backpressure under overload.
+const URING_REQ_QUEUE_CAP: usize = 4096;
+
 impl UringWorker {
     fn new(device_path: String) -> Self {
-        let (tx, rx) = crossbeam::channel::unbounded();
+        let (tx, rx) = crossbeam::channel::bounded(URING_REQ_QUEUE_CAP);
         let thread = std::thread::spawn(move || {
             worker_thread_loop(device_path, rx);
         });
@@ -438,14 +441,14 @@ impl NvmeBlockDev {
             let (tx, rx) = oneshot::channel();
             self.worker
                 .sender()
-                .send(UringRequest::Write {
+                .try_send(UringRequest::Write {
                     offset,
                     data: data_type,
                     tx,
                 })
                 .map_err(|e| {
                     crate::error::SqueezefsError::InvalidOperation(format!(
-                        "Failed to send write request to worker: {:?}",
+                        "Uring request queue full or closed (backpressure): {:?}",
                         e
                     ))
                 })?;
@@ -477,7 +480,7 @@ impl NvmeBlockDev {
             if self
                 .worker
                 .sender()
-                .send(UringRequest::Write {
+                .try_send(UringRequest::Write {
                     offset,
                     data: data_type,
                     tx,
@@ -489,7 +492,7 @@ impl NvmeBlockDev {
                     libc::free(rp as *mut libc::c_void);
                 }
                 return Err(crate::error::SqueezefsError::InvalidOperation(
-                    "Failed to send write request to worker".to_string(),
+                    "Uring request queue full or closed (backpressure)".to_string(),
                 ));
             }
             // rp raw pointer value was copied into SendPtr inside the sent message.
@@ -536,7 +539,7 @@ impl NvmeBlockDev {
         let (tx, rx_oneshot) = oneshot::channel();
         self.worker
             .sender()
-            .send(UringRequest::Read {
+            .try_send(UringRequest::Read {
                 offset,
                 buf_ptr: SendPtr(buf_ptr),
                 size,
@@ -545,7 +548,7 @@ impl NvmeBlockDev {
             })
             .map_err(|e| {
                 crate::error::SqueezefsError::InvalidOperation(format!(
-                    "Failed to send read request to worker: {:?}",
+                    "Uring request queue full or closed (backpressure): {:?}",
                     e
                 ))
             })?;

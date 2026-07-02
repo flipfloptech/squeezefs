@@ -52,7 +52,8 @@ pub struct BackendRouter {
     pub backends: std::sync::Arc<
         dashmap::DashMap<String, std::sync::Arc<StorageBackend>, ahash::RandomState>,
     >,
-    pub active_write_backend: std::sync::Arc<parking_lot::RwLock<String>>,
+    /// P1-11: lock-free active backend id (hot path read).
+    pub active_write_backend: std::sync::Arc<arc_swap::ArcSwap<String>>,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -90,7 +91,7 @@ impl BackendRouter {
             default_allocator,
             default_device,
             backends: std::sync::Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
-            active_write_backend: std::sync::Arc::new(parking_lot::RwLock::new(
+            active_write_backend: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 "backend_0".to_string(),
             )),
             block_size,
@@ -104,21 +105,21 @@ impl BackendRouter {
         std::sync::Arc<crate::block_allocator::BlockAllocator>,
         std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     )> {
-        let active_be_id = { self.active_write_backend.read().clone() };
-        if active_be_id == "backend_0" {
+        let active_be_id = self.active_write_backend.load_full();
+        if active_be_id.as_str() == "backend_0" {
             Ok((
                 "backend_0".to_string(),
                 self.default_allocator.clone(),
                 self.default_device.clone(),
             ))
-        } else if let Some(be) = self.backends.get(&active_be_id) {
+        } else if let Some(be) = self.backends.get(active_be_id.as_str()) {
             Ok((
-                active_be_id.clone(),
+                (*active_be_id).clone(),
                 be.block_allocator.clone(),
                 be.device.clone(),
             ))
         } else {
-            Err(err_active_backend_not_found(&active_be_id))
+            Err(err_active_backend_not_found(active_be_id.as_str()))
         }
     }
 

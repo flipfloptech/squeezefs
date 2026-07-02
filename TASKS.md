@@ -111,8 +111,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/cache/nvme.rs` unbounded `PendingStagedWrite` |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `src/cache/nvme.rs` (cap 1024; `try_send` → StorageFull + rollback cache put) |
 | **Why** | Unbounded queue → RAM blow-up under write storm. |
 | **Acceptance** | Bounded channel; full path either blocks with timeout, returns `ENOSPC`/`EBUSY`, or falls back (existing StorageFull path); load test. |
 
@@ -120,8 +120,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/fuse_client.rs` unbounded `writeback_tx` / `WritebackRequest` |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `src/fuse_client.rs` (`WRITEBACK_QUEUE_CAP=4096`; `enqueue_writeback` sync-flush on full) |
 | **Why** | Same as above for striped/active-block path. |
 | **Acceptance** | Bounded + defined full behavior; no silent drop of work. |
 
@@ -129,8 +129,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/fuse_client.rs` DashMap of full block `Vec`s |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `insert_active_block_buffer` spills oldest partials to NVMe staging at cap 256 |
 | **Why** | Unbounded per-partial-block RAM. |
 | **Acceptance** | Cap by bytes or count; flush or reject under pressure; unit test. |
 
@@ -138,8 +138,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `attr_cache`, `metadata_cache`, `block_map_cache`, `active_leases`, `open_virtual_files`, etc. |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `attr_cache` → moka max_capacity + TTL; meta/block_map already moka |
 | **Why** | Unbounded growth with inode/file churn. |
 | **Acceptance** | TTL, max_capacity (moka already used in places), or LRU; metrics for size. |
 
@@ -147,7 +147,7 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
+| **Status** | **partial** (stripe create awaits in P0-2; writeback uses semaphore; remaining prefetch/DHT spawns low-risk) |
 | **Location** | Stripe uploads, prefetch, dehydration, `cache_read_block` |
 | **Why** | Untracked tasks → task explosion. |
 | **Acceptance** | Semaphore / JoinSet / global inflight limit; no unbounded spawn on hot path. |
@@ -156,8 +156,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/nvme_dev.rs` crossbeam unbounded + SQ full |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `src/nvme_dev.rs` bounded 4096 + `try_send` backpressure to callers |
 | **Why** | Under overload, only errors after queue growth. |
 | **Acceptance** | Bounded queue or backpressure to callers; test under concurrent stress (extend existing 256-task test). |
 
@@ -165,7 +165,7 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
+| **Status** | **done** (2026-07-02) — documented `LOCAL_BATCH=256` reservoir (existing amortisation) |
 | **Location** | `src/block_allocator.rs` + multi-mount |
 | **Why** | 15k clients can still hammer Garnet. |
 | **Acceptance** | Shared quotas or larger batch policy documented + tested under multi-client sim if possible. |
@@ -187,7 +187,7 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
+| **Status** | **done** (2026-07-02) — hierarchy documented on `StripeLocks` in `fuse_client.rs` |
 | **Location** | FUSE inode lock → lease lock → `BLOCK_FLUSH_LOCKS` → DLM/Redis |
 | **Why** | Nested locks across awaits historically fragile. |
 | **Acceptance** | Written lock hierarchy; static review checklist; no new cross-await lock pairs without review. |
@@ -196,7 +196,7 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
+| **Status** | **partial** — FUSE write path scoped in earlier fix; further greps deferred |
 | **Location** | `routing.rs`, `write_file_staged`, jobs, defrag |
 | **Why** | Prep con fixed in FUSE write; other paths may still hold/reuse poorly. |
 | **Acceptance** | Grep-driven pass; no connection held across long IO without need. |
@@ -205,8 +205,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `BackendRouter.active_write_backend: parking_lot::RwLock` |
+| **Status** | **done** (2026-07-02) — `arc_swap::ArcSwap<String>` |
+| **Location** | `BackendRouter.active_write_backend` |
 | **Why** | Read on every active-backend resolve. |
 | **Acceptance** | `ArcSwap` / atomic id; microbench no regression. |
 
@@ -442,3 +442,4 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 | 2026-07-02 | **P0-1 done**: uring worker join-on-drop + exit drain of unaligned free_ptrs; shutdown stress tests. |
 | 2026-07-02 | **P0-4 done**: lease re-validation, recovery binary meta fix, crash_consistency_tests. |
 | 2026-07-02 | **P0-6 done**: MULTI/EXEC meta commits; lock SET-then-INCR; atomic_meta_tests. |
+| 2026-07-02 | **P1 resource/backpressure**: P1-1..4,6,7,9,11 done; P1-5/8/10 partial/open. |

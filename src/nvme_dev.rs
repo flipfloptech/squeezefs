@@ -24,8 +24,21 @@ use tokio::sync::oneshot;
 pub static SIMULATE_CORRUPTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test/fault-injection: next N `write_block` calls fail before I/O.
+/// Used by layout atomicity tests (P0-2) and related regression suites.
+pub static FAIL_NEXT_WRITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub fn set_simulate_corruption(val: bool) {
     SIMULATE_CORRUPTION.store(val, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_fail_next_writes(n: usize) {
+    FAIL_NEXT_WRITES.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn clear_fail_next_writes() {
+    FAIL_NEXT_WRITES.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
 struct SendPtr(*mut u8);
@@ -321,6 +334,27 @@ impl NvmeBlockDev {
     }
 
     pub async fn write_block(&self, offset: u64, data: &[u8]) -> Result<()> {
+        // Fault injection for atomicity / durability tests (no-op when counter is 0).
+        loop {
+            let cur = FAIL_NEXT_WRITES.load(std::sync::atomic::Ordering::SeqCst);
+            if cur == 0 {
+                break;
+            }
+            if FAIL_NEXT_WRITES
+                .compare_exchange(
+                    cur,
+                    cur - 1,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return Err(crate::error::SqueezefsError::Io(std::io::Error::other(
+                    "injected write_block failure (FAIL_NEXT_WRITES)",
+                )));
+            }
+        }
+
         let data_len = data.len();
         let alignment = 4096;
 

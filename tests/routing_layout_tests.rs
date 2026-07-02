@@ -534,3 +534,171 @@ async fn test_layout_write_rejects_stale_fencing_token() {
         "got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P0-2: Atomic layout transitions (failure leaves prior layout; retry works)
+// ---------------------------------------------------------------------------
+
+/// Mid-transition write failure must **not** flip layout off inline, and the
+/// original payload must still be readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_inline_to_striped_failure_preserves_inline() {
+    let Some(fx) = LayoutFixture::new("p02_inline_fail", false).await else {
+        return;
+    };
+    let path = fx.path();
+    let small = Bytes::from(vec![0x11u8; 256]);
+    fx.router
+        .write_file(&path, 0, small.clone(), fx.next_fence())
+        .await
+        .expect("initial inline");
+    assert_eq!(fx.layout_type(&path).await.as_deref(), Some("inline"));
+
+    // Fail the first durable block write of the transition (existing image
+    // and/or the subsequent striped RMW — either way type must not flip).
+    squeezefs::nvme_dev::set_fail_next_writes(32);
+    let large = Bytes::from(vec![0x22u8; 8 * 1024]);
+    let err = fx
+        .router
+        .write_file(&path, 0, large, fx.next_fence())
+        .await
+        .expect_err("transition must fail under injected write faults");
+    squeezefs::nvme_dev::clear_fail_next_writes();
+
+    assert!(
+        matches!(err, squeezefs::error::SqueezefsError::Io(_)),
+        "expected Io from injected failure, got {err:?}"
+    );
+    assert_eq!(
+        fx.layout_type(&path).await.as_deref(),
+        Some("inline"),
+        "failed transition must leave prior inline layout"
+    );
+    let got = fx
+        .router
+        .read_file(&path)
+        .await
+        .expect("original inline data still readable");
+    assert_eq!(got.as_slice(), small.as_ref());
+}
+
+/// After a failed growth transition, a clean retry must succeed and become striped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_inline_to_striped_failure_then_retry_succeeds() {
+    let Some(fx) = LayoutFixture::new("p02_inline_retry", false).await else {
+        return;
+    };
+    let path = fx.path();
+    let small = Bytes::from(vec![0x33u8; 200]);
+    fx.router
+        .write_file(&path, 0, small, fx.next_fence())
+        .await
+        .expect("inline seed");
+
+    squeezefs::nvme_dev::set_fail_next_writes(8);
+    let _ = fx
+        .router
+        .write_file(
+            &path,
+            0,
+            Bytes::from(vec![0x44u8; 8 * 1024]),
+            fx.next_fence(),
+        )
+        .await;
+    squeezefs::nvme_dev::clear_fail_next_writes();
+
+    assert_eq!(fx.layout_type(&path).await.as_deref(), Some("inline"));
+
+    let large = Bytes::from(vec![0x55u8; 8 * 1024]);
+    fx.router
+        .write_file(&path, 0, large.clone(), fx.next_fence())
+        .await
+        .expect("retry after clearing fault inject");
+    assert_eq!(fx.layout_type(&path).await.as_deref(), Some("striped"));
+    let got = fx.router.read_file(&path).await.expect("read after retry");
+    assert_eq!(got.as_slice(), large.as_ref());
+}
+
+/// Staged → striped failure must preserve **staged** layout and prior bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_staged_to_striped_failure_preserves_staged() {
+    let Some(fx) = LayoutFixture::new("p02_staged_fail", true).await else {
+        return;
+    };
+    let path = fx.path();
+    let mid = Bytes::from(vec![0x66u8; 64 * 1024]);
+    fx.router
+        .write_file(&path, 0, mid.clone(), fx.next_fence())
+        .await
+        .expect("initial staged");
+    assert_eq!(fx.layout_type(&path).await.as_deref(), Some("staged"));
+
+    squeezefs::nvme_dev::set_fail_next_writes(64);
+    let err = fx
+        .router
+        .write_file(
+            &path,
+            0,
+            Bytes::from(vec![0x77u8; 5 * 1024 * 1024]),
+            fx.next_fence(),
+        )
+        .await
+        .expect_err("growth must fail under inject");
+    squeezefs::nvme_dev::clear_fail_next_writes();
+
+    assert!(matches!(err, squeezefs::error::SqueezefsError::Io(_)));
+    assert_eq!(
+        fx.layout_type(&path).await.as_deref(),
+        Some("staged"),
+        "failed staged→striped must leave staged layout"
+    );
+    let got = fx
+        .router
+        .read_file(&path)
+        .await
+        .expect("staged still readable");
+    assert_eq!(got.as_slice(), mid.as_ref());
+}
+
+/// First-time large write that fails mid-stripe must **not** leave type=striped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_first_striped_write_failure_no_meta_flip() {
+    let Some(fx) = LayoutFixture::new("p02_first_stripe_fail", false).await else {
+        return;
+    };
+    let path = fx.path();
+
+    // Empty file / no prior layout. Fail all block writes for the initial stripe.
+    squeezefs::nvme_dev::set_fail_next_writes(16);
+    let err = fx
+        .router
+        .write_file(
+            &path,
+            0,
+            Bytes::from(vec![0x88u8; 8 * 1024]),
+            fx.next_fence(),
+        )
+        .await
+        .expect_err("first striped write must fail under inject");
+    squeezefs::nvme_dev::clear_fail_next_writes();
+
+    assert!(matches!(err, squeezefs::error::SqueezefsError::Io(_)));
+    // No successful meta commit: type absent or not striped.
+    let ty = fx.layout_type(&path).await;
+    assert!(
+        ty.is_none() || ty.as_deref() != Some("striped"),
+        "must not commit striped meta on failed first write, got {ty:?}"
+    );
+
+    // Clean retry works.
+    let payload = Bytes::from(vec![0x99u8; 8 * 1024]);
+    fx.router
+        .write_file(&path, 0, payload.clone(), fx.next_fence())
+        .await
+        .expect("retry first striped write");
+    assert_eq!(fx.layout_type(&path).await.as_deref(), Some("striped"));
+    assert_eq!(
+        fx.router.read_file(&path).await.expect("read").as_slice(),
+        payload.as_ref()
+    );
+}

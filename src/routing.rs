@@ -9,6 +9,15 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
+/// Build a Redis pipeline wrapped in MULTI/EXEC for critical metadata mutations (P0-6).
+/// Non-atomic pipelines can leave partial key updates if the connection dies mid-batch.
+#[inline]
+fn atomic_meta_pipe() -> redis::Pipeline {
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    pipe
+}
+
 pub fn parse_inode_from_path(path: &str) -> u64 {
     if path.starts_with("inode_") {
         path.strip_prefix("inode_")
@@ -878,18 +887,20 @@ impl DataRouter {
             let inline_key = format!("inline_data:{}", file_path);
             let shared_data = bytes::Bytes::from(existing_data);
             let processed_data = self.get_crypto().process_write(shared_data.clone())?;
-            let mut pipe = redis::pipe();
-            pipe.set(&inline_key, &processed_data[..])
-                .hset(&meta_key, "size", new_size)
-                .hset(&meta_key, "type", "inline")
-                .hset(&meta_key, "fencing_token", fencing_token);
-
             let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
-                pipe.hdel(&meta_key, "file_id");
                 con.hget(&meta_key, "file_id").await?
             } else {
                 None
             };
+
+            let mut pipe = atomic_meta_pipe();
+            pipe.set(&inline_key, &processed_data[..])
+                .hset(&meta_key, "size", new_size)
+                .hset(&meta_key, "type", "inline")
+                .hset(&meta_key, "fencing_token", fencing_token);
+            if file_type.as_deref() == Some("staged") {
+                pipe.hdel(&meta_key, "file_id");
+            }
 
             let _: () = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -899,7 +910,7 @@ impl DataRouter {
             .map_err(|_| {
                 SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "Redis query timed out",
+                    "Redis atomic inline metadata commit timed out",
                 ))
             })??;
 
@@ -937,7 +948,7 @@ impl DataRouter {
 
             match stage_res {
                 Ok(_) => {
-                    let mut pipe = redis::pipe();
+                    let mut pipe = atomic_meta_pipe();
                     pipe.hset(&meta_key, "size", new_size)
                         .hset(&meta_key, "type", "staged")
                         .hset(&meta_key, "file_id", &new_file_id)
@@ -955,7 +966,7 @@ impl DataRouter {
                     .map_err(|_| {
                         SqueezefsError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
-                            "Redis query timed out",
+                            "Redis atomic staged metadata commit timed out",
                         ))
                     })??;
 
@@ -988,8 +999,10 @@ impl DataRouter {
 
                     nvme_writer.write_block(offset, &processed_data).await?;
 
-                    // 3. Register type as staged, file_id, and mapping in Garnet
-                    let mut pipe = redis::pipe();
+                    // 3. Atomically register staged meta + block mapping (P0-6).
+                    let mapping_key = format!("mapping:{}", new_file_id);
+                    let size = processed_data.len() as u64;
+                    let mut pipe = atomic_meta_pipe();
                     pipe.hset(&meta_key, "size", new_size)
                         .hset(&meta_key, "type", "staged")
                         .hset(&meta_key, "file_id", &new_file_id)
@@ -999,6 +1012,15 @@ impl DataRouter {
                         let inline_key = format!("inline_data:{}", file_path);
                         pipe.del(&inline_key);
                     }
+                    pipe.hset(&mapping_key, "block", &stored_block_key)
+                        .hset(&mapping_key, "offset", 0u64)
+                        .hset(&mapping_key, "size", size)
+                        .hset(crate::fs_key!("block_refcounts"), &stored_block_key, 1)
+                        .hset(
+                            crate::fs_key!("block_sizes"),
+                            &stored_block_key,
+                            format!("{}:{}", shared_data.len(), processed_data.len()),
+                        );
                     let _: () = tokio::time::timeout(
                         std::time::Duration::from_secs(2),
                         pipe.query_async(&mut con),
@@ -1007,24 +1029,9 @@ impl DataRouter {
                     .map_err(|_| {
                         SqueezefsError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
-                            "Redis query timed out",
+                            "Redis atomic staged+mapping commit timed out",
                         ))
                     })??;
-
-                    let mapping_key = format!("mapping:{}", new_file_id);
-                    let size = processed_data.len() as u64;
-                    let _: () = redis::pipe()
-                        .hset(&mapping_key, "block", &stored_block_key)
-                        .hset(&mapping_key, "offset", 0u64)
-                        .hset(&mapping_key, "size", size)
-                        .hset(crate::fs_key!("block_refcounts"), &stored_block_key, 1)
-                        .hset(
-                            crate::fs_key!("block_sizes"),
-                            &stored_block_key,
-                            format!("{}:{}", shared_data.len(), processed_data.len()),
-                        )
-                        .query_async(&mut con)
-                        .await?;
 
                     // 4. Remove old staged files if any
                     if let Some(old_id) = old_file_id {
@@ -1163,7 +1170,8 @@ impl DataRouter {
     }
 
     /// Register a completed stripe layout in Garnet only after durable writes.
-    /// Deletes prior inline/staged keys only after the type flip succeeds.
+    /// Block-map, refcounts, sizes, and file meta type flip are applied in one
+    /// MULTI/EXEC transaction so readers never observe a half-committed layout (P0-6).
     async fn commit_striped_layout_meta(
         &self,
         file_path: &str,
@@ -1181,22 +1189,23 @@ impl DataRouter {
         let block_map_key = format!("block_map:{}", block_map_id);
         let refcounts_key_str = crate::fs_key!("block_refcounts");
         let refcounts_key = &refcounts_key_str;
+        let block_sizes_key = crate::fs_key!("block_sizes");
 
-        let mut pipe_map = redis::pipe();
+        // Reads must happen outside MULTI (WATCHed differently); capture staged id first.
+        let old_file_id: Option<String> = if file_type == Some("staged") {
+            con.hget(meta_key, "file_id").await?
+        } else {
+            None
+        };
+
+        let mut pipe = atomic_meta_pipe();
         for (idx_str, key) in block_mappings {
-            pipe_map.hset(&block_map_key, idx_str, key);
-            pipe_map.hset(refcounts_key, key, 1);
+            pipe.hset(&block_map_key, idx_str, key);
+            pipe.hset(refcounts_key, key, 1);
         }
         for (key, logical, physical) in sizes_to_register {
-            pipe_map.hset(
-                crate::fs_key!("block_sizes"),
-                key,
-                format!("{}:{}", logical, physical),
-            );
+            pipe.hset(&block_sizes_key, key, format!("{}:{}", logical, physical));
         }
-        let _: () = pipe_map.query_async(con).await?;
-
-        let mut pipe = redis::pipe();
         pipe.hset(meta_key, "size", size)
             .hset(meta_key, "type", "striped")
             .hset(meta_key, "block_prefix", format!("blocks/{}", file_uuid))
@@ -1208,20 +1217,16 @@ impl DataRouter {
             let inline_key = format!("inline_data:{}", file_path);
             pipe.del(&inline_key);
         }
-
-        let old_file_id: Option<String> = if file_type == Some("staged") {
+        if file_type == Some("staged") {
             pipe.hdel(meta_key, "file_id");
-            con.hget(meta_key, "file_id").await?
-        } else {
-            None
-        };
+        }
 
         let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(con))
             .await
             .map_err(|_| {
                 SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "Redis query timed out",
+                    "Redis atomic metadata commit timed out",
                 ))
             })??;
 
@@ -1495,8 +1500,8 @@ impl DataRouter {
             return Err(e);
         }
 
-        // 4. Build single Redis pipeline to update mappings
-        let mut pipe_update = redis::pipe();
+        // 4. Atomically update block map + file size/fence (P0-6).
+        let mut pipe_update = atomic_meta_pipe();
         let mut old_keys_to_clean = Vec::new();
         for res in results {
             let (b, old_block_key, new_block_key, logical_size, physical_size) = res;
@@ -1513,16 +1518,24 @@ impl DataRouter {
                 old_keys_to_clean.push(bk);
             }
         }
+
+        let new_num_blocks = std::cmp::max(num_blocks, end_block + 1);
+        let new_size = std::cmp::max(existing_size, end_pos);
+        pipe_update
+            .hset(meta_key, "size", new_size)
+            .hset(meta_key, "num_blocks", new_num_blocks)
+            .hset(meta_key, "fencing_token", fencing_token);
+
         let _: () = pipe_update.query_async(con).await?;
 
-        // Clean up old block keys
+        // Clean up old block keys (best-effort; primary mapping already committed)
         for bk in old_keys_to_clean {
             self.cache.read_lru.remove(&bk);
             let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
             if let Some(mut r) = old_ref {
                 r -= 1;
                 if r <= 0 {
-                    let _: () = redis::pipe()
+                    let _: () = atomic_meta_pipe()
                         .hdel(refcounts_key, &bk)
                         .hdel(crate::fs_key!("block_sizes"), &bk)
                         .query_async(con)
@@ -1541,16 +1554,6 @@ impl DataRouter {
                 let _ = self.backend_router.free_block(&bk).await;
             }
         }
-
-        let new_num_blocks = std::cmp::max(num_blocks, end_block + 1);
-        let new_size = std::cmp::max(existing_size, end_pos);
-
-        let _: () = redis::pipe()
-            .hset(meta_key, "size", new_size)
-            .hset(meta_key, "num_blocks", new_num_blocks)
-            .hset(meta_key, "fencing_token", fencing_token)
-            .query_async(con)
-            .await?;
 
         // If file data is fully cached in RAM, update/invalidate
         let mut found_data = self.cache.write_lru.get(file_path);

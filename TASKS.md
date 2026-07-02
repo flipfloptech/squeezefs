@@ -179,8 +179,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/fuse_client.rs` `write`: full `RwLock.write()` for entire op |
+| **Status** | **done** (2026-07-02) — striped writes: meta-prep under inode write lock, data under `BLOCK_FLUSH_LOCKS`; inline/layout transition keep `EntireOp` |
+| **Location** | `src/fuse_client.rs` `write` + `inode_write_lock_scope`; tests `tests/inode_write_lock_tests.rs` |
 | **Why** | Serializes all writes per stripe; long tail under Redis/IO stalls. |
 | **Acceptance** | Split meta-prep vs data; or finer locks; stress test same-inode concurrent writes for correctness + latency. |
 

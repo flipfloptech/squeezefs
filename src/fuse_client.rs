@@ -48,9 +48,10 @@ fn get_fuse_timeout() -> Duration {
 /// 3. `BLOCK_FLUSH_LOCKS` (per block) — active-block flush mutual exclusion
 /// 4. DLM/Redis — network locks via Garnet (no local lock held across unrelated Redis work)
 ///
-/// Do not hold (1) write-guard across long backend I/O when a finer lock suffices.
-/// Do not acquire (1) while holding (3). Prefer dropping Redis connections before
-/// nested locks that may await (see write path connection scoping).
+/// Do not hold (1) write-guard across long backend I/O when a finer lock suffices
+/// (see [`InodeWriteLockScope`] / P1-8). Do not acquire (1) while holding (3).
+/// Prefer dropping Redis connections before nested locks that may await
+/// (see write path connection scoping).
 pub struct StripeLocks<L, const N: usize> {
     locks: Vec<std::sync::Arc<L>>,
 }
@@ -117,6 +118,31 @@ fn osstr_to_cow(name: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
 }
 pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
     Lazy::new(|| StripeLocks::new());
+
+/// P1-8: how long the FUSE write path holds the per-inode write lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InodeWriteLockScope {
+    /// Hold exclusive lock for the entire write (inline RMW or layout transition).
+    EntireOp,
+    /// Hold exclusive lock only for meta-prep (lease, size/type, quota, attr/meta
+    /// size update). Data I/O runs without the inode write lock; per-block
+    /// [`BLOCK_FLUSH_LOCKS`] serialize active-block mutation.
+    MetaPrepOnly,
+}
+
+/// Decide inode write-lock scope for a FUSE write.
+///
+/// Already-striped files use block-level locks on the data path, so the full-inode
+/// write lock need only cover short meta-prep. Inline and non-striped (layout
+/// transition / whole-buffer RMW) paths keep the lock for the entire operation.
+#[inline]
+pub fn inode_write_lock_scope(fits_inline: bool, is_striped: bool) -> InodeWriteLockScope {
+    if fits_inline || !is_striped {
+        InodeWriteLockScope::EntireOp
+    } else {
+        InodeWriteLockScope::MetaPrepOnly
+    }
+}
 
 struct ThreadLocalState {
     count: u64,
@@ -848,7 +874,7 @@ impl SqueezefsFilesystem {
             && (write_start > block_start || write_end < existing_block_end)
     }
 
-    async fn flush_memory_buffers_for_inode(
+    pub async fn flush_memory_buffers_for_inode(
         &self,
         ino: u64,
         fencing_token: u64,
@@ -889,7 +915,9 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
-    async fn write_file_staged(
+    /// Staged/striped active-block write path. Safe to call without holding the
+    /// per-inode write lock: mutates each block under [`BLOCK_FLUSH_LOCKS`].
+    pub async fn write_file_staged(
         &self,
         ino: u64,
         offset: u64,
@@ -2399,10 +2427,12 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let write_future = async {
-            // Acquire local inode lock for the ENTIRE write operation to serialize
-            // concurrent/subsequent writes to the same file.
+            // P1-8: take the per-inode write lock for meta-prep (and for EntireOp paths
+            // through data). Already-striped data I/O drops the guard and relies on
+            // BLOCK_FLUSH_LOCKS so concurrent non-overlapping writers are not serialized
+            // on Redis/IO stalls of peer writes.
             let lock = self.get_inode_lock_ref(ino);
-            let _guard = lock.write().await;
+            let guard = lock.write().await;
 
             // 1. Get or acquire lease (fencing token)
             let fencing_token = self
@@ -2448,6 +2478,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             let fits_inline =
                 expected_new_size <= 4096 && file_type != "staged" && file_type != "striped";
+            let lock_scope = inode_write_lock_scope(fits_inline, is_striped);
 
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2514,8 +2545,19 @@ impl Filesystem for SqueezefsFilesystem {
                 );
             }
 
+            // Publish size/mtime to attr_cache under the write lock so concurrent
+            // MetaPrepOnly writers observe a monotonic size before data I/O.
+            if let Some((mut attr, _)) = self.attr_cache.get(&ino) {
+                attr.size = expected_new_size;
+                attr.blocks = expected_new_size.div_ceil(512);
+                attr.mtime = Timestamp::new(sec, nsec);
+                attr.ctime = Timestamp::new(sec, nsec);
+                self.attr_cache
+                    .insert(ino, (attr, std::time::Instant::now()));
+            }
+
             if fits_inline {
-                // Fresh con for inline read of previous data + update
+                // EntireOp: inline RMW stays under the inode write lock.
                 let mut con = self
                     .dlm
                     .get_connection_for_inode(ino)
@@ -2557,7 +2599,6 @@ impl Filesystem for SqueezefsFilesystem {
                 pipe.hset(&meta_key, "type", "inline");
                 pipe.set(&inline_key, packed.as_ref());
                 let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
-                // con drops at end of scope
 
                 self.router.metadata_cache.insert(
                     file_path.clone(),
@@ -2571,9 +2612,9 @@ impl Filesystem for SqueezefsFilesystem {
                         data_key: None,
                     },
                 );
+                drop(guard);
             } else {
-                // Fresh con only for the metadata size update; release before calling into
-                // write_file_staged / router.write_file (which acquire their own connections).
+                // Fresh con only for the metadata size update; release before data work.
                 {
                     let mut update_con = self
                         .dlm
@@ -2581,9 +2622,11 @@ impl Filesystem for SqueezefsFilesystem {
                         .await
                         .map_err(map_squeezefs_err)?;
                     let _: () = pipe.query_async(&mut update_con).await.map_err(map_err)?;
-                } // update_con drops here -- no manual drop, no held across data work
+                }
 
-                if is_striped {
+                if lock_scope == InodeWriteLockScope::MetaPrepOnly {
+                    // Striped: drop inode write lock before long active-block I/O.
+                    drop(guard);
                     if let Err(e) = self
                         .write_file_staged(ino, offset, data, old_size, fencing_token)
                         .await
@@ -2596,6 +2639,7 @@ impl Filesystem for SqueezefsFilesystem {
                     self.router.cache.write_lru.remove(&file_path);
                     self.router.cache.read_lru.remove(&file_path);
                 } else {
+                    // Non-striped layout transition / staged whole-buffer RMW: keep lock.
                     let data_bytes = bytes::Bytes::copy_from_slice(data);
                     if let Err(e) = self
                         .router
@@ -2607,18 +2651,9 @@ impl Filesystem for SqueezefsFilesystem {
                         }
                         return Err(map_squeezefs_err(e));
                     }
+                    drop(guard);
                 }
                 self.router.metadata_cache.remove(&file_path);
-            }
-
-            // Update local attr_cache securely
-            if let Some((mut attr, _)) = self.attr_cache.get(&ino) {
-                attr.size = expected_new_size;
-                attr.blocks = expected_new_size.div_ceil(512);
-                attr.mtime = Timestamp::new(sec, nsec);
-                attr.ctime = Timestamp::new(sec, nsec);
-                self.attr_cache
-                    .insert(ino, (attr, std::time::Instant::now()));
             }
 
             Ok(ReplyWrite {

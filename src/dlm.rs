@@ -1,3 +1,19 @@
+//! Distributed lock manager (DLM) over Garnet/Redis.
+//!
+//! # Crash consistency (P0-4)
+//!
+//! Leases are `SET key client_id NX PX ttl` plus a monotonic **fencing token**
+//! (`INCR fencing_generator:…`). Heartbeats renew TTL only while this client still
+//! owns the key. After a hard kill:
+//!
+//! 1. Heartbeats stop → TTL expires → another client may acquire a new token.
+//! 2. The new owner's writes update `metadata:… fencing_token`.
+//! 3. Stale writers (or staging recovery with an old token) are rejected when
+//!    `token < metadata.fencing_token`.
+//!
+//! Live processes must not keep using a cached `LockLease` after Redis no longer
+//! shows their `client_id` as holder — see [`LockLease::is_held`].
+
 use crate::error::{Result, SqueezefsError};
 use log::{debug, error, warn};
 use once_cell::sync::Lazy;
@@ -1226,6 +1242,29 @@ impl LockLease {
 
     pub fn range(&self) -> Option<(u64, u64)> {
         self.range
+    }
+
+    pub fn lock_key(&self) -> &str {
+        &self.lock_key
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Returns true if Garnet still lists this client as the lock holder.
+    /// False after TTL expiry, explicit release by another path, or network loss
+    /// of the key — the local lease must then be dropped and re-acquired.
+    pub async fn is_held(&self) -> bool {
+        let Ok(mut con) = self.meta_client.get_connection().await else {
+            return false;
+        };
+        let current_holder: Option<String> = redis::cmd("GET")
+            .arg(&self.lock_key)
+            .query_async(&mut con)
+            .await
+            .unwrap_or(None);
+        current_holder.as_deref() == Some(self.client_id.as_str())
     }
 
     /// Explicitly release the lease.

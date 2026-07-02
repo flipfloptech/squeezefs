@@ -241,36 +241,35 @@ async fn test_fsck_and_recovery_flow() {
         .await
         .unwrap();
 
-    // Write mock staged active blocks to NvmeCache
+    // Write mock staged active blocks to NvmeCache (binary StagedMetadata + 4KiB header pad)
     let cache =
         squeezefs::tiering::nvme::NvmeCache::new(&[&staging_segment_dir], &[100 * 1024 * 1024], 1)
             .unwrap();
 
-    // Prepare payload bytes
-    let create_payload = |f_token: u64| -> bytes::Bytes {
-        let meta_json = serde_json::json!({
-            "file_path": "inode_10",
-            "fencing_token": f_token,
-            "original_size": 16
-        });
-        let json_bytes = serde_json::to_vec(&meta_json).unwrap();
-        let meta_len = json_bytes.len() as u64;
-
+    let create_active_payload = |f_token: u64, file_path: &str| -> bytes::Bytes {
+        let meta = squeezefs::cache::nvme::StagedMetadata {
+            fencing_token: f_token,
+            original_size: 16,
+            file_path: file_path.to_string(),
+        };
+        let meta_bytes = meta.serialize();
+        let meta_len = meta_bytes.len() as u64;
         let mut buf = Vec::new();
         buf.extend_from_slice(&meta_len.to_be_bytes());
-        buf.extend_from_slice(&json_bytes);
+        buf.extend_from_slice(&meta_bytes);
+        buf.resize(4096, 0); // active_block header pad (must match put_active_block)
         buf.extend_from_slice(&[9u8; 16]); // 16 bytes of data
         bytes::Bytes::from(buf)
     };
 
     // Active block for Inode 10: fencing token = 8 (should be recovered)
     let k10 = bytes::Bytes::from("active_block:inode_10:block_0");
-    let v10 = create_payload(8);
+    let v10 = create_active_payload(8, "inode_10");
     cache.put(k10, v10);
 
     // Active block for Inode 11: fencing token = 8 (should be discarded because db has 12)
     let k11 = bytes::Bytes::from("active_block:inode_11:block_0");
-    let v11 = create_payload(8);
+    let v11 = create_active_payload(8, "inode_11");
     cache.put(k11, v11);
 
     // Write incomplete block to test parser resiliency

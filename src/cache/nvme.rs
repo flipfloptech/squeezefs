@@ -53,14 +53,17 @@ fn check_disk_free_safeguard(path: &std::path::Path) -> bool {
     true
 }
 
-struct StagedMetadata {
-    fencing_token: u64,
-    original_size: u64,
-    file_path: String,
+/// Binary header for staged / active-block payloads on local NVMe staging.
+/// Shared with crash recovery (`recovery::recover_staging`) — must stay stable.
+#[derive(Clone, Debug)]
+pub struct StagedMetadata {
+    pub fencing_token: u64,
+    pub original_size: u64,
+    pub file_path: String,
 }
 
 impl StagedMetadata {
-    fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Vec<u8> {
         let path_bytes = self.file_path.as_bytes();
         let mut buf = Vec::with_capacity(20 + path_bytes.len());
         buf.extend_from_slice(&self.fencing_token.to_be_bytes());
@@ -70,13 +73,13 @@ impl StagedMetadata {
         buf
     }
 
-    fn deserialize(bytes: &[u8]) -> Option<Self> {
+    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 20 {
             return None;
         }
-        let fencing_token = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-        let original_size = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        let path_len = u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let fencing_token = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
+        let original_size = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+        let path_len = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as usize;
         if bytes.len() < 20 + path_len {
             return None;
         }
@@ -87,6 +90,25 @@ impl StagedMetadata {
             file_path,
         })
     }
+}
+
+/// Parse a packed staging blob: `[meta_len:u64][meta bytes][payload…]`.
+/// Active blocks pad the header to 4 KiB; ordinary staged files do not.
+pub fn parse_staged_blob(bytes: &[u8], is_active_block: bool) -> Option<(StagedMetadata, Vec<u8>)> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let meta_len = u64::from_be_bytes(bytes[0..8].try_into().ok()?) as usize;
+    if bytes.len() < 8 + meta_len {
+        return None;
+    }
+    let meta = StagedMetadata::deserialize(&bytes[8..8 + meta_len])?;
+    let data_start = if is_active_block { 4096 } else { 8 + meta_len };
+    let data_end = data_start + meta.original_size as usize;
+    if bytes.len() < data_end {
+        return None;
+    }
+    Some((meta, bytes[data_start..data_end].to_vec()))
 }
 
 #[derive(Clone)]

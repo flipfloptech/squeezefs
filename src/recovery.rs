@@ -1,15 +1,26 @@
+//! Crash recovery for local NVMe staging after a client kill / reboot.
+//!
+//! # Consistency model (P0-4)
+//!
+//! - **DLM leases** (`lock:inode_*` in Garnet) use TTL + heartbeat. After a hard kill,
+//!   the lease expires; another client may acquire a **new fencing token**.
+//! - **File metadata** stores the last committed `fencing_token`. Writers must present a
+//!   token ≥ that value (see `DataRouter::write_file`).
+//! - **Local staging** (active blocks / staged files) may outlive the process. On remount,
+//!   `recover_staging` only commits staging entries whose fencing token is not stale
+//!   relative to Garnet, and whose layout still points at that staged id.
+//! - **Live clients** must not trust a locally cached lease after Redis no longer holds
+//!   their client id on the lock key (`get_or_acquire_lease` re-validates).
+//!
+//! Staged payload headers use the binary format in `cache::nvme::StagedMetadata`
+//! (not JSON).
+
+use crate::cache::nvme::parse_staged_blob;
 use crate::error::Result;
 use log::{debug, error, info, warn};
 use redis::AsyncCommands;
-use serde::Deserialize;
 use std::fs;
 use std::path::Path;
-
-#[derive(Deserialize, Debug)]
-struct StagedMetadata {
-    file_path: String,
-    fencing_token: u64,
-}
 
 /// Scan NVMe staging segment index, cross-reference pending staged files with Garnet metadata,
 /// and recover/finalize writes to backing block device.
@@ -110,40 +121,7 @@ pub async fn recover_staging(
             let active_block_data = {
                 if let Some(guard) = cache.get(&key_bytes) {
                     let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
-                    if bytes.len() >= 8 {
-                        let meta_len =
-                            u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
-                        if bytes.len() >= 8 + meta_len {
-                            if let Ok(meta) =
-                                serde_json::from_slice::<StagedMetadata>(&bytes[8..8 + meta_len])
-                            {
-                                let original_size = match serde_json::from_slice::<serde_json::Value>(
-                                    &bytes[8..8 + meta_len],
-                                ) {
-                                    Ok(json) => json
-                                        .get("original_size")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0)
-                                        as usize,
-                                    Err(_) => 0,
-                                };
-                                let data_start = 8 + meta_len;
-                                let data_end = data_start + original_size;
-                                if bytes.len() >= data_end {
-                                    let data = bytes[data_start..data_end].to_vec();
-                                    Some((meta, data))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
+                    parse_staged_blob(bytes, true)
                 } else {
                     None
                 }
@@ -276,43 +254,14 @@ pub async fn recover_staging(
         let staged_data = {
             if let Some(guard) = cache.get(&key_bytes) {
                 let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
-                if bytes.len() < 8 {
-                    None
-                } else {
-                    let meta_len =
-                        u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
-                    if bytes.len() < 8 + meta_len {
+                match parse_staged_blob(bytes, false) {
+                    Some(v) => Some(v),
+                    None => {
+                        error!(
+                            "Crash Recovery: Failed to parse binary staged metadata for key {}",
+                            file_id
+                        );
                         None
-                    } else {
-                        match serde_json::from_slice::<StagedMetadata>(&bytes[8..8 + meta_len]) {
-                            Ok(meta) => {
-                                let original_size = match serde_json::from_slice::<serde_json::Value>(
-                                    &bytes[8..8 + meta_len],
-                                ) {
-                                    Ok(json) => json
-                                        .get("original_size")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0)
-                                        as usize,
-                                    Err(_) => 0,
-                                };
-                                let data_start = 8 + meta_len;
-                                let data_end = data_start + original_size;
-                                if bytes.len() >= data_end {
-                                    let data = bytes[data_start..data_end].to_vec();
-                                    Some((meta, data))
-                                } else {
-                                    None
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Crash Recovery: Failed to parse metadata from staged segment key {}: {:?}",
-                                    file_id, e
-                                );
-                                None
-                            }
-                        }
                     }
                 }
             } else {

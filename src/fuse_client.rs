@@ -723,15 +723,25 @@ impl SqueezefsFilesystem {
     }
 
     async fn get_or_acquire_lease(&self, ino: u64) -> Result<u64, SqueezefsError> {
+        // Fast path: cached lease still held in Garnet (P0-4 re-validation).
         if let Some(lease) = self.active_leases.get(&ino) {
-            return Ok(lease.fencing_token());
+            if lease.is_held().await {
+                return Ok(lease.fencing_token());
+            }
+            drop(lease);
+            // Lock lost (TTL / crash of peer takeover) — drop stale local lease.
+            self.active_leases.remove(&ino);
         }
 
         let lock_arc = self.lease_locks.get_lock(ino, 0);
         let _guard = lock_arc.lock().await;
 
         if let Some(lease) = self.active_leases.get(&ino) {
-            return Ok(lease.fencing_token());
+            if lease.is_held().await {
+                return Ok(lease.fencing_token());
+            }
+            drop(lease);
+            self.active_leases.remove(&ino);
         }
 
         let file_path = format!("inode_{}", ino);
@@ -742,6 +752,14 @@ impl SqueezefsFilesystem {
         let token = lease.fencing_token();
         self.active_leases.insert(ino, lease);
         Ok(token)
+    }
+
+    /// Drop a locally cached lease (e.g. after `FencingTokenExpired` or lock loss).
+    pub fn invalidate_local_lease(&self, ino: u64) {
+        if let Some((_, lease)) = self.active_leases.remove(&ino) {
+            // Best-effort async release if runtime present.
+            drop(lease);
+        }
     }
 
     async fn ensure_delegation_held(&self, inode: Inode) -> Result<(), SqueezefsError> {
@@ -2487,17 +2505,29 @@ impl Filesystem for SqueezefsFilesystem {
                 } // update_con drops here -- no manual drop, no held across data work
 
                 if is_striped {
-                    self.write_file_staged(ino, offset, data, old_size, fencing_token)
+                    if let Err(e) = self
+                        .write_file_staged(ino, offset, data, old_size, fencing_token)
                         .await
-                        .map_err(map_squeezefs_err)?;
+                    {
+                        if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
+                            self.invalidate_local_lease(ino);
+                        }
+                        return Err(map_squeezefs_err(e));
+                    }
                     self.router.cache.write_lru.remove(&file_path);
                     self.router.cache.read_lru.remove(&file_path);
                 } else {
                     let data_bytes = bytes::Bytes::copy_from_slice(data);
-                    self.router
+                    if let Err(e) = self
+                        .router
                         .write_file(&file_path, offset, data_bytes, fencing_token)
                         .await
-                        .map_err(map_squeezefs_err)?;
+                    {
+                        if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
+                            self.invalidate_local_lease(ino);
+                        }
+                        return Err(map_squeezefs_err(e));
+                    }
                 }
                 self.router.metadata_cache.remove(&file_path);
             }

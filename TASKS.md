@@ -77,10 +77,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/fuse_client.rs` leases, `src/dlm.rs` heartbeats, `src/recovery.rs` |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `src/dlm.rs` (`LockLease::is_held`), `src/fuse_client.rs` (lease re-validation), `src/recovery.rs` + `cache/nvme` binary meta; tests `crash_consistency_tests.rs` |
 | **Why** | Two lock layers can diverge after crash. |
 | **Acceptance** | Documented model + recovery/fsck tests for stale lease, expired fence, staged-but-uncommitted. |
+| **Notes** | Documented DLM/fence/staging model in rustdoc. Live leases re-check Redis ownership before reuse; fencing errors invalidate local lease. Recovery parses **binary** `StagedMetadata` (was broken JSON). Tests: lock loss → re-acquire higher fence; stale write rejected; recover discards stale fence; recover commits matching staged. |
 
 ### P0-5 — Direct router layout transition tests
 
@@ -438,3 +439,4 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 | 2026-07-02 | **P0-2 done**: durable await + rollback before meta flip; P0-2 failure/retry tests; `FAIL_NEXT_WRITES` inject. |
 | 2026-07-02 | **P0-3 done**: fsync propagates flush errors; writeback retry + sticky hard failures; writeback_durability_tests. |
 | 2026-07-02 | **P0-1 done**: uring worker join-on-drop + exit drain of unaligned free_ptrs; shutdown stress tests. |
+| 2026-07-02 | **P0-4 done**: lease re-validation, recovery binary meta fix, crash_consistency_tests. |

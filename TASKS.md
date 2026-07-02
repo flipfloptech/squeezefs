@@ -66,10 +66,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/routing.rs` (background `tokio::spawn` paths that only `log::error` on write failure) |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `src/fuse_client.rs` writeback worker, `fsync`/`flush`, `flush_inode_to_backend`; tests `tests/writeback_durability_tests.rs` (router create paths fixed in P0-2) |
 | **Why** | Client can think write succeeded while block never landed. |
 | **Acceptance** | Fail the op or track inflight with join/retry/fsck path; test forced `write_block` failure. |
+| **Notes** | fsync no longer masks backend flush errors (returns EIO). Background writeback re-queues with backoff (max 4 attempts) then sticky `WRITEBACK_HARD_FAILURES` for fsync. Successful sync flush clears sticky state. Staged data retained on failed upload for retry. |
 
 ### P0-4 — Crash consistency: FUSE lease + DLM + fencing after kill
 
@@ -434,3 +435,4 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 | 2026-07-02 | Task list created from post-audit findings. Completed earlier in session: nvme unaligned leak, FUSE write con scoping, cleanup logging, unaligned test, HPC_AUDIT removal. |
 | 2026-07-02 | **P0-5 done**: `tests/routing_layout_tests.rs` + fix stale full-file LRU on oversized put / layout transition. |
 | 2026-07-02 | **P0-2 done**: durable await + rollback before meta flip; P0-2 failure/retry tests; `FAIL_NEXT_WRITES` inject. |
+| 2026-07-02 | **P0-3 done**: fsync propagates flush errors; writeback retry + sticky hard failures; writeback_durability_tests. |

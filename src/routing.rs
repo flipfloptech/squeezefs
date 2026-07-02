@@ -596,7 +596,8 @@ impl DataRouter {
         );
         let router = self.clone();
 
-        tokio::spawn(async move {
+        // P1-5: single admitted outer job; inner fetches limited by buffer_unordered.
+        crate::bg_admit::spawn_bg(async move {
             let block_keys = match router
                 .load_striped_block_keys(&file_path, &meta, next_block, prefetch_end)
                 .await
@@ -608,76 +609,63 @@ impl DataRouter {
                 }
             };
 
-            let mut tasks = Vec::new();
-            for (_, block_key_opt) in block_keys {
-                if let Some(block_key) = block_key_opt {
+            use futures::stream::{self, StreamExt};
+            let fetches = stream::iter(block_keys.into_iter().filter_map(|(_, block_key_opt)| {
+                block_key_opt.map(|block_key| {
                     let router_clone = router.clone();
-
-                    if router_clone.cache.gds.is_available() {
-                        if let Some(local_path) = router_clone.cache.gds.get_gds_path(&block_key) {
-                            if !local_path.exists() {
-                                debug!(
-                                    "Prefetch (GDS): Scheduling download for block {}",
-                                    block_key
-                                );
-                                let local_path_clone = local_path.clone();
-                                let block_key_clone = block_key.clone();
-                                tasks.push(tokio::spawn(async move {
+                    async move {
+                        if router_clone.cache.gds.is_available() {
+                            if let Some(local_path) =
+                                router_clone.cache.gds.get_gds_path(&block_key)
+                            {
+                                if !local_path.exists() {
+                                    debug!(
+                                        "Prefetch (GDS): Scheduling download for block {}",
+                                        block_key
+                                    );
                                     if let Ok(downloaded) =
-                                        router_clone.fetch_block_from_remote(&block_key_clone).await
+                                        router_clone.fetch_block_from_remote(&block_key).await
                                     {
                                         if let Err(e) =
-                                            tokio::fs::write(&local_path_clone, &*downloaded).await
+                                            tokio::fs::write(&local_path, &*downloaded).await
                                         {
                                             debug!(
                                                 "Prefetch (GDS): Failed to write block {}: {:?}",
-                                                block_key_clone, e
-                                            );
-                                        } else {
-                                            debug!(
-                                                "Prefetch (GDS): Successfully cached block {}",
-                                                block_key_clone
+                                                block_key, e
                                             );
                                         }
                                     }
-                                }));
-                                continue;
+                                    return;
+                                }
+                            }
+                        }
+
+                        if let Some(guard) = router_clone
+                            .cache
+                            .nvme
+                            .get_cached_read_block_range_zero_copy(&block_key, 0, u32::MAX)
+                        {
+                            debug!(
+                                "Prefetch (io_uring): Scheduling page prefetch for block {}",
+                                block_key
+                            );
+                            let addr = guard.as_ptr() as u64;
+                            let len = guard.len();
+                            router_clone.prefetcher.prefetch(addr, len);
+                        } else {
+                            debug!("Prefetch: Scheduling remote fetch for block {}", block_key);
+                            if let Err(err) =
+                                router_clone.get_cached_or_fetch_block(&block_key).await
+                            {
+                                debug!("Prefetch: Failed to fetch block {}: {:?}", block_key, err);
                             }
                         }
                     }
+                })
+            }))
+            .buffer_unordered(crate::bg_admit::PREFETCH_BLOCK_CONCURRENCY);
 
-                    if let Some(guard) = router_clone
-                        .cache
-                        .nvme
-                        .get_cached_read_block_range_zero_copy(&block_key, 0, u32::MAX)
-                    {
-                        debug!(
-                            "Prefetch (io_uring): Scheduling page prefetch for block {}",
-                            block_key
-                        );
-                        let addr = guard.as_ptr() as u64;
-                        let len = guard.len();
-                        router_clone.prefetcher.prefetch(addr, len);
-                    } else {
-                        debug!("Prefetch: Scheduling remote fetch for block {}", block_key);
-                        let block_key_clone = block_key.clone();
-                        tasks.push(tokio::spawn(async move {
-                            if let Err(err) = router_clone
-                                .get_cached_or_fetch_block(&block_key_clone)
-                                .await
-                            {
-                                debug!(
-                                    "Prefetch: Failed to fetch block {}: {:?}",
-                                    block_key_clone, err
-                                );
-                            }
-                        }));
-                    }
-                }
-            }
-            for task in tasks {
-                let _ = task.await;
-            }
+            fetches.for_each(|_| async {}).await;
         });
     }
 
@@ -1731,30 +1719,35 @@ impl DataRouter {
                     keys
                 };
 
-                let mut futures = Vec::new();
-                for block_key_opt in block_keys {
-                    let router = self.clone();
-                    let task = tokio::spawn(async move {
-                        if let Some(block_key) = block_key_opt {
-                            router.get_cached_or_fetch_block(&block_key).await
-                        } else {
-                            let mut buf = BUFFER_POOL.alloc();
-                            buf.resize(block_size as usize, 0);
-                            Ok(crate::cache::pool::ReadBlockValue::Pooled(buf))
-                        }
-                    });
-                    futures.push(task);
-                }
+                // P1-5: bounded concurrency (order preserved via index sort).
+                use futures::stream::{self, StreamExt};
+                let mut indexed: Vec<(usize, Result<crate::cache::pool::ReadBlockValue>)> =
+                    stream::iter(
+                        block_keys
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, block_key_opt)| {
+                                let router = self.clone();
+                                async move {
+                                    let res = if let Some(block_key) = block_key_opt {
+                                        router.get_cached_or_fetch_block(&block_key).await
+                                    } else {
+                                        let mut buf = BUFFER_POOL.alloc();
+                                        buf.resize(block_size as usize, 0);
+                                        Ok(crate::cache::pool::ReadBlockValue::Pooled(buf))
+                                    };
+                                    (i, res)
+                                }
+                            }),
+                    )
+                    .buffer_unordered(crate::bg_admit::STRIPED_READ_CONCURRENCY)
+                    .collect()
+                    .await;
+                indexed.sort_by_key(|(i, _)| *i);
 
                 let mut file_data = Vec::new();
-                for f in futures {
-                    let block_data = f.await.map_err(|e| {
-                        SqueezefsError::Io(std::io::Error::other(format!(
-                            "Stripe download block panicked: {:?}",
-                            e
-                        )))
-                    })??;
-                    file_data.extend_from_slice(&block_data);
+                for (_, block_data) in indexed {
+                    file_data.extend_from_slice(&block_data?);
                 }
                 if file_data.len() > meta_size as usize {
                     file_data.truncate(meta_size as usize);
@@ -1944,7 +1937,7 @@ impl DataRouter {
                     .load_striped_block_keys(file_path, &meta, start_block, end_block)
                     .await?;
 
-                // Spawn concurrent tasks to download block data in parallel
+                // P1-5: admit each block task under STRIPED_IO_SEM (bounded concurrency).
                 let mut futures = Vec::new();
                 for (b_idx, b_key_opt) in block_keys {
                     let router = self.clone();
@@ -1955,7 +1948,17 @@ impl DataRouter {
                     let rel_end = slice_end - b_start_offset;
                     let slice_len = (rel_end - slice_start) as u32;
                     let file_path_clone = file_path.to_string();
+                    let permit = crate::bg_admit::STRIPED_IO_SEM
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            SqueezefsError::InvalidOperation(
+                                "striped read admission closed".to_string(),
+                            )
+                        })?;
                     futures.push(tokio::spawn(async move {
+                        let _permit = permit;
                         let cache_key = format!("active_block:{}:block_{}", file_path_clone, b_idx);
                         let block_data = if let Some(active_data) =
                             router.cache.nvme.read_staged(&cache_key)
@@ -2251,7 +2254,17 @@ impl DataRouter {
                     let rel_start = (slice_start - b_start_offset) as usize;
                     let file_path_clone = file_path.to_string();
 
+                    let permit = crate::bg_admit::STRIPED_IO_SEM
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            SqueezefsError::InvalidOperation(
+                                "striped read admission closed".to_string(),
+                            )
+                        })?;
                     futures.push(tokio::spawn(async move {
+                        let _permit = permit;
                         let cache_key = format!("active_block:{}:block_{}", file_path_clone, b_idx);
                         if let Some(active_data) = router.cache.nvme.read_staged(&cache_key) {
                             let start = std::cmp::min(rel_start, active_data.len());

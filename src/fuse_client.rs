@@ -2343,6 +2343,10 @@ impl Filesystem for SqueezefsFilesystem {
                 self.check_capacity_quota(&mut con, diff).await?;
             }
 
+            // Release prep connection (used for size/type/capacity) before data-path work.
+            // Data path will acquire its own connections. This removes the need for manual drop hacks.
+            drop(con);
+
             // Call the custom transaction SqueezeMetadataWrite
             let mut pipe = redis::pipe();
 
@@ -2383,6 +2387,12 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             if fits_inline {
+                // Fresh con for inline read of previous data + update
+                let mut con = self
+                    .dlm
+                    .get_connection_for_inode(ino)
+                    .await
+                    .map_err(map_squeezefs_err)?;
                 let mut final_data = if old_size == 0 && offset == 0 {
                     Vec::new()
                 } else {
@@ -2419,7 +2429,7 @@ impl Filesystem for SqueezefsFilesystem {
                 pipe.hset(&meta_key, "type", "inline");
                 pipe.set(&inline_key, packed.as_ref());
                 let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
-                drop(con);
+                // con drops at end of scope
 
                 self.router.metadata_cache.insert(
                     file_path.clone(),
@@ -2434,8 +2444,16 @@ impl Filesystem for SqueezefsFilesystem {
                     },
                 );
             } else {
-                let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
-                drop(con); // PREVENT DEADLOCK
+                // Fresh con only for the metadata size update; release before calling into
+                // write_file_staged / router.write_file (which acquire their own connections).
+                {
+                    let mut update_con = self
+                        .dlm
+                        .get_connection_for_inode(ino)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                    let _: () = pipe.query_async(&mut update_con).await.map_err(map_err)?;
+                } // update_con drops here -- no manual drop, no held across data work
 
                 if is_striped {
                     self.write_file_staged(ino, offset, data, old_size, fencing_token)

@@ -698,7 +698,9 @@ impl DataRouter {
                 let _: () = con
                     .hdel(crate::fs_key!("block_sizes"), &bk)
                     .await
-                    .unwrap_or(());
+                    .unwrap_or_else(|e| {
+                        log::debug!("non-fatal cleanup op failed: {:?}", e);
+                    });
                 let _ = self.backend_router.free_block(&bk).await;
             }
         }
@@ -917,7 +919,9 @@ impl DataRouter {
                     .decrement_staged_block_refcount(&old_id, &mut con)
                     .await;
                 let mapping_key = format!("mapping:{}", old_id);
-                let _: () = con.del(&mapping_key).await.unwrap_or(());
+                let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
+                    log::debug!("non-fatal cleanup op failed: {:?}", e);
+                });
             }
 
             // Now that layout is transitioned to "striped", perform the write block-by-block
@@ -976,7 +980,9 @@ impl DataRouter {
                     .decrement_staged_block_refcount(&old_id, &mut con)
                     .await;
                 let mapping_key = format!("mapping:{}", old_id);
-                let _: () = con.del(&mapping_key).await.unwrap_or(());
+                let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
+                    log::debug!("non-fatal cleanup op failed: {:?}", e);
+                });
             }
 
             self.cache.write_lru.put(file_path, shared_data.clone());
@@ -1030,7 +1036,9 @@ impl DataRouter {
                             .decrement_staged_block_refcount(&old_id, &mut con)
                             .await;
                         let mapping_key = format!("mapping:{}", old_id);
-                        let _: () = con.del(&mapping_key).await.unwrap_or(());
+                        let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
+                            log::debug!("non-fatal cleanup op failed: {:?}", e);
+                        });
                     }
                 }
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
@@ -1096,7 +1104,9 @@ impl DataRouter {
                             .decrement_staged_block_refcount(&old_id, &mut con)
                             .await;
                         let old_mapping_key = format!("mapping:{}", old_id);
-                        let _: () = con.del(&old_mapping_key).await.unwrap_or(());
+                        let _: () = con.del(&old_mapping_key).await.unwrap_or_else(|e| {
+                            log::debug!("non-fatal cleanup op failed: {:?}", e);
+                        });
                     }
                 }
                 Err(e) => return Err(e),
@@ -1243,11 +1253,15 @@ impl DataRouter {
                         let _: () = con
                             .hdel(crate::fs_key!("block_sizes"), &bk)
                             .await
-                            .unwrap_or(());
+                            .unwrap_or_else(|e| {
+                                log::debug!("non-fatal cleanup op failed: {:?}", e);
+                            });
                         let _ = self.backend_router.free_block(&bk).await;
                     }
                 }
-                let _: () = con.del(&mapping_key).await.unwrap_or(());
+                let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
+                    log::debug!("non-fatal cleanup op failed: {:?}", e);
+                });
             }
 
             self.cache.write_lru.remove(file_path);
@@ -1540,7 +1554,9 @@ impl DataRouter {
                 let _: () = con
                     .hdel(crate::fs_key!("block_sizes"), &bk)
                     .await
-                    .unwrap_or(());
+                    .unwrap_or_else(|e| {
+                        log::debug!("non-fatal cleanup op failed: {:?}", e);
+                    });
                 let _ = self.backend_router.free_block(&bk).await;
             }
         }
@@ -2666,7 +2682,9 @@ impl DataRouter {
                             let _: () = con
                                 .hdel(crate::fs_key!("block_sizes"), &bk)
                                 .await
-                                .unwrap_or(());
+                                .unwrap_or_else(|e| {
+                                    log::debug!("non-fatal cleanup op failed: {:?}", e);
+                                });
                             let _ = self.backend_router.free_block(&bk).await;
                         }
                     }
@@ -2686,7 +2704,9 @@ impl DataRouter {
             .hdel(&meta_key, "block_prefix")
             .hdel(&meta_key, "num_blocks")
             .hdel(&meta_key, "file_id");
-        let _: () = pipe.query_async(con).await.unwrap_or(());
+        let _: () = pipe.query_async(con).await.unwrap_or_else(|e| {
+            log::debug!("non-fatal cleanup op failed: {:?}", e);
+        });
 
         // Remove any local active write blocks for this inode from the staging segment cache
         let active_block_prefix = format!("active_block:{}:", file_path);

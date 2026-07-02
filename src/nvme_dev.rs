@@ -81,8 +81,9 @@ enum UringResponse {
 }
 
 struct UringWorker {
-    tx: crossbeam::channel::Sender<UringRequest>,
-    _thread: std::thread::JoinHandle<()>,
+    /// Dropped first in `Drop` so the worker observes disconnect and drains.
+    tx: Option<crossbeam::channel::Sender<UringRequest>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl UringWorker {
@@ -92,8 +93,28 @@ impl UringWorker {
             worker_thread_loop(device_path, rx);
         });
         Self {
-            tx,
-            _thread: thread,
+            tx: Some(tx),
+            thread: Some(thread),
+        }
+    }
+
+    fn sender(&self) -> &crossbeam::channel::Sender<UringRequest> {
+        self.tx
+            .as_ref()
+            .expect("UringWorker sender used after drop")
+    }
+}
+
+impl Drop for UringWorker {
+    fn drop(&mut self) {
+        // Close the channel first so the worker stops accepting work and exits
+        // its loop, then join so exit cleanup (free unaligned bufs) runs before
+        // we return (P0-1).
+        drop(self.tx.take());
+        if let Some(handle) = self.thread.take() {
+            if let Err(e) = handle.join() {
+                log::error!("NvmeBlockDev uring worker thread panicked: {:?}", e);
+            }
         }
     }
 }
@@ -317,6 +338,56 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
             break;
         }
     }
+
+    // P0-1: Worker exit cleanup — free any unaligned write buffers still held
+    // in-flight or left on the channel, and fail pending oneshots so callers
+    // do not hang after NvmeBlockDev drop.
+    while let Ok(req) = rx.try_recv() {
+        match req {
+            UringRequest::Write { data, tx, .. } => {
+                if let WriteData::Unaligned { ptr, .. } = data {
+                    if !ptr.0.is_null() {
+                        unsafe {
+                            libc::free(ptr.0 as *mut libc::c_void);
+                        }
+                    }
+                }
+                let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
+                    "NvmeBlockDev worker shutting down".to_string(),
+                )));
+            }
+            UringRequest::Read { tx, .. } => {
+                let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
+                    "NvmeBlockDev worker shutting down".to_string(),
+                )));
+            }
+        }
+    }
+
+    for slot in active.iter_mut() {
+        if let Some(act) = slot.take() {
+            let free_ptr = act.free_ptr;
+            match act.response {
+                UringResponse::Read { tx, .. } => {
+                    let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
+                        "NvmeBlockDev worker shutting down".to_string(),
+                    )));
+                }
+                UringResponse::Write { tx } => {
+                    let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
+                        "NvmeBlockDev worker shutting down".to_string(),
+                    )));
+                }
+            }
+            if let Some(p) = free_ptr {
+                if !p.0.is_null() {
+                    unsafe {
+                        libc::free(p.0 as *mut libc::c_void);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -366,7 +437,7 @@ impl NvmeBlockDev {
             };
             let (tx, rx) = oneshot::channel();
             self.worker
-                .tx
+                .sender()
                 .send(UringRequest::Write {
                     offset,
                     data: data_type,
@@ -405,7 +476,7 @@ impl NvmeBlockDev {
             let (tx, rx) = oneshot::channel();
             if self
                 .worker
-                .tx
+                .sender()
                 .send(UringRequest::Write {
                     offset,
                     data: data_type,
@@ -464,7 +535,7 @@ impl NvmeBlockDev {
 
         let (tx, rx_oneshot) = oneshot::channel();
         self.worker
-            .tx
+            .sender()
             .send(UringRequest::Read {
                 offset,
                 buf_ptr: SendPtr(buf_ptr),

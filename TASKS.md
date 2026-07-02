@@ -47,10 +47,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/nvme_dev.rs` worker loop |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `src/nvme_dev.rs` (`UringWorker` Drop + `worker_thread_loop` exit drain) |
 | **Why** | On disconnect/shutdown, `ActiveReq.free_ptr` can still leak (drain was dropped during the leak fix for compile/Drop reasons). |
 | **Acceptance** | Drain or RAII on worker exit; no leak under kill-during-write stress; existing nvme tests + new shutdown stress still pass. |
+| **Notes** | `UringWorker::Drop` closes the channel then **joins** the thread (was detaching via JoinHandle drop). On loop exit: drain residual channel requests (free unaligned ptrs, fail oneshots) and free any remaining in-flight `free_ptr`s. Tests: drop during concurrent unaligned writes; drop after unaligned burst. |
 
 ### P0-2 — Transactional / atomic layout transitions
 
@@ -436,3 +437,4 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 | 2026-07-02 | **P0-5 done**: `tests/routing_layout_tests.rs` + fix stale full-file LRU on oversized put / layout transition. |
 | 2026-07-02 | **P0-2 done**: durable await + rollback before meta flip; P0-2 failure/retry tests; `FAIL_NEXT_WRITES` inject. |
 | 2026-07-02 | **P0-3 done**: fsync propagates flush errors; writeback retry + sticky hard failures; writeback_durability_tests. |
+| 2026-07-02 | **P0-1 done**: uring worker join-on-drop + exit drain of unaligned free_ptrs; shutdown stress tests. |

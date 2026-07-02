@@ -253,12 +253,23 @@ impl std::fmt::Debug for PosixLock {
     }
 }
 
+/// Max automatic retries for a single background writeback unit (P0-3).
+const WRITEBACK_MAX_ATTEMPTS: u32 = 4;
+
 #[derive(Debug, Clone)]
 pub struct WritebackRequest {
     pub ino: u64,
     pub block_idx: u32,
     pub fencing_token: u64,
+    /// 0-based attempt count; re-queued failures increment this.
+    pub attempts: u32,
 }
+
+/// Inodes with exhausted writeback retries (or last hard failure) until a
+/// successful flush clears them. fsync consults this for durable error reporting.
+pub static WRITEBACK_HARD_FAILURES: once_cell::sync::Lazy<
+    dashmap::DashMap<u64, String, ahash::RandomState>,
+> = once_cell::sync::Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
 pub struct SqueezefsFilesystem {
     pub router: DataRouter,
@@ -829,6 +840,7 @@ impl SqueezefsFilesystem {
                             ino,
                             block_idx: b,
                             fencing_token,
+                            attempts: 0,
                         };
                         let _ = self.writeback_tx.send(req);
                     }
@@ -1035,6 +1047,7 @@ impl SqueezefsFilesystem {
                         ino,
                         block_idx: b as u32,
                         fencing_token,
+                        attempts: 0,
                     };
                     let _ = self.writeback_tx.send(req);
                 } else {
@@ -1090,7 +1103,22 @@ impl SqueezefsFilesystem {
             .await?;
         }
 
+        // Successful synchronous flush clears hard-failure sticky state for this inode.
+        WRITEBACK_HARD_FAILURES.remove(&ino);
         Ok(())
+    }
+
+    /// Public flush of staged active blocks for an inode to the block backend (P0-3 / tests).
+    /// Propagates I/O errors so callers (fsync, tests) can fail the durable op.
+    pub async fn flush_inode_to_backend(
+        &self,
+        ino: u64,
+        fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        self.flush_memory_buffers_for_inode(ino, fencing_token)
+            .await?;
+        self.flush_active_blocks_with_retry(ino, fencing_token)
+            .await
     }
 
     pub async fn flush_all_memory_buffers_to_staging(&self) -> Result<(), SqueezefsError> {
@@ -1135,6 +1163,7 @@ impl SqueezefsFilesystem {
                                 ino,
                                 block_idx: b,
                                 fencing_token,
+                                attempts: 0,
                             };
                             let _ = self.writeback_tx.send(req);
                         }
@@ -1556,9 +1585,11 @@ impl Filesystem for SqueezefsFilesystem {
             let dlm = self.dlm.clone();
             let active_inode_locks = self.active_inode_locks.clone();
             let max_uploads = self.max_background_uploads;
+            let requeue_tx = self.writeback_tx.clone();
             tokio::spawn(async move {
                 run_constant_writeback_worker(
                     writeback_rx,
+                    requeue_tx,
                     router,
                     dlm,
                     active_inode_locks,
@@ -4447,14 +4478,12 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(());
         }
 
-        // 1. Acquire local inode lock
-        // 1. Get or acquire lease (fencing token)
         let fencing_token = self
             .get_or_acquire_lease(ino)
             .await
             .map_err(map_squeezefs_err)?;
 
-        // 2. Flush the staging blocks concurrently to NVMe-oF backend volume
+        // Best-effort push memory → staging; durable errors reported on fsync.
         let _ = self
             .flush_memory_buffers_for_inode(ino, fencing_token)
             .await;
@@ -4462,10 +4491,12 @@ impl Filesystem for SqueezefsFilesystem {
             .flush_active_blocks_with_retry(ino, fencing_token)
             .await
         {
-            warn!(
-                "FUSE Flush failed for ino {}, but masking error for editor compatibility: {:?}",
+            // Soft for close-path flush (editor compatibility), but sticky for fsync.
+            error!(
+                "FUSE Flush: backend flush failed for ino {} (will surface on fsync): {:?}",
                 ino, e
             );
+            WRITEBACK_HARD_FAILURES.insert(ino, format!("{e:?}"));
         }
 
         Ok(())
@@ -4537,24 +4568,29 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Fsync: ino = {}, datasync = {}", ino, _datasync);
 
-        // 1. Get or acquire lease (fencing token)
+        if ino == STATS_INODE || ino == CONFIG_INODE {
+            return Ok(());
+        }
+
+        // P0-3: durable ops must not mask backend write failures.
         let fencing_token = self
             .get_or_acquire_lease(ino)
             .await
             .map_err(map_squeezefs_err)?;
 
-        // 2. Flush the staging blocks concurrently to NVMe-oF backend volume
-        let _ = self
-            .flush_memory_buffers_for_inode(ino, fencing_token)
-            .await;
-        if let Err(e) = self
-            .flush_active_blocks_with_retry(ino, fencing_token)
-            .await
-        {
-            warn!(
-                "FUSE Fsync failed for ino {}, but masking error for editor compatibility: {:?}",
-                ino, e
+        if let Err(e) = self.flush_inode_to_backend(ino, fencing_token).await {
+            error!("FUSE Fsync failed for ino {}: {:?}", ino, e);
+            WRITEBACK_HARD_FAILURES.insert(ino, format!("{e:?}"));
+            return Err(map_squeezefs_err(e));
+        }
+
+        if let Some(err_msg) = WRITEBACK_HARD_FAILURES.get(&ino) {
+            error!(
+                "FUSE Fsync: prior writeback hard failure for ino {}: {}",
+                ino,
+                err_msg.value()
             );
+            return Err(Errno::from(libc::EIO));
         }
 
         Ok(())
@@ -6294,6 +6330,7 @@ pub async fn get_volume_status(redis_url: &str) -> Result<serde_json::Value, Squ
 
 async fn run_constant_writeback_worker(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<WritebackRequest>,
+    requeue_tx: tokio::sync::mpsc::UnboundedSender<WritebackRequest>,
     router: DataRouter,
     dlm: DlmClient,
     active_inode_locks: std::sync::Arc<StripeLocks<tokio::sync::RwLock<()>, 4096>>,
@@ -6303,14 +6340,16 @@ async fn run_constant_writeback_worker(
 
     while let Some(req) = rx.recv().await {
         log::info!(
-            "Constant Writeback: Received writeback request for ino {}, block {}",
+            "Constant Writeback: Received writeback request for ino {}, block {} (attempt {})",
             req.ino,
-            req.block_idx
+            req.block_idx,
+            req.attempts
         );
         let router_clone = router.clone();
         let dlm_clone = dlm.clone();
         let locks_clone = active_inode_locks.clone();
         let sem_clone = upload_semaphore.clone();
+        let requeue_tx = requeue_tx.clone();
 
         tokio::spawn(async move {
             let _permit = match sem_clone.acquire().await {
@@ -6327,6 +6366,7 @@ async fn run_constant_writeback_worker(
                 Ok(c) => c,
                 Err(e) => {
                     log::error!("Constant Writeback: Failed to get connection: {:?}", e);
+                    requeue_or_hard_fail(&requeue_tx, req, format!("conn: {e:?}")).await;
                     return;
                 }
             };
@@ -6345,6 +6385,7 @@ async fn run_constant_writeback_worker(
                             meta_key,
                             e
                         );
+                        requeue_or_hard_fail(&requeue_tx, req, format!("meta: {e:?}")).await;
                         return;
                     }
                 };
@@ -6368,11 +6409,12 @@ async fn run_constant_writeback_worker(
                             req.block_idx,
                             e
                         );
+                        requeue_or_hard_fail(&requeue_tx, req, format!("hget: {e:?}")).await;
                         return;
                     }
                 };
 
-            if let Err(e) = flush_single_active_block(
+            match flush_single_active_block(
                 req.ino,
                 req.block_idx,
                 req.fencing_token,
@@ -6386,14 +6428,42 @@ async fn run_constant_writeback_worker(
             )
             .await
             {
-                log::error!(
-                    "Constant Writeback: Failed to flush block {} of inode {}: {:?}",
-                    req.block_idx,
-                    req.ino,
-                    e
-                );
+                Ok(()) => {
+                    WRITEBACK_HARD_FAILURES.remove(&req.ino);
+                }
+                Err(e) => {
+                    log::error!(
+                        "Constant Writeback: Failed to flush block {} of inode {} (attempt {}): {:?}",
+                        req.block_idx,
+                        req.ino,
+                        req.attempts,
+                        e
+                    );
+                    requeue_or_hard_fail(&requeue_tx, req, format!("{e:?}")).await;
+                }
             }
         });
+    }
+}
+
+async fn requeue_or_hard_fail(
+    requeue_tx: &tokio::sync::mpsc::UnboundedSender<WritebackRequest>,
+    mut req: WritebackRequest,
+    err_msg: String,
+) {
+    if req.attempts + 1 < WRITEBACK_MAX_ATTEMPTS {
+        req.attempts += 1;
+        let backoff_ms = 50u64.saturating_mul(1u64 << req.attempts.min(6));
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        if requeue_tx.send(req).is_err() {
+            log::error!("Constant Writeback: requeue channel closed; marking hard failure");
+        }
+    } else {
+        error!(
+            "Constant Writeback: exhausted retries for ino {} block {}; sticky hard failure: {}",
+            req.ino, req.block_idx, err_msg
+        );
+        WRITEBACK_HARD_FAILURES.insert(req.ino, err_msg);
     }
 }
 

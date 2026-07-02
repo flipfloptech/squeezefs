@@ -1048,35 +1048,41 @@ impl DlmClient {
         // Generate a monotonic fencing token key
         let fencing_gen_key = format!("fencing_generator:{}", file_path);
 
-        // Perform atomic lock acquire + fencing token increment via pipeline
-        let mut pipe = redis::pipe();
-        pipe.cmd("SET")
+        // P0-6: Only INCR the fencing generator after a successful SET NX.
+        // (Garnet often has Lua disabled; a non-conditional pipeline would burn
+        // tokens on every failed acquire.)
+        let acquired: Option<String> = redis::cmd("SET")
             .arg(&lock_key)
             .arg(&self.client_id)
             .arg("NX")
             .arg("PX")
-            .arg(ttl_ms);
-        pipe.cmd("INCR").arg(&fencing_gen_key);
-
-        let (acquired, fencing_token): (Option<String>, u64) =
-            pipe.query_async(&mut con).await.map_err(|e| {
-                println!("REDIS ERROR (Pipeline): {:?}", e);
+            .arg(ttl_ms)
+            .query_async(&mut con)
+            .await
+            .map_err(|e| {
+                println!("REDIS ERROR (SET NX): {:?}", e);
                 e
             })?;
 
-        let fencing_token = if acquired.is_some() {
-            Some(fencing_token)
-        } else {
-            None
-        };
+        if acquired.is_none() {
+            return Err(err_lock_failed(format!(
+                "Lock is already held on {}",
+                lock_key
+            )));
+        }
 
-        let fencing_token = match fencing_token {
-            Some(token) => token,
-            None => {
-                return Err(err_lock_failed(format!(
-                    "Lock is already held on {}",
-                    lock_key
-                )));
+        let fencing_token: u64 = match redis::cmd("INCR")
+            .arg(&fencing_gen_key)
+            .query_async(&mut con)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // Best-effort unlock so we do not leave a held lock without a token.
+                let _: std::result::Result<(), redis::RedisError> =
+                    redis::cmd("DEL").arg(&lock_key).query_async(&mut con).await;
+                println!("REDIS ERROR (INCR fence): {:?}", e);
+                return Err(e.into());
             }
         };
 

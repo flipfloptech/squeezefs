@@ -97,10 +97,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | Write paths that use non-atomic Redis pipelines |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `src/routing.rs` (`atomic_meta_pipe`, commit/striped/inline/staged paths); `src/dlm.rs` lock acquire; tests `atomic_meta_tests.rs` |
 | **Why** | Pipelines are not full transactions; partial apply under failure/timeout. |
 | **Acceptance** | Critical meta updates atomic; tests simulate mid-pipeline failure if feasible. |
+| **Notes** | Critical layout commits use MULTI/EXEC via `atomic_meta_pipe()`. `commit_striped_layout_meta` and `write_striped` map+size+fence are one transaction. Lock acquire is SET NX then INCR only on success (no token burn on fail; Garnet often has Lua disabled). Tests assert co-existence of related meta keys after writes. |
 
 ---
 
@@ -440,3 +441,4 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 | 2026-07-02 | **P0-3 done**: fsync propagates flush errors; writeback retry + sticky hard failures; writeback_durability_tests. |
 | 2026-07-02 | **P0-1 done**: uring worker join-on-drop + exit drain of unaligned free_ptrs; shutdown stress tests. |
 | 2026-07-02 | **P0-4 done**: lease re-validation, recovery binary meta fix, crash_consistency_tests. |
+| 2026-07-02 | **P0-6 done**: MULTI/EXEC meta commits; lock SET-then-INCR; atomic_meta_tests. |

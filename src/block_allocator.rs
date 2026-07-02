@@ -11,6 +11,7 @@ struct Reservoir {
     local: ArrayQueue<u64>,
     next_inline: AtomicU64,
     inline_end: AtomicU64,
+    refill_lock: tokio::sync::Mutex<()>,
 }
 
 pub struct BlockAllocator {
@@ -38,6 +39,7 @@ impl BlockAllocator {
                 local: ArrayQueue::new(LOCAL_BATCH as usize),
                 next_inline: AtomicU64::new(0),
                 inline_end: AtomicU64::new(0),
+                refill_lock: tokio::sync::Mutex::new(()),
             }));
         }
 
@@ -74,6 +76,15 @@ impl BlockAllocator {
             }
 
             // 3. Slow path: refill reservoirs.
+            let _refill_guard = rs.refill_lock.lock().await;
+
+            // Double check after acquiring lock - another thread may have refilled.
+            let cur = rs.next_inline.load(Ordering::Relaxed);
+            let end = rs.inline_end.load(Ordering::Acquire);
+            if cur < end {
+                continue;
+            }
+
             let mut conn = self.client.get_connection().await?;
             let (spopped, incrbed): (Vec<u64>, u64) = redis::pipe()
                 .atomic()

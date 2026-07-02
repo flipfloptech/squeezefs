@@ -1,12 +1,10 @@
-use crate::cache::{PooledBuf, TieredCache, BUFFER_POOL};
+use crate::cache::{TieredCache, BUFFER_POOL};
 use crate::dlm::DlmClient;
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
 use log::debug;
 use redis::AsyncCommands;
 use std::sync::atomic::Ordering;
-static STRIPE_WRITE_SEMAPHORE: once_cell::sync::Lazy<std::sync::Arc<tokio::sync::Semaphore>> =
-    once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(32)));
 
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -49,6 +47,30 @@ pub struct BackendRouter {
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[cold]
+#[inline(never)]
+fn err_invalid_offset() -> crate::error::SqueezefsError {
+    crate::error::SqueezefsError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "Invalid block offset",
+    ))
+}
+
+#[cold]
+#[inline(never)]
+fn err_backend_not_found(be_id: &str) -> crate::error::SqueezefsError {
+    crate::error::SqueezefsError::InvalidOperation(format!("Storage backend '{}' not found", be_id))
+}
+
+#[cold]
+#[inline(never)]
+fn err_active_backend_not_found(be_id: &str) -> crate::error::SqueezefsError {
+    crate::error::SqueezefsError::InvalidOperation(format!(
+        "Active write backend '{}' not found",
+        be_id
+    ))
+}
+
 impl BackendRouter {
     pub fn new(
         default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
@@ -87,10 +109,7 @@ impl BackendRouter {
                 be.device.clone(),
             ))
         } else {
-            Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                "Active write backend '{}' not found",
-                active_be_id
-            )))
+            Err(err_active_backend_not_found(&active_be_id))
         }
     }
 
@@ -106,10 +125,7 @@ impl BackendRouter {
         } else if let Some(be) = self.backends.get(be_id) {
             Ok((be.block_allocator.clone(), be.device.clone()))
         } else {
-            Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                "Backend '{}' not found",
-                be_id
-            )))
+            Err(err_backend_not_found(be_id))
         }
     }
 
@@ -121,22 +137,16 @@ impl BackendRouter {
             ("backend_0", block_key)
         };
 
-        let offset = offset_str.parse::<u64>().map_err(|_| {
-            crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid block offset",
-            ))
-        })?;
+        let offset = offset_str
+            .parse::<u64>()
+            .map_err(|_| err_invalid_offset())?;
 
         if be_id == "backend_0" {
             self.default_device.read_block(offset, size).await
         } else if let Some(be) = self.backends.get(be_id) {
             be.device.read_block(offset, size).await
         } else {
-            Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                "Storage backend '{}' not found",
-                be_id
-            )))
+            Err(err_backend_not_found(be_id))
         }
     }
 
@@ -148,12 +158,9 @@ impl BackendRouter {
             ("backend_0", block_key)
         };
 
-        let offset = offset_str.parse::<u64>().map_err(|_| {
-            crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid block offset",
-            ))
-        })?;
+        let offset = offset_str
+            .parse::<u64>()
+            .map_err(|_| err_invalid_offset())?;
 
         if be_id == "backend_0" {
             let _ = self.default_allocator.free_block(offset).await;
@@ -192,8 +199,7 @@ impl BackendRouter {
     }
 }
 
-#[derive(Clone)]
-pub struct DataRouter {
+pub struct DataRouterInner {
     pub dlm: DlmClient,
     pub cache: TieredCache,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
@@ -202,12 +208,25 @@ pub struct DataRouter {
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
     pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
-    inflight_block_reads:
+    pub(crate) inflight_block_reads:
         std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<()>>>,
-    sequential_read_state: moka::sync::Cache<String, (u32, std::time::Instant)>,
+    pub(crate) sequential_read_state: moka::sync::Cache<String, (u32, std::time::Instant)>,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
     pub prefetcher: std::sync::Arc<IoUringPrefetcher>,
+    pub stripe_write_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+pub struct DataRouter {
+    inner: std::sync::Arc<DataRouterInner>,
+}
+
+impl std::ops::Deref for DataRouter {
+    type Target = DataRouterInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 struct InflightBlockReadGuard {
@@ -246,28 +265,38 @@ impl DataRouter {
         let metadata_capacity = std::cmp::max(10_000, total_memory / 200_000);
         let block_map_capacity = std::cmp::max(50_000, total_memory / 50_000);
 
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(16);
+        let stripe_permits = cores * 4;
+        let stripe_write_semaphore =
+            std::sync::Arc::new(tokio::sync::Semaphore::new(stripe_permits));
+
         Self {
-            dlm,
-            cache,
-            block_allocator,
-            nvme_writer,
-            backend_router,
-            block_size,
-            metadata_cache: moka::sync::Cache::builder()
-                .max_capacity(metadata_capacity)
-                .time_to_live(std::time::Duration::from_secs(300))
-                .build(),
-            block_map_cache: moka::sync::Cache::builder()
-                .max_capacity(block_map_capacity)
-                .time_to_live(std::time::Duration::from_secs(300))
-                .build(),
-            inflight_block_reads: std::sync::Arc::new(scc::HashIndex::new()),
-            sequential_read_state: moka::sync::Cache::builder()
-                .max_capacity(100000)
-                .time_to_live(std::time::Duration::from_secs(5))
-                .build(),
-            crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
-            prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
+            inner: std::sync::Arc::new(DataRouterInner {
+                dlm,
+                cache,
+                block_allocator,
+                nvme_writer,
+                backend_router,
+                block_size,
+                metadata_cache: moka::sync::Cache::builder()
+                    .max_capacity(metadata_capacity)
+                    .time_to_live(std::time::Duration::from_secs(300))
+                    .build(),
+                block_map_cache: moka::sync::Cache::builder()
+                    .max_capacity(block_map_capacity)
+                    .time_to_live(std::time::Duration::from_secs(300))
+                    .build(),
+                inflight_block_reads: std::sync::Arc::new(scc::HashIndex::new()),
+                sequential_read_state: moka::sync::Cache::builder()
+                    .max_capacity(100000)
+                    .time_to_live(std::time::Duration::from_secs(5))
+                    .build(),
+                crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
+                prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
+                stripe_write_semaphore,
+            }),
         }
     }
 
@@ -297,7 +326,7 @@ impl DataRouter {
             .store(block_size, std::sync::atomic::Ordering::Relaxed);
     }
 
-    async fn fetch_block_from_remote(&self, block_key: &str) -> Result<PooledBuf> {
+    async fn fetch_block_from_remote(&self, block_key: &str) -> Result<bytes::Bytes> {
         let raw = if let Some(dht) = self.cache.nvme.dht_node.get() {
             let client = crate::p2p::P2pClient::new();
             if let Ok(data) = client.download_block_from_peer(dht, block_key).await {
@@ -310,10 +339,10 @@ impl DataRouter {
         };
 
         let decompressed = self.get_crypto().process_read(&raw)?;
-        let mut pooled = BUFFER_POOL.alloc();
-        pooled.resize(decompressed.len(), 0);
-        pooled.copy_from_slice(&decompressed);
-        Ok(pooled)
+        match decompressed {
+            std::borrow::Cow::Borrowed(slice) => Ok(bytes::Bytes::copy_from_slice(slice)),
+            std::borrow::Cow::Owned(vec) => Ok(bytes::Bytes::from(vec)),
+        }
     }
 
     pub async fn get_cached_or_fetch_block(
@@ -368,13 +397,20 @@ impl DataRouter {
                     };
 
                     let downloaded = self.fetch_block_from_remote(block_key).await?;
-                    let downloaded_bytes = bytes::Bytes::from(downloaded.into_inner());
-                    let nvme_clone = self.cache.nvme.clone();
-                    let bk_clone = block_key.to_string();
-                    let dl_clone = downloaded_bytes.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
-                    });
+                    let downloaded_bytes = downloaded;
+                    if downloaded_bytes.len() < 64 * 1024 {
+                        let _ = self
+                            .cache
+                            .nvme
+                            .cache_read_block(block_key, downloaded_bytes.clone());
+                    } else {
+                        let nvme_clone = self.cache.nvme.clone();
+                        let bk_clone = block_key.to_string();
+                        let dl_clone = downloaded_bytes.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
+                        });
+                    }
                     self.cache.read_lru.put(block_key, downloaded_bytes.clone());
                     return Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes));
                 }
@@ -674,7 +710,7 @@ impl DataRouter {
         &self,
         file_path: &str,
         offset: u64,
-        data: &[u8],
+        data: bytes::Bytes,
         fencing_token: u64,
     ) -> Result<()> {
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
@@ -699,15 +735,8 @@ impl DataRouter {
 
         // 1. If file is already striped, perform RMW block-by-block without loading the whole file
         if file_type.as_deref() == Some("striped") {
-            self.write_striped(
-                file_path,
-                &meta_key,
-                offset,
-                bytes::Bytes::copy_from_slice(data),
-                fencing_token,
-                &mut con,
-            )
-            .await?;
+            self.write_striped(file_path, &meta_key, offset, data, fencing_token, &mut con)
+                .await?;
             return Ok(());
         }
 
@@ -729,9 +758,17 @@ impl DataRouter {
                         staged_data
                     } else {
                         let mapping_key = format!("mapping:{}", file_id);
-                        let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
-                        let off_val: Option<u64> = con.hget(&mapping_key, "offset").await?;
-                        let sz_val: Option<u64> = con.hget(&mapping_key, "size").await?;
+                        let (block_key, off_val, sz_val): (
+                            Option<String>,
+                            Option<u64>,
+                            Option<u64>,
+                        ) = redis::cmd("HMGET")
+                            .arg(&mapping_key)
+                            .arg("block")
+                            .arg("offset")
+                            .arg("size")
+                            .query_async(&mut con)
+                            .await?;
 
                         if let (Some(bk), Some(off), Some(sz)) = (block_key, off_val, sz_val) {
                             let offset_u64 = bk.parse::<u64>().map_err(|_| {
@@ -760,7 +797,7 @@ impl DataRouter {
         let end_offset = (offset as usize) + data.len();
 
         let stripe_threshold = if self.cache.nvme.staging_dirs().is_empty() {
-            64 * 1024
+            4 * 1024
         } else {
             4 * 1024 * 1024
         };
@@ -778,7 +815,11 @@ impl DataRouter {
             let existing_size = existing_bytes.len();
             while offset_cursor < existing_size {
                 let end = std::cmp::min(offset_cursor + block_size, existing_size);
-                let chunk = existing_bytes.slice(offset_cursor..end);
+                // SAFETY: offset_cursor < existing_size, and end is clamped to existing_size
+                let chunk = unsafe {
+                    let sub = existing_bytes.get_unchecked(offset_cursor..end);
+                    existing_bytes.slice_ref(sub)
+                };
                 let (be_id, block_allocator, nvme_writer) =
                     match self.backend_router.get_active_backend() {
                         Ok(res) => res,
@@ -884,7 +925,7 @@ impl DataRouter {
                 file_path,
                 &meta_key,
                 offset,
-                bytes::Bytes::copy_from_slice(data),
+                data.clone(),
                 fencing_token,
                 &mut con,
             )
@@ -895,11 +936,11 @@ impl DataRouter {
         if existing_data.len() < end_offset {
             existing_data.resize(end_offset, 0);
         }
-        existing_data[offset as usize..end_offset].copy_from_slice(data);
+        existing_data[offset as usize..end_offset].copy_from_slice(&data);
         let new_size = existing_data.len();
 
         // 4. Save back with appropriate layout routing
-        if new_size < 64 * 1024 {
+        if new_size < 4 * 1024 {
             // Layout: inline
             let inline_key = format!("inline_data:{}", file_path);
             let shared_data = bytes::Bytes::from(existing_data);
@@ -1076,7 +1117,11 @@ impl DataRouter {
             let new_size = existing_bytes.len();
             while offset_cursor < new_size {
                 let end = std::cmp::min(offset_cursor + block_size, new_size);
-                let chunk = existing_bytes.slice(offset_cursor..end);
+                // SAFETY: offset_cursor < new_size, and end is clamped to new_size
+                let chunk = unsafe {
+                    let sub = existing_bytes.get_unchecked(offset_cursor..end);
+                    existing_bytes.slice_ref(sub)
+                };
                 let (be_id, block_allocator, nvme_writer) =
                     match self.backend_router.get_active_backend() {
                         Ok(res) => res,
@@ -1102,7 +1147,8 @@ impl DataRouter {
 
                 let read_lru = self.cache.read_lru.clone();
                 let chunk_clone = chunk.clone();
-                let permit = STRIPE_WRITE_SEMAPHORE
+                let permit = self
+                    .stripe_write_semaphore
                     .clone()
                     .acquire_owned()
                     .await
@@ -1222,7 +1268,18 @@ impl DataRouter {
         fencing_token: u64,
         con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
-        let block_map_id_opt: Option<String> = con.hget(meta_key, "block_map_id").await?;
+        let (block_map_id_opt, num_blocks_opt, size_opt): (
+            Option<String>,
+            Option<u32>,
+            Option<u64>,
+        ) = redis::cmd("HMGET")
+            .arg(meta_key)
+            .arg("block_map_id")
+            .arg("num_blocks")
+            .arg("size")
+            .query_async(con)
+            .await?;
+
         let block_map_id = match block_map_id_opt {
             Some(id) => id,
             None => {
@@ -1232,7 +1289,6 @@ impl DataRouter {
                         "Missing block_map_id and block_prefix for striped file".to_string(),
                     )
                 })?;
-                let num_blocks_opt: Option<u32> = con.hget(meta_key, "num_blocks").await?;
                 let num_blocks = num_blocks_opt.unwrap_or(0);
 
                 let new_id = Uuid::new_v4().to_string();
@@ -1251,10 +1307,7 @@ impl DataRouter {
             }
         };
 
-        let num_blocks_opt: Option<u32> = con.hget(meta_key, "num_blocks").await?;
         let num_blocks = num_blocks_opt.unwrap_or(0);
-
-        let size_opt: Option<u64> = con.hget(meta_key, "size").await?;
         let existing_size = size_opt.unwrap_or(0);
 
         let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
@@ -1332,8 +1385,13 @@ impl DataRouter {
             let rel_start = (overlap_start - block_start_file_offset) as usize;
             let rel_end = (overlap_end - block_start_file_offset) as usize;
 
-            let data_slice =
-                data.slice((overlap_start - offset) as usize..(overlap_end - offset) as usize);
+            // SAFETY: (overlap_start - offset) and (overlap_end - offset) are in bounds by construction
+            let data_slice = unsafe {
+                let sub = data.get_unchecked(
+                    (overlap_start - offset) as usize..(overlap_end - offset) as usize,
+                );
+                data.slice_ref(sub)
+            };
 
             let router_clone = self.clone();
             let crypto = self.get_crypto().clone();
@@ -1390,7 +1448,12 @@ impl DataRouter {
                     block_data.resize(rel_end, 0);
                 }
 
-                block_data[rel_start..rel_end].copy_from_slice(&data_slice);
+                // SAFETY: We ensured block_data.len() >= rel_end on line 1419
+                unsafe {
+                    block_data
+                        .get_unchecked_mut(rel_start..rel_end)
+                        .copy_from_slice(&data_slice);
+                }
 
                 let (be_id, block_allocator, nvme_writer) =
                     router_clone.backend_router.get_active_backend()?;
@@ -1582,9 +1645,14 @@ impl DataRouter {
                         file_path, file_id
                     );
                     let mapping_key = format!("mapping:{}", file_id);
-                    let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
-                    let offset: Option<u64> = con.hget(&mapping_key, "offset").await?;
-                    let size: Option<u64> = con.hget(&mapping_key, "size").await?;
+                    let (block_key, offset, size): (Option<String>, Option<u64>, Option<u64>) =
+                        redis::cmd("HMGET")
+                            .arg(&mapping_key)
+                            .arg("block")
+                            .arg("offset")
+                            .arg("size")
+                            .query_async(&mut con)
+                            .await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, offset, size) {
                         let offset_u64 = bk.parse::<u64>().map_err(|_| {
@@ -1819,9 +1887,14 @@ impl DataRouter {
                         .dlm
                         .get_connection_for_inode(parse_inode_from_path(file_path))
                         .await?;
-                    let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
-                    let off_opt: Option<u64> = con.hget(&mapping_key, "offset").await?;
-                    let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
+                    let (block_key, off_opt, sz_opt): (Option<String>, Option<u64>, Option<u64>) =
+                        redis::cmd("HMGET")
+                            .arg(&mapping_key)
+                            .arg("block")
+                            .arg("offset")
+                            .arg("size")
+                            .query_async(&mut con)
+                            .await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
                         let offset_u64 = bk.parse::<u64>().map_err(|_| {
@@ -1985,7 +2058,11 @@ impl DataRouter {
             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
             let start = std::cmp::min(offset as usize, cached_data.len());
             let end = std::cmp::min((offset + size as u64) as usize, cached_data.len());
-            let data = cached_data.slice(start..end);
+            // SAFETY: start and end are clamped to cached_data.len()
+            let data = unsafe {
+                let sub = cached_data.get_unchecked(start..end);
+                cached_data.slice_ref(sub)
+            };
             return Ok((data, None));
         }
 
@@ -2018,12 +2095,7 @@ impl DataRouter {
                     let mut sliced_guard = guard;
                     sliced_guard.offset += start;
                     sliced_guard.len = end - start;
-                    let slice: &[u8] = &sliced_guard;
-                    let data = unsafe {
-                        bytes::Bytes::from_static(std::mem::transmute::<&[u8], &'static [u8]>(
-                            slice,
-                        ))
-                    };
+                    let data = bytes::Bytes::copy_from_slice(&sliced_guard);
                     Ok((data, Some(std::sync::Arc::new(sliced_guard))))
                 } else {
                     let mapping_key = format!("mapping:{}", file_id);
@@ -2031,9 +2103,14 @@ impl DataRouter {
                         .dlm
                         .get_connection_for_inode(parse_inode_from_path(file_path))
                         .await?;
-                    let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
-                    let off_opt: Option<u64> = con.hget(&mapping_key, "offset").await?;
-                    let sz_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
+                    let (block_key, off_opt, sz_opt): (Option<String>, Option<u64>, Option<u64>) =
+                        redis::cmd("HMGET")
+                            .arg(&mapping_key)
+                            .arg("block")
+                            .arg("offset")
+                            .arg("size")
+                            .query_async(&mut con)
+                            .await?;
 
                     if let (Some(bk), Some(off), Some(sz)) = (block_key, off_opt, sz_opt) {
                         let offset_u64 = bk.parse::<u64>().map_err(|_| {
@@ -2095,12 +2172,7 @@ impl DataRouter {
                         let mut sliced_guard = guard;
                         sliced_guard.offset += start;
                         sliced_guard.len = end - start;
-                        let slice: &[u8] = &sliced_guard;
-                        let data = unsafe {
-                            bytes::Bytes::from_static(std::mem::transmute::<&[u8], &'static [u8]>(
-                                slice,
-                            ))
-                        };
+                        let data = bytes::Bytes::copy_from_slice(&sliced_guard);
                         return Ok((data, Some(std::sync::Arc::new(sliced_guard))));
                     }
 
@@ -2118,15 +2190,7 @@ impl DataRouter {
                                 )
                             {
                                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                let slice: &[u8] = &guard;
-                                let data = unsafe {
-                                    bytes::Bytes::from_static(std::mem::transmute::<
-                                        &[u8],
-                                        &'static [u8],
-                                    >(
-                                        slice
-                                    ))
-                                };
+                                let data = bytes::Bytes::copy_from_slice(&guard);
                                 return Ok((data, Some(std::sync::Arc::new(guard))));
                             } else {
                                 // Single block cache miss: download directly in-line (zero-copy, no spawn)
@@ -2149,26 +2213,14 @@ impl DataRouter {
                                     );
                                 }
                                 let slice: &[u8] = &downloaded[start..end];
-                                let data = unsafe {
-                                    bytes::Bytes::from_static(std::mem::transmute::<
-                                        &[u8],
-                                        &'static [u8],
-                                    >(
-                                        slice
-                                    ))
-                                };
+                                let data = bytes::Bytes::copy_from_slice(slice);
                                 return Ok((data, Some(std::sync::Arc::new(downloaded))));
                             }
                         } else {
                             // Hole support: return zero-filled slice
                             let mut hole_pooled = BUFFER_POOL.alloc();
                             hole_pooled.resize(slice_len as usize, 0);
-                            let slice: &[u8] = &hole_pooled;
-                            let data = unsafe {
-                                bytes::Bytes::from_static(
-                                    std::mem::transmute::<&[u8], &'static [u8]>(slice),
-                                )
-                            };
+                            let data = bytes::Bytes::copy_from_slice(&hole_pooled);
                             return Ok((data, Some(std::sync::Arc::new(hole_pooled))));
                         }
                     }
@@ -2271,10 +2323,7 @@ impl DataRouter {
                     );
                 }
 
-                let slice: &[u8] = &final_buf[..final_len];
-                let data = unsafe {
-                    bytes::Bytes::from_static(std::mem::transmute::<&[u8], &'static [u8]>(slice))
-                };
+                let data = bytes::Bytes::copy_from_slice(&final_buf[..final_len]);
                 Ok((data, Some(std::sync::Arc::new(final_buf))))
             }
             _ => Err(SqueezefsError::InvalidOperation(format!(
@@ -2416,9 +2465,14 @@ impl DataRouter {
 
             let mapping_src_key = format!("mapping:{}", src_file_id);
             let mapping_dest_key = format!("mapping:{}", new_file_id);
-            let block: Option<String> = src_con.hget(&mapping_src_key, "block").await?;
-            let offset: Option<u64> = src_con.hget(&mapping_src_key, "offset").await?;
-            let sz: Option<u64> = src_con.hget(&mapping_src_key, "size").await?;
+            let (block, offset, sz): (Option<String>, Option<u64>, Option<u64>) =
+                redis::cmd("HMGET")
+                    .arg(&mapping_src_key)
+                    .arg("block")
+                    .arg("offset")
+                    .arg("size")
+                    .query_async(&mut src_con)
+                    .await?;
 
             if let (Some(ref bk), Some(off), Some(s)) = (&block, offset, sz) {
                 let mut map_pipe = redis::pipe();

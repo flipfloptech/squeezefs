@@ -3,7 +3,7 @@ pub mod lru;
 pub mod nvme;
 pub mod pool;
 pub use nvme::NvmeStaging;
-pub use pool::{PooledBuf, BUFFER_POOL};
+pub use pool::{AlignedBufPool, PooledBuf, ALIGNED_BUF_POOL, BUFFER_POOL};
 
 use crate::error::{Result, SqueezefsError};
 use std::path::PathBuf;
@@ -110,10 +110,14 @@ impl TieredCache {
                             let nvme_clone_inner = nvme_clone.clone();
                             let key_clone = key.clone();
                             let data_clone = data.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                nvme_clone_inner.cache_read_block(&key_clone, data_clone)
-                            })
-                            .await;
+                            if data_clone.len() < 64 * 1024 {
+                                let _ = nvme_clone_inner.cache_read_block(&key_clone, data_clone);
+                            } else {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    nvme_clone_inner.cache_read_block(&key_clone, data_clone)
+                                })
+                                .await;
+                            }
                         }
                     }
                 });

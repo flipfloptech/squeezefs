@@ -101,7 +101,7 @@ fn bench_squeezefs_concurrency(c: &mut Criterion) {
     let mut group = c.benchmark_group("squeezefs_concurrency");
 
     // 1. Concurrent writes: 16 tasks concurrently writing to different files
-    let write_data = vec![7u8; 128 * 1024]; // 128KB
+    let write_data = bytes::Bytes::from(vec![7u8; 128 * 1024]); // 128KB
     let write_counter = Arc::new(AtomicU64::new(0));
     group.throughput(Throughput::Bytes(128 * 1024 * 16));
     group.bench_function("concurrent_writes_16_tasks", |b| {
@@ -116,7 +116,10 @@ fn bench_squeezefs_concurrency(c: &mut Criterion) {
                     let router = router_ref.clone();
                     let data = data_ref.clone();
                     tokio::spawn(async move {
-                        router.write_file(&name, 0, &data, base + i).await.unwrap();
+                        router
+                            .write_file(&name, 0, data.clone(), base + i)
+                            .await
+                            .unwrap();
                         let mut con = router.dlm.get_connection().await.unwrap();
                         let _ = router.delete_file(&name, &mut con).await;
                     })
@@ -134,7 +137,12 @@ fn bench_squeezefs_concurrency(c: &mut Criterion) {
     let read_file_name = "routing_concurrent_read.bin".to_string();
     rt.block_on(async {
         router
-            .write_file(&read_file_name, 0, &vec![9u8; 128 * 1024], 9999)
+            .write_file(
+                &read_file_name,
+                0,
+                bytes::Bytes::from(vec![9u8; 128 * 1024]),
+                9999,
+            )
             .await
             .unwrap();
     });

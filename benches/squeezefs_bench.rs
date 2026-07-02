@@ -102,7 +102,7 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     let mut group = c.benchmark_group("squeezefs_routing");
 
     // Bench Micro-file routing path (< 64KB)
-    let micro_data = vec![8u8; 1024]; // 1KB
+    let micro_data = bytes::Bytes::from(vec![8u8; 1024]); // 1KB
     let micro_counter = Arc::new(AtomicU64::new(0));
     group.throughput(Throughput::Bytes(1024));
     group.bench_function("write_micro_file_1kb", |b| {
@@ -113,7 +113,10 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
             let c = counter.fetch_add(1, Ordering::Relaxed);
             let name = format!("bench_micro_{}.bin", c);
             async move {
-                router_ref.write_file(&name, 0, data_ref, 1).await.unwrap();
+                router_ref
+                    .write_file(&name, 0, data_ref.clone(), 1)
+                    .await
+                    .unwrap();
                 let mut con = router_ref.dlm.get_connection().await.unwrap();
                 let _ = router_ref.delete_file(&name, &mut con).await;
             }
@@ -121,7 +124,7 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     });
 
     // Bench Small-file routing path (64KB - 4MB)
-    let small_data = vec![8u8; 128 * 1024]; // 128KB
+    let small_data = bytes::Bytes::from(vec![8u8; 128 * 1024]); // 128KB
     let small_counter = Arc::new(AtomicU64::new(0));
     group.throughput(Throughput::Bytes(128 * 1024));
     group.bench_function("write_small_file_128kb", |b| {
@@ -132,7 +135,10 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
             let c = counter.fetch_add(1, Ordering::Relaxed);
             let name = format!("bench_small_{}.bin", c);
             async move {
-                router_ref.write_file(&name, 0, data_ref, 2).await.unwrap();
+                router_ref
+                    .write_file(&name, 0, data_ref.clone(), 2)
+                    .await
+                    .unwrap();
                 let mut con = router_ref.dlm.get_connection().await.unwrap();
                 let _ = router_ref.delete_file(&name, &mut con).await;
             }
@@ -140,7 +146,7 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     });
 
     // Bench Large-file routing path (> 4MB)
-    let large_data = vec![8u8; 4 * 1024 * 1024]; // 4MB
+    let large_data = bytes::Bytes::from(vec![8u8; 4 * 1024 * 1024]); // 4MB
     let large_counter = Arc::new(AtomicU64::new(0));
     group.throughput(Throughput::Bytes(4 * 1024 * 1024));
     group.bench_function("write_large_striped_4mb", |b| {
@@ -151,7 +157,10 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
             let c = counter.fetch_add(1, Ordering::Relaxed);
             let name = format!("bench_large_{}.bin", c);
             async move {
-                router_ref.write_file(&name, 0, data_ref, 3).await.unwrap();
+                router_ref
+                    .write_file(&name, 0, data_ref.clone(), 3)
+                    .await
+                    .unwrap();
                 let mut con = router_ref.dlm.get_connection().await.unwrap();
                 let _ = router_ref.delete_file(&name, &mut con).await;
             }
@@ -162,19 +171,29 @@ fn bench_squeezefs_routing(c: &mut Criterion) {
     let (micro_path, small_path, large_path) = rt.block_on(async {
         let micro_path = "routing_micro_read.bin".to_string();
         router
-            .write_file(&micro_path, 0, &vec![8u8; 1024], 10)
+            .write_file(&micro_path, 0, bytes::Bytes::from(vec![8u8; 1024]), 10)
             .await
             .unwrap();
 
         let small_path = "routing_small_read.bin".to_string();
         router
-            .write_file(&small_path, 0, &vec![8u8; 128 * 1024], 11)
+            .write_file(
+                &small_path,
+                0,
+                bytes::Bytes::from(vec![8u8; 128 * 1024]),
+                11,
+            )
             .await
             .unwrap();
 
         let large_path = "routing_large_read.bin".to_string();
         router
-            .write_file(&large_path, 0, &vec![8u8; 4 * 1024 * 1024], 12)
+            .write_file(
+                &large_path,
+                0,
+                bytes::Bytes::from(vec![8u8; 4 * 1024 * 1024]),
+                12,
+            )
             .await
             .unwrap();
 

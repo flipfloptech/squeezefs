@@ -19,6 +19,12 @@ use tokio::runtime::Builder;
 const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
+#[cold]
+#[inline(never)]
+fn err_enoent() -> Errno {
+    Errno::from(libc::ENOENT)
+}
+
 fn get_fuse_timeout() -> Duration {
     if let Ok(val) = std::env::var("SQUEEZEFS_TIMEOUT") {
         if let Ok(secs) = val.parse::<u64>() {
@@ -270,7 +276,9 @@ pub struct SqueezefsFilesystem {
     pub dir_entry_cache: moka::sync::Cache<u64, std::sync::Arc<[(std::boxed::Box<str>, u64)]>>,
     pub dismount_wait: u64,
     writeback_tx: tokio::sync::mpsc::UnboundedSender<WritebackRequest>,
-    writeback_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<WritebackRequest>>>,
+    writeback_rx: std::sync::Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<WritebackRequest>>>,
+    >,
     pub client_id: std::sync::Arc<std::sync::Mutex<String>>,
     pub mountpoint: std::sync::Arc<std::sync::Mutex<String>>,
     pub max_background_uploads: usize,
@@ -297,7 +305,7 @@ impl Clone for SqueezefsFilesystem {
             dir_entry_cache: self.dir_entry_cache.clone(),
             dismount_wait: self.dismount_wait,
             writeback_tx: self.writeback_tx.clone(),
-            writeback_rx: std::sync::Mutex::new(None),
+            writeback_rx: self.writeback_rx.clone(),
             client_id: self.client_id.clone(),
             mountpoint: self.mountpoint.clone(),
             max_background_uploads: self.max_background_uploads,
@@ -343,7 +351,7 @@ impl SqueezefsFilesystem {
             dir_entry_cache,
             dismount_wait: 10,
             writeback_tx,
-            writeback_rx: std::sync::Mutex::new(Some(writeback_rx)),
+            writeback_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(writeback_rx))),
             client_id: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             mountpoint: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             max_background_uploads: {
@@ -971,13 +979,21 @@ impl SqueezefsFilesystem {
                                         .cache
                                         .read_lru
                                         .put(&bk, decompressed_bytes.clone());
-                                    let nvme_clone = self.router.cache.nvme.clone();
-                                    let bk_clone = bk.clone();
-                                    let decompressed_clone = decompressed_bytes.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        let _ = nvme_clone
-                                            .cache_read_block(&bk_clone, decompressed_clone);
-                                    });
+                                    if decompressed_bytes.len() < 64 * 1024 {
+                                        let _ = self
+                                            .router
+                                            .cache
+                                            .nvme
+                                            .cache_read_block(&bk, decompressed_bytes.clone());
+                                    } else {
+                                        let nvme_clone = self.router.cache.nvme.clone();
+                                        let bk_clone = bk.clone();
+                                        let decompressed_clone = decompressed_bytes.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = nvme_clone
+                                                .cache_read_block(&bk_clone, decompressed_clone);
+                                        });
+                                    }
                                     decompressed_bytes.to_vec()
                                 };
                             }
@@ -992,7 +1008,12 @@ impl SqueezefsFilesystem {
 
                 // 2. Perform write range directly in memory
                 let rel_start = (write_start - b_start_offset) as usize;
-                block_data[rel_start..rel_start + slice_len].copy_from_slice(file_data_slice);
+                // SAFETY: rel_start + slice_len <= block_size, and we resized block_data to at least block_size
+                unsafe {
+                    block_data
+                        .get_unchecked_mut(rel_start..rel_start + slice_len)
+                        .copy_from_slice(file_data_slice);
+                }
 
                 // 3. Write back to staging_nvme_cache if block is complete, or keep in memory
                 let is_block_complete = write_end == b_end_offset;
@@ -1620,31 +1641,35 @@ impl Filesystem for SqueezefsFilesystem {
         // Gracefully wait up to self.dismount_wait seconds for background workers to drain staged writes and active writes to NVMe-oF backend
         let start_wait = std::time::Instant::now();
         let max_wait = std::time::Duration::from_secs(self.dismount_wait);
-        let (staged_count, active_writes_count) = loop {
-            let keys = self.router.cache.nvme.list_staged_files();
-            let mut current_staged = 0;
-            let mut current_active = 0;
-            for key in keys {
-                if key.starts_with("active_block:") {
-                    current_active += 1;
-                } else {
-                    current_staged += 1;
-                }
-            }
-            if (current_staged == 0 && current_active == 0) || start_wait.elapsed() >= max_wait {
-                break (current_staged, current_active);
+        loop {
+            let n = self
+                .router
+                .cache
+                .nvme
+                .staged_writes_in_flight
+                .load(Ordering::Acquire);
+            if n == 0 || start_wait.elapsed() >= max_wait {
+                break;
             }
             let remaining = max_wait.saturating_sub(start_wait.elapsed());
             if remaining.is_zero() {
-                break (current_staged, current_active);
+                break;
             }
-            let notify = self.router.cache.nvme.space_freed_notify.clone();
-            let _ = tokio::time::timeout(
-                std::cmp::min(remaining, std::time::Duration::from_millis(100)),
-                notify.notified(),
-            )
-            .await;
-        };
+            let notify = self.router.cache.nvme.staged_drained_notify.clone();
+            let _ = tokio::time::timeout(remaining, notify.notified()).await;
+        }
+
+        // Gather final count for warnings/statistics
+        let keys = self.router.cache.nvme.list_staged_files();
+        let mut staged_count = 0;
+        let mut active_writes_count = 0;
+        for key in keys {
+            if key.starts_with("active_block:") {
+                active_writes_count += 1;
+            } else {
+                staged_count += 1;
+            }
+        }
 
         if staged_count > 0 || active_writes_count > 0 {
             warn!(
@@ -1694,7 +1719,7 @@ impl Filesystem for SqueezefsFilesystem {
             let child_ino = if let Some(entries) = self.dir_entry_cache.get(&parent) {
                 match entries.binary_search_by(|(n, _)| n.as_ref().cmp(&*name_str)) {
                     Ok(idx) => entries[idx].1,
-                    Err(_) => return Err(Errno::from(libc::ENOENT)),
+                    Err(_) => return Err(err_enoent()),
                 }
             } else {
                 let mut con = self
@@ -1707,7 +1732,7 @@ impl Filesystem for SqueezefsFilesystem {
                     con.hget(&dir_key, &*name_str).await.map_err(map_err)?;
                 match ino_str {
                     Some(s) => s.parse::<u64>().unwrap_or(0),
-                    None => return Err(Errno::from(libc::ENOENT)),
+                    None => return Err(err_enoent()),
                 }
             };
 
@@ -2010,7 +2035,6 @@ impl Filesystem for SqueezefsFilesystem {
             let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
 
             let mut pipe = redis::pipe();
-            pipe.atomic();
             pipe.hset_multiple(
                 &attr_key,
                 &[
@@ -2177,6 +2201,9 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        let lock = self.get_inode_lock_ref(ino);
+        let _guard = lock.read().await;
+
         let file_path = format!("inode_{}", ino);
 
         // Get file size to bound the read
@@ -2246,6 +2273,9 @@ impl Filesystem for SqueezefsFilesystem {
         let write_future = async {
             // Acquire local inode lock for the ENTIRE write operation to serialize
             // concurrent/subsequent writes to the same file.
+            let lock = self.get_inode_lock_ref(ino);
+            let _guard = lock.write().await;
+
             // 1. Get or acquire lease (fencing token)
             let fencing_token = self
                 .get_or_acquire_lease(ino)
@@ -2289,7 +2319,7 @@ impl Filesystem for SqueezefsFilesystem {
             let expected_new_size = std::cmp::max(old_size, offset + bytes_written as u64);
 
             let fits_inline =
-                expected_new_size <= 65536 && file_type != "staged" && file_type != "striped";
+                expected_new_size <= 4096 && file_type != "staged" && file_type != "striped";
 
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2414,17 +2444,16 @@ impl Filesystem for SqueezefsFilesystem {
                     self.router.cache.write_lru.remove(&file_path);
                     self.router.cache.read_lru.remove(&file_path);
                 } else {
+                    let data_bytes = bytes::Bytes::copy_from_slice(data);
                     self.router
-                        .write_file(&file_path, offset, data, fencing_token)
+                        .write_file(&file_path, offset, data_bytes, fencing_token)
                         .await
                         .map_err(map_squeezefs_err)?;
                 }
                 self.router.metadata_cache.remove(&file_path);
             }
 
-            // Update local attr_cache securely by briefly acquiring the lock
-            let lock = self.get_inode_lock_ref(ino);
-            let _guard = lock.write().await;
+            // Update local attr_cache securely
             if let Some(mut entry) = self.attr_cache.get_mut(&ino) {
                 entry.value_mut().0.size = expected_new_size;
                 entry.value_mut().0.blocks = expected_new_size.div_ceil(512);
@@ -2531,7 +2560,6 @@ impl Filesystem for SqueezefsFilesystem {
             let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
 
             let mut pipe = redis::pipe();
-            pipe.atomic();
             pipe.hset_multiple(
                 &attr_key,
                 &[
@@ -3625,65 +3653,69 @@ impl Filesystem for SqueezefsFilesystem {
                 .is_ok();
 
             // Standard "." and ".." entries should be added if not already in Garnet
+            let mut next_offset = 1;
             if !has_dot {
-                entries.push(DirectoryEntry {
-                    name: ".".into(),
-                    kind: FileType::Directory,
-                    inode: parent,
-                    offset: 1,
-                });
+                if next_offset > offset {
+                    entries.push(DirectoryEntry {
+                        name: ".".into(),
+                        kind: FileType::Directory,
+                        inode: parent,
+                        offset: next_offset,
+                    });
+                }
+                next_offset += 1;
             }
             if !has_dotdot {
-                // Find parent directory from root/parent key, or just default to root 1 if not exists
-                let parent_parent = if parent == 1 {
-                    1
-                } else {
-                    let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
-                    let p: Option<u64> = con.hget(&child_dir_key, "..").await.unwrap_or(None);
-                    p.unwrap_or(1)
-                };
-                entries.push(DirectoryEntry {
-                    name: "..".into(),
-                    kind: FileType::Directory,
-                    inode: parent_parent,
-                    offset: 2,
-                });
+                if next_offset > offset {
+                    // Find parent directory from root/parent key, or just default to root 1 if not exists
+                    let parent_parent = if parent == 1 {
+                        1
+                    } else {
+                        let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
+                        let p: Option<u64> = con.hget(&child_dir_key, "..").await.unwrap_or(None);
+                        p.unwrap_or(1)
+                    };
+                    entries.push(DirectoryEntry {
+                        name: "..".into(),
+                        kind: FileType::Directory,
+                        inode: parent_parent,
+                        offset: next_offset,
+                    });
+                }
+                next_offset += 1;
             }
 
             if parent == 1 && !has_config {
-                let offset = (entries.len() + 1) as i64;
-                entries.push(DirectoryEntry {
-                    name: ".config".into(),
-                    kind: FileType::RegularFile,
-                    inode: CONFIG_INODE,
-                    offset,
-                });
+                if next_offset > offset {
+                    entries.push(DirectoryEntry {
+                        name: ".config".into(),
+                        kind: FileType::RegularFile,
+                        inode: CONFIG_INODE,
+                        offset: next_offset,
+                    });
+                }
+                next_offset += 1;
             }
 
             if parent == 1 && !has_stats {
-                let offset = (entries.len() + 1) as i64;
-                entries.push(DirectoryEntry {
-                    name: ".stats".into(),
-                    kind: FileType::RegularFile,
-                    inode: STATS_INODE,
-                    offset,
-                });
-            }
-
-            let temp_entries = std::mem::take(&mut entries);
-            for entry in temp_entries {
-                if entry.offset >= offset {
-                    entries.push(entry);
+                if next_offset > offset {
+                    entries.push(DirectoryEntry {
+                        name: ".stats".into(),
+                        kind: FileType::RegularFile,
+                        inode: STATS_INODE,
+                        offset: next_offset,
+                    });
                 }
+                next_offset += 1;
             }
 
-            let mut current_offset = (entries.len() + 1) as i64;
+            let mut current_offset = next_offset;
             let mut child_inos = Vec::new();
             for (name, child_ino) in entries_map.iter() {
                 if name.as_ref() == "." || name.as_ref() == ".." {
                     continue;
                 }
-                if current_offset < offset as i64 {
+                if current_offset <= offset as i64 {
                     current_offset += 1;
                     continue;
                 }
@@ -3727,12 +3759,12 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             }
 
-            let mut current_offset = (entries.len() + 1) as i64;
+            let mut current_offset = next_offset;
             for (name, child_ino) in entries_map.iter() {
                 if name.as_ref() == "." || name.as_ref() == ".." {
                     continue;
                 }
-                if current_offset < offset as i64 {
+                if current_offset <= offset as i64 {
                     current_offset += 1;
                     continue;
                 }
@@ -3816,86 +3848,90 @@ impl Filesystem for SqueezefsFilesystem {
                 .is_ok();
 
             // Standard "." and ".." entries
+            let mut next_offset = 1;
             if !has_dot {
-                let attr = self
-                    .get_attr_internal(parent)
-                    .await
-                    .map_err(map_squeezefs_err)?;
-                entries.push(DirectoryEntryPlus {
-                    name: ".".into(),
-                    kind: FileType::Directory,
-                    inode: parent,
-                    generation: 1,
-                    attr,
-                    entry_ttl: Duration::from_secs(1),
-                    attr_ttl: Duration::from_secs(1),
-                    offset: 1,
-                });
+                if next_offset > offset as i64 {
+                    let attr = self
+                        .get_attr_internal(parent)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                    entries.push(DirectoryEntryPlus {
+                        name: ".".into(),
+                        kind: FileType::Directory,
+                        inode: parent,
+                        generation: 1,
+                        attr,
+                        entry_ttl: Duration::from_secs(1),
+                        attr_ttl: Duration::from_secs(1),
+                        offset: next_offset,
+                    });
+                }
+                next_offset += 1;
             }
             if !has_dotdot {
-                let parent_parent = if parent == 1 {
-                    1
-                } else {
-                    let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
-                    let p: Option<u64> = con.hget(&child_dir_key, "..").await.unwrap_or(None);
-                    p.unwrap_or(1)
-                };
-                let attr = self
-                    .get_attr_internal(parent_parent)
-                    .await
-                    .map_err(map_squeezefs_err)?;
-                entries.push(DirectoryEntryPlus {
-                    name: "..".into(),
-                    kind: FileType::Directory,
-                    inode: parent_parent,
-                    generation: 1,
-                    attr,
-                    entry_ttl: Duration::from_secs(1),
-                    attr_ttl: Duration::from_secs(1),
-                    offset: 2,
-                });
+                if next_offset > offset as i64 {
+                    let parent_parent = if parent == 1 {
+                        1
+                    } else {
+                        let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
+                        let p: Option<u64> = con.hget(&child_dir_key, "..").await.unwrap_or(None);
+                        p.unwrap_or(1)
+                    };
+                    let attr = self
+                        .get_attr_internal(parent_parent)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                    entries.push(DirectoryEntryPlus {
+                        name: "..".into(),
+                        kind: FileType::Directory,
+                        inode: parent_parent,
+                        generation: 1,
+                        attr,
+                        entry_ttl: Duration::from_secs(1),
+                        attr_ttl: Duration::from_secs(1),
+                        offset: next_offset,
+                    });
+                }
+                next_offset += 1;
             }
 
             if parent == 1 && !has_config {
-                let config_data = self.generate_config_json().await;
-                let attr = self.get_config_attr(config_data.len() as u64);
-                let offset = (entries.len() + 1) as i64;
-                entries.push(DirectoryEntryPlus {
-                    name: ".config".into(),
-                    kind: FileType::RegularFile,
-                    inode: CONFIG_INODE,
-                    generation: 1,
-                    attr,
-                    entry_ttl: Duration::from_secs(1),
-                    attr_ttl: Duration::from_secs(1),
-                    offset,
-                });
+                if next_offset > offset as i64 {
+                    let config_data = self.generate_config_json().await;
+                    let attr = self.get_config_attr(config_data.len() as u64);
+                    entries.push(DirectoryEntryPlus {
+                        name: ".config".into(),
+                        kind: FileType::RegularFile,
+                        inode: CONFIG_INODE,
+                        generation: 1,
+                        attr,
+                        entry_ttl: Duration::from_secs(1),
+                        attr_ttl: Duration::from_secs(1),
+                        offset: next_offset,
+                    });
+                }
+                next_offset += 1;
             }
 
             if parent == 1 && !has_stats {
-                let stats_data = self.generate_stats_json().await;
-                let attr = self.get_stats_attr(stats_data.len() as u64);
-                let offset = (entries.len() + 1) as i64;
-                entries.push(DirectoryEntryPlus {
-                    name: ".stats".into(),
-                    kind: FileType::RegularFile,
-                    inode: STATS_INODE,
-                    generation: 1,
-                    attr,
-                    entry_ttl: Duration::from_secs(0),
-                    attr_ttl: Duration::from_secs(0),
-                    offset,
-                });
-            }
-
-            let temp_entries = std::mem::take(&mut entries);
-            for entry in temp_entries {
-                if (entry.offset as u64) >= offset {
-                    entries.push(entry);
+                if next_offset > offset as i64 {
+                    let stats_data = self.generate_stats_json().await;
+                    let attr = self.get_stats_attr(stats_data.len() as u64);
+                    entries.push(DirectoryEntryPlus {
+                        name: ".stats".into(),
+                        kind: FileType::RegularFile,
+                        inode: STATS_INODE,
+                        generation: 1,
+                        attr,
+                        entry_ttl: Duration::from_secs(0),
+                        attr_ttl: Duration::from_secs(0),
+                        offset: next_offset,
+                    });
                 }
+                next_offset += 1;
             }
 
-            let mut current_offset = (entries.len() + 1) as i64;
+            let mut current_offset = next_offset;
             // 1. Gather all inodes we need attributes for that AREN'T in local cache
             let mut pipe = redis::pipe();
             let mut inos_to_fetch = Vec::new();
@@ -3904,7 +3940,7 @@ impl Filesystem for SqueezefsFilesystem {
                 if name.as_ref() == "." || name.as_ref() == ".." {
                     continue;
                 }
-                if current_offset < offset as i64 {
+                if current_offset <= offset as i64 {
                     current_offset += 1;
                     continue;
                 }
@@ -4022,12 +4058,12 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             }
 
-            let mut current_offset = (entries.len() + 1) as i64;
+            let mut current_offset = next_offset;
             for (name, child_ino) in entries_map.iter() {
                 if name.as_ref() == "." || name.as_ref() == ".." {
                     continue;
                 }
-                if current_offset < offset as i64 {
+                if current_offset <= offset as i64 {
                     current_offset += 1;
                     continue;
                 }
@@ -4244,18 +4280,23 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // 3. General copy: read range from source, write to destination
-        let src_data = self
-            .router
-            .read_file(&src_path)
-            .await
-            .map_err(map_squeezefs_err)?;
+        let src_data = bytes::Bytes::from(
+            self.router
+                .read_file(&src_path)
+                .await
+                .map_err(map_squeezefs_err)?,
+        );
         if off_in >= src_data.len() as u64 {
             return Ok(ReplyCopyFileRange { copied: 0 });
         }
 
         let start = off_in as usize;
         let end = std::cmp::min((off_in + length) as usize, src_data.len());
-        let chunk = &src_data[start..end];
+        // SAFETY: start < src_data.len() checked on line 4278, and end is clamped to src_data.len()
+        let chunk = unsafe {
+            let sub = src_data.get_unchecked(start..end);
+            src_data.slice_ref(sub)
+        };
 
         if chunk.is_empty() {
             return Ok(ReplyCopyFileRange { copied: 0 });
@@ -4275,7 +4316,7 @@ impl Filesystem for SqueezefsFilesystem {
         };
 
         self.router
-            .write_file(&dest_path, off_out, chunk, target_fencing_token)
+            .write_file(&dest_path, off_out, chunk.clone(), target_fencing_token)
             .await
             .map_err(map_squeezefs_err)?;
 
@@ -5123,6 +5164,24 @@ pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {
     custom_opts
 }
 
+pub fn filter_kernel_mount_options(opts: &str) -> String {
+    let mut kernel_opts = Vec::new();
+    for opt in opts.split(',') {
+        let opt_trimmed = opt.trim();
+        if !opt_trimmed.is_empty() {
+            let key = opt_trimmed.split('=').next().unwrap_or("").trim();
+            if key == "max_read"
+                || key == "blksize"
+                || key == "default_permissions"
+                || key == "allow_other"
+            {
+                kernel_opts.push(opt_trimmed);
+            }
+        }
+    }
+    kernel_opts.join(",")
+}
+
 /// Start FUSE mount daemon using fuse3.
 pub async fn start_mount<P: AsRef<Path>>(
     mountpoint: P,
@@ -5134,7 +5193,8 @@ pub async fn start_mount<P: AsRef<Path>>(
     custom_opts: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = MountOptions::default();
-    if unsafe { libc::getuid() } == 0 {
+    let is_root = unsafe { libc::getuid() } == 0;
+    if is_root {
         options.uid(uid);
         options.gid(gid);
     }
@@ -5142,12 +5202,21 @@ pub async fn start_mount<P: AsRef<Path>>(
     options.write_back(writeback);
     options.default_permissions(true);
 
-    if let Some(opts) = custom_opts {
-        let parsed = parse_custom_options(&opts);
-        options.custom_options(parsed);
+    if is_root {
+        let filtered_opts = if let Some(ref opts) = custom_opts {
+            filter_kernel_mount_options(opts)
+        } else {
+            "max_read=1048576".to_string()
+        };
+        options.custom_options(filtered_opts);
     } else {
-        // default custom option
-        options.custom_options("max_read=1048576,max_write=1048576,max_pages=256,max_readahead=4194304,max_background=64,congestion_threshold=48,async_read");
+        if let Some(opts) = custom_opts {
+            let parsed = parse_custom_options(&opts);
+            options.custom_options(parsed);
+        } else {
+            // default custom option
+            options.custom_options("max_read=1048576,max_write=1048576,max_pages=256,max_readahead=4194304,max_background=64,congestion_threshold=48,async_read");
+        }
     }
 
     info!(
@@ -6215,6 +6284,11 @@ async fn run_constant_writeback_worker(
     let upload_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_uploads));
 
     while let Some(req) = rx.recv().await {
+        log::info!(
+            "Constant Writeback: Received writeback request for ino {}, block {}",
+            req.ino,
+            req.block_idx
+        );
         let router_clone = router.clone();
         let dlm_clone = dlm.clone();
         let locks_clone = active_inode_locks.clone();
@@ -6223,14 +6297,20 @@ async fn run_constant_writeback_worker(
         tokio::spawn(async move {
             let _permit = match sem_clone.acquire().await {
                 Ok(p) => p,
-                Err(_) => return,
+                Err(e) => {
+                    log::error!("Constant Writeback: Semaphore acquire failed: {:?}", e);
+                    return;
+                }
             };
 
             let file_path = format!("inode_{}", req.ino);
             let meta_key = format!("metadata:{}", file_path);
             let mut con = match dlm_clone.get_connection().await {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(e) => {
+                    log::error!("Constant Writeback: Failed to get connection: {:?}", e);
+                    return;
+                }
             };
 
             let (file_type_opt, block_map_id_opt): (Option<String>, Option<String>) =
@@ -6241,7 +6321,14 @@ async fn run_constant_writeback_worker(
                     .await
                 {
                     Ok(r) => r,
-                    Err(_) => return,
+                    Err(e) => {
+                        log::error!(
+                            "Constant Writeback: Pipeline query failed on {}: {:?}",
+                            meta_key,
+                            e
+                        );
+                        return;
+                    }
                 };
 
             let file_type = file_type_opt.unwrap_or_else(|| "inline".to_string());
@@ -6256,10 +6343,18 @@ async fn run_constant_writeback_worker(
             let old_key: Option<String> =
                 match con.hget(&block_map_key, req.block_idx.to_string()).await {
                     Ok(k) => k,
-                    Err(_) => return,
+                    Err(e) => {
+                        log::error!(
+                            "Constant Writeback: HGET failed on {} field {}: {:?}",
+                            block_map_key,
+                            req.block_idx,
+                            e
+                        );
+                        return;
+                    }
                 };
 
-            let _ = flush_single_active_block(
+            if let Err(e) = flush_single_active_block(
                 req.ino,
                 req.block_idx,
                 req.fencing_token,
@@ -6271,7 +6366,15 @@ async fn run_constant_writeback_worker(
                 old_key,
                 false,
             )
-            .await;
+            .await
+            {
+                log::error!(
+                    "Constant Writeback: Failed to flush block {} of inode {}: {:?}",
+                    req.block_idx,
+                    req.ino,
+                    e
+                );
+            }
         });
     }
 }
@@ -6362,45 +6465,37 @@ async fn flush_single_active_block(
 ) -> Result<(), SqueezefsError> {
     let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
 
-    let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
-
-    let _block_guard = block_lock.lock().await;
-
     let lock_opt = if !locked {
         Some(active_inode_locks.get_inode_lock(ino))
     } else {
         None
     };
 
+    let mut _inode_guard = None;
+    if let Some(ref l) = lock_opt {
+        _inode_guard = Some(l.read().await);
+    }
+
+    let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
+    let _block_guard = block_lock.lock().await;
+
     let block_data_guard = match router.cache.nvme.read_staged_zero_copy(&cache_key) {
         Some(g) => g,
         None => return Ok(()),
     };
 
+    let block_bytes = bytes::Bytes::copy_from_slice(&block_data_guard);
+    drop(block_data_guard);
+
     use redis::AsyncCommands;
     let mut con = dlm.get_connection_for_inode(ino).await?;
 
-    let meta_key = format!("metadata:inode_{}", ino);
-    let current_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await?;
-    if let Some(cf) = current_fencing {
-        if fencing_token < cf {
-            return Err(SqueezefsError::FencingTokenExpired {
-                token: fencing_token,
-                expected: cf,
-            });
-        }
-    }
-
-    let slice: &[u8] = &block_data_guard;
-    let block_bytes =
-        unsafe { bytes::Bytes::from_static(std::mem::transmute::<&[u8], &'static [u8]>(slice)) };
     let processed_block = router.get_crypto().process_write(block_bytes.clone())?;
     let processed_len = processed_block.len();
 
     let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
     let offset = block_allocator.allocate_block().await?;
 
-    let _guard_arc = std::sync::Arc::new(block_data_guard);
     if let Err(e) = nvme_writer.write_block(offset, &processed_block).await {
         error!(
             "flush_single_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
@@ -6408,11 +6503,6 @@ async fn flush_single_active_block(
         );
         let _ = block_allocator.free_block(offset).await;
         return Err(e);
-    }
-
-    let mut _inode_guard = None;
-    if let Some(ref l) = lock_opt {
-        _inode_guard = Some(l.read().await);
     }
 
     let stored_block_key = if be_id == "backend_0" {

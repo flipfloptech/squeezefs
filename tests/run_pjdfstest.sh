@@ -4,6 +4,7 @@ set -e
 # Squeezefs POSIX compliance test script using pjdfstest
 # Must be run inside WSL as root (or with sudo) because pjdfstest tests chown/chmod/etc.
 
+REPO_DIR="$(pwd)"
 MOUNT_DIR="/tmp/squeezefs_pjdfs_mount"
 STAGING_DIR="/tmp/squeezefs_pjdfs_staging"
 GARNET_URL="${GARNET_URL:-redis://127.0.0.1:6379}"
@@ -37,20 +38,23 @@ if [ ! -f "pjdfstest" ]; then
 fi
 
 # 4. Prepare mounts
+sudo umount -l "$MOUNT_DIR" &>/dev/null || true
 mkdir -p "$MOUNT_DIR"
 mkdir -p "$STAGING_DIR"
 
 # Clean Garnet volume format
 echo "Formatting volume..."
-GARNET_URL="$GARNET_URL" cargo run --release -- format pjdfsvol --disk-cache-paths "$STAGING_DIR"
+cd "$REPO_DIR"
+GARNET_URL="$GARNET_URL" cargo run --release -- format pjdfsvol --disk-cache-paths "$STAGING_DIR" --volume /dev/shm/squeezefs_default_backend --force
 
 # Mount squeezefs
 echo "Mounting squeezefs..."
 # Start in background / daemon mode
-GARNET_URL="$GARNET_URL" cargo run --release -- mount "$MOUNT_DIR" --daemon --disk-cache-paths "$STAGING_DIR" --log-file /tmp/squeezefs_pjdfs.log
+cd "$REPO_DIR"
+GARNET_URL="$GARNET_URL" cargo run --release -- mount pjdfsvol "$MOUNT_DIR" --daemon --disk-cache-paths "$STAGING_DIR" --log-file /tmp/squeezefs_pjdfs.log --allow-other
 
 # Ensure mounted
-sleep 2
+sleep 5
 if ! mountpoint -q "$MOUNT_DIR"; then
     echo "ERROR: Failed to mount Squeezefs!"
     cat /tmp/squeezefs_pjdfs.log
@@ -62,7 +66,8 @@ echo "Running pjdfstest suite..."
 cd "$PJDFSTEST_DIR"
 # Run tests and show report
 # We run as root because many tests require root chown/chmod/mknod privileges.
-sudo prove -r tests/ || true
+PROVE_CMD=$(command -v prove || echo "/usr/bin/core_perl/prove")
+$PROVE_CMD -r tests/ || true
 
 # 6. Cleanup
 echo "Cleaning up..."

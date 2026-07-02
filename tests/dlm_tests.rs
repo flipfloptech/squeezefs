@@ -272,11 +272,15 @@ async fn test_fencing_token_validation_on_write() {
         .unwrap_or_default();
 
     // 1. Initial write with fencing token = 10
-    let res1 = router.write_file(file_path, 0, b"hello", 10).await;
+    let res1 = router
+        .write_file(file_path, 0, bytes::Bytes::from_static(b"hello"), 10)
+        .await;
     assert!(res1.is_ok());
 
     // 2. Stale write with fencing token = 5 (should be rejected)
-    let res2 = router.write_file(file_path, 0, b"world", 5).await;
+    let res2 = router
+        .write_file(file_path, 0, bytes::Bytes::from_static(b"world"), 5)
+        .await;
     assert!(res2.is_err());
     assert!(matches!(
         res2.unwrap_err(),
@@ -284,7 +288,9 @@ async fn test_fencing_token_validation_on_write() {
     ));
 
     // 3. Newer write with fencing token = 15 (should succeed)
-    let res3 = router.write_file(file_path, 0, b"world", 15).await;
+    let res3 = router
+        .write_file(file_path, 0, bytes::Bytes::from_static(b"world"), 15)
+        .await;
     assert!(res3.is_ok());
 
     let _ = std::fs::remove_file(dev_path);

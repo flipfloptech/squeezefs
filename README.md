@@ -71,7 +71,7 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
   - `--capacity <bytes>`: Maximum capacity of the volume in bytes (default: 1PB).
   - `--mem-cache-size <size>`: Memory cache limit (default: 20%).
   - `--disk-cache-size <size>`: Staging disk cache capacity (default: 50G).
-  - `--nvme-target-path <path>`: Required NVMe device target path for format (e.g. /dev/nvme0n1).
+  - `--volume <path>`: Required backing volume/device path for format (alias: `--nvme-target`, `--backing-dev`, e.g. `/dev/nvme0n1`).
 
 * **Mount Squeezefs:**
   ```bash
@@ -86,7 +86,7 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
   - `--uid <id>`: Custom UID owner for the mount (default: current user or SUDO_UID).
   - `--gid <id>`: Custom GID owner for the mount (default: current group or SUDO_GID).
   - `--log-file <path>`: Path to write daemon logs to when running in background.
-  - `--nvme-path <path>`: Local NVMe path or NVMe-oF connected target path.
+  - `--volume <path>`: Backing volume/device path (alias: `--nvme-target`, `--backing-dev`, e.g. `/dev/main-pool/my-vol`).
   - `--job-cpu-limit <percentage>`: Cap background job worker CPU utilization percentage (1 to 100, default: 50).
   - `--write-verification`: Enable read-after-write checksum verification on all writes to cache and disk.
 
@@ -126,18 +126,18 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
   ```
 
 * **NVMe-oF Utilities:**
-  Share and dismantle NVMe-oF targets, and install/configure user-space SPDK via `squeezefs nvmeof`.
+  Share and dismantle NVMe-oF targets, and install/configure user-space SPDK via `squeezefs storage nvmeof`.
   ```bash
-  squeezefs nvmeof share <path> [--spdk] [--port <port>] [--ip <ip>]
-  squeezefs nvmeof connect --ip <ip> --subnqn <nqn> [--port <port>]
-  squeezefs nvmeof disconnect <nqn>
-  squeezefs nvmeof unshare <nqn> [--spdk]
-  squeezefs nvmeof list
-  squeezefs nvmeof spdk-install
-  squeezefs nvmeof spdk-setup [--hugepages <2GB/4GB>]
-  squeezefs nvmeof spdk-bind --pci <pci_addr>
-  squeezefs nvmeof unbind --pci <pci_addr>
-  squeezefs nvmeof spdk-start
+  squeezefs storage nvmeof share <path> [--spdk] [--port <port>] [--ip <ip>]
+  squeezefs storage nvmeof connect --ip <ip> --subnqn <nqn> [--port <port>]
+  squeezefs storage nvmeof disconnect <nqn>
+  squeezefs storage nvmeof unshare <nqn> [--spdk]
+  squeezefs storage nvmeof list
+  squeezefs storage nvmeof spdk-install
+  squeezefs storage nvmeof spdk-setup [--hugepages <2GB/4GB>]
+  squeezefs storage nvmeof spdk-bind --pci <pci_addr>
+  squeezefs storage nvmeof unbind --pci <pci_addr>
+  squeezefs storage nvmeof spdk-start
   ```
 
 * **Storage Pool & Volume Management:**
@@ -158,7 +158,7 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
   ```
   *Actions:*
   - `set <key> <value>`: Updates runtime format quotas and cache limits. Supported keys are `capacity` (e.g. "100G", "2T"), `inodes` (e.g. "2000000"), `mem_cache_size`, `read_mem_cache_size`, `write_mem_cache_size`, `disk_cache_size`, `read_cache_size`, and `write_cache_size`.
-  - `diskcache <subcommand>` (alias: `diskcaches`): Manages staging disk cache paths.
+  - `disk-cache <subcommand>` (alias: `diskcaches`): Manages staging disk cache paths.
     * `add <path>`
     * `remove <path> [--force]`
     * `enable <path>`

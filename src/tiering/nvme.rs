@@ -68,6 +68,7 @@ impl NvmeShardInner {
 }
 
 pub struct NvmeReadGuard<'a> {
+    pub _device: Option<Arc<NvmeDevice>>,
     pub guard: RwLockReadGuard<'a, NvmeShardInner>,
     pub offset: usize,
     pub len: usize,
@@ -135,7 +136,7 @@ impl NvmeShard {
     }
 
     pub fn get<'a>(&'a self, key: &Bytes) -> Option<NvmeReadGuard<'a>> {
-        let inner = self.inner.try_read()?;
+        let inner = self.inner.read();
         if let Some(&meta) = inner.map.get(key) {
             // Verify magic
             let magic =
@@ -158,6 +159,7 @@ impl NvmeShard {
             let val_start =
                 (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
             Some(NvmeReadGuard {
+                _device: None,
                 guard: inner,
                 offset: val_start,
                 len: val_len,
@@ -411,7 +413,11 @@ impl NvmeCache {
         for dev in devices.iter() {
             if dev.online.load(Ordering::Relaxed) {
                 let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
-                if let Some(guard) = dev.shards[shard_idx].get(key) {
+                if let Some(mut guard) = dev.shards[shard_idx].get(key) {
+                    guard._device = Some(dev.clone());
+                    // SAFETY: transmuting NvmeReadGuard to extend lifetime to 'a is safe
+                    // because the cloned Arc<NvmeDevice> inside it guarantees the underlying
+                    // shard and memory map are kept alive.
                     let extended_guard = unsafe {
                         std::mem::transmute::<NvmeReadGuard<'_>, NvmeReadGuard<'a>>(guard)
                     };
@@ -428,22 +434,46 @@ impl NvmeCache {
             if dev.online.load(Ordering::Relaxed) {
                 let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
                 let shard = &dev.shards[shard_idx];
-                if let Some(inner) = shard.inner.try_read() {
-                    if let Some(&meta) = inner.map.get(key) {
-                        // Erase lifetime of RwLockReadGuard
-                        let static_guard = unsafe {
-                            std::mem::transmute::<
-                                RwLockReadGuard<'_, NvmeShardInner>,
-                                RwLockReadGuard<'static, NvmeShardInner>,
-                            >(inner)
-                        };
-                        return Some(NvmeCacheReadGuard {
-                            _device: dev.clone(),
-                            guard: static_guard,
-                            offset: meta.offset,
-                            len: meta.len,
-                        });
+                let inner = shard.inner.read();
+                if let Some(&meta) = inner.map.get(key) {
+                    let magic = u32::from_le_bytes(
+                        inner.mmap[meta.offset..meta.offset + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
+                    if magic != BLOCK_MAGIC {
+                        return None;
                     }
+                    let key_len = u32::from_le_bytes(
+                        inner.mmap[meta.offset + 4..meta.offset + 8]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ) as usize;
+                    let val_len = u32::from_le_bytes(
+                        inner.mmap[meta.offset + 8..meta.offset + 12]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ) as usize;
+
+                    let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
+                    let val_start =
+                        (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+
+                    // SAFETY: Erasing lifetime of RwLockReadGuard is safe because
+                    // NvmeCacheReadGuard holds a cloned Arc<NvmeDevice> which keeps
+                    // the device, its shards, and the memory map alive.
+                    let static_guard = unsafe {
+                        std::mem::transmute::<
+                            RwLockReadGuard<'_, NvmeShardInner>,
+                            RwLockReadGuard<'static, NvmeShardInner>,
+                        >(inner)
+                    };
+                    return Some(NvmeCacheReadGuard {
+                        _device: dev.clone(),
+                        guard: static_guard,
+                        offset: val_start,
+                        len: val_len,
+                    });
                 }
             }
         }

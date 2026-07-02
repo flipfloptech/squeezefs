@@ -625,9 +625,14 @@ impl MetaClient {
                 let pool_idx = idx % pool_arc.conns.len();
                 let conn = pool_arc.conns[pool_idx].read().clone();
 
-                // Cache connection in thread-local cache
+                // Cache connection in thread-local cache (capped at 2 entries to prevent leaks/linear search growth)
                 LOCAL_CONN.with(|cache| {
-                    cache.borrow_mut().push((info.clone(), conn.clone()));
+                    let mut cache_borrow = cache.borrow_mut();
+                    if cache_borrow.len() < 2 {
+                        cache_borrow.push((info.clone(), conn.clone()));
+                    } else {
+                        cache_borrow[0] = (info.clone(), conn.clone());
+                    }
                 });
 
                 Ok(MetaConnection::Single {
@@ -1052,9 +1057,10 @@ impl DlmClient {
         let fencing_token = match fencing_token {
             Some(token) => token,
             None => {
-                return Err(SqueezefsError::LockFailed {
-                    reason: format!("Lock is already held on {}", lock_key),
-                });
+                return Err(err_lock_failed(format!(
+                    "Lock is already held on {}",
+                    lock_key
+                )));
             }
         };
 
@@ -1093,7 +1099,7 @@ impl DlmClient {
                 Ok(lease) => return Ok(lease),
                 Err(SqueezefsError::LockFailed { reason }) => {
                     if attempt + 1 == max_attempts {
-                        return Err(SqueezefsError::LockFailed { reason });
+                        return Err(err_lock_failed(reason));
                     }
                     // Sleep with random jitter
                     let jitter_limit = backoff.as_micros() as u32;
@@ -1108,9 +1114,7 @@ impl DlmClient {
                 Err(e) => return Err(e),
             }
         }
-        Err(SqueezefsError::LockFailed {
-            reason: "Max lock attempts exceeded".to_string(),
-        })
+        Err(err_lock_failed("Max lock attempts exceeded".to_string()))
     }
 
     pub async fn acquire_delegation(&self, inode: u64, ttl: Duration) -> Result<DelegationResult> {
@@ -1355,4 +1359,10 @@ impl Drop for DelegationLease {
             }
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn err_lock_failed(reason: String) -> SqueezefsError {
+    SqueezefsError::LockFailed { reason }
 }

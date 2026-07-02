@@ -795,7 +795,10 @@ pub fn connect_target_with_local_ips(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    Ok("Connection requested. Check 'squeezefs nvmeof list' for device mapping.".to_string())
+    Ok(
+        "Connection requested. Check 'squeezefs storage nvmeof list' for device mapping."
+            .to_string(),
+    )
 }
 
 pub fn disconnect_target(subnqn: &str) -> std::io::Result<()> {
@@ -1307,7 +1310,7 @@ pub fn spdk_bind(pci_addr: &str) -> std::io::Result<()> {
     } else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "SPDK setup.sh not found. Run 'squeezefs nvmeof spdk-install' first.",
+            "SPDK setup.sh not found. Run 'squeezefs storage nvmeof spdk-install' first.",
         ));
     }
 
@@ -1351,7 +1354,7 @@ pub fn spdk_start() -> std::io::Result<()> {
     if !std::path::Path::new(bin_path).exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "SPDK target binary not found. Run 'squeezefs nvmeof spdk-install' first.",
+            "SPDK target binary not found. Run 'squeezefs storage nvmeof spdk-install' first.",
         ));
     }
 

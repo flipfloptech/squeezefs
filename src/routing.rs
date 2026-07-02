@@ -805,132 +805,55 @@ impl DataRouter {
         };
 
         if end_offset > stripe_threshold && file_type.as_deref() != Some("striped") {
-            // Transition the existing data (which is at most 4MB) to striped layout
+            // Transition prior layout → striped (or first-time striped create).
+            // Durable block I/O always completes before any metadata type flip so a
+            // mid-transition failure leaves the prior layout intact (or no layout).
             let file_uuid = Uuid::new_v4().to_string();
             let block_map_id = Uuid::new_v4().to_string();
-            let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
-            let mut sizes_to_register = Vec::new();
-            let mut offset_cursor = 0;
-            let mut block_count = 0;
-            let mut block_mappings = Vec::new();
             let existing_bytes = bytes::Bytes::from(existing_data);
             let existing_size = existing_bytes.len();
-            while offset_cursor < existing_size {
-                let end = std::cmp::min(offset_cursor + block_size, existing_size);
-                // SAFETY: offset_cursor < existing_size, and end is clamped to existing_size
-                let chunk = unsafe {
-                    let sub = existing_bytes.get_unchecked(offset_cursor..end);
-                    existing_bytes.slice_ref(sub)
-                };
-                let (be_id, block_allocator, nvme_writer) =
-                    match self.backend_router.get_active_backend() {
-                        Ok(res) => res,
-                        Err(e) => return Err(e),
-                    };
-                let offset = block_allocator.allocate_block().await?;
-                let stored_block_key = if be_id == "backend_0" {
-                    offset.to_string()
-                } else {
-                    format!("{}://{}", be_id, offset)
-                };
-                let stored_block_key_clone = stored_block_key.clone();
 
-                block_mappings.push((block_count.to_string(), stored_block_key.clone()));
-
-                let chunk_len = chunk.len();
-                let processed = match self.get_crypto().process_write(chunk.clone()) {
-                    Ok(p) => p,
-                    Err(e) => return Err(e),
-                };
-                let processed_len = processed.len();
-                sizes_to_register.push((stored_block_key_clone.clone(), chunk_len, processed_len));
-
-                let read_lru = self.cache.read_lru.clone();
-                let chunk_clone = chunk.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = nvme_writer.write_block(offset, &processed).await {
-                        log::error!(
-                            "Background Stripe upload task failed for block {}: {:?}",
-                            stored_block_key,
-                            e
-                        );
-                    }
-                    // Cache the newly written block in RAM - dehydrated to NVMe on eviction
-                    read_lru.put(&stored_block_key_clone, chunk_clone);
-                });
-
-                offset_cursor = end;
-                block_count += 1;
+            // Fast path: no prior content and write starts at 0 — the full image is
+            // `data`. Persist it once, then commit meta (no empty striped commit).
+            if existing_size == 0 && offset == 0 {
+                let (block_mappings, sizes_to_register, block_count) =
+                    self.durable_write_stripe_payload(data.clone()).await?;
+                self.commit_striped_layout_meta(
+                    file_path,
+                    &meta_key,
+                    file_type.as_deref(),
+                    &block_map_id,
+                    &file_uuid,
+                    block_count,
+                    data.len(),
+                    fencing_token,
+                    &block_mappings,
+                    &sizes_to_register,
+                    &mut con,
+                )
+                .await?;
+                return Ok(());
             }
 
-            // Register block mappings and reference counts in Garnet
-            let block_map_key = format!("block_map:{}", block_map_id);
-            let refcounts_key_str = crate::fs_key!("block_refcounts");
-            let refcounts_key = &refcounts_key_str;
-            let mut pipe_map = redis::pipe();
-            for (idx_str, key) in &block_mappings {
-                pipe_map.hset(&block_map_key, idx_str, key);
-                pipe_map.hset(refcounts_key, key, 1);
-            }
-            for (key, logical, physical) in &sizes_to_register {
-                pipe_map.hset(
-                    crate::fs_key!("block_sizes"),
-                    key,
-                    format!("{}:{}", logical, physical),
-                );
-            }
-            let _: () = pipe_map.query_async(&mut con).await?;
+            let (block_mappings, sizes_to_register, block_count) =
+                self.durable_write_stripe_payload(existing_bytes).await?;
 
-            let mut pipe = redis::pipe();
-            pipe.hset(&meta_key, "size", existing_size)
-                .hset(&meta_key, "type", "striped")
-                .hset(&meta_key, "block_prefix", format!("blocks/{}", file_uuid))
-                .hset(&meta_key, "block_map_id", &block_map_id)
-                .hset(&meta_key, "num_blocks", block_count)
-                .hset(&meta_key, "fencing_token", fencing_token);
-
-            if file_type.as_deref() == Some("inline") {
-                let inline_key = format!("inline_data:{}", file_path);
-                pipe.del(&inline_key);
-            }
-
-            let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
-                pipe.hdel(&meta_key, "file_id");
-                con.hget(&meta_key, "file_id").await?
-            } else {
-                None
-            };
-
-            let _: () = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                pipe.query_async(&mut con),
+            self.commit_striped_layout_meta(
+                file_path,
+                &meta_key,
+                file_type.as_deref(),
+                &block_map_id,
+                &file_uuid,
+                block_count,
+                existing_size,
+                fencing_token,
+                &block_mappings,
+                &sizes_to_register,
+                &mut con,
             )
-            .await
-            .map_err(|_| {
-                SqueezefsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Redis query timed out",
-                ))
-            })??;
+            .await?;
 
-            if let Some(old_id) = old_file_id {
-                self.cache.nvme.remove_staged(&old_id);
-                let _ = self
-                    .decrement_staged_block_refcount(&old_id, &mut con)
-                    .await;
-                let mapping_key = format!("mapping:{}", old_id);
-                let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
-                    log::debug!("non-fatal cleanup op failed: {:?}", e);
-                });
-            }
-
-            // Drop full-file LRU entries before the block-level write. A smaller
-            // staged/inline image must not shadow the post-transition striped size.
-            self.cache.write_lru.remove(file_path);
-            self.cache.read_lru.remove(file_path);
-            self.metadata_cache.invalidate(file_path);
-
-            // Now that layout is transitioned to "striped", perform the write block-by-block
+            // Apply the caller write on the now-striped layout (awaited block RMW).
             self.write_striped(
                 file_path,
                 &meta_key,
@@ -1121,113 +1044,179 @@ impl DataRouter {
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
         } else {
-            // Layout: striped
+            // First-time striped layout for a fully-buffered image. Durable writes
+            // complete before the metadata type flip (P0-2 atomicity).
             let file_uuid = Uuid::new_v4().to_string();
             let block_map_id = Uuid::new_v4().to_string();
-            let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
-            let mut sizes_to_register = Vec::new();
-            let mut offset_cursor = 0;
-            let mut block_count = 0;
-            let mut block_mappings = Vec::new();
             let existing_bytes = bytes::Bytes::from(existing_data);
             let new_size = existing_bytes.len();
-            while offset_cursor < new_size {
-                let end = std::cmp::min(offset_cursor + block_size, new_size);
-                // SAFETY: offset_cursor < new_size, and end is clamped to new_size
-                let chunk = unsafe {
-                    let sub = existing_bytes.get_unchecked(offset_cursor..end);
-                    existing_bytes.slice_ref(sub)
-                };
-                let (be_id, block_allocator, nvme_writer) =
-                    match self.backend_router.get_active_backend() {
-                        Ok(res) => res,
-                        Err(e) => return Err(e),
-                    };
-                let offset = block_allocator.allocate_block().await?;
-                let stored_block_key = if be_id == "backend_0" {
-                    offset.to_string()
-                } else {
-                    format!("{}://{}", be_id, offset)
-                };
-                let stored_block_key_clone = stored_block_key.clone();
 
-                block_mappings.push((block_count.to_string(), stored_block_key.clone()));
+            let (block_mappings, sizes_to_register, block_count) =
+                self.durable_write_stripe_payload(existing_bytes).await?;
 
-                let chunk_len = chunk.len();
-                let processed = match self.get_crypto().process_write(chunk.clone()) {
-                    Ok(p) => p,
-                    Err(e) => return Err(e),
-                };
-                let processed_len = processed.len();
-                sizes_to_register.push((stored_block_key_clone.clone(), chunk_len, processed_len));
+            self.commit_striped_layout_meta(
+                file_path,
+                &meta_key,
+                file_type.as_deref(),
+                &block_map_id,
+                &file_uuid,
+                block_count,
+                new_size,
+                fencing_token,
+                &block_mappings,
+                &sizes_to_register,
+                &mut con,
+            )
+            .await?;
+        }
 
-                let read_lru = self.cache.read_lru.clone();
-                let chunk_clone = chunk.clone();
-                let permit = self
-                    .stripe_write_semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .unwrap();
-                tokio::spawn(async move {
-                    let _permit_guard = permit;
-                    if let Err(e) = nvme_writer.write_block(offset, &processed).await {
-                        log::error!(
-                            "Background Stripe upload task failed for block {}: {:?}",
-                            stored_block_key,
-                            e
-                        );
-                    }
-                    // Cache the newly written block in RAM - dehydrated to NVMe on eviction
-                    read_lru.put(&stored_block_key_clone, chunk_clone);
-                });
+        self.metadata_cache.invalidate(file_path);
 
-                offset_cursor = end;
-                block_count += 1;
-            }
+        Ok(())
+    }
 
-            // Register block mappings and reference counts in Garnet
-            let block_map_key = format!("block_map:{}", block_map_id);
-            let refcounts_key_str = crate::fs_key!("block_refcounts");
-            let refcounts_key = &refcounts_key_str;
-            let mut pipe_map = redis::pipe();
-            for (idx_str, key) in &block_mappings {
-                pipe_map.hset(&block_map_key, idx_str, key);
-                pipe_map.hset(refcounts_key, key, 1);
-            }
-            for (key, logical, physical) in &sizes_to_register {
-                pipe_map.hset(
-                    crate::fs_key!("block_sizes"),
-                    key,
-                    format!("{}:{}", logical, physical),
-                );
-            }
-            let _: () = pipe_map.query_async(&mut con).await?;
+    /// Persist `payload` as contiguous stripe blocks on the active backend.
+    ///
+    /// Every block I/O is **awaited**. On any allocate/crypto/write failure, all
+    /// blocks allocated in this call are freed and the error is returned so the
+    /// caller can leave the prior layout (inline/staged) untouched.
+    async fn durable_write_stripe_payload(
+        &self,
+        payload: bytes::Bytes,
+    ) -> Result<(
+        Vec<(String, String)>,       // (block_idx, block_key)
+        Vec<(String, usize, usize)>, // (block_key, logical_len, physical_len)
+        u32,                         // block_count
+    )> {
+        let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let mut block_mappings: Vec<(String, String)> = Vec::new();
+        let mut sizes_to_register: Vec<(String, usize, usize)> = Vec::new();
+        let mut allocated_keys: Vec<String> = Vec::new();
+        let mut offset_cursor = 0usize;
+        let mut block_count = 0u32;
+        let payload_len = payload.len();
 
-            let mut pipe = redis::pipe();
-            pipe.hset(&meta_key, "size", new_size)
-                .hset(&meta_key, "type", "striped")
-                .hset(&meta_key, "block_prefix", format!("blocks/{}", file_uuid))
-                .hset(&meta_key, "block_map_id", &block_map_id)
-                .hset(&meta_key, "num_blocks", block_count)
-                .hset(&meta_key, "fencing_token", fencing_token);
-
-            if file_type.as_deref() == Some("inline") {
-                let inline_key = format!("inline_data:{}", file_path);
-                pipe.del(&inline_key);
-            }
-
-            let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
-                pipe.hdel(&meta_key, "file_id");
-                con.hget(&meta_key, "file_id").await?
-            } else {
-                None
+        while offset_cursor < payload_len {
+            let end = std::cmp::min(offset_cursor + block_size, payload_len);
+            // SAFETY: offset_cursor < payload_len, end clamped to payload_len
+            let chunk = unsafe {
+                let sub = payload.get_unchecked(offset_cursor..end);
+                payload.slice_ref(sub)
             };
 
-            let _: () = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                pipe.query_async(&mut con),
-            )
+            let (be_id, block_allocator, nvme_writer) =
+                match self.backend_router.get_active_backend() {
+                    Ok(res) => res,
+                    Err(e) => {
+                        for k in &allocated_keys {
+                            let _ = self.backend_router.free_block(k).await;
+                        }
+                        return Err(e);
+                    }
+                };
+
+            let offset = match block_allocator.allocate_block().await {
+                Ok(o) => o,
+                Err(e) => {
+                    for k in &allocated_keys {
+                        let _ = self.backend_router.free_block(k).await;
+                    }
+                    return Err(e);
+                }
+            };
+            let stored_block_key = if be_id == "backend_0" {
+                offset.to_string()
+            } else {
+                format!("{}://{}", be_id, offset)
+            };
+            allocated_keys.push(stored_block_key.clone());
+
+            let chunk_len = chunk.len();
+            let processed = match self.get_crypto().process_write(chunk.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    for k in &allocated_keys {
+                        let _ = self.backend_router.free_block(k).await;
+                    }
+                    return Err(e);
+                }
+            };
+            let processed_len = processed.len();
+
+            if let Err(e) = nvme_writer.write_block(offset, &processed).await {
+                for k in &allocated_keys {
+                    let _ = self.backend_router.free_block(k).await;
+                }
+                return Err(e);
+            }
+
+            // Cache plaintext block for subsequent reads (key = block key, not file path).
+            self.cache.read_lru.put(&stored_block_key, chunk);
+
+            block_mappings.push((block_count.to_string(), stored_block_key.clone()));
+            sizes_to_register.push((stored_block_key, chunk_len, processed_len));
+            offset_cursor = end;
+            block_count += 1;
+        }
+
+        Ok((block_mappings, sizes_to_register, block_count))
+    }
+
+    /// Register a completed stripe layout in Garnet only after durable writes.
+    /// Deletes prior inline/staged keys only after the type flip succeeds.
+    async fn commit_striped_layout_meta(
+        &self,
+        file_path: &str,
+        meta_key: &str,
+        file_type: Option<&str>,
+        block_map_id: &str,
+        file_uuid: &str,
+        block_count: u32,
+        size: usize,
+        fencing_token: u64,
+        block_mappings: &[(String, String)],
+        sizes_to_register: &[(String, usize, usize)],
+        con: &mut crate::dlm::MetaConnection,
+    ) -> Result<()> {
+        let block_map_key = format!("block_map:{}", block_map_id);
+        let refcounts_key_str = crate::fs_key!("block_refcounts");
+        let refcounts_key = &refcounts_key_str;
+
+        let mut pipe_map = redis::pipe();
+        for (idx_str, key) in block_mappings {
+            pipe_map.hset(&block_map_key, idx_str, key);
+            pipe_map.hset(refcounts_key, key, 1);
+        }
+        for (key, logical, physical) in sizes_to_register {
+            pipe_map.hset(
+                crate::fs_key!("block_sizes"),
+                key,
+                format!("{}:{}", logical, physical),
+            );
+        }
+        let _: () = pipe_map.query_async(con).await?;
+
+        let mut pipe = redis::pipe();
+        pipe.hset(meta_key, "size", size)
+            .hset(meta_key, "type", "striped")
+            .hset(meta_key, "block_prefix", format!("blocks/{}", file_uuid))
+            .hset(meta_key, "block_map_id", block_map_id)
+            .hset(meta_key, "num_blocks", block_count)
+            .hset(meta_key, "fencing_token", fencing_token);
+
+        if file_type == Some("inline") {
+            let inline_key = format!("inline_data:{}", file_path);
+            pipe.del(&inline_key);
+        }
+
+        let old_file_id: Option<String> = if file_type == Some("staged") {
+            pipe.hdel(meta_key, "file_id");
+            con.hget(meta_key, "file_id").await?
+        } else {
+            None
+        };
+
+        let _: () = tokio::time::timeout(std::time::Duration::from_secs(2), pipe.query_async(con))
             .await
             .map_err(|_| {
                 SqueezefsError::Io(std::io::Error::new(
@@ -1236,46 +1225,18 @@ impl DataRouter {
                 ))
             })??;
 
-            if let Some(old_id) = old_file_id {
-                self.cache.nvme.remove_staged(&old_id);
-                let mapping_key = format!("mapping:{}", old_id);
-                // Decrement refcount of old staged merged block if it exists
-                let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
-                if let Some(bk) = block_key {
-                    let current_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
-                    if let Some(mut r) = current_ref {
-                        r -= 1;
-                        if r <= 0 {
-                            let _: () = redis::pipe()
-                                .hdel(refcounts_key, &bk)
-                                .hdel(crate::fs_key!("block_sizes"), &bk)
-                                .query_async(&mut con)
-                                .await?;
-                            let _ = self.backend_router.free_block(&bk).await;
-                        } else {
-                            let _: () = con.hset(refcounts_key, &bk, r).await?;
-                        }
-                    } else {
-                        let _: () = con
-                            .hdel(crate::fs_key!("block_sizes"), &bk)
-                            .await
-                            .unwrap_or_else(|e| {
-                                log::debug!("non-fatal cleanup op failed: {:?}", e);
-                            });
-                        let _ = self.backend_router.free_block(&bk).await;
-                    }
-                }
-                let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
-                    log::debug!("non-fatal cleanup op failed: {:?}", e);
-                });
-            }
-
-            self.cache.write_lru.remove(file_path);
-            self.cache.read_lru.remove(file_path);
+        if let Some(old_id) = old_file_id {
+            self.cache.nvme.remove_staged(&old_id);
+            let _ = self.decrement_staged_block_refcount(&old_id, con).await;
+            let mapping_key = format!("mapping:{}", old_id);
+            let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
+                log::debug!("non-fatal cleanup op failed: {:?}", e);
+            });
         }
 
+        self.cache.write_lru.remove(file_path);
+        self.cache.read_lru.remove(file_path);
         self.metadata_cache.invalidate(file_path);
-
         Ok(())
     }
 
@@ -1509,15 +1470,29 @@ impl DataRouter {
         }
 
         let mut results = Vec::new();
+        let mut first_err: Option<SqueezefsError> = None;
         let mut tasks_stream = tasks;
         while let Some(task_res) = tasks_stream.next().await {
-            let res = task_res.map_err(|e| {
+            match task_res.map_err(|e| {
                 SqueezefsError::Io(std::io::Error::other(format!(
                     "Block write task panicked: {:?}",
                     e
                 )))
-            })??;
-            results.push(res);
+            }) {
+                Ok(Ok(res)) => results.push(res),
+                Ok(Err(e)) | Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            // Do not commit partial block-map updates; free blocks that did land.
+            for (_b, _old, new_key, _logical, _physical) in &results {
+                let _ = self.backend_router.free_block(new_key).await;
+            }
+            return Err(e);
         }
 
         // 4. Build single Redis pipeline to update mappings

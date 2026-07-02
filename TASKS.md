@@ -56,10 +56,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/routing.rs` (`write_file`, `write_striped`), inline→staged→striped |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `src/routing.rs` (`durable_write_stripe_payload`, `commit_striped_layout_meta`, `write_file` / `write_striped`); fault inject `nvme_dev::FAIL_NEXT_WRITES` |
 | **Why** | Partial Garnet updates + background block writes can leave inconsistent meta vs data on failure. |
 | **Acceptance** | Failure leaves consistent state (retry-safe or rolled back); tests for failed allocate / failed write mid-transition. |
+| **Notes** | Stripe creation now **awaits** block I/O and only then flips meta; allocated blocks freed on failure. `write_striped` frees successful blocks if any task fails before meta commit. Tests: preserve inline/staged on fail, no striped meta on failed first write, retry succeeds. |
 
 ### P0-3 — Background stripe write failure visibility + recovery
 
@@ -432,3 +433,4 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 |------|--------|
 | 2026-07-02 | Task list created from post-audit findings. Completed earlier in session: nvme unaligned leak, FUSE write con scoping, cleanup logging, unaligned test, HPC_AUDIT removal. |
 | 2026-07-02 | **P0-5 done**: `tests/routing_layout_tests.rs` + fix stale full-file LRU on oversized put / layout transition. |
+| 2026-07-02 | **P0-2 done**: durable await + rollback before meta flip; P0-2 failure/retry tests; `FAIL_NEXT_WRITES` inject. |

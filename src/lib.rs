@@ -29,9 +29,9 @@ pub mod defrag;
 pub mod jobs;
 pub mod storage;
 
-use std::sync::Mutex;
+use parking_lot::RwLock;
 
-pub static FS_PREFIX: Mutex<Option<&'static str>> = Mutex::new(None);
+pub static FS_PREFIX: RwLock<&'static str> = RwLock::new("squeezefs");
 
 pub static WRITE_VERIFICATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -45,23 +45,60 @@ pub fn set_write_verification(enabled: bool) {
 }
 
 pub fn fs_prefix() -> &'static str {
-    FS_PREFIX.lock().unwrap().unwrap_or("squeezefs")
+    *FS_PREFIX.read()
 }
 
 pub fn set_fs_prefix(prefix: &str) {
     if !prefix.is_empty() {
         let leaked = Box::leak(prefix.to_string().into_boxed_str());
-        *FS_PREFIX.lock().unwrap() = Some(leaked);
+        *FS_PREFIX.write() = leaked;
     }
 }
 
-pub fn build_fs_key(suffix: &str) -> String {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FsKey(pub compact_str::CompactString);
+
+impl redis::ToRedisArgs for FsKey {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + redis::RedisWrite,
+    {
+        self.0.as_str().write_redis_args(out)
+    }
+}
+
+impl std::ops::Deref for FsKey {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_str()
+    }
+}
+
+impl AsRef<str> for FsKey {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl AsRef<[u8]> for FsKey {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl std::fmt::Display for FsKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+pub fn build_fs_key(suffix: &str) -> FsKey {
     let prefix = fs_prefix();
-    let mut s = String::with_capacity(prefix.len() + 1 + suffix.len());
+    let mut s = compact_str::CompactString::with_capacity(prefix.len() + 1 + suffix.len());
     s.push_str(prefix);
     s.push(':');
     s.push_str(suffix);
-    s
+    FsKey(s)
 }
 
 #[macro_export]

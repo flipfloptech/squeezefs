@@ -714,7 +714,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..
     } = &cli.command
     {
-        let (redis_url, fs_name) = match parse_squeeze_uri(squeeze_uri) {
+        let (redis_url, fs_name) = match resolve_squeeze_uri(Some(squeeze_uri), None) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("{}", e);
@@ -1379,7 +1379,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             upload_delay,
             fuse_io_uring_sqpoll_idle_ms,
         } => {
-            let (redis_url, name) = parse_squeeze_uri(&squeeze_uri)?;
+            let (redis_url, name) = resolve_squeeze_uri(Some(&squeeze_uri), None)?;
             squeezefs::set_fs_prefix(&name);
             let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
             let quick = !full;
@@ -1754,7 +1754,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Commands::Clients { squeeze_uri } => {
-            let (redis_url, name) = parse_squeeze_uri(&squeeze_uri)?;
+            let (redis_url, name) = resolve_squeeze_uri(Some(&squeeze_uri), None)?;
             squeezefs::set_fs_prefix(&name);
             let client = squeezefs::dlm::MetaClient::new(&redis_url)?;
             let mut con = client.get_connection().await?;
@@ -1816,7 +1816,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             job_cpu_limit,
             write_verification,
         } => {
-            let (redis_url_str, fs_name) = parse_squeeze_uri(&squeeze_uri)?;
+            let (redis_url_str, fs_name) = resolve_squeeze_uri(Some(&squeeze_uri), None)?;
             squeezefs::set_fs_prefix(&fs_name);
             squeezefs::set_write_verification(write_verification);
             let writeback = !no_writeback;
@@ -2969,8 +2969,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 staging_dirs = vec![get_default_staging_dir()];
             }
 
-            // 4. Resolve dismount_wait limit (default: 10)
+            // 4. Resolve dismount_wait limit (default: 10) and find active daemon PID
             let mut dismount_wait = 10;
+            let mut daemon_pid: Option<u32> = None;
             if let Ok(client) = redis::Client::open(redis_url.as_str()) {
                 if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
                     let wait_str: Option<String> = con
@@ -2980,6 +2981,27 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(s) = wait_str {
                         if let Ok(w) = s.parse::<u64>() {
                             dismount_wait = w;
+                        }
+                    }
+
+                    // Look up active client matching this mountpoint to find daemon PID
+                    let raw_clients: std::collections::HashMap<String, String> = con
+                        .hgetall(squeezefs::fs_key!("active_clients"))
+                        .await
+                        .unwrap_or_default();
+                    let abs_mountpoint =
+                        std::fs::canonicalize(&mountpoint).unwrap_or_else(|_| mountpoint.clone());
+                    for (_, json_str) in raw_clients {
+                        if let Ok(info) =
+                            serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str)
+                        {
+                            let client_mount = std::path::Path::new(&info.mountpoint);
+                            let abs_client_mount = std::fs::canonicalize(client_mount)
+                                .unwrap_or_else(|_| client_mount.to_path_buf());
+                            if abs_client_mount == abs_mountpoint {
+                                daemon_pid = Some(info.pid);
+                                break;
+                            }
                         }
                     }
                 }
@@ -3345,27 +3367,43 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .arg(&mountpoint)
                 .status();
 
-            match status {
-                Ok(s) if s.success() => {
-                    println!("Successfully unmounted mountpoint {:?}", mountpoint);
-                }
+            let unmount_success = match status {
+                Ok(s) if s.success() => true,
                 _ => {
                     let umount_status = std::process::Command::new("umount")
                         .arg(&mountpoint)
                         .status();
-                    match umount_status {
-                        Ok(s) if s.success() => {
-                            println!("Successfully unmounted mountpoint {:?}", mountpoint);
+                    matches!(umount_status, Ok(s) if s.success())
+                }
+            };
+
+            if unmount_success {
+                println!("Successfully unmounted mountpoint {:?}", mountpoint);
+                if let Some(pid) = daemon_pid {
+                    let proc_path = format!("/proc/{}", pid);
+                    if std::path::Path::new(&proc_path).exists() {
+                        print!("Waiting for background FUSE daemon process (PID {}) to flush data and exit...", pid);
+                        let _ = std::io::stdout().flush();
+                        let start_wait = std::time::Instant::now();
+                        let max_wait = std::time::Duration::from_secs(dismount_wait);
+                        while std::path::Path::new(&proc_path).exists() {
+                            if start_wait.elapsed() >= max_wait {
+                                println!("\nWarning: Background daemon process (PID {}) did not exit within {} seconds.", pid, dismount_wait);
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         }
-                        _ => {
-                            eprintln!(
-                                "Error: Failed to unmount mountpoint {:?}. Try running with sudo.",
-                                mountpoint
-                            );
-                            std::process::exit(1);
+                        if !std::path::Path::new(&proc_path).exists() {
+                            println!(" done.");
                         }
                     }
                 }
+            } else {
+                eprintln!(
+                    "Error: Failed to unmount mountpoint {:?}. Try running with sudo.",
+                    mountpoint
+                );
+                std::process::exit(1);
             }
         }
     }
@@ -4170,6 +4208,17 @@ fn resolve_squeeze_uri(
         if is_uri(uri) {
             return Ok(parse_squeeze_uri(uri)?);
         } else {
+            if !uri.contains('/') && !uri.contains('\\') {
+                if let Ok(garnet_url) = std::env::var("GARNET_URL") {
+                    let host_port = garnet_url
+                        .trim_start_matches("redis://")
+                        .trim_start_matches("redis+cluster://");
+                    let squeeze_format = format!("squeeze://{}/{}", host_port, uri);
+                    if let Ok(res) = parse_squeeze_uri(&squeeze_format) {
+                        return Ok(res);
+                    }
+                }
+            }
             let path = std::path::Path::new(uri);
             return resolve_squeeze_uri(None, Some(path));
         }

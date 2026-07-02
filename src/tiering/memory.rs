@@ -1,22 +1,12 @@
 use bytes::Bytes;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use xxhash_rust::xxh3::xxh3_64;
 
-/// A node in the Clock cache.
-struct ClockNode {
-    value: Bytes,
-    referenced: AtomicBool,
-}
-
-struct EvictionState {
-    queue: VecDeque<Bytes>,
-}
-
 /// A single thread-safe shard of the Clock cache.
 struct MemoryCacheShard {
-    map: scc::HashIndex<Bytes, std::sync::Arc<ClockNode>>,
-    eviction_state: parking_lot::Mutex<EvictionState>,
+    map: scc::HashIndex<Bytes, (Bytes, AtomicBool)>,
+    eviction_queue: crossbeam::queue::SegQueue<Bytes>,
+    eviction_lock: parking_lot::Mutex<()>,
     current_bytes: AtomicUsize,
     max_bytes: usize,
 }
@@ -25,9 +15,8 @@ impl MemoryCacheShard {
     fn new(max_bytes: usize) -> Self {
         Self {
             map: scc::HashIndex::default(),
-            eviction_state: parking_lot::Mutex::new(EvictionState {
-                queue: VecDeque::new(),
-            }),
+            eviction_queue: crossbeam::queue::SegQueue::new(),
+            eviction_lock: parking_lot::Mutex::new(()),
             current_bytes: AtomicUsize::new(0),
             max_bytes,
         }
@@ -35,94 +24,98 @@ impl MemoryCacheShard {
 
     fn get(&self, key: &[u8]) -> Option<Bytes> {
         let entry = self.map.get_sync(key)?;
-        let node = entry.get();
-        node.referenced.store(true, Ordering::Relaxed);
-        Some(node.value.clone())
+        let (value, referenced) = entry.get();
+        referenced.store(true, Ordering::Relaxed);
+        Some(value.clone())
     }
 
     fn put(&self, key: Bytes, value: Bytes, evicted: &mut Vec<(Bytes, Bytes)>) {
         let val_len = value.len();
         if val_len > self.max_bytes {
-            // Value itself is larger than the entire shard capacity
             return;
         }
 
-        let node = std::sync::Arc::new(ClockNode {
-            value: value.clone(),
-            referenced: AtomicBool::new(true),
+        let mut old_len = None;
+        let _ = unsafe {
+            self.map
+                .entry_sync(key.clone())
+                .and_modify(|(old_val, ref_ok)| {
+                    let old = std::mem::replace(old_val, value.clone());
+                    ref_ok.store(true, Ordering::Relaxed);
+                    old_len = Some(old.len());
+                })
+        }
+        .or_insert_with(|| {
+            self.eviction_queue.push(key.clone());
+            self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
+            (value, AtomicBool::new(true))
         });
 
-        let mut state = self.eviction_state.lock();
-
-        let mut old_len = None;
-        if let Some(existing) = self.map.get_sync(&key) {
-            old_len = Some(existing.get().value.len());
-        } // existing guard dropped here
-
-        if let Some(len) = old_len {
-            self.map.remove_sync(&key);
-            let _ = self.map.insert_sync(key.clone(), node);
+        if let Some(old) = old_len {
             self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
-            self.current_bytes.fetch_sub(len, Ordering::Relaxed);
-        } else {
-            let _ = self.map.insert_sync(key.clone(), node);
-            state.queue.push_back(key);
-            self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
+            self.current_bytes.fetch_sub(old, Ordering::Relaxed);
         }
 
-        // Perform Clock eviction if over capacity
-        let mut loops = 0;
-        let max_loops = state.queue.len() * 2;
-        while self.current_bytes.load(Ordering::Relaxed) > self.max_bytes
-            && !state.queue.is_empty()
-            && loops < max_loops
-        {
-            loops += 1;
-            if let Some(evict_key) = state.queue.pop_front() {
-                let mut should_evict = false;
-                let mut len = 0;
-                let mut val = None;
-                if let Some(entry) = self.map.get_sync(&evict_key) {
-                    let node = entry.get();
-                    if node.referenced.load(Ordering::Relaxed) {
-                        node.referenced.store(false, Ordering::Relaxed);
-                        state.queue.push_back(evict_key.clone());
-                    } else {
-                        should_evict = true;
-                        len = node.value.len();
-                        val = Some(node.value.clone());
-                    }
-                } // entry guard dropped here
+        if self.current_bytes.load(Ordering::Relaxed) > self.max_bytes {
+            self.try_evict(evicted);
+        }
+    }
 
-                if should_evict {
-                    self.map.remove_sync(&evict_key);
-                    self.current_bytes.fetch_sub(len, Ordering::Relaxed);
-                    if let Some(v) = val {
-                        evicted.push((evict_key, v));
+    fn try_evict(&self, evicted: &mut Vec<(Bytes, Bytes)>) {
+        if let Some(_guard) = self.eviction_lock.try_lock() {
+            let approx_len = self.eviction_queue.len();
+            let max_loops = std::cmp::max(approx_len * 2, 512);
+            let mut loops = 0;
+
+            while self.current_bytes.load(Ordering::Relaxed) > self.max_bytes && loops < max_loops {
+                loops += 1;
+                if let Some(evict_key) = self.eviction_queue.pop() {
+                    let mut should_evict = false;
+                    let mut len = 0;
+                    let mut val = None;
+
+                    let inspect_res = self.map.entry_sync(evict_key.clone());
+                    match inspect_res {
+                        scc::hash_index::Entry::Occupied(mut entry) => {
+                            let (val_ref, ref_ok) = unsafe { entry.get_mut() };
+                            if ref_ok.load(Ordering::Relaxed) {
+                                ref_ok.store(false, Ordering::Relaxed);
+                                self.eviction_queue.push(evict_key.clone());
+                            } else {
+                                should_evict = true;
+                                len = val_ref.len();
+                                val = Some(val_ref.clone());
+                                entry.remove_entry();
+                            }
+                        }
+                        scc::hash_index::Entry::Vacant(_) => {}
                     }
+
+                    if should_evict {
+                        self.current_bytes.fetch_sub(len, Ordering::Relaxed);
+                        if let Some(v) = val {
+                            evicted.push((evict_key, v));
+                        }
+                    }
+                } else {
+                    break;
                 }
-            } else {
-                break;
             }
         }
     }
 
     fn remove(&self, key: &[u8]) -> Option<Bytes> {
-        let _state = self.eviction_state.lock();
-        let mut val = None;
-        let mut len = 0;
-        if let Some(entry) = self.map.get_sync(key) {
-            let node = entry.get();
-            val = Some(node.value.clone());
-            len = node.value.len();
-        } // entry guard dropped here
-
-        if let Some(v) = val {
-            self.map.remove_sync(key);
-            self.current_bytes.fetch_sub(len, Ordering::Relaxed);
-            Some(v)
-        } else {
-            None
+        let entry = self.map.entry_sync(Bytes::copy_from_slice(key));
+        match entry {
+            scc::hash_index::Entry::Occupied(entry) => {
+                let (val, _) = entry.get();
+                let val_clone = val.clone();
+                let len = val.len();
+                entry.remove_entry();
+                self.current_bytes.fetch_sub(len, Ordering::Relaxed);
+                Some(val_clone)
+            }
+            scc::hash_index::Entry::Vacant(_) => None,
         }
     }
 }
@@ -209,8 +202,7 @@ impl MemoryCache {
     pub fn clear(&self) {
         for shard in &self.shards {
             shard.map.clear_sync();
-            let mut state = shard.eviction_state.lock();
-            state.queue.clear();
+            while shard.eviction_queue.pop().is_some() {}
             shard.current_bytes.store(0, Ordering::Relaxed);
         }
     }
@@ -227,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_memory_cache_basic() {
-        let cache = MemoryCache::new(100, 4); // 100 bytes capacity, 4 shards
+        let cache = MemoryCache::new(200, 4); // 200 bytes capacity, 4 shards
 
         let k1 = Bytes::from("key1");
         let v1 = Bytes::from(vec![0; 20]);
@@ -277,10 +269,22 @@ mod tests {
 
     #[test]
     fn test_scc_api() {
-        let index: scc::HashIndex<String, std::sync::Arc<u32>> = scc::HashIndex::default();
-        let _ = index.insert_sync("key".to_string(), std::sync::Arc::new(42));
-        let entry = index.get_sync("key");
-        assert!(entry.is_some());
-        assert_eq!(**entry.unwrap().get(), 42);
+        let index: scc::HashIndex<String, (String, std::sync::atomic::AtomicBool)> =
+            scc::HashIndex::default();
+        let _ = index.insert_sync(
+            "key".to_string(),
+            ("val".to_string(), std::sync::atomic::AtomicBool::new(true)),
+        );
+        let entry = index.entry_sync("key".to_string());
+        let val = match entry {
+            scc::hash_index::Entry::Occupied(entry) => {
+                let (v, _) = entry.get();
+                let v_clone = v.clone();
+                entry.remove_entry();
+                Some(v_clone)
+            }
+            scc::hash_index::Entry::Vacant(_) => None,
+        };
+        assert_eq!(val, Some("val".to_string()));
     }
 }

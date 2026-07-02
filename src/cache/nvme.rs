@@ -103,6 +103,8 @@ pub struct NvmeStaging {
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
     pub current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub space_freed_notify: std::sync::Arc<tokio::sync::Notify>,
+    pub staged_writes_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub staged_drained_notify: std::sync::Arc<tokio::sync::Notify>,
 
     // Hypertier NVMe cache instances
     pub read_nvme_cache: std::sync::Arc<crate::tiering::nvme::NvmeCache>,
@@ -245,6 +247,10 @@ impl NvmeStaging {
                 initial_write_bytes,
             )),
             space_freed_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            staged_writes_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                staging_nvme_cache.list_keys().len(),
+            )),
+            staged_drained_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             read_nvme_cache,
             staging_nvme_cache,
             dht_node: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -338,11 +344,17 @@ impl NvmeStaging {
 
         let payload_bytes = Bytes::from(packed_payload);
 
+        let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
         // Memory-mapped copy (lock-free, zero disk syscall wait)
         self.staging_nvme_cache.put(key_bytes, payload_bytes);
 
         self.current_staged_write_bytes
             .fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
+
+        if is_new {
+            self.staged_writes_in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
 
         info!(
             "NVMe Staging: Staged write for file {} (ID: {}) size = {} bytes. Acknowledging write to OS.",
@@ -385,14 +397,26 @@ impl NvmeStaging {
         let key_bytes = Bytes::copy_from_slice(key.as_bytes());
         let payload_bytes = Bytes::from(packed_payload);
 
+        let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
         self.staging_nvme_cache.put(key_bytes, payload_bytes);
+        if is_new {
+            self.staged_writes_in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Remove a packed active block write from staging_nvme_cache.
     pub fn remove_active_block(&self, key: &str) -> Option<Vec<u8>> {
         let val = self.read_staged(key);
         let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-        self.staging_nvme_cache.remove(&key_bytes);
+        if self.staging_nvme_cache.remove(&key_bytes).is_some() {
+            let prev = self
+                .staged_writes_in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if prev == 1 {
+                self.staged_drained_notify.notify_waiters();
+            }
+        }
         val
     }
 
@@ -478,6 +502,8 @@ impl NvmeStaging {
         let staged_bytes = self.current_staged_write_bytes.clone();
         let space_freed_notify = self.space_freed_notify.clone();
         let staging_nvme_cache = self.staging_nvme_cache.clone();
+        let staged_writes_in_flight = self.staged_writes_in_flight.clone();
+        let staged_drained_notify = self.staged_drained_notify.clone();
 
         tokio::spawn(async move {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
@@ -519,7 +545,7 @@ impl NvmeStaging {
 
                         if current_bytes >= max_batch_bytes {
                             info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify).await {
                                 error!("Failed to flush NVMe staging batch: {:?}", e);
                             }
                         }
@@ -527,7 +553,7 @@ impl NvmeStaging {
                     _ = &mut sleep => {
                         if !batch.is_empty() {
                             info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify).await {
                                 error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
                             }
                         }
@@ -549,6 +575,8 @@ impl NvmeStaging {
         >,
         default_allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
         default_writer: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+        staged_writes_in_flight: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        staged_drained_notify: &tokio::sync::Notify,
     ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -692,7 +720,13 @@ impl NvmeStaging {
 
         for item in batch.iter() {
             let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
-            staging_nvme_cache.remove(&key_bytes);
+            if staging_nvme_cache.remove(&key_bytes).is_some() {
+                let prev =
+                    staged_writes_in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if prev == 1 {
+                    staged_drained_notify.notify_waiters();
+                }
+            }
             let mut val = staged_bytes.load(std::sync::atomic::Ordering::Relaxed);
             loop {
                 let new_val = val.saturating_sub(item.padded_size);

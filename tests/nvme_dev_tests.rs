@@ -62,3 +62,40 @@ async fn test_read_block_from_offset() {
         "Data read from block device should match exactly"
     );
 }
+
+#[tokio::test]
+async fn test_concurrent_stress() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    // Ensure file is large enough for concurrent writes/reads
+    let file = File::create(&path).unwrap();
+    file.set_len(16 * 1024 * 1024).unwrap(); // 16MB
+
+    let writer = std::sync::Arc::new(NvmeBlockDev::new(path.to_str().unwrap()));
+
+    let mut handles = vec![];
+    let concurrency = 256; // Make sure this is larger than physical cores to cause collision
+
+    for i in 0..concurrency {
+        let writer_clone = writer.clone();
+        let handle = tokio::spawn(async move {
+            let offset = (i % 4) * 4 * 1024 * 1024; // 4MB blocks
+            let data = vec![i as u8; 4 * 1024 * 1024];
+            writer_clone
+                .write_block(offset as u64, &data)
+                .await
+                .unwrap();
+            let read_back = writer_clone
+                .read_block(offset as u64, 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(read_back.len(), 4 * 1024 * 1024);
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}

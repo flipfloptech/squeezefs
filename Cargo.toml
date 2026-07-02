@@ -51,6 +51,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crossbeam = "0.8"
 scc = "3.8.3"
 arc-swap = "1.7"
+compact_str = "0.8"
 
 [features]
 default = []
@@ -87,5 +88,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-Clink-arg=-Wl,--no-rosegment"]

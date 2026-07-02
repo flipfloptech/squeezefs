@@ -45,7 +45,7 @@ cargo build --release
 2. **Format the filesystem volume** (this sets up block allocation maps for your NVMe device in Garnet using SqueezeFS URI):
    ```bash
    ./target/release/squeezefs format squeeze://127.0.0.1:6379/squeezefs-volume \
-     --nvme-target-path /dev/main-pool/my-vol
+     --volume /dev/main-pool/my-vol
    ```
 
 3. **Create the mount point and local staging directories**:
@@ -58,7 +58,7 @@ cargo build --release
    ```bash
    ./target/release/squeezefs mount squeeze://127.0.0.1:6379/squeezefs-volume /mnt/squeezefs \
      --disk-cache-paths /tmp/squeezefs_staging \
-     --nvme-path /dev/main-pool/my-vol \
+     --volume /dev/main-pool/my-vol \
      --daemon \
      --log-file /tmp/squeezefs.log \
      --uid 1000 \
@@ -107,16 +107,16 @@ When deploying on a multi-node cluster where hosts are equipped with multiple ph
 To compile SPDK from source, set up local hugepages, selectively bind target NVMe SSDs to user-space, and launch the user-space target daemon (`nvmf_tgt` listener) in the background:
 ```bash
 # 1. Compile SPDK from source and install system dependencies to /opt/spdk
-sudo ./target/release/squeezefs nvmeof spdk-install
+sudo ./target/release/squeezefs storage nvmeof spdk-install
 
 # 2. Configure hugepages safely (defaults to 2GB, supports 4GB) without unbinding system disks
-sudo ./target/release/squeezefs nvmeof spdk-setup --hugepages 2GB
+sudo ./target/release/squeezefs storage nvmeof spdk-setup --hugepages 2GB
 
 # 3. Selectively bind only a specific secondary NVMe SSD PCIe controller to SPDK
-sudo ./target/release/squeezefs nvmeof spdk-bind --pci 0000:02:00.0
+sudo ./target/release/squeezefs storage nvmeof spdk-bind --pci 0000:02:00.0
 
 # 4. Start the background SPDK target daemon (nvmf_tgt)
-sudo ./target/release/squeezefs nvmeof spdk-start
+sudo ./target/release/squeezefs storage nvmeof spdk-start
 ```
 This maps only the selected data NVMe drives to SPDK polled user-space drivers while keeping your system OS disk safe under kernel control.
 
@@ -124,7 +124,7 @@ This maps only the selected data NVMe drives to SPDK polled user-space drivers w
 To share a local backing file or NVMe block device using the high-performance user-space SPDK target (`nvmf_tgt` listener):
 ```bash
 # Share a backing disk as SPDK NVMe-oF subsystem target
-sudo ./target/release/squeezefs nvmeof share /dev/nvme0n1 --spdk --port 4420 --ip 10.10.10.50
+sudo ./target/release/squeezefs storage nvmeof share /dev/nvme0n1 --spdk --port 4420 --ip 10.10.10.50
 ```
 This sends JSON-RPC requests directly to the SPDK daemon listening at `/var/tmp/spdk.sock` to construct bdevs, subsystems, namespaces, and bind TCP listeners, achieving bare-metal polling throughput.
 
@@ -132,15 +132,15 @@ This sends JSON-RPC requests directly to the SPDK daemon listening at `/var/tmp/
 To connect to an NVMe over Fabrics target device (fully compatible with standard Linux targets and user-space SPDK targets) before mounting:
 ```bash
 # Connect to the remote storage cluster
-sudo ./target/release/squeezefs nvmeof connect --ip 10.10.10.50 --subnqn nqn.2026-06.org.squeezefs:data
+sudo ./target/release/squeezefs storage nvmeof connect --ip 10.10.10.50 --subnqn nqn.2026-06.org.squeezefs:data
 
 # Create pool and volume spanning the fabric-attached block device
 sudo ./target/release/squeezefs storage pool create fabric-pool /dev/nvme1n1
 sudo ./target/release/squeezefs storage volume create fabric-pool my-fabric-vol --size 1P
 
 # Format and mount the fabric-attached volume
-sudo ./target/release/squeezefs format default --nvme-target-path /dev/fabric-pool/my-fabric-vol
-sudo ./target/release/squeezefs mount /mnt/squeezefs --nvme-path /dev/fabric-pool/my-fabric-vol --local-ips 10.10.10.1,10.10.20.1
+sudo ./target/release/squeezefs format default --volume /dev/fabric-pool/my-fabric-vol
+sudo ./target/release/squeezefs mount default /mnt/squeezefs --volume /dev/fabric-pool/my-fabric-vol --local-ips 10.10.10.1,10.10.20.1
 ```
 
 * **Load Balancing:** All IO operations will cycle and balance round-robin between the two local IPs traversing the fabric.
@@ -171,7 +171,7 @@ If you do not have a dedicated local NVMe staging drive or want to evaluate Sque
 ```bash
 ./target/release/squeezefs mount squeeze://127.0.0.1:6379/squeezefs-volume /mnt/squeezefs \
   --disk-cache-paths memory \
-  --nvme-path /dev/main-pool/my-vol \
+  --volume /dev/main-pool/my-vol \
   --daemon
 ```
 * **Memory Staging:** Specifying `memory` (or `none`) directs SqueezeFS to spin up virtual `MmapMut::map_anon` segments in RAM, completely bypassing local disk operations.

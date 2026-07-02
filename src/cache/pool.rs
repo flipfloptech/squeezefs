@@ -94,3 +94,69 @@ impl AsRef<[u8]> for ReadBlockValue {
         self.deref()
     }
 }
+
+pub struct AlignedBufPool {
+    queue: ArrayQueue<*mut u8>,
+    buf_size: usize,
+}
+
+unsafe impl Send for AlignedBufPool {}
+unsafe impl Sync for AlignedBufPool {}
+
+pub struct AlignedBufOwner {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+unsafe impl Send for AlignedBufOwner {}
+unsafe impl Sync for AlignedBufOwner {}
+
+impl AsRef<[u8]> for AlignedBufOwner {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBufOwner {
+    fn drop(&mut self) {
+        let _ = ALIGNED_BUF_POOL.queue.push(self.ptr);
+    }
+}
+
+impl AlignedBufPool {
+    pub fn new(capacity: usize, buf_size: usize) -> Self {
+        let queue = ArrayQueue::new(capacity);
+        let layout = std::alloc::Layout::from_size_align(buf_size, 4096).unwrap();
+        for _ in 0..capacity {
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            assert!(!ptr.is_null());
+            let _ = queue.push(ptr);
+        }
+        Self { queue, buf_size }
+    }
+
+    pub fn alloc(self: &Arc<Self>) -> (*mut u8, bytes::Bytes) {
+        let ptr = self.queue.pop().unwrap_or_else(|| {
+            let layout = std::alloc::Layout::from_size_align(self.buf_size, 4096).unwrap();
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            assert!(!ptr.is_null());
+            ptr
+        });
+
+        let owner = AlignedBufOwner {
+            ptr,
+            len: self.buf_size,
+        };
+        let bytes = bytes::Bytes::from_owner(owner);
+
+        (ptr, bytes)
+    }
+}
+
+pub static ALIGNED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let capacity = std::cmp::max(cores * 16, 64);
+    Arc::new(AlignedBufPool::new(capacity, 4 * 1024 * 1024))
+});

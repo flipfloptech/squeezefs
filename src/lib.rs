@@ -2,6 +2,7 @@
 pub mod nvme_dev;
 pub mod tiering;
 
+pub mod bg_admit;
 pub mod cache;
 pub mod config_ops;
 pub mod crypto_compress;

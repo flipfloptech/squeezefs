@@ -812,7 +812,8 @@ impl NvmeStaging {
         if let Some(dht) = self.dht_node.get() {
             let dht_clone = dht.clone();
             let key_hash = xxh3_64(block_key.as_bytes());
-            tokio::spawn(async move {
+            // P1-5: best-effort peer publish under global admission.
+            crate::bg_admit::spawn_bg(async move {
                 let owners = dht_clone.find_closest_peers(key_hash, 3);
                 if let Some(primary_owner) = owners.first() {
                     if primary_owner != dht_clone.peer_addr() {
@@ -828,7 +829,7 @@ impl NvmeStaging {
             let redis_client = self.redis_client.clone();
             let block_key = block_key.to_string();
             let p2p_addr = p2p_addr.clone();
-            tokio::spawn(async move {
+            crate::bg_admit::spawn_bg(async move {
                 if let Ok(mut con) = redis_client.get_connection().await {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

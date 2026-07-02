@@ -147,10 +147,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | **partial** (stripe create awaits in P0-2; writeback uses semaphore; remaining prefetch/DHT spawns low-risk) |
-| **Location** | Stripe uploads, prefetch, dehydration, `cache_read_block` |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `src/bg_admit.rs`; prefetch via `spawn_bg` + `buffer_unordered`; striped reads via `STRIPED_IO_SEM` / ordered `buffer_unordered`; DHT/peer publish via `spawn_bg` |
 | **Why** | Untracked tasks → task explosion. |
 | **Acceptance** | Semaphore / JoinSet / global inflight limit; no unbounded spawn on hot path. |
+| **Notes** | Best-effort work is **dropped** when `BG_TASK_SEM` is full (bounded memory). Critical striped reads wait on a separate `STRIPED_IO_SEM` (cap 16). Write_striped already used per-mount stripe semaphore (P0-2). |
 
 ### P1-6 — Uring request channel pressure
 
@@ -443,3 +444,4 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 | 2026-07-02 | **P0-4 done**: lease re-validation, recovery binary meta fix, crash_consistency_tests. |
 | 2026-07-02 | **P0-6 done**: MULTI/EXEC meta commits; lock SET-then-INCR; atomic_meta_tests. |
 | 2026-07-02 | **P1 resource/backpressure**: P1-1..4,6,7,9,11 done; P1-5/8/10 partial/open. |
+| 2026-07-02 | **P1-5 done**: bg_admit pool + striped read concurrency limits; bg_admit_tests. |

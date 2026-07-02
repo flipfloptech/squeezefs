@@ -83,10 +83,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | New tests (e.g. `tests/routing_layout_tests.rs`) |
+| **Status** | **done** (2026-07-02) |
+| **Location** | `tests/routing_layout_tests.rs` (+ `src/tiering/memory.rs`, `src/cache/lru.rs`, `src/routing.rs` fix for stale full-file LRU) |
 | **Why** | No cargo-level tests for inline→staged→striped / RMW; external pjdfstest only. |
 | **Acceptance** | Automated tests (Garnet + temp block file) for transitions, RMW, truncate, concurrent same-inode writes. |
+| **Notes** | 10 tests cover inline/staged/striped, inline→striped, staged→striped, RMW (mid + cross-block), delete+rewrite (truncate-to-zero data path), concurrent same-inode under FUSE-like mutex, stale fencing. Tests exposed a real bug: oversized cache `put` left smaller stale entries, so growing staged→striped could read the old size from LRU. |
 
 ### P0-6 — Metadata write atomicity (MULTI/EXEC or Lua)
 
@@ -430,3 +431,4 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 | Date | Notes |
 |------|--------|
 | 2026-07-02 | Task list created from post-audit findings. Completed earlier in session: nvme unaligned leak, FUSE write con scoping, cleanup logging, unaligned test, HPC_AUDIT removal. |
+| 2026-07-02 | **P0-5 done**: `tests/routing_layout_tests.rs` + fix stale full-file LRU on oversized put / layout transition. |

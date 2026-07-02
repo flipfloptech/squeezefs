@@ -31,7 +31,10 @@ impl MemoryCacheShard {
 
     fn put(&self, key: Bytes, value: Bytes, evicted: &mut Vec<(Bytes, Bytes)>) {
         let val_len = value.len();
+        // Oversized values cannot live in this shard. Remove any smaller stale
+        // entry under the same key so readers never observe a truncated prior write.
         if val_len > self.max_bytes {
+            let _ = self.remove(&key);
             return;
         }
 

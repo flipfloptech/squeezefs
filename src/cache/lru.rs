@@ -86,6 +86,10 @@ impl LruCache {
                     let _ = self.evict_tx.try_send((k_str, ev));
                 }
             }
+        } else {
+            // Do not leave a smaller stale entry under this key when the new
+            // payload exceeds the cache budget (e.g. layout growth RMW).
+            self.inner.remove(key.as_bytes());
         }
     }
 

@@ -924,6 +924,12 @@ impl DataRouter {
                 });
             }
 
+            // Drop full-file LRU entries before the block-level write. A smaller
+            // staged/inline image must not shadow the post-transition striped size.
+            self.cache.write_lru.remove(file_path);
+            self.cache.read_lru.remove(file_path);
+            self.metadata_cache.invalidate(file_path);
+
             // Now that layout is transitioned to "striped", perform the write block-by-block
             self.write_striped(
                 file_path,

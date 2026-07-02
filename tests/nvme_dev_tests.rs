@@ -128,3 +128,68 @@ async fn test_write_unaligned_size() {
         .expect("read after unaligned write");
     assert_eq!(read_back.as_ref(), data.as_slice());
 }
+
+/// P0-1: Dropping the device while unaligned writes are in flight must join the
+/// uring worker cleanly (no hang) and free unaligned buffers on exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_drop_device_during_unaligned_writes_joins_cleanly() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    let file = File::create(&path).unwrap();
+    file.set_len(16 * 1024 * 1024).unwrap();
+
+    let writer = Arc::new(NvmeBlockDev::new(path.to_str().unwrap()));
+    let mut handles = Vec::new();
+    for i in 0..64 {
+        let w = writer.clone();
+        handles.push(tokio::spawn(async move {
+            // Force unaligned path (size not multiple of 4k, heap ptr rarely 4k-aligned).
+            let data: Vec<u8> = (0u8..200).map(|x| x.wrapping_add(i as u8)).collect();
+            let offset = ((i % 8) * 4096) as u64;
+            w.write_block(offset, &data).await
+        }));
+    }
+
+    // Drop our Arc while tasks may still be in flight; last Arc drop joins worker.
+    drop(writer);
+
+    let start = Instant::now();
+    for h in handles {
+        // Results may be Ok or Err (shutdown); must not hang.
+        let _ = h.await.expect("task join");
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(30),
+        "worker join under concurrent unaligned writes must complete promptly"
+    );
+}
+
+/// P0-1: Explicit drop after a burst of unaligned writes must not hang on join.
+#[tokio::test]
+async fn test_drop_after_unaligned_burst_does_not_hang() {
+    use std::time::{Duration, Instant};
+
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    let file = File::create(&path).unwrap();
+    file.set_len(8 * 1024 * 1024).unwrap();
+
+    let writer = NvmeBlockDev::new(path.to_str().unwrap());
+    for i in 0..32 {
+        let data: Vec<u8> = (0u8..177).map(|x| x.wrapping_add(i as u8)).collect();
+        writer
+            .write_block((i % 4) * 4096, &data)
+            .await
+            .expect("unaligned write in burst");
+    }
+
+    let start = Instant::now();
+    drop(writer);
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "Drop/join of uring worker after unaligned burst must be prompt"
+    );
+}

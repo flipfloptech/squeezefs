@@ -99,3 +99,32 @@ async fn test_concurrent_stress() {
         handle.await.unwrap();
     }
 }
+
+/// Exercise the unaligned write path (posix_memalign + copy in nvme_dev) to prevent
+/// regressions in buffer management / leaks on that branch.
+#[tokio::test]
+async fn test_write_unaligned_size() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let file = File::create(&path).unwrap();
+    file.set_len(8 * 1024 * 1024).unwrap();
+
+    let writer = NvmeBlockDev::new(path.to_str().unwrap());
+
+    // Small size that is unlikely to be 4k-aligned in memory from vec, plus non-multiple.
+    let data: Vec<u8> = (0u8..123).collect();
+    let offset = 4096u64; // within first block but offset aligned for device
+
+    writer
+        .write_block(offset, &data)
+        .await
+        .expect("unaligned write should succeed");
+
+    // Read back and compare (read path uses aligned pool)
+    let read_back = writer
+        .read_block(offset, data.len())
+        .await
+        .expect("read after unaligned write");
+    assert_eq!(read_back.as_ref(), data.as_slice());
+}

@@ -228,7 +228,9 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                             }
                         }
                         if let Some(p) = act.free_ptr {
-                            libc::free(p.0 as *mut libc::c_void);
+                            if !p.0.is_null() {
+                                libc::free(p.0 as *mut libc::c_void);
+                            }
                         }
                     }
                     free_slots.push(slot_idx);
@@ -281,7 +283,11 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     }
 
                     if let Some(p) = act.free_ptr {
-                        unsafe { libc::free(p.0 as *mut libc::c_void) };
+                        if !p.0.is_null() {
+                            unsafe {
+                                libc::free(p.0 as *mut libc::c_void);
+                            }
+                        }
                     }
                 }
 
@@ -318,16 +324,31 @@ impl NvmeBlockDev {
         let data_len = data.len();
         let alignment = 4096;
 
-        let data_type = if (data.as_ptr() as usize) % alignment == 0 && data_len % alignment == 0 {
+        let rx_oneshot = if (data.as_ptr() as usize) % alignment == 0 && data_len % alignment == 0 {
             let data_ptr = data.as_ptr() as usize;
-            WriteData::Aligned {
+            let data_type = WriteData::Aligned {
                 ptr: SendConstPtr(data_ptr as *const u8),
                 len: data_len,
-            }
+            };
+            let (tx, rx) = oneshot::channel();
+            self.worker
+                .tx
+                .send(UringRequest::Write {
+                    offset,
+                    data: data_type,
+                    tx,
+                })
+                .map_err(|e| {
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "Failed to send write request to worker: {:?}",
+                        e
+                    ))
+                })?;
+            rx
         } else {
             let aligned_len = (data_len + 4095) & !4095;
-            let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
-            unsafe {
+            let rp = unsafe {
+                let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
                 if libc::posix_memalign(&mut buf_ptr, alignment, aligned_len) != 0 {
                     return Err(crate::error::SqueezefsError::InvalidOperation(
                         "posix_memalign failed for write block".to_string(),
@@ -341,27 +362,35 @@ impl NvmeBlockDev {
                         aligned_len - data_len,
                     );
                 }
-            }
-            WriteData::Unaligned {
-                ptr: SendPtr(buf_ptr as *mut u8),
+                buf_ptr as *mut u8
+            };
+            let data_type = WriteData::Unaligned {
+                ptr: SendPtr(rp),
                 len: aligned_len,
+            };
+            let (tx, rx) = oneshot::channel();
+            if self
+                .worker
+                .tx
+                .send(UringRequest::Write {
+                    offset,
+                    data: data_type,
+                    tx,
+                })
+                .is_err()
+            {
+                // Send failed; worker never took ownership. Free immediately.
+                unsafe {
+                    libc::free(rp as *mut libc::c_void);
+                }
+                return Err(crate::error::SqueezefsError::InvalidOperation(
+                    "Failed to send write request to worker".to_string(),
+                ));
             }
+            // rp raw pointer value was copied into SendPtr inside the sent message.
+            // The local `rp` binding ends with this block; no !Send value crosses the await below.
+            rx
         };
-
-        let (tx, rx_oneshot) = oneshot::channel();
-        self.worker
-            .tx
-            .send(UringRequest::Write {
-                offset,
-                data: data_type,
-                tx,
-            })
-            .map_err(|e| {
-                crate::error::SqueezefsError::InvalidOperation(format!(
-                    "Failed to send write request to worker: {:?}",
-                    e
-                ))
-            })?;
 
         rx_oneshot.await.map_err(|e| {
             crate::error::SqueezefsError::InvalidOperation(format!(

@@ -136,13 +136,7 @@ impl AlignedBufPool {
     }
 
     pub fn alloc(self: &Arc<Self>) -> (*mut u8, bytes::Bytes) {
-        let ptr = self.queue.pop().unwrap_or_else(|| {
-            let layout = std::alloc::Layout::from_size_align(self.buf_size, 4096).unwrap();
-            let ptr = unsafe { std::alloc::alloc(layout) };
-            assert!(!ptr.is_null());
-            ptr
-        });
-
+        let ptr = self.alloc_raw();
         let owner = AlignedBufOwner {
             ptr,
             len: self.buf_size,
@@ -150,6 +144,35 @@ impl AlignedBufPool {
         let bytes = bytes::Bytes::from_owner(owner);
 
         (ptr, bytes)
+    }
+
+    /// Take a 4096-aligned buffer of [`Self::buf_size`] without wrapping in
+    /// `Bytes` (P2-4: nvme unaligned write path recycles via [`Self::recycle`]).
+    pub fn alloc_raw(self: &Arc<Self>) -> *mut u8 {
+        self.queue.pop().unwrap_or_else(|| {
+            let layout = std::alloc::Layout::from_size_align(self.buf_size, 4096).unwrap();
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            assert!(!ptr.is_null());
+            ptr
+        })
+    }
+
+    /// Return a buffer previously obtained from [`Self::alloc_raw`].
+    pub fn recycle(self: &Arc<Self>, ptr: *mut u8) {
+        if ptr.is_null() {
+            return;
+        }
+        if self.queue.push(ptr).is_err() {
+            // Pool full — free the over-capacity buffer.
+            let layout = std::alloc::Layout::from_size_align(self.buf_size, 4096).unwrap();
+            unsafe {
+                std::alloc::dealloc(ptr, layout);
+            }
+        }
+    }
+
+    pub fn buf_size(&self) -> usize {
+        self.buf_size
     }
 }
 

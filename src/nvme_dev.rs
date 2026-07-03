@@ -50,8 +50,57 @@ unsafe impl Send for SendConstPtr {}
 unsafe impl Sync for SendConstPtr {}
 
 enum WriteData {
-    Aligned { ptr: SendConstPtr, len: usize },
-    Unaligned { ptr: SendPtr, len: usize },
+    Aligned {
+        ptr: SendConstPtr,
+        len: usize,
+    },
+    /// Heap buffer from `posix_memalign` — free with `libc::free`.
+    Unaligned {
+        ptr: SendPtr,
+        len: usize,
+    },
+    /// Buffer from [`crate::cache::ALIGNED_BUF_POOL`] — recycle on completion (P2-4).
+    PooledUnaligned {
+        ptr: SendPtr,
+        len: usize,
+    },
+}
+
+fn release_write_buf(data: &WriteData) {
+    match data {
+        WriteData::Aligned { .. } => {}
+        WriteData::Unaligned { ptr, .. } => {
+            if !ptr.0.is_null() {
+                unsafe {
+                    libc::free(ptr.0 as *mut libc::c_void);
+                }
+            }
+        }
+        WriteData::PooledUnaligned { ptr, .. } => {
+            crate::cache::ALIGNED_BUF_POOL.recycle(ptr.0);
+        }
+    }
+}
+
+fn release_free_ptr(kind: FreePtrKind, p: SendPtr) {
+    match kind {
+        FreePtrKind::Libc => {
+            if !p.0.is_null() {
+                unsafe {
+                    libc::free(p.0 as *mut libc::c_void);
+                }
+            }
+        }
+        FreePtrKind::Pool => {
+            crate::cache::ALIGNED_BUF_POOL.recycle(p.0);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FreePtrKind {
+    Libc,
+    Pool,
 }
 
 enum UringRequest {
@@ -162,7 +211,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
 
     struct ActiveReq {
         response: UringResponse,
-        free_ptr: Option<SendPtr>,
+        free_ptr: Option<(FreePtrKind, SendPtr)>,
     }
 
     let mut active: Vec<Option<ActiveReq>> = Vec::with_capacity(1024);
@@ -229,7 +278,12 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                 UringRequest::Write { offset, data, tx } => {
                     let (ptr, len, free_ptr) = match data {
                         WriteData::Aligned { ptr, len } => (ptr.0, len, None),
-                        WriteData::Unaligned { ptr, len } => (ptr.0 as *const u8, len, Some(ptr)),
+                        WriteData::Unaligned { ptr, len } => {
+                            (ptr.0 as *const u8, len, Some((FreePtrKind::Libc, ptr)))
+                        }
+                        WriteData::PooledUnaligned { ptr, len } => {
+                            (ptr.0 as *const u8, len, Some((FreePtrKind::Pool, ptr)))
+                        }
                     };
                     active[slot_idx] = Some(ActiveReq {
                         response: UringResponse::Write { tx },
@@ -264,10 +318,8 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                                 )));
                             }
                         }
-                        if let Some(p) = act.free_ptr {
-                            if !p.0.is_null() {
-                                libc::free(p.0 as *mut libc::c_void);
-                            }
+                        if let Some((kind, p)) = act.free_ptr {
+                            release_free_ptr(kind, p);
                         }
                     }
                     free_slots.push(slot_idx);
@@ -319,12 +371,8 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         }
                     }
 
-                    if let Some(p) = act.free_ptr {
-                        if !p.0.is_null() {
-                            unsafe {
-                                libc::free(p.0 as *mut libc::c_void);
-                            }
-                        }
+                    if let Some((kind, p)) = act.free_ptr {
+                        release_free_ptr(kind, p);
                     }
                 }
 
@@ -348,13 +396,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
     while let Ok(req) = rx.try_recv() {
         match req {
             UringRequest::Write { data, tx, .. } => {
-                if let WriteData::Unaligned { ptr, .. } = data {
-                    if !ptr.0.is_null() {
-                        unsafe {
-                            libc::free(ptr.0 as *mut libc::c_void);
-                        }
-                    }
-                }
+                release_write_buf(&data);
                 let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
                     "NvmeBlockDev worker shutting down".to_string(),
                 )));
@@ -382,12 +424,8 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     )));
                 }
             }
-            if let Some(p) = free_ptr {
-                if !p.0.is_null() {
-                    unsafe {
-                        libc::free(p.0 as *mut libc::c_void);
-                    }
-                }
+            if let Some((kind, p)) = free_ptr {
+                release_free_ptr(kind, p);
             }
         }
     }
@@ -454,27 +492,61 @@ impl NvmeBlockDev {
                 })?;
             rx
         } else {
+            // P2-4: prefer the process-wide 4K-aligned buffer pool for typical
+            // block sizes; fall back to posix_memalign only when the write is
+            // larger than the pool buffer.
             let aligned_len = (data_len + 4095) & !4095;
-            let rp = unsafe {
-                let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
-                if libc::posix_memalign(&mut buf_ptr, alignment, aligned_len) != 0 {
-                    return Err(crate::error::SqueezefsError::InvalidOperation(
-                        "posix_memalign failed for write block".to_string(),
-                    ));
-                }
-                libc::memcpy(buf_ptr, data.as_ptr() as *const libc::c_void, data_len);
-                if aligned_len > data_len {
-                    libc::memset(
-                        (buf_ptr as usize + data_len) as *mut libc::c_void,
-                        0,
-                        aligned_len - data_len,
+            let pool = &crate::cache::ALIGNED_BUF_POOL;
+            let use_pool = aligned_len <= pool.buf_size();
+
+            let (rp, data_type) = if use_pool {
+                let rp = pool.alloc_raw();
+                unsafe {
+                    libc::memcpy(
+                        rp as *mut libc::c_void,
+                        data.as_ptr() as *const libc::c_void,
+                        data_len,
                     );
+                    if aligned_len > data_len {
+                        libc::memset(
+                            (rp as usize + data_len) as *mut libc::c_void,
+                            0,
+                            aligned_len - data_len,
+                        );
+                    }
                 }
-                buf_ptr as *mut u8
-            };
-            let data_type = WriteData::Unaligned {
-                ptr: SendPtr(rp),
-                len: aligned_len,
+                (
+                    rp,
+                    WriteData::PooledUnaligned {
+                        ptr: SendPtr(rp),
+                        len: aligned_len,
+                    },
+                )
+            } else {
+                let rp = unsafe {
+                    let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
+                    if libc::posix_memalign(&mut buf_ptr, alignment, aligned_len) != 0 {
+                        return Err(crate::error::SqueezefsError::InvalidOperation(
+                            "posix_memalign failed for write block".to_string(),
+                        ));
+                    }
+                    libc::memcpy(buf_ptr, data.as_ptr() as *const libc::c_void, data_len);
+                    if aligned_len > data_len {
+                        libc::memset(
+                            (buf_ptr as usize + data_len) as *mut libc::c_void,
+                            0,
+                            aligned_len - data_len,
+                        );
+                    }
+                    buf_ptr as *mut u8
+                };
+                (
+                    rp,
+                    WriteData::Unaligned {
+                        ptr: SendPtr(rp),
+                        len: aligned_len,
+                    },
+                )
             };
             let (tx, rx) = oneshot::channel();
             if self
@@ -487,9 +559,13 @@ impl NvmeBlockDev {
                 })
                 .is_err()
             {
-                // Send failed; worker never took ownership. Free immediately.
-                unsafe {
-                    libc::free(rp as *mut libc::c_void);
+                // Send failed; worker never took ownership. Release immediately.
+                if use_pool {
+                    pool.recycle(rp);
+                } else {
+                    unsafe {
+                        libc::free(rp as *mut libc::c_void);
+                    }
                 }
                 return Err(crate::error::SqueezefsError::InvalidOperation(
                     "Uring request queue full or closed (backpressure)".to_string(),

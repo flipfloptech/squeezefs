@@ -1248,26 +1248,20 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(reply) => reply,
         };
 
-        // Advertise FUSE_OVER_IO_URING only when the kernel module has it enabled.
-        // Advertising then failing to REGISTER hangs the mount (kernel stops using
-        // classical /dev/fuse for new requests). No userspace opt-out — only the
-        // kernel fuse.enable_uring knob gates this.
+        // Always advertise FUSE_OVER_IO_URING — required transport (no classical opt-out).
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         let flags2 = {
-            let want = crate::raw::connection::fuse_over_uring::kernel_fuse_uring_enabled();
-            if want {
-                debug!("advertising FUSE_OVER_IO_URING in init flags2");
-                crate::raw::connection::fuse_over_uring::FUSE_OVER_IO_URING_FLAGS2
-            } else {
-                tracing::info!(
-                    "kernel fuse.enable_uring is off; using classical /dev/fuse \
-                     (echo Y > /sys/module/fuse/parameters/enable_uring to enable)"
-                );
-                0
-            }
+            debug!("advertising FUSE_OVER_IO_URING in init flags2");
+            crate::raw::connection::fuse_over_uring::FUSE_OVER_IO_URING_FLAGS2
         };
         #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
         let flags2 = 0u32;
+
+        // REGISTER all CPU queues first (session still reads classical: ready=false).
+        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+        {
+            fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
+        }
 
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
@@ -1308,6 +1302,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             .serialize_into(&mut data, &init_out)
             .expect("won't happened");
 
+        // Classical write of init_out (ready still false → not uring COMMIT path).
         if let Err(err) = fuse_connection
             .write_vectored::<_, Vec<u8>>(data, None)
             .await
@@ -1318,17 +1313,16 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             return Err(err);
         }
 
-        debug!("fuse init done");
-
-        // After classical INIT reply with FUSE_OVER_IO_URING advertised, start workers.
-        // If we advertised the flag, enable must succeed — otherwise the session is wedged.
+        // Now arm the session uring path — kernel has flags2 + full REGISTER set.
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
-            if flags2 != 0 {
-                fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
-                tracing::info!("FUSE-over-io_uring transport enabled for this session");
+            if let Some(pool) = fuse_connection.over_uring.lock().unwrap().clone() {
+                pool.mark_ready();
             }
+            tracing::info!("FUSE-over-io_uring transport armed for this session");
         }
+
+        debug!("fuse init done");
 
         Ok(reply.max_write)
     }

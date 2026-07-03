@@ -194,28 +194,23 @@ impl FuseConnection {
         }
     }
 
-    /// Start kernel FUSE-over-io_uring workers after a successful FUSE_INIT that
-    /// advertised `FUSE_OVER_IO_URING`. Must succeed if that flag was set.
+    /// Start kernel FUSE-over-io_uring workers after FUSE_INIT. Required transport.
     /// Shared with multi-queue clones via [`clone_connection`].
     #[cfg(target_os = "linux")]
     pub fn enable_fuse_over_uring(&self, max_write: usize) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         // Already enabled (e.g. race with another enable call)
-        if self
-            .over_uring
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|p| p.is_active())
-            .unwrap_or(false)
-        {
+        if self.over_uring.lock().unwrap().is_some() {
             return Ok(());
         }
         let fd = self.as_fd().as_raw_fd();
         let pool = super::fuse_over_uring::FuseOverUring::try_start(fd, max_write).map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("FUSE-over-io_uring setup failed after advertising the feature: {e}"),
+                format!(
+                    "FUSE-over-io_uring is required but setup failed: {e} \
+                     (need root + CONFIG_FUSE_IO_URING; enable_uring will be set to Y)"
+                ),
             )
         })?;
         *self.over_uring.lock().unwrap() = Some(pool);
@@ -296,11 +291,12 @@ impl FuseConnection {
         mut header_buf: Vec<u8>,
         mut data_buf: T,
     ) -> CompleteIoResult<(Vec<u8>, T), usize> {
-        // Prefer kernel FUSE-over-io_uring shared work queue when active.
+        // Prefer kernel FUSE-over-io_uring only once every queue has REGISTERed.
+        // Until then keep classical /dev/fuse reads (kernel has not switched yet).
         #[cfg(target_os = "linux")]
         {
             let pool = self.over_uring.lock().unwrap().clone();
-            if let Some(pool) = pool.filter(|p| p.is_active()) {
+            if let Some(pool) = pool.filter(|p| p.is_ready()) {
                 let pool2 = pool.clone();
                 let inbound = match tokio::task::spawn_blocking(move || {
                     // Block until a request or inactivity timeout (retry while active).
@@ -378,13 +374,19 @@ impl FuseConnection {
         data: T,
         body_extend_data: Option<U>,
     ) -> CompleteIoResult<(T, Option<U>), usize> {
-        // Kernel FUSE-over-io_uring reply path: COMMIT_AND_FETCH.
+        // Kernel FUSE-over-io_uring reply path: COMMIT_AND_FETCH — only for uniques
+        // that arrived on a uring entry. Classical INIT (and any pre-ready request)
+        // must still be written to /dev/fuse.
         #[cfg(target_os = "linux")]
         {
             let pool = self.over_uring.lock().unwrap().clone();
-            if let Some(pool) = pool.filter(|p| p.is_active()) {
+            if let Some(pool) = pool.filter(|p| p.is_ready()) {
                 let mut reply = bytes::BytesMut::with_capacity(
-                    data.deref().len() + body_extend_data.as_ref().map(|b| b.deref().len()).unwrap_or(0),
+                    data.deref().len()
+                        + body_extend_data
+                            .as_ref()
+                            .map(|b| b.deref().len())
+                            .unwrap_or(0),
                 );
                 reply.extend_from_slice(data.deref());
                 if let Some(ref ext) = body_extend_data {
@@ -397,9 +399,12 @@ impl FuseConnection {
                 } else {
                     0
                 };
-                let len = reply.len();
-                let res = pool.submit_reply(unique, reply);
-                return ((data, body_extend_data), res.map(|_| len));
+                if pool.has_pending(unique) {
+                    let len = reply.len();
+                    let res = pool.submit_reply(unique, reply);
+                    return ((data, body_extend_data), res.map(|_| len));
+                }
+                // fall through to classical write
             }
         }
 

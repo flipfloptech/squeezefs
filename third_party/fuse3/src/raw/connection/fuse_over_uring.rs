@@ -1,16 +1,22 @@
 //! Kernel **FUSE-over-io_uring** (Linux 6.14+ / 7.x) — `linux/fuse.h` + libfuse `fuse_uring.c`.
 //!
-//! Always enabled after classical `FUSE_INIT` (required transport). Tuning only:
+//! **Required** request transport after classical `FUSE_INIT`. No userspace opt-out.
+//! Mount fails if setup fails. The kernel module parameter `fuse.enable_uring` must
+//! be Y (we try to enable it at start).
+//!
+//! Tuning only:
 //! ```text
-//! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=8   # optional, per-queue depth (default 8)
-//! SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES=N    # optional, default = min(nproc, 32)
+//! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=4   # optional, per-queue depth
+//! SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES=N    # optional, default = min(nproc, 8)
 //! ```
 //!
 //! # Design (hardened)
 //! - **Per-qid commit channel** — no shared demux / re-queue races.
 //! - **Shared inbound work queue** + condvar — multi-queue session workers all pop requests.
 //! - **eventfd** per queue — wake workers on commit / shutdown (no busy poll).
-//! - Metrics: register/commit/cqe errors, inflight uniques.
+//! - Pool is **not** marked ready until every queue has submitted REGISTER — avoids
+//!   a deadlock where the session stops reading classical `/dev/fuse` while the
+//!   kernel has not yet switched to the uring path.
 
 #![cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 
@@ -145,9 +151,15 @@ impl InboundQueue {
     }
 }
 
-/// Process-wide optional FUSE-over-io_uring controller (one per fuse session / mount).
+/// Process-wide FUSE-over-io_uring controller (one per fuse session / mount).
 pub struct FuseOverUring {
+    /// Session may drain the inbound queue only when true (all queues REGISTERed).
+    ready: AtomicBool,
+    /// False after shutdown; workers exit and session falls through to errors.
     active: AtomicBool,
+    /// Number of queue workers that have submitted their initial REGISTERs.
+    queues_registered: AtomicU64,
+    nqueues: u16, // used for diagnostics
     inbound: Arc<InboundQueue>,
     /// unique → (qid, ent_idx, commit_id)
     pending: Mutex<HashMap<u64, (u16, u16, u64)>>,
@@ -181,48 +193,77 @@ pub fn over_uring_stats() -> (u64, u64, u64, u64) {
     )
 }
 
-/// True when `/sys/module/fuse/parameters/enable_uring` is Y/1 (kernel will accept
-/// FUSE-over-io_uring REGISTER). No userspace disable switch — only this kernel knob.
-pub fn kernel_fuse_uring_enabled() -> bool {
-    std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring")
-        .map(|s| {
+/// Best-effort: turn on kernel `fuse.enable_uring` so REGISTER is accepted.
+/// Returns whether the parameter reads as enabled after the attempt.
+pub fn ensure_kernel_fuse_uring_enabled() -> io::Result<bool> {
+    const PATH: &str = "/sys/module/fuse/parameters/enable_uring";
+    let read = || {
+        std::fs::read_to_string(PATH).map(|s| {
             matches!(
                 s.trim().to_ascii_lowercase().as_str(),
                 "y" | "1" | "yes" | "true" | "on"
             )
         })
-        .unwrap_or(false)
+    };
+    if read().unwrap_or(false) {
+        return Ok(true);
+    }
+    // Need privileges; mount is typically root for allow_other / fuse.
+    if let Err(e) = std::fs::write(PATH, b"Y") {
+        warn!("could not set {PATH}=Y: {e}");
+    }
+    let on = read().unwrap_or(false);
+    if on {
+        info!("enabled kernel fuse.enable_uring=Y");
+    }
+    Ok(on)
 }
 
 impl FuseOverUring {
     pub fn try_start(fuse_fd: RawFd, max_write: usize) -> io::Result<Arc<Self>> {
-        if !kernel_fuse_uring_enabled() {
+        if !ensure_kernel_fuse_uring_enabled()? {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "kernel fuse.enable_uring is disabled",
+                "kernel fuse.enable_uring is off and could not be enabled \
+                 (need CAP_SYS_ADMIN / root: echo Y > /sys/module/fuse/parameters/enable_uring)",
             ));
         }
-        // Defaults stay modest: each entry holds a full max_write-sized payload, so
-        // memory ≈ queues * depth * payload_sz. Strix-class machines with 32+ cores
-        // would otherwise allocate multi‑GB and get OOM-killed at mount.
+        // Kernel fuse_uring_create() uses num_possible_cpus() for ring->nr_queues and
+        // is_ring_ready() requires EVERY queue (except the current) to have ≥1 entry.
+        // Registering fewer queues than that means the kernel never switches off the
+        // classical path while we stop reading it → permanent hang.
+        // Override only for testing; production must match the kernel.
+        let kernel_nqueues = {
+            let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+            if n > 0 {
+                n as usize
+            } else {
+                std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4)
+            }
+        };
         let nqueues = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get().clamp(1, 8))
-                    .unwrap_or(4)
-            })
-            .clamp(1, 32);
+            .unwrap_or(kernel_nqueues)
+            .clamp(1, 512);
+        if nqueues < kernel_nqueues {
+            warn!(
+                "SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES={nqueues} < kernel possible CPUs \
+                 ({kernel_nqueues}); FUSE-over-io_uring will never become ready"
+            );
+        }
+        // Depth 2 is enough to become ready (one entry per queue minimum); keep small
+        // to limit memory: nqueues * depth * ~1MiB payload.
         let depth = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(4usize)
-            .clamp(2, 32);
+            .unwrap_or(1usize)
+            .clamp(1, 32);
         // Must be >= kernel ring->max_payload_sz:
         //   max(FUSE_MIN_READ_BUFFER, max_write, max_pages * PAGE_SIZE)
         // (fs/fuse/dev_uring.c). Kernel clamps max_pages to fuse_max_pages_limit (256).
-        // Undersized payload → EINVAL on REGISTER.
         const FUSE_MIN_READ_BUFFER: usize = 8192;
         const KERNEL_MAX_PAGES_LIMIT: usize = 256;
         let page = 4096usize;
@@ -253,7 +294,13 @@ impl FuseOverUring {
         }
 
         let pool = Arc::new(Self {
+            // Critical: stay not-ready until every queue has submitted REGISTER.
+            // Otherwise the session stops classical /dev/fuse reads while the kernel
+            // still delivers on the classical path → permanent hang.
+            ready: AtomicBool::new(false),
             active: AtomicBool::new(true),
+            queues_registered: AtomicU64::new(0),
+            nqueues: nqueues as u16,
             inbound,
             pending: Mutex::new(HashMap::new()),
             queues: queue_handles,
@@ -265,39 +312,95 @@ impl FuseOverUring {
             stats_register: AtomicU64::new(0),
         });
 
-        // Probe one ring before spawning all workers (fail fast if kernel rejects).
-        // Do not probe with a one-shot REGISTER + wait: REGISTER parks the entry
-        // until the kernel has a request, so a blocking wait deadlocks mount.
-        // Workers perform REGISTER; immediate setup failures surface there.
-
+        let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<String>(nqueues.max(1));
         let mut handles = Vec::new();
         for qid in 0..nqueues as u16 {
             let pool_c = pool.clone();
             let commit_rx = commit_rxs.remove(0);
             let wake_fd = wake_fds[qid as usize];
+            let err_tx = err_tx.clone();
             let h = std::thread::Builder::new()
                 .name(format!("fuse-over-uring-{qid}"))
                 .spawn(move || {
                     if let Err(e) =
-                        queue_worker(pool_c, qid, depth, payload_sz, commit_rx, wake_fd)
+                        queue_worker(pool_c.clone(), qid, depth, payload_sz, commit_rx, wake_fd)
                     {
-                        error!("fuse-over-uring worker qid={qid}: {e}");
+                        let msg = format!("qid={qid}: {e}");
+                        error!("fuse-over-uring worker {msg}");
+                        let _ = err_tx.send(msg);
+                        pool_c.shutdown();
                     }
                 })
                 .map_err(io::Error::other)?;
             handles.push(h);
         }
+        drop(err_tx);
         *pool.workers.lock().unwrap() = handles;
+
+        // Poll until every queue REGISTERed (no Barrier — that deadlocks if spawn
+        // is slow while workers already wait on the barrier).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(msg) = err_rx.try_recv() {
+                pool.shutdown();
+                return Err(io::Error::other(format!(
+                    "FUSE-over-io_uring worker failed during setup: {msg}"
+                )));
+            }
+            let n = pool.queues_registered.load(Ordering::Acquire);
+            if n >= nqueues as u64 {
+                break;
+            }
+            if !pool.active.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "FUSE-over-io_uring shut down during REGISTER",
+                ));
+            }
+            if std::time::Instant::now() > deadline {
+                pool.shutdown();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "FUSE-over-io_uring REGISTER timed out ({n}/{nqueues} queues)"
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Leave ready=false until after FUSE_INIT reply is written (see mark_ready).
         ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "FUSE-over-io_uring registered: queues={nqueues} depth={depth} payload_sz={payload_sz} fd={fuse_fd}"
+        );
         info!(
-            "FUSE-over-io_uring active: queues={nqueues} depth={depth} payload_sz={payload_sz} fd={fuse_fd}"
+            "FUSE-over-io_uring registered: queues={nqueues} depth={depth} \
+             payload_sz={payload_sz} fd={fuse_fd}"
         );
         Ok(pool)
+    }
+
+    /// Open the session uring read path — call only after init_out with flags2 is sent.
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+        eprintln!(
+            "FUSE-over-io_uring session path armed (ready=true, queues={})",
+            self.nqueues
+        );
+    }
+
+    /// Session should drain the uring inbound path only when ready.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire) && self.active.load(Ordering::Acquire)
     }
 
     /// Blocking pop for session read path (works from multi-queue workers).
     pub fn recv_inbound_timeout(&self, timeout: Duration) -> Option<InboundUringReq> {
         self.inbound.pop_timeout(&self.active, timeout)
+    }
+
+    /// True if `unique` was delivered on an over-uring entry (needs COMMIT, not classical write).
+    pub fn has_pending(&self, unique: u64) -> bool {
+        self.pending.lock().unwrap().contains_key(&unique)
     }
 
     pub fn submit_reply(&self, unique: u64, reply: Bytes) -> io::Result<()> {
@@ -331,18 +434,22 @@ impl FuseOverUring {
         Ok(())
     }
 
+    /// True once workers are live (may still be registering). Prefer [`is_ready`] for the
+    /// session read path.
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
     }
 
     pub fn shutdown(&self) {
-        if self.active.swap(false, Ordering::Relaxed) {
+        self.ready.store(false, Ordering::Release);
+        if self.active.swap(false, Ordering::Release) {
+            // Session was counted at spawn time (before ready).
             ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
-            self.inbound.notify_all();
-            let one: u64 = 1;
-            for q in &self.queues {
-                let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
-            }
+        }
+        self.inbound.notify_all();
+        let one: u64 = 1;
+        for q in &self.queues {
+            let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
         }
     }
 
@@ -373,19 +480,30 @@ fn queue_worker(
     // Best-effort pin to core qid
     let _ = core_affinity::set_for_current(core_affinity::CoreId { id: qid as usize });
 
+    let sq_entries = (depth as u32 + 8).next_power_of_two().max(16);
     let mut ring: Ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
-        .setup_cqsize((depth as u32) * 2)
-        .build(depth as u32 + 8)
-        .map_err(|e| io::Error::other(format!("SQE128 IoUring: {e}")))?;
+        .setup_cqsize(sq_entries * 2)
+        .build(sq_entries)
+        .map_err(|e| {
+            io::Error::other(format!(
+                "SQE128 IoUring build(sq={sq_entries}): {e} — need IORING_SETUP_SQE128"
+            ))
+        })?;
 
     ring.submitter()
         .register_files(&[pool.fuse_fd, wake_fd])
-        .map_err(|e| io::Error::other(format!("register_files: {e}")))?;
+        .map_err(|e| {
+            io::Error::other(format!(
+                "register_files(fuse_fd={}, wake_fd={}): {e}",
+                pool.fuse_fd, wake_fd
+            ))
+        })?;
 
     let mut ents: Vec<Ent> = (0..depth)
         .map(|_| {
-            let header = Box::new(FuseUringReqHeader::default());
+            let mut header = Box::new(FuseUringReqHeader::default());
             let payload = vec![0u8; payload_sz];
+            header.ring_ent_in_out.payload_sz = payload_sz as u32;
             Ent {
                 header,
                 payload,
@@ -422,11 +540,11 @@ fn queue_worker(
             0,
             Some((ent.iov.as_ptr(), 2)),
             idx as u64,
-        )?;
+        )
+        .map_err(|e| io::Error::other(format!("push REGISTER ent={idx}: {e}")))?;
         pool.stats_register.fetch_add(1, Ordering::Relaxed);
         STATS_REGISTER.fetch_add(1, Ordering::Relaxed);
     }
-    // Poll wake_fd (fixed index 1) so commits/shutdown wake submit_and_wait
     {
         let poll_e = opcode::PollAdd::new(types::Fixed(1), libc::POLLIN as _)
             .build()
@@ -437,8 +555,9 @@ fn queue_worker(
                 .map_err(|_| io::Error::other("sq full (poll)"))?;
         }
     }
-    ring.submit()?;
-    debug!("fuse-over-uring qid={qid}: registered {depth} entries + wake poll");
+    ring.submit()
+        .map_err(|e| io::Error::other(format!("submit REGISTER batch: {e}")))?;
+    pool.queues_registered.fetch_add(1, Ordering::AcqRel);
 
     while pool.active.load(Ordering::Relaxed) {
         // Drain commits for this queue only (no demux)
@@ -598,6 +717,7 @@ fn push_cmd(
         qid,
         padding: [0; 6],
     };
+    // SAFETY: FuseUringCmdReq is repr(C), 24 bytes; rest of cmd stays zero.
     unsafe {
         std::ptr::write(cmd.as_mut_ptr().cast::<FuseUringCmdReq>(), req);
     }
@@ -608,8 +728,11 @@ fn push_cmd(
         .user_data(user_data);
 
     if let Some((ptr, len)) = iov {
-        // libfuse: sqe.addr = iov, sqe.len = count for REGISTER.
-        // io_uring_sqe: addr @ +16, len @ +24.
+        // libfuse fuse_uring_register_ent:
+        //   sqe->addr = (uint64_t)ent->iov;  sqe->len = 2;
+        // io_uring_sqe layout: addr @ +16, len @ +24 (first 64-byte SQE half of Entry128).
+        //
+        // SAFETY: Entry128 is (Entry, [u8;64]); Entry is the first 64 bytes of the SQE.
         unsafe {
             let base = (&mut entry as *mut Entry128 as *mut u8).add(16);
             std::ptr::write_unaligned(base as *mut u64, ptr as u64);

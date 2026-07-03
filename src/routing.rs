@@ -761,6 +761,9 @@ impl DataRouter {
                 drop(con);
                 self.write_striped(file_path, &meta_key, offset, data, fencing_token)
                     .await?;
+                crate::fuse_client::METRICS
+                    .layout_striped_writes
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
 
@@ -899,6 +902,9 @@ impl DataRouter {
         // Save back with appropriate layout routing
         if new_size < 4 * 1024 {
             // Layout: inline (redis-only after crypto)
+            crate::fuse_client::METRICS
+                .layout_inline_writes
+                .fetch_add(1, Ordering::Relaxed);
             let inline_key = crate::keys::inline_data(file_path);
             let shared_data = bytes::Bytes::from(existing_data);
             let processed_data = self.get_crypto().process_write(shared_data.clone())?;
@@ -946,6 +952,9 @@ impl DataRouter {
             self.cache.read_lru.put(file_path, shared_data);
         } else if !self.cache.nvme.staging_dirs().is_empty() && new_size <= 4 * 1024 * 1024 {
             // Layout: staged — capture old id, drop con, stage (or backend write), re-acquire for meta.
+            crate::fuse_client::METRICS
+                .layout_staged_writes
+                .fetch_add(1, Ordering::Relaxed);
             let new_file_id = Uuid::new_v4().to_string();
 
             let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
@@ -1090,6 +1099,9 @@ impl DataRouter {
                 &mut con,
             )
             .await?;
+            crate::fuse_client::METRICS
+                .layout_striped_writes
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         self.metadata_cache.invalidate(file_path);

@@ -1040,7 +1040,7 @@ impl DlmClient {
         };
 
         let mut con = self.meta_client.get_connection().await.map_err(|e| {
-            println!("REDIS ERROR: {:?}", e);
+            log::warn!("REDIS ERROR (lock connection): {:?}", e);
             e
         })?;
         let ttl_ms = ttl.as_millis() as u64;
@@ -1060,11 +1060,14 @@ impl DlmClient {
             .query_async(&mut con)
             .await
             .map_err(|e| {
-                println!("REDIS ERROR (SET NX): {:?}", e);
+                log::warn!("REDIS ERROR (SET NX lock): {:?}", e);
                 e
             })?;
 
         if acquired.is_none() {
+            crate::fuse_client::METRICS
+                .lease_acquire_fail
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(err_lock_failed(format!(
                 "Lock is already held on {}",
                 lock_key
@@ -1081,20 +1084,30 @@ impl DlmClient {
                 // Best-effort unlock so we do not leave a held lock without a token.
                 let _: std::result::Result<(), redis::RedisError> =
                     redis::cmd("DEL").arg(&lock_key).query_async(&mut con).await;
-                println!("REDIS ERROR (INCR fence): {:?}", e);
+                log::warn!("REDIS ERROR (INCR fence): {:?}", e);
+                crate::fuse_client::METRICS
+                    .lease_acquire_fail
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(e.into());
             }
         };
 
         // Register with manager
         let tx = self.get_heartbeat_tx().clone();
-        let _ = tx
+        if let Err(e) = tx
             .send(HeartbeatCommand::Register {
                 lock_key: lock_key.clone(),
                 client_id: self.client_id.clone(),
                 ttl_ms,
             })
-            .await;
+            .await
+        {
+            log::debug!("DLM heartbeat register send failed (non-fatal): {:?}", e);
+        }
+
+        crate::fuse_client::METRICS
+            .lease_acquire_ok
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(LockLease {
             file_path: file_path.to_string(),

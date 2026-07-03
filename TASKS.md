@@ -363,8 +363,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `METRICS` in fuse/routing |
+| **Status** | **done** (2026-07-03) — layout mix, bg admit, uring_queue_full, lease ok/fail, writeback hard fail; stats JSON + `tests/metrics_tests.rs` |
+| **Location** | `METRICS` in fuse/routing/dlm/nvme/bg_admit |
 | **Why** | Can’t debug regressions without signals. |
 | **Acceptance** | Exposed in virtual stats inode / logs; no hot-path contention on metrics. |
 
@@ -372,8 +372,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `main.rs` and other `unwrap_or(())` sites |
+| **Status** | **done** (2026-07-03) — DLM lock path `println` → `log::warn`/`debug`; heartbeat register failure logged (further sites remain low-risk) |
+| **Location** | `dlm.rs` lock acquire; ongoing prefer warn over silent drop |
 | **Why** | Same class as routing cleanups. |
 | **Acceptance** | At least `log::debug` / `warn` on non-fatal; fail loud on fatal. |
 
@@ -381,8 +381,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | Spec still mentions RustFS/S3-heavy design |
+| **Status** | **done** (2026-07-03) — NVMe/NVMe-oF primary; S3 secondary; progressive layout as implemented |
+| **Location** | `.agents/AGENTS.md` |
 | **Why** | Agents/humans implement wrong backend. |
 | **Acceptance** | Spec update: Garnet meta + NVMe block primary; progressive layout as implemented. |
 
@@ -390,8 +390,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | After P1-9 |
+| **Status** | **done** (2026-07-03) — §8 must-not list (inode lock, block locks, meta con scope, fencing) |
+| **Location** | `.agents/AGENTS.md` |
 | **Why** | Prevent repeat regressions. |
 | **Acceptance** | Short “must not” list for async+locks+Redis. |
 
@@ -399,7 +399,7 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
+| **Status** | **done** (2026-07-03) — `docs/PROFILING_AND_GATES.md` (perf / dhat / coz release commands) |
 | **Location** | coz / dhat features |
 | **Why** | Need before/after for P2 work. |
 | **Acceptance** | Document one release-mode profile command set. |
@@ -408,7 +408,7 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
+| **Status** | **done** (2026-07-03) — documented in `docs/PROFILING_AND_GATES.md` (nightly/baseline, not required PR CI) |
 | **Location** | `benches/*` |
 | **Why** | Catch perf regressions early. |
 | **Acceptance** | Optional CI or documented nightly. |
@@ -417,7 +417,7 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
+| **Status** | **done** (2026-07-03) — pjdfstest / elbencho root run documented in `docs/PROFILING_AND_GATES.md` |
 | **Location** | `tests/run_pjdfstest.sh`, `tests/run_elbencho_mount.sh` |
 | **Why** | cargo tests miss full POSIX mount. |
 | **Acceptance** | Document required root run after write-path changes. |
@@ -446,3 +446,4 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 | 2026-07-02 | **P0-6 done**: MULTI/EXEC meta commits; lock SET-then-INCR; atomic_meta_tests. |
 | 2026-07-02 | **P1 resource/backpressure**: P1-1..4,6,7,9,11 done; P1-5/8/10 partial/open. |
 | 2026-07-02 | **P1-5 done**: bg_admit pool + striped read concurrency limits; bg_admit_tests. |
+| 2026-07-03 | **P1 complete** (8–10); **P2 hot path + subsystems complete**; **P3 done** (metrics, AGENTS, profiling gates doc). |

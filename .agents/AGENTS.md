@@ -4,75 +4,87 @@
 
 ### Target Scale & Layout
 * **Scale:** 15,000+ Concurrent Nodes.
-* **Architecture Type:** Decoupled Metadata / Object Backend with Local POSIX FUSE Mount.
+* **Architecture Type:** Decoupled metadata (Garnet) + **block data** (local NVMe / NVMe-oF), exposed via POSIX FUSE.
 
 ### Technology Stack
 * **Client Daemon (FUSE Engine):** Built in **Rust** using the asynchronous `tokio` runtime and `io_uring` polling over `/dev/fuse`.
-* **Metadata & Distributed Lock Manager (DLM):** Microsoft Research **Garnet** (RESP-compliant, latch-free, epoch-based multithreaded architecture).
-* **Data Backend:** **RustFS** (S3-compatible, decentralized object store optimized for massive parallel throughput).
+* **Metadata & Distributed Lock Manager (DLM):** Microsoft Research **Garnet** (RESP-compatible). Primary meta store for attrs, layout maps, leases, and volume format.
+* **Data Backend (primary):** **NVMe / NVMe-oF block devices** via `NvmeBlockDev` (io_uring workers). Progressive layouts (inline / staged / striped) live on this path.
+* **Data Backend (optional / secondary):** S3-compatible paths may exist in the tree for historical or multi-backend experiments; **do not assume S3 is primary** when changing the data plane. Prefer the NVMe path that `format` / `mount --volume` and integration tests exercise.
 
 ---
 
 ## 2. Progressive Data Layout & I/O Routing
 
-Data is logically chunked (64MB), sliced into mutations, and physically stored in blocks (max 4MB). Write routing is determined dynamically by file size:
+Logical file growth uses three layouts (thresholds are implementation-defined; current code uses ~4 KiB inline, up to ~4 MiB staged when staging dirs exist, else striped):
 
-1. **Micro-Files (< 64KB): KV Inlining**
-   - Bypasses the object store completely. Raw byte payloads are written directly into the Garnet key-value store alongside file metadata.
-2. **Small Files (64KB - 4MB): Asynchronous Batching**
-   - Staged locally on a hidden NVMe staging directory. The write is instantly acknowledged to the OS.
-   - A background thread merges small files into a single 4MB physical block, uploads it to RustFS, and updates Garnet with byte offset mappings.
-3. **Large Files (> 4MB): Parallel Striping**
-   - The data stream is sliced into 4MB blocks. A thread pool executes concurrent S3 `PUT` requests to stripe blocks across RustFS volumes.
+1. **Inline (tiny):** Payload in Garnet (`inline_data:…`) with type `inline`.
+2. **Staged (small):** Local NVMe staging (`file_id` + optional `mapping:…`); writeback/flush promotes to durable blocks.
+3. **Striped (large):** 4 MiB (configurable) blocks on the active block backend with `block_map:…` and refcounts.
+
+Writes that grow past thresholds promote layouts **durably** (block I/O before meta type flip — see P0 layout atomicity).
 
 ---
 
 ## 3. Distributed Lock Manager (DLM) & Consistency
 
-POSIX FUSE locks are translated to global cluster locks:
-* **Acquisition:** Executed via Garnet `SETNX` commands.
-* **Granularity:** Strictly file-level or byte-range level (never at the directory level).
-* **Leases & Heartbeats:** Lock leases are issued with strict TTLs (e.g., 5 seconds). A background thread continuously renews open locks at 1/3 of the TTL (every ~1.6s).
-* **Fencing Tokens:** Garnet issues a monotonic integer upon lock acquisition. This fencing token is sent to RustFS. Writes with older/expired fencing tokens are rejected by RustFS to prevent split-brain write conflicts.
+POSIX FUSE locks map to cluster leases on Garnet:
+* **Acquisition:** `SET NX` + fencing token `INCR` (no Lua required for lock grant).
+* **Granularity:** File-level or byte-range; never directory-wide for data.
+* **Leases & Heartbeats:** TTL + background renewal; local caches must re-validate after lock key loss.
+* **Fencing Tokens:** Monotonic per-file tokens; writers present tokens; stale tokens → `FencingTokenExpired` / reject.
 
 ---
 
-## 4. Tiered Caching & Zero-Copy Paths
+## 4. Tiered Caching & Paths
 
-* **Tier 1 (GPU Direct Storage):** Intercepts GPU reads and routes RDMA transfers directly from RustFS to VRAM, bypassing the host kernel and system RAM.
-* **Tier 2 (Unified System RAM):** Least Recently Used (LRU) cache dynamically sized to 20% of system RAM by default.
-* **Tier 3 (Local NVMe Staging):** Hidden `.staging` directory on local NVMe handles async writes and cache overflow reads.
-
----
-
-## 5. FUSE Client Implementation & Asynchronous I/O
-
-* **Thread Pool:** Work-stealing pool bound strictly to physical CPU cores (reserving at least 1 core for OS kernel tasks).
-* **`io_uring`:** Main polling loop harvests FUSE requests from `/dev/fuse` without blocking. Network and disk IO are delegated strictly to background workers.
-* **FUSE parameters:**
-  - `max_read` & `max_write` set to absolute kernel maximums (e.g., `1048576`).
-  - `writeback_cache` enabled to group sequential micro-writes.
-  - `async_dio` enabled to allow overlapping asynchronous direct I/O.
+* **Tier 1 (optional GDS):** GPU Direct path when `gds` feature is enabled.
+* **Tier 2 (RAM LRU):** Sharded Clock/LRU read & write caches.
+* **Tier 3 (Local NVMe staging / read cache):** Staging segments + optional read block cache; dehydrate on eviction.
 
 ---
 
-## 6. Metadata Cluster Topology & High Availability
+## 5. FUSE Client & Asynchronous I/O
 
-* **Sharding:** 16,384 slots distributed across primary Garnet instances.
-* **Log-Shipping:** Append-Only-Files (AOF) enabled on primaries and shipped to replicas.
-* **Read Scaling:** Read-heavy metadata lookups route to replicas using the `READWRITE` protocol flag.
+* Work-stealing / multi-thread tokio; core pinning where configured.
+* **Block path io_uring:** `NvmeBlockDev` worker (bounded request queue, backpressure).
+* FUSE `/dev/fuse` path uses the fuse3 stack (vendored); not every byte path is uring yet (see TASKS P2-8 plan).
+
+---
+
+## 6. Metadata Cluster Topology
+
+* Optional multi-shard Garnet URLs; keys for volume control use `fs_prefix` / `fs_key!`.
+* **Layout keys** (`metadata:…`, `inline_data:…`, `block_map:…`, `mapping:…`, `active_block:…`) are **unprefixed historical** forms — use `crate::keys::*` helpers; do not migrate under `FS_PREFIX` without an on-disk format change.
 
 ---
 
 ## 7. Error Handling & Crash Recovery
 
-* **FUSE Timeout Protection:** Task operations must fail-fast within 2 seconds on network stalls, falling back to NVMe disk staging. Hangs are strictly prohibited.
-* **Stale Write Discard:** Writes rejected by RustFS due to expired fencing tokens are discarded, and `EIO` is propagated to the OS.
-* **Daemon Crash Recovery:** Upon reboot, the daemon scans `.staging` for pending writes, verifies state with Garnet, uploads completed blocks to RustFS, and patches metadata before opening the mount.
+* FUSE op timeouts; staging recovery on remount (`recover_staging`) with fence + layout checks.
+* Stale fencing tokens discard staged work; missing inode meta discards orphan active blocks.
+* Write verification is **opt-in** (`--write-verification`, optional sample rate).
 
 ---
 
-## 8. OS Kernel & Network Fabric Tuning Requirements
+## 8. Lock order & connection scope (must not)
 
-* Elevate `vm.dirty_ratio` and `vm.dirty_background_ratio` on client nodes to buffer write sequences in RAM.
-* Use a non-blocking Clos network topology with RoCE (RDMA over Converged Ethernet) to bypass host network stack overhead.
+Always acquire in this order; **never invert** (P1-9):
+
+1. `active_inode_locks` (per-inode `RwLock`) — FUSE op serialization  
+2. `lease_locks` (per-inode) — only while acquiring/refreshing DLM lease  
+3. `BLOCK_FLUSH_LOCKS` (per block) — active-block mutation  
+4. DLM/Redis — network meta work  
+
+**Must not:**
+* Hold inode **write** guard across long backend I/O when block locks suffice (striped data path = meta-prep only under write lock — P1-8).
+* Hold a **pooled Garnet/Redis connection** across durable NVMe / staging I/O (P1-10: open → short meta → drop → I/O → re-acquire for commit).
+* Acquire (1) while holding (3).
+* Burn fencing tokens on failed lock `SET NX` (SET then INCR only on success).
+
+---
+
+## 9. OS / fabric notes
+
+* Dirty ratios and fabric tuning remain operator concerns for large clusters.
+* Primary data path does **not** require S3; NVMe-oF is for remote block exposure of the same block backend model.

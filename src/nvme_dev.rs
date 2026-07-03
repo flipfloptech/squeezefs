@@ -485,6 +485,9 @@ impl NvmeBlockDev {
                     tx,
                 })
                 .map_err(|e| {
+                    crate::fuse_client::METRICS
+                        .uring_queue_full
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     crate::error::SqueezefsError::InvalidOperation(format!(
                         "Uring request queue full or closed (backpressure): {:?}",
                         e
@@ -567,6 +570,9 @@ impl NvmeBlockDev {
                         libc::free(rp as *mut libc::c_void);
                     }
                 }
+                crate::fuse_client::METRICS
+                    .uring_queue_full
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(crate::error::SqueezefsError::InvalidOperation(
                     "Uring request queue full or closed (backpressure)".to_string(),
                 ));
@@ -624,6 +630,9 @@ impl NvmeBlockDev {
                 tx,
             })
             .map_err(|e| {
+                crate::fuse_client::METRICS
+                    .uring_queue_full
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::error::SqueezefsError::InvalidOperation(format!(
                     "Uring request queue full or closed (backpressure): {:?}",
                     e

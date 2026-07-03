@@ -219,8 +219,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | Pervasive `format!("metadata:…")`, `inline_data:…`, `block_map:…`, lock keys |
+| **Status** | **done** (2026-07-03) — `crate::keys::*` helpers (`FsKey` / `CompactString`); hot paths in routing/fuse/recovery/jobs/defrag/config_ops |
+| **Location** | `src/lib.rs` `keys` mod; call sites in fuse/routing/… |
 | **Why** | Alloc on every FUSE op. |
 | **Acceptance** | Helpers (e.g. `meta_key(ino)`, reuse `FsKey`/`compact_str`); no wrong prefixes; layout tests still pass. |
 
@@ -228,8 +228,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | Mixed styles in fuse/routing/dlm |
+| **Status** | **done** (2026-07-03) — dual namespace documented on `keys` mod: volume keys under `fs_prefix` / `fs_key!`; layout keys unprefixed historical (`metadata:`, `inline_data:`, …) — no on-disk migration |
+| **Location** | `src/lib.rs` `keys` module docs + helpers |
 | **Why** | Risk of wrong keys / hard-to-debug misses. |
 | **Acceptance** | Single convention documented + enforced; migration if needed. |
 

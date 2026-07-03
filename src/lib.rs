@@ -109,6 +109,133 @@ macro_rules! fs_key {
     };
 }
 
+/// Garnet/Redis key construction for the hot path (P2-1 / P2-2).
+///
+/// # Namespace convention
+///
+/// - **Volume keys** (format, free_blocks, used_bytes, attr, dir, job sets, …):
+///   always under [`fs_prefix`] via [`fs_key!`] / [`build_fs_key`] / [`keys::attr`].
+/// - **Layout keys** (per-file metadata, inline payload, block maps, staging maps,
+///   active-block buffers): **unprefixed** historical names
+///   (`metadata:…`, `inline_data:…`, `block_map:…`, `mapping:…`, `active_block:…`).
+///   Do **not** put these under `FS_PREFIX` without an on-disk format migration —
+///   existing volumes already store the unprefixed forms.
+///
+/// Prefer these helpers over ad-hoc `format!(…)` so key shape stays consistent and
+/// we avoid redundant intermediate `String`s on the FUSE write/read path.
+pub mod keys {
+    use super::FsKey;
+    use compact_str::CompactString;
+    use std::fmt::Write;
+
+    /// Logical file path used as the in-process cache / layout identity: `inode_{ino}`.
+    ///
+    /// Returns [`String`] so it plugs into existing `String`-keyed caches (moka/scc)
+    /// without extra conversion noise at call sites.
+    #[inline]
+    pub fn inode_path(ino: u64) -> String {
+        format!("inode_{ino}")
+    }
+
+    /// Layout meta hash key: `metadata:inode_{ino}`.
+    #[inline]
+    pub fn metadata_for_inode(ino: u64) -> FsKey {
+        let mut s = CompactString::with_capacity(20);
+        let _ = write!(s, "metadata:inode_{ino}");
+        FsKey(s)
+    }
+
+    /// Layout meta hash key for a path that is already `inode_N` (or similar):
+    /// `metadata:{file_path}`.
+    #[inline]
+    pub fn metadata_for_path(file_path: &str) -> FsKey {
+        let mut s = CompactString::with_capacity(10 + file_path.len());
+        s.push_str("metadata:");
+        s.push_str(file_path);
+        FsKey(s)
+    }
+
+    /// Inline payload key: `inline_data:{file_path}`.
+    #[inline]
+    pub fn inline_data(file_path: &str) -> FsKey {
+        let mut s = CompactString::with_capacity(12 + file_path.len());
+        s.push_str("inline_data:");
+        s.push_str(file_path);
+        FsKey(s)
+    }
+
+    /// Block-map hash key: `block_map:{block_map_id}`.
+    #[inline]
+    pub fn block_map(block_map_id: &str) -> FsKey {
+        let mut s = CompactString::with_capacity(10 + block_map_id.len());
+        s.push_str("block_map:");
+        s.push_str(block_map_id);
+        FsKey(s)
+    }
+
+    /// Staged-file mapping hash key: `mapping:{file_id}`.
+    #[inline]
+    pub fn mapping(file_id: &str) -> FsKey {
+        let mut s = CompactString::with_capacity(8 + file_id.len());
+        s.push_str("mapping:");
+        s.push_str(file_id);
+        FsKey(s)
+    }
+
+    /// Active-block buffer / staging key: `active_block:inode_{ino}:block_{block}`.
+    #[inline]
+    pub fn active_block(ino: u64, block: u64) -> FsKey {
+        let mut s = CompactString::with_capacity(40);
+        let _ = write!(s, "active_block:inode_{ino}:block_{block}");
+        FsKey(s)
+    }
+
+    /// Active-block key when `file_path` is already `inode_N`:
+    /// `active_block:{file_path}:block_{block}`.
+    #[inline]
+    pub fn active_block_for_path(file_path: &str, block: u32) -> FsKey {
+        let mut s = CompactString::with_capacity(24 + file_path.len());
+        let _ = write!(s, "active_block:{file_path}:block_{block}");
+        FsKey(s)
+    }
+
+    /// Scan prefix for an inode's active blocks: `active_block:inode_{ino}:`.
+    #[inline]
+    pub fn active_block_ino_prefix(ino: u64) -> CompactString {
+        let mut s = CompactString::with_capacity(28);
+        let _ = write!(s, "active_block:inode_{ino}:");
+        s
+    }
+
+    /// Scan prefix when `file_path` is already `inode_N`: `active_block:{file_path}:`.
+    #[inline]
+    pub fn active_block_path_prefix(file_path: &str) -> CompactString {
+        let mut s = CompactString::with_capacity(14 + file_path.len());
+        s.push_str("active_block:");
+        s.push_str(file_path);
+        s.push(':');
+        s
+    }
+
+    /// POSIX attr hash under the volume prefix: `{fs_prefix}:attr:{ino}`.
+    #[inline]
+    pub fn attr(ino: u64) -> FsKey {
+        let prefix = super::fs_prefix();
+        let mut s = CompactString::with_capacity(prefix.len() + 20);
+        let _ = write!(s, "{prefix}:attr:{ino}");
+        FsKey(s)
+    }
+
+    /// Directory listing hash under the volume prefix: `{fs_prefix}:dir:{ino}`.
+    #[inline]
+    pub fn dir(ino: u64) -> FsKey {
+        let prefix = super::fs_prefix();
+        let mut s = CompactString::with_capacity(prefix.len() + 20);
+        let _ = write!(s, "{prefix}:dir:{ino}");
+        FsKey(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +244,41 @@ mod tests {
     fn test_fs_prefix_default() {
         let prefix = fs_prefix();
         assert!(!prefix.is_empty());
+    }
+
+    #[test]
+    fn test_layout_key_shapes_match_historical_format() {
+        assert_eq!(keys::inode_path(42), "inode_42");
+        assert_eq!(&*keys::metadata_for_inode(42), "metadata:inode_42");
+        assert_eq!(&*keys::metadata_for_path("inode_7"), "metadata:inode_7");
+        assert_eq!(
+            &*keys::metadata_for_path(&keys::inode_path(7)),
+            &*keys::metadata_for_inode(7)
+        );
+        assert_eq!(&*keys::inline_data("inode_1"), "inline_data:inode_1");
+        assert_eq!(&*keys::block_map("abc"), "block_map:abc");
+        assert_eq!(&*keys::mapping("fid"), "mapping:fid");
+        assert_eq!(&*keys::active_block(9, 3), "active_block:inode_9:block_3");
+        assert_eq!(
+            &*keys::active_block_for_path("inode_9", 3),
+            &*keys::active_block(9, 3)
+        );
+        assert_eq!(
+            keys::active_block_ino_prefix(9).as_str(),
+            "active_block:inode_9:"
+        );
+        assert_eq!(
+            keys::active_block_path_prefix("inode_9").as_str(),
+            "active_block:inode_9:"
+        );
+    }
+
+    #[test]
+    fn test_volume_attr_dir_use_fs_prefix() {
+        let prefix = fs_prefix();
+        assert_eq!(&*keys::attr(1), format!("{prefix}:attr:1"));
+        assert_eq!(&*keys::dir(1), format!("{prefix}:dir:1"));
+        // Same shape as fs_key! for attr suffix
+        assert_eq!(&*keys::attr(1), &*build_fs_key("attr:1"));
     }
 }

@@ -230,7 +230,7 @@ async fn execute_task(router: &DataRouter, task_type: &TaskType) -> Result<()> {
             len,
         } => {
             // Acquire lease on file being moved to serialize against concurrent FUSE client writes
-            let lock_name = format!("inode_{}", ino);
+            let lock_name = crate::keys::inode_path(*ino);
             let lease = router
                 .dlm
                 .acquire_lock_with_retry(&lock_name, None, Duration::from_secs(10), 10)
@@ -244,7 +244,7 @@ async fn execute_task(router: &DataRouter, task_type: &TaskType) -> Result<()> {
 
             // Atomically update block_map metadata in database
             let mut con = router.dlm.get_connection().await?;
-            let key = format!("block_map:{}", map_id);
+            let key = crate::keys::block_map(map_id);
             let _: () = con.hset(&key, idx_str, dest_offset.to_string()).await?;
 
             // Free the old high block

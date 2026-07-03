@@ -60,3 +60,28 @@ fn test_striped_read_concurrency_constant() {
     assert_eq!(bg_admit::STRIPED_READ_CONCURRENCY, 16);
     assert_eq!(bg_admit::PREFETCH_BLOCK_CONCURRENCY, 8);
 }
+
+/// P2-6: auto policy is cores-based and clamped; override is sticky until reset.
+#[test]
+fn test_striped_block_concurrency_policy_and_override() {
+    // Ensure auto mode for this test (other tests may have set override).
+    bg_admit::set_striped_block_concurrency(0);
+    let auto = bg_admit::striped_block_concurrency();
+    assert!(
+        (4..=64).contains(&auto),
+        "auto concurrency must be in [4, 64], got {auto}"
+    );
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    assert_eq!(auto, cores.saturating_mul(2).clamp(4, 64));
+
+    bg_admit::set_striped_block_concurrency(12);
+    assert_eq!(bg_admit::striped_block_concurrency(), 12);
+    bg_admit::set_striped_block_concurrency(1);
+    assert_eq!(bg_admit::striped_block_concurrency(), 1);
+
+    // Restore auto for other tests / process state.
+    bg_admit::set_striped_block_concurrency(0);
+    assert_eq!(bg_admit::striped_block_concurrency(), auto);
+}

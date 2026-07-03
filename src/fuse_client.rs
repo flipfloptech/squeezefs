@@ -1327,7 +1327,9 @@ impl SqueezefsFilesystem {
             active_keys.len()
         );
 
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::bg_admit::striped_block_concurrency(),
+        ));
         let mut tasks = futures::stream::FuturesUnordered::new();
 
         for key in active_keys {

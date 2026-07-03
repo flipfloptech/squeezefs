@@ -1338,7 +1338,10 @@ impl DataRouter {
         // Pre-resolve cache hits on the main thread and spawn tasks to modify affected blocks concurrently
         use futures::stream::{FuturesUnordered, StreamExt};
         let tasks = FuturesUnordered::new();
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16)); // Max 16 concurrent block writes
+        // P2-6: cores-based (or override) concurrent block writes per striped op.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::bg_admit::striped_block_concurrency(),
+        ));
 
         let mut pre_resolved_blocks = Vec::with_capacity(old_block_keys.len());
         for (idx, b) in (start_block..=end_block).enumerate() {

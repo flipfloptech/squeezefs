@@ -264,8 +264,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | Hardcoded `Semaphore::new(16)` in `write_striped` |
+| **Status** | **done** (2026-07-03) — `bg_admit::striped_block_concurrency()` = `clamp(cores*2, 4, 64)` + runtime override; used by `write_striped`, staged flush, `STRIPED_IO_SEM` |
+| **Location** | `src/bg_admit.rs`, `routing::write_striped`, `fuse_client` flush |
 | **Why** | May under/over-subscribe cores. |
 | **Acceptance** | Tunable (cores-based); criterion/`squeezefs_bench` comparison. |
 

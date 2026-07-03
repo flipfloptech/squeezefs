@@ -1652,6 +1652,60 @@ impl SqueezefsFilesystem {
     ) -> Result<(), SqueezefsError> {
         Ok(())
     }
+
+    /// Free storage for an inode that has `nlink == 0` and is no longer referenced
+    /// by the kernel (FORGET). Open-but-unlinked files stay until this point.
+    async fn reclaim_orphaned_inode(&self, ino: u64) -> Result<(), Errno> {
+        if ino <= 1 || ino == CONFIG_INODE || ino == STATS_INODE {
+            return Ok(());
+        }
+        let attr_key = crate::keys::attr(ino);
+        let mut con = self
+            .dlm
+            .get_connection_for_inode(ino)
+            .await
+            .map_err(map_squeezefs_err)?;
+        let nlink: Option<i64> = con.hget(&attr_key, "nlink").await.map_err(map_err)?;
+        let Some(nlink) = nlink else {
+            return Ok(()); // already gone
+        };
+        if nlink > 0 {
+            return Ok(());
+        }
+        let size: u64 = con
+            .hget::<_, _, Option<u64>>(&attr_key, "size")
+            .await
+            .map_err(map_err)?
+            .unwrap_or(0);
+        let file_path = crate::keys::inode_path(ino);
+        let inline_key = format!("inline_data:{}", file_path);
+        let meta_key = crate::keys::metadata_for_path(&file_path);
+        let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), ino);
+        let _ = self.router.delete_file(&file_path, &mut con).await;
+        let _: () = redis::pipe()
+            .del(&attr_key)
+            .del(&inline_key)
+            .del(&meta_key)
+            .del(&symlink_key)
+            .del(format!("fencing_generator:inode_{}", ino))
+            .query_async(&mut con)
+            .await
+            .map_err(map_err)?;
+        let mut global_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
+        let _: () = redis::pipe()
+            .decr(crate::fs_key!("used_bytes"), size)
+            .decr(crate::fs_key!("used_inodes"), 1)
+            .query_async(&mut global_con)
+            .await
+            .map_err(map_err)?;
+        if let Some((_, lease)) = self.active_leases.remove(&ino) {
+            let _ = lease.release().await;
+        }
+        self.active_posix_locks.retain(|key, _| key.0 != ino);
+        self.router.metadata_cache.remove(&file_path);
+        self.attr_cache.invalidate(&ino);
+        Ok(())
+    }
 }
 
 #[repr(C)]
@@ -3534,98 +3588,35 @@ impl Filesystem for SqueezefsFilesystem {
                 Ok::<_, Errno>((kind, size, file_type, new_nlink))
             };
 
-            let (_, (kind, file_size, file_type, mut new_nlink)) =
+            let (_, (kind, _file_size, _file_type, mut new_nlink)) =
                 tokio::try_join!(parent_fut, child_fut)?;
 
             if kind == FileType::Directory {
                 return Err(Errno::from(libc::EISDIR));
             }
 
+            // Clamp and persist nlink; always refresh ctime on the surviving inode
+            // (POSIX: unlinking one of several hard links updates ctime of the remaining).
             if new_nlink < 0 {
                 new_nlink = 0;
+            }
+            {
                 let mut child_con = self
                     .dlm
                     .get_connection_for_inode(ino)
                     .await
                     .map_err(map_squeezefs_err)?;
-                let _: () = child_con
-                    .hset(&child_attr_key, "nlink", 0)
+                let _: () = redis::pipe()
+                    .hset(&child_attr_key, "nlink", new_nlink)
+                    .hset(&child_attr_key, "ctime_sec", sec)
+                    .hset(&child_attr_key, "ctime_nsec", nsec)
+                    .query_async(&mut child_con)
                     .await
                     .map_err(map_err)?;
             }
-
-            if new_nlink == 0 {
-                let file_path = crate::keys::inode_path(ino);
-                let inline_key = format!("inline_data:{}", file_path);
-                let meta_key_del = crate::keys::metadata_for_path(&file_path);
-                let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), ino);
-
-                // 3. Delete blocks, delete keys, update global limits, and release leases concurrently
-                let delete_blocks_fut = async {
-                    if file_type != "inline" {
-                        let mut child_con = self
-                            .dlm
-                            .get_connection_for_inode(ino)
-                            .await
-                            .map_err(map_squeezefs_err)?;
-                        self.router
-                            .delete_file(&file_path, &mut child_con)
-                            .await
-                            .map_err(map_squeezefs_err)?;
-                    }
-                    Ok::<(), Errno>(())
-                };
-
-                let delete_keys_fut = async {
-                    let mut child_con = self
-                        .dlm
-                        .get_connection_for_inode(ino)
-                        .await
-                        .map_err(map_squeezefs_err)?;
-                    let mut child_del_pipe = redis::pipe();
-                    child_del_pipe
-                        .del(&child_attr_key)
-                        .del(&inline_key)
-                        .del(&meta_key_del)
-                        .del(&symlink_key)
-                        .del(format!("fencing_generator:inode_{}", ino));
-                    let _: () = child_del_pipe
-                        .query_async(&mut child_con)
-                        .await
-                        .map_err(map_err)?;
-                    Ok::<(), Errno>(())
-                };
-
-                let global_update_fut = async {
-                    let mut global_con =
-                        self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
-                    let mut global_pipe = redis::pipe();
-                    global_pipe
-                        .decr(crate::fs_key!("used_bytes"), file_size)
-                        .decr(crate::fs_key!("used_inodes"), 1);
-                    let _: () = global_pipe
-                        .query_async(&mut global_con)
-                        .await
-                        .map_err(map_err)?;
-                    Ok::<(), Errno>(())
-                };
-
-                let lease_release_fut = async {
-                    if let Some((_, lease)) = self.active_leases.remove(&ino) {
-                        let _ = lease.release().await;
-                    }
-                    self.active_inode_locks.remove(&ino);
-                    self.active_posix_locks.retain(|key, _| key.0 != ino);
-                    Ok::<(), Errno>(())
-                };
-
-                tokio::try_join!(
-                    delete_blocks_fut,
-                    delete_keys_fut,
-                    global_update_fut,
-                    lease_release_fut
-                )?;
-            }
+            // When nlink reaches 0 the name is gone but the inode must remain until
+            // the kernel FORGETs it (open-but-unlinked files still fstat/read/write).
+            // Actual reclaim is in forget() / reclaim_orphaned_inode().
 
             // Invalidate attr_cache, router metadata_cache, and dir_entry_cache
             self.attr_cache.invalidate(&ino);
@@ -3738,13 +3729,12 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             }
 
-            // If target exists, delete it (overwrite behavior)
+            // If target exists, unlink that name (POSIX: may leave hard links alive).
             let dest_ino_opt: Option<u64> = new_parent_con
                 .hget(&dest_dir_key, &*new_name_str)
                 .await
                 .map_err(map_err)?;
             if let Some(dest_ino) = dest_ino_opt {
-                // Overwrite existing file or directory
                 let dest_attr_key = format!("{}:attr:{}", crate::fs_prefix(), dest_ino);
                 let dest_kind: u8 = new_parent_con
                     .hget(&dest_attr_key, "kind")
@@ -3762,7 +3752,7 @@ impl Filesystem for SqueezefsFilesystem {
 
                 let dest_file_path = format!("inode_{}", dest_ino);
                 if dest_kind == 2 {
-                    // If it is a directory, it must be empty
+                    // Directory must be empty; reclaim fully (dirs are not multi-linked like files).
                     let child_dest_dir_key = format!("{}:dir:{}", crate::fs_prefix(), dest_ino);
                     let keys: Vec<String> = new_parent_con
                         .hkeys(&child_dest_dir_key)
@@ -3775,59 +3765,46 @@ impl Filesystem for SqueezefsFilesystem {
                     }
                     let _: () = redis::pipe()
                         .del(&child_dest_dir_key)
+                        .del(&dest_attr_key)
                         .query_async(&mut new_parent_con)
                         .await
                         .map_err(map_err)?;
+                    let _: () = redis::pipe()
+                        .decr(crate::fs_key!("used_inodes"), 1)
+                        .query_async(&mut global_con)
+                        .await
+                        .map_err(map_err)?;
+                    self.attr_cache.invalidate(&dest_ino);
+                    self.active_inode_locks.remove(&dest_ino);
+                    self.active_posix_locks.retain(|key, _| key.0 != dest_ino);
+                    if let Some((_, lease)) = self.active_leases.remove(&dest_ino) {
+                        let _ = lease.release().await;
+                    }
                 } else {
-                    // Delete data blocks via router
-                    let _ = self
-                        .router
-                        .delete_file(&dest_file_path, &mut global_con)
-                        .await;
+                    // Non-directory: drop one link on the overwritten name; do not destroy
+                    // the inode while other hard links remain (rename/23.t).
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO);
+                    let sec = now.as_secs() as i64;
+                    let nsec = now.subsec_nanos();
+                    let new_nlink: i64 = new_parent_con
+                        .hincr(&dest_attr_key, "nlink", -1)
+                        .await
+                        .map_err(map_err)?;
+                    let nlink = new_nlink.max(0);
+                    let _: () = redis::pipe()
+                        .hset(&dest_attr_key, "nlink", nlink)
+                        .hset(&dest_attr_key, "ctime_sec", sec)
+                        .hset(&dest_attr_key, "ctime_nsec", nsec)
+                        .query_async(&mut new_parent_con)
+                        .await
+                        .map_err(map_err)?;
+                    self.attr_cache.invalidate(&dest_ino);
+                    self.router.metadata_cache.remove(&dest_file_path);
+                    // nlink==0: orphan until FORGET (same as unlink); do not free data here.
                 }
-
-                // Delete Redis keys
-                let inline_key = format!("inline_data:{}", dest_file_path);
-                let meta_key = crate::keys::metadata_for_path(&dest_file_path);
-                let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), dest_ino);
-
-                // Fetch target size first to decrement used_bytes
-                let file_size_opt: Option<u64> = new_parent_con
-                    .hget(&dest_attr_key, "size")
-                    .await
-                    .map_err(map_err)?;
-                let file_size = file_size_opt.unwrap_or(0);
-
-                let mut pipe = redis::pipe();
-                pipe.del(&dest_attr_key)
-                    .del(&inline_key)
-                    .del(&meta_key)
-                    .del(&symlink_key);
-                let _: () = pipe
-                    .query_async(&mut new_parent_con)
-                    .await
-                    .map_err(map_err)?;
-
-                let mut global_pipe = redis::pipe();
-                if dest_kind != 2 {
-                    global_pipe.decr(crate::fs_key!("used_bytes"), file_size);
-                }
-                global_pipe.decr(crate::fs_key!("used_inodes"), 1);
-                let _: () = global_pipe
-                    .query_async(&mut global_con)
-                    .await
-                    .map_err(map_err)?;
-
-                // Invalidate caches
-                self.attr_cache.invalidate(&dest_ino);
-                self.router.metadata_cache.remove(&dest_file_path);
-
-                // Clean up leases, inode locks, POSIX locks
-                if let Some((_, lease)) = self.active_leases.remove(&dest_ino) {
-                    let _ = lease.release().await;
-                }
-                self.active_inode_locks.remove(&dest_ino);
-                self.active_posix_locks.retain(|key, _| key.0 != dest_ino);
+                // Directory entry for new_name is replaced by the hset below.
             }
 
             let now = SystemTime::now()
@@ -4916,6 +4893,10 @@ impl Filesystem for SqueezefsFilesystem {
         debug!("FUSE Forget: ino = {}, count = {}", ino, count);
         self.attr_cache.invalidate(&ino);
         self.active_inode_locks.remove(&ino);
+        // Reclaim inodes that reached nlink==0 while still open (unlink/14.t).
+        if let Err(e) = self.reclaim_orphaned_inode(ino).await {
+            debug!("FUSE Forget: reclaim orphaned inode {} : {:?}", ino, e);
+        }
     }
 
     async fn getlk(

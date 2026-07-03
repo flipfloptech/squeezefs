@@ -116,6 +116,7 @@ impl NvmeShard {
                 write_offset: 0,
                 capacity,
             }),
+            // Keep the file open so optional uring fdatasync can target the segment (P2-8).
             _file: Some(file),
         })
     }

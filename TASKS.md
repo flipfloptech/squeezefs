@@ -282,11 +282,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | **planned** (2026-07-03) — see notes; no code move yet (needs separate design+bench) |
-| **Location** | Block path only; FUSE/network still elsewhere |
+| **Status** | **done** (2026-07-03) — `uring_fs` for path I/O; block path fixed-file register; GDS/prefetch writes via uring; mmap staging kept intentionally; Redis/TLS still non-uring |
+| **Location** | `src/uring_fs.rs`, `nvme_dev` fixed files, GDS/prefetch callers; coverage table in `docs/PROFILING_AND_GATES.md` |
 | **Why** | Spec vs implementation gap. |
 | **Acceptance** | Clear plan: what moves to uring; no regression on existing block tests. |
-| **Plan** | **In uring today:** `NvmeBlockDev` read/write via worker + bounded SQ. **Keep:** Garnet/Redis over TCP (not a natural uring fit without a dedicated client). **Next candidates (priority order):** (1) FUSE read/write data copy path if fuse3 exposes registered buffers — only after fuse3/TPC audit; (2) staging-file writeback (`stage_write` / dehydrate) via `io_uring` open/read/write on staging dirs when not already buffered; (3) multi-device register_files for multi-backend. **Non-goals near-term:** TLS/mTLS peers, RESP pipeline. **Gate:** each move needs `nvme_dev_tests` + a mount smoke; no change until a follow-up PR with measurements. |
+| **Notes** | Staging segments stay **mmap** (hot get/put already zero-syscall). Multi-backend = each `NvmeBlockDev` owns a uring worker + optional fixed fd. Future: fuse3 registered buffers for FUSE data plane if/when fuse3 supports it cleanly. |
 
 ### P2-9 — Write-verification mode cost
 

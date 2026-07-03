@@ -238,7 +238,8 @@ impl GdsCache {
             if !local_path.exists() {
                 // Fetch the block using the router (handles decompression, decryption, and caching layers)
                 let data = router.get_cached_or_fetch_block(object_key).await?;
-                tokio::fs::write(&local_path, &data[..]).await?;
+                // P2-8: GDS local cache materialization via process io_uring file worker.
+                crate::uring_fs::write_all(&local_path, data.to_vec()).await?;
             }
 
             // 2. Open file descriptor with O_DIRECT

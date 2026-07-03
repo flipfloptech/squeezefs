@@ -626,8 +626,12 @@ impl DataRouter {
                                     if let Ok(downloaded) =
                                         router_clone.fetch_block_from_remote(&block_key).await
                                     {
-                                        if let Err(e) =
-                                            tokio::fs::write(&local_path, &*downloaded).await
+                                        // P2-8: path-based cache write via process io_uring worker.
+                                        if let Err(e) = crate::uring_fs::write_all(
+                                            &local_path,
+                                            downloaded.clone(),
+                                        )
+                                        .await
                                         {
                                             debug!(
                                                 "Prefetch (GDS): Failed to write block {}: {:?}",

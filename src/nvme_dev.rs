@@ -15,7 +15,7 @@
  */
 
 use crate::error::Result;
-use io_uring::{opcode, types::Fd, IoUring};
+use io_uring::{opcode, types, types::Fd, IoUring};
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
@@ -209,6 +209,27 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
         }
     };
 
+    // P2-8: register the block device as a fixed file so hot SQEs can use
+    // Fixed(0) and avoid per-op fd lookup overhead. Fall back to plain Fd(fd)
+    // if the kernel rejects registration.
+    let use_fixed = match unsafe { ring.submitter().register_files(&[fd]) } {
+        Ok(()) => {
+            log::debug!(
+                "NvmeBlockDev: registered fixed file for {:?} (index 0)",
+                device_path
+            );
+            true
+        }
+        Err(e) => {
+            log::debug!(
+                "NvmeBlockDev: fixed-file register failed for {:?}: {:?} (using raw Fd)",
+                device_path,
+                e
+            );
+            false
+        }
+    };
+
     struct ActiveReq {
         response: UringResponse,
         free_ptr: Option<(FreePtrKind, SendPtr)>,
@@ -270,10 +291,17 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         response: UringResponse::Read { bytes, size, tx },
                         free_ptr: None,
                     });
-                    opcode::Read::new(Fd(fd), buf_ptr.0, size as _)
-                        .offset(offset)
-                        .build()
-                        .user_data(slot_idx as u64)
+                    if use_fixed {
+                        opcode::Read::new(types::Fixed(0), buf_ptr.0, size as _)
+                            .offset(offset)
+                            .build()
+                            .user_data(slot_idx as u64)
+                    } else {
+                        opcode::Read::new(Fd(fd), buf_ptr.0, size as _)
+                            .offset(offset)
+                            .build()
+                            .user_data(slot_idx as u64)
+                    }
                 }
                 UringRequest::Write { offset, data, tx } => {
                     let (ptr, len, free_ptr) = match data {
@@ -289,10 +317,17 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         response: UringResponse::Write { tx },
                         free_ptr,
                     });
-                    opcode::Write::new(Fd(fd), ptr, len as _)
-                        .offset(offset)
-                        .build()
-                        .user_data(slot_idx as u64)
+                    if use_fixed {
+                        opcode::Write::new(types::Fixed(0), ptr, len as _)
+                            .offset(offset)
+                            .build()
+                            .user_data(slot_idx as u64)
+                    } else {
+                        opcode::Write::new(Fd(fd), ptr, len as _)
+                            .offset(offset)
+                            .build()
+                            .user_data(slot_idx as u64)
+                    }
                 }
             };
 

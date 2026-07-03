@@ -47,8 +47,10 @@ POSIX FUSE locks map to cluster leases on Garnet:
 ## 5. FUSE Client & Asynchronous I/O
 
 * Work-stealing / multi-thread tokio; core pinning where configured.
-* **Block path io_uring:** `NvmeBlockDev` worker (bounded request queue, backpressure).
-* FUSE `/dev/fuse` path uses the fuse3 stack (vendored); not every byte path is uring yet (see TASKS P2-8 plan).
+* **Block path io_uring:** `NvmeBlockDev` worker (bounded request queue, backpressure, fixed-file register when available).
+* **Path file I/O io_uring:** `crate::uring_fs` for ad-hoc local files (e.g. GDS cache materialize). Staging **mmap** segments stay mmap for zero-syscall get/put.
+* FUSE `/dev/fuse` uses fuse3 (+ optional uring poll helper); kernel protocol handling remains in fuse3.
+* **Not uring:** Garnet/Redis TCP, TLS peer paths (dedicated network stacks).
 
 ---
 

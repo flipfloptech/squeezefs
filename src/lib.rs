@@ -29,6 +29,7 @@ pub mod block_allocator;
 pub mod defrag;
 pub mod jobs;
 pub mod storage;
+pub mod uring_fs;
 
 use parking_lot::RwLock;
 

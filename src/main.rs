@@ -2095,11 +2095,23 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     (resolved_ip, resolved_port, resolved_subnqn)
                 {
                     log::info!("Backing device {} not found. Connecting to NVMe-oF target at {}:{} / {}...", resolved_backing_dev, ip_val, port_val, nqn_val);
-                    if let Ok(dev_path) =
-                        squeezefs::nvmeof::connect_target(&ip_val, port_val, &nqn_val)
-                    {
-                        log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
-                        resolved_backing_dev = dev_path;
+                    match squeezefs::nvmeof::connect_target(&ip_val, port_val, &nqn_val) {
+                        Ok(dev_path) => {
+                            log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
+                            resolved_backing_dev = dev_path;
+                        }
+                        Err(e) => {
+                            // P2-14: fail-fast with an actionable message (not a later opaque I/O error).
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!(
+                                    "Backing volume '{}' is missing and NVMe-oF connect to {}:{} nqn={} failed: {:?}. \
+                                     Start the target or pass --volume / a local path that exists.",
+                                    resolved_backing_dev, ip_val, port_val, nqn_val, e
+                                ),
+                            )
+                            .into());
+                        }
                     }
                 }
             }
@@ -2137,6 +2149,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(file) = std::fs::File::create(&resolved_backing_dev) {
                     let _ = file.set_len(capacity_bytes);
                 }
+            }
+
+            // P2-14: fail-fast if backing volume is still missing after NVMe-oF / LVM / ephemeral restore.
+            if !std::path::Path::new(&resolved_backing_dev).exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "Backing volume '{}' does not exist after mount setup. \
+                         Check --volume / format-time backing_dev, start the NVMe-oF target \
+                         (backing_dev_ip/port/subnqn), or restore LVM loops. \
+                         Without a data device the filesystem will not function.",
+                        resolved_backing_dev
+                    ),
+                )
+                .into());
             }
 
             squeezefs::storage::validate_backing_device(&resolved_backing_dev)?;

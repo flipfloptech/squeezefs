@@ -314,3 +314,191 @@ async fn test_recover_staging_commits_matching_uncommitted() {
         "recovery must write mapping, got {block:?}"
     );
 }
+
+/// P2-13 matrix: staged blob present but Garnet meta does not point at this file_id → discard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recover_staging_discards_when_meta_file_id_mismatch() {
+    if !garnet_ok().await {
+        println!("Skipping: Garnet unavailable");
+        return;
+    }
+    let (prefix, ino) = uniq_tag("rec_mismatch");
+    set_fs_prefix(&prefix);
+    set_write_verification(false);
+
+    let dlm = DlmClient::new(&redis_url()).unwrap();
+    let temp = TempDir::new().unwrap();
+    let block_path = temp.path().join("b.img");
+    {
+        let f = std::fs::File::create(&block_path).unwrap();
+        f.set_len(32 * 1024 * 1024).unwrap();
+    }
+    let staging_root = temp.path().join("staging_root");
+    let segment = staging_root.join("staging_segment");
+    std::fs::create_dir_all(&segment).unwrap();
+
+    let meta = Arc::new(dlm.meta_client().clone());
+    let nvme = Arc::new(NvmeBlockDev::new(block_path.to_str().unwrap()));
+    let alloc = Arc::new(BlockAllocator::new(meta.clone(), &prefix).await.unwrap());
+
+    let path = format!("inode_{ino}");
+    let file_id = format!("fid_{ino}_orphan");
+    let payload = vec![0xCDu8; 4096];
+
+    {
+        let cache =
+            squeezefs::tiering::nvme::NvmeCache::new(&[&segment], &[8 * 1024 * 1024], 1).unwrap();
+        let meta_hdr = squeezefs::cache::nvme::StagedMetadata {
+            fencing_token: 1,
+            original_size: payload.len() as u64,
+            file_path: path.clone(),
+        };
+        let meta_bytes = meta_hdr.serialize();
+        let meta_len = meta_bytes.len() as u64;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta_len.to_be_bytes());
+        buf.extend_from_slice(&meta_bytes);
+        buf.extend_from_slice(&payload);
+        cache.put(bytes::Bytes::from(file_id.clone()), bytes::Bytes::from(buf));
+        drop(cache);
+    }
+
+    let mut con = meta.get_connection().await.unwrap();
+    let format_key = format!("{prefix}:format");
+    let _: () = redis::cmd("HSET")
+        .arg(&format_key)
+        .arg("write_disk_limit")
+        .arg("8MB")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    // Meta says staged but a *different* file_id — orphan staging must not commit.
+    let meta_key = format!("metadata:{path}");
+    let _: () = redis::pipe()
+        .hset(&meta_key, "type", "staged")
+        .hset(&meta_key, "file_id", "other_fid")
+        .hset(&meta_key, "fencing_token", 1u64)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let n = squeezefs::recovery::recover_staging(&staging_root, meta.as_ref(), &alloc, &nvme)
+        .await
+        .expect("recover_staging");
+    assert_eq!(n, 0, "mismatched file_id must not recover");
+}
+
+/// P2-13 matrix: corrupt staged blob (garbage bytes) → discard, no panic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recover_staging_discards_corrupt_blob() {
+    if !garnet_ok().await {
+        println!("Skipping: Garnet unavailable");
+        return;
+    }
+    let (prefix, _ino) = uniq_tag("rec_corrupt");
+    set_fs_prefix(&prefix);
+
+    let dlm = DlmClient::new(&redis_url()).unwrap();
+    let temp = TempDir::new().unwrap();
+    let block_path = temp.path().join("b.img");
+    {
+        let f = std::fs::File::create(&block_path).unwrap();
+        f.set_len(16 * 1024 * 1024).unwrap();
+    }
+    let staging_root = temp.path().join("staging_root");
+    let segment = staging_root.join("staging_segment");
+    std::fs::create_dir_all(&segment).unwrap();
+
+    let meta = Arc::new(dlm.meta_client().clone());
+    let nvme = Arc::new(NvmeBlockDev::new(block_path.to_str().unwrap()));
+    let alloc = Arc::new(BlockAllocator::new(meta.clone(), &prefix).await.unwrap());
+
+    {
+        let cache =
+            squeezefs::tiering::nvme::NvmeCache::new(&[&segment], &[8 * 1024 * 1024], 1).unwrap();
+        // Not a valid staged header.
+        cache.put(
+            bytes::Bytes::from_static(b"not_a_real_file_id"),
+            bytes::Bytes::from(vec![0xFFu8; 64]),
+        );
+        drop(cache);
+    }
+
+    let mut con = meta.get_connection().await.unwrap();
+    let format_key = format!("{prefix}:format");
+    let _: () = redis::cmd("HSET")
+        .arg(&format_key)
+        .arg("write_disk_limit")
+        .arg("8MB")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let n = squeezefs::recovery::recover_staging(&staging_root, meta.as_ref(), &alloc, &nvme)
+        .await
+        .expect("recover_staging must tolerate corrupt entries");
+    assert_eq!(n, 0);
+}
+
+/// P2-13 matrix: active_block for inode with no metadata → discard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recover_discards_active_block_without_inode_meta() {
+    if !garnet_ok().await {
+        println!("Skipping: Garnet unavailable");
+        return;
+    }
+    let (prefix, ino) = uniq_tag("rec_no_meta");
+    set_fs_prefix(&prefix);
+
+    let dlm = DlmClient::new(&redis_url()).unwrap();
+    let temp = TempDir::new().unwrap();
+    let block_path = temp.path().join("b.img");
+    {
+        let f = std::fs::File::create(&block_path).unwrap();
+        f.set_len(32 * 1024 * 1024).unwrap();
+    }
+    let staging_root = temp.path().join("staging_root");
+    let segment = staging_root.join("staging_segment");
+    std::fs::create_dir_all(&segment).unwrap();
+
+    let meta = Arc::new(dlm.meta_client().clone());
+    let nvme = Arc::new(NvmeBlockDev::new(block_path.to_str().unwrap()));
+    let alloc = Arc::new(BlockAllocator::new(meta.clone(), &prefix).await.unwrap());
+
+    let cache_key = format!("active_block:inode_{ino}:block_0");
+    let payload = vec![0x11u8; 4096];
+    {
+        let cache =
+            squeezefs::tiering::nvme::NvmeCache::new(&[&segment], &[8 * 1024 * 1024], 1).unwrap();
+        let meta_hdr = squeezefs::cache::nvme::StagedMetadata {
+            fencing_token: 1,
+            original_size: payload.len() as u64,
+            file_path: format!("inode_{ino}"),
+        };
+        let meta_bytes = meta_hdr.serialize();
+        let meta_len = meta_bytes.len() as u64;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta_len.to_be_bytes());
+        buf.extend_from_slice(&meta_bytes);
+        buf.extend_from_slice(&payload);
+        // active_block path uses parse_staged_blob(..., true)
+        cache.put(bytes::Bytes::from(cache_key), bytes::Bytes::from(buf));
+        drop(cache);
+    }
+
+    let mut con = meta.get_connection().await.unwrap();
+    let format_key = format!("{prefix}:format");
+    let _: () = redis::cmd("HSET")
+        .arg(&format_key)
+        .arg("write_disk_limit")
+        .arg("8MB")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    // Intentionally no metadata:inode_{ino}
+
+    let n = squeezefs::recovery::recover_staging(&staging_root, meta.as_ref(), &alloc, &nvme)
+        .await
+        .expect("recover");
+    assert_eq!(n, 0, "orphan active_block must be discarded");
+}

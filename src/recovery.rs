@@ -14,6 +14,20 @@
 //!
 //! Staged payload headers use the binary format in `cache::nvme::StagedMetadata`
 //! (not JSON).
+//!
+//! # Recovery completeness matrix (P2-13)
+//!
+//! | Scenario | Expected |
+//! |----------|----------|
+//! | Staged id matches meta `file_id` + type staged + fence OK | commit to backend + mapping |
+//! | Staged fence &lt; Garnet fence | discard |
+//! | Staged present, meta `file_id` mismatch / not staged | discard |
+//! | Corrupt staged blob | discard (no panic) |
+//! | `active_block:` with missing inode meta | discard |
+//! | `active_block:` fence stale | discard |
+//! | Partial flush (write_block fails) | leave entry / continue (best-effort log) |
+//!
+//! Covered by `tests/crash_consistency_tests.rs` and `tests/recovery_tests.rs`.
 
 use crate::cache::nvme::parse_staged_blob;
 use crate::error::Result;

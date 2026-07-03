@@ -1,10 +1,8 @@
 //! Kernel **FUSE-over-io_uring** (Linux 6.14+ / 7.x) — `linux/fuse.h` + libfuse `fuse_uring.c`.
 //!
-//! # Enable (default on)
+//! Always enabled after classical `FUSE_INIT` (required transport). Tuning only:
 //! ```text
-//! # default: attempt FUSE-over-io_uring after INIT; fall back to classical on failure
-//! SQUEEZEFS_FUSE_OVER_IO_URING=0           # force classical /dev/fuse path only
-//! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=8   # optional, per-queue depth
+//! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=8   # optional, per-queue depth (default 8)
 //! SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES=N    # optional, default = min(nproc, 32)
 //! ```
 //!
@@ -181,18 +179,6 @@ pub fn over_uring_stats() -> (u64, u64, u64, u64) {
         STATS_CQE_ERR.load(Ordering::Relaxed),
         STATS_REGISTER.load(Ordering::Relaxed),
     )
-}
-
-/// Default **on**. Opt out with `SQUEEZEFS_FUSE_OVER_IO_URING=0|false|off|no`.
-/// Setup still falls back to the classical path if the kernel rejects the protocol.
-pub fn want_fuse_over_uring() -> bool {
-    match std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING") {
-        Ok(v) => !matches!(
-            v.to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
 }
 
 impl FuseOverUring {
@@ -668,12 +654,6 @@ mod tests {
     #[test]
     fn test_flags2_bit() {
         assert_eq!(FUSE_OVER_IO_URING_FLAGS2, 1u32 << 9);
-    }
-
-    #[test]
-    fn test_want_env_opt_in() {
-        // Don't assert global env; just ensure function is callable.
-        let _ = want_fuse_over_uring();
     }
 
     #[test]

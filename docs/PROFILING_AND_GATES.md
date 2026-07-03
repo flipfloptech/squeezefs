@@ -115,19 +115,15 @@ Mounted volumes expose process metrics under the virtual **stats** inode (JSON),
 |----------|--------|
 | `SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS` | Enable SQPOLL with idle timeout (ms); also set via mount/format |
 | `SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU` | Pin SQPOLL kernel thread |
-| `SQUEEZEFS_FUSE_IO_URING_ENTRIES` | SQ depth for classical FUSE rings (default 1024, clamp 64–4096) |
-| **`SQUEEZEFS_FUSE_OVER_IO_URING`** | **Default on.** Set to `0`/`false`/`off` to force classical `/dev/fuse` only |
-| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | Entries per queue (default 8) |
+| `SQUEEZEFS_FUSE_IO_URING_ENTRIES` | SQ depth for classical FUSE rings used during INIT / notify (default 1024, clamp 64–4096) |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | Entries per FUSE-over-io_uring queue (default 8) |
 | `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` | Number of per-CPU style queues (default `min(nproc, 32)`) |
 
 ```bash
-# Default mount attempts FUSE-over-io_uring after INIT.
+# Mount always enables FUSE-over-io_uring after INIT (required; no opt-out).
 target/release/squeezefs mount …
 # Expect log: "FUSE-over-io_uring transport enabled for this session"
-# or a warn + classical fallback if the kernel rejects the protocol.
-
-# Force classical path only:
-export SQUEEZEFS_FUSE_OVER_IO_URING=0
+# Mount fails if the kernel rejects the protocol (need Linux 6.14+ / CONFIG_FUSE_IO_URING).
 ```
 
 **Hardening notes:** per-qid commit channels (no demux races), shared inbound work queue for multi-queue session workers, eventfd wake on commit/shutdown, probe REGISTER before full start.

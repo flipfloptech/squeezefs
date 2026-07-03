@@ -282,11 +282,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | **done** (2026-07-03) — classical fuse-over-userspace-uring + **kernel FUSE-over-io_uring default-on** with classical fallback |
+| **Status** | **done** (2026-07-03) — classical fuse-over-userspace-uring for INIT/notify + **kernel FUSE-over-io_uring required** for the request path (no opt-out) |
 | **Location** | `src/uring_fs.rs`, `nvme_dev`, fuse3 connection + `fuse_over_uring`; docs |
 | **Why** | Spec vs implementation gap. |
 | **Acceptance** | Clear plan: what moves to uring; no regression on existing block tests. |
-| **Notes** | Kernel FUSE-over-io_uring is **default**; set `SQUEEZEFS_FUSE_OVER_IO_URING=0` to force classical. Staging stays mmap. |
+| **Notes** | Kernel FUSE-over-io_uring is **required** after INIT (no opt-out / no classical fallback). Staging stays mmap. |
 
 ### P2-9 — Write-verification mode cost
 

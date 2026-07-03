@@ -72,12 +72,18 @@ where
     let sem = BG_TASK_SEM.clone();
     match sem.clone().try_acquire_owned() {
         Ok(permit) => {
+            crate::fuse_client::METRICS
+                .bg_spawn_admitted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
                 let _permit = permit;
                 fut.await;
             });
         }
         Err(_) => {
+            crate::fuse_client::METRICS
+                .bg_spawn_rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::debug!("bg_admit: rejected background task (admission full)");
         }
     }

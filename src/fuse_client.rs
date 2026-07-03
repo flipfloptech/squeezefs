@@ -210,6 +210,7 @@ impl<T> std::ops::DerefMut for Align64<T> {
     }
 }
 
+/// Process-wide counters (P3-1). All updates are `Relaxed` atomics — no locks on the hot path.
 #[derive(Default)]
 pub struct Metrics {
     pub fuse_ops: Align64<ProbabilisticAtomic>,
@@ -219,6 +220,20 @@ pub struct Metrics {
     pub del_obj: Align64<AtomicU64>,
     pub cache_hits: Align64<AtomicU64>,
     pub cache_misses: Align64<AtomicU64>,
+    /// Layout mix (write path outcomes).
+    pub layout_inline_writes: Align64<AtomicU64>,
+    pub layout_staged_writes: Align64<AtomicU64>,
+    pub layout_striped_writes: Align64<AtomicU64>,
+    /// Best-effort background admission (see `bg_admit`).
+    pub bg_spawn_admitted: Align64<AtomicU64>,
+    pub bg_spawn_rejected: Align64<AtomicU64>,
+    /// io_uring request queue backpressure (submit rejected as full).
+    pub uring_queue_full: Align64<AtomicU64>,
+    /// DLM lease acquire outcomes (coarse lock-wait signal).
+    pub lease_acquire_ok: Align64<AtomicU64>,
+    pub lease_acquire_fail: Align64<AtomicU64>,
+    /// Writeback path: durable flush hard failures (sticky).
+    pub writeback_hard_failures: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -612,6 +627,18 @@ impl SqueezefsFilesystem {
                 "cache_hits": hits,
                 "cache_misses": misses,
                 "cache_hit_ratio": ratio,
+                "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
+                "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
+                "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
+                "bg_spawn_admitted": METRICS.bg_spawn_admitted.load(Ordering::Relaxed),
+                "bg_spawn_rejected": METRICS.bg_spawn_rejected.load(Ordering::Relaxed),
+                "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),
+                "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
+                "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),
+                "writeback_hard_failures": METRICS.writeback_hard_failures.load(Ordering::Relaxed),
+                "bg_admit_available_permits": crate::bg_admit::available_permits(),
+                "bg_admit_capacity": crate::bg_admit::capacity(),
+                "striped_block_concurrency": crate::bg_admit::striped_block_concurrency(),
             },
             "cache_capacities": {
                 "read_lru_current_bytes": self.router.cache.read_lru.current_bytes(),
@@ -6623,6 +6650,9 @@ async fn requeue_or_hard_fail(
             req.ino, req.block_idx, err_msg
         );
         WRITEBACK_HARD_FAILURES.insert(req.ino, err_msg);
+        METRICS
+            .writeback_hard_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 

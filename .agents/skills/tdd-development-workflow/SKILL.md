@@ -40,7 +40,13 @@ This repo is Linux + **io_uring**-first. When planning or implementing:
 - The **only** intentional classical FUSE use is the one-shot **`FUSE_INIT`** exchange (kernel requires it before REGISTER). After arm, requests/replies are over-uring only.
 - If a failing test tempts you to disable over-uring or switch to blocking `read`/`write`, stop — write a failing test that encodes correct uring behavior, then fix uring.
 
-Authoritative detail: root `AGENTS.md` (“Non-negotiable: always use io_uring”) and `.agents/AGENTS.md`.
+Authoritative detail: root `AGENTS.md` (“Non-negotiable: always use io_uring” / “no dead code”) and `.agents/AGENTS.md`.
+
+### No dead code
+
+- Remove unused functions, fields, imports, and modules as part of the same change that made them unused.
+- **Never** add `#[allow(dead_code)]` / `#[allow(unused_*)]` to park unused code. Delete it; git has history.
+- Clippy with `-D warnings` failing on unused items means **delete**, not allow.
 
 ## Phase 1: Understand & Plan
 
@@ -126,6 +132,7 @@ Write the minimum code to make all tests pass:
 - [ ] No `unwrap()`/`expect()` in library code — propagate errors
 - [ ] All `JoinHandle`s are awaited or explicitly detached with documented rationale
 - [ ] No TODO/FIXME left without a tracking issue
+- [ ] **I/O uses io_uring where applicable** — no new classical FUSE/file fallbacks; FUSE request path stays over-uring after arm
 
 ### Commit: Implementation
 
@@ -212,3 +219,4 @@ git branch -d feat/short-description
 | Unbounded channels in production code | Use `mpsc::channel(bound)` with explicit backpressure |
 | Leaking tasks (fire-and-forget `spawn` without tracking) | Use `JoinSet` or structured concurrency patterns |
 | Ignoring `Send + Sync` bounds | Design types to be `Send + Sync` from the start; document why if not |
+| Falling back to classical `/dev/fuse` or POSIX file I/O to dodge an uring bug | **Always use io_uring when we can.** Fix the uring path or fail the mount/op — never reintroduce classical escape hatches |

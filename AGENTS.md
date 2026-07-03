@@ -16,6 +16,15 @@ Squeezefs is a high-performance distributed POSIX FUSE filesystem (Rust + tokio 
 
 If over-uring or block uring misbehaves: **debug and fix uring** — never reintroduce a classical escape hatch “just to make tests pass.”
 
+## Non-negotiable: no dead code
+
+**Do not leave unused code in the tree.** Agents and humans must remove it, not silence it.
+
+- **Delete** unused functions, methods, fields, imports, constants, modules, and feature-gated stubs that nothing calls.
+- **Do not** paper over dead code with `#[allow(dead_code)]`, `#[allow(unused)]`, or broad `allow` attributes “for later.” If it is not used now, delete it; restore from git when needed.
+- **Clippy/gate:** `cargo clippy --all-targets --all-features -- -D warnings` must stay clean — that includes unused items. Fix by **removing** dead code, not by allowing warnings.
+- **Exceptions only** when the item is part of a public API surface that must stay stable (`pub` for crates/downstream) or is required for `#[cfg]` / trait impl completeness and truly cannot be omitted — document why in a one-line comment on that item. Prefer not exporting unused symbols.
+
 See `.agents/AGENTS.md` (architecture) and `.agents/skills/tdd-development-workflow/SKILL.md` (dev workflow).
 
 ## Authoritative docs already in this repo

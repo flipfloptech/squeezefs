@@ -51,6 +51,7 @@ POSIX FUSE locks map to cluster leases on Garnet:
 * **Path file I/O io_uring:** `crate::uring_fs` for ad-hoc local files (e.g. GDS cache materialize). Staging **mmap** segments stay mmap for zero-syscall get/put.
 * **FUSE transport:** vendored **fuse3** — classical `/dev/fuse` only for `FUSE_INIT` (kernel requires initialized connection before REGISTER); **FUSE-over-io_uring is required** for the request hot path after arm (`flags2` `FUSE_OVER_IO_URING`, `REGISTER` / `COMMIT_AND_FETCH`). No userspace opt-out; mount fails if setup fails. Auto-enables `fuse.enable_uring=Y` when possible. One queue per possible CPU; session arms only after all queues REGISTERed.
 * **Always use io_uring when we can (non-negotiable):** every local/block/FUSE data path that the kernel can drive with io_uring **must** use it. Do not add classical `read`/`write`/`/dev/fuse` fallbacks to paper over uring bugs — fix the uring implementation or fail the mount/operation. Applies to agents and human contributors.
+* **No dead code (non-negotiable):** delete unused items; do not leave them with `#[allow(dead_code)]` “for later.” Clippy `-D warnings` must stay green by removal, not by allows. Rare exceptions only for real public API / unavoidable cfg-trait surface, with a one-line why.
 * **Not uring:** Garnet/Redis TCP, TLS peer paths (network). Staging **mmap** segments stay mmap by design.
 
 ---

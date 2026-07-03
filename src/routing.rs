@@ -442,7 +442,7 @@ impl DataRouter {
             .dlm
             .get_connection_for_inode(parse_inode_from_path(file_path))
             .await?;
-        let meta_key = format!("metadata:{}", file_path);
+        let meta_key = crate::keys::metadata_for_path(file_path);
         let fields: std::collections::HashMap<String, String> =
             tokio::time::timeout(std::time::Duration::from_secs(2), con.hgetall(&meta_key))
                 .await
@@ -496,7 +496,7 @@ impl DataRouter {
         let mut block_keys = Vec::new();
 
         if let Some(block_map_id) = &meta.block_map_id {
-            let block_map_key = format!("block_map:{}", block_map_id);
+            let block_map_key = crate::keys::block_map(&block_map_id);
 
             let mut blocks_to_query = Vec::new();
             for b in start_block..=end_block {
@@ -674,7 +674,7 @@ impl DataRouter {
         old_id: &str,
         con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
-        let mapping_key = format!("mapping:{}", old_id);
+        let mapping_key = crate::keys::mapping(&old_id);
         let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
         if let Some(bk) = block_key {
             let refcounts_key_str = crate::fs_key!("block_refcounts");
@@ -719,7 +719,7 @@ impl DataRouter {
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
 
         let ino = parse_inode_from_path(file_path);
-        let meta_key = format!("metadata:{}", file_path);
+        let meta_key = crate::keys::metadata_for_path(file_path);
 
         // Deferred NVMe read of a staged payload (mapping captured under meta con).
         enum StagedBackendRead {
@@ -757,7 +757,7 @@ impl DataRouter {
             let mut staged_backend = StagedBackendRead::None;
             let existing_data = match file_type.as_deref() {
                 Some("inline") => {
-                    let inline_key = format!("inline_data:{}", file_path);
+                    let inline_key = crate::keys::inline_data(file_path);
                     let bytes: Option<Vec<u8>> = con.get(&inline_key).await?;
                     if let Some(b) = bytes {
                         self.get_crypto().process_read(&b)?.into_owned()
@@ -771,7 +771,7 @@ impl DataRouter {
                         if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
                             staged_data
                         } else {
-                            let mapping_key = format!("mapping:{}", file_id);
+                            let mapping_key = crate::keys::mapping(&file_id);
                             let (block_key, off_val, sz_val): (
                                 Option<String>,
                                 Option<u64>,
@@ -890,7 +890,7 @@ impl DataRouter {
         // Save back with appropriate layout routing
         if new_size < 4 * 1024 {
             // Layout: inline (redis-only after crypto)
-            let inline_key = format!("inline_data:{}", file_path);
+            let inline_key = crate::keys::inline_data(file_path);
             let shared_data = bytes::Bytes::from(existing_data);
             let processed_data = self.get_crypto().process_write(shared_data.clone())?;
 
@@ -927,7 +927,7 @@ impl DataRouter {
                 let _ = self
                     .decrement_staged_block_refcount(&old_id, &mut con)
                     .await;
-                let mapping_key = format!("mapping:{}", old_id);
+                let mapping_key = crate::keys::mapping(&old_id);
                 let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
                     log::debug!("non-fatal cleanup op failed: {:?}", e);
                 });
@@ -964,7 +964,7 @@ impl DataRouter {
                         .hset(&meta_key, "fencing_token", fencing_token);
 
                     if file_type.as_deref() == Some("inline") {
-                        let inline_key = format!("inline_data:{}", file_path);
+                        let inline_key = crate::keys::inline_data(file_path);
                         pipe.del(&inline_key);
                     }
                     let _: () = tokio::time::timeout(
@@ -984,7 +984,7 @@ impl DataRouter {
                         let _ = self
                             .decrement_staged_block_refcount(&old_id, &mut con)
                             .await;
-                        let mapping_key = format!("mapping:{}", old_id);
+                        let mapping_key = crate::keys::mapping(&old_id);
                         let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
                             log::debug!("non-fatal cleanup op failed: {:?}", e);
                         });
@@ -1006,7 +1006,7 @@ impl DataRouter {
 
                     nvme_writer.write_block(be_offset, &processed_data).await?;
 
-                    let mapping_key = format!("mapping:{}", new_file_id);
+                    let mapping_key = crate::keys::mapping(&new_file_id);
                     let size = processed_data.len() as u64;
                     let mut con = self.dlm.get_connection_for_inode(ino).await?;
                     let mut pipe = atomic_meta_pipe();
@@ -1016,7 +1016,7 @@ impl DataRouter {
                         .hset(&meta_key, "fencing_token", fencing_token);
 
                     if file_type.as_deref() == Some("inline") {
-                        let inline_key = format!("inline_data:{}", file_path);
+                        let inline_key = crate::keys::inline_data(file_path);
                         pipe.del(&inline_key);
                     }
                     pipe.hset(&mapping_key, "block", &stored_block_key)
@@ -1045,7 +1045,7 @@ impl DataRouter {
                         let _ = self
                             .decrement_staged_block_refcount(&old_id, &mut con)
                             .await;
-                        let old_mapping_key = format!("mapping:{}", old_id);
+                        let old_mapping_key = crate::keys::mapping(&old_id);
                         let _: () = con.del(&old_mapping_key).await.unwrap_or_else(|e| {
                             log::debug!("non-fatal cleanup op failed: {:?}", e);
                         });
@@ -1192,7 +1192,7 @@ impl DataRouter {
         sizes_to_register: &[(String, usize, usize)],
         con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
-        let block_map_key = format!("block_map:{}", block_map_id);
+        let block_map_key = crate::keys::block_map(&block_map_id);
         let refcounts_key_str = crate::fs_key!("block_refcounts");
         let refcounts_key = &refcounts_key_str;
         let block_sizes_key = crate::fs_key!("block_sizes");
@@ -1220,7 +1220,7 @@ impl DataRouter {
             .hset(meta_key, "fencing_token", fencing_token);
 
         if file_type == Some("inline") {
-            let inline_key = format!("inline_data:{}", file_path);
+            let inline_key = crate::keys::inline_data(file_path);
             pipe.del(&inline_key);
         }
         if file_type == Some("staged") {
@@ -1239,7 +1239,7 @@ impl DataRouter {
         if let Some(old_id) = old_file_id {
             self.cache.nvme.remove_staged(&old_id);
             let _ = self.decrement_staged_block_refcount(&old_id, con).await;
-            let mapping_key = format!("mapping:{}", old_id);
+            let mapping_key = crate::keys::mapping(&old_id);
             let _: () = con.del(&mapping_key).await.unwrap_or_else(|e| {
                 log::debug!("non-fatal cleanup op failed: {:?}", e);
             });
@@ -1304,7 +1304,7 @@ impl DataRouter {
                     let num_blocks = num_blocks_opt.unwrap_or(0);
 
                     let new_id = Uuid::new_v4().to_string();
-                    let block_map_key = format!("block_map:{}", new_id);
+                    let block_map_key = crate::keys::block_map(&new_id);
                     let refcounts_key_str = crate::fs_key!("block_refcounts");
                     let refcounts_key = &refcounts_key_str;
                     let mut pipe = redis::pipe();
@@ -1321,7 +1321,7 @@ impl DataRouter {
 
             let num_blocks = num_blocks_opt.unwrap_or(0);
             let existing_size = size_opt.unwrap_or(0);
-            let block_map_key = format!("block_map:{}", block_map_id);
+            let block_map_key = crate::keys::block_map(&block_map_id);
 
             let mut pipe = redis::pipe();
             for b in start_block..=end_block {
@@ -1331,7 +1331,7 @@ impl DataRouter {
             (block_map_id, num_blocks, existing_size, old_block_keys)
         }; // meta con dropped before block I/O
 
-        let block_map_key = format!("block_map:{}", block_map_id);
+        let block_map_key = crate::keys::block_map(&block_map_id);
         let refcounts_key_str = crate::fs_key!("block_refcounts");
         let refcounts_key = &refcounts_key_str;
 
@@ -1623,7 +1623,7 @@ impl DataRouter {
             .dlm
             .get_connection_for_inode(parse_inode_from_path(file_path))
             .await?;
-        let meta_key = format!("metadata:{}", file_path);
+        let meta_key = crate::keys::metadata_for_path(file_path);
 
         let file_type: Option<String> = con.hget(&meta_key, "type").await?;
         let file_type = file_type.ok_or_else(|| {
@@ -1640,7 +1640,7 @@ impl DataRouter {
                     "Routing: File '{}' inline read from metadata server.",
                     file_path
                 );
-                let inline_key = format!("inline_data:{}", file_path);
+                let inline_key = crate::keys::inline_data(file_path);
                 let bytes: Vec<u8> = con.get(&inline_key).await?;
                 self.get_crypto().process_read(&bytes)?.into_owned()
             }
@@ -1664,7 +1664,7 @@ impl DataRouter {
                         "Routing: Staged file '{}' (ID: {}) already merged. Reading packed block.",
                         file_path, file_id
                     );
-                    let mapping_key = format!("mapping:{}", file_id);
+                    let mapping_key = crate::keys::mapping(&file_id);
                     let (block_key, offset, size): (Option<String>, Option<u64>, Option<u64>) =
                         redis::cmd("HMGET")
                             .arg(&mapping_key)
@@ -1714,7 +1714,7 @@ impl DataRouter {
                 let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
 
                 let block_keys = if let Some(block_map_id) = block_map_id_opt {
-                    let block_map_key = format!("block_map:{}", block_map_id);
+                    let block_map_key = crate::keys::block_map(&block_map_id);
                     let mut keys = Vec::new();
                     let mut pipe = redis::pipe();
                     for i in 0..num_blocks {
@@ -1838,7 +1838,7 @@ impl DataRouter {
                     .dlm
                     .get_connection_for_inode(parse_inode_from_path(file_path))
                     .await?;
-                let meta_key = format!("metadata:{}", file_path);
+                let meta_key = crate::keys::metadata_for_path(file_path);
                 let fields: std::collections::HashMap<String, String> =
                     tokio::time::timeout(std::time::Duration::from_secs(2), con.hgetall(&meta_key))
                         .await
@@ -1889,7 +1889,7 @@ impl DataRouter {
                     .dlm
                     .get_connection_for_inode(parse_inode_from_path(file_path))
                     .await?;
-                let inline_key = format!("inline_data:{}", file_path);
+                let inline_key = crate::keys::inline_data(file_path);
                 let bytes: Vec<u8> = con.get(&inline_key).await?;
                 let decompressed = self.get_crypto().process_read(&bytes)?;
                 let start = std::cmp::min(offset as usize, decompressed.len());
@@ -1907,7 +1907,7 @@ impl DataRouter {
                     let end = std::cmp::min((offset + size as u64) as usize, staged_data.len());
                     Ok(staged_data[start..end].to_vec())
                 } else {
-                    let mapping_key = format!("mapping:{}", file_id);
+                    let mapping_key = crate::keys::mapping(&file_id);
                     let mut con = self
                         .dlm
                         .get_connection_for_inode(parse_inode_from_path(file_path))
@@ -1990,7 +1990,8 @@ impl DataRouter {
                         })?;
                     futures.push(tokio::spawn(async move {
                         let _permit = permit;
-                        let cache_key = format!("active_block:{}:block_{}", file_path_clone, b_idx);
+                        let cache_key =
+                            crate::keys::active_block_for_path(&file_path_clone, b_idx).to_string();
                         let block_data = if let Some(active_data) =
                             router.cache.nvme.read_staged(&cache_key)
                         {
@@ -2110,7 +2111,7 @@ impl DataRouter {
                     .dlm
                     .get_connection_for_inode(parse_inode_from_path(file_path))
                     .await?;
-                let inline_key = format!("inline_data:{}", file_path);
+                let inline_key = crate::keys::inline_data(file_path);
                 let bytes: Vec<u8> = con.get(&inline_key).await?;
                 let decompressed = self.get_crypto().process_read(&bytes)?;
                 let start = std::cmp::min(offset as usize, decompressed.len());
@@ -2133,7 +2134,7 @@ impl DataRouter {
                     let data = bytes::Bytes::copy_from_slice(&sliced_guard);
                     Ok((data, Some(std::sync::Arc::new(sliced_guard))))
                 } else {
-                    let mapping_key = format!("mapping:{}", file_id);
+                    let mapping_key = crate::keys::mapping(&file_id);
                     let mut con = self
                         .dlm
                         .get_connection_for_inode(parse_inode_from_path(file_path))
@@ -2197,7 +2198,8 @@ impl DataRouter {
                     let b_start_offset = b_idx as u64 * block_size;
                     let slice_start = offset - b_start_offset;
                     let slice_len = (end_offset - offset) as u32;
-                    let cache_key = format!("active_block:{}:block_{}", file_path, b_idx);
+                    let cache_key =
+                        crate::keys::active_block_for_path(file_path, b_idx).to_string();
 
                     // Check active block staging first
                     if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&cache_key) {
@@ -2296,7 +2298,8 @@ impl DataRouter {
                         })?;
                     futures.push(tokio::spawn(async move {
                         let _permit = permit;
-                        let cache_key = format!("active_block:{}:block_{}", file_path_clone, b_idx);
+                        let cache_key =
+                            crate::keys::active_block_for_path(&file_path_clone, b_idx).to_string();
                         if let Some(active_data) = router.cache.nvme.read_staged(&cache_key) {
                             let start = std::cmp::min(rel_start, active_data.len());
                             let end = std::cmp::min(rel_start + copy_len, active_data.len());
@@ -2384,7 +2387,7 @@ impl DataRouter {
             .dlm
             .get_connection_for_inode(parse_inode_from_path(file_path))
             .await?;
-        let meta_key = format!("metadata:{}", file_path);
+        let meta_key = crate::keys::metadata_for_path(file_path);
         let size: Option<u64> = con.hget(&meta_key, "size").await?;
         size.ok_or_else(|| {
             SqueezefsError::Io(std::io::Error::new(
@@ -2424,14 +2427,15 @@ impl DataRouter {
             (l2, l1)
         };
 
-        let mut src_con =
-            if let Some(src_ino) = crate::dlm::parse_inode_from_key(&format!("metadata:{}", src)) {
-                self.dlm.get_connection_for_inode(src_ino).await?
-            } else {
-                self.dlm.get_connection().await?
-            };
+        let mut src_con = if let Some(src_ino) =
+            crate::dlm::parse_inode_from_key(&crate::keys::metadata_for_path(src))
+        {
+            self.dlm.get_connection_for_inode(src_ino).await?
+        } else {
+            self.dlm.get_connection().await?
+        };
         let mut dest_con = if let Some(dest_ino) =
-            crate::dlm::parse_inode_from_key(&format!("metadata:{}", dest))
+            crate::dlm::parse_inode_from_key(&crate::keys::metadata_for_path(dest))
         {
             self.dlm.get_connection_for_inode(dest_ino).await?
         } else {
@@ -2439,8 +2443,8 @@ impl DataRouter {
         };
         let mut con = self.dlm.get_connection().await?;
 
-        let src_meta_key = format!("metadata:{}", src);
-        let dest_meta_key = format!("metadata:{}", dest);
+        let src_meta_key = crate::keys::metadata_for_path(src);
+        let dest_meta_key = crate::keys::metadata_for_path(dest);
 
         let exists_src: bool = src_con.exists(&src_meta_key).await?;
         if !exists_src {
@@ -2468,8 +2472,8 @@ impl DataRouter {
             .ok_or_else(|| SqueezefsError::InvalidOperation("Missing file type".to_string()))?;
 
         if file_type == "inline" {
-            let inline_src_key = format!("inline_data:{}", src);
-            let inline_dest_key = format!("inline_data:{}", dest);
+            let inline_src_key = crate::keys::inline_data(src);
+            let inline_dest_key = crate::keys::inline_data(dest);
 
             let inline_data: Option<Vec<u8>> = src_con.get(&inline_src_key).await?;
             let inline_data = inline_data.unwrap_or_default();
@@ -2508,8 +2512,8 @@ impl DataRouter {
                     .await?;
             }
 
-            let mapping_src_key = format!("mapping:{}", src_file_id);
-            let mapping_dest_key = format!("mapping:{}", new_file_id);
+            let mapping_src_key = crate::keys::mapping(&src_file_id);
+            let mapping_dest_key = crate::keys::mapping(&new_file_id);
             let (block, offset, sz): (Option<String>, Option<u64>, Option<u64>) =
                 redis::cmd("HMGET")
                     .arg(&mapping_src_key)
@@ -2567,7 +2571,7 @@ impl DataRouter {
                     let num_blocks = num_blocks_opt.unwrap_or(0);
 
                     let new_id = Uuid::new_v4().to_string();
-                    let block_map_key = format!("block_map:{}", new_id);
+                    let block_map_key = crate::keys::block_map(&new_id);
                     let refcounts_key_str = crate::fs_key!("block_refcounts");
                     let refcounts_key = &refcounts_key_str;
 
@@ -2596,8 +2600,8 @@ impl DataRouter {
             let num_blocks = num_blocks_opt.unwrap_or(0);
 
             let dest_block_map_id = Uuid::new_v4().to_string();
-            let src_block_map_key = format!("block_map:{}", src_block_map_id);
-            let dest_block_map_key = format!("block_map:{}", dest_block_map_id);
+            let src_block_map_key = crate::keys::block_map(&src_block_map_id);
+            let dest_block_map_key = crate::keys::block_map(&dest_block_map_id);
             let refcounts_key_str = crate::fs_key!("block_refcounts");
             let refcounts_key = &refcounts_key_str;
 
@@ -2660,13 +2664,13 @@ impl DataRouter {
         file_path: &str,
         con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
-        let meta_key = format!("metadata:{}", file_path);
+        let meta_key = crate::keys::metadata_for_path(file_path);
         let file_type: Option<String> = con.hget(&meta_key, "type").await?;
         if let Some(t) = file_type {
             if t == "striped" {
                 let block_map_id_opt: Option<String> = con.hget(&meta_key, "block_map_id").await?;
                 if let Some(block_map_id) = block_map_id_opt {
-                    let block_map_key = format!("block_map:{}", block_map_id);
+                    let block_map_key = crate::keys::block_map(&block_map_id);
                     let refcounts_key_str = crate::fs_key!("block_refcounts");
                     let refcounts_key = &refcounts_key_str;
                     let blocks_to_free = self
@@ -2689,7 +2693,7 @@ impl DataRouter {
             } else if t == "staged" {
                 let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;
                 if let Some(fid) = file_id_opt {
-                    let mapping_key = format!("mapping:{}", fid);
+                    let mapping_key = crate::keys::mapping(&fid);
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     if let Some(bk) = block_key {
                         let refcounts_key_str = crate::fs_key!("block_refcounts");
@@ -2738,13 +2742,13 @@ impl DataRouter {
         });
 
         // Remove any local active write blocks for this inode from the staging segment cache
-        let active_block_prefix = format!("active_block:{}:", file_path);
+        let active_block_prefix = crate::keys::active_block_path_prefix(file_path);
         let keys_to_remove: Vec<String> = self
             .cache
             .nvme
             .list_staged_files()
             .into_iter()
-            .filter(|k| k.starts_with(&active_block_prefix))
+            .filter(|k| k.starts_with(active_block_prefix.as_str()))
             .collect();
         for key in keys_to_remove {
             self.cache.nvme.remove_active_block(&key);
@@ -2918,8 +2922,8 @@ impl DataRouter {
 
         // Clone the underlying data blocks/metadata
         self.clone_file(
-            &format!("inode_{}", src_ino),
-            &format!("inode_{}", dest_ino),
+            crate::keys::inode_path(src_ino).as_str(),
+            crate::keys::inode_path(dest_ino).as_str(),
         )
         .await?;
 

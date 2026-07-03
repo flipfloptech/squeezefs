@@ -791,7 +791,7 @@ impl SqueezefsFilesystem {
             self.active_leases.remove(&ino);
         }
 
-        let file_path = format!("inode_{}", ino);
+        let file_path = crate::keys::inode_path(ino);
         let lease = self
             .dlm
             .acquire_lock_with_retry(&file_path, None, Duration::from_secs(5), 5)
@@ -882,8 +882,8 @@ impl SqueezefsFilesystem {
         let mut keys_to_flush = Vec::new();
         for r in self.active_block_buffers.iter() {
             let key = r.key();
-            let prefix = format!("active_block:inode_{}:", ino);
-            if key.starts_with(&prefix) {
+            let prefix = crate::keys::active_block_ino_prefix(ino);
+            if key.starts_with(prefix.as_str()) {
                 keys_to_flush.push(key.clone());
             }
         }
@@ -928,7 +928,7 @@ impl SqueezefsFilesystem {
         existing_size: u64,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
-        let meta_key = format!("metadata:inode_{}", ino);
+        let meta_key = crate::keys::metadata_for_inode(ino);
         {
             let mut con = self.dlm.get_connection_for_inode(ino).await?;
             let current_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await?;
@@ -959,7 +959,7 @@ impl SqueezefsFilesystem {
             let file_data_slice = &data[data_cursor..data_cursor + slice_len];
             data_cursor += slice_len;
 
-            let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
+            let cache_key = crate::keys::active_block(ino, b as u64).to_string();
             let needs_existing_data = Self::block_write_needs_existing_data(
                 existing_size,
                 b_start_offset,
@@ -968,7 +968,7 @@ impl SqueezefsFilesystem {
                 write_end,
             );
 
-            let file_path = format!("inode_{}", ino);
+            let file_path = crate::keys::inode_path(ino);
 
             futures.push(async move {
                 // 0. Acquire Block-level Lock to prevent concurrent modification to the same block
@@ -998,7 +998,7 @@ impl SqueezefsFilesystem {
                         let block_map_id = match block_map_id_opt {
                             Some(id) => Some(id),
                             None => {
-                                let meta_key = format!("metadata:{}", file_path);
+                                let meta_key = crate::keys::metadata_for_path(&file_path);
                                 let mut con = self.dlm.get_connection_for_inode(ino).await?;
                                 let id_opt: Option<String> =
                                     con.hget(&meta_key, "block_map_id").await?;
@@ -1023,7 +1023,7 @@ impl SqueezefsFilesystem {
                             let old_block_key = match old_block_key {
                                 Some(key_opt) => key_opt,
                                 None => {
-                                    let block_map_key = format!("block_map:{}", block_map_id);
+                                    let block_map_key = crate::keys::block_map(&block_map_id);
                                     let mut con = self.dlm.get_connection_for_inode(ino).await?;
                                     let key_opt: Option<String> =
                                         con.hget(&block_map_key, b.to_string()).await?;
@@ -1140,14 +1140,14 @@ impl SqueezefsFilesystem {
         ino: u64,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
-        let prefix = format!("active_block:inode_{}:", ino);
+        let prefix = crate::keys::active_block_ino_prefix(ino);
 
         let keys = self.router.cache.nvme.staging_nvme_cache.list_keys();
 
         let mut active_keys = Vec::new();
         for key_bytes in keys {
             let key_str = String::from_utf8(key_bytes.to_vec()).unwrap_or_default();
-            if key_str.starts_with(&prefix) {
+            if key_str.starts_with(prefix.as_str()) {
                 active_keys.push(key_str);
             }
         }
@@ -1156,7 +1156,7 @@ impl SqueezefsFilesystem {
             let mut block_indices = Vec::new();
             for key_str in active_keys {
                 let b_str = key_str
-                    .trim_start_matches(&prefix)
+                    .trim_start_matches(prefix.as_str())
                     .trim_start_matches("block_");
                 if let Ok(b) = b_str.parse::<u32>() {
                     block_indices.push(b);
@@ -1264,7 +1264,7 @@ impl SqueezefsFilesystem {
                         if let (Ok(ino), Ok(b)) =
                             (ino_parts[1].parse::<u64>(), parts[1].parse::<u32>())
                         {
-                            let meta_key = format!("metadata:inode_{}", ino);
+                            let meta_key = crate::keys::metadata_for_inode(ino);
                             let fencing_token = match self.dlm.get_connection().await {
                                 Ok(mut con) => {
                                     let token_opt: Option<u64> =
@@ -1357,7 +1357,7 @@ impl SqueezefsFilesystem {
                 };
 
                 let mut con = dlm_clone.get_connection().await?;
-                let meta_key = format!("metadata:inode_{}", ino);
+                let meta_key = crate::keys::metadata_for_inode(ino);
 
                 let (file_type_opt, block_map_id_opt, fencing_token_opt): (
                     Option<String>,
@@ -1379,7 +1379,7 @@ impl SqueezefsFilesystem {
                 }
                 let fencing_token = fencing_token_opt.unwrap_or(0);
 
-                let block_map_key = format!("block_map:{}", block_map_id);
+                let block_map_key = crate::keys::block_map(&block_map_id);
                 let old_key: Option<String> = con.hget(&block_map_key, b.to_string()).await?;
 
                 flush_single_active_block(
@@ -1427,7 +1427,7 @@ impl SqueezefsFilesystem {
         }
 
         let mut con = self.dlm.get_connection_for_inode(ino).await?;
-        let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
+        let attr_key = crate::keys::attr(ino);
         let fields: std::collections::HashMap<String, String> = con.hgetall(&attr_key).await?;
 
         if fields.is_empty() {
@@ -1533,7 +1533,7 @@ impl SqueezefsFilesystem {
             .unwrap_or(Duration::ZERO);
         let sec = now.as_secs() as i64;
         let nsec = now.subsec_nanos();
-        let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
+        let parent_attr_key = crate::keys::attr(parent);
         let _: () = redis::pipe()
             .hset(&parent_attr_key, "mtime_sec", sec)
             .hset(&parent_attr_key, "mtime_nsec", nsec)
@@ -2042,7 +2042,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             let attr_key = format!("{}:attr:{}", crate::fs_prefix(), new_ino);
 
-            let meta_key = format!("metadata:inode_{}", new_ino);
+            let meta_key = crate::keys::metadata_for_inode(new_ino);
             let mut pipe = redis::pipe();
             pipe.hset(&dir_key, &*name_str, new_ino)
                 .hset(&attr_key, "ino", new_ino)
@@ -2067,7 +2067,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .hset(&meta_key, "size", 0);
 
                 self.router.metadata_cache.insert(
-                    format!("inode_{}", new_ino),
+                    crate::keys::inode_path(new_ino),
                     crate::routing::CachedMetadata {
                         file_type: "inline".to_string(),
                         size: 0,
@@ -2192,8 +2192,8 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             let attr_key = format!("{}:attr:{}", crate::fs_prefix(), new_ino);
-            let meta_key = format!("metadata:inode_{}", new_ino);
-            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
+            let meta_key = crate::keys::metadata_for_inode(new_ino);
+            let parent_attr_key = crate::keys::attr(parent);
 
             let mut pipe = redis::pipe();
             pipe.hset_multiple(
@@ -2365,7 +2365,7 @@ impl Filesystem for SqueezefsFilesystem {
         let lock = self.get_inode_lock_ref(ino);
         let _guard = lock.read().await;
 
-        let file_path = format!("inode_{}", ino);
+        let file_path = crate::keys::inode_path(ino);
 
         // Get file size to bound the read
         let file_size = if let Some((attr, _)) = self.attr_cache.get(&ino) {
@@ -2376,7 +2376,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .get_connection_for_inode(ino)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
+            let attr_key = crate::keys::attr(ino);
             let size_opt: Option<u64> = con.hget(&attr_key, "size").await.map_err(map_err)?;
             size_opt.unwrap_or(0)
         };
@@ -2451,9 +2451,9 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
 
-            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
-            let meta_key = format!("metadata:inode_{}", ino);
-            let file_path = format!("inode_{}", ino);
+            let attr_key = crate::keys::attr(ino);
+            let meta_key = crate::keys::metadata_for_inode(ino);
+            let file_path = crate::keys::inode_path(ino);
 
             let cached_size = self.attr_cache.get(&ino).map(|(a, _)| a.size);
             let cached_meta = self.router.metadata_cache.get(&file_path);
@@ -2754,9 +2754,9 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             let attr_key = format!("{}:attr:{}", crate::fs_prefix(), new_ino);
-            let meta_key = format!("metadata:inode_{}", new_ino);
+            let meta_key = crate::keys::metadata_for_inode(new_ino);
             let child_dir_key = format!("{}:dir:{}", crate::fs_prefix(), new_ino);
-            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
+            let parent_attr_key = crate::keys::attr(parent);
 
             let mut pipe = redis::pipe();
             pipe.hset_multiple(
@@ -2889,8 +2889,8 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             }
 
-            let child_attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
-            let child_meta_key = format!("metadata:inode_{}", ino);
+            let child_attr_key = crate::keys::attr(ino);
+            let child_meta_key = crate::keys::metadata_for_inode(ino);
             let child_inline_key = format!("inline_data:inode_{}", ino);
 
             let mut pipe = redis::pipe();
@@ -2902,7 +2902,7 @@ impl Filesystem for SqueezefsFilesystem {
             pipe.cmd("DECR").arg(crate::fs_key!("used_inodes"));
             let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
 
-            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
+            let parent_attr_key = crate::keys::attr(parent);
             let parent_nlink: i64 = con.hget(&parent_attr_key, "nlink").await.unwrap_or(2);
             let mut new_nlink = parent_nlink - 1;
             if new_nlink < 1 {
@@ -2929,7 +2929,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache.invalidate(&parent);
             self.dir_entry_cache.invalidate(&parent);
             self.dir_entry_cache.invalidate(&ino);
-            let file_path = format!("inode_{}", ino);
+            let file_path = crate::keys::inode_path(ino);
             self.router.metadata_cache.remove(&file_path);
 
             if let Some((_, lease)) = self.active_leases.remove(&ino) {
@@ -2976,7 +2976,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .get_connection_for_inode(ino)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
+            let attr_key = crate::keys::attr(ino);
 
             // Check if inode exists first
             let exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
@@ -3011,7 +3011,7 @@ impl Filesystem for SqueezefsFilesystem {
             if let Some(size) = set_attr.size {
                 // Fix: Actually delete data when file is truncated to size 0
                 if size == 0 && old_size > 0 {
-                    let file_path = format!("inode_{}", ino);
+                    let file_path = crate::keys::inode_path(ino);
                     // 1. Physically delete blocks from NVMe-oF backend via router
                     let _ = self.router.delete_file(&file_path, &mut con).await;
 
@@ -3022,7 +3022,7 @@ impl Filesystem for SqueezefsFilesystem {
 
                 pipe.hset(&attr_key, "size", size);
                 // Also update the physical/routing size in the metadata block?
-                let meta_key = format!("metadata:inode_{}", ino);
+                let meta_key = crate::keys::metadata_for_inode(ino);
                 pipe.hset(&meta_key, "size", size);
 
                 // Fix: If truncated to 0, reset type to inline so it doesn't look for deleted staged/striped blocks
@@ -3058,7 +3058,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             // Invalidate cached attributes and router metadata
             self.attr_cache.invalidate(&ino);
-            let file_path = format!("inode_{}", ino);
+            let file_path = crate::keys::inode_path(ino);
             self.router.metadata_cache.remove(&file_path);
 
             let attr = self
@@ -3234,7 +3234,7 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             // Check if source exists
-            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
+            let attr_key = crate::keys::attr(ino);
             let source_exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
             if !source_exists {
                 return Err(Errno::from(libc::ENOENT));
@@ -3317,7 +3317,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         let unlink_future = async {
             let dir_key = format!("{}:dir:{}", crate::fs_prefix(), parent);
-            let parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
+            let parent_attr_key = crate::keys::attr(parent);
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO);
@@ -3344,8 +3344,8 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             };
 
-            let child_attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
-            let meta_key = format!("metadata:inode_{}", ino);
+            let child_attr_key = crate::keys::attr(ino);
+            let meta_key = crate::keys::metadata_for_inode(ino);
 
             // 2. Perform parent directory entry deletion and child stats modification concurrently
             let parent_fut = async {
@@ -3377,7 +3377,7 @@ impl Filesystem for SqueezefsFilesystem {
             let cached_type = self
                 .router
                 .metadata_cache
-                .get(&format!("inode_{}", ino))
+                .get(&crate::keys::inode_path(ino))
                 .map(|e| e.file_type.clone());
 
             let child_fut = async {
@@ -3445,9 +3445,9 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             if new_nlink == 0 {
-                let file_path = format!("inode_{}", ino);
+                let file_path = crate::keys::inode_path(ino);
                 let inline_key = format!("inline_data:{}", file_path);
-                let meta_key_del = format!("metadata:{}", file_path);
+                let meta_key_del = crate::keys::metadata_for_path(&file_path);
                 let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), ino);
 
                 // 3. Delete blocks, delete keys, update global limits, and release leases concurrently
@@ -3521,7 +3521,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache.invalidate(&ino);
             self.attr_cache.invalidate(&parent);
             self.dir_entry_cache.invalidate(&parent);
-            let file_path = format!("inode_{}", ino);
+            let file_path = crate::keys::inode_path(ino);
             self.router.metadata_cache.remove(&file_path);
 
             Ok(())
@@ -3586,7 +3586,7 @@ impl Filesystem for SqueezefsFilesystem {
                 None => return Err(Errno::from(libc::ENOENT)),
             };
 
-            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
+            let attr_key = crate::keys::attr(ino);
             let src_kind: u8 = parent_con
                 .hget(&attr_key, "kind")
                 .await
@@ -3676,7 +3676,7 @@ impl Filesystem for SqueezefsFilesystem {
 
                 // Delete Redis keys
                 let inline_key = format!("inline_data:{}", dest_file_path);
-                let meta_key = format!("metadata:{}", dest_file_path);
+                let meta_key = crate::keys::metadata_for_path(&dest_file_path);
                 let symlink_key = format!("{}:symlink:{}", crate::fs_prefix(), dest_ino);
 
                 // Fetch target size first to decrement used_bytes
@@ -3724,7 +3724,7 @@ impl Filesystem for SqueezefsFilesystem {
             let sec = now.as_secs() as i64;
             let nsec = now.subsec_nanos();
 
-            let old_parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), parent);
+            let old_parent_attr_key = crate::keys::attr(parent);
             let new_parent_attr_key = format!("{}:attr:{}", crate::fs_prefix(), new_parent);
 
             // Perform rename atomically
@@ -3783,7 +3783,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let dest_file_path = format!("inode_{}", dest_ino);
                 self.router.metadata_cache.remove(&dest_file_path);
             }
-            let file_path = format!("inode_{}", ino);
+            let file_path = crate::keys::inode_path(ino);
             self.router.metadata_cache.remove(&file_path);
 
             Ok(())
@@ -4775,7 +4775,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .get_connection_for_inode(ino)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr_key = format!("{}:attr:{}", crate::fs_prefix(), ino);
+            let attr_key = crate::keys::attr(ino);
 
             // Check if inode exists first
             let exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
@@ -4794,7 +4794,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let mut pipe = redis::pipe();
                 pipe.hset(&attr_key, "size", target_size);
 
-                let meta_key = format!("metadata:inode_{}", ino);
+                let meta_key = crate::keys::metadata_for_inode(ino);
                 pipe.hset(&meta_key, "size", target_size);
 
                 let diff = target_size - old_size;
@@ -4804,7 +4804,7 @@ impl Filesystem for SqueezefsFilesystem {
 
                 // Invalidate cached attributes
                 self.attr_cache.invalidate(&ino);
-                let file_path = format!("inode_{}", ino);
+                let file_path = crate::keys::inode_path(ino);
                 self.router.metadata_cache.remove(&file_path);
             }
         }
@@ -6510,7 +6510,7 @@ async fn run_constant_writeback_worker(
             };
 
             let file_path = format!("inode_{}", req.ino);
-            let meta_key = format!("metadata:{}", file_path);
+            let meta_key = crate::keys::metadata_for_path(&file_path);
             let mut con = match dlm_clone.get_connection().await {
                 Ok(c) => c,
                 Err(e) => {
@@ -6547,7 +6547,7 @@ async fn run_constant_writeback_worker(
                 let _: Result<(), _> = con.hset(&meta_key, "block_map_id", &block_map_id).await;
             }
 
-            let block_map_key = format!("block_map:{}", block_map_id);
+            let block_map_key = crate::keys::block_map(&block_map_id);
             let old_key: Option<String> =
                 match con.hget(&block_map_key, req.block_idx.to_string()).await {
                     Ok(k) => k,
@@ -6634,8 +6634,8 @@ async fn flush_due_active_blocks_for_inode(
 ) -> Result<(), SqueezefsError> {
     use futures::stream::{self, StreamExt};
 
-    let file_path = format!("inode_{}", ino);
-    let meta_key = format!("metadata:{}", file_path);
+    let file_path = crate::keys::inode_path(ino);
+    let meta_key = crate::keys::metadata_for_path(&file_path);
     let mut con = dlm.get_connection_for_inode(ino).await?;
     let (file_type_opt, block_map_id_opt): (Option<String>, Option<String>) = redis::pipe()
         .hget(&meta_key, "type")
@@ -6651,7 +6651,7 @@ async fn flush_due_active_blocks_for_inode(
         let _: () = con.hset(&meta_key, "block_map_id", &block_map_id).await?;
     }
 
-    let block_map_key = format!("block_map:{}", block_map_id);
+    let block_map_key = crate::keys::block_map(&block_map_id);
     let mut pipe = redis::pipe();
     for &b in &block_indices {
         pipe.hget(&block_map_key, b.to_string());
@@ -6708,7 +6708,7 @@ async fn flush_single_active_block(
     old_block_key: Option<String>,
     locked: bool,
 ) -> Result<(), SqueezefsError> {
-    let cache_key = format!("active_block:inode_{}:block_{}", ino, b);
+    let cache_key = crate::keys::active_block(ino, b as u64).to_string();
 
     let lock_opt = if !locked {
         Some(active_inode_locks.get_inode_lock(ino))
@@ -6756,7 +6756,7 @@ async fn flush_single_active_block(
         format!("{}://{}", be_id, offset)
     };
 
-    let block_map_key = format!("block_map:{}", block_map_id);
+    let block_map_key = crate::keys::block_map(&block_map_id);
 
     let refcounts_key_str = crate::fs_key!("block_refcounts");
     let refcounts_key = &refcounts_key_str;

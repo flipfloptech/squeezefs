@@ -135,7 +135,7 @@ pub async fn recover_staging(
                     let b_part = parts[2].trim_start_matches("block_");
                     if let (Ok(ino), Ok(b)) = (ino_part.parse::<u64>(), b_part.parse::<u32>()) {
                         // Cross-reference metadata
-                        let meta_key = format!("metadata:inode_{}", ino);
+                        let meta_key = crate::keys::metadata_for_inode(ino);
                         let exists: bool = con.exists(&meta_key).await.unwrap_or(false);
                         if exists {
                             let db_fencing: Option<u64> =
@@ -271,7 +271,7 @@ pub async fn recover_staging(
 
         if let Some((meta, data)) = staged_data {
             // Cross-reference with Garnet
-            let meta_key = format!("metadata:{}", meta.file_path);
+            let meta_key = crate::keys::metadata_for_path(&meta.file_path);
             let redis_file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
             let redis_file_type: Option<String> = con.hget(&meta_key, "type").await?;
             let db_fencing: Option<u64> =

@@ -498,7 +498,7 @@ pub async fn remove_storage_backend(
             if meta_type.as_deref() == Some("striped") {
                 let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await?;
                 if let Some(bmid) = block_map_id {
-                    let map_key = format!("block_map:{}", bmid);
+                    let map_key = crate::keys::block_map(&bmid).to_string();
                     let block_keys: Vec<String> = con.hvals(&map_key).await.unwrap_or_default();
                     for bk in block_keys {
                         let parts: Vec<&str> = bk.split("://").collect();
@@ -518,7 +518,7 @@ pub async fn remove_storage_backend(
             } else if meta_type.as_deref() == Some("staged") {
                 let file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
                 if let Some(fid) = file_id {
-                    let mapping_key = format!("mapping:{}", fid);
+                    let mapping_key = crate::keys::mapping(&fid).to_string();
                     let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
                     if let Some(bk) = block_key {
                         let parts: Vec<&str> = bk.split("://").collect();
@@ -644,7 +644,7 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
         match meta_type {
             Some("striped") => {
                 if let Some(bmid) = fields.get("block_map_id") {
-                    striped_files.push((file_path, format!("block_map:{}", bmid)));
+                    striped_files.push((file_path, crate::keys::block_map(&bmid).to_string()));
                 } else {
                     issues.push(format!(
                         "File '{}' has type 'striped' but missing 'block_map' reference",
@@ -654,7 +654,7 @@ pub async fn run_metadata_fsck(redis_url: &str, _fs_name: &str) -> Result<Vec<St
             }
             Some("staged") => {
                 if let Some(fid) = fields.get("file_id") {
-                    staged_files.push((file_path, format!("mapping:{}", fid)));
+                    staged_files.push((file_path, crate::keys::mapping(&fid).to_string()));
                 } else {
                     issues.push(format!(
                         "File '{}' has type 'staged' but missing 'file_id' field",

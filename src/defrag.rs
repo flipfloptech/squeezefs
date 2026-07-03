@@ -58,7 +58,7 @@ pub async fn run_defragmentation(redis_url: &str, fs_name: &str, _nvme_path: &st
 
             if file_type.as_deref() == Some("striped") {
                 if let Some(block_map_id) = block_map_id_opt {
-                    let block_map_key = format!("block_map:{}", block_map_id);
+                    let block_map_key = crate::keys::block_map(&block_map_id);
                     let mappings: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
                         .arg(&block_map_key)
                         .query_async(&mut conn)

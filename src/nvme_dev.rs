@@ -212,7 +212,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
     // P2-8: register the block device as a fixed file so hot SQEs can use
     // Fixed(0) and avoid per-op fd lookup overhead. Fall back to plain Fd(fd)
     // if the kernel rejects registration.
-    let use_fixed = match unsafe { ring.submitter().register_files(&[fd]) } {
+    let use_fixed = match ring.submitter().register_files(&[fd]) {
         Ok(()) => {
             log::debug!(
                 "NvmeBlockDev: registered fixed file for {:?} (index 0)",

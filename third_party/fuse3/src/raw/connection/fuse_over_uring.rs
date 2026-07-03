@@ -82,6 +82,7 @@ pub struct InboundUringReq {
     /// `fuse_in_header` || per-op header (`op_in`).
     pub header_and_op: Vec<u8>,
     pub payload: Vec<u8>,
+    /// FUSE request unique (also embedded in `header_and_op`).
     pub unique: u64,
 }
 
@@ -163,9 +164,23 @@ pub struct FuseOverUring {
 }
 
 static ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
+static STATS_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static STATS_REPLIES: AtomicU64 = AtomicU64::new(0);
+static STATS_CQE_ERR: AtomicU64 = AtomicU64::new(0);
+static STATS_REGISTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn over_uring_sessions_active() -> u64 {
     ACTIVE_SESSIONS.load(Ordering::Relaxed)
+}
+
+/// Cumulative FUSE-over-io_uring counters: (requests, replies, cqe_err, registers).
+pub fn over_uring_stats() -> (u64, u64, u64, u64) {
+    (
+        STATS_REQUESTS.load(Ordering::Relaxed),
+        STATS_REPLIES.load(Ordering::Relaxed),
+        STATS_CQE_ERR.load(Ordering::Relaxed),
+        STATS_REGISTER.load(Ordering::Relaxed),
+    )
 }
 
 /// Default **on**. Opt out with `SQUEEZEFS_FUSE_OVER_IO_URING=0|false|off|no`.
@@ -293,6 +308,7 @@ impl FuseOverUring {
         let one: u64 = 1;
         let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
         self.stats_replies.fetch_add(1, Ordering::Relaxed);
+        STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -311,15 +327,6 @@ impl FuseOverUring {
         }
     }
 
-    pub fn stats_snapshot(&self) -> (u64, u64, u64, u64, u64) {
-        (
-            self.stats_requests.load(Ordering::Relaxed),
-            self.stats_replies.load(Ordering::Relaxed),
-            self.stats_cqe_err.load(Ordering::Relaxed),
-            self.stats_register.load(Ordering::Relaxed),
-            self.pending.lock().unwrap().len() as u64,
-        )
-    }
 }
 
 impl Drop for FuseOverUring {
@@ -453,6 +460,7 @@ fn queue_worker(
             idx as u64,
         )?;
         pool.stats_register.fetch_add(1, Ordering::Relaxed);
+        STATS_REGISTER.fetch_add(1, Ordering::Relaxed);
     }
     // Poll wake_fd (fixed index 1) so commits/shutdown wake submit_and_wait
     {
@@ -526,6 +534,7 @@ fn queue_worker(
             if res < 0 {
                 let err = -res;
                 pool.stats_cqe_err.fetch_add(1, Ordering::Relaxed);
+                STATS_CQE_ERR.fetch_add(1, Ordering::Relaxed);
                 if err == libc::EAGAIN || err == libc::EINTR {
                     if ent_idx < ents.len() {
                         resubmit.push(ent_idx);
@@ -561,6 +570,11 @@ fn queue_worker(
                 .unwrap()
                 .insert(unique, (qid, ent_idx as u16, commit_id));
             pool.stats_requests.fetch_add(1, Ordering::Relaxed);
+            STATS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                qid,
+                ent_idx, unique, commit_id, "fuse-over-uring inbound request"
+            );
             pool.inbound.push(InboundUringReq {
                 header_and_op,
                 payload,

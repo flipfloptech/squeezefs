@@ -96,3 +96,14 @@ Prerequisites: Garnet up, volume formatted/mounted per `QUICKSTART.md`. Failures
 ## Stats surface (P3-1)
 
 Mounted volumes expose process metrics under the virtual **stats** inode (JSON), including layout mix, bg admission, uring queue-full, and lease acquire outcomes. Prefer these for live regression signals over ad-hoc logging.
+
+## io_uring coverage (P2-8)
+
+| Path | Mechanism |
+|------|-----------|
+| Primary block device R/W | `NvmeBlockDev` worker + fixed-file registration when supported |
+| Ad-hoc file R/W / fdatasync | `crate::uring_fs` process worker (GDS cache materialize, etc.) |
+| Mmap page hint | `IoUringPrefetcher` (`MADV_WILLNEED`) |
+| FUSE fd poll (optional loop) | `start_io_uring_polling_loop` on `/dev/fuse` |
+| Staging / read-segment hot path | **mmap** (by design — zero syscall get/put) |
+| Garnet/Redis, TLS peers | **Not** uring (network stacks) |

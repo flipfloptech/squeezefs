@@ -3170,6 +3170,13 @@ impl Filesystem for SqueezefsFilesystem {
                 pipe.hset(&attr_key, "gid", gid);
             }
             if let Some(size) = set_attr.size {
+                // POSIX: length greater than the maximum file size → EFBIG
+                // (pjdfstest truncate/12.t). Use signed off_t max as the limit.
+                const MAX_FILE_SIZE: u64 = i64::MAX as u64;
+                if size > MAX_FILE_SIZE {
+                    return Err(Errno::from(libc::EFBIG));
+                }
+
                 // Fix: Actually delete data when file is truncated to size 0
                 if size == 0 && old_size > 0 {
                     let file_path = crate::keys::inode_path(ino);
@@ -3191,13 +3198,17 @@ impl Filesystem for SqueezefsFilesystem {
                     pipe.hset(&meta_key, "type", "inline");
                 }
 
-                if size > old_size {
-                    let diff = size - old_size;
-                    self.check_capacity_quota(&mut con, diff).await?;
-                    pipe.incr(crate::fs_key!("used_bytes"), diff);
-                } else if size < old_size {
-                    let diff = old_size - size;
-                    pipe.decr(crate::fs_key!("used_bytes"), diff);
+                // Sparse extend (truncate up / ftruncate larger): logical size only.
+                // Do **not** charge the hole to used_bytes or capacity — that made
+                // huge truncates return ENOSPC (wrong for pjdfstest truncate/12.t)
+                // and polluted the global used_bytes counter. Allocation is accounted
+                // when data is actually written.
+                //
+                // Truncate down to 0 with data delete: release prior logical charge
+                // for this file's old size (best-effort; may overshoot if history was
+                // sparse-only — get_usage_counter clamps negatives).
+                if size == 0 && old_size > 0 {
+                    pipe.decr(crate::fs_key!("used_bytes"), old_size);
                 }
             }
 

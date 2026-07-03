@@ -2,6 +2,22 @@
 
 Squeezefs is a high-performance distributed POSIX FUSE filesystem (Rust + tokio + io_uring) with a decoupled Microsoft Garnet (RESP) metadata backend and an NVMe / NVMe-oF block data backend. Linux-only.
 
+## Non-negotiable: always use io_uring when we can
+
+**Policy for agents and humans:** prefer and require **io_uring** for every I/O path where the Linux kernel can do it. Do **not** “temporarily” fall back to classical `read`/`write`/`pread`/`pwrite`/`/dev/fuse` polling as a way to unblock a bug. Fix the uring path, or fail loud.
+
+| Path | Expectation |
+|------|-------------|
+| **FUSE request hot path** | **FUSE-over-io_uring only** after arm (`REGISTER` / `COMMIT_AND_FETCH`). No userspace opt-out. Mount fails if setup fails. |
+| **FUSE_INIT only** | Classical `/dev/fuse` once — kernel requires `fch->initialized` before REGISTER. Then over-uring. |
+| **NVMe / block data** | `NvmeBlockDev` io_uring workers (fixed files when available). |
+| **Ad-hoc local files** | `crate::uring_fs` (not std file APIs) where practical. |
+| **Not uring** | Garnet/Redis TCP, TLS peers (network stacks). Staging **mmap** segments stay mmap by design. |
+
+If over-uring or block uring misbehaves: **debug and fix uring** — never reintroduce a classical escape hatch “just to make tests pass.”
+
+See `.agents/AGENTS.md` (architecture) and `.agents/skills/tdd-development-workflow/SKILL.md` (dev workflow).
+
 ## Authoritative docs already in this repo
 
 - `.agents/AGENTS.md` — full architectural & behavioral spec (data layout tiers, DLM, caching, recovery). Read this before touching core logic; it is the source of truth for intended behavior.

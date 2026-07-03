@@ -31,6 +31,17 @@ git checkout -b feat/short-description   # or fix/short-description
 - **Branch naming**: `feat/`, `fix/`, `refactor/`, `perf/`, `docs/` prefixes matching conventional commit types.
 - **One branch per logical unit of work**: a feature, a bugfix, or a hardening pass.
 
+## SqueezeFS I/O constraint (always io_uring when we can)
+
+This repo is Linux + **io_uring**-first. When planning or implementing:
+
+- **Default to io_uring** for FUSE request traffic (FUSE-over-io_uring after arm), NVMe/block I/O (`NvmeBlockDev`), and local file I/O (`crate::uring_fs`) whenever the kernel can support it.
+- **Do not** introduce or re-enable classical `/dev/fuse` or POSIX file I/O fallbacks to “make it work.” That is an anti-pattern here. Fix the uring path or fail loud.
+- The **only** intentional classical FUSE use is the one-shot **`FUSE_INIT`** exchange (kernel requires it before REGISTER). After arm, requests/replies are over-uring only.
+- If a failing test tempts you to disable over-uring or switch to blocking `read`/`write`, stop — write a failing test that encodes correct uring behavior, then fix uring.
+
+Authoritative detail: root `AGENTS.md` (“Non-negotiable: always use io_uring”) and `.agents/AGENTS.md`.
+
 ## Phase 1: Understand & Plan
 
 Before touching any code:
@@ -41,6 +52,7 @@ Before touching any code:
 - Identify edge cases, error conditions, and concurrency concerns upfront.
 - Determine `Send`/`Sync` requirements for all shared state.
 - Identify async boundaries — which types must implement `Future`, which tasks cross `.await` points.
+- **I/O path:** does this touch FUSE, NVMe, or local files? If yes, plan the **io_uring** design — not a classical shortcut.
 
 Produce a brief execution plan:
 ```

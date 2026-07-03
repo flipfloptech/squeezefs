@@ -831,7 +831,11 @@ pub struct fuse_init_out {
     pub time_gran: u32,
     pub max_pages: u16,
     pub map_alignment: u16,
-    pub unused: [u32; 8],
+    /// High 32 init flags (bits 32..63). Bit 9 = `FUSE_OVER_IO_URING` (1ULL<<41).
+    pub flags2: u32,
+    pub max_stack_depth: u32,
+    pub request_timeout: u16,
+    pub unused: [u16; 11],
 }
 
 /*#[derive(Debug)]

@@ -1248,6 +1248,17 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(reply) => reply,
         };
 
+        // Advertise kernel FUSE-over-io_uring when enabled (P2-8 / Linux 6.14+).
+        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+        let flags2 = if crate::raw::connection::fuse_over_uring::want_fuse_over_uring() {
+            debug!("advertising FUSE_OVER_IO_URING in init flags2");
+            crate::raw::connection::fuse_over_uring::FUSE_OVER_IO_URING_FLAGS2
+        } else {
+            0
+        };
+        #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
+        let flags2 = 0u32;
+
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
@@ -1259,7 +1270,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             time_gran: DEFAULT_TIME_GRAN,
             max_pages: DEFAULT_MAX_PAGES,
             map_alignment: DEFAULT_MAP_ALIGNMENT,
-            unused: [0; 8],
+            flags2,
+            max_stack_depth: 0,
+            request_timeout: 0,
+            unused: [0; 11],
         };
 
         let has_splice_read = (reply_flags & FUSE_SPLICE_READ) > 0;
@@ -1295,6 +1309,26 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         }
 
         debug!("fuse init done");
+
+        // After classical INIT, optionally switch the hot path to kernel FUSE-over-io_uring.
+        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+        {
+            if crate::raw::connection::fuse_over_uring::want_fuse_over_uring() {
+                match fuse_connection.try_enable_fuse_over_uring(reply.max_write.get() as usize) {
+                    Ok(true) => {
+                        tracing::info!("FUSE-over-io_uring transport enabled for this session");
+                    }
+                    Ok(false) => {
+                        debug!("FUSE-over-io_uring not enabled (disabled or unsupported)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "FUSE-over-io_uring enable error: {e} (classical path continues)"
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(reply.max_write)
     }

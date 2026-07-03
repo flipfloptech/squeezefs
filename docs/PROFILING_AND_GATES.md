@@ -104,7 +104,8 @@ Mounted volumes expose process metrics under the virtual **stats** inode (JSON),
 | Primary block device R/W | `NvmeBlockDev` worker + fixed-file registration when supported |
 | Ad-hoc file R/W / fdatasync | `crate::uring_fs` process worker (GDS cache materialize, etc.) |
 | Mmap page hint | `IoUringPrefetcher` (`MADV_WILLNEED`) |
-| **FUSE `/dev/fuse` transport** | **fuse3 `BlockFuseConnection`**: readv/writev on dedicated rings, eventfd wakeups, optional SQPOLL, multi-queue clone, **fixed-file** `Fixed(0)` for the fuse fd (P2-8) |
+| **FUSE `/dev/fuse` transport (default)** | **fuse3 `BlockFuseConnection`**: classical fuse framing over userspace `Readv`/`Writev` rings, eventfd, optional SQPOLL, multi-queue clone, fixed-file `Fixed(0)` |
+| **FUSE-over-io_uring (opt-in, Linux 6.14+ / 7.x)** | Kernel protocol: `IORING_OP_URING_CMD` + `REGISTER` / `COMMIT_AND_FETCH`, per-CPU queues, request buffers in userspace (see `fuse_over_uring.rs`) |
 | Staging / read-segment hot path | **mmap** (by design — zero syscall get/put) |
 | Garnet/Redis, TLS peers | **Not** uring (network stacks) |
 
@@ -114,6 +115,12 @@ Mounted volumes expose process metrics under the virtual **stats** inode (JSON),
 |----------|--------|
 | `SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS` | Enable SQPOLL with idle timeout (ms); also set via mount/format |
 | `SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU` | Pin SQPOLL kernel thread |
-| `SQUEEZEFS_FUSE_IO_URING_ENTRIES` | SQ depth for FUSE rings (default 1024, clamp 64–4096) |
+| `SQUEEZEFS_FUSE_IO_URING_ENTRIES` | SQ depth for classical FUSE rings (default 1024, clamp 64–4096) |
+| **`SQUEEZEFS_FUSE_OVER_IO_URING=1`** | **Enable kernel FUSE-over-io_uring** after INIT (requires supporting kernel; falls back to classical on setup failure) |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | Entries per CPU queue for over-io_uring (default 8) |
 
-Kernel **FUSE-over-io_uring** (register/cmd protocol, Linux 6.14+) is a separate ABI and is **not** required; we use classical FUSE over userspace `io_uring` syscalls, which works on older kernels.
+```bash
+# Opt-in kernel FUSE-over-io_uring on a modern kernel (e.g. 6.14+ / 7.x):
+export SQUEEZEFS_FUSE_OVER_IO_URING=1
+target/release/squeezefs mount …
+```

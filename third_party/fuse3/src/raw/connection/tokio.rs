@@ -337,6 +337,11 @@ impl FuseConnection {
                 // Classical path layout: header_buf = fuse_in_header, data_buf = rest.
                 if inbound.header_and_op.len() >= 40 && header_buf.len() >= 40 {
                     header_buf[..40].copy_from_slice(&inbound.header_and_op[..40]);
+                    // unique is authoritative for reply matching (also in header bytes).
+                    debug_assert_eq!(
+                        inbound.unique,
+                        u64::from_ne_bytes(header_buf[8..16].try_into().unwrap())
+                    );
                     let rest = &inbound.header_and_op[40..];
                     let n1 = rest.len().min(data_buf.len());
                     data_buf[..n1].copy_from_slice(&rest[..n1]);

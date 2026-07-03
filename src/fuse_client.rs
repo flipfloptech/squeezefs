@@ -614,6 +614,10 @@ impl SqueezefsFilesystem {
         let fuse_over_uring_sessions = fuse3::over_uring_sessions_active();
         #[cfg(not(target_os = "linux"))]
         let fuse_over_uring_sessions = 0u64;
+        #[cfg(target_os = "linux")]
+        let (fou_req, fou_rep, fou_err, fou_reg) = fuse3::over_uring_stats();
+        #[cfg(not(target_os = "linux"))]
+        let (fou_req, fou_rep, fou_err, fou_reg) = (0u64, 0u64, 0u64, 0u64);
 
         let stats_obj = serde_json::json!({
             "read_lru_keys": read_lru_keys,
@@ -645,6 +649,10 @@ impl SqueezefsFilesystem {
                 "bg_admit_capacity": crate::bg_admit::capacity(),
                 "striped_block_concurrency": crate::bg_admit::striped_block_concurrency(),
                 "fuse_over_uring_sessions_active": fuse_over_uring_sessions,
+                "fuse_over_uring_requests": fou_req,
+                "fuse_over_uring_replies": fou_rep,
+                "fuse_over_uring_cqe_errors": fou_err,
+                "fuse_over_uring_registers": fou_reg,
             },
             "cache_capacities": {
                 "read_lru_current_bytes": self.router.cache.read_lru.current_bytes(),

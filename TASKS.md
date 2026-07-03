@@ -282,11 +282,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | **done** (2026-07-03) — path + block uring; **FUSE fixed-file** on fuse3 rings + larger SQ; deprecated dead poll loop |
-| **Location** | `src/uring_fs.rs`, `nvme_dev`, fuse3 `BlockFuseConnection`, GDS/prefetch; `docs/PROFILING_AND_GATES.md` |
+| **Status** | **done** (2026-07-03) — classical fuse-over-userspace-uring + **opt-in kernel FUSE-over-io_uring** (`fuse_over_uring.rs`, `SQUEEZEFS_FUSE_OVER_IO_URING=1`) |
+| **Location** | `src/uring_fs.rs`, `nvme_dev`, fuse3 connection + `fuse_over_uring`; docs |
 | **Why** | Spec vs implementation gap. |
 | **Acceptance** | Clear plan: what moves to uring; no regression on existing block tests. |
-| **Notes** | Staging stays **mmap**. FUSE uses classical fuse protocol over userspace `io_uring` (not kernel FUSE-over-io_uring 6.14+ cmd ABI). Multi-queue clone workers each register their own fuse fd. |
+| **Notes** | Kernel FUSE-over-io_uring is **opt-in** (needs 6.14+/7.x); classical path remains default. Staging stays mmap. |
 
 ### P2-9 — Write-verification mode cost
 

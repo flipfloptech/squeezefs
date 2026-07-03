@@ -49,8 +49,9 @@ POSIX FUSE locks map to cluster leases on Garnet:
 * Work-stealing / multi-thread tokio; core pinning where configured.
 * **Block path io_uring:** `NvmeBlockDev` worker (bounded request queue, backpressure, fixed-file register when available).
 * **Path file I/O io_uring:** `crate::uring_fs` for ad-hoc local files (e.g. GDS cache materialize). Staging **mmap** segments stay mmap for zero-syscall get/put.
-* **FUSE transport io_uring:** vendored **fuse3** `BlockFuseConnection` — `Readv`/`Writev` on `/dev/fuse` with separate read/write rings, eventfd completions, optional SQPOLL, multi-queue clone workers, and fixed-file registration of the fuse fd when supported. Protocol decode stays in fuse3.
-* **Not uring:** Garnet/Redis TCP, TLS peer paths (dedicated network stacks). Full kernel **FUSE-over-io_uring** (6.14+ cmd ABI) is out of scope unless we adopt that protocol end-to-end.
+* **FUSE transport (default):** vendored **fuse3** `BlockFuseConnection` — classical fuse framing over userspace `Readv`/`Writev` rings (eventfd, optional SQPOLL, multi-queue clone, fixed fuse fd).
+* **FUSE-over-io_uring (opt-in):** set `SQUEEZEFS_FUSE_OVER_IO_URING=1` on Linux kernels that implement the fuse uring cmd ABI (6.14+). After `FUSE_INIT` with `flags2` bit for `FUSE_OVER_IO_URING`, workers run `REGISTER` / `COMMIT_AND_FETCH` and feed the same fuse3 opcode handlers. Interrupts/notifications still use the classical path (kernel limitation). Falls back to classical if setup fails.
+* **Not uring:** Garnet/Redis TCP, TLS peer paths.
 
 ---
 

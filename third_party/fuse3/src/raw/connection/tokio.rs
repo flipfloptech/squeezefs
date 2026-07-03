@@ -146,12 +146,25 @@ use crate::find_fusermount3;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use crate::MountOptions;
 
-#[derive(Debug)]
 pub struct FuseConnection {
     unmount_notify: Arc<Notify>,
     mode: ConnectionMode,
     pub(crate) splice_read: std::sync::atomic::AtomicBool,
     pub(crate) splice_write: std::sync::atomic::AtomicBool,
+    /// Optional kernel FUSE-over-io_uring pool (Linux 6.14+).
+    #[cfg(target_os = "linux")]
+    pub(crate) over_uring: std::sync::Mutex<Option<std::sync::Arc<super::fuse_over_uring::FuseOverUring>>>,
+    #[cfg(target_os = "linux")]
+    over_uring_inbound:
+        std::sync::Mutex<Option<std::sync::mpsc::Receiver<super::fuse_over_uring::InboundUringReq>>>,
+}
+
+impl std::fmt::Debug for FuseConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FuseConnection")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FuseConnection {
@@ -177,7 +190,31 @@ impl FuseConnection {
                 mode: ConnectionMode::Block(connection),
                 splice_read: std::sync::atomic::AtomicBool::new(false),
                 splice_write: std::sync::atomic::AtomicBool::new(false),
+                over_uring: std::sync::Mutex::new(None),
+                over_uring_inbound: std::sync::Mutex::new(None),
             })
+        }
+    }
+
+    /// Start kernel FUSE-over-io_uring workers after a successful FUSE_INIT.
+    #[cfg(target_os = "linux")]
+    pub fn try_enable_fuse_over_uring(&self, max_write: usize) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        if !super::fuse_over_uring::want_fuse_over_uring() {
+            return Ok(false);
+        }
+        let fd = self.as_fd().as_raw_fd();
+        match super::fuse_over_uring::FuseOverUring::try_start(fd, max_write) {
+            Ok(pool) => {
+                let rx = pool.take_inbound();
+                *self.over_uring_inbound.lock().unwrap() = rx;
+                *self.over_uring.lock().unwrap() = Some(pool);
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!("FUSE-over-io_uring setup failed (using classical path): {e}");
+                Ok(false)
+            }
         }
     }
 
@@ -195,6 +232,8 @@ impl FuseConnection {
             mode: ConnectionMode::NonBlock(connection),
             splice_read: std::sync::atomic::AtomicBool::new(false),
             splice_write: std::sync::atomic::AtomicBool::new(false),
+            over_uring: std::sync::Mutex::new(None),
+            over_uring_inbound: std::sync::Mutex::new(None),
         })
     }
 
@@ -224,6 +263,9 @@ impl FuseConnection {
                     mode: ConnectionMode::Block(connection),
                     splice_read: std::sync::atomic::AtomicBool::new(self.splice_read.load(std::sync::atomic::Ordering::Relaxed)),
                     splice_write: std::sync::atomic::AtomicBool::new(self.splice_write.load(std::sync::atomic::Ordering::Relaxed)),
+                    // Multi-queue clones keep classical uring path for now.
+                    over_uring: std::sync::Mutex::new(None),
+                    over_uring_inbound: std::sync::Mutex::new(None),
                 })
             }
             _ => Err(io::Error::new(
@@ -249,9 +291,82 @@ impl FuseConnection {
 
     async fn inner_read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
         &self,
-        header_buf: Vec<u8>,
-        data_buf: T,
+        mut header_buf: Vec<u8>,
+        mut data_buf: T,
     ) -> CompleteIoResult<(Vec<u8>, T), usize> {
+        // Prefer kernel FUSE-over-io_uring inbound channel when active.
+        #[cfg(target_os = "linux")]
+        {
+            let has_uring = self
+                .over_uring
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|p| p.is_active())
+                .unwrap_or(false);
+            if has_uring {
+                let req = {
+                    // Blocking recv off the async path.
+                    let rx_slot = self.over_uring_inbound.lock().unwrap();
+                    // We need owned receiver for blocking recv — take temporarily is wrong.
+                    // Use try_recv in a loop with yield instead if we only have shared access.
+                    drop(rx_slot);
+                    None::<super::fuse_over_uring::InboundUringReq>
+                };
+                let _ = req;
+                // Blocking recv via spawn_blocking on a cloned channel is hard without Arc.
+                // Use poll loop with try_recv:
+                let inbound = loop {
+                    let try_msg = {
+                        let guard = self.over_uring_inbound.lock().unwrap();
+                        guard.as_ref().and_then(|rx| rx.try_recv().ok())
+                    };
+                    if let Some(msg) = try_msg {
+                        break msg;
+                    }
+                    if !self
+                        .over_uring
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|p| p.is_active())
+                        .unwrap_or(false)
+                    {
+                        return (
+                            (header_buf, data_buf),
+                            Err(io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                "fuse-over-uring inactive",
+                            )),
+                        );
+                    }
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                };
+
+                // Classical path layout: header_buf = fuse_in_header, data_buf = rest.
+                if inbound.header_and_op.len() >= 40 && header_buf.len() >= 40 {
+                    header_buf[..40].copy_from_slice(&inbound.header_and_op[..40]);
+                    let rest = &inbound.header_and_op[40..];
+                    let n1 = rest.len().min(data_buf.len());
+                    data_buf[..n1].copy_from_slice(&rest[..n1]);
+                    let n2 = inbound
+                        .payload
+                        .len()
+                        .min(data_buf.len().saturating_sub(n1));
+                    data_buf[n1..n1 + n2].copy_from_slice(&inbound.payload[..n2]);
+                    return ((header_buf, data_buf), Ok(40 + n1 + n2));
+                }
+                return (
+                    (header_buf, data_buf),
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "short fuse-over-uring header",
+                    )),
+                );
+            }
+        }
+
         match &self.mode {
             #[cfg(target_os = "linux")]
             ConnectionMode::Block(connection) => {
@@ -272,6 +387,31 @@ impl FuseConnection {
         data: T,
         body_extend_data: Option<U>,
     ) -> CompleteIoResult<(T, Option<U>), usize> {
+        // Kernel FUSE-over-io_uring reply path: COMMIT_AND_FETCH.
+        #[cfg(target_os = "linux")]
+        {
+            let pool = self.over_uring.lock().unwrap().clone();
+            if let Some(pool) = pool.filter(|p| p.is_active()) {
+                let mut reply = bytes::BytesMut::with_capacity(
+                    data.deref().len() + body_extend_data.as_ref().map(|b| b.deref().len()).unwrap_or(0),
+                );
+                reply.extend_from_slice(data.deref());
+                if let Some(ref ext) = body_extend_data {
+                    reply.extend_from_slice(ext.deref());
+                }
+                let reply = reply.freeze();
+                // unique is at offset 8 in fuse_out_header (len u32, error i32, unique u64)
+                let unique = if reply.len() >= 16 {
+                    u64::from_ne_bytes(reply[8..16].try_into().unwrap())
+                } else {
+                    0
+                };
+                let len = reply.len();
+                let res = pool.submit_reply(unique, reply);
+                return ((data, body_extend_data), res.map(|_| len));
+            }
+        }
+
         match &self.mode {
             #[cfg(target_os = "linux")]
             ConnectionMode::Block(connection) => {

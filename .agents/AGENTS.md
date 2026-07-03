@@ -50,7 +50,7 @@ POSIX FUSE locks map to cluster leases on Garnet:
 * **Block path io_uring:** `NvmeBlockDev` worker (bounded request queue, backpressure, fixed-file register when available).
 * **Path file I/O io_uring:** `crate::uring_fs` for ad-hoc local files (e.g. GDS cache materialize). Staging **mmap** segments stay mmap for zero-syscall get/put.
 * **FUSE transport (default):** vendored **fuse3** `BlockFuseConnection` — classical fuse framing over userspace `Readv`/`Writev` rings (eventfd, optional SQPOLL, multi-queue clone, fixed fuse fd).
-* **FUSE-over-io_uring (opt-in):** set `SQUEEZEFS_FUSE_OVER_IO_URING=1` on Linux kernels that implement the fuse uring cmd ABI (6.14+). After `FUSE_INIT` with `flags2` bit for `FUSE_OVER_IO_URING`, workers run `REGISTER` / `COMMIT_AND_FETCH` and feed the same fuse3 opcode handlers. Interrupts/notifications still use the classical path (kernel limitation). Falls back to classical if setup fails.
+* **FUSE-over-io_uring (default on):** after `FUSE_INIT` with `flags2` bit for `FUSE_OVER_IO_URING`, workers run `REGISTER` / `COMMIT_AND_FETCH` and feed the same fuse3 opcode handlers (Linux 6.14+ / 7.x). Interrupts/notifications still use the classical path (kernel limitation). Falls back to classical if setup fails. Opt out with `SQUEEZEFS_FUSE_OVER_IO_URING=0`.
 * **Not uring:** Garnet/Redis TCP, TLS peer paths.
 
 ---

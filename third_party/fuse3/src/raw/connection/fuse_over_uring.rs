@@ -1,8 +1,9 @@
 //! Kernel **FUSE-over-io_uring** (Linux 6.14+ / 7.x) — `linux/fuse.h` + libfuse `fuse_uring.c`.
 //!
-//! # Enable (opt-in)
+//! # Enable (default on)
 //! ```text
-//! SQUEEZEFS_FUSE_OVER_IO_URING=1
+//! # default: attempt FUSE-over-io_uring after INIT; fall back to classical on failure
+//! SQUEEZEFS_FUSE_OVER_IO_URING=0           # force classical /dev/fuse path only
 //! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=8   # optional, per-queue depth
 //! SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES=N    # optional, default = min(nproc, 32)
 //! ```

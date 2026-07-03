@@ -168,14 +168,15 @@ pub fn over_uring_sessions_active() -> u64 {
     ACTIVE_SESSIONS.load(Ordering::Relaxed)
 }
 
-/// Opt-in: `SQUEEZEFS_FUSE_OVER_IO_URING=1|true|on|yes`
+/// Default **on**. Opt out with `SQUEEZEFS_FUSE_OVER_IO_URING=0|false|off|no`.
+/// Setup still falls back to the classical path if the kernel rejects the protocol.
 pub fn want_fuse_over_uring() -> bool {
     match std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING") {
-        Ok(v) => matches!(
+        Ok(v) => !matches!(
             v.to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
+            "0" | "false" | "off" | "no"
         ),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 

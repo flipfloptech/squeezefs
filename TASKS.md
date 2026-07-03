@@ -282,11 +282,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | **done** (2026-07-03) — `uring_fs` for path I/O; block path fixed-file register; GDS/prefetch writes via uring; mmap staging kept intentionally; Redis/TLS still non-uring |
-| **Location** | `src/uring_fs.rs`, `nvme_dev` fixed files, GDS/prefetch callers; coverage table in `docs/PROFILING_AND_GATES.md` |
+| **Status** | **done** (2026-07-03) — path + block uring; **FUSE fixed-file** on fuse3 rings + larger SQ; deprecated dead poll loop |
+| **Location** | `src/uring_fs.rs`, `nvme_dev`, fuse3 `BlockFuseConnection`, GDS/prefetch; `docs/PROFILING_AND_GATES.md` |
 | **Why** | Spec vs implementation gap. |
 | **Acceptance** | Clear plan: what moves to uring; no regression on existing block tests. |
-| **Notes** | Staging segments stay **mmap** (hot get/put already zero-syscall). Multi-backend = each `NvmeBlockDev` owns a uring worker + optional fixed fd. Future: fuse3 registered buffers for FUSE data plane if/when fuse3 supports it cleanly. |
+| **Notes** | Staging stays **mmap**. FUSE uses classical fuse protocol over userspace `io_uring` (not kernel FUSE-over-io_uring 6.14+ cmd ABI). Multi-queue clone workers each register their own fuse fd. |
 
 ### P2-9 — Write-verification mode cost
 

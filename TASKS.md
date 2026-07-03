@@ -246,8 +246,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `nvme_dev` memalign+memcpy |
+| **Status** | **done** (2026-07-03) — unaligned writes ≤ pool size use `ALIGNED_BUF_POOL` (`alloc_raw`/`recycle`); larger still `posix_memalign` |
+| **Location** | `src/nvme_dev.rs`, `src/cache/pool.rs` |
 | **Why** | Still expensive even if leak-fixed. |
 | **Acceptance** | Prefer pool of aligned buffers; avoid copy when possible; keep unaligned test green. |
 

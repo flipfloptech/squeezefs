@@ -706,6 +706,9 @@ impl DataRouter {
     }
 
     /// Write file data using progressive data layout routing with offset support (POSIX random-access RMW).
+    /// Write path with phased meta connections (P1-10): Redis/Garnet work uses
+    /// short-lived connections; durable NVMe / staging I/O never holds a pooled
+    /// meta connection across the await.
     pub async fn write_file(
         &self,
         file_path: &str,
@@ -715,85 +718,105 @@ impl DataRouter {
     ) -> Result<()> {
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
 
-        let mut con = self
-            .dlm
-            .get_connection_for_inode(parse_inode_from_path(file_path))
-            .await?;
+        let ino = parse_inode_from_path(file_path);
         let meta_key = format!("metadata:{}", file_path);
 
-        let current_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await?;
-        if let Some(cf) = current_fencing {
-            if fencing_token < cf {
-                return Err(SqueezefsError::FencingTokenExpired {
-                    token: fencing_token,
-                    expected: cf,
-                });
-            }
+        // Deferred NVMe read of a staged payload (mapping captured under meta con).
+        enum StagedBackendRead {
+            None,
+            Mapping {
+                block_key: String,
+                off: u64,
+                sz: u64,
+            },
         }
 
-        let file_type: Option<String> = con.hget(&meta_key, "type").await?;
+        // --- Meta prep: fencing, type, and cheap existing-data fetch ---
+        let (file_type, mut existing_data, staged_backend) = {
+            let mut con = self.dlm.get_connection_for_inode(ino).await?;
 
-        // 1. If file is already striped, perform RMW block-by-block without loading the whole file
-        if file_type.as_deref() == Some("striped") {
-            self.write_striped(file_path, &meta_key, offset, data, fencing_token, &mut con)
-                .await?;
-            return Ok(());
-        }
-
-        // 2. Fetch existing data for inline or staged layouts
-        let mut existing_data = match file_type.as_deref() {
-            Some("inline") => {
-                let inline_key = format!("inline_data:{}", file_path);
-                let bytes: Option<Vec<u8>> = con.get(&inline_key).await?;
-                if let Some(b) = bytes {
-                    self.get_crypto().process_read(&b)?.into_owned()
-                } else {
-                    Vec::new()
+            let current_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await?;
+            if let Some(cf) = current_fencing {
+                if fencing_token < cf {
+                    return Err(SqueezefsError::FencingTokenExpired {
+                        token: fencing_token,
+                        expected: cf,
+                    });
                 }
             }
-            Some("staged") => {
-                let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;
-                if let Some(file_id) = file_id_opt {
-                    if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
-                        staged_data
-                    } else {
-                        let mapping_key = format!("mapping:{}", file_id);
-                        let (block_key, off_val, sz_val): (
-                            Option<String>,
-                            Option<u64>,
-                            Option<u64>,
-                        ) = redis::cmd("HMGET")
-                            .arg(&mapping_key)
-                            .arg("block")
-                            .arg("offset")
-                            .arg("size")
-                            .query_async(&mut con)
-                            .await?;
 
-                        if let (Some(bk), Some(off), Some(sz)) = (block_key, off_val, sz_val) {
-                            let offset_u64 = bk.parse::<u64>().map_err(|_| {
-                                crate::error::SqueezefsError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "Invalid block offset",
-                                ))
-                            })?;
-                            let raw = self
-                                .nvme_writer
-                                .read_block(offset_u64 + off, sz as usize)
-                                .await?;
-                            self.get_crypto().process_read(&raw)?.into_owned()
+            let file_type: Option<String> = con.hget(&meta_key, "type").await?;
+
+            if file_type.as_deref() == Some("striped") {
+                drop(con);
+                self.write_striped(file_path, &meta_key, offset, data, fencing_token)
+                    .await?;
+                return Ok(());
+            }
+
+            let mut staged_backend = StagedBackendRead::None;
+            let existing_data = match file_type.as_deref() {
+                Some("inline") => {
+                    let inline_key = format!("inline_data:{}", file_path);
+                    let bytes: Option<Vec<u8>> = con.get(&inline_key).await?;
+                    if let Some(b) = bytes {
+                        self.get_crypto().process_read(&b)?.into_owned()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Some("staged") => {
+                    let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;
+                    if let Some(file_id) = file_id_opt {
+                        if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
+                            staged_data
                         } else {
+                            let mapping_key = format!("mapping:{}", file_id);
+                            let (block_key, off_val, sz_val): (
+                                Option<String>,
+                                Option<u64>,
+                                Option<u64>,
+                            ) = redis::cmd("HMGET")
+                                .arg(&mapping_key)
+                                .arg("block")
+                                .arg("offset")
+                                .arg("size")
+                                .query_async(&mut con)
+                                .await?;
+
+                            if let (Some(bk), Some(off), Some(sz)) = (block_key, off_val, sz_val) {
+                                staged_backend = StagedBackendRead::Mapping {
+                                    block_key: bk,
+                                    off,
+                                    sz,
+                                };
+                            }
                             Vec::new()
                         }
+                    } else {
+                        Vec::new()
                     }
-                } else {
-                    Vec::new()
                 }
-            }
-            _ => Vec::new(),
-        };
+                _ => Vec::new(),
+            };
+            (file_type, existing_data, staged_backend)
+        }; // meta con dropped before any backend read
 
-        // 3. Patch the in-memory buffer
+        if let StagedBackendRead::Mapping { block_key, off, sz } = staged_backend {
+            let offset_u64 = block_key.parse::<u64>().map_err(|_| {
+                crate::error::SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid block offset",
+                ))
+            })?;
+            let raw = self
+                .nvme_writer
+                .read_block(offset_u64 + off, sz as usize)
+                .await?;
+            existing_data = self.get_crypto().process_read(&raw)?.into_owned();
+        }
+
+        // Patch the in-memory buffer
         let end_offset = (offset as usize) + data.len();
 
         let stripe_threshold = if self.cache.nvme.staging_dirs().is_empty() {
@@ -803,19 +826,17 @@ impl DataRouter {
         };
 
         if end_offset > stripe_threshold && file_type.as_deref() != Some("striped") {
-            // Transition prior layout → striped (or first-time striped create).
-            // Durable block I/O always completes before any metadata type flip so a
-            // mid-transition failure leaves the prior layout intact (or no layout).
+            // Transition prior layout → striped. Durable I/O first (no meta con),
+            // then short-lived con for the atomic type flip (P0-2).
             let file_uuid = Uuid::new_v4().to_string();
             let block_map_id = Uuid::new_v4().to_string();
             let existing_bytes = bytes::Bytes::from(existing_data);
             let existing_size = existing_bytes.len();
 
-            // Fast path: no prior content and write starts at 0 — the full image is
-            // `data`. Persist it once, then commit meta (no empty striped commit).
             if existing_size == 0 && offset == 0 {
                 let (block_mappings, sizes_to_register, block_count) =
                     self.durable_write_stripe_payload(data.clone()).await?;
+                let mut con = self.dlm.get_connection_for_inode(ino).await?;
                 self.commit_striped_layout_meta(
                     file_path,
                     &meta_key,
@@ -836,31 +857,27 @@ impl DataRouter {
             let (block_mappings, sizes_to_register, block_count) =
                 self.durable_write_stripe_payload(existing_bytes).await?;
 
-            self.commit_striped_layout_meta(
-                file_path,
-                &meta_key,
-                file_type.as_deref(),
-                &block_map_id,
-                &file_uuid,
-                block_count,
-                existing_size,
-                fencing_token,
-                &block_mappings,
-                &sizes_to_register,
-                &mut con,
-            )
-            .await?;
+            {
+                let mut con = self.dlm.get_connection_for_inode(ino).await?;
+                self.commit_striped_layout_meta(
+                    file_path,
+                    &meta_key,
+                    file_type.as_deref(),
+                    &block_map_id,
+                    &file_uuid,
+                    block_count,
+                    existing_size,
+                    fencing_token,
+                    &block_mappings,
+                    &sizes_to_register,
+                    &mut con,
+                )
+                .await?;
+            }
 
-            // Apply the caller write on the now-striped layout (awaited block RMW).
-            self.write_striped(
-                file_path,
-                &meta_key,
-                offset,
-                data.clone(),
-                fencing_token,
-                &mut con,
-            )
-            .await?;
+            // Apply the caller write on the now-striped layout (own phased cons).
+            self.write_striped(file_path, &meta_key, offset, data.clone(), fencing_token)
+                .await?;
             return Ok(());
         }
 
@@ -870,12 +887,14 @@ impl DataRouter {
         existing_data[offset as usize..end_offset].copy_from_slice(&data);
         let new_size = existing_data.len();
 
-        // 4. Save back with appropriate layout routing
+        // Save back with appropriate layout routing
         if new_size < 4 * 1024 {
-            // Layout: inline
+            // Layout: inline (redis-only after crypto)
             let inline_key = format!("inline_data:{}", file_path);
             let shared_data = bytes::Bytes::from(existing_data);
             let processed_data = self.get_crypto().process_write(shared_data.clone())?;
+
+            let mut con = self.dlm.get_connection_for_inode(ino).await?;
             let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
                 con.hget(&meta_key, "file_id").await?
             } else {
@@ -917,16 +936,16 @@ impl DataRouter {
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
         } else if !self.cache.nvme.staging_dirs().is_empty() && new_size <= 4 * 1024 * 1024 {
-            // Layout: staged
+            // Layout: staged — capture old id, drop con, stage (or backend write), re-acquire for meta.
             let new_file_id = Uuid::new_v4().to_string();
 
             let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
+                let mut con = self.dlm.get_connection_for_inode(ino).await?;
                 con.hget(&meta_key, "file_id").await?
             } else {
                 None
             };
 
-            // Stage write locally (fallback to direct backend write if staging is full)
             let stage_res = self
                 .cache
                 .nvme
@@ -937,6 +956,7 @@ impl DataRouter {
 
             match stage_res {
                 Ok(_) => {
+                    let mut con = self.dlm.get_connection_for_inode(ino).await?;
                     let mut pipe = atomic_meta_pipe();
                     pipe.hset(&meta_key, "size", new_size)
                         .hset(&meta_key, "type", "staged")
@@ -973,24 +993,22 @@ impl DataRouter {
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
                     log::warn!("NVMe write staging cache full. Falling back to direct synchronous backend block write for: {}", file_path);
 
-                    // 1. Process data (encryption and compression)
                     let processed_data = self.get_crypto().process_write(shared_data.clone())?;
 
-                    // 2. Write block directly to backing device
                     let (be_id, block_allocator, nvme_writer) =
                         self.backend_router.get_active_backend()?;
-                    let offset = block_allocator.allocate_block().await?;
+                    let be_offset = block_allocator.allocate_block().await?;
                     let stored_block_key = if be_id == "backend_0" {
-                        offset.to_string()
+                        be_offset.to_string()
                     } else {
-                        format!("{}://{}", be_id, offset)
+                        format!("{}://{}", be_id, be_offset)
                     };
 
-                    nvme_writer.write_block(offset, &processed_data).await?;
+                    nvme_writer.write_block(be_offset, &processed_data).await?;
 
-                    // 3. Atomically register staged meta + block mapping (P0-6).
                     let mapping_key = format!("mapping:{}", new_file_id);
                     let size = processed_data.len() as u64;
+                    let mut con = self.dlm.get_connection_for_inode(ino).await?;
                     let mut pipe = atomic_meta_pipe();
                     pipe.hset(&meta_key, "size", new_size)
                         .hset(&meta_key, "type", "staged")
@@ -1022,7 +1040,6 @@ impl DataRouter {
                         ))
                     })??;
 
-                    // 4. Remove old staged files if any
                     if let Some(old_id) = old_file_id {
                         self.cache.nvme.remove_staged(&old_id);
                         let _ = self
@@ -1040,8 +1057,7 @@ impl DataRouter {
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
         } else {
-            // First-time striped layout for a fully-buffered image. Durable writes
-            // complete before the metadata type flip (P0-2 atomicity).
+            // First-time striped layout for a fully-buffered image.
             let file_uuid = Uuid::new_v4().to_string();
             let block_map_id = Uuid::new_v4().to_string();
             let existing_bytes = bytes::Bytes::from(existing_data);
@@ -1050,6 +1066,7 @@ impl DataRouter {
             let (block_mappings, sizes_to_register, block_count) =
                 self.durable_write_stripe_payload(existing_bytes).await?;
 
+            let mut con = self.dlm.get_connection_for_inode(ino).await?;
             self.commit_striped_layout_meta(
                 file_path,
                 &meta_key,
@@ -1234,6 +1251,9 @@ impl DataRouter {
         Ok(())
     }
 
+    /// Striped RMW. P1-10: meta connections are phased — open for block-map
+    /// reads, **dropped** before durable block I/O, re-acquired only for the
+    /// atomic map/size commit and refcount cleanup (frees run after redis work).
     async fn write_striped(
         &self,
         file_path: &str,
@@ -1241,53 +1261,10 @@ impl DataRouter {
         offset: u64,
         data: bytes::Bytes,
         fencing_token: u64,
-        con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
-        let (block_map_id_opt, num_blocks_opt, size_opt): (
-            Option<String>,
-            Option<u32>,
-            Option<u64>,
-        ) = redis::cmd("HMGET")
-            .arg(meta_key)
-            .arg("block_map_id")
-            .arg("num_blocks")
-            .arg("size")
-            .query_async(con)
-            .await?;
-
-        let block_map_id = match block_map_id_opt {
-            Some(id) => id,
-            None => {
-                let block_prefix_opt: Option<String> = con.hget(meta_key, "block_prefix").await?;
-                let block_prefix = block_prefix_opt.ok_or_else(|| {
-                    SqueezefsError::InvalidOperation(
-                        "Missing block_map_id and block_prefix for striped file".to_string(),
-                    )
-                })?;
-                let num_blocks = num_blocks_opt.unwrap_or(0);
-
-                let new_id = Uuid::new_v4().to_string();
-                let block_map_key = format!("block_map:{}", new_id);
-                let refcounts_key_str = crate::fs_key!("block_refcounts");
-                let refcounts_key = &refcounts_key_str;
-                let mut pipe = redis::pipe();
-                for i in 0..num_blocks {
-                    let old_key = format!("{}/part_{}", block_prefix, i);
-                    pipe.hset(&block_map_key, i.to_string(), &old_key);
-                    pipe.hset(refcounts_key, &old_key, 1);
-                }
-                pipe.hset(meta_key, "block_map_id", &new_id);
-                let _: () = pipe.query_async(con).await?;
-                new_id
-            }
-        };
-
-        let num_blocks = num_blocks_opt.unwrap_or(0);
-        let existing_size = size_opt.unwrap_or(0);
-
+        let ino = parse_inode_from_path(file_path);
         let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
         let end_pos = offset + data.len() as u64;
-
         let start_block = (offset / block_size) as u32;
         let end_block = if data.is_empty() {
             start_block
@@ -1299,21 +1276,66 @@ impl DataRouter {
             return Ok(());
         }
 
+        // --- Meta prep (short-lived connection) ---
+        let (block_map_id, num_blocks, existing_size, old_block_keys) = {
+            let mut con = self.dlm.get_connection_for_inode(ino).await?;
+            let (block_map_id_opt, num_blocks_opt, size_opt): (
+                Option<String>,
+                Option<u32>,
+                Option<u64>,
+            ) = redis::cmd("HMGET")
+                .arg(meta_key)
+                .arg("block_map_id")
+                .arg("num_blocks")
+                .arg("size")
+                .query_async(&mut con)
+                .await?;
+
+            let block_map_id = match block_map_id_opt {
+                Some(id) => id,
+                None => {
+                    let block_prefix_opt: Option<String> =
+                        con.hget(meta_key, "block_prefix").await?;
+                    let block_prefix = block_prefix_opt.ok_or_else(|| {
+                        SqueezefsError::InvalidOperation(
+                            "Missing block_map_id and block_prefix for striped file".to_string(),
+                        )
+                    })?;
+                    let num_blocks = num_blocks_opt.unwrap_or(0);
+
+                    let new_id = Uuid::new_v4().to_string();
+                    let block_map_key = format!("block_map:{}", new_id);
+                    let refcounts_key_str = crate::fs_key!("block_refcounts");
+                    let refcounts_key = &refcounts_key_str;
+                    let mut pipe = redis::pipe();
+                    for i in 0..num_blocks {
+                        let old_key = format!("{}/part_{}", block_prefix, i);
+                        pipe.hset(&block_map_key, i.to_string(), &old_key);
+                        pipe.hset(refcounts_key, &old_key, 1);
+                    }
+                    pipe.hset(meta_key, "block_map_id", &new_id);
+                    let _: () = pipe.query_async(&mut con).await?;
+                    new_id
+                }
+            };
+
+            let num_blocks = num_blocks_opt.unwrap_or(0);
+            let existing_size = size_opt.unwrap_or(0);
+            let block_map_key = format!("block_map:{}", block_map_id);
+
+            let mut pipe = redis::pipe();
+            for b in start_block..=end_block {
+                pipe.hget(&block_map_key, b.to_string());
+            }
+            let old_block_keys: Vec<Option<String>> = pipe.query_async(&mut con).await?;
+            (block_map_id, num_blocks, existing_size, old_block_keys)
+        }; // meta con dropped before block I/O
+
         let block_map_key = format!("block_map:{}", block_map_id);
         let refcounts_key_str = crate::fs_key!("block_refcounts");
         let refcounts_key = &refcounts_key_str;
 
-        // 1. Fill any block gaps: gaps are now supported natively as sparse blocks
-        // (i.e. not written to backing device and mapped to None in block map), so no action is required here.
-
-        // 2. Fetch all old block keys in a single pipeline
-        let mut pipe = redis::pipe();
-        for b in start_block..=end_block {
-            pipe.hget(&block_map_key, b.to_string());
-        }
-        let old_block_keys: Vec<Option<String>> = pipe.query_async(con).await?;
-
-        // 3. Pre-resolve cache hits on the main thread and spawn tasks to modify affected blocks concurrently
+        // Pre-resolve cache hits on the main thread and spawn tasks to modify affected blocks concurrently
         use futures::stream::{FuturesUnordered, StreamExt};
         let tasks = FuturesUnordered::new();
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16)); // Max 16 concurrent block writes
@@ -1489,59 +1511,68 @@ impl DataRouter {
             return Err(e);
         }
 
-        // 4. Atomically update block map + file size/fence (P0-6).
-        let mut pipe_update = atomic_meta_pipe();
+        // 4. Atomically update block map + file size/fence (P0-6). Fresh meta con
+        // only for redis work; backend free runs after the connection is released.
         let mut old_keys_to_clean = Vec::new();
-        for res in results {
-            let (b, old_block_key, new_block_key, logical_size, physical_size) = res;
-            pipe_update
-                .hset(refcounts_key, &new_block_key, 1)
-                .hset(&block_map_key, b.to_string(), &new_block_key)
-                .hset(
-                    crate::fs_key!("block_sizes"),
-                    &new_block_key,
-                    format!("{}:{}", logical_size, physical_size),
-                );
+        let mut keys_to_free = Vec::new();
+        {
+            let mut con = self.dlm.get_connection_for_inode(ino).await?;
+            let mut pipe_update = atomic_meta_pipe();
+            for res in results {
+                let (b, old_block_key, new_block_key, logical_size, physical_size) = res;
+                pipe_update
+                    .hset(refcounts_key, &new_block_key, 1)
+                    .hset(&block_map_key, b.to_string(), &new_block_key)
+                    .hset(
+                        crate::fs_key!("block_sizes"),
+                        &new_block_key,
+                        format!("{}:{}", logical_size, physical_size),
+                    );
 
-            if let Some(bk) = old_block_key {
-                old_keys_to_clean.push(bk);
-            }
-        }
-
-        let new_num_blocks = std::cmp::max(num_blocks, end_block + 1);
-        let new_size = std::cmp::max(existing_size, end_pos);
-        pipe_update
-            .hset(meta_key, "size", new_size)
-            .hset(meta_key, "num_blocks", new_num_blocks)
-            .hset(meta_key, "fencing_token", fencing_token);
-
-        let _: () = pipe_update.query_async(con).await?;
-
-        // Clean up old block keys (best-effort; primary mapping already committed)
-        for bk in old_keys_to_clean {
-            self.cache.read_lru.remove(&bk);
-            let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
-            if let Some(mut r) = old_ref {
-                r -= 1;
-                if r <= 0 {
-                    let _: () = atomic_meta_pipe()
-                        .hdel(refcounts_key, &bk)
-                        .hdel(crate::fs_key!("block_sizes"), &bk)
-                        .query_async(con)
-                        .await?;
-                    let _ = self.backend_router.free_block(&bk).await;
-                } else {
-                    let _: () = con.hset(refcounts_key, &bk, r).await?;
+                if let Some(bk) = old_block_key {
+                    old_keys_to_clean.push(bk);
                 }
-            } else {
-                let _: () = con
-                    .hdel(crate::fs_key!("block_sizes"), &bk)
-                    .await
-                    .unwrap_or_else(|e| {
-                        log::debug!("non-fatal cleanup op failed: {:?}", e);
-                    });
-                let _ = self.backend_router.free_block(&bk).await;
             }
+
+            let new_num_blocks = std::cmp::max(num_blocks, end_block + 1);
+            let new_size = std::cmp::max(existing_size, end_pos);
+            pipe_update
+                .hset(meta_key, "size", new_size)
+                .hset(meta_key, "num_blocks", new_num_blocks)
+                .hset(meta_key, "fencing_token", fencing_token);
+
+            let _: () = pipe_update.query_async(&mut con).await?;
+
+            // Clean up old block keys (best-effort; primary mapping already committed)
+            for bk in old_keys_to_clean {
+                self.cache.read_lru.remove(&bk);
+                let old_ref: Option<i32> = con.hget(refcounts_key, &bk).await?;
+                if let Some(mut r) = old_ref {
+                    r -= 1;
+                    if r <= 0 {
+                        let _: () = atomic_meta_pipe()
+                            .hdel(refcounts_key, &bk)
+                            .hdel(crate::fs_key!("block_sizes"), &bk)
+                            .query_async(&mut con)
+                            .await?;
+                        keys_to_free.push(bk);
+                    } else {
+                        let _: () = con.hset(refcounts_key, &bk, r).await?;
+                    }
+                } else {
+                    let _: () = con
+                        .hdel(crate::fs_key!("block_sizes"), &bk)
+                        .await
+                        .unwrap_or_else(|e| {
+                            log::debug!("non-fatal cleanup op failed: {:?}", e);
+                        });
+                    keys_to_free.push(bk);
+                }
+            }
+        } // meta con dropped before backend free
+
+        for bk in keys_to_free {
+            let _ = self.backend_router.free_block(&bk).await;
         }
 
         // If file data is fully cached in RAM, update/invalidate

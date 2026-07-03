@@ -917,6 +917,9 @@ impl SqueezefsFilesystem {
 
     /// Staged/striped active-block write path. Safe to call without holding the
     /// per-inode write lock: mutates each block under [`BLOCK_FLUSH_LOCKS`].
+    ///
+    /// P1-10: the fencing check uses a short-lived meta connection that is dropped
+    /// before any active-block / backend I/O (block tasks open their own connections).
     pub async fn write_file_staged(
         &self,
         ino: u64,
@@ -926,16 +929,18 @@ impl SqueezefsFilesystem {
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
         let meta_key = format!("metadata:inode_{}", ino);
-        let mut con = self.dlm.get_connection_for_inode(ino).await?;
-        let current_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await?;
-        if let Some(cf) = current_fencing {
-            if fencing_token < cf {
-                return Err(SqueezefsError::FencingTokenExpired {
-                    token: fencing_token,
-                    expected: cf,
-                });
+        {
+            let mut con = self.dlm.get_connection_for_inode(ino).await?;
+            let current_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await?;
+            if let Some(cf) = current_fencing {
+                if fencing_token < cf {
+                    return Err(SqueezefsError::FencingTokenExpired {
+                        token: fencing_token,
+                        expected: cf,
+                    });
+                }
             }
-        }
+        } // meta con dropped before block I/O
 
         let block_size = self.router.block_size.load(Ordering::Relaxed);
         let start_block = offset / block_size;

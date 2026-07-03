@@ -293,6 +293,50 @@ fn map_err(e: redis::RedisError) -> Errno {
     Errno::from(libc::ECOMM)
 }
 
+/// Parse a Redis string/integer usage counter to a non-negative `u64`.
+///
+/// Redis `DECR`/`DECRBY` can drive counters below zero (e.g. double-unlink or
+/// truncate races). redis-rs then fails to decode the value as `u64`, and we
+/// used to surface that as `ECOMM` — which breaks `statfs`/`df` and aborts the
+/// entire pjdfstest harness at FS-type detection.
+pub(crate) fn parse_usage_counter(raw: Option<&str>) -> u64 {
+    match raw {
+        None => 0,
+        Some(s) => s
+            .trim()
+            .parse::<i128>()
+            .ok()
+            .map(|v| v.max(0) as u64)
+            .or_else(|| s.trim().parse::<u64>().ok())
+            .unwrap_or(0),
+    }
+}
+
+/// Load a usage counter (used_bytes / used_inodes). Tolerates negative Redis
+/// values from DECR underflow and self-heals them back to 0.
+async fn get_usage_counter<C>(con: &mut C, key: &str) -> Result<u64, redis::RedisError>
+where
+    C: redis::aio::ConnectionLike + Send,
+{
+    let raw: Option<String> = redis::cmd("GET").arg(key).query_async(con).await?;
+    let value = parse_usage_counter(raw.as_deref());
+    // Self-heal so subsequent typed reads and capacity checks stay consistent.
+    if let Some(ref s) = raw {
+        if s.trim().starts_with('-') {
+            let _: () = redis::cmd("SET")
+                .arg(key)
+                .arg(value)
+                .query_async(con)
+                .await?;
+            warn!(
+                "usage counter {} was negative ({}); clamped to {}",
+                key, s, value
+            );
+        }
+    }
+    Ok(value)
+}
+
 #[cold]
 #[inline(never)]
 fn map_squeezefs_err(e: SqueezefsError) -> Errno {
@@ -777,7 +821,9 @@ impl SqueezefsFilesystem {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         if inodes_limit > 0 {
-            let used_inodes: u64 = con.get(crate::fs_key!("used_inodes")).await.unwrap_or(0);
+            let used_inodes = get_usage_counter(con, &crate::fs_key!("used_inodes"))
+                .await
+                .unwrap_or(0);
             if used_inodes >= inodes_limit {
                 return Err(Errno::from(libc::ENOSPC));
             }
@@ -806,12 +852,10 @@ impl SqueezefsFilesystem {
             1024 * 1024 * 1024 * 1024 * 1024 // 1PB default
         };
 
-        let used_bytes_opt: Option<u64> = con
-            .get(crate::fs_key!("used_bytes"))
+        let used_bytes = get_usage_counter(con, &crate::fs_key!("used_bytes"))
             .await
             .map_err(map_err)?;
-        let used_bytes = used_bytes_opt.unwrap_or(0);
-        if used_bytes + additional_bytes > capacity_limit {
+        if used_bytes.saturating_add(additional_bytes) > capacity_limit {
             return Err(Errno::from(libc::ENOSPC));
         }
         Ok(())
@@ -4615,26 +4659,13 @@ impl Filesystem for SqueezefsFilesystem {
     async fn statfs(&self, _req: Request, _ino: u64) -> FuseResult<ReplyStatFs> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         let mut con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
-        let shard_count = self.dlm.shard_count();
-        let mut used_bytes = 0;
-        let mut used_inodes = 0;
-        for i in 0..shard_count {
-            let mut shard_con = self
-                .dlm
-                .get_connection_for_inode(i as u64)
-                .await
-                .map_err(map_squeezefs_err)?;
-            let ub: Option<u64> = shard_con
-                .get(crate::fs_key!("used_bytes"))
-                .await
-                .map_err(map_err)?;
-            let ui: Option<u64> = shard_con
-                .get(crate::fs_key!("used_inodes"))
-                .await
-                .map_err(map_err)?;
-            used_bytes += ub.unwrap_or(0);
-            used_inodes += ui.unwrap_or(0);
-        }
+        // Global counters (not per-shard). DECR can go negative — clamp on read.
+        let used_bytes = get_usage_counter(&mut con, &crate::fs_key!("used_bytes"))
+            .await
+            .map_err(map_err)?;
+        let used_inodes = get_usage_counter(&mut con, &crate::fs_key!("used_inodes"))
+            .await
+            .map_err(map_err)?;
 
         let bsize = 4096;
         let format_exists: bool = con
@@ -6995,6 +7026,16 @@ mod tests {
         assert!(check_component_name_len(OsStr::new("")).is_ok());
         assert!(check_component_name_len(OsStr::new("x")).is_ok());
         assert!(check_component_name_len(OsStr::new(&"b".repeat(255))).is_ok());
+    }
+
+    #[test]
+    fn parse_usage_counter_clamps_negative_and_missing() {
+        assert_eq!(parse_usage_counter(None), 0);
+        assert_eq!(parse_usage_counter(Some("")), 0);
+        assert_eq!(parse_usage_counter(Some("42")), 42);
+        assert_eq!(parse_usage_counter(Some("-252")), 0);
+        assert_eq!(parse_usage_counter(Some("  -1 ")), 0);
+        assert_eq!(parse_usage_counter(Some("not-a-number")), 0);
     }
 
     fn get_redis_url() -> String {

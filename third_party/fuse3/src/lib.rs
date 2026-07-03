@@ -31,6 +31,8 @@ pub use helper::{mode_from_kind_and_perm, perm_from_mode_and_kind};
 pub use mount_options::MountOptions;
 #[cfg(feature = "tokio-runtime")]
 pub use raw::{tpc_spawn, tpc_thread_count};
+#[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+pub use raw::over_uring_sessions_active;
 use nix::sys::stat::mode_t;
 use raw::abi::{
     fuse_setattr_in, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_GID, FATTR_LOCKOWNER,

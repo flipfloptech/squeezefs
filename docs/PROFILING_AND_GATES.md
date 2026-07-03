@@ -117,10 +117,17 @@ Mounted volumes expose process metrics under the virtual **stats** inode (JSON),
 | `SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU` | Pin SQPOLL kernel thread |
 | `SQUEEZEFS_FUSE_IO_URING_ENTRIES` | SQ depth for classical FUSE rings (default 1024, clamp 64–4096) |
 | **`SQUEEZEFS_FUSE_OVER_IO_URING=1`** | **Enable kernel FUSE-over-io_uring** after INIT (requires supporting kernel; falls back to classical on setup failure) |
-| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | Entries per CPU queue for over-io_uring (default 8) |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | Entries per queue (default 8) |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` | Number of per-CPU style queues (default `min(nproc, 32)`) |
 
 ```bash
 # Opt-in kernel FUSE-over-io_uring on a modern kernel (e.g. 6.14+ / 7.x):
 export SQUEEZEFS_FUSE_OVER_IO_URING=1
+export SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=16
 target/release/squeezefs mount …
+
+# Expect log: "FUSE-over-io_uring transport enabled for this session"
+# Stats inode JSON includes fuse_over_uring_sessions_active when enabled.
 ```
+
+**Hardening notes:** per-qid commit channels (no demux races), shared inbound work queue for multi-queue session workers, eventfd wake on commit/shutdown, probe REGISTER before full start.

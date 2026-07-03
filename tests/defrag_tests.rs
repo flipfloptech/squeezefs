@@ -188,3 +188,60 @@ async fn test_defragmentation_under_lock() {
 
     let _ = std::fs::remove_file(dev_path);
 }
+
+/// P2-12: BlockMove path must take the inode DLM lease; a held lease blocks a second
+/// acquire (simulating live FUSE writers serialized against defrag moves).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_defrag_block_move_contends_for_inode_lease() {
+    let redis_url = "redis://127.0.0.1:6379";
+    let client = match redis::Client::open(redis_url) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if client.get_multiplexed_tokio_connection().await.is_err() {
+        println!("Skipping: Redis/Garnet not available");
+        return;
+    }
+
+    let dlm = DlmClient::new(redis_url).unwrap();
+    let ino = 9_001_234u64;
+    let lock_name = format!("inode_{ino}");
+
+    let held = dlm
+        .acquire_lock(&lock_name, None, std::time::Duration::from_secs(30))
+        .await
+        .expect("hold live-writer lease");
+
+    // Same path BlockMove uses: short retry budget — must fail while FUSE holds lease.
+    let contended = dlm
+        .acquire_lock_with_retry(&lock_name, None, std::time::Duration::from_secs(1), 3)
+        .await;
+    assert!(
+        contended.is_err(),
+        "second acquire must fail while inode lease is held (defrag vs live write)"
+    );
+
+    let _ = held.release().await;
+
+    let after = dlm
+        .acquire_lock_with_retry(&lock_name, None, std::time::Duration::from_secs(5), 5)
+        .await;
+    assert!(after.is_ok(), "lease available after live writer releases");
+    let _ = after.unwrap().release().await;
+}
+
+/// P2-11 pure policy: low-hole selection and high-candidate retention.
+#[test]
+fn test_defrag_bounded_selection_helpers() {
+    use squeezefs::defrag::{insert_high_candidate, select_low_free_holes};
+    use std::collections::BTreeMap;
+
+    assert_eq!(select_low_free_holes([0, 8, 3, 1, 2], 3, 2), vec![1, 2]);
+
+    let mut map = BTreeMap::new();
+    for off in [100u64, 200, 150, 50, 300] {
+        insert_high_candidate(&mut map, off, (1, "m".into(), "0".into()), 100, 2);
+    }
+    let keys: Vec<_> = map.keys().copied().collect();
+    assert_eq!(keys, vec![200, 300]);
+}

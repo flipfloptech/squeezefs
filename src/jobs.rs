@@ -204,19 +204,32 @@ async fn run_worker_cycle(router: &DataRouter, fs_name: &str, cpu_limit: u32) ->
                 }
             }
 
-            // Duty-cycle CPU throttling
-            if cpu_limit < 100 {
-                // sleep_duration = elapsed * (100 - L) / L
-                let multiplier = (100 - cpu_limit) as f64 / cpu_limit as f64;
-                let sleep_duration = elapsed.mul_f64(multiplier);
-                if sleep_duration > Duration::from_millis(1) {
-                    sleep(sleep_duration).await;
-                }
+            // Duty-cycle CPU throttling (P2-15)
+            if let Some(sleep_duration) = job_throttle_sleep(elapsed, cpu_limit) {
+                sleep(sleep_duration).await;
             }
         }
     }
 
     Ok(())
+}
+
+/// Background job duty-cycle sleep so FUSE keeps CPU under load (P2-15).
+///
+/// For limit `L` percent: sleep = `elapsed * (100 - L) / L`.
+/// Returns `None` when no sleep is required (`L >= 100` or sleep ≤ 1ms).
+pub fn job_throttle_sleep(elapsed: Duration, cpu_limit_pct: u32) -> Option<Duration> {
+    let cpu_limit = cpu_limit_pct.clamp(1, 100);
+    if cpu_limit >= 100 {
+        return None;
+    }
+    let multiplier = (100 - cpu_limit) as f64 / cpu_limit as f64;
+    let sleep_duration = elapsed.mul_f64(multiplier);
+    if sleep_duration > Duration::from_millis(1) {
+        Some(sleep_duration)
+    } else {
+        None
+    }
 }
 
 async fn execute_task(router: &DataRouter, task_type: &TaskType) -> Result<()> {

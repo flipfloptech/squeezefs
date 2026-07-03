@@ -294,3 +294,27 @@ async fn test_write_verification_failure_pauses_job() {
         "Job should be paused globally due to write verification failure"
     );
 }
+
+/// P2-15: duty-cycle formula yields sleep under limit and none at 100%.
+#[test]
+fn test_job_throttle_sleep_policy() {
+    use squeezefs::jobs::job_throttle_sleep;
+    use std::time::Duration;
+
+    assert!(job_throttle_sleep(Duration::from_millis(100), 100).is_none());
+    assert!(job_throttle_sleep(Duration::from_millis(100), 50).is_some());
+    let half = job_throttle_sleep(Duration::from_millis(100), 50).unwrap();
+    // elapsed * (100-50)/50 = elapsed * 1
+    assert!(
+        (half.as_millis() as i64 - 100).abs() <= 2,
+        "50% limit should sleep ~elapsed, got {half:?}"
+    );
+    let quarter = job_throttle_sleep(Duration::from_millis(100), 25).unwrap();
+    // elapsed * 75/25 = 3 * elapsed
+    assert!(
+        (quarter.as_millis() as i64 - 300).abs() <= 5,
+        "25% limit should sleep ~3x elapsed, got {quarter:?}"
+    );
+    // Tiny elapsed → no sleep floor
+    assert!(job_throttle_sleep(Duration::from_micros(100), 50).is_none());
+}

@@ -94,17 +94,21 @@ impl StagedMetadata {
 
 /// Parse a packed staging blob: `[meta_len:u64][meta bytes][payload…]`.
 /// Active blocks pad the header to 4 KiB; ordinary staged files do not.
+///
+/// Returns `None` on malformed / hostile lengths (no panics on overflow — P2-13).
 pub fn parse_staged_blob(bytes: &[u8], is_active_block: bool) -> Option<(StagedMetadata, Vec<u8>)> {
     if bytes.len() < 8 {
         return None;
     }
-    let meta_len = u64::from_be_bytes(bytes[0..8].try_into().ok()?) as usize;
-    if bytes.len() < 8 + meta_len {
+    let meta_len = usize::try_from(u64::from_be_bytes(bytes[0..8].try_into().ok()?)).ok()?;
+    let meta_end = 8usize.checked_add(meta_len)?;
+    if bytes.len() < meta_end {
         return None;
     }
-    let meta = StagedMetadata::deserialize(&bytes[8..8 + meta_len])?;
-    let data_start = if is_active_block { 4096 } else { 8 + meta_len };
-    let data_end = data_start + meta.original_size as usize;
+    let meta = StagedMetadata::deserialize(&bytes[8..meta_end])?;
+    let data_start = if is_active_block { 4096usize } else { meta_end };
+    let payload_len = usize::try_from(meta.original_size).ok()?;
+    let data_end = data_start.checked_add(payload_len)?;
     if bytes.len() < data_end {
         return None;
     }

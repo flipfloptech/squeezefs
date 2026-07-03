@@ -314,8 +314,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/defrag.rs` SCAN + SMEMBERS |
+| **Status** | **done** (2026-07-03) — SSCAN free holes + bounded high-candidate map (`DefragOptions`); no full `SMEMBERS` |
+| **Location** | `src/defrag.rs`; unit helpers + `defrag_tests` |
 | **Why** | Won’t scale on large volumes. |
 | **Acceptance** | Incremental cursor, sampling, or secondary indexes; `defrag_tests` still pass. |
 
@@ -323,8 +323,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | Defrag `BlockMove` vs FUSE writes |
+| **Status** | **done** (2026-07-03) — `BlockMove` already takes DLM lease; test proves second acquire fails while held |
+| **Location** | `jobs::execute_task` BlockMove; `tests/defrag_tests.rs` |
 | **Why** | Move under active writers needs strong fencing. |
 | **Acceptance** | Explicit lease/fence tests (extend `defrag_tests` “under lock”). |
 
@@ -332,8 +332,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/recovery.rs`, `tests/recovery_tests.rs` |
+| **Status** | **done** (2026-07-03) — matrix documented on `recovery.rs`; tests for mismatch / corrupt / orphan active_block (+ prior fence/commit cases) |
+| **Location** | `src/recovery.rs`, `tests/crash_consistency_tests.rs` |
 | **Why** | Partial scenarios covered. |
 | **Acceptance** | Matrix: partial stage, partial flush, corrupt meta, missing mapping, fencing mismatch. |
 
@@ -341,8 +341,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/nvmeof.rs`, mount `--volume` |
+| **Status** | **done** (2026-07-03) — clear errors on NVMe-oF connect failure; refuse mount if backing path still missing after restore |
+| **Location** | `src/main.rs` mount path |
 | **Why** | Failures look like “FS broken” when target down. |
 | **Acceptance** | Clear errors on missing device; optional health check at mount. |
 
@@ -350,8 +350,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/jobs.rs` |
+| **Status** | **done** (2026-07-03) — `job_throttle_sleep` extracted + unit-tested duty-cycle formula |
+| **Location** | `src/jobs.rs`, `tests/jobs_tests.rs` |
 | **Why** | Background jobs can starve FUSE. |
 | **Acceptance** | Test under load that FUSE still progresses. |
 

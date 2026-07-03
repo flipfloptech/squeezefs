@@ -610,6 +610,11 @@ impl SqueezefsFilesystem {
             0.0
         };
 
+        #[cfg(target_os = "linux")]
+        let fuse_over_uring_sessions = fuse3::over_uring_sessions_active();
+        #[cfg(not(target_os = "linux"))]
+        let fuse_over_uring_sessions = 0u64;
+
         let stats_obj = serde_json::json!({
             "read_lru_keys": read_lru_keys,
             "write_lru_keys": write_lru_keys,
@@ -639,6 +644,7 @@ impl SqueezefsFilesystem {
                 "bg_admit_available_permits": crate::bg_admit::available_permits(),
                 "bg_admit_capacity": crate::bg_admit::capacity(),
                 "striped_block_concurrency": crate::bg_admit::striped_block_concurrency(),
+                "fuse_over_uring_sessions_active": fuse_over_uring_sessions,
             },
             "cache_capacities": {
                 "read_lru_current_bytes": self.router.cache.read_lru.current_bytes(),

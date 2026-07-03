@@ -1,28 +1,25 @@
-//! Kernel **FUSE-over-io_uring** (Linux 6.14+ / 7.x) — protocol from `linux/fuse.h`
-//! and libfuse `fuse_uring.c`.
+//! Kernel **FUSE-over-io_uring** (Linux 6.14+ / 7.x) — `linux/fuse.h` + libfuse `fuse_uring.c`.
 //!
-//! # Enable
-//! - Default: **attempt** when the kernel negotiated `FUSE_OVER_IO_URING`.
-//! - Force off: `SQUEEZEFS_FUSE_OVER_IO_URING=0`
-//! - Queue depth: `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` (default 8)
+//! # Enable (opt-in)
+//! ```text
+//! SQUEEZEFS_FUSE_OVER_IO_URING=1
+//! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=8   # optional, per-queue depth
+//! SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES=N    # optional, default = min(nproc, 32)
+//! ```
 //!
-//! # Model
-//! Per-CPU (capped) worker threads each own an `IoUring` (SQE128), register the
-//! fuse connection fd as fixed file 0, submit `FUSE_IO_URING_CMD_REGISTER` with
-//! header+payload iovecs, then loop on CQEs.
-//!
-//! Inbound requests are pushed to a channel for the fuse3 session read path.
-//! Replies call [`FuseOverUring::submit_reply`] which issues
-//! `FUSE_IO_URING_CMD_COMMIT_AND_FETCH`.
+//! # Design (hardened)
+//! - **Per-qid commit channel** — no shared demux / re-queue races.
+//! - **Shared inbound work queue** + condvar — multi-queue session workers all pop requests.
+//! - **eventfd** per queue — wake workers on commit / shutdown (no busy poll).
+//! - Metrics: register/commit/cqe errors, inflight uniques.
 
 #![cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -39,7 +36,6 @@ pub const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
 
 const FUSE_IO_URING_CMD_REGISTER: u32 = 1;
 const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
-
 const FUSE_IN_HEADER_SIZE: usize = 40;
 
 #[repr(C)]
@@ -85,39 +81,93 @@ pub struct InboundUringReq {
     /// `fuse_in_header` || per-op header (`op_in`).
     pub header_and_op: Vec<u8>,
     pub payload: Vec<u8>,
-    #[allow(dead_code)]
     pub unique: u64,
 }
 
 struct CommitMsg {
-    qid: u16,
     ent_idx: u16,
     commit_id: u64,
     reply: Bytes,
 }
 
-/// Process-wide optional FUSE-over-io_uring controller.
+struct QueueHandle {
+    commit_tx: std::sync::mpsc::SyncSender<CommitMsg>,
+    /// Wake the queue thread (commit or shutdown).
+    wake_fd: RawFd,
+    /// Keep OwnedFd alive.
+    _wake: OwnedFd,
+}
+
+/// Shared work queue for all session workers (primary + multi-queue clones).
+struct InboundQueue {
+    q: Mutex<VecDeque<InboundUringReq>>,
+    cv: Condvar,
+}
+
+impl InboundQueue {
+    fn new() -> Self {
+        Self {
+            q: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn push(&self, req: InboundUringReq) {
+        self.q.lock().unwrap().push_back(req);
+        self.cv.notify_one();
+    }
+
+    /// Blocking pop with timeout; returns None if inactive and empty.
+    fn pop_timeout(&self, active: &AtomicBool, timeout: Duration) -> Option<InboundUringReq> {
+        let mut g = self.q.lock().unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(r) = g.pop_front() {
+                return Some(r);
+            }
+            if !active.load(Ordering::Relaxed) {
+                return None;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (gg, _) = self
+                .cv
+                .wait_timeout(g, deadline.saturating_duration_since(now))
+                .unwrap();
+            g = gg;
+        }
+    }
+
+    fn notify_all(&self) {
+        self.cv.notify_all();
+    }
+}
+
+/// Process-wide optional FUSE-over-io_uring controller (one per fuse session / mount).
 pub struct FuseOverUring {
     active: AtomicBool,
-    inbound_tx: SyncSender<InboundUringReq>,
-    inbound_rx: Mutex<Option<Receiver<InboundUringReq>>>,
+    inbound: Arc<InboundQueue>,
+    /// unique → (qid, ent_idx, commit_id)
     pending: Mutex<HashMap<u64, (u16, u16, u64)>>,
-    commit_tx: SyncSender<CommitMsg>,
-    /// One commit receiver shared — workers demux by qid.
-    commit_rx: Arc<Mutex<Receiver<CommitMsg>>>,
+    queues: Vec<QueueHandle>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     fuse_fd: RawFd,
+    // metrics
+    pub stats_requests: AtomicU64,
+    pub stats_replies: AtomicU64,
+    pub stats_cqe_err: AtomicU64,
+    pub stats_register: AtomicU64,
 }
 
-static ACTIVE: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
 
-/// How many FUSE-over-io_uring sessions are currently active (tests/metrics).
 pub fn over_uring_sessions_active() -> u64 {
-    ACTIVE.load(Ordering::Relaxed)
+    ACTIVE_SESSIONS.load(Ordering::Relaxed)
 }
 
-/// Opt-in until the transport is battle-tested on production mounts.
-/// Set `SQUEEZEFS_FUSE_OVER_IO_URING=1` (or `true`/`on`) to enable.
+/// Opt-in: `SQUEEZEFS_FUSE_OVER_IO_URING=1|true|on|yes`
 pub fn want_fuse_over_uring() -> bool {
     match std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING") {
         Ok(v) => matches!(
@@ -130,9 +180,14 @@ pub fn want_fuse_over_uring() -> bool {
 
 impl FuseOverUring {
     pub fn try_start(fuse_fd: RawFd, max_write: usize) -> io::Result<Arc<Self>> {
-        let nprocs = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
+        let nqueues = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
             .clamp(1, 32);
         let depth = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH")
             .ok()
@@ -141,28 +196,55 @@ impl FuseOverUring {
             .clamp(2, 32);
         let payload_sz = (max_write + 8192).max(128 * 1024);
 
-        let (inbound_tx, inbound_rx) = sync_channel(depth * nprocs * 4);
-        let (commit_tx, commit_rx) = sync_channel(depth * nprocs * 4);
-        let commit_rx = Arc::new(Mutex::new(commit_rx));
+        let inbound = Arc::new(InboundQueue::new());
+        let mut queue_handles = Vec::with_capacity(nqueues);
+        let mut commit_rxs = Vec::with_capacity(nqueues);
+        let mut wake_fds = Vec::with_capacity(nqueues);
+
+        for _ in 0..nqueues {
+            let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel(depth * 4);
+            let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if efd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let wake = unsafe { OwnedFd::from_raw_fd(efd) };
+            let wake_fd = wake.as_raw_fd();
+            wake_fds.push(wake_fd);
+            queue_handles.push(QueueHandle {
+                commit_tx,
+                wake_fd,
+                _wake: wake,
+            });
+            commit_rxs.push(commit_rx);
+        }
 
         let pool = Arc::new(Self {
             active: AtomicBool::new(true),
-            inbound_tx,
-            inbound_rx: Mutex::new(Some(inbound_rx)),
+            inbound,
             pending: Mutex::new(HashMap::new()),
-            commit_tx,
-            commit_rx,
+            queues: queue_handles,
             workers: Mutex::new(Vec::new()),
             fuse_fd,
+            stats_requests: AtomicU64::new(0),
+            stats_replies: AtomicU64::new(0),
+            stats_cqe_err: AtomicU64::new(0),
+            stats_register: AtomicU64::new(0),
         });
 
+        // Probe one ring before spawning all workers (fail fast if kernel rejects).
+        probe_kernel_support(fuse_fd, payload_sz)?;
+
         let mut handles = Vec::new();
-        for qid in 0..nprocs as u16 {
+        for qid in 0..nqueues as u16 {
             let pool_c = pool.clone();
+            let commit_rx = commit_rxs.remove(0);
+            let wake_fd = wake_fds[qid as usize];
             let h = std::thread::Builder::new()
                 .name(format!("fuse-over-uring-{qid}"))
                 .spawn(move || {
-                    if let Err(e) = queue_worker(pool_c, qid, depth, payload_sz) {
+                    if let Err(e) =
+                        queue_worker(pool_c, qid, depth, payload_sz, commit_rx, wake_fd)
+                    {
                         error!("fuse-over-uring worker qid={qid}: {e}");
                     }
                 })
@@ -170,15 +252,16 @@ impl FuseOverUring {
             handles.push(h);
         }
         *pool.workers.lock().unwrap() = handles;
-        ACTIVE.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
         info!(
-            "FUSE-over-io_uring active: queues={nprocs} depth={depth} payload_sz={payload_sz} fd={fuse_fd}"
+            "FUSE-over-io_uring active: queues={nqueues} depth={depth} payload_sz={payload_sz} fd={fuse_fd}"
         );
         Ok(pool)
     }
 
-    pub fn take_inbound(&self) -> Option<Receiver<InboundUringReq>> {
-        self.inbound_rx.lock().unwrap().take()
+    /// Blocking pop for session read path (works from multi-queue workers).
+    pub fn recv_inbound_timeout(&self, timeout: Duration) -> Option<InboundUringReq> {
+        self.inbound.pop_timeout(&self.active, timeout)
     }
 
     pub fn submit_reply(&self, unique: u64, reply: Bytes) -> io::Result<()> {
@@ -193,14 +276,21 @@ impl FuseOverUring {
                     format!("uring: no pending unique={unique}"),
                 )
             })?;
-        self.commit_tx
+        let q = self
+            .queues
+            .get(qid as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
+        q.commit_tx
             .send(CommitMsg {
-                qid,
                 ent_idx,
                 commit_id,
                 reply,
             })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring commit closed"))?;
+        // Wake queue thread
+        let one: u64 = 1;
+        let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
+        self.stats_replies.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -210,8 +300,23 @@ impl FuseOverUring {
 
     pub fn shutdown(&self) {
         if self.active.swap(false, Ordering::Relaxed) {
-            ACTIVE.fetch_sub(1, Ordering::Relaxed);
+            ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+            self.inbound.notify_all();
+            let one: u64 = 1;
+            for q in &self.queues {
+                let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
+            }
         }
+    }
+
+    pub fn stats_snapshot(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.stats_requests.load(Ordering::Relaxed),
+            self.stats_replies.load(Ordering::Relaxed),
+            self.stats_cqe_err.load(Ordering::Relaxed),
+            self.stats_register.load(Ordering::Relaxed),
+            self.pending.lock().unwrap().len() as u64,
+        )
     }
 }
 
@@ -229,41 +334,102 @@ struct Ent {
     iov: [libc::iovec; 2],
 }
 
-fn queue_worker(pool: Arc<FuseOverUring>, qid: u16, depth: usize, payload_sz: usize) -> io::Result<()> {
+/// Fail fast if the kernel cannot accept a REGISTER cmd on this fuse fd.
+fn probe_kernel_support(fuse_fd: RawFd, payload_sz: usize) -> io::Result<()> {
+    let mut ring: Ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
+        .build(8)
+        .map_err(|e| io::Error::other(format!("probe ring: {e}")))?;
+    ring.submitter()
+        .register_files(&[fuse_fd])
+        .map_err(|e| io::Error::other(format!("probe register_files: {e}")))?;
+
+    let mut header = Box::new(FuseUringReqHeader::default());
+    let mut payload = vec![0u8; payload_sz.min(4096)];
+    let iov = [
+        libc::iovec {
+            iov_base: (&mut *header as *mut FuseUringReqHeader).cast(),
+            iov_len: std::mem::size_of::<FuseUringReqHeader>(),
+        },
+        libc::iovec {
+            iov_base: payload.as_mut_ptr().cast(),
+            iov_len: payload.len(),
+        },
+    ];
+    push_cmd(
+        &mut ring,
+        FUSE_IO_URING_CMD_REGISTER,
+        0,
+        0,
+        Some((iov.as_ptr(), 2)),
+        0,
+    )?;
+    ring.submit_and_wait(1)?;
+    let mut cq = ring.completion();
+    cq.sync();
+    if let Some(cqe) = cq.next() {
+        let res = cqe.result();
+        if res < 0 {
+            let err = -res;
+            // EAGAIN is ok (no request yet after register)
+            if err != libc::EAGAIN && err != 0 {
+                if err == libc::ENOTSUP || err == libc::EINVAL || err == libc::ENOSYS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("kernel rejected FUSE URING_CMD REGISTER (err={err})"),
+                    ));
+                }
+                // Other errors: still try full start (some kernels return odd codes once)
+                warn!("fuse-over-uring probe REGISTER returned {err}; continuing");
+            }
+        }
+    }
+    // Keep header/payload alive until after submit_and_wait
+    drop(header);
+    drop(payload);
+    Ok(())
+}
+
+fn queue_worker(
+    pool: Arc<FuseOverUring>,
+    qid: u16,
+    depth: usize,
+    payload_sz: usize,
+    commit_rx: std::sync::mpsc::Receiver<CommitMsg>,
+    wake_fd: RawFd,
+) -> io::Result<()> {
+    // Best-effort pin to core qid
+    let _ = core_affinity::set_for_current(core_affinity::CoreId { id: qid as usize });
+
     let mut ring: Ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
         .setup_cqsize((depth as u32) * 2)
         .build(depth as u32 + 8)
-        .map_err(|e| io::Error::other(format!(
-            "SQE128 IoUring required for FUSE-over-io_uring: {e}"
-        )))?;
+        .map_err(|e| io::Error::other(format!("SQE128 IoUring: {e}")))?;
 
     ring.submitter()
-        .register_files(&[pool.fuse_fd])
+        .register_files(&[pool.fuse_fd, wake_fd])
         .map_err(|e| io::Error::other(format!("register_files: {e}")))?;
 
     let mut ents: Vec<Ent> = (0..depth)
         .map(|_| {
-            let mut header = Box::new(FuseUringReqHeader::default());
-            let mut payload = vec![0u8; payload_sz];
-            let iov = [
-                libc::iovec {
-                    iov_base: (&mut *header as *mut FuseUringReqHeader).cast(),
-                    iov_len: std::mem::size_of::<FuseUringReqHeader>(),
-                },
-                libc::iovec {
-                    iov_base: payload.as_mut_ptr().cast(),
-                    iov_len: payload_sz,
-                },
-            ];
+            let header = Box::new(FuseUringReqHeader::default());
+            let payload = vec![0u8; payload_sz];
             Ent {
                 header,
                 payload,
-                iov,
+                iov: [
+                    libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    },
+                    libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    },
+                ],
             }
         })
         .collect();
 
-    // Re-bind iov after moves into Vec
     for ent in &mut ents {
         ent.iov[0] = libc::iovec {
             iov_base: (&mut *ent.header as *mut FuseUringReqHeader).cast(),
@@ -284,29 +450,25 @@ fn queue_worker(pool: Arc<FuseOverUring>, qid: u16, depth: usize, payload_sz: us
             Some((ent.iov.as_ptr(), 2)),
             idx as u64,
         )?;
+        pool.stats_register.fetch_add(1, Ordering::Relaxed);
+    }
+    // Poll wake_fd (fixed index 1) so commits/shutdown wake submit_and_wait
+    {
+        let poll_e = opcode::PollAdd::new(types::Fixed(1), libc::POLLIN as _)
+            .build()
+            .user_data(u64::MAX);
+        unsafe {
+            ring.submission()
+                .push(&Entry128::from(poll_e))
+                .map_err(|_| io::Error::other("sq full (poll)"))?;
+        }
     }
     ring.submit()?;
-    debug!("fuse-over-uring qid={qid}: REGISTER submitted for {depth} entries");
+    debug!("fuse-over-uring qid={qid}: registered {depth} entries + wake poll");
 
     while pool.active.load(Ordering::Relaxed) {
-        // Process commits for this qid (with short timeout so we still wait CQEs)
-        loop {
-            let msg = {
-                let rx = pool.commit_rx.lock().unwrap();
-                match rx.recv_timeout(Duration::from_millis(0)) {
-                    Ok(m) => m,
-                    Err(RecvTimeoutError::Timeout) => break,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        pool.shutdown();
-                        return Ok(());
-                    }
-                }
-            };
-            if msg.qid != qid {
-                // Other queue's commit — put back (may reorder; rare under load)
-                let _ = pool.commit_tx.send(msg);
-                break;
-            }
+        // Drain commits for this queue only (no demux)
+        while let Ok(msg) = commit_rx.try_recv() {
             let ent = &mut ents[msg.ent_idx as usize];
             apply_reply(ent, &msg.reply);
             push_cmd(
@@ -318,6 +480,24 @@ fn queue_worker(pool: Arc<FuseOverUring>, qid: u16, depth: usize, payload_sz: us
                 msg.ent_idx as u64,
             )?;
             ring.submit()?;
+        }
+        // Drain eventfd
+        let mut buf = [0u8; 8];
+        loop {
+            let n = unsafe { libc::read(wake_fd, buf.as_mut_ptr().cast(), 8) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                if e.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
         }
 
         match ring.submit_and_wait(1) {
@@ -333,20 +513,25 @@ fn queue_worker(pool: Arc<FuseOverUring>, qid: u16, depth: usize, payload_sz: us
         };
 
         let mut resubmit = Vec::new();
+        let mut need_repoll = false;
         for (user_data, res) in completed {
+            if user_data == u64::MAX {
+                // wake_fd poll completed — re-arm
+                need_repoll = true;
+                continue;
+            }
             let ent_idx = user_data as usize;
             if res < 0 {
                 let err = -res;
+                pool.stats_cqe_err.fetch_add(1, Ordering::Relaxed);
                 if err == libc::EAGAIN || err == libc::EINTR {
                     if ent_idx < ents.len() {
                         resubmit.push(ent_idx);
                     }
                     continue;
                 }
-                if err == libc::ENOTSUP || err == libc::EINVAL {
-                    error!(
-                        "fuse-over-uring: kernel rejected protocol (err={err}); disabling"
-                    );
+                if err == libc::ENOTSUP || err == libc::EINVAL || err == libc::ENOSYS {
+                    error!("fuse-over-uring: kernel rejected protocol err={err}");
                     pool.shutdown();
                     return Err(io::Error::from_raw_os_error(err));
                 }
@@ -373,19 +558,19 @@ fn queue_worker(pool: Arc<FuseOverUring>, qid: u16, depth: usize, payload_sz: us
                 .lock()
                 .unwrap()
                 .insert(unique, (qid, ent_idx as u16, commit_id));
-
-            if pool
-                .inbound_tx
-                .send(InboundUringReq {
-                    header_and_op,
-                    payload,
-                    unique,
-                })
-                .is_err()
-            {
-                pool.shutdown();
-                break;
-            }
+            pool.stats_requests.fetch_add(1, Ordering::Relaxed);
+            pool.inbound.push(InboundUringReq {
+                header_and_op,
+                payload,
+                unique,
+            });
+        }
+        if need_repoll {
+            let poll_e = opcode::PollAdd::new(types::Fixed(1), libc::POLLIN as _)
+                .build()
+                .user_data(u64::MAX);
+            let _ = unsafe { ring.submission().push(&Entry128::from(poll_e)) };
+            let _ = ring.submit();
         }
         if !resubmit.is_empty() {
             for ent_idx in resubmit {
@@ -444,7 +629,7 @@ fn push_cmd(
 
     if let Some((ptr, len)) = iov {
         // libfuse: sqe.addr = iov, sqe.len = count for REGISTER.
-        // io_uring_sqe layout (linux uapi): addr at +16, len at +24.
+        // io_uring_sqe: addr @ +16, len @ +24.
         unsafe {
             let base = (&mut entry as *mut Entry128 as *mut u8).add(16);
             std::ptr::write_unaligned(base as *mut u64, ptr as u64);
@@ -458,4 +643,26 @@ fn push_cmd(
             .map_err(|_| io::Error::other("submission queue full"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flags2_bit() {
+        assert_eq!(FUSE_OVER_IO_URING_FLAGS2, 1u32 << 9);
+    }
+
+    #[test]
+    fn test_want_env_opt_in() {
+        // Don't assert global env; just ensure function is callable.
+        let _ = want_fuse_over_uring();
+    }
+
+    #[test]
+    fn test_header_sizes() {
+        assert_eq!(std::mem::size_of::<FuseUringReqHeader>(), 128 + 128 + 32);
+        assert_eq!(std::mem::size_of::<FuseUringCmdReq>(), 24);
+    }
 }

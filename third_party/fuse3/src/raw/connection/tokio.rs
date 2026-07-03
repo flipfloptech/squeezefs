@@ -291,8 +291,9 @@ impl FuseConnection {
         mut header_buf: Vec<u8>,
         mut data_buf: T,
     ) -> CompleteIoResult<(Vec<u8>, T), usize> {
-        // Prefer kernel FUSE-over-io_uring only once every queue has REGISTERed.
-        // Until then keep classical /dev/fuse reads (kernel has not switched yet).
+        // After arm, the request path is FUSE-over-io_uring only — never classical.
+        // Pre-arm (during INIT only) still uses /dev/fuse because the kernel rejects
+        // REGISTER until fch->initialized.
         #[cfg(target_os = "linux")]
         {
             let pool = self.over_uring.lock().unwrap().clone();
@@ -326,31 +327,62 @@ impl FuseConnection {
                     }
                 };
 
-                // Classical path layout: header_buf = fuse_in_header, data_buf = rest.
-                if inbound.header_and_op.len() >= 40 && header_buf.len() >= 40 {
-                    header_buf[..40].copy_from_slice(&inbound.header_and_op[..40]);
-                    // unique is authoritative for reply matching (also in header bytes).
-                    debug_assert_eq!(
-                        inbound.unique,
-                        u64::from_ne_bytes(header_buf[8..16].try_into().unwrap())
+                // Reconstruct classical fuse framing for the session dispatcher:
+                //   [fuse_in_header 40][arg0 in op_in][arg1+ in payload]
+                // Kernel puts in_args[0] into the fixed op_in slot and the rest into
+                // the payload buffer. Classical handlers expect a contiguous body
+                // after the header (e.g. LOOKUP name). Use in_header.len to size it.
+                if inbound.header_and_op.len() < 40 || header_buf.len() < 40 {
+                    return (
+                        (header_buf, data_buf),
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "short fuse-over-uring header",
+                        )),
                     );
-                    let rest = &inbound.header_and_op[40..];
-                    let n1 = rest.len().min(data_buf.len());
-                    data_buf[..n1].copy_from_slice(&rest[..n1]);
-                    let n2 = inbound
-                        .payload
-                        .len()
-                        .min(data_buf.len().saturating_sub(n1));
-                    data_buf[n1..n1 + n2].copy_from_slice(&inbound.payload[..n2]);
-                    return ((header_buf, data_buf), Ok(40 + n1 + n2));
                 }
-                return (
-                    (header_buf, data_buf),
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "short fuse-over-uring header",
-                    )),
-                );
+                header_buf[..40].copy_from_slice(&inbound.header_and_op[..40]);
+                let total_len =
+                    u32::from_le_bytes(header_buf[0..4].try_into().unwrap()) as usize;
+                let body_need = total_len.saturating_sub(40);
+                let op_in = &inbound.header_and_op[40..];
+                let payload = &inbound.payload;
+                // Bytes of body that live in op_in (first in_arg); remainder in payload.
+                let from_op = body_need.saturating_sub(payload.len()).min(op_in.len());
+                let from_payload = body_need.saturating_sub(from_op).min(payload.len());
+                let mut filled = 0usize;
+                if from_op > 0 && filled < data_buf.len() {
+                    let n = from_op.min(data_buf.len() - filled);
+                    data_buf[filled..filled + n].copy_from_slice(&op_in[..n]);
+                    filled += n;
+                }
+                if from_payload > 0 && filled < data_buf.len() {
+                    let n = from_payload.min(data_buf.len() - filled);
+                    data_buf[filled..filled + n].copy_from_slice(&payload[..n]);
+                    filled += n;
+                }
+                // If in_header.len was wrong/zero (some uring paths), fall back to
+                // payload-first then op_in — LOOKUP often has name only in payload.
+                if filled == 0 {
+                    let n = payload.len().min(data_buf.len());
+                    if n > 0 {
+                        data_buf[..n].copy_from_slice(&payload[..n]);
+                        filled = n;
+                    }
+                    if filled < data_buf.len() {
+                        let n2 = op_in
+                            .iter()
+                            .position(|&b| b == 0)
+                            .map(|i| i + 1)
+                            .unwrap_or(0)
+                            .min(data_buf.len() - filled);
+                        if n2 > 0 && op_in.iter().any(|&b| b != 0) {
+                            data_buf[filled..filled + n2].copy_from_slice(&op_in[..n2]);
+                            filled += n2;
+                        }
+                    }
+                }
+                return ((header_buf, data_buf), Ok(40 + filled));
             }
         }
 
@@ -374,9 +406,8 @@ impl FuseConnection {
         data: T,
         body_extend_data: Option<U>,
     ) -> CompleteIoResult<(T, Option<U>), usize> {
-        // Kernel FUSE-over-io_uring reply path: COMMIT_AND_FETCH — only for uniques
-        // that arrived on a uring entry. Classical INIT (and any pre-ready request)
-        // must still be written to /dev/fuse.
+        // After arm: replies go via COMMIT_AND_FETCH only. Never fall back to
+        // classical /dev/fuse write for the request path.
         #[cfg(target_os = "linux")]
         {
             let pool = self.over_uring.lock().unwrap().clone();
@@ -395,16 +426,24 @@ impl FuseConnection {
                 let reply = reply.freeze();
                 // unique is at offset 8 in fuse_out_header (len u32, error i32, unique u64)
                 let unique = if reply.len() >= 16 {
-                    u64::from_ne_bytes(reply[8..16].try_into().unwrap())
+                    u64::from_le_bytes(reply[8..16].try_into().unwrap())
                 } else {
                     0
                 };
-                if pool.has_pending(unique) {
-                    let len = reply.len();
-                    let res = pool.submit_reply(unique, reply);
-                    return ((data, body_extend_data), res.map(|_| len));
+                // Notifications (unique==0) are not supported on over-uring yet — drop
+                // rather than writing classical (would violate always-on policy).
+                if unique == 0 {
+                    return (
+                        (data, body_extend_data),
+                        Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "fuse notify not supported on FUSE-over-io_uring path",
+                        )),
+                    );
                 }
-                // fall through to classical write
+                let len = reply.len();
+                let res = pool.submit_reply(unique, reply);
+                return ((data, body_extend_data), res.map(|_| len));
             }
         }
 

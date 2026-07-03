@@ -1,8 +1,12 @@
 //! Kernel **FUSE-over-io_uring** (Linux 6.14+ / 7.x) — `linux/fuse.h` + libfuse `fuse_uring.c`.
 //!
-//! **Required** request transport after classical `FUSE_INIT`. No userspace opt-out.
+//! **Required** request transport. No userspace opt-out, no classical fallback after arm.
 //! Mount fails if setup fails. The kernel module parameter `fuse.enable_uring` must
 //! be Y (we try to enable it at start).
+//!
+//! The only classical `/dev/fuse` use is the single `FUSE_INIT` exchange — the kernel
+//! rejects `REGISTER` until `fch->initialized`. After that, all requests/replies are
+//! over-uring only.
 //!
 //! Tuning only:
 //! ```text
@@ -87,6 +91,7 @@ pub struct InboundUringReq {
     pub header_and_op: Vec<u8>,
     pub payload: Vec<u8>,
     /// FUSE request unique (also embedded in `header_and_op`).
+    #[allow(dead_code)]
     pub unique: u64,
 }
 
@@ -398,11 +403,6 @@ impl FuseOverUring {
         self.inbound.pop_timeout(&self.active, timeout)
     }
 
-    /// True if `unique` was delivered on an over-uring entry (needs COMMIT, not classical write).
-    pub fn has_pending(&self, unique: u64) -> bool {
-        self.pending.lock().unwrap().contains_key(&unique)
-    }
-
     pub fn submit_reply(&self, unique: u64, reply: Bytes) -> io::Result<()> {
         let (qid, ent_idx, commit_id) = self
             .pending
@@ -636,11 +636,23 @@ fn queue_worker(
                 continue;
             }
             let ent = &ents[ent_idx];
-            let commit_id = ent.header.ring_ent_in_out.commit_id;
+            // Kernel sets commit_id = unique when delivering a request.
+            let unique = u64::from_le_bytes(ent.header.in_out[8..16].try_into().unwrap());
+            let mut commit_id = ent.header.ring_ent_in_out.commit_id;
             if commit_id == 0 {
+                // Fall back to unique — some paths only fill in_out.
+                commit_id = unique;
+            }
+            if unique == 0 {
+                eprintln!(
+                    "fuse-over-uring DROP qid={qid} ent={ent_idx} res={res} unique=0 \
+                     ring_commit={}",
+                    ent.header.ring_ent_in_out.commit_id
+                );
+                // Re-REGISTER the entry so we do not permanently lose capacity.
+                resubmit.push(ent_idx);
                 continue;
             }
-            let unique = u64::from_ne_bytes(ent.header.in_out[8..16].try_into().unwrap());
             let payload_sz = ent.header.ring_ent_in_out.payload_sz as usize;
             let mut header_and_op =
                 Vec::with_capacity(FUSE_IN_HEADER_SIZE + FUSE_URING_OP_IN_OUT_SZ);
@@ -656,7 +668,7 @@ fn queue_worker(
             STATS_REQUESTS.fetch_add(1, Ordering::Relaxed);
             debug!(
                 qid,
-                ent_idx, unique, commit_id, "fuse-over-uring inbound request"
+                ent_idx, unique, commit_id, payload_sz, "fuse-over-uring inbound request"
             );
             pool.inbound.push(InboundUringReq {
                 header_and_op,
@@ -689,17 +701,26 @@ fn queue_worker(
     Ok(())
 }
 
+/// Place a classical fuse reply (`fuse_out_header` || body) into the ring entry
+/// the way libfuse/`send_reply_uring` does: header in `in_out`, body in payload.
 fn apply_reply(ent: &mut Ent, reply: &Bytes) {
-    let hdr_n = reply.len().min(FUSE_URING_IN_OUT_HEADER_SZ);
-    ent.header.in_out[..hdr_n].copy_from_slice(&reply[..hdr_n]);
-    if reply.len() > FUSE_URING_IN_OUT_HEADER_SZ {
-        let body = &reply[FUSE_URING_IN_OUT_HEADER_SZ..];
-        let n = body.len().min(ent.payload.len());
-        ent.payload[..n].copy_from_slice(&body[..n]);
-        ent.header.ring_ent_in_out.payload_sz = n as u32;
-    } else {
+    const OUT_HDR: usize = 16; // sizeof(fuse_out_header)
+    // Clear header region so stale request bytes cannot leak into the reply.
+    ent.header.in_out = [0; FUSE_URING_IN_OUT_HEADER_SZ];
+    if reply.len() < OUT_HDR {
+        // Degenerate — treat as IO error header.
+        ent.header.in_out[..4].copy_from_slice(&((OUT_HDR as u32).to_le_bytes()));
+        ent.header.in_out[4..8].copy_from_slice(&((-libc::EIO as i32).to_le_bytes()));
         ent.header.ring_ent_in_out.payload_sz = 0;
+        return;
     }
+    ent.header.in_out[..OUT_HDR].copy_from_slice(&reply[..OUT_HDR]);
+    let body = &reply[OUT_HDR..];
+    let n = body.len().min(ent.payload.len());
+    if n > 0 {
+        ent.payload[..n].copy_from_slice(&body[..n]);
+    }
+    ent.header.ring_ent_in_out.payload_sz = n as u32;
 }
 
 fn push_cmd(

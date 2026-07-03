@@ -1248,20 +1248,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(reply) => reply,
         };
 
-        // Always advertise FUSE_OVER_IO_URING — required transport (no classical opt-out).
+        // Required: always advertise FUSE_OVER_IO_URING. No opt-out.
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         let flags2 = {
             debug!("advertising FUSE_OVER_IO_URING in init flags2");
             crate::raw::connection::fuse_over_uring::FUSE_OVER_IO_URING_FLAGS2
         };
+        // Non-Linux / non-tokio builds cannot use over-uring (SqueezeFS is Linux-only).
         #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
         let flags2 = 0u32;
-
-        // REGISTER all CPU queues first (session still reads classical: ready=false).
-        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
-        {
-            fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
-        }
 
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
@@ -1302,7 +1297,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             .serialize_into(&mut data, &init_out)
             .expect("won't happened");
 
-        // Classical write of init_out (ready still false → not uring COMMIT path).
+        // 1) Classical INIT reply first. Kernel fuse_uring_cmd requires
+        //    fch->initialized before REGISTER (returns -EAGAIN otherwise).
         if let Err(err) = fuse_connection
             .write_vectored::<_, Vec<u8>>(data, None)
             .await
@@ -1313,12 +1309,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             return Err(err);
         }
 
-        // Now arm the session uring path — kernel has flags2 + full REGISTER set.
+        // 2) REGISTER all CPU queues now that the connection is initialized.
+        //    Session still uses classical reads until mark_ready (ready=false).
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
+            fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
             if let Some(pool) = fuse_connection.over_uring.lock().unwrap().clone() {
                 pool.mark_ready();
             }
+            eprintln!("FUSE-over-io_uring transport armed for this session");
             tracing::info!("FUSE-over-io_uring transport armed for this session");
         }
 

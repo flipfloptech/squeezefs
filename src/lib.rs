@@ -37,12 +37,45 @@ pub static FS_PREFIX: RwLock<&'static str> = RwLock::new("squeezefs");
 pub static WRITE_VERIFICATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// When write verification is enabled, check every N-th write (P2-9).
+/// `1` = verify every write (historical default).
+static WRITE_VERIFICATION_SAMPLE_N: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+static WRITE_VERIFICATION_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub fn write_verification_enabled() -> bool {
     WRITE_VERIFICATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn set_write_verification(enabled: bool) {
     WRITE_VERIFICATION.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How often enabled write-verification issues a read-after-write.
+/// `every_n == 1` verifies all writes; larger N samples roughly 1/N of writes.
+pub fn set_write_verification_sample_rate(every_n: u64) {
+    WRITE_VERIFICATION_SAMPLE_N.store(every_n.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn write_verification_sample_rate() -> u64 {
+    WRITE_VERIFICATION_SAMPLE_N
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1)
+}
+
+/// Whether this write should run read-after-write verification (enabled + sample).
+#[inline]
+pub fn write_verification_should_check() -> bool {
+    if !write_verification_enabled() {
+        return false;
+    }
+    let n = write_verification_sample_rate();
+    if n <= 1 {
+        return true;
+    }
+    WRITE_VERIFICATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n == 0
 }
 
 pub fn fs_prefix() -> &'static str {
@@ -244,6 +277,35 @@ mod tests {
     fn test_fs_prefix_default() {
         let prefix = fs_prefix();
         assert!(!prefix.is_empty());
+    }
+
+    #[test]
+    fn test_write_verification_sample_gate() {
+        set_write_verification(false);
+        set_write_verification_sample_rate(1);
+        assert!(!write_verification_should_check());
+
+        set_write_verification(true);
+        set_write_verification_sample_rate(1);
+        assert!(write_verification_should_check());
+        assert!(write_verification_should_check());
+
+        set_write_verification_sample_rate(5);
+        let mut hits = 0usize;
+        for _ in 0..50 {
+            if write_verification_should_check() {
+                hits += 1;
+            }
+        }
+        // Roughly 1/5 of 50 = 10; allow wide band for counter phase.
+        assert!(
+            (5..=20).contains(&hits),
+            "expected ~10 sample hits in 50, got {hits}"
+        );
+
+        // Restore defaults so other tests are not affected.
+        set_write_verification(false);
+        set_write_verification_sample_rate(1);
     }
 
     #[test]

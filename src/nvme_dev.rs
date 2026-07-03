@@ -587,7 +587,8 @@ impl NvmeBlockDev {
             .put_obj
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if crate::write_verification_enabled() {
+        // P2-9: full RAW only when verification is on *and* this write is sampled.
+        if crate::write_verification_should_check() {
             let verified = self.verify_write_block(offset, data).await?;
             if !verified {
                 return Err(crate::error::SqueezefsError::InvalidOperation(format!(

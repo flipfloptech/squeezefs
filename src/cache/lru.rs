@@ -77,14 +77,23 @@ impl LruCache {
     }
 
     /// Insert an entry into the cache, executing Clock eviction if maximum capacity is exceeded.
+    ///
+    /// P2-7: dehydration `try_send` runs **only** when Clock actually evicts
+    /// entries (empty eviction vector is a pure no-op — no channel traffic).
     pub fn put(&self, key: &str, data: Bytes) {
         if (data.len() as u64) <= self.max_bytes {
             let key_bytes = Bytes::copy_from_slice(key.as_bytes());
             let evicted = self.inner.put(key_bytes, data);
+            if evicted.is_empty() {
+                return;
+            }
             for (ek, ev) in evicted {
-                if let Ok(k_str) = String::from_utf8(ek.to_vec()) {
-                    let _ = self.evict_tx.try_send((k_str, ev));
-                }
+                // Keys inserted via this API are always valid UTF-8 path/block ids.
+                let k_str = match String::from_utf8(ek.to_vec()) {
+                    Ok(s) => s,
+                    Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+                };
+                let _ = self.evict_tx.try_send((k_str, ev));
             }
         } else {
             // Do not leave a smaller stale entry under this key when the new

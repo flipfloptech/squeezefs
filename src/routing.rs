@@ -732,10 +732,22 @@ impl DataRouter {
         }
 
         // --- Meta prep: fencing, type, and cheap existing-data fetch ---
+        // P2-5: single HMGET for fence + type + file_id (one RTT instead of 2–3).
         let (file_type, mut existing_data, staged_backend) = {
             let mut con = self.dlm.get_connection_for_inode(ino).await?;
 
-            let current_fencing: Option<u64> = con.hget(&meta_key, "fencing_token").await?;
+            let (current_fencing, file_type, file_id_opt): (
+                Option<u64>,
+                Option<String>,
+                Option<String>,
+            ) = redis::cmd("HMGET")
+                .arg(&meta_key)
+                .arg("fencing_token")
+                .arg("type")
+                .arg("file_id")
+                .query_async(&mut con)
+                .await?;
+
             if let Some(cf) = current_fencing {
                 if fencing_token < cf {
                     return Err(SqueezefsError::FencingTokenExpired {
@@ -744,8 +756,6 @@ impl DataRouter {
                     });
                 }
             }
-
-            let file_type: Option<String> = con.hget(&meta_key, "type").await?;
 
             if file_type.as_deref() == Some("striped") {
                 drop(con);
@@ -766,7 +776,6 @@ impl DataRouter {
                     }
                 }
                 Some("staged") => {
-                    let file_id_opt: Option<String> = con.hget(&meta_key, "file_id").await?;
                     if let Some(file_id) = file_id_opt {
                         if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
                             staged_data

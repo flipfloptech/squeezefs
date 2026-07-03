@@ -168,11 +168,25 @@ impl MemoryCache {
     }
 
     /// Inserts an item into the cache. Returns any items evicted from the cache.
+    ///
+    /// P2-7: reuse a thread-local eviction buffer so the common no-eviction
+    /// path does not allocate a fresh `Vec` on every put.
     pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes)> {
         let idx = self.get_shard_idx(&key);
-        let mut evicted = Vec::new();
-        self.shards[idx].put(key, value, &mut evicted);
-        evicted
+        thread_local! {
+            static EVICT_BUF: std::cell::RefCell<Vec<(Bytes, Bytes)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        EVICT_BUF.with(|cell| {
+            let mut evicted = cell.borrow_mut();
+            evicted.clear();
+            self.shards[idx].put(key, value, &mut evicted);
+            if evicted.is_empty() {
+                Vec::new()
+            } else {
+                std::mem::take(&mut *evicted)
+            }
+        })
     }
 
     /// Removes an item from the cache, returning the value if it existed.

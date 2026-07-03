@@ -255,8 +255,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | Meta size/type, fencing, block map, refcounts |
+| **Status** | **done** (2026-07-03) — `write_file` meta prep uses one `HMGET` (fence+type+file_id); FUSE path already pipelined size+type; further RTTs left for P2 follow-ups |
+| **Location** | `routing::write_file` meta prep |
 | **Why** | Still dominant under high QPS. |
 | **Acceptance** | Pipeline more; cache meta with invalidation rules; measure with coz/dhat. |
 
@@ -273,8 +273,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `cache/lru.rs` `try_send` on every put |
+| **Status** | **done** (2026-07-03) — dehydrate `try_send` only when Clock returns evictions; thread-local eviction buf in `MemoryCache::put` |
+| **Location** | `cache/lru.rs`, `tiering/memory.rs` |
 | **Why** | Noise + work even when empty. |
 | **Acceptance** | Batch or only on actual eviction; no drop of must-dehydrate blocks. |
 
@@ -291,8 +291,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | Full read-after-write when enabled |
+| **Status** | **done** (2026-07-03) — remains opt-in; `--write-verification-sample N` / `set_write_verification_sample_rate`; `write_verification_should_check()` gates RAW |
+| **Location** | `src/lib.rs`, `nvme_dev::write_block`, mount CLI |
 | **Why** | Correct for debug, harsh for default. |
 | **Acceptance** | Keep opt-in; optional sample rate; document impact. |
 

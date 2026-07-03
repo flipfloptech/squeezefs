@@ -237,8 +237,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | `src/crypto_compress.rs`, per-block `process_write` |
+| **Status** | **done** (2026-07-03) — enum modes + passthrough; session RSA wrap / `LessSafeKey` reuse; `Arc<[u8]>` wrapped key; cached AEAD tag len |
+| **Location** | `src/crypto_compress.rs` |
 | **Why** | Key schedule / wrap cost per block. |
 | **Acceptance** | Session/key reuse where safe; benches for write_none / lz4 / aes paths unchanged or better. |
 

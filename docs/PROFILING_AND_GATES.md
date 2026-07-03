@@ -116,14 +116,14 @@ Mounted volumes expose process metrics under the virtual **stats** inode (JSON),
 | `SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS` | Enable SQPOLL with idle timeout (ms); also set via mount/format |
 | `SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU` | Pin SQPOLL kernel thread |
 | `SQUEEZEFS_FUSE_IO_URING_ENTRIES` | SQ depth for classical FUSE rings used during INIT / notify (default 1024, clamp 64–4096) |
-| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | Entries per FUSE-over-io_uring queue (default 8) |
-| `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` | Number of per-CPU style queues (default `min(nproc, 32)`) |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | Entries per FUSE-over-io_uring queue (default 4) |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` | Number of queues (default `min(nproc, 8)`, max 32) |
 
 ```bash
-# Mount always enables FUSE-over-io_uring after INIT (required; no opt-out).
+# Mount always enables FUSE-over-io_uring after INIT (required; no classical opt-out).
+# Needs CONFIG_FUSE_IO_URING; sets fuse.enable_uring=Y when run as root.
 target/release/squeezefs mount …
-# Expect log: "FUSE-over-io_uring transport enabled for this session"
-# Mount fails if the kernel rejects the protocol (need Linux 6.14+ / CONFIG_FUSE_IO_URING).
+# Expect log: "FUSE-over-io_uring ready: …" and "transport enabled for this session"
 ```
 
-**Hardening notes:** per-qid commit channels (no demux races), shared inbound work queue for multi-queue session workers, eventfd wake on commit/shutdown, probe REGISTER before full start.
+**Hardening notes:** pool not marked ready until all queues submit REGISTER (avoids classical/uring read deadlock); per-qid commit channels; shared inbound queue; eventfd wake; full-size payload buffers.

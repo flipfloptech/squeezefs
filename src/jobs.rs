@@ -145,24 +145,30 @@ pub fn start_job_worker(
 }
 
 async fn run_worker_cycle(router: &DataRouter, fs_name: &str, cpu_limit: u32) -> Result<()> {
-    let mut con = router.dlm.get_connection().await?;
     let active_set_key = format!("{}:active_jobs", fs_name);
 
-    // Get list of active jobs
-    let active_jobs: Vec<String> = con.smembers(&active_set_key).await?;
+    // P1-10: only hold a meta connection for short Redis ops. Task bodies do NVMe
+    // I/O and must not pin a pool connection across that work.
+    let active_jobs: Vec<String> = {
+        let mut con = router.dlm.get_connection().await?;
+        con.smembers(&active_set_key).await?
+    };
+
     for job_id in active_jobs {
         let pending_key = format!("{}:jobs:{}:pending", fs_name, job_id);
         let completed_key = format!("{}:jobs:{}:completed", fs_name, job_id);
         let paused_key = format!("{}:jobs:{}:paused", fs_name, job_id);
 
-        // Check if job is paused
-        let paused_str: Option<String> = con.get(&paused_key).await?;
-        if paused_str.as_deref() == Some("1") {
-            continue;
-        }
+        let task_json_opt: Option<String> = {
+            let mut con = router.dlm.get_connection().await?;
+            let paused_str: Option<String> = con.get(&paused_key).await?;
+            if paused_str.as_deref() == Some("1") {
+                None
+            } else {
+                con.spop(&pending_key).await?
+            }
+        }; // meta con dropped before execute_task
 
-        // Atomic SPOP to grab a task
-        let task_json_opt: Option<String> = con.spop(&pending_key).await?;
         if let Some(task_json) = task_json_opt {
             let task: JobTask = match serde_json::from_str(&task_json) {
                 Ok(t) => t,
@@ -171,28 +177,30 @@ async fn run_worker_cycle(router: &DataRouter, fs_name: &str, cpu_limit: u32) ->
 
             let start_time = Instant::now();
 
-            // Execute task
+            // Execute task (NVMe / lease work — no meta con held from the worker)
             let execute_result = execute_task(router, &task.task_type).await;
 
             let elapsed = start_time.elapsed();
 
-            match execute_result {
-                Ok(()) => {
-                    // Register completed task
-                    let _: () = con.sadd(&completed_key, task_json).await?;
-                }
-                Err(e) => {
-                    log::error!("Task {} failed: {:?}", task.task_id, e);
-                    let err_msg = e.to_string();
-                    if err_msg.contains("Write verification failed") {
-                        log::warn!(
-                            "CRITICAL: Pausing job {} due to write verification failure!",
-                            task.job_id
-                        );
-                        let _: () = con.set(&paused_key, "1").await?;
+            {
+                let mut con = router.dlm.get_connection().await?;
+                match execute_result {
+                    Ok(()) => {
+                        let _: () = con.sadd(&completed_key, &task_json).await?;
                     }
-                    // Push back to pending
-                    let _: () = con.sadd(&pending_key, task_json).await?;
+                    Err(e) => {
+                        log::error!("Task {} failed: {:?}", task.task_id, e);
+                        let err_msg = e.to_string();
+                        if err_msg.contains("Write verification failed") {
+                            log::warn!(
+                                "CRITICAL: Pausing job {} due to write verification failure!",
+                                task.job_id
+                            );
+                            let _: () = con.set(&paused_key, "1").await?;
+                        }
+                        // Push back to pending
+                        let _: () = con.sadd(&pending_key, &task_json).await?;
+                    }
                 }
             }
 

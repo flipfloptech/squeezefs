@@ -197,8 +197,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | **partial** — FUSE write path scoped in earlier fix; further greps deferred |
-| **Location** | `routing.rs`, `write_file_staged`, jobs, defrag |
+| **Status** | **done** (2026-07-03) — phased meta cons on `write_file` / `write_striped` / `write_file_staged` + jobs worker; defrag is redis-only SCAN (no change) |
+| **Location** | `routing.rs`, `fuse_client::write_file_staged`, `jobs.rs`; tests `tests/connection_lifetime_tests.rs` |
 | **Why** | Prep con fixed in FUSE write; other paths may still hold/reuse poorly. |
 | **Acceptance** | Grep-driven pass; no connection held across long IO without need. |
 

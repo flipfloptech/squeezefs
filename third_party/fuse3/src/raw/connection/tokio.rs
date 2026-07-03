@@ -194,8 +194,8 @@ impl FuseConnection {
         }
     }
 
-    /// Start kernel FUSE-over-io_uring workers after a successful FUSE_INIT.
-    /// Required transport — errors if the kernel rejects the protocol.
+    /// Start kernel FUSE-over-io_uring workers after a successful FUSE_INIT that
+    /// advertised `FUSE_OVER_IO_URING`. Must succeed if that flag was set.
     /// Shared with multi-queue clones via [`clone_connection`].
     #[cfg(target_os = "linux")]
     pub fn enable_fuse_over_uring(&self, max_write: usize) -> io::Result<()> {
@@ -215,10 +215,7 @@ impl FuseConnection {
         let pool = super::fuse_over_uring::FuseOverUring::try_start(fd, max_write).map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!(
-                    "FUSE-over-io_uring is required but setup failed: {e} \
-                     (need Linux 6.14+ with CONFIG_FUSE_IO_URING)"
-                ),
+                format!("FUSE-over-io_uring setup failed after advertising the feature: {e}"),
             )
         })?;
         *self.over_uring.lock().unwrap() = Some(pool);

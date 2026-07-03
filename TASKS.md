@@ -282,10 +282,11 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
+| **Status** | **planned** (2026-07-03) — see notes; no code move yet (needs separate design+bench) |
 | **Location** | Block path only; FUSE/network still elsewhere |
 | **Why** | Spec vs implementation gap. |
 | **Acceptance** | Clear plan: what moves to uring; no regression on existing block tests. |
+| **Plan** | **In uring today:** `NvmeBlockDev` read/write via worker + bounded SQ. **Keep:** Garnet/Redis over TCP (not a natural uring fit without a dedicated client). **Next candidates (priority order):** (1) FUSE read/write data copy path if fuse3 exposes registered buffers — only after fuse3/TPC audit; (2) staging-file writeback (`stage_write` / dehydrate) via `io_uring` open/read/write on staging dirs when not already buffered; (3) multi-device register_files for multi-backend. **Non-goals near-term:** TLS/mTLS peers, RESP pipeline. **Gate:** each move needs `nvme_dev_tests` + a mount smoke; no change until a follow-up PR with measurements. |
 
 ### P2-9 — Write-verification mode cost
 
@@ -300,8 +301,8 @@ Tracked follow-ups from the post-HPC_AUDIT codebase audit. **Excludes work alrea
 
 | Field | Detail |
 |-------|--------|
-| **Status** | open |
-| **Location** | Clone-heavy structures on tasks |
+| **Status** | **done** (2026-07-03) — audit: `DataRouter` / `BackendRouter` are already thin `Arc` wrappers (`DataRouterInner`); task clones are cheap atomic refcount ops. No structural change needed now. |
+| **Location** | `routing.rs` `DataRouter` / spawn sites |
 | **Why** | Extra atomics under concurrency. |
 | **Acceptance** | Pass refs/`Arc` more carefully; profile with `high_concurrency_bench`. |
 

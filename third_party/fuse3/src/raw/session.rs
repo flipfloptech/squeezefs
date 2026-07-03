@@ -1248,11 +1248,23 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(reply) => reply,
         };
 
-        // Always advertise kernel FUSE-over-io_uring (required transport on Linux).
+        // Advertise FUSE_OVER_IO_URING only when the kernel module has it enabled.
+        // Advertising then failing to REGISTER hangs the mount (kernel stops using
+        // classical /dev/fuse for new requests). No userspace opt-out — only the
+        // kernel fuse.enable_uring knob gates this.
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         let flags2 = {
-            debug!("advertising FUSE_OVER_IO_URING in init flags2");
-            crate::raw::connection::fuse_over_uring::FUSE_OVER_IO_URING_FLAGS2
+            let want = crate::raw::connection::fuse_over_uring::kernel_fuse_uring_enabled();
+            if want {
+                debug!("advertising FUSE_OVER_IO_URING in init flags2");
+                crate::raw::connection::fuse_over_uring::FUSE_OVER_IO_URING_FLAGS2
+            } else {
+                tracing::info!(
+                    "kernel fuse.enable_uring is off; using classical /dev/fuse \
+                     (echo Y > /sys/module/fuse/parameters/enable_uring to enable)"
+                );
+                0
+            }
         };
         #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
         let flags2 = 0u32;
@@ -1308,11 +1320,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         debug!("fuse init done");
 
-        // After classical INIT, switch the hot path to kernel FUSE-over-io_uring (required).
+        // After classical INIT reply with FUSE_OVER_IO_URING advertised, start workers.
+        // If we advertised the flag, enable must succeed — otherwise the session is wedged.
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
-            fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
-            tracing::info!("FUSE-over-io_uring transport enabled for this session");
+            if flags2 != 0 {
+                fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
+                tracing::info!("FUSE-over-io_uring transport enabled for this session");
+            }
         }
 
         Ok(reply.max_write)

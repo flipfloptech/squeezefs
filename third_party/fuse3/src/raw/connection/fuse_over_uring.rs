@@ -181,23 +181,54 @@ pub fn over_uring_stats() -> (u64, u64, u64, u64) {
     )
 }
 
+/// True when `/sys/module/fuse/parameters/enable_uring` is Y/1 (kernel will accept
+/// FUSE-over-io_uring REGISTER). No userspace disable switch — only this kernel knob.
+pub fn kernel_fuse_uring_enabled() -> bool {
+    std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring")
+        .map(|s| {
+            matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "y" | "1" | "yes" | "true" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 impl FuseOverUring {
     pub fn try_start(fuse_fd: RawFd, max_write: usize) -> io::Result<Arc<Self>> {
+        if !kernel_fuse_uring_enabled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel fuse.enable_uring is disabled",
+            ));
+        }
+        // Defaults stay modest: each entry holds a full max_write-sized payload, so
+        // memory ≈ queues * depth * payload_sz. Strix-class machines with 32+ cores
+        // would otherwise allocate multi‑GB and get OOM-killed at mount.
         let nqueues = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| {
                 std::thread::available_parallelism()
-                    .map(|n| n.get())
+                    .map(|n| n.get().clamp(1, 8))
                     .unwrap_or(4)
             })
             .clamp(1, 32);
         let depth = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(8usize)
+            .unwrap_or(4usize)
             .clamp(2, 32);
-        let payload_sz = (max_write + 8192).max(128 * 1024);
+        // Must be >= kernel ring->max_payload_sz:
+        //   max(FUSE_MIN_READ_BUFFER, max_write, max_pages * PAGE_SIZE)
+        // (fs/fuse/dev_uring.c). Kernel clamps max_pages to fuse_max_pages_limit (256).
+        // Undersized payload → EINVAL on REGISTER.
+        const FUSE_MIN_READ_BUFFER: usize = 8192;
+        const KERNEL_MAX_PAGES_LIMIT: usize = 256;
+        let page = 4096usize;
+        let payload_sz = max_write
+            .max(FUSE_MIN_READ_BUFFER)
+            .max(KERNEL_MAX_PAGES_LIMIT * page);
 
         let inbound = Arc::new(InboundQueue::new());
         let mut queue_handles = Vec::with_capacity(nqueues);
@@ -235,7 +266,9 @@ impl FuseOverUring {
         });
 
         // Probe one ring before spawning all workers (fail fast if kernel rejects).
-        probe_kernel_support(fuse_fd, payload_sz)?;
+        // Do not probe with a one-shot REGISTER + wait: REGISTER parks the entry
+        // until the kernel has a request, so a blocking wait deadlocks mount.
+        // Workers perform REGISTER; immediate setup failures surface there.
 
         let mut handles = Vec::new();
         for qid in 0..nqueues as u16 {
@@ -327,61 +360,6 @@ struct Ent {
     header: Box<FuseUringReqHeader>,
     payload: Vec<u8>,
     iov: [libc::iovec; 2],
-}
-
-/// Fail fast if the kernel cannot accept a REGISTER cmd on this fuse fd.
-fn probe_kernel_support(fuse_fd: RawFd, payload_sz: usize) -> io::Result<()> {
-    let mut ring: Ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
-        .build(8)
-        .map_err(|e| io::Error::other(format!("probe ring: {e}")))?;
-    ring.submitter()
-        .register_files(&[fuse_fd])
-        .map_err(|e| io::Error::other(format!("probe register_files: {e}")))?;
-
-    let mut header = Box::new(FuseUringReqHeader::default());
-    let mut payload = vec![0u8; payload_sz.min(4096)];
-    let iov = [
-        libc::iovec {
-            iov_base: (&mut *header as *mut FuseUringReqHeader).cast(),
-            iov_len: std::mem::size_of::<FuseUringReqHeader>(),
-        },
-        libc::iovec {
-            iov_base: payload.as_mut_ptr().cast(),
-            iov_len: payload.len(),
-        },
-    ];
-    push_cmd(
-        &mut ring,
-        FUSE_IO_URING_CMD_REGISTER,
-        0,
-        0,
-        Some((iov.as_ptr(), 2)),
-        0,
-    )?;
-    ring.submit_and_wait(1)?;
-    let mut cq = ring.completion();
-    cq.sync();
-    if let Some(cqe) = cq.next() {
-        let res = cqe.result();
-        if res < 0 {
-            let err = -res;
-            // EAGAIN is ok (no request yet after register)
-            if err != libc::EAGAIN && err != 0 {
-                if err == libc::ENOTSUP || err == libc::EINVAL || err == libc::ENOSYS {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("kernel rejected FUSE URING_CMD REGISTER (err={err})"),
-                    ));
-                }
-                // Other errors: still try full start (some kernels return odd codes once)
-                warn!("fuse-over-uring probe REGISTER returned {err}; continuing");
-            }
-        }
-    }
-    // Keep header/payload alive until after submit_and_wait
-    drop(header);
-    drop(payload);
-    Ok(())
 }
 
 fn queue_worker(

@@ -195,13 +195,11 @@ impl FuseConnection {
     }
 
     /// Start kernel FUSE-over-io_uring workers after a successful FUSE_INIT.
+    /// Required transport — errors if the kernel rejects the protocol.
     /// Shared with multi-queue clones via [`clone_connection`].
     #[cfg(target_os = "linux")]
-    pub fn try_enable_fuse_over_uring(&self, max_write: usize) -> io::Result<bool> {
+    pub fn enable_fuse_over_uring(&self, max_write: usize) -> io::Result<()> {
         use std::os::fd::AsRawFd;
-        if !super::fuse_over_uring::want_fuse_over_uring() {
-            return Ok(false);
-        }
         // Already enabled (e.g. race with another enable call)
         if self
             .over_uring
@@ -211,19 +209,20 @@ impl FuseConnection {
             .map(|p| p.is_active())
             .unwrap_or(false)
         {
-            return Ok(true);
+            return Ok(());
         }
         let fd = self.as_fd().as_raw_fd();
-        match super::fuse_over_uring::FuseOverUring::try_start(fd, max_write) {
-            Ok(pool) => {
-                *self.over_uring.lock().unwrap() = Some(pool);
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::warn!("FUSE-over-io_uring setup failed (using classical path): {e}");
-                Ok(false)
-            }
-        }
+        let pool = super::fuse_over_uring::FuseOverUring::try_start(fd, max_write).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "FUSE-over-io_uring is required but setup failed: {e} \
+                     (need Linux 6.14+ with CONFIG_FUSE_IO_URING)"
+                ),
+            )
+        })?;
+        *self.over_uring.lock().unwrap() = Some(pool);
+        Ok(())
     }
 
     #[cfg(all(target_os = "linux", feature = "unprivileged"))]

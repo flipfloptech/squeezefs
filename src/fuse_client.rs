@@ -116,6 +116,21 @@ fn osstr_to_cow(name: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
         .map(std::borrow::Cow::Borrowed)
         .unwrap_or_else(|| name.to_string_lossy())
 }
+
+/// POSIX `NAME_MAX`: max bytes in a single path component (excludes the trailing NUL).
+/// Reported via `statfs.f_namelen` and enforced on every name-taking FUSE op so the
+/// kernel gets `ENAMETOOLONG` instead of silently accepting oversize components.
+pub(crate) const FUSE_NAME_MAX: usize = 255;
+
+/// Reject a directory entry name longer than [`FUSE_NAME_MAX`].
+#[inline]
+pub(crate) fn check_component_name_len(name: &std::ffi::OsStr) -> Result<(), Errno> {
+    if name.len() > FUSE_NAME_MAX {
+        Err(Errno::from(libc::ENAMETOOLONG))
+    } else {
+        Ok(())
+    }
+}
 pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
     Lazy::new(|| StripeLocks::new());
 
@@ -1888,6 +1903,7 @@ impl Filesystem for SqueezefsFilesystem {
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_lookup");
+        check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
         debug!("FUSE Lookup: parent = {}, name = {}", parent, name_str);
 
@@ -2031,6 +2047,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
         info!(
             "FUSE mknod: parent = {}, name = {}, mode = {:o}, rdev = {}",
@@ -2167,6 +2184,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_create");
+        check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
         info!(
             "FUSE Create: parent = {}, name = {}, mode = {:o}, flags = {}",
@@ -2729,6 +2747,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
         debug!(
             "FUSE mkdir: parent = {}, name = {}, mode = {:o}",
@@ -2876,6 +2895,7 @@ impl Filesystem for SqueezefsFilesystem {
     async fn rmdir(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
         debug!("FUSE rmdir: parent = {}, name = {}", parent, name_str);
 
@@ -3135,6 +3155,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
         let link_str = osstr_to_cow(link);
         debug!(
@@ -3256,6 +3277,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        check_component_name_len(new_name)?;
         let new_name_str = osstr_to_cow(new_name);
         debug!(
             "FUSE link: ino = {}, new_parent = {}, new_name = {}",
@@ -3351,6 +3373,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_unlink");
+        check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
         debug!("FUSE unlink: parent = {}, name = {}", parent, name_str);
 
@@ -3592,6 +3615,8 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        check_component_name_len(name)?;
+        check_component_name_len(new_name)?;
         let name_str = osstr_to_cow(name);
         let new_name_str = osstr_to_cow(new_name);
         debug!(
@@ -6945,10 +6970,32 @@ mod tests {
     use crate::nvme_dev::NvmeBlockDev;
     use crate::routing::DataRouter;
     use bytes::Bytes;
+    use std::ffi::OsStr;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn component_name_len_accepts_name_max() {
+        let name = "a".repeat(FUSE_NAME_MAX);
+        assert!(check_component_name_len(OsStr::new(&name)).is_ok());
+    }
+
+    #[test]
+    fn component_name_len_rejects_over_name_max() {
+        let name = "a".repeat(FUSE_NAME_MAX + 1);
+        let err = check_component_name_len(OsStr::new(&name)).unwrap_err();
+        // fuse3::Errno stores the negated libc errno.
+        assert_eq!(i32::from(err).unsigned_abs(), libc::ENAMETOOLONG as u32);
+    }
+
+    #[test]
+    fn component_name_len_accepts_empty_and_short() {
+        assert!(check_component_name_len(OsStr::new("")).is_ok());
+        assert!(check_component_name_len(OsStr::new("x")).is_ok());
+        assert!(check_component_name_len(OsStr::new(&"b".repeat(255))).is_ok());
+    }
 
     fn get_redis_url() -> String {
         std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())

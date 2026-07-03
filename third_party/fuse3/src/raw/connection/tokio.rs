@@ -26,6 +26,17 @@ impl Drop for SendIovec {
 #[cfg(target_os = "linux")]
 struct DebugUring(IoUring);
 
+/// Default SQ/CQ depth for FUSE /dev/fuse rings (P2-8). Overridable via
+/// `SQUEEZEFS_FUSE_IO_URING_ENTRIES` (clamped to [64, 4096]).
+#[cfg(target_os = "linux")]
+fn fuse_uring_entries() -> u32 {
+    std::env::var("SQUEEZEFS_FUSE_IO_URING_ENTRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(1024)
+        .clamp(64, 4096)
+}
+
 #[cfg(target_os = "linux")]
 fn build_io_uring(entries: u32) -> io::Result<IoUring> {
     let sqpoll_idle = std::env::var("SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS")
@@ -50,6 +61,21 @@ fn build_io_uring(entries: u32) -> io::Result<IoUring> {
     }
 
     IoUring::new(entries)
+}
+
+/// Register `/dev/fuse` (or a cloned worker fd) as fixed file index 0 on a ring.
+/// Returns whether subsequent SQEs may use `types::Fixed(0)`.
+#[cfg(target_os = "linux")]
+fn try_register_fuse_fd(ring: &IoUring, fd: RawFd) -> bool {
+    match ring.submitter().register_files(&[fd]) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!(
+                "fuse3: register_files(/dev/fuse) failed ({e:?}); using types::Fd"
+            );
+            false
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -281,6 +307,9 @@ struct BlockFuseConnection {
     read_ring_fd: AsyncFd<OwnedFd>,
     write_ring: std::sync::Mutex<DebugUring>,
     write_ring_fd: AsyncFd<OwnedFd>,
+    /// When true, SQEs use `types::Fixed(0)` for the fuse device (P2-8).
+    read_use_fixed: bool,
+    write_use_fixed: bool,
     read: Mutex<()>,
     write: Mutex<()>,
 }
@@ -304,8 +333,13 @@ impl BlockFuseConnection {
         let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
 
-        let read_ring = build_io_uring(256)?;
-        let write_ring = build_io_uring(256)?;
+        let entries = fuse_uring_entries();
+        let read_ring = build_io_uring(entries)?;
+        let write_ring = build_io_uring(entries)?;
+
+        // P2-8: register /dev/fuse (or cloned worker fd) as fixed file index 0.
+        let read_use_fixed = try_register_fuse_fd(&read_ring, fd);
+        let write_use_fixed = try_register_fuse_fd(&write_ring, fd);
 
         let read_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if read_event_fd < 0 {
@@ -346,6 +380,8 @@ impl BlockFuseConnection {
             read_ring_fd,
             write_ring: std::sync::Mutex::new(write_ring),
             write_ring_fd,
+            read_use_fixed,
+            write_use_fixed,
             read: Mutex::new(()),
             write: Mutex::new(()),
         })
@@ -374,13 +410,23 @@ impl BlockFuseConnection {
         {
             let mut guard = self.read_ring.lock().unwrap();
             let ring = &mut guard.0;
-            let read_e = opcode::Readv::new(
-                types::Fd(fd),
-                iovecs.as_ptr() as *mut libc::iovec,
-                iovecs.len() as u32,
-            )
-            .build()
-            .user_data(0x01);
+            let read_e = if self.read_use_fixed {
+                opcode::Readv::new(
+                    types::Fixed(0),
+                    iovecs.as_ptr() as *mut libc::iovec,
+                    iovecs.len() as u32,
+                )
+                .build()
+                .user_data(0x01)
+            } else {
+                opcode::Readv::new(
+                    types::Fd(fd),
+                    iovecs.as_ptr() as *mut libc::iovec,
+                    iovecs.len() as u32,
+                )
+                .build()
+                .user_data(0x01)
+            };
 
             unsafe {
                 ring.submission()
@@ -477,13 +523,23 @@ impl BlockFuseConnection {
         {
             let mut guard = self.write_ring.lock().unwrap();
             let ring = &mut guard.0;
-            let write_e = opcode::Writev::new(
-                types::Fd(fd),
-                iovecs.as_ptr() as *mut libc::iovec,
-                iovecs.len() as u32,
-            )
-            .build()
-            .user_data(0x01);
+            let write_e = if self.write_use_fixed {
+                opcode::Writev::new(
+                    types::Fixed(0),
+                    iovecs.as_ptr() as *mut libc::iovec,
+                    iovecs.len() as u32,
+                )
+                .build()
+                .user_data(0x01)
+            } else {
+                opcode::Writev::new(
+                    types::Fd(fd),
+                    iovecs.as_ptr() as *mut libc::iovec,
+                    iovecs.len() as u32,
+                )
+                .build()
+                .user_data(0x01)
+            };
 
             unsafe {
                 ring.submission()

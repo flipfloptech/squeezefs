@@ -104,6 +104,16 @@ Mounted volumes expose process metrics under the virtual **stats** inode (JSON),
 | Primary block device R/W | `NvmeBlockDev` worker + fixed-file registration when supported |
 | Ad-hoc file R/W / fdatasync | `crate::uring_fs` process worker (GDS cache materialize, etc.) |
 | Mmap page hint | `IoUringPrefetcher` (`MADV_WILLNEED`) |
-| FUSE fd poll (optional loop) | `start_io_uring_polling_loop` on `/dev/fuse` |
+| **FUSE `/dev/fuse` transport** | **fuse3 `BlockFuseConnection`**: readv/writev on dedicated rings, eventfd wakeups, optional SQPOLL, multi-queue clone, **fixed-file** `Fixed(0)` for the fuse fd (P2-8) |
 | Staging / read-segment hot path | **mmap** (by design — zero syscall get/put) |
 | Garnet/Redis, TLS peers | **Not** uring (network stacks) |
+
+### FUSE uring knobs (env)
+
+| Variable | Effect |
+|----------|--------|
+| `SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS` | Enable SQPOLL with idle timeout (ms); also set via mount/format |
+| `SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU` | Pin SQPOLL kernel thread |
+| `SQUEEZEFS_FUSE_IO_URING_ENTRIES` | SQ depth for FUSE rings (default 1024, clamp 64–4096) |
+
+Kernel **FUSE-over-io_uring** (register/cmd protocol, Linux 6.14+) is a separate ABI and is **not** required; we use classical FUSE over userspace `io_uring` syscalls, which works on older kernels.

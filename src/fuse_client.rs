@@ -5334,48 +5334,26 @@ pub fn init_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Low-level io_uring polling loop for /dev/fuse.
-/// When compiled for Linux, registers /dev/fuse descriptor to io_uring to intercept events
-/// and delegate requests instantly to the runtime thread pool.
+/// Historical debug helper — **not** used by production mounts.
+///
+/// Production FUSE transport is **fuse3** `BlockFuseConnection`: separate read/write
+/// `IoUring` rings, optional SQPOLL (`SQUEEZEFS_FUSE_IO_URING_SQPOLL_*`), eventfd
+/// completion wakeups, multi-queue `FUSE_DEV_IOC_CLONE` workers, and (P2-8) fixed-file
+/// registration of `/dev/fuse` as `types::Fixed(0)` when the kernel allows.
+///
+/// Prefer that path over this loop, which only demonstrates a bare `Read` on an fd
+/// and does not decode FUSE messages.
 #[cfg(target_os = "linux")]
+#[deprecated(
+    note = "Production mounts use fuse3 BlockFuseConnection io_uring; this loop is a no-op debug stub"
+)]
 pub fn start_io_uring_polling_loop(
-    fuse_fd: std::os::fd::RawFd,
+    _fuse_fd: std::os::fd::RawFd,
     _runtime: &tokio::runtime::Runtime,
 ) {
-    use io_uring::{opcode, types, IoUring};
-
-    info!("FUSE Daemon: Initializing io_uring polling ring on FUSE descriptor.");
-    let mut ring = IoUring::new(256).expect("Failed to initialize io_uring");
-
-    let mut buf = vec![0u8; 4096];
-
-    loop {
-        let read_e = opcode::Read::new(types::Fd(fuse_fd), buf.as_mut_ptr(), buf.len() as u32)
-            .build()
-            .user_data(0x01);
-
-        unsafe {
-            ring.submission()
-                .push(&read_e)
-                .expect("Failed to push read entry to io_uring submission queue");
-        }
-
-        ring.submit_and_wait(1).expect("io_uring wait failed");
-
-        let mut cq = ring.completion();
-        for cqe in &mut cq {
-            if cqe.user_data() == 0x01 {
-                let res = cqe.result();
-                if res > 0 {
-                    let bytes_read = res as usize;
-                    debug!(
-                        "io_uring FUSE poll read: reaped {} bytes from /dev/fuse",
-                        bytes_read
-                    );
-                }
-            }
-        }
-    }
+    info!(
+        "FUSE Daemon: start_io_uring_polling_loop is deprecated; production I/O uses fuse3 uring rings"
+    );
 }
 
 pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {

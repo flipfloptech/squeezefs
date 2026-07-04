@@ -133,4 +133,34 @@ impl MetaLvStorage {
     pub fn device_path(&self) -> &Path {
         &self.path
     }
+
+    pub fn wipe(&self) -> Result<()> {
+        let size = {
+            let mut file = self.file.lock();
+            use std::io::Seek;
+            let mut size = 0;
+            if let Ok(s) = file.seek(std::io::SeekFrom::End(0)) {
+                size = s;
+            }
+            if size == 0 {
+                if let Ok(meta) = file.metadata() {
+                    size = meta.len();
+                }
+            }
+            size
+        };
+        let wipe_len = std::cmp::max(size, 64 * 1024 * 1024);
+
+        let zeros = vec![0u8; 1024 * 1024];
+        let file = self.file.lock();
+        let mut written = 0;
+        while written < wipe_len {
+            let to_write = std::cmp::min(zeros.len() as u64, wipe_len - written) as usize;
+            file.write_all_at(&zeros[..to_write], written)
+                .map_err(SqueezefsError::Io)?;
+            written += to_write as u64;
+        }
+        file.sync_all().map_err(SqueezefsError::Io)?;
+        Ok(())
+    }
 }

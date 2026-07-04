@@ -2063,23 +2063,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             skip,
             direct,
         } => {
-            let mut resolved_url = None;
             let config_path = path.join(".config");
             let is_squeeze = if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-                if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                    if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
-                        resolved_url = Some(url_str.to_string());
-                    }
-                    if let Some(format_obj) = config_json.get("format").and_then(|v| v.as_object())
-                    {
-                        if let Some(name_str) = format_obj.get("name").and_then(|v| v.as_str()) {
-                            squeezefs::set_fs_prefix(name_str);
-                        }
-                    }
-                    true
-                } else {
-                    false
-                }
+                serde_json::from_str::<serde_json::Value>(&config_str).is_ok()
             } else {
                 if let Err(ref e) = std::fs::metadata(&config_path) {
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -2121,7 +2107,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     large_size,
                     small_size,
                     small_count,
-                    resolved_url.as_deref(),
+                    is_squeeze,
                     only.as_deref(),
                     skip.as_deref(),
                     direct,
@@ -3370,8 +3356,21 @@ mod tests {
     }
 }
 
-async fn get_daemon_metrics(_redis_url: &str) -> Option<HashMap<String, u64>> {
-    Some(HashMap::new())
+fn get_daemon_metrics_from_stats(mount_path: &Path) -> Option<HashMap<String, u64>> {
+    let stats_path = mount_path.join(".stats");
+    let stats_str = std::fs::read_to_string(&stats_path).ok()?;
+    let stats_json: serde_json::Value = serde_json::from_str(&stats_str).ok()?;
+
+    let mut metrics_map = HashMap::new();
+    if let Some(metrics_obj) = stats_json.get("metrics").and_then(|v| v.as_object()) {
+        for (k, v) in metrics_obj {
+            if let Some(val_u64) = v.as_u64() {
+                metrics_map.insert(k.clone(), val_u64);
+            }
+        }
+    }
+
+    Some(metrics_map)
 }
 
 async fn run_benchmark(
@@ -3380,7 +3379,7 @@ async fn run_benchmark(
     large_size_mb: usize,
     small_size_kb: usize,
     small_count: usize,
-    redis_url: Option<&str>,
+    is_squeeze: bool,
     only: Option<&[String]>,
     skip: Option<&[String]>,
     direct: bool,
@@ -3440,8 +3439,8 @@ async fn run_benchmark(
     );
 
     // 1. Fetch baseline metrics
-    let baseline_metrics = if let Some(url) = redis_url {
-        get_daemon_metrics(url).await
+    let baseline_metrics = if is_squeeze {
+        get_daemon_metrics_from_stats(path)
     } else {
         None
     };
@@ -4029,8 +4028,8 @@ async fn run_benchmark(
     }
 
     // 2. Fetch post-benchmark metrics
-    let post_metrics = if let Some(url) = redis_url {
-        get_daemon_metrics(url).await
+    let post_metrics = if is_squeeze {
+        get_daemon_metrics_from_stats(path)
     } else {
         None
     };

@@ -24,9 +24,9 @@ mkdir -p "$MOUNT_DIR"
 mkdir -p "$CACHE_DIR"
 
 # Ensure we have a compiled squeezefs binary
-if [ ! -f "./target/debug/squeezefs" ]; then
+if [ ! -f "./target/release/squeezefs" ]; then
     echo "Squeezefs binary not found. Compiling..."
-    cargo build
+    cargo build --release
 fi
 
 # Check if elbencho is installed
@@ -37,12 +37,12 @@ fi
 
 # 1. Format the SqueezeFS volume
 echo "Formatting SqueezeFS volume..."
-./target/debug/squeezefs format squeezefs-vol --force --capacity 100G --inodes 1000000
+./target/release/squeezefs format squeeze://127.0.0.1:6379/squeezefs-vol --force --capacity 100G --inodes 1000000 --volume /dev/shm/squeezefs_elbencho_backend
 
 # 2. Mount SqueezeFS as a daemon
 # Note: We configure the cache-dir explicitly to /tmp/squeezefs_staging
 echo "Mounting SqueezeFS at $MOUNT_DIR..."
-./target/debug/squeezefs mount "$MOUNT_DIR" --daemon --cache-dir "$CACHE_DIR" --cache-size 10G
+./target/release/squeezefs mount squeeze://127.0.0.1:6379/squeezefs-vol "$MOUNT_DIR" --daemon --cache-dir "$CACHE_DIR" --cache-size 10G
 
 # 3. Wait for the FUSE mount to be ready
 echo "Waiting for mount to become ready..."

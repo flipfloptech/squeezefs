@@ -351,6 +351,7 @@ impl FuseConnection {
                     classical_inflight: self.classical_inflight.clone(),
                 })
             }
+            #[cfg(not(feature = "unprivileged"))]
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Cloning non-blocking connections is not supported",

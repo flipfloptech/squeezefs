@@ -52,6 +52,7 @@ pub struct BackendRouter {
     pub backends: std::sync::Arc<
         dashmap::DashMap<String, std::sync::Arc<StorageBackend>, ahash::RandomState>,
     >,
+    pub unhealthy_backends: std::sync::Arc<dashmap::DashMap<String, bool, ahash::RandomState>>,
     /// P1-11: lock-free active backend id (hot path read).
     pub active_write_backend: std::sync::Arc<arc_swap::ArcSwap<String>>,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -69,14 +70,8 @@ fn err_invalid_offset() -> crate::error::SqueezefsError {
 #[cold]
 #[inline(never)]
 fn err_backend_not_found(be_id: &str) -> crate::error::SqueezefsError {
-    crate::error::SqueezefsError::InvalidOperation(format!("Storage backend '{}' not found", be_id))
-}
-
-#[cold]
-#[inline(never)]
-fn err_active_backend_not_found(be_id: &str) -> crate::error::SqueezefsError {
     crate::error::SqueezefsError::InvalidOperation(format!(
-        "Active write backend '{}' not found",
+        "Storage backend '{}' not found/offline",
         be_id
     ))
 }
@@ -91,10 +86,25 @@ impl BackendRouter {
             default_allocator,
             default_device,
             backends: std::sync::Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
+            unhealthy_backends: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
             active_write_backend: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 "backend_0".to_string(),
             )),
             block_size,
+        }
+    }
+
+    pub fn is_backend_healthy(&self, be_id: &str) -> bool {
+        if self.unhealthy_backends.contains_key(be_id) {
+            false
+        } else if be_id == "backend_0" {
+            std::path::Path::new(&self.default_device.device_path).exists()
+        } else if let Some(be) = self.backends.get(be_id) {
+            std::path::Path::new(&be.device.device_path).exists()
+        } else {
+            false
         }
     }
 
@@ -106,21 +116,55 @@ impl BackendRouter {
         std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     )> {
         let active_be_id = self.active_write_backend.load_full();
-        if active_be_id.as_str() == "backend_0" {
-            Ok((
+        if self.is_backend_healthy(&active_be_id) {
+            if active_be_id.as_str() == "backend_0" {
+                return Ok((
+                    "backend_0".to_string(),
+                    self.default_allocator.clone(),
+                    self.default_device.clone(),
+                ));
+            } else if let Some(be) = self.backends.get(active_be_id.as_str()) {
+                return Ok((
+                    (*active_be_id).clone(),
+                    be.block_allocator.clone(),
+                    be.device.clone(),
+                ));
+            }
+        }
+
+        // Inline failover: active backend is unhealthy!
+        if active_be_id.as_str() != "backend_0" && self.is_backend_healthy("backend_0") {
+            log::warn!(
+                "Active write backend '{}' is unhealthy. Falling back inline to 'backend_0'.",
+                active_be_id
+            );
+            return Ok((
                 "backend_0".to_string(),
                 self.default_allocator.clone(),
                 self.default_device.clone(),
-            ))
-        } else if let Some(be) = self.backends.get(active_be_id.as_str()) {
-            Ok((
-                (*active_be_id).clone(),
-                be.block_allocator.clone(),
-                be.device.clone(),
-            ))
-        } else {
-            Err(err_active_backend_not_found(active_be_id.as_str()))
+            ));
         }
+
+        for entry in self.backends.iter() {
+            let be_id = entry.key();
+            if self.is_backend_healthy(be_id) {
+                log::warn!(
+                    "Active write backend '{}' is unhealthy. Falling back inline to '{}'.",
+                    active_be_id,
+                    be_id
+                );
+                return Ok((
+                    be_id.clone(),
+                    entry.value().block_allocator.clone(),
+                    entry.value().device.clone(),
+                ));
+            }
+        }
+
+        Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "No healthy storage backends available for write",
+        )))
     }
 
     pub fn get_backend(
@@ -130,6 +174,9 @@ impl BackendRouter {
         std::sync::Arc<crate::block_allocator::BlockAllocator>,
         std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     )> {
+        if !self.is_backend_healthy(be_id) {
+            return Err(err_backend_not_found(be_id));
+        }
         if be_id == "backend_0" {
             Ok((self.default_allocator.clone(), self.default_device.clone()))
         } else if let Some(be) = self.backends.get(be_id) {
@@ -207,6 +254,124 @@ impl BackendRouter {
         }
         Ok(())
     }
+
+    pub fn start_health_check_worker(
+        self: &std::sync::Arc<Self>,
+        redis_url: String,
+        fs_name: String,
+    ) {
+        let router = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+
+                // 1. Health check default backend (backend_0)
+                let default_healthy = perform_device_health_check(&router.default_device).await;
+                if !default_healthy {
+                    if !router.unhealthy_backends.contains_key("backend_0") {
+                        log::error!("Backend health check: backend_0 (default) is UNHEALTHY!");
+                        router
+                            .unhealthy_backends
+                            .insert("backend_0".to_string(), true);
+                    }
+                } else if router.unhealthy_backends.contains_key("backend_0") {
+                    log::info!("Backend health check: backend_0 has recovered.");
+                    router.unhealthy_backends.remove("backend_0");
+                }
+
+                // 2. Health check all registered secondary backends
+                let mut failed_backends = Vec::new();
+                let mut recovered_backends = Vec::new();
+
+                for entry in router.backends.iter() {
+                    let be_id = entry.key();
+                    let dev = &entry.value().device;
+                    let healthy = perform_device_health_check(dev).await;
+                    if !healthy {
+                        if !router.unhealthy_backends.contains_key(be_id) {
+                            log::error!("Backend health check: backend '{}' is UNHEALTHY!", be_id);
+                            failed_backends.push(be_id.clone());
+                        }
+                    } else if router.unhealthy_backends.contains_key(be_id) {
+                        log::info!("Backend health check: backend '{}' has recovered.", be_id);
+                        recovered_backends.push(be_id.clone());
+                    }
+                }
+
+                for be_id in failed_backends {
+                    router.unhealthy_backends.insert(be_id, true);
+                }
+                for be_id in recovered_backends {
+                    router.unhealthy_backends.remove(&be_id);
+                }
+
+                // 3. Trigger failover if currently active write backend is unhealthy
+                let active_be = (*router.active_write_backend.load_full()).clone();
+                if !router.is_backend_healthy(&active_be) {
+                    log::warn!(
+                        "Active write backend '{}' is unhealthy! Initiating failover...",
+                        active_be
+                    );
+                    let mut fallback_be = None;
+                    if router.is_backend_healthy("backend_0") {
+                        fallback_be = Some("backend_0".to_string());
+                    } else {
+                        for entry in router.backends.iter() {
+                            let be_id = entry.key();
+                            if router.is_backend_healthy(be_id) {
+                                fallback_be = Some(be_id.clone());
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(healthy_be) = fallback_be {
+                        log::info!(
+                            "Failover: Switching active write backend from '{}' to '{}'",
+                            active_be,
+                            healthy_be
+                        );
+                        router
+                            .active_write_backend
+                            .store(std::sync::Arc::new(healthy_be.clone()));
+
+                        // Update format metadata in Garnet/Redis
+                        if let Ok(client) = redis::Client::open(redis_url.clone()) {
+                            if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
+                                let format_key = format!("{}:format", fs_name);
+                                let _: std::result::Result<(), _> = redis::cmd("HSET")
+                                    .arg(&format_key)
+                                    .arg("active_write_backend")
+                                    .arg(&healthy_be)
+                                    .query_async(&mut con)
+                                    .await;
+                            }
+                        }
+                    } else {
+                        log::error!("Failover failed: No healthy storage backends available!");
+                    }
+                }
+            }
+        });
+    }
+}
+
+async fn perform_device_health_check(dev: &crate::nvme_dev::NvmeBlockDev) -> bool {
+    if !std::path::Path::new(&dev.device_path).exists() {
+        return false;
+    }
+    match dev.read_block(0, 4096).await {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!(
+                "Device health check failed for path {}: {:?}",
+                dev.device_path,
+                e
+            );
+            false
+        }
+    }
 }
 
 pub struct DataRouterInner {
@@ -268,6 +433,10 @@ impl DataRouter {
             block_size.clone(),
         ));
         cache.set_backend_router(backend_router.clone());
+
+        let fs_name = crate::fs_prefix();
+        let redis_url = dlm.redis_url().to_string();
+        backend_router.start_health_check_worker(redis_url, fs_name.to_string());
 
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();

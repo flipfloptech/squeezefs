@@ -173,7 +173,7 @@ async fn test_write_read_inline_layout() {
 
     let (range, _) = fx
         .router
-        .read_file_range_zero_copy(&path, 10, 20)
+        .read_file_range_zero_copy(&path, 10, 20, None)
         .await
         .expect("range read");
     assert_eq!(range.as_ref(), &payload.as_ref()[10..30]);

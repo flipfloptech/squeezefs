@@ -224,6 +224,12 @@ impl FuseConnection {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
+        let pool = self.over_uring.lock().unwrap().clone()?;
+        pool.get_payload_buffer(unique)
+    }
+
     #[cfg(all(target_os = "linux", feature = "unprivileged"))]
     pub async fn new_with_unprivileged(
         mount_options: MountOptions,
@@ -533,21 +539,9 @@ impl FuseConnection {
         {
             let pool = self.over_uring.lock().unwrap().clone();
             if let Some(pool) = pool.filter(|p| p.is_ready()) {
-                let mut reply = bytes::BytesMut::with_capacity(
-                    data.deref().len()
-                        + body_extend_data
-                            .as_ref()
-                            .map(|b| b.deref().len())
-                            .unwrap_or(0),
-                );
-                reply.extend_from_slice(data.deref());
-                if let Some(ref ext) = body_extend_data {
-                    reply.extend_from_slice(ext.deref());
-                }
-                let reply = reply.freeze();
                 // unique is at offset 8 in fuse_out_header (len u32, error i32, unique u64)
-                let unique = if reply.len() >= 16 {
-                    u64::from_le_bytes(reply[8..16].try_into().unwrap())
+                let unique = if data.deref().len() >= 16 {
+                    u64::from_le_bytes(data.deref()[8..16].try_into().unwrap())
                 } else {
                     0
                 };
@@ -570,8 +564,23 @@ impl FuseConnection {
                 if is_classical {
                     // Fall through to classical write below.
                 } else {
-                    let len = reply.len();
-                    match pool.submit_reply(unique, reply) {
+                    let body_bytes = if let Some(ref ext) = body_extend_data {
+                        let slice = ext.deref();
+                        let dest_addr = pool.get_payload_buffer(unique).map(|(ptr, _)| ptr as *const u8);
+                        if let Some(addr) = dest_addr {
+                            if slice.as_ptr() == addr {
+                                unsafe { bytes::Bytes::from_static(std::slice::from_raw_parts(slice.as_ptr(), slice.len())) }
+                            } else {
+                                bytes::Bytes::copy_from_slice(slice)
+                            }
+                        } else {
+                            bytes::Bytes::copy_from_slice(slice)
+                        }
+                    } else {
+                        bytes::Bytes::new()
+                    };
+                    let len = data.deref().len() + body_bytes.len();
+                    match pool.submit_reply(unique, data.deref().to_vec(), body_bytes) {
                         Ok(()) => return ((data, body_extend_data), Ok(len)),
                         Err(e) if e.kind() == io::ErrorKind::NotFound => {
                             // Double-reply or auto-COMMITed FORGET — do not classical-write

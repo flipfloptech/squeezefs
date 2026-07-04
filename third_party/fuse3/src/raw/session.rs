@@ -72,6 +72,7 @@ use crate::{Errno, SetAttr};
 #[derive(Debug)]
 pub struct MountHandle {
     inner: Option<MountHandleInner>,
+    pub fuse_connection: Option<Arc<crate::raw::connection::FuseConnection>>,
 }
 
 impl MountHandle {
@@ -86,6 +87,10 @@ impl MountHandle {
     #[cfg(unix)]
     pub fn fd(&self) -> Option<std::os::fd::RawFd> {
         self.inner.as_ref().map(|inner| inner.fd)
+    }
+
+    pub fn connection(&self) -> Option<Arc<crate::raw::connection::FuseConnection>> {
+        self.fuse_connection.clone()
     }
 }
 
@@ -316,6 +321,15 @@ impl<FS> Session<FS> {
     fn get_notify(&self) -> Notify {
         Notify::new(self.response_sender.clone())
     }
+
+    pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
+        let conn = self.fuse_connection.as_ref()?;
+        conn.get_payload_buffer(unique)
+    }
+
+    pub fn connection(&self) -> Option<Arc<FuseConnection>> {
+        self.fuse_connection.clone()
+    }
 }
 
 #[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
@@ -382,6 +396,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         debug!("mount {:?} success", mount_path);
 
+        let fuse_conn_opt = self.fuse_connection.clone();
         Ok(MountHandle {
             inner: Some(MountHandleInner {
                 task: task::spawn(self.inner_mount()),
@@ -391,6 +406,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 #[cfg(unix)]
                 fd,
             }),
+            fuse_connection: fuse_conn_opt,
         })
     }
 
@@ -434,6 +450,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         debug!("mount {:?} success", mount_path);
 
+        let fuse_conn_opt = self.fuse_connection.clone();
         Ok(MountHandle {
             inner: Some(MountHandleInner {
                 task: task::spawn(self.inner_mount()),
@@ -444,6 +461,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 #[cfg(unix)]
                 fd,
             }),
+            fuse_connection: fuse_conn_opt,
         })
     }
 
@@ -485,6 +503,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
             }),
+            fuse_connection: self.fuse_connection.clone(),
         })
     }
 
@@ -881,7 +900,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                             hdr[0..4]
                                 .copy_from_slice(&(FUSE_OUT_HEADER_SIZE as u32).to_le_bytes());
                             hdr[8..16].copy_from_slice(&request.unique.to_le_bytes());
-                            let _ = pool.submit_reply(request.unique, bytes::Bytes::from(hdr));
+                            let _ = pool.submit_reply(request.unique, hdr, bytes::Bytes::new());
                             pool.shutdown();
                         }
                     }

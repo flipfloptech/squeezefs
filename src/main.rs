@@ -1474,13 +1474,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 format_size_human(total_capacity)
             );
 
-            for path in &meta_lvs {
-                log::info!("Formatting metadata volume at {}...", path);
-                let storage =
-                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 64 * 1024 * 1024)?;
-                squeezefs::meta_backend::MetaLvBackend::format(&storage)?;
-            }
-
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let config = FormatConfig {
                 name: "squeezefs".to_string(),
@@ -1503,6 +1496,138 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 fuse_io_uring_sqpoll_idle_ms,
             };
 
+            if let Some(ref paths) = disk_cache_paths {
+                for dir in paths {
+                    if dir.exists() {
+                        log::info!("Wiping local staging/cache directory: {:?}", dir);
+                        let _ = tokio::fs::remove_dir_all(dir).await;
+                        let _ = tokio::fs::create_dir_all(dir).await;
+                    }
+                }
+            }
+
+            let quick = !full;
+            let num_cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            let pool_size = num_cores * 2;
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(pool_size));
+            let mp = std::sync::Arc::new(indicatif::MultiProgress::new());
+
+            let mut join_handles = Vec::new();
+
+            // 1. Concurrent Metadata Volumes Tasks
+            for path in meta_lvs.clone() {
+                let sem = semaphore.clone();
+                let mp_c = mp.clone();
+                let path_basename = Path::new(&path)
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("meta"))
+                    .to_string_lossy()
+                    .to_string();
+
+                let handle = tokio::task::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    tokio::task::spawn_blocking(move || {
+                        let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
+                            &path,
+                            64 * 1024 * 1024,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        let pb = if !quick {
+                            let pb = mp_c.add(indicatif::ProgressBar::new(0));
+                            pb.set_style(
+                                indicatif::ProgressStyle::default_bar()
+                                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) - {msg}")
+                                    .unwrap()
+                                    .progress_chars("#>-")
+                            );
+                            pb.set_message(format!("Meta: {}", path_basename));
+                            Some(pb)
+                        } else {
+                            None
+                        };
+                        squeezefs::meta_backend::MetaLvBackend::format_with_options(
+                            &storage, quick, pb,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Ok::<(), String>(())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                });
+                join_handles.push(handle);
+            }
+
+            // 2. Concurrent Data Volumes Tasks
+            for path in data_lvs.clone() {
+                let sem = semaphore.clone();
+                let mp_c = mp.clone();
+                let path_basename = Path::new(&path)
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("data"))
+                    .to_string_lossy()
+                    .to_string();
+
+                let handle = tokio::task::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    tokio::task::spawn_blocking(move || {
+                        let physical_size = get_backing_device_size(&path).unwrap_or(0);
+                        let wipe_len = if quick {
+                            std::cmp::min(total_capacity, 32 * 1024 * 1024)
+                        } else if physical_size > 0 {
+                            std::cmp::min(total_capacity, physical_size)
+                        } else {
+                            total_capacity
+                        };
+
+                        let pb = if !quick {
+                            let pb = mp_c.add(indicatif::ProgressBar::new(wipe_len));
+                            pb.set_style(
+                                indicatif::ProgressStyle::default_bar()
+                                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) - {msg}")
+                                    .unwrap()
+                                    .progress_chars("#>-")
+                            );
+                            pb.set_message(format!("Data: {}", path_basename));
+                            Some(pb)
+                        } else {
+                            None
+                        };
+
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .map_err(|e| e.to_string())?;
+                        use std::io::Write;
+                        let zeros = vec![0u8; 1024 * 1024];
+                        let mut written = 0;
+                        while written < wipe_len {
+                            let to_write =
+                                std::cmp::min(zeros.len() as u64, wipe_len - written) as usize;
+                            file.write_all(&zeros[..to_write])
+                                .map_err(|e| e.to_string())?;
+                            written += to_write as u64;
+                            if let Some(ref p_bar) = pb {
+                                p_bar.inc(to_write as u64);
+                            }
+                        }
+                        file.sync_all().map_err(|e| e.to_string())?;
+                        if let Some(ref p_bar) = pb {
+                            p_bar.finish_with_message("Complete");
+                        }
+                        Ok::<(), String>(())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                });
+                join_handles.push(handle);
+            }
+
+            for handle in join_handles {
+                handle.await.map_err(|e| e.to_string())??;
+            }
+
             let first_meta_path = &meta_lvs[0];
             let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
                 first_meta_path,
@@ -1516,57 +1641,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &config_bytes,
             )?;
             log::info!("Successfully formatted and recorded config on metadata volume.");
-
-            if let Some(ref paths) = disk_cache_paths {
-                for dir in paths {
-                    if dir.exists() {
-                        log::info!("Wiping local staging/cache directory: {:?}", dir);
-                        let _ = tokio::fs::remove_dir_all(dir).await;
-                        let _ = tokio::fs::create_dir_all(dir).await;
-                    }
-                }
-            }
-
-            let quick = !full;
-            for path in &data_lvs {
-                let physical_size = get_backing_device_size(path).unwrap_or(0);
-                let wipe_len = if quick {
-                    std::cmp::min(total_capacity, 32 * 1024 * 1024)
-                } else if physical_size > 0 {
-                    std::cmp::min(total_capacity, physical_size)
-                } else {
-                    total_capacity
-                };
-
-                if quick {
-                    log::info!(
-                        "Quick format: Wiping first {} bytes of data volume: {}",
-                        wipe_len,
-                        path
-                    );
-                } else {
-                    log::info!(
-                        "Full format: Wiping {} bytes of data volume: {}",
-                        wipe_len,
-                        path
-                    );
-                }
-
-                if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(path) {
-                    use std::io::Write;
-                    let zeros = vec![0u8; 1024 * 1024];
-                    let mut written = 0;
-                    while written < wipe_len {
-                        let to_write =
-                            std::cmp::min(zeros.len() as u64, wipe_len - written) as usize;
-                        if file.write_all(&zeros[..to_write]).is_err() {
-                            break;
-                        }
-                        written += to_write as u64;
-                    }
-                    let _ = file.sync_all();
-                }
-            }
             let resolved_mem = mem_cache_size.as_deref().unwrap_or("1GB");
             let resolved_disk = disk_cache_size.as_deref().unwrap_or("10GB");
             let resolved_paths = disk_cache_paths

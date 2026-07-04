@@ -53,7 +53,7 @@ echo "SqueezeFS is mounted and ready."
 
 # 4. Run elbencho write and read tests
 echo "Running elbencho tests..."
-elbencho -w -r -t 4 -s 1G -b 1M --direct "$MOUNT_DIR/file"
+elbencho -w -r -t 4 -s 1G -b 4M "$MOUNT_DIR/file"
 
 # 5. Clean up mount
 echo "Unmounting SqueezeFS..."

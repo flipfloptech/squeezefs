@@ -123,4 +123,4 @@ Two Criterion benches, both `harness = false`:
 
 - Garnet keys are namespaced via the `fs_key!("suffix")` macro and the global `FS_PREFIX` (`src/lib.rs`). Code that touches Garnet keys must go through the macro, not hardcode prefixes.
 - `WRITE_VERIFICATION` is a process-global `AtomicBool` toggled by `--write-verification` on mount; read-after-write checksum verification uses it. Library code should call `write_verification_enabled()` rather than reading CLI args.
-- The `.agents/AGENTS.md` spec names **RustFS** (S3) as the data backend, but `README.md` / `QUICKSTART.md` describe the **NVMe / NVMe-oF block** backend as primary. Both code paths exist (`aws-sdk-s3` and NVMe block device); when changing data-path code, check which backend the relevant test/CLI actually exercises rather than assuming.
+- The `.agents/AGENTS.md` spec and the overall architecture use the **NVMe / NVMe-oF block** backend as the sole primary data path.

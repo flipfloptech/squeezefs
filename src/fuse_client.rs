@@ -872,10 +872,11 @@ impl SqueezefsFilesystem {
     async fn get_or_acquire_lease(&self, ino: u64) -> Result<u64, SqueezefsError> {
         // Fast path: cached lease still held in Garnet (P0-4 re-validation).
         if let Some(lease) = self.active_leases.get(&ino) {
-            if lease.is_held().await {
-                return Ok(lease.fencing_token());
-            }
+            let lease_clone = lease.clone();
             drop(lease);
+            if lease_clone.is_held().await {
+                return Ok(lease_clone.fencing_token());
+            }
             // Lock lost (TTL / crash of peer takeover) — drop stale local lease.
             self.active_leases.remove(&ino);
         }
@@ -884,10 +885,11 @@ impl SqueezefsFilesystem {
         let _guard = lock_arc.lock().await;
 
         if let Some(lease) = self.active_leases.get(&ino) {
-            if lease.is_held().await {
-                return Ok(lease.fencing_token());
-            }
+            let lease_clone = lease.clone();
             drop(lease);
+            if lease_clone.is_held().await {
+                return Ok(lease_clone.fencing_token());
+            }
             self.active_leases.remove(&ino);
         }
 
@@ -5379,7 +5381,7 @@ pub fn init_runtime() -> tokio::runtime::Runtime {
     let physical_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    // Leave at least one core for kernel processing (FUSE filesystem driver, S3, Garnet, networking)
+    // Leave at least one core for kernel processing (FUSE filesystem driver, Garnet, networking)
     let worker_threads = std::cmp::max(1, physical_cores - 1);
     info!(
         "FUSE Daemon: Initializing runtime with {} worker threads bound to physical CPU cores.",
@@ -5519,8 +5521,8 @@ pub async fn start_mount<P: AsRef<Path>>(
 
         if is_stale {
             error!(
-                "Stale mount point detected at {:?}.\nTo resolve this, please manually unmount it by running:\n    sudo umount -l {:?}",
-                mount_path, mount_path
+                "Stale mount point detected at {:?}.\nTo resolve this, run:\n    sudo squeezefs umount {:?}\n    # or: sudo umount -f {:?}\n    # last resort: sudo umount -l {:?}",
+                mount_path, mount_path, mount_path, mount_path
             );
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -5640,18 +5642,21 @@ pub async fn start_mount<P: AsRef<Path>>(
         let shutdown = async {
             #[cfg(unix)]
             {
+                println!("[SIG] Registering signal handlers inside shutdown block...");
                 let sigterm_opt =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
                 let sigint_opt =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
                 if let (Ok(mut sigterm), Ok(mut sigint)) = (sigterm_opt, sigint_opt) {
+                    println!("[SIG] Signal handlers registered successfully.");
                     loop {
                         tokio::select! {
                             _ = tokio::signal::ctrl_c() => {
+                                println!("[SIG] Ctrl+C pressed (ctrl_c future matched)!");
                                 eprintln!("\nWARNING: Ctrl+C pressed! If you really want to unmount/exit, hit Ctrl+C again.");
                                 tokio::select! {
                                     _ = tokio::signal::ctrl_c() => {
-                                        info!("Received second Ctrl+C, exiting...");
+                                        println!("[SIG] Second Ctrl+C, exiting...");
                                         break;
                                     }
                                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
@@ -5660,14 +5665,15 @@ pub async fn start_mount<P: AsRef<Path>>(
                                 }
                             }
                             _ = sigterm.recv() => {
-                                info!("Received SIGTERM, exiting...");
+                                println!("[SIG] Received SIGTERM signal in sigterm.recv()!");
                                 break;
                             }
                             _ = sigint.recv() => {
+                                println!("[SIG] Received SIGINT signal in sigint.recv()!");
                                 eprintln!("\nWARNING: SIGINT received! If you really want to unmount/exit, send SIGINT again.");
                                 tokio::select! {
                                     _ = sigint.recv() => {
-                                        info!("Received second SIGINT, exiting...");
+                                        println!("[SIG] Second SIGINT, exiting...");
                                         break;
                                     }
                                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
@@ -5678,6 +5684,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                         }
                     }
                 } else {
+                    println!("[SIG] Failed to register unix signal handlers. Falling back...");
                     loop {
                         let _ = tokio::signal::ctrl_c().await;
                         eprintln!("\nWARNING: Ctrl+C pressed! If you really want to unmount/exit, hit Ctrl+C again.");
@@ -5727,6 +5734,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                 use std::io::Write;
                 use std::io::IsTerminal;
 
+                println!("[SIG] Shutdown future resolved. Running shutdown logic...");
                 info!("Received shutdown signal. Force flushing memory buffers to staging...");
                 // Phase 1: Force flush RAM buffers to staging (cancellation NOT allowed)
                 if let Err(e) = fs.flush_all_memory_buffers_to_staging().await {

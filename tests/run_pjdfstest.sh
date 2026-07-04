@@ -114,6 +114,7 @@ set -e
 
 # 6. Cleanup
 echo "Cleaning up..."
+cd "$REPO_DIR"
 umount "$MOUNT_DIR" || umount -l "$MOUNT_DIR" || true
 rm -rf "$MOUNT_DIR" "$STAGING_DIR"
 echo "=== POSIX Verification Completed (prove exit=$PROVE_RC) ==="

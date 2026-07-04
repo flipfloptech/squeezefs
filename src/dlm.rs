@@ -906,6 +906,7 @@ pub struct DlmClient {
     redis_url: String,
 }
 
+#[derive(Clone)]
 pub struct LockLease {
     file_path: String,
     client_id: String,

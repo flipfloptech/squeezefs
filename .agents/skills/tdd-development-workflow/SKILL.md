@@ -133,6 +133,7 @@ Write the minimum code to make all tests pass:
 - [ ] All `JoinHandle`s are awaited or explicitly detached with documented rationale
 - [ ] No TODO/FIXME left without a tracking issue
 - [ ] **I/O uses io_uring where applicable** — no new classical FUSE/file fallbacks; FUSE request path stays over-uring after arm
+- [ ] **No dead code** — unused items deleted; no new `#[allow(dead_code)]` / unused allows to hide them
 
 ### Commit: Implementation
 
@@ -220,3 +221,4 @@ git branch -d feat/short-description
 | Leaking tasks (fire-and-forget `spawn` without tracking) | Use `JoinSet` or structured concurrency patterns |
 | Ignoring `Send + Sync` bounds | Design types to be `Send + Sync` from the start; document why if not |
 | Falling back to classical `/dev/fuse` or POSIX file I/O to dodge an uring bug | **Always use io_uring when we can.** Fix the uring path or fail the mount/op — never reintroduce classical escape hatches |
+| Leaving unused code with `#[allow(dead_code)]` “for later” | **Delete dead code.** Restore from git when needed; keep clippy `-D warnings` clean by removal |

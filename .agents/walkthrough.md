@@ -23,11 +23,11 @@ We have successfully implemented transparent data compression and client-side da
 - **Staged Layout (Consolidated small files)**:
   - NVMe staged files are staged locally raw (unencrypted/uncompressed) to maximize write performance.
   - During batch consolidation (`flush_batch` in `src/cache/nvme.rs`), each file's data is individually compressed and encrypted using `process_write` before being merged into the packed block.
-  - Range reads of merged staged files download the specific file's encrypted range from S3, run `process_read` on it, and slice out the requested offset/size.
+  - Range reads of merged staged files read the specific file's encrypted range from NVMe block storage, run `process_read` on it, and slice out the requested offset/size.
 - **Striped Layout (Large files > 4MB)**:
-  - Parallel block upload tasks in `write_striped` compress and encrypt the block data via `process_write` before calling `put_object`.
+  - Parallel block upload tasks in `write_striped` compress and encrypt the block data via `process_write` before writing block data to the backend.
   - Old blocks retrieved during RMW gap-filling are decrypted and decompressed using `process_read` before modifications are applied.
-  - Blocks downloaded in parallel from S3 are decrypted/decompressed via `process_read` before being stored in the local NVMe block cache or returned to FUSE.
+  - Blocks read in parallel from NVMe block storage are decrypted/decompressed via `process_read` before being stored in the local NVMe block cache or returned to FUSE.
 
 ### 3. CLI & Initialization
 - **`src/main.rs` & `src/fuse_client.rs`**:

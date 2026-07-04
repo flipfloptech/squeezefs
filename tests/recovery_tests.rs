@@ -301,6 +301,7 @@ async fn test_fsck_and_recovery_flow() {
         dlm.meta_client(),
         &block_allocator,
         &nvme_writer,
+        Some(&dlm),
     )
     .await
     .unwrap();

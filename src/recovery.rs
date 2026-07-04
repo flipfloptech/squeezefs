@@ -35,6 +35,7 @@ use log::{debug, error, info, warn};
 use redis::AsyncCommands;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 /// Scan NVMe staging segment index, cross-reference pending staged files with Garnet metadata,
 /// and recover/finalize writes to backing block device.
@@ -44,6 +45,7 @@ pub async fn recover_staging(
     redis_client: &crate::dlm::MetaClient,
     block_allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
     nvme_writer: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    dlm: Option<&crate::dlm::DlmClient>,
 ) -> Result<usize> {
     if !staging_dir.exists() {
         return Ok(0);
@@ -148,7 +150,59 @@ pub async fn recover_staging(
                     let ino_part = parts[1].trim_start_matches("inode_");
                     let b_part = parts[2].trim_start_matches("block_");
                     if let (Ok(ino), Ok(b)) = (ino_part.parse::<u64>(), b_part.parse::<u32>()) {
-                        // Cross-reference metadata
+                        // 1. DLM fencing and lease acquisition
+                        let mut lease_opt = None;
+                        let mut fence_stale = false;
+                        if let Some(dlm) = dlm {
+                            let file_path = crate::keys::inode_path(ino);
+                            match dlm
+                                .acquire_lock(&file_path, None, Duration::from_secs(10))
+                                .await
+                            {
+                                Ok(lease) => {
+                                    let acquired_token = lease.fencing_token();
+                                    if acquired_token > meta.fencing_token + 1 {
+                                        warn!(
+                                            "Crash Recovery: Stale fencing token {} detected for inode {} during lock acquisition (got {}). Discarding entry.",
+                                            meta.fencing_token, ino, acquired_token
+                                        );
+                                        fence_stale = true;
+                                    } else {
+                                        // Update the entry in the cache with the new token so that if recovery fails,
+                                        // it will not fail fencing checks on retries.
+                                        let mut new_meta = meta.clone();
+                                        new_meta.fencing_token = acquired_token;
+                                        let new_meta_bytes = new_meta.serialize();
+                                        let new_meta_len = new_meta_bytes.len() as u64;
+                                        let mut new_buf = Vec::new();
+                                        new_buf.extend_from_slice(&new_meta_len.to_be_bytes());
+                                        new_buf.extend_from_slice(&new_meta_bytes);
+                                        new_buf.resize(4096, 0);
+                                        new_buf.extend_from_slice(&data);
+                                        cache.put(key_bytes.clone(), bytes::Bytes::from(new_buf));
+
+                                        lease_opt = Some(lease);
+                                    }
+                                }
+                                Err(crate::error::SqueezefsError::LockFailed { .. }) => {
+                                    warn!(
+                                        "Crash Recovery: Lock acquisition failed for inode {} (held by another client). Discarding stale entry.",
+                                        ino
+                                    );
+                                    fence_stale = true;
+                                }
+                                Err(e) => {
+                                    return Err(e);
+                                }
+                            }
+                        }
+
+                        if fence_stale {
+                            cache.remove(&key_bytes);
+                            continue;
+                        }
+
+                        // 2. Cross-reference metadata
                         let meta_key = crate::keys::metadata_for_inode(ino);
                         let exists: bool = con.exists(&meta_key).await.unwrap_or(false);
                         if exists {
@@ -207,6 +261,7 @@ pub async fn recover_staging(
                                     "Crash Recovery: Failed to write active block {} of inode {} to backing device: {:?}",
                                     b, ino, e
                                 );
+                                // Partial flush / write block failure -> leave entry in cache.
                                 continue;
                             }
 
@@ -223,6 +278,9 @@ pub async fn recover_staging(
                                     &stored_block_key,
                                     format!("{}:{}", data_len, processed_len),
                                 );
+                            if let Some(ref lease) = lease_opt {
+                                pipe.hset(&meta_key, "fencing_token", lease.fencing_token());
+                            }
                             let _: () = pipe.query_async(&mut con).await?;
 
                             if let Some(bk) = old_block_key {
@@ -284,67 +342,122 @@ pub async fn recover_staging(
         }; // guard dropped here
 
         if let Some((meta, data)) = staged_data {
-            // Cross-reference with Garnet
-            let meta_key = crate::keys::metadata_for_path(&meta.file_path);
-            let redis_file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
-            let redis_file_type: Option<String> = con.hget(&meta_key, "type").await?;
-            let db_fencing: Option<u64> =
-                con.hget(&meta_key, "fencing_token").await.unwrap_or(None);
+            let mut lease_opt = None;
+            let mut should_recover = true;
 
-            let mut should_recover = redis_file_type.as_deref() == Some("staged")
-                && redis_file_id.as_deref() == Some(&file_id);
+            if let Some(dlm) = dlm {
+                match dlm
+                    .acquire_lock(&meta.file_path, None, Duration::from_secs(10))
+                    .await
+                {
+                    Ok(lease) => {
+                        let acquired_token = lease.fencing_token();
+                        if acquired_token > meta.fencing_token + 1 {
+                            warn!(
+                                "Crash Recovery: Stale fencing token {} detected for staged file '{}' during lock acquisition (got {}). Discarding entry.",
+                                meta.fencing_token, meta.file_path, acquired_token
+                            );
+                            should_recover = false;
+                        } else {
+                            // Update the entry in the cache with the new token so that if recovery fails,
+                            // it will not fail fencing checks on retries.
+                            let mut new_meta = meta.clone();
+                            new_meta.fencing_token = acquired_token;
+                            let new_meta_bytes = new_meta.serialize();
+                            let new_meta_len = new_meta_bytes.len() as u64;
+                            let mut new_buf = Vec::new();
+                            new_buf.extend_from_slice(&new_meta_len.to_be_bytes());
+                            new_buf.extend_from_slice(&new_meta_bytes);
+                            new_buf.extend_from_slice(&data);
+                            cache.put(key_bytes.clone(), bytes::Bytes::from(new_buf));
 
-            if should_recover {
-                if let Some(df) = db_fencing {
-                    if meta.fencing_token < df {
+                            lease_opt = Some(lease);
+                        }
+                    }
+                    Err(crate::error::SqueezefsError::LockFailed { .. }) => {
                         warn!(
-                            "Crash Recovery: Stale fencing token {} detected for staged file '{}' (database has {}). Discarding entry.",
-                            meta.fencing_token, meta.file_path, df
+                            "Crash Recovery: Lock acquisition failed for staged file '{}' (held by another client). Discarding stale entry.",
+                            meta.file_path
                         );
                         should_recover = false;
+                    }
+                    Err(e) => {
+                        return Err(e);
                     }
                 }
             }
 
             if should_recover {
-                info!(
-                    "Crash Recovery: Recovering write for '{}' (ID: {}, size: {} bytes, fencing token: {})",
-                    meta.file_path, file_id, data.len(), meta.fencing_token
-                );
+                // Cross-reference with Garnet
+                let meta_key = crate::keys::metadata_for_path(&meta.file_path);
+                let redis_file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
+                let redis_file_type: Option<String> = con.hget(&meta_key, "type").await?;
+                let db_fencing: Option<u64> =
+                    con.hget(&meta_key, "fencing_token").await.unwrap_or(None);
 
-                // Write to backing block device
-                let offset = block_allocator.allocate_block().await?;
-                let recovered_key = offset.to_string();
-                if let Err(e) = nvme_writer
-                    .write_block(offset, &bytes::Bytes::from(data.clone()))
-                    .await
-                {
-                    error!(
-                        "Crash Recovery: Failed to write recovered block to NVMe-oF backend: {:?}",
-                        e
-                    );
-                    continue;
+                should_recover = redis_file_type.as_deref() == Some("staged")
+                    && redis_file_id.as_deref() == Some(&file_id);
+
+                if should_recover {
+                    if let Some(df) = db_fencing {
+                        if meta.fencing_token < df {
+                            warn!(
+                                "Crash Recovery: Stale fencing token {} detected for staged file '{}' (database has {}). Discarding entry.",
+                                meta.fencing_token, meta.file_path, df
+                            );
+                            should_recover = false;
+                        }
+                    }
                 }
 
-                // Update Garnet mapping
-                let mapping_key = format!("mapping:{}", file_id);
-                let _: () = redis::pipe()
-                    .hset(&mapping_key, "block", &recovered_key)
-                    .hset(&mapping_key, "offset", 0u64)
-                    .hset(&mapping_key, "size", data.len() as u64)
-                    .hset(
-                        crate::fs_key!("block_sizes"),
-                        &recovered_key,
-                        format!("{}:{}", data.len(), data.len()),
-                    )
-                    .query_async(&mut con)
-                    .await?;
+                if should_recover {
+                    info!(
+                        "Crash Recovery: Recovering write for '{}' (ID: {}, size: {} bytes, fencing token: {})",
+                        meta.file_path, file_id, data.len(), meta.fencing_token
+                    );
 
-                recovered_count += 1;
+                    // Write to backing block device
+                    let offset = block_allocator.allocate_block().await?;
+                    let recovered_key = offset.to_string();
+                    if let Err(e) = nvme_writer
+                        .write_block(offset, &bytes::Bytes::from(data.clone()))
+                        .await
+                    {
+                        error!(
+                            "Crash Recovery: Failed to write recovered block to NVMe-oF backend: {:?}",
+                            e
+                        );
+                        // Partial flush / write failure -> leave entry in cache.
+                        continue;
+                    }
+
+                    // Update Garnet mapping
+                    let mapping_key = format!("mapping:{}", file_id);
+                    let mut pipe = redis::pipe();
+                    pipe.hset(&mapping_key, "block", &recovered_key)
+                        .hset(&mapping_key, "offset", 0u64)
+                        .hset(&mapping_key, "size", data.len() as u64)
+                        .hset(
+                            crate::fs_key!("block_sizes"),
+                            &recovered_key,
+                            format!("{}:{}", data.len(), data.len()),
+                        );
+                    if let Some(ref lease) = lease_opt {
+                        pipe.hset(&meta_key, "fencing_token", lease.fencing_token());
+                    }
+                    let _: () = pipe.query_async(&mut con).await?;
+
+                    recovered_count += 1;
+                } else {
+                    warn!(
+                        "Crash Recovery: Stale write detected for '{}' (ID: {}). Redis has type={:?} and file_id={:?}. Discarding stale local entry.",
+                        meta.file_path, file_id, redis_file_type, redis_file_id
+                    );
+                }
             } else {
                 warn!(
-                    "Crash Recovery: Stale write detected for '{}' (ID: {}). Redis has type={:?} and file_id={:?}. Discarding stale local entry.",
-                    meta.file_path, file_id, redis_file_type, redis_file_id
+                    "Crash Recovery: Discarding staged file '{}' (ID: {}) due to stale token or lock contention.",
+                    meta.file_path, file_id
                 );
             }
         }

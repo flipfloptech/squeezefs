@@ -226,9 +226,15 @@ async fn test_recover_staging_discards_stale_fence() {
     // Release live mmap so recover can open segment files (simulates remount).
     drop(cache);
 
-    let n = squeezefs::recovery::recover_staging(&staging_root, meta.as_ref(), &alloc, &nvme)
-        .await
-        .expect("recover_staging");
+    let n = squeezefs::recovery::recover_staging(
+        &staging_root,
+        meta.as_ref(),
+        &alloc,
+        &nvme,
+        Some(&dlm),
+    )
+    .await
+    .expect("recover_staging");
     assert_eq!(n, 0, "stale fencing must not recover (got {n} recoveries)");
 }
 
@@ -302,9 +308,15 @@ async fn test_recover_staging_commits_matching_uncommitted() {
         .await
         .unwrap();
 
-    let n = squeezefs::recovery::recover_staging(&staging_root, meta.as_ref(), &alloc, &nvme)
-        .await
-        .expect("recover_staging");
+    let n = squeezefs::recovery::recover_staging(
+        &staging_root,
+        meta.as_ref(),
+        &alloc,
+        &nvme,
+        Some(&dlm),
+    )
+    .await
+    .expect("recover_staging");
     assert_eq!(n, 1, "matching staged entry must recover");
 
     let mapping_key = format!("mapping:{file_id}");
@@ -382,9 +394,15 @@ async fn test_recover_staging_discards_when_meta_file_id_mismatch() {
         .await
         .unwrap();
 
-    let n = squeezefs::recovery::recover_staging(&staging_root, meta.as_ref(), &alloc, &nvme)
-        .await
-        .expect("recover_staging");
+    let n = squeezefs::recovery::recover_staging(
+        &staging_root,
+        meta.as_ref(),
+        &alloc,
+        &nvme,
+        Some(&dlm),
+    )
+    .await
+    .expect("recover_staging");
     assert_eq!(n, 0, "mismatched file_id must not recover");
 }
 
@@ -434,9 +452,15 @@ async fn test_recover_staging_discards_corrupt_blob() {
         .await
         .unwrap();
 
-    let n = squeezefs::recovery::recover_staging(&staging_root, meta.as_ref(), &alloc, &nvme)
-        .await
-        .expect("recover_staging must tolerate corrupt entries");
+    let n = squeezefs::recovery::recover_staging(
+        &staging_root,
+        meta.as_ref(),
+        &alloc,
+        &nvme,
+        Some(&dlm),
+    )
+    .await
+    .expect("recover_staging must tolerate corrupt entries");
     assert_eq!(n, 0);
 }
 
@@ -497,8 +521,244 @@ async fn test_recover_discards_active_block_without_inode_meta() {
         .unwrap();
     // Intentionally no metadata:inode_{ino}
 
-    let n = squeezefs::recovery::recover_staging(&staging_root, meta.as_ref(), &alloc, &nvme)
-        .await
-        .expect("recover");
+    let n = squeezefs::recovery::recover_staging(
+        &staging_root,
+        meta.as_ref(),
+        &alloc,
+        &nvme,
+        Some(&dlm),
+    )
+    .await
+    .expect("recover");
     assert_eq!(n, 0, "orphan active_block must be discarded");
+}
+
+/// Epic 3: Test that recovery fencing correctly discards entries if another client
+/// holds the lock or has acquired a newer fencing token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recovery_fencing_under_multi_mount() {
+    if !garnet_ok().await {
+        println!("Skipping: Garnet unavailable");
+        return;
+    }
+    let (prefix, ino) = uniq_tag("rec_fence_multi");
+    set_fs_prefix(&prefix);
+    set_write_verification(false);
+
+    let dlm_a = DlmClient::new(&redis_url()).unwrap();
+    let dlm_b = DlmClient::new(&redis_url()).unwrap();
+    let path = format!("inode_{ino}");
+
+    // Node A holds lock at token 8, but crashes.
+    // We mock this by manually putting token 8 in Garnet's fencing generator.
+    let mut con = dlm_a.meta_client().get_connection().await.unwrap();
+    let fencing_gen_key = format!("fencing_generator:{path}");
+    let _: () = redis::cmd("SET")
+        .arg(&fencing_gen_key)
+        .arg("8")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let meta_key = format!("metadata:inode_{ino}");
+    let format_key = format!("{prefix}:format");
+    let _: () = redis::pipe()
+        .hset(&meta_key, "type", "striped")
+        .hset(&meta_key, "fencing_token", 8u64)
+        .hset(&format_key, "write_disk_limit", "8MB")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    // Node B has booted and acquired the lock. It now holds it.
+    let lease_b = dlm_b
+        .acquire_lock(&path, None, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(lease_b.fencing_token(), 9);
+
+    // Prepare Node A's staging root with an active block at token 8.
+    let temp = TempDir::new().unwrap();
+    let block_path = temp.path().join("b.img");
+    {
+        let f = std::fs::File::create(&block_path).unwrap();
+        f.set_len(16 * 1024 * 1024).unwrap();
+    }
+    let staging_root = temp.path().join("staging_root");
+    let segment = staging_root.join("staging_segment");
+    std::fs::create_dir_all(&segment).unwrap();
+
+    let meta = Arc::new(dlm_a.meta_client().clone());
+    let nvme = Arc::new(NvmeBlockDev::new(block_path.to_str().unwrap()));
+    let alloc = Arc::new(BlockAllocator::new(meta.clone(), &prefix).await.unwrap());
+
+    let cache_key = format!("active_block:inode_{ino}:block_0");
+    let payload = vec![0x33u8; 4096];
+    {
+        let cache =
+            squeezefs::tiering::nvme::NvmeCache::new(&[&segment], &[8 * 1024 * 1024], 1).unwrap();
+        let meta_hdr = squeezefs::cache::nvme::StagedMetadata {
+            fencing_token: 8,
+            original_size: payload.len() as u64,
+            file_path: format!("inode_{ino}"),
+        };
+        let meta_bytes = meta_hdr.serialize();
+        let meta_len = meta_bytes.len() as u64;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta_len.to_be_bytes());
+        buf.extend_from_slice(&meta_bytes);
+        buf.resize(4096, 0);
+        buf.extend_from_slice(&payload);
+        cache.put(
+            bytes::Bytes::from(cache_key.clone()),
+            bytes::Bytes::from(buf),
+        );
+        drop(cache);
+    }
+
+    // Run recovery with dlm_a. Since Node B holds the lock, dlm_a cannot acquire it,
+    // and Node A's stale staged write must be discarded.
+    let n = squeezefs::recovery::recover_staging(
+        &staging_root,
+        meta.as_ref(),
+        &alloc,
+        &nvme,
+        Some(&dlm_a),
+    )
+    .await
+    .expect("recover");
+    assert_eq!(n, 0, "must discard entry because lock is held by B");
+
+    // Verify it was removed from staging cache.
+    let cache_check =
+        squeezefs::tiering::nvme::NvmeCache::new(&[&segment], &[8 * 1024 * 1024], 1).unwrap();
+    cache_check.recover_index();
+    assert!(cache_check
+        .get(&bytes::Bytes::from(cache_key.clone()))
+        .is_none());
+}
+
+/// Epic 3: Test that recovery retains staging cache entries if block writes fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recovery_partial_flush_retains_entry() {
+    if !garnet_ok().await {
+        println!("Skipping: Garnet unavailable");
+        return;
+    }
+    let (prefix, ino) = uniq_tag("rec_partial");
+    set_fs_prefix(&prefix);
+    set_write_verification(false);
+
+    let dlm = DlmClient::new(&redis_url()).unwrap();
+    let temp = TempDir::new().unwrap();
+
+    let block_path = temp.path().join("b.img");
+    {
+        let f = std::fs::File::create(&block_path).unwrap();
+        f.set_len(16 * 1024 * 1024).unwrap();
+    }
+    let nvme = Arc::new(NvmeBlockDev::new(block_path.to_str().unwrap()));
+
+    let staging_root = temp.path().join("staging_root");
+    let segment = staging_root.join("staging_segment");
+    std::fs::create_dir_all(&segment).unwrap();
+
+    let meta = Arc::new(dlm.meta_client().clone());
+    let alloc = Arc::new(BlockAllocator::new(meta.clone(), &prefix).await.unwrap());
+
+    // Prepare metadata in Garnet
+    let mut con = dlm.meta_client().get_connection().await.unwrap();
+    let meta_key = format!("metadata:inode_{ino}");
+    let format_key = format!("{prefix}:format");
+    let _: () = redis::pipe()
+        .hset(&meta_key, "type", "striped")
+        .hset(&meta_key, "fencing_token", 1u64)
+        .hset(&format_key, "write_disk_limit", "8MB")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+
+    let cache_key = format!("active_block:inode_{ino}:block_0");
+    let payload = vec![0x44u8; 4096];
+    {
+        let cache =
+            squeezefs::tiering::nvme::NvmeCache::new(&[&segment], &[8 * 1024 * 1024], 1).unwrap();
+        let meta_hdr = squeezefs::cache::nvme::StagedMetadata {
+            fencing_token: 1,
+            original_size: payload.len() as u64,
+            file_path: format!("inode_{ino}"),
+        };
+        let meta_bytes = meta_hdr.serialize();
+        let meta_len = meta_bytes.len() as u64;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&meta_len.to_be_bytes());
+        buf.extend_from_slice(&meta_bytes);
+        buf.resize(4096, 0);
+        buf.extend_from_slice(&payload);
+        cache.put(
+            bytes::Bytes::from(cache_key.clone()),
+            bytes::Bytes::from(buf),
+        );
+        drop(cache);
+    }
+
+    // Inject write failure for the next write_block call
+    squeezefs::nvme_dev::set_fail_next_writes(1);
+
+    // Run recovery. The write_block will fail due to injected error.
+    // The entry must be retained in staging cache.
+    let n = squeezefs::recovery::recover_staging(
+        &staging_root,
+        meta.as_ref(),
+        &alloc,
+        &nvme,
+        Some(&dlm),
+    )
+    .await
+    .expect("recover");
+    assert_eq!(
+        n, 0,
+        "should not have successfully recovered anything on write failure"
+    );
+
+    // Clear fault injection
+    squeezefs::nvme_dev::clear_fail_next_writes();
+
+    // Verify it was RETAINED in staging cache.
+    let cache_check =
+        squeezefs::tiering::nvme::NvmeCache::new(&[&segment], &[8 * 1024 * 1024], 1).unwrap();
+    cache_check.recover_index();
+    assert!(
+        cache_check
+            .get(&bytes::Bytes::from(cache_key.clone()))
+            .is_some(),
+        "entry must be retained on write failure"
+    );
+    drop(cache_check);
+
+    // Now run recovery again (without fault injection). It must succeed.
+    let n2 = squeezefs::recovery::recover_staging(
+        &staging_root,
+        meta.as_ref(),
+        &alloc,
+        &nvme,
+        Some(&dlm),
+    )
+    .await
+    .expect("recover");
+    assert_eq!(
+        n2, 1,
+        "should have successfully recovered the retained entry"
+    );
+
+    // Verify it is now removed from staging cache after successful recovery.
+    let cache_check2 =
+        squeezefs::tiering::nvme::NvmeCache::new(&[&segment], &[8 * 1024 * 1024], 1).unwrap();
+    cache_check2.recover_index();
+    assert!(
+        cache_check2
+            .get(&bytes::Bytes::from(cache_key.clone()))
+            .is_none(),
+        "entry must be removed after successful recovery"
+    );
 }

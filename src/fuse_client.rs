@@ -225,6 +225,135 @@ impl<T> std::ops::DerefMut for Align64<T> {
     }
 }
 
+pub struct LatencyHistogram {
+    pub buckets: [AtomicU64; 26],
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+        }
+    }
+}
+
+impl LatencyHistogram {
+    pub fn record(&self, duration: Duration) {
+        let micros = duration.as_micros() as u64;
+        let bucket_idx = if micros <= 1 {
+            0
+        } else {
+            let idx = (micros - 1).ilog2() as usize + 1;
+            std::cmp::min(idx, 25)
+        };
+        self.buckets[bucket_idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        const LABELS: &[&str] = &[
+            "<=1us", "<=2us", "<=4us", "<=8us", "<=16us", "<=32us", "<=64us", "<=128us", "<=256us",
+            "<=512us", "<=1024us", "<=2ms", "<=4ms", "<=8ms", "<=16ms", "<=32ms", "<=64ms",
+            "<=128ms", "<=256ms", "<=512ms", "<=1024ms", "<=2s", "<=4s", "<=8s", "<=16s", ">16s",
+        ];
+        let mut map = serde_json::Map::new();
+        for (i, label) in LABELS.iter().enumerate() {
+            let val = self.buckets[i].load(Ordering::Relaxed);
+            map.insert(
+                label.to_string(),
+                serde_json::Value::Number(serde_json::Number::from(val)),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+pub struct QueueDepthHistogram {
+    pub buckets: [AtomicU64; 15],
+}
+
+impl Default for QueueDepthHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+        }
+    }
+}
+
+impl QueueDepthHistogram {
+    pub fn record(&self, depth: usize) {
+        let bucket_idx = if depth == 0 {
+            0
+        } else if depth == 1 {
+            1
+        } else if depth == 2 {
+            2
+        } else {
+            let idx = (depth - 1).ilog2() as usize + 2;
+            std::cmp::min(idx, 14)
+        };
+        self.buckets[bucket_idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        const LABELS: &[&str] = &[
+            "0", "1", "2", "<=4", "<=8", "<=16", "<=32", "<=64", "<=128", "<=256", "<=512",
+            "<=1024", "<=2048", "<=4096", ">4096",
+        ];
+        let mut map = serde_json::Map::new();
+        for (i, label) in LABELS.iter().enumerate() {
+            let val = self.buckets[i].load(Ordering::Relaxed);
+            map.insert(
+                label.to_string(),
+                serde_json::Value::Number(serde_json::Number::from(val)),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
 /// Process-wide counters (P3-1). All updates are `Relaxed` atomics — no locks on the hot path.
 #[derive(Default)]
 pub struct Metrics {
@@ -249,6 +378,12 @@ pub struct Metrics {
     pub lease_acquire_fail: Align64<AtomicU64>,
     /// Writeback path: durable flush hard failures (sticky).
     pub writeback_hard_failures: Align64<AtomicU64>,
+    /// Histograms for lock wait times and queue depths.
+    pub write_lock_wait: Align64<LatencyHistogram>,
+    pub block_lock_wait: Align64<LatencyHistogram>,
+    pub lease_lock_wait: Align64<LatencyHistogram>,
+    pub dlm_acquire_time: Align64<LatencyHistogram>,
+    pub writeback_queue_depth: Align64<QueueDepthHistogram>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -638,7 +773,7 @@ impl SqueezefsFilesystem {
         }
     }
 
-    async fn generate_stats_json(&self) -> String {
+    pub async fn generate_stats_json(&self) -> String {
         let read_lru_keys = self.router.cache.read_lru.keys();
         let write_lru_keys = self.router.cache.write_lru.keys();
         let nvme_read_cache_block_keys = self.router.cache.nvme.list_cached_blocks();
@@ -715,6 +850,11 @@ impl SqueezefsFilesystem {
                 "fuse_over_uring_replies": fou_rep,
                 "fuse_over_uring_cqe_errors": fou_err,
                 "fuse_over_uring_registers": fou_reg,
+                "write_lock_wait": METRICS.write_lock_wait.to_json(),
+                "block_lock_wait": METRICS.block_lock_wait.to_json(),
+                "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
+                "dlm_acquire_time": METRICS.dlm_acquire_time.to_json(),
+                "writeback_queue_depth": METRICS.writeback_queue_depth.to_json(),
             },
             "cache_capacities": {
                 "read_lru_current_bytes": self.router.cache.read_lru.current_bytes(),
@@ -885,7 +1025,9 @@ impl SqueezefsFilesystem {
         }
 
         let lock_arc = self.lease_locks.get_lock(ino, 0);
+        let start_lease_lock = std::time::Instant::now();
         let _guard = lock_arc.lock().await;
+        METRICS.lease_lock_wait.record(start_lease_lock.elapsed());
 
         if let Some(lease) = self.active_leases.get(&ino) {
             let lease_clone = lease.clone();
@@ -897,10 +1039,12 @@ impl SqueezefsFilesystem {
         }
 
         let file_path = crate::keys::inode_path(ino);
+        let start_dlm = std::time::Instant::now();
         let lease = self
             .dlm
             .acquire_lock_with_retry(&file_path, None, Duration::from_secs(5), 5)
             .await?;
+        METRICS.dlm_acquire_time.record(start_dlm.elapsed());
         let token = lease.fencing_token();
         self.active_leases.insert(ino, lease);
         Ok(token)
@@ -1078,7 +1222,9 @@ impl SqueezefsFilesystem {
             futures.push(async move {
                 // 0. Acquire Block-level Lock to prevent concurrent modification to the same block
                 let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b as u32);
+                let start_block_lock = std::time::Instant::now();
                 let _block_guard = block_lock.lock().await;
+                METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
                 // 1. Get existing block data (either from memory cache, NVMe staging cache, or read from backend/cache)
                 let mut block_data = if let Some((_, buf)) =
@@ -2634,13 +2780,19 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EACCES));
         }
 
+        // Record writeback queue depth
+        let queue_depth = WRITEBACK_QUEUE_CAP - self.writeback_tx.capacity();
+        METRICS.writeback_queue_depth.record(queue_depth);
+
         let write_future = async {
             // P1-8: take the per-inode write lock for meta-prep (and for EntireOp paths
             // through data). Already-striped data I/O drops the guard and relies on
             // BLOCK_FLUSH_LOCKS so concurrent non-overlapping writers are not serialized
             // on Redis/IO stalls of peer writes.
             let lock = self.get_inode_lock_ref(ino);
+            let start_wait = std::time::Instant::now();
             let guard = lock.write().await;
+            METRICS.write_lock_wait.record(start_wait.elapsed());
 
             // 1. Get or acquire lease (fencing token)
             let fencing_token = self
@@ -6902,7 +7054,9 @@ async fn flush_single_active_block(
     }
 
     let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
+    let start_block_lock = std::time::Instant::now();
     let _block_guard = block_lock.lock().await;
+    METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
     let block_data_guard = match router.cache.nvme.read_staged_zero_copy(&cache_key) {
         Some(g) => g,

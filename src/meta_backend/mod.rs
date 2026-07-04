@@ -92,8 +92,16 @@ impl MetaLvBackend {
 
     /// Formats the raw block storage device with a superblock and the root inode
     pub fn format(storage: &storage::MetaLvStorage) -> Result<()> {
+        Self::format_with_options(storage, true, None)
+    }
+
+    pub fn format_with_options(
+        storage: &storage::MetaLvStorage,
+        quick: bool,
+        pb: Option<indicatif::ProgressBar>,
+    ) -> Result<()> {
         // Zero-wipe the entire metadata volume first to prevent stale garbage issues
-        storage.wipe()?;
+        storage.wipe(quick, pb)?;
 
         // Initialize Superblock
         let sb = storage::Superblock {

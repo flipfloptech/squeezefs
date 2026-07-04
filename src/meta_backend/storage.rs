@@ -134,7 +134,7 @@ impl MetaLvStorage {
         &self.path
     }
 
-    pub fn wipe(&self) -> Result<()> {
+    pub fn wipe(&self, quick: bool, pb: Option<indicatif::ProgressBar>) -> Result<()> {
         let size = {
             let mut file = self.file.lock();
             use std::io::Seek;
@@ -149,7 +149,23 @@ impl MetaLvStorage {
             }
             size
         };
-        let wipe_len = std::cmp::max(size, 64 * 1024 * 1024);
+        let wipe_len = if quick {
+            if size > 0 {
+                std::cmp::min(size, 32 * 1024 * 1024)
+            } else {
+                32 * 1024 * 1024
+            }
+        } else {
+            if size > 0 {
+                std::cmp::max(size, 64 * 1024 * 1024)
+            } else {
+                64 * 1024 * 1024
+            }
+        };
+
+        if let Some(ref p_bar) = pb {
+            p_bar.set_length(wipe_len);
+        }
 
         let zeros = vec![0u8; 1024 * 1024];
         let file = self.file.lock();
@@ -159,8 +175,14 @@ impl MetaLvStorage {
             file.write_all_at(&zeros[..to_write], written)
                 .map_err(SqueezefsError::Io)?;
             written += to_write as u64;
+            if let Some(ref p_bar) = pb {
+                p_bar.inc(to_write as u64);
+            }
         }
         file.sync_all().map_err(SqueezefsError::Io)?;
+        if let Some(ref p_bar) = pb {
+            p_bar.finish_with_message("Complete");
+        }
         Ok(())
     }
 }

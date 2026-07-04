@@ -182,10 +182,20 @@ impl MountHandleInner {
                 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
                 if self.unprivileged {
                     let binary_path = find_fusermount3()?;
-                    let mut child = Command::new(binary_path)
-                        .args([OsStr::new("-u"), self.mount_path.as_os_str()])
-                        .spawn()?;
-                    if !child.wait().await?.success() {
+                    let mut success = false;
+                    for attempt in 0..10 {
+                        if attempt > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        let mut child = Command::new(&binary_path)
+                            .args([OsStr::new("-u"), self.mount_path.as_os_str()])
+                            .spawn()?;
+                        if child.wait().await?.success() {
+                            success = true;
+                            break;
+                        }
+                    }
+                    if !success {
                         return Err(IoError::new(
                             ErrorKind::Other,
                             "call fusermount3 -u to unmount failed",
@@ -195,9 +205,27 @@ impl MountHandleInner {
                     return Ok(());
                 }
 
-                task::spawn_blocking(move || mount::umount(&self.mount_path))
-                    .await
-                    .unwrap()?;
+                let mount_path = self.mount_path.clone();
+                let mut success = false;
+                for attempt in 0..10 {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    let mp = mount_path.clone();
+                    let res = task::spawn_blocking(move || mount::umount(&mp))
+                        .await
+                        .unwrap();
+                    if res.is_ok() {
+                        success = true;
+                        break;
+                    }
+                }
+                if !success {
+                    return Err(IoError::new(
+                        ErrorKind::Other,
+                        "umount failed after retries",
+                    ));
+                }
             }
         }
 
@@ -686,12 +714,30 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         };
         let n = match res {
             Err(err) => {
-                if let Some(errno) = err.raw_os_error() {
-                    if errno == libc::ENODEV {
-                        debug!("read from /dev/fuse failed with ENODEV");
-
-                        return ReadResult::Destroy;
+                // Kernel abort / unmount / fuse-over-uring pool shutdown.
+                // Classical path: ENODEV (pre-FUSE_ABORT_ERROR) or ECONNABORTED.
+                // Uring path: we surface ENOTCONN / NotConnected when the pool dies.
+                let disconnect = match err.raw_os_error() {
+                    Some(e) if matches!(
+                        e,
+                        libc::ENODEV
+                            | libc::ECONNABORTED
+                            | libc::ENOTCONN
+                            | libc::EPIPE
+                            | libc::EBADF
+                            | libc::ESHUTDOWN
+                    ) => true,
+                    _ => err.kind() == ErrorKind::NotConnected || err.kind() == ErrorKind::BrokenPipe,
+                };
+                if disconnect {
+                    debug!("fuse connection dead ({err}); ending session");
+                    #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+                    {
+                        if let Some(pool) = fuse_connection.over_uring.lock().unwrap().take() {
+                            pool.shutdown();
+                        }
                     }
+                    return ReadResult::Destroy;
                 }
 
                 error!("read from /dev/fuse failed {}", err);
@@ -825,6 +871,24 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     debug!("receive fuse destroy");
 
                     fs.destroy(request).await;
+
+                    // COMMIT the ring entry synchronously before pool shutdown so we
+                    // do not race the async reply task (pending map would be cleared).
+                    #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+                    {
+                        if let Some(pool) = fuse_connection.over_uring.lock().unwrap().take() {
+                            let mut hdr = vec![0u8; FUSE_OUT_HEADER_SIZE];
+                            hdr[0..4]
+                                .copy_from_slice(&(FUSE_OUT_HEADER_SIZE as u32).to_le_bytes());
+                            hdr[8..16].copy_from_slice(&request.unique.to_le_bytes());
+                            let _ = pool.submit_reply(request.unique, bytes::Bytes::from(hdr));
+                            pool.shutdown();
+                        }
+                    }
+                    #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
+                    {
+                        reply_none_in_place(request, &self.response_sender).await;
+                    }
 
                     debug!("fuse destroyed");
 
@@ -1309,13 +1373,18 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             return Err(err);
         }
 
-        // 2) REGISTER all CPU queues now that the connection is initialized.
-        //    Session still uses classical reads until mark_ready (ready=false).
+        // 2) REGISTER all CPU queues (blocks until kernel fiq→uring switch), arm
+        //    session uring path, then non-blocking-drain any classical requests that
+        //    arrived during INIT→REGISTER (parent metadata, FORGET, …).
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
+            use std::os::fd::AsRawFd;
             fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
             if let Some(pool) = fuse_connection.over_uring.lock().unwrap().clone() {
                 pool.mark_ready();
+                crate::raw::connection::fuse_over_uring::FuseOverUring::drain_classical_stranded(
+                    fuse_connection.as_fd().as_raw_fd(),
+                );
             }
             eprintln!("FUSE-over-io_uring transport armed for this session");
             tracing::info!("FUSE-over-io_uring transport armed for this session");
@@ -1412,7 +1481,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                // no need to reply
+                // No userspace reply: over-uring COMMITs FORGET in the queue worker.
                 return;
             }
 
@@ -1427,6 +1496,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 request.unique, in_header.nodeid, forget_in.nlookup
             );
 
+            // Over-uring: ring entry already COMMITed in the queue worker (noreply).
+            // Classical: no write. Only nlookup accounting remains here.
             fs.forget(request, in_header.nodeid, forget_in.nlookup)
                 .await
         });
@@ -3895,7 +3966,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                // no need to reply
+                // No userspace reply: over-uring COMMITs in the queue worker.
                 return;
             }
 
@@ -3912,7 +3983,6 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Err(err) => {
                     error!("deserialize fuse_batch_forget_in body fuse_forget_one failed {}, request unique {}", err, request.unique);
 
-                    // no need to reply
                     return;
                 }
 
@@ -3943,6 +4013,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             debug!("batch_forget unique {} inodes {:?}", request.unique, inodes);
 
+            // Over-uring: ring entry already COMMITed in the queue worker (noreply).
             fs.batch_forget(request, &inodes).await
         });
     }
@@ -4399,6 +4470,26 @@ where
     let out_header = fuse_out_header {
         len: FUSE_OUT_HEADER_SIZE as u32,
         error: err.into(),
+        unique: request.unique,
+    };
+
+    let data = get_bincode_config()
+        .serialize(&out_header)
+        .expect("won't happened");
+
+    let _ = pin!(sender).send(Either::Left(data)).await;
+}
+
+/// Classical-only helper for no-reply opcodes (non-uring builds).
+/// Over-uring COMMITs FORGET/BATCH_FORGET in the queue worker and DESTROY inline.
+#[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
+async fn reply_none_in_place<S>(request: Request, sender: S)
+where
+    S: Sink<FuseData>,
+{
+    let out_header = fuse_out_header {
+        len: FUSE_OUT_HEADER_SIZE as u32,
+        error: 0,
         unique: request.unique,
     };
 

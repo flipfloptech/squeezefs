@@ -281,8 +281,31 @@ impl MountOptions {
         let mut options = OsString::from(opts.join(","));
 
         if let Some(custom_options) = &self.custom_options {
-            options.push(",");
-            options.push(custom_options);
+            if let Some(custom_str) = custom_options.to_str() {
+                let filtered: Vec<&str> = custom_str
+                    .split(',')
+                    .filter(|opt| {
+                        let name = opt.split('=').next().unwrap_or("").trim();
+                        !matches!(
+                            name,
+                            "max_read"
+                                | "max_write"
+                                | "max_pages"
+                                | "max_readahead"
+                                | "max_background"
+                                | "congestion_threshold"
+                                | "async_read"
+                        )
+                    })
+                    .collect();
+                if !filtered.is_empty() {
+                    options.push(",");
+                    options.push(filtered.join(","));
+                }
+            } else {
+                options.push(",");
+                options.push(custom_options);
+            }
         }
 
         options

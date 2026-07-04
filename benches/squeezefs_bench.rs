@@ -3,7 +3,6 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use fuse3::raw::prelude::*;
 use fuse3::raw::Request;
-// No longer using RustFsClient
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;

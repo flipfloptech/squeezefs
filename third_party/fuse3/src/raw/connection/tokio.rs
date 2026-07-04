@@ -156,6 +156,10 @@ pub struct FuseConnection {
     pub(crate) over_uring: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<super::fuse_over_uring::FuseOverUring>>>,
     >,
+    /// Uniques delivered via classical `/dev/fuse` (INIT + REGISTER handoff). Replies
+    /// for these must use classical write even after the uring pool is armed.
+    #[cfg(target_os = "linux")]
+    classical_inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
 }
 
 impl std::fmt::Debug for FuseConnection {
@@ -190,6 +194,9 @@ impl FuseConnection {
                 splice_read: std::sync::atomic::AtomicBool::new(false),
                 splice_write: std::sync::atomic::AtomicBool::new(false),
                 over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                classical_inflight: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
             })
         }
     }
@@ -232,6 +239,9 @@ impl FuseConnection {
             splice_read: std::sync::atomic::AtomicBool::new(false),
             splice_write: std::sync::atomic::AtomicBool::new(false),
             over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            classical_inflight: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         })
     }
 
@@ -263,6 +273,82 @@ impl FuseConnection {
                     splice_write: std::sync::atomic::AtomicBool::new(self.splice_write.load(std::sync::atomic::Ordering::Relaxed)),
                     // Share over-uring pool so multi-queue session workers pull the same inbound queue.
                     over_uring: self.over_uring.clone(),
+                    classical_inflight: self.classical_inflight.clone(),
+                })
+            }
+            #[cfg(feature = "unprivileged")]
+            ConnectionMode::NonBlock(_) => {
+                use std::os::unix::fs::OpenOptionsExt;
+                use std::os::fd::{AsRawFd, FromRawFd};
+                let primary_fd = self.as_fd().as_raw_fd();
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open("/dev/fuse")?;
+                let worker_fd = file.as_fd().as_raw_fd();
+                let mut session_fd = primary_fd as libc::c_int;
+
+                nix::ioctl_read!(fuse_dev_clone, 229, 0, libc::c_int);
+                unsafe {
+                    fuse_dev_clone(worker_fd, &mut session_fd)?;
+                }
+
+                let fd = file.into(); // OwnedFd
+                let read_ring = build_io_uring(256)?;
+                let write_ring = build_io_uring(256)?;
+
+                let read_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                if read_event_fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                let write_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                if write_event_fd < 0 {
+                    unsafe { libc::close(read_event_fd); }
+                    return Err(io::Error::last_os_error());
+                }
+
+                if let Err(e) = read_ring.submitter().register_eventfd(read_event_fd) {
+                    unsafe {
+                        libc::close(read_event_fd);
+                        libc::close(write_event_fd);
+                    }
+                    return Err(e);
+                }
+
+                if let Err(e) = write_ring.submitter().register_eventfd(write_event_fd) {
+                    unsafe {
+                        libc::close(read_event_fd);
+                        libc::close(write_event_fd);
+                    }
+                    return Err(e);
+                }
+
+                let read_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(read_event_fd) })?;
+                let write_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(write_event_fd) })?;
+
+                let read_ring = DebugUring(read_ring);
+                let write_ring = DebugUring(write_ring);
+
+                let connection = NonBlockFuseConnection {
+                    fd,
+                    read_ring: std::sync::Mutex::new(read_ring),
+                    read_ring_fd,
+                    write_ring: std::sync::Mutex::new(write_ring),
+                    write_ring_fd,
+                    read: Mutex::new(()),
+                    write: Mutex::new(()),
+                };
+
+                Ok(Self {
+                    unmount_notify: self.unmount_notify.clone(),
+                    mode: ConnectionMode::NonBlock(connection),
+                    splice_read: std::sync::atomic::AtomicBool::new(self.splice_read.load(std::sync::atomic::Ordering::Relaxed)),
+                    splice_write: std::sync::atomic::AtomicBool::new(self.splice_write.load(std::sync::atomic::Ordering::Relaxed)),
+                    // Share over-uring pool so multi-queue session workers pull the same inbound queue.
+                    over_uring: self.over_uring.clone(),
+                    classical_inflight: self.classical_inflight.clone(),
                 })
             }
             _ => Err(io::Error::new(
@@ -297,7 +383,20 @@ impl FuseConnection {
         #[cfg(target_os = "linux")]
         {
             let pool = self.over_uring.lock().unwrap().clone();
-            if let Some(pool) = pool.filter(|p| p.is_ready()) {
+            // After arm: uring-only. Before arm / when inactive: fall through.
+            // - ready → drain uring inbound
+            // - shut down (!active) → disconnect error
+            // - not yet ready → classical (INIT only; REGISTER wait is inside enable)
+            if let Some(pool) = pool.filter(|p| p.is_ready() || !p.is_active()) {
+                if !pool.is_active() {
+                    return (
+                        (header_buf, data_buf),
+                        Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "fuse-over-uring inactive (unmounted or aborted)",
+                        )),
+                    );
+                }
                 let pool2 = pool.clone();
                 let inbound = match tokio::task::spawn_blocking(move || {
                     // Block until a request or inactivity timeout (retry while active).
@@ -310,7 +409,7 @@ impl FuseConnection {
                         if !pool2.is_active() {
                             return Err(io::Error::new(
                                 io::ErrorKind::NotConnected,
-                                "fuse-over-uring inactive",
+                                "fuse-over-uring inactive (unmounted or aborted)",
                             ));
                         }
                     }
@@ -386,7 +485,8 @@ impl FuseConnection {
             }
         }
 
-        match &self.mode {
+        // Classical device path (FUSE_INIT only; after arm the branch above is used).
+        let result = match &self.mode {
             #[cfg(target_os = "linux")]
             ConnectionMode::Block(connection) => {
                 connection.read_vectored(header_buf, data_buf).await
@@ -398,7 +498,18 @@ impl FuseConnection {
             ConnectionMode::NonBlock(connection) => {
                 connection.read_vectored(header_buf, data_buf).await
             }
+        };
+        // Track unique so a reply that races mark_ready still uses classical write.
+        #[cfg(target_os = "linux")]
+        if let ((ref hdr, _), Ok(n)) = &result {
+            if *n >= 16 {
+                let unique = u64::from_le_bytes(hdr[8..16].try_into().unwrap_or([0; 8]));
+                if unique != 0 {
+                    self.classical_inflight.lock().unwrap().insert(unique);
+                }
+            }
         }
+        result
     }
 
     pub async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
@@ -406,8 +517,11 @@ impl FuseConnection {
         data: T,
         body_extend_data: Option<U>,
     ) -> CompleteIoResult<(T, Option<U>), usize> {
-        // After arm: replies go via COMMIT_AND_FETCH only. Never fall back to
-        // classical /dev/fuse write for the request path.
+        // After arm: uring-delivered requests reply via COMMIT_AND_FETCH.
+        // Requests that were still on the classical device queue during the
+        // REGISTER handoff must be completed with a classical write — if we only
+        // try COMMIT they miss the pending map, stay in kernel `waiting`, and
+        // plain `umount` returns EBUSY forever.
         #[cfg(target_os = "linux")]
         {
             let pool = self.over_uring.lock().unwrap().clone();
@@ -430,8 +544,7 @@ impl FuseConnection {
                 } else {
                     0
                 };
-                // Notifications (unique==0) are not supported on over-uring yet — drop
-                // rather than writing classical (would violate always-on policy).
+                // Notifications (unique==0) are not supported on over-uring yet.
                 if unique == 0 {
                     return (
                         (data, body_extend_data),
@@ -441,9 +554,30 @@ impl FuseConnection {
                         )),
                     );
                 }
-                let len = reply.len();
-                let res = pool.submit_reply(unique, reply);
-                return ((data, body_extend_data), res.map(|_| len));
+                // Classical-delivered handoff requests must not use COMMIT.
+                let is_classical = self
+                    .classical_inflight
+                    .lock()
+                    .unwrap()
+                    .remove(&unique);
+                if is_classical {
+                    // Fall through to classical write below.
+                } else {
+                    let len = reply.len();
+                    match pool.submit_reply(unique, reply) {
+                        Ok(()) => return ((data, body_extend_data), Ok(len)),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                            // Double-reply or auto-COMMITed FORGET — do not classical-write
+                            // (that path has stalled the single reply task under load).
+                            debug!(
+                                unique,
+                                "fuse-over-uring COMMIT miss; drop (no classical fallback)"
+                            );
+                            return ((data, body_extend_data), Ok(len));
+                        }
+                        Err(e) => return ((data, body_extend_data), Err(e)),
+                    }
+                }
             }
         }
 

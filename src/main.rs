@@ -220,7 +220,7 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         write_verification_sample: u64,
     },
-    /// Cleanly unmount a squeezefs mountpoint, with options to cancel, wait, or force dismount
+    /// Cleanly unmount a squeezefs mountpoint (fusermount/umount/-f; kills zombie daemon if needed)
     Umount {
         /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
         #[arg(
@@ -233,7 +233,7 @@ enum Commands {
         squeeze_uri: Option<String>,
         /// Path to the mountpoint
         mountpoint: PathBuf,
-        /// Force unmount immediately without prompting/waiting
+        /// Skip drain prompts; kill holders / leftover daemon; last resort uses umount -l
         #[arg(long, short = 'f')]
         force: bool,
     },
@@ -684,13 +684,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let uid = unsafe { libc::getuid() };
         if uid != 0 {
             match &cli.command {
-                Commands::Format { .. }
-                | Commands::Mount { .. }
-                | Commands::Umount { .. }
-                | Commands::Config { .. }
-                | Commands::Tune
-                | Commands::Status { .. }
-                | Commands::Clients { .. } => {
+                Commands::Tune => {
                     eprintln!("Error: This command must be run as root (or with sudo).");
                     std::process::exit(1);
                 }
@@ -3400,48 +3394,191 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // 7. Execute the unmount
-            println!("Unmounting squeezefs at {:?}...", mountpoint);
-            let status = std::process::Command::new("fusermount")
-                .arg("-u")
-                .arg(&mountpoint)
-                .status();
+            // 7. Execute the unmount (prefer a *real* unmount; lazy only with --force)
+            let abs_mp = std::fs::canonicalize(&mountpoint).unwrap_or_else(|_| mountpoint.clone());
+            let mp_str = abs_mp.to_string_lossy().to_string();
 
-            let unmount_success = match status {
-                Ok(s) if s.success() => true,
-                _ => {
-                    let umount_status = std::process::Command::new("umount")
-                        .arg(&mountpoint)
-                        .status();
-                    matches!(umount_status, Ok(s) if s.success())
+            // Prefer a live daemon from /proc. Garnet active_clients can be stale
+            // (old PID after crash / kill -9), which would skip wait/kill incorrectly.
+            match find_squeezefs_daemon_pid(&abs_mp) {
+                Some(pid) => daemon_pid = Some(pid),
+                None => {
+                    if let Some(pid) = daemon_pid {
+                        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                            daemon_pid = None;
+                        }
+                    }
                 }
-            };
+            }
+
+            if !is_path_mounted(&abs_mp) {
+                println!("Mountpoint {:?} is not currently mounted.", abs_mp);
+                if let Some(pid) = daemon_pid {
+                    eprintln!(
+                        "However, a squeezefs daemon (PID {}) is still running for this path.",
+                        pid
+                    );
+                    if force {
+                        eprintln!("--force: sending SIGTERM then SIGKILL to PID {}...", pid);
+                        let _ = nix_kill(pid, false);
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                            let _ = nix_kill(pid, true);
+                        }
+                    } else {
+                        eprintln!(
+                            "Re-run with --force to kill the orphaned daemon, or: sudo kill {pid}"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
+
+            // Show openers so a busy mount is diagnosable without loof guesswork.
+            let holders = find_mount_holders(&abs_mp);
+            if !holders.is_empty() {
+                println!(
+                    "Processes currently using {} (will block a non-lazy umount):",
+                    mp_str
+                );
+                for line in &holders {
+                    println!("  {}", line);
+                }
+            }
+
+            println!("Unmounting squeezefs at {}...", mp_str);
+
+            let mut unmount_success = false;
+
+            if let Some(pid) = daemon_pid {
+                println!("Sending SIGTERM to squeezefs daemon (PID {})...", pid);
+                if nix_kill(pid, false).is_ok() {
+                    // Wait for daemon to exit and unmount itself
+                    let start_wait = std::time::Instant::now();
+                    let max_wait = std::time::Duration::from_secs(dismount_wait.max(5));
+                    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                        if start_wait.elapsed() >= max_wait {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                        unmount_success = true;
+                    } else {
+                        println!("Daemon (PID {}) did not exit within timeout.", pid);
+                    }
+                }
+            }
+
+            if !unmount_success {
+                println!("Daemon unmount failed or no daemon found. Attempting direct unmount...");
+                unmount_success = try_clean_unmount(&abs_mp);
+            }
+
+            if !unmount_success && force {
+                // --force: kill user-space holders (not the fuse daemon — kernel abort
+                // should stop it), retry clean/-f, and only then lazy-detach.
+                eprintln!(
+                    "--force: clean umount failed; killing non-daemon holders and retrying..."
+                );
+                for line in &holders {
+                    if let Some(pid) = line
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse::<u32>().ok())
+                    {
+                        if Some(pid) != daemon_pid {
+                            let _ = nix_kill(pid, false);
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                unmount_success = try_clean_unmount(&abs_mp);
+                if !unmount_success {
+                    eprintln!(
+                        "--force: still busy after umount -f; lazy unmount (umount -l) as last resort"
+                    );
+                    unmount_success = std::process::Command::new("umount")
+                        .args(["-l", &mp_str])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                }
+            }
 
             if unmount_success {
-                println!("Successfully unmounted mountpoint {:?}", mountpoint);
+                println!("Successfully unmounted mountpoint {}", mp_str);
+                // Kernel abort should make the over-uring pool shut down and the
+                // daemon exit on its own. Wait, then only kill leftovers with --force.
                 if let Some(pid) = daemon_pid {
-                    let proc_path = format!("/proc/{}", pid);
+                    let proc_path = format!("/proc/{pid}");
                     if std::path::Path::new(&proc_path).exists() {
-                        print!("Waiting for background FUSE daemon process (PID {}) to flush data and exit...", pid);
+                        print!(
+                            "Waiting for FUSE daemon (PID {}) to exit after kernel abort...",
+                            pid
+                        );
                         let _ = std::io::stdout().flush();
                         let start_wait = std::time::Instant::now();
-                        let max_wait = std::time::Duration::from_secs(dismount_wait);
+                        // Kernel uring teardown can be async; give it a few seconds.
+                        let max_wait = std::time::Duration::from_secs(dismount_wait.max(5));
                         while std::path::Path::new(&proc_path).exists() {
                             if start_wait.elapsed() >= max_wait {
-                                println!("\nWarning: Background daemon process (PID {}) did not exit within {} seconds.", pid, dismount_wait);
                                 break;
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                         if !std::path::Path::new(&proc_path).exists() {
                             println!(" done.");
+                        } else if force {
+                            println!();
+                            eprintln!(
+                                "Daemon PID {} still alive after unmount; --force: SIGTERM/SIGKILL...",
+                                pid
+                            );
+                            let _ = nix_kill(pid, false);
+                            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                            if std::path::Path::new(&proc_path).exists() {
+                                let _ = nix_kill(pid, true);
+                            }
+                            if std::path::Path::new(&proc_path).exists() {
+                                eprintln!("Warning: failed to kill daemon PID {}", pid);
+                            } else {
+                                println!("Daemon killed.");
+                            }
+                        } else {
+                            println!();
+                            eprintln!(
+                                "Warning: daemon PID {} still running after unmount (should self-exit on abort).",
+                                pid
+                            );
+                            eprintln!(
+                                "This is a bug if it persists; re-run with --force to kill it, or: sudo kill {}",
+                                pid
+                            );
                         }
                     }
                 }
             } else {
+                eprintln!("Error: Failed to unmount {}.", mp_str);
+                if holders.is_empty() {
+                    eprintln!(
+                        "No obvious user-space holders found. If this persists after a rebuild with the fuse-over-uring abort fix, try:"
+                    );
+                    eprintln!("  sudo fuser -vm {}", mp_str);
+                    eprintln!("  sudo loof --dir-tree {}", mp_str);
+                } else {
+                    eprintln!(
+                        "Stop the processes listed above (or cd out of the mount), then retry."
+                    );
+                }
                 eprintln!(
-                    "Error: Failed to unmount mountpoint {:?}. Try running with sudo.",
-                    mountpoint
+                    "Try: sudo umount -f {0}   or   sudo squeezefs umount --force {0}",
+                    mp_str
+                );
+                eprintln!(
+                    "Lazy unmount only if nothing else works: sudo umount -l {}",
+                    mp_str
                 );
                 std::process::exit(1);
             }
@@ -3449,6 +3586,212 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// True if `path` is a mount point according to `/proc/self/mountinfo`.
+fn is_path_mounted(path: &std::path::Path) -> bool {
+    let want = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => path.to_path_buf(),
+    };
+    let want_s = want.to_string_lossy();
+    let want_trim = want_s.trim_end_matches('/');
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        // Fall back to findmnt / stat FS type if mountinfo unreadable.
+        return std::process::Command::new("findmnt")
+            .args(["-n", "-T"])
+            .arg(path)
+            .output()
+            .ok()
+            .map(|o| {
+                let s = String::from_utf8_lossy(&o.stdout);
+                o.status.success() && s.contains("fuse")
+            })
+            .unwrap_or(false);
+    };
+    for line in mountinfo.lines() {
+        // mountinfo: … mountpoint … - fstype …
+        let mut parts = line.split(" - ");
+        let left = parts.next().unwrap_or("");
+        let fields: Vec<&str> = left.split_whitespace().collect();
+        // field 5 is mount point (may be octal-escaped)
+        if fields.len() < 5 {
+            continue;
+        }
+        let mp = fields[4].replace("\\040", " ").replace("\\011", "\t");
+        let mp_trim = mp.trim_end_matches('/');
+        if mp_trim == want_trim {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort list of processes with cwd or open FDs under `mountpoint`.
+/// Lines look like: `1234 cwd=/mnt/foo cmd=bash`
+fn find_mount_holders(mountpoint: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let want = match std::fs::canonicalize(mountpoint) {
+        Ok(p) => p,
+        Err(_) => mountpoint.to_path_buf(),
+    };
+    let want_s = want.to_string_lossy();
+    let prefix = format!("{}/", want_s.trim_end_matches('/'));
+    let root = want_s.trim_end_matches('/').to_string();
+
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in proc.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: u32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let proc_path = entry.path();
+        let cmdline = std::fs::read(proc_path.join("cmdline"))
+            .ok()
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .replace('\0', " ")
+                    .trim()
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+
+        // cwd
+        if let Ok(cwd) = std::fs::read_link(proc_path.join("cwd")) {
+            let c = cwd.to_string_lossy();
+            if c == root || c.starts_with(&prefix) {
+                out.push(format!("{pid} cwd={c} cmd={cmdline}"));
+                continue;
+            }
+        }
+
+        // open fds
+        let Ok(fd_dir) = std::fs::read_dir(proc_path.join("fd")) else {
+            continue;
+        };
+        for fd in fd_dir.flatten() {
+            if let Ok(target) = std::fs::read_link(fd.path()) {
+                let t = target.to_string_lossy();
+                if t == root || t.starts_with(&prefix) {
+                    out.push(format!(
+                        "{pid} fd={} -> {t} cmd={cmdline}",
+                        fd.file_name().to_string_lossy()
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Locate a live `squeezefs mount … <mountpoint>` process.
+fn find_squeezefs_daemon_pid(mountpoint: &std::path::Path) -> Option<u32> {
+    let want = match std::fs::canonicalize(mountpoint) {
+        Ok(p) => p,
+        Err(_) => mountpoint.to_path_buf(),
+    };
+    let want_s = want.to_string_lossy().trim_end_matches('/').to_string();
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return None;
+    };
+    for entry in proc.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(mut bytes) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        if bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        let args: Vec<String> = bytes
+            .split(|&b| b == 0)
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        let is_mount =
+            args.iter().any(|a| a.contains("squeezefs")) && args.iter().any(|a| a == "mount");
+        if !is_mount {
+            continue;
+        }
+        for arg in &args {
+            if !arg.starts_with('/') {
+                continue;
+            }
+            let norm = arg.trim_end_matches('/');
+            let matches = if let Ok(abs) = std::path::Path::new(arg).canonicalize() {
+                abs.to_string_lossy().trim_end_matches('/') == want_s
+            } else {
+                norm == want_s
+            };
+            if matches {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+/// Unmount without lazy detach.
+///
+/// Order: fusermount helpers → plain `umount` → `umount -f`.
+/// After heavy fuse-over-uring workloads a single stranded kernel request can make
+/// plain `umount` report EBUSY with **no** process holders; `-f` aborts the fuse
+/// connection (daemon should self-exit). Lazy (`-l`) is never used here.
+fn try_clean_unmount(mountpoint: &std::path::Path) -> bool {
+    let mp = mountpoint.as_os_str();
+    let attempts: [(&str, Vec<&std::ffi::OsStr>); 4] = [
+        ("fusermount3", vec![std::ffi::OsStr::new("-u"), mp]),
+        ("fusermount", vec![std::ffi::OsStr::new("-u"), mp]),
+        ("umount", vec![mp]),
+        ("umount", vec![std::ffi::OsStr::new("-f"), mp]),
+    ];
+    for (bin, args) in attempts {
+        // Suppress noise from attempts that fail before a later one succeeds.
+        let status = std::process::Command::new(bin)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if matches!(status, Ok(s) if s.success()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Send SIGTERM (or SIGKILL if `force_kill`).
+fn nix_kill(pid: u32, force_kill: bool) -> std::io::Result<()> {
+    let sig = if force_kill {
+        libc::SIGKILL
+    } else {
+        libc::SIGTERM
+    };
+    let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn find_uri_from_proc(target_path: &std::path::Path) -> Option<String> {

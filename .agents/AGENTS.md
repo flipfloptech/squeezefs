@@ -10,7 +10,6 @@
 * **Client Daemon (FUSE Engine):** Built in **Rust** using the asynchronous `tokio` runtime and `io_uring` polling over `/dev/fuse`.
 * **Metadata & Distributed Lock Manager (DLM):** Microsoft Research **Garnet** (RESP-compatible). Primary meta store for attrs, layout maps, leases, and volume format.
 * **Data Backend (primary):** **NVMe / NVMe-oF block devices** via `NvmeBlockDev` (io_uring workers). Progressive layouts (inline / staged / striped) live on this path.
-* **Data Backend (optional / secondary):** S3-compatible paths may exist in the tree for historical or multi-backend experiments; **do not assume S3 is primary** when changing the data plane. Prefer the NVMe path that `format` / `mount --volume` and integration tests exercise.
 
 ---
 
@@ -91,4 +90,4 @@ Always acquire in this order; **never invert** (P1-9):
 ## 9. OS / fabric notes
 
 * Dirty ratios and fabric tuning remain operator concerns for large clusters.
-* Primary data path does **not** require S3; NVMe-oF is for remote block exposure of the same block backend model.
+* Primary data path uses the NVMe/NVMe-oF block storage backend.

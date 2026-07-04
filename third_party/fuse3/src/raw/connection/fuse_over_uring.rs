@@ -102,7 +102,9 @@ struct CommitMsg {
 }
 
 struct QueueHandle {
-    commit_tx: std::sync::mpsc::SyncSender<CommitMsg>,
+    /// Unbounded: a bounded sync_channel can block the session reply task if the
+    /// queue worker is briefly not draining, freezing *all* fuse replies.
+    commit_tx: std::sync::mpsc::Sender<CommitMsg>,
     /// Wake the queue thread (commit or shutdown).
     wake_fd: RawFd,
     /// Keep OwnedFd alive.
@@ -259,12 +261,14 @@ impl FuseOverUring {
                  ({kernel_nqueues}); FUSE-over-io_uring will never become ready"
             );
         }
-        // Depth 2 is enough to become ready (one entry per queue minimum); keep small
-        // to limit memory: nqueues * depth * ~1MiB payload.
+        // Per-queue ring depth. depth=1 is enough for kernel readiness but leaves no
+        // slack when a COMMIT is in flight and a new request arrives on the same
+        // CPU — under pjdfstest-style forget/open storms that contributed to stalls.
+        // depth=4 keeps memory modest (nqueues * depth * payload_sz).
         let depth = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1usize)
+            .unwrap_or(4usize)
             .clamp(1, 32);
         // Must be >= kernel ring->max_payload_sz:
         //   max(FUSE_MIN_READ_BUFFER, max_write, max_pages * PAGE_SIZE)
@@ -282,7 +286,7 @@ impl FuseOverUring {
         let mut wake_fds = Vec::with_capacity(nqueues);
 
         for _ in 0..nqueues {
-            let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel(depth * 4);
+            let (commit_tx, commit_rx) = std::sync::mpsc::channel();
             let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             if efd < 0 {
                 return Err(io::Error::last_os_error());
@@ -342,8 +346,14 @@ impl FuseOverUring {
         drop(err_tx);
         *pool.workers.lock().unwrap() = handles;
 
-        // Poll until every queue REGISTERed (no Barrier — that deadlocks if spawn
-        // is slow while workers already wait on the barrier).
+        // Block until every queue has submitted REGISTER so the kernel has
+        // switched fiq→uring *before* the session marks ready and stops classical
+        // reads. (Serving classical across that switch deadlocks: session blocks
+        // on classical while new requests only arrive on uring.)
+        //
+        // Requests that arrived on classical during this wait (e.g. parent
+        // metadata() while daemon is still in INIT) are drained just after
+        // mark_ready — see `drain_classical_stranded`.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(msg) = err_rx.try_recv() {
@@ -352,8 +362,7 @@ impl FuseOverUring {
                     "FUSE-over-io_uring worker failed during setup: {msg}"
                 )));
             }
-            let n = pool.queues_registered.load(Ordering::Acquire);
-            if n >= nqueues as u64 {
+            if pool.all_queues_registered() {
                 break;
             }
             if !pool.active.load(Ordering::Acquire) {
@@ -362,18 +371,30 @@ impl FuseOverUring {
                 ));
             }
             if std::time::Instant::now() > deadline {
+                let n = pool.queues_registered.load(Ordering::Acquire);
                 pool.shutdown();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!(
-                        "FUSE-over-io_uring REGISTER timed out ({n}/{nqueues} queues)"
-                    ),
+                    format!("FUSE-over-io_uring REGISTER timed out ({n}/{nqueues} queues)"),
                 ));
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        // Leave ready=false until after FUSE_INIT reply is written (see mark_ready).
+
         ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+
+        // Watch /dev/fuse for POLLERR/POLLHUP/etc so we shut down even if a
+        // worker is blocked in submit_and_wait and has not yet seen a CQE with
+        // -ENOTCONN (e.g. all ring entries already torn down by the kernel).
+        {
+            let watch = pool.clone();
+            let h = std::thread::Builder::new()
+                .name("fuse-over-uring-watch".into())
+                .spawn(move || connection_watch(watch))
+                .map_err(io::Error::other)?;
+            pool.workers.lock().unwrap().push(h);
+        }
+
         eprintln!(
             "FUSE-over-io_uring registered: queues={nqueues} depth={depth} payload_sz={payload_sz} fd={fuse_fd}"
         );
@@ -384,8 +405,89 @@ impl FuseOverUring {
         Ok(pool)
     }
 
-    /// Open the session uring read path — call only after init_out with flags2 is sent.
+    /// Non-blocking drain of classical `/dev/fuse` requests stranded during INIT→REGISTER.
+    /// FORGET is completed by the read alone; other ops get a minimal ENOSYS reply so the
+    /// client retries on the now-live uring path. Prevents permanent `waiting≥1` / EBUSY umount.
+    pub fn drain_classical_stranded(fuse_fd: RawFd) {
+        // Ensure non-blocking.
+        let flags = unsafe { libc::fcntl(fuse_fd, libc::F_GETFL) };
+        if flags >= 0 {
+            let _ = unsafe { libc::fcntl(fuse_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+        let mut buf = vec![0u8; 8192];
+        let mut drained = 0u32;
+        loop {
+            let n = unsafe {
+                libc::read(
+                    fuse_fd,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EAGAIN) {
+                    break;
+                }
+                if e.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                warn!("drain_classical_stranded read: {e}");
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            if (n as usize) < 40 {
+                break;
+            }
+            let opcode = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+            let unique = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            drained += 1;
+            // FUSE_FORGET=2, FUSE_BATCH_FORGET=42: no reply on classical.
+            if matches!(opcode, 2 | 42) {
+                continue;
+            }
+            if unique == 0 {
+                continue;
+            }
+            // Minimal fuse_out_header: ENOSYS so client retries (now via uring).
+            let mut out = [0u8; 16];
+            out[0..4].copy_from_slice(&16u32.to_le_bytes());
+            out[4..8].copy_from_slice(&(-libc::ENOSYS).to_le_bytes());
+            out[8..16].copy_from_slice(&unique.to_le_bytes());
+            let w = unsafe { libc::write(fuse_fd, out.as_ptr().cast(), out.len()) };
+            if w < 0 {
+                let e = io::Error::last_os_error();
+                // ENOENT = already completed; fine.
+                if e.raw_os_error() != Some(libc::ENOENT) {
+                    warn!("drain_classical_stranded write unique={unique}: {e}");
+                }
+            }
+        }
+        if drained > 0 {
+            info!("drained {drained} classical request(s) stranded during uring arm");
+            eprintln!("FUSE-over-io_uring: drained {drained} classical handoff request(s)");
+        }
+    }
+
+    /// True once every per-CPU queue has submitted its initial REGISTER batch.
+    /// Kernel `is_ring_ready` requires this before it switches `fiq->ops` to uring.
+    pub fn all_queues_registered(&self) -> bool {
+        self.queues_registered.load(Ordering::Acquire) >= self.nqueues as u64
+            && self.active.load(Ordering::Acquire)
+    }
+
+    /// Open the session uring read path — only after all queues REGISTERed **and**
+    /// the session has finished any classical handoff reads.
     pub fn mark_ready(&self) {
+        if !self.all_queues_registered() {
+            warn!(
+                "mark_ready called before all queues REGISTERed ({}/{})",
+                self.queues_registered.load(Ordering::Acquire),
+                self.nqueues
+            );
+        }
         self.ready.store(true, Ordering::Release);
         eprintln!(
             "FUSE-over-io_uring session path armed (ready=true, queues={})",
@@ -440,11 +542,36 @@ impl FuseOverUring {
         self.active.load(Ordering::Relaxed)
     }
 
+    /// Kernel abort / unmount completed a uring cmd with a fatal disconnect errno.
+    ///
+    /// From `fs/fuse/dev_uring.c`: ring entry teardown and cancel complete with
+    /// `-ENOTCONN`; the abort path sets request errors to `-ECONNABORTED` and
+    /// may surface `-ENODEV` on the classical device. Treat all of these as
+    /// "session is dead — stop workers and wake the session loop".
+    #[inline]
+    pub fn is_disconnect_errno(err: i32) -> bool {
+        matches!(
+            err,
+            libc::ENOTCONN
+                | libc::ECONNABORTED
+                | libc::ENODEV
+                | libc::EPIPE
+                | libc::EBADF
+                | libc::ESHUTDOWN
+        )
+    }
+
     pub fn shutdown(&self) {
         self.ready.store(false, Ordering::Release);
         if self.active.swap(false, Ordering::Release) {
             // Session was counted at spawn time (before ready).
             ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+            info!(
+                "FUSE-over-io_uring shutting down (fd={})",
+                self.fuse_fd
+            );
+            // Drop any uncommitted request map entries; kernel already aborted them.
+            self.pending.lock().unwrap().clear();
         }
         self.inbound.notify_all();
         let one: u64 = 1;
@@ -467,6 +594,38 @@ struct Ent {
     header: Box<FuseUringReqHeader>,
     payload: Vec<u8>,
     iov: [libc::iovec; 2],
+}
+
+/// Poll `/dev/fuse` until the connection is aborted/closed or the pool shuts down.
+fn connection_watch(pool: Arc<FuseOverUring>) {
+    while pool.active.load(Ordering::Relaxed) {
+        let mut pfd = libc::pollfd {
+            fd: pool.fuse_fd,
+            events: (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i16,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut pfd, 1, 250) };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            warn!("fuse-over-uring watch poll failed: {e}; shutting down");
+            pool.shutdown();
+            return;
+        }
+        if r == 0 {
+            continue;
+        }
+        let rev = pfd.revents;
+        if rev & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i16 != 0 {
+            info!(
+                "fuse-over-uring watch: /dev/fuse revents={rev:#x} (abort/unmount); shutting down"
+            );
+            pool.shutdown();
+            return;
+        }
+    }
 }
 
 fn queue_worker(
@@ -593,10 +752,26 @@ fn queue_worker(
             }
         }
 
+        // Exit promptly when another worker/watch already shut us down (wake_fd).
+        if !pool.active.load(Ordering::Relaxed) {
+            break;
+        }
+
         match ring.submit_and_wait(1) {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) if FuseOverUring::is_disconnect_errno(e.raw_os_error().unwrap_or(0)) => {
+                info!(
+                    "fuse-over-uring qid={qid}: submit_and_wait disconnect ({e}); shutting down"
+                );
+                pool.shutdown();
+                break;
+            }
             Err(e) => return Err(e),
+        }
+
+        if !pool.active.load(Ordering::Relaxed) {
+            break;
         }
 
         let completed: Vec<(u64, i32)> = {
@@ -607,9 +782,10 @@ fn queue_worker(
 
         let mut resubmit = Vec::new();
         let mut need_repoll = false;
+        let mut disconnect = false;
         for (user_data, res) in completed {
             if user_data == u64::MAX {
-                // wake_fd poll completed — re-arm
+                // wake_fd poll completed — re-arm (or exit if inactive)
                 need_repoll = true;
                 continue;
             }
@@ -624,57 +800,141 @@ fn queue_worker(
                     }
                     continue;
                 }
+                // Kernel abort/unmount (dev_uring.c): -ENOTCONN on entry teardown /
+                // cancel; -ECONNABORTED when abort_with_err is set.
+                if FuseOverUring::is_disconnect_errno(err) {
+                    info!(
+                        "fuse-over-uring qid={qid} ent={ent_idx}: disconnect CQE err={err}; shutting down"
+                    );
+                    disconnect = true;
+                    break;
+                }
                 if err == libc::ENOTSUP || err == libc::EINVAL || err == libc::ENOSYS {
                     error!("fuse-over-uring: kernel rejected protocol err={err}");
                     pool.shutdown();
                     return Err(io::Error::from_raw_os_error(err));
                 }
-                warn!("fuse-over-uring qid={qid} cqe err={err} ent={ent_idx}");
+                // Drop any pending map entry for this ring slot and re-REGISTER so we
+                // do not permanently lose queue capacity after a failed COMMIT/REGISTER.
+                warn!("fuse-over-uring qid={qid} cqe err={err} ent={ent_idx}; reclaim entry");
+                pool.pending.lock().unwrap().retain(|_, (q, e, _)| {
+                    !(*q == qid && *e == ent_idx as u16)
+                });
+                if ent_idx < ents.len() {
+                    resubmit.push(ent_idx);
+                }
                 continue;
             }
             if ent_idx >= ents.len() {
                 continue;
             }
-            let ent = &ents[ent_idx];
             // Kernel sets commit_id = unique when delivering a request.
-            let unique = u64::from_le_bytes(ent.header.in_out[8..16].try_into().unwrap());
-            let mut commit_id = ent.header.ring_ent_in_out.commit_id;
+            let unique = u64::from_le_bytes(ents[ent_idx].header.in_out[8..16].try_into().unwrap());
+            let mut commit_id = ents[ent_idx].header.ring_ent_in_out.commit_id;
             if commit_id == 0 {
                 // Fall back to unique — some paths only fill in_out.
                 commit_id = unique;
             }
             if unique == 0 {
-                eprintln!(
-                    "fuse-over-uring DROP qid={qid} ent={ent_idx} res={res} unique=0 \
-                     ring_commit={}",
-                    ent.header.ring_ent_in_out.commit_id
-                );
-                // Re-REGISTER the entry so we do not permanently lose capacity.
-                resubmit.push(ent_idx);
+                // Prefer COMMIT with commit_id if the kernel filled it — re-REGISTER
+                // alone leaves USERSPACE entries and permanent waiting/EBUSY umount.
+                let cid = ents[ent_idx].header.ring_ent_in_out.commit_id;
+                if cid != 0 {
+                    warn!(
+                        "fuse-over-uring qid={qid} ent={ent_idx}: unique=0 commit_id={cid}; force EIO COMMIT"
+                    );
+                    let mut out = [0u8; 16];
+                    out[0..4].copy_from_slice(&16u32.to_le_bytes());
+                    out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
+                    out[8..16].copy_from_slice(&cid.to_le_bytes());
+                    apply_reply(&mut ents[ent_idx], &Bytes::copy_from_slice(&out));
+                    let _ = push_cmd(
+                        &mut ring,
+                        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                        qid,
+                        cid,
+                        None,
+                        ent_idx as u64,
+                    );
+                    let _ = ring.submit();
+                } else {
+                    warn!(
+                        "fuse-over-uring qid={qid} ent={ent_idx}: unique=0 commit_id=0; re-REGISTER"
+                    );
+                    resubmit.push(ent_idx);
+                }
                 continue;
             }
-            let payload_sz = ent.header.ring_ent_in_out.payload_sz as usize;
+            let opcode =
+                u32::from_le_bytes(ents[ent_idx].header.in_out[4..8].try_into().unwrap());
+            let payload_sz = ents[ent_idx].header.ring_ent_in_out.payload_sz as usize;
             let mut header_and_op =
                 Vec::with_capacity(FUSE_IN_HEADER_SIZE + FUSE_URING_OP_IN_OUT_SZ);
-            header_and_op.extend_from_slice(&ent.header.in_out[..FUSE_IN_HEADER_SIZE]);
-            header_and_op.extend_from_slice(&ent.header.op_in);
-            let payload = ent.payload[..payload_sz.min(ent.payload.len())].to_vec();
+            header_and_op.extend_from_slice(&ents[ent_idx].header.in_out[..FUSE_IN_HEADER_SIZE]);
+            header_and_op.extend_from_slice(&ents[ent_idx].header.op_in);
+            let payload = ents[ent_idx].payload[..payload_sz.min(ents[ent_idx].payload.len())]
+                .to_vec();
 
-            pool.pending
-                .lock()
-                .unwrap()
-                .insert(unique, (qid, ent_idx as u16, commit_id));
             pool.stats_requests.fetch_add(1, Ordering::Relaxed);
             STATS_REQUESTS.fetch_add(1, Ordering::Relaxed);
             debug!(
                 qid,
-                ent_idx, unique, commit_id, payload_sz, "fuse-over-uring inbound request"
+                ent_idx, unique, commit_id, payload_sz, opcode, "fuse-over-uring inbound request"
             );
+
+            // FUSE_FORGET (2) / FUSE_BATCH_FORGET (42) are "no reply" on classical.
+            // Over-uring still holds the ring entry in USERSPACE until COMMIT.
+            // Commit *immediately* here (do not wait for the session task).
+            // Session still runs forget accounting from `inbound`; it must not reply.
+            const FUSE_FORGET: u32 = 2;
+            const FUSE_BATCH_FORGET: u32 = 42;
+            if matches!(opcode, FUSE_FORGET | FUSE_BATCH_FORGET) {
+                // Deliver for nlookup accounting only — no pending map entry.
+                pool.inbound.push(InboundUringReq {
+                    header_and_op,
+                    payload,
+                    unique,
+                });
+                let mut out = [0u8; 16];
+                out[0..4].copy_from_slice(&16u32.to_le_bytes());
+                // error = 0
+                out[8..16].copy_from_slice(&unique.to_le_bytes());
+                apply_reply(&mut ents[ent_idx], &Bytes::copy_from_slice(&out));
+                push_cmd(
+                    &mut ring,
+                    FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                    qid,
+                    commit_id,
+                    None,
+                    ent_idx as u64,
+                )?;
+                ring.submit()?;
+                pool.stats_replies.fetch_add(1, Ordering::Relaxed);
+                STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // CRITICAL: insert pending *before* exposing the request on `inbound`.
+            // Otherwise a session worker can reply before the map entry exists,
+            // submit_reply returns NotFound, we drop the reply, and the kernel
+            // keeps `waiting≥1` forever → plain `umount` EBUSY with no openers
+            // (seen after full pjdfstest).
+            pool.pending
+                .lock()
+                .unwrap()
+                .insert(unique, (qid, ent_idx as u16, commit_id));
             pool.inbound.push(InboundUringReq {
                 header_and_op,
                 payload,
                 unique,
             });
+        }
+        if disconnect {
+            pool.shutdown();
+            break;
+        }
+        if !pool.active.load(Ordering::Relaxed) {
+            break;
         }
         if need_repoll {
             let poll_e = opcode::PollAdd::new(types::Fixed(1), libc::POLLIN as _)
@@ -683,7 +943,8 @@ fn queue_worker(
             let _ = unsafe { ring.submission().push(&Entry128::from(poll_e)) };
             let _ = ring.submit();
         }
-        if !resubmit.is_empty() {
+        // Never re-REGISTER after a disconnect; only while still active.
+        if !resubmit.is_empty() && pool.active.load(Ordering::Relaxed) {
             for ent_idx in resubmit {
                 let ent = &ents[ent_idx];
                 let _ = push_cmd(
@@ -698,6 +959,25 @@ fn queue_worker(
             let _ = ring.submit();
         }
     }
+    // Final drain of any pending commits (including FUSE_DESTROY reply) before exiting
+    let mut final_commits = 0;
+    while let Ok(msg) = commit_rx.try_recv() {
+        let ent = &mut ents[msg.ent_idx as usize];
+        apply_reply(ent, &msg.reply);
+        let _ = push_cmd(
+            &mut ring,
+            FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+            qid,
+            msg.commit_id,
+            None,
+            msg.ent_idx as u64,
+        );
+        final_commits += 1;
+    }
+    if final_commits > 0 {
+        let _ = ring.submit_and_wait(final_commits);
+    }
+    debug!("fuse-over-uring qid={qid} worker exit");
     Ok(())
 }
 

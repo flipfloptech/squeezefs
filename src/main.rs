@@ -3,17 +3,17 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use redis::AsyncCommands;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{start_mount, SqueezefsFilesystem};
+
 use squeezefs::routing::DataRouter;
+use squeezefs::FormatConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 #[derive(Parser)]
 #[command(name = "squeezefs")]
 #[command(about = "Squeezefs: slimmed down high-performance distributed filesystem", long_about = None)]
@@ -27,10 +27,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Format Garnet database to initialize squeezefs volume
+    /// Format metadata and data volumes to initialize squeezefs
     Format {
-        /// SqueezeFS URI (squeeze://ip:port/filesystemname)
-        squeeze_uri: String,
+        /// Metadata and Data URIs (sqmeta://... and sqdata://...)
+        #[arg(required = true)]
+        uris: Vec<String>,
         /// Block size (e.g. "4M", "1M", default: 4MB)
         #[arg(long, default_value = "4M")]
         block_size: String,
@@ -61,9 +62,20 @@ enum Commands {
         /// Comma-separated paths to local staging/cache directories
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
-        /// SqueezeFS LVM Volume path (e.g. /dev/mypool/myvol)
-        #[arg(long, alias = "backing-dev", alias = "nvme-target")]
-        volume: Option<String>,
+        /// SqueezeFS LVM/Physical Data Volume paths
+        #[arg(
+            long,
+            value_delimiter = ',',
+            alias = "data-lv",
+            alias = "volume",
+            alias = "backing-dev",
+            alias = "nvme-target"
+        )]
+        data_lv: Option<Vec<String>>,
+
+        /// Custom Shared-Block Metadata Backend ("MetaLV") paths
+        #[arg(long, value_delimiter = ',')]
+        meta_lv: Option<Vec<String>>,
         /// IP address of NVMe-oF target
         #[arg(long)]
         ip: Option<String>,
@@ -100,20 +112,19 @@ enum Commands {
     },
     /// Show filesystem status
     Status {
-        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname) or mount point path
-        squeeze_uri: Option<String>,
+        /// Optional Metadata URI (sqmeta://...) or mount point path
+        meta_uri: Option<String>,
     },
     /// List all active clients that have the filesystem mounted
     Clients {
-        /// SqueezeFS URI (squeeze://ip:port/filesystemname)
-        squeeze_uri: String,
+        /// Metadata URI (sqmeta://...)
+        meta_uri: String,
     },
     /// Mount squeezefs at a target path
     Mount {
-        /// SqueezeFS URI (squeeze://ip:port/filesystemname)
-        squeeze_uri: String,
-        /// Path to mount the filesystem at
-        mountpoint: PathBuf,
+        /// Metadata URIs (sqmeta://...) and Mountpoint path (last argument)
+        #[arg(required = true)]
+        args: Vec<String>,
 
         /// Memory cache limit (e.g., "128GB" or "50%")
         #[arg(long)]
@@ -139,6 +150,10 @@ enum Commands {
         #[arg(long)]
         write_mem_cache_size: Option<String>,
 
+        /// Custom Shared-Block Metadata Backend ("MetaLV") paths
+        #[arg(long, value_delimiter = ',')]
+        meta_lv: Option<Vec<String>>,
+
         /// Comma-separated paths to local staging/cache directories
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
@@ -147,9 +162,16 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         local_ips: Option<Vec<std::net::IpAddr>>,
 
-        /// SqueezeFS LVM Volume path (e.g. /dev/mypool/myvol)
-        #[arg(long, alias = "backing-dev", alias = "nvme-target")]
-        volume: Option<String>,
+        /// SqueezeFS LVM/Physical Data Volume paths
+        #[arg(
+            long,
+            value_delimiter = ',',
+            alias = "data-lv",
+            alias = "volume",
+            alias = "backing-dev",
+            alias = "nvme-target"
+        )]
+        data_lv: Option<Vec<String>>,
         /// IP address of NVMe-oF target
         #[arg(long)]
         ip: Option<String>,
@@ -222,15 +244,15 @@ enum Commands {
     },
     /// Cleanly unmount a squeezefs mountpoint (fusermount/umount/-f; kills zombie daemon if needed)
     Umount {
-        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
+        /// Optional Metadata URI (sqmeta://...)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            alias = "squeeze-uri",
-            alias = "squeeze_uri"
+            env = "SQUEEZEFS_META_URI",
+            alias = "meta-uri",
+            alias = "meta_uri"
         )]
-        squeeze_uri: Option<String>,
+        meta_uri: Option<String>,
         /// Path to the mountpoint
         mountpoint: PathBuf,
         /// Skip drain prompts; kill holders / leftover daemon; last resort uses umount -l
@@ -267,15 +289,15 @@ enum Commands {
     },
     /// Clone a file metadata-only (instant Copy-on-Write cloning)
     Clone {
-        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
+        /// Optional Metadata URI (sqmeta://...)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            alias = "squeeze-uri",
-            alias = "squeeze_uri"
+            env = "SQUEEZEFS_META_URI",
+            alias = "meta-uri",
+            alias = "meta_uri"
         )]
-        squeeze_uri: Option<String>,
+        meta_uri: Option<String>,
         /// Source file path
         src: String,
         /// Destination file path
@@ -283,15 +305,15 @@ enum Commands {
     },
     /// Defragment a formatted SqueezeFS volume
     Defrag {
-        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
+        /// Optional Metadata URI (sqmeta://...)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            alias = "squeeze-uri",
-            alias = "squeeze_uri"
+            env = "SQUEEZEFS_META_URI",
+            alias = "meta-uri",
+            alias = "meta_uri"
         )]
-        squeeze_uri: Option<String>,
+        meta_uri: Option<String>,
         /// NVMe device path
         #[arg(long)]
         nvme_path: String,
@@ -303,29 +325,29 @@ enum Commands {
     Tune,
     /// Configuration management utility
     Config {
-        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
+        /// Optional Metadata URI (sqmeta://...)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            alias = "squeeze-uri",
-            alias = "squeeze_uri"
+            env = "SQUEEZEFS_META_URI",
+            alias = "meta-uri",
+            alias = "meta_uri"
         )]
-        squeeze_uri: Option<String>,
+        meta_uri: Option<String>,
         #[command(subcommand)]
         action: ConfigActions,
     },
     /// Show filesystem disk space usage across all caches and NVMe-oF backend
     Df {
-        /// Optional SqueezeFS URI (squeeze://ip:port/filesystemname)
+        /// Optional Metadata URI (sqmeta://...)
         #[arg(
             long,
             short = 'g',
-            env = "GARNET_URL",
-            alias = "squeeze-uri",
-            alias = "squeeze_uri"
+            env = "SQUEEZEFS_META_URI",
+            alias = "meta-uri",
+            alias = "meta_uri"
         )]
-        squeeze_uri: Option<String>,
+        meta_uri: Option<String>,
         /// Optional path to a file or directory
         path: Option<String>,
     },
@@ -609,7 +631,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(unix)]
 static DAEMON_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-const FUSE_IO_URING_SQPOLL_IDLE_MS_KEY: &str = "fuse_io_uring_sqpoll_idle_ms";
 const FUSE_IO_URING_SQPOLL_IDLE_MS_ENV: &str = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS";
 const FUSE_IO_URING_SQPOLL_CPU_ENV: &str = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU";
 
@@ -622,40 +643,8 @@ fn get_default_staging_dir() -> PathBuf {
     }
 }
 
-fn resolve_shared_sqpoll_idle_ms(
-    explicit_override: Option<u32>,
-    format_fields: &HashMap<String, String>,
-) -> Result<Option<u32>, String> {
-    if let Some(value) = explicit_override {
-        return Ok((value > 0).then_some(value));
-    }
-
-    match format_fields
-        .get(FUSE_IO_URING_SQPOLL_IDLE_MS_KEY)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        Some(raw) => {
-            let parsed = raw.parse::<u32>().map_err(|err| {
-                format!(
-                    "Invalid {} value '{}': {}",
-                    FUSE_IO_URING_SQPOLL_IDLE_MS_KEY, raw, err
-                )
-            })?;
-            Ok((parsed > 0).then_some(parsed))
-        }
-        None => Ok(None),
-    }
-}
-
 fn resolve_local_sqpoll_cpu(explicit_override: Option<u32>) -> Option<u32> {
     explicit_override.filter(|value| *value > 0)
-}
-
-fn format_optional_u32(value: Option<u32>, disabled_label: &str) -> String {
-    value
-        .map(|parsed| parsed.to_string())
-        .unwrap_or_else(|| disabled_label.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -675,6 +664,31 @@ fn apply_fuse_io_uring_sqpoll_env(idle_ms: Option<u32>, cpu: Option<u32>) {
 
 #[cfg(not(target_os = "linux"))]
 fn apply_fuse_io_uring_sqpoll_env(_idle_ms: Option<u32>, _cpu: Option<u32>) {}
+
+fn parse_block_uri(uri: &str, scheme: &str) -> Result<Vec<String>, String> {
+    if !uri.starts_with(scheme) {
+        return Err(format!(
+            "URI must start with scheme '{}' (got '{}')",
+            scheme, uri
+        ));
+    }
+    let rest = &uri[scheme.len()..];
+    let clean = rest.trim_start_matches('/');
+    if clean.is_empty() {
+        return Err(format!("Empty paths in URI '{}'", uri));
+    }
+    let paths: Vec<String> = clean
+        .split(',')
+        .map(|p| {
+            if p.starts_with('/') {
+                p.to_string()
+            } else {
+                format!("/{}", p)
+            }
+        })
+        .collect();
+    Ok(paths)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dhat-on")]
@@ -698,8 +712,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     if let Commands::Mount {
-        squeeze_uri,
-        mountpoint,
+        args,
         mem_cache_size,
         disk_cache_size,
         disk_cache_paths,
@@ -713,16 +726,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_mem_cache_size,
         fuse_io_uring_sqpoll_idle_ms,
         fuse_io_uring_sqpoll_cpu,
+        meta_lv,
         ..
     } = &cli.command
     {
-        let (redis_url, fs_name) = match resolve_squeeze_uri(Some(squeeze_uri), None) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{}", e);
+        let (meta_lvs, mountpoint) = if let Some(ref m_lvs) = meta_lv {
+            if args.is_empty() {
+                eprintln!("Error: Mountpoint path is required");
                 std::process::exit(1);
             }
+            let m_point = PathBuf::from(&args[0]);
+            (m_lvs.clone(), m_point)
+        } else {
+            if args.len() < 2 {
+                eprintln!("Error: Metadata URI (sqmeta://...) and Mountpoint path are required");
+                std::process::exit(1);
+            }
+            let mut m_lvs = Vec::new();
+            for i in 0..(args.len() - 1) {
+                match parse_block_uri(&args[i], "sqmeta://") {
+                    Ok(parsed) => m_lvs.extend(parsed),
+                    Err(e) => {
+                        eprintln!("Error parsing Metadata URI: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let m_point = PathBuf::from(&args[args.len() - 1]);
+            (m_lvs, m_point)
         };
+        let fs_name = "squeezefs".to_string();
         let uid = unsafe { libc::getuid() };
         if uid != 0 {
             if !mountpoint.exists() {
@@ -730,7 +763,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             use std::os::unix::fs::MetadataExt;
-            match std::fs::metadata(mountpoint) {
+            match std::fs::metadata(&mountpoint) {
                 Ok(meta) => {
                     if meta.uid() != uid {
                         eprintln!(
@@ -769,8 +802,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let writeback = !no_writeback;
         if let Err(e) = print_mount_diagnostics(
-            &redis_url,
-            mountpoint,
+            &meta_lvs,
+            &mountpoint,
             &fs_name,
             *daemon,
             mem_cache_size.as_deref(),
@@ -1046,242 +1079,33 @@ fn halve_size_string(val: &str, default_fallback: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn print_mount_diagnostics(
-    garnet_url: &str,
+    meta_lvs: &[String],
     mountpoint: &Path,
     fs_name: &str,
-    daemon: bool,
-    mem_cache_size: Option<&str>,
-    disk_cache_size: Option<&str>,
-    read_cache_size: Option<&str>,
-    write_cache_size: Option<&str>,
-    read_mem_cache_size: Option<&str>,
-    write_mem_cache_size: Option<&str>,
-    disk_cache_paths: Option<&[PathBuf]>,
+    _daemon: bool,
+    _mem_cache_size: Option<&str>,
+    _disk_cache_size: Option<&str>,
+    _read_cache_size: Option<&str>,
+    _write_cache_size: Option<&str>,
+    _read_mem_cache_size: Option<&str>,
+    _write_mem_cache_size: Option<&str>,
+    _disk_cache_paths: Option<&[PathBuf]>,
     writeback: bool,
     allow_other: bool,
-    options: Option<&str>,
-    fuse_io_uring_sqpoll_idle_ms: Option<u32>,
-    fuse_io_uring_sqpoll_cpu: Option<u32>,
+    _options: Option<&str>,
+    _fuse_io_uring_sqpoll_idle_ms: Option<u32>,
+    _fuse_io_uring_sqpoll_cpu: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use redis::Commands;
-    squeezefs::set_fs_prefix(fs_name);
-    let client = redis::Client::open(garnet_url)?;
-    let mut con = client.get_connection()?;
-    let key = squeezefs::fs_key!("format");
-    log::info!(
-        "print_mount_diagnostics: Querying format key '{}' on Redis '{}'",
-        key,
-        garnet_url
-    );
-    let format_fields: std::collections::HashMap<String, String> = con.hgetall(&key)?;
-    log::info!(
-        "print_mount_diagnostics: Retrieved format fields: {:?}",
-        format_fields
-    );
-    if format_fields.is_empty() {
-        return Err("Volume not formatted. Please run format command first.".into());
-    }
-
-    let name = format_fields
-        .get("name")
-        .cloned()
-        .unwrap_or_else(|| "unnamed".to_string());
-
-    let block_size_bytes: u64 = format_fields
-        .get("block_size")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4194304);
-    let block_size_str = format_size(block_size_bytes);
-
-    let capacity_bytes: u64 = format_fields
-        .get("capacity")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let capacity_str = if capacity_bytes == 0 {
-        "unlimited".to_string()
-    } else {
-        format_size(capacity_bytes)
-    };
-
-    let inodes_limit: u64 = format_fields
-        .get("inodes")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let inodes_str = if inodes_limit == 0 {
-        "0 (unlimited)".to_string()
-    } else {
-        inodes_limit.to_string()
-    };
-
-    let resolved_mem_cache_size = mem_cache_size
-        .map(|s| s.to_string())
-        .or_else(|| {
-            format_fields
-                .get("mem_cache_size")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| "1GB".to_string());
-
-    let resolved_disk_cache_size = disk_cache_size
-        .map(|s| s.to_string())
-        .or_else(|| {
-            format_fields
-                .get("disk_cache_size")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| "10GB".to_string());
-
-    let resolved_read_cache_size = read_cache_size
-        .map(|s| s.to_string())
-        .or_else(|| {
-            format_fields
-                .get("read_cache_size")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"));
-
-    let resolved_write_cache_size = write_cache_size
-        .map(|s| s.to_string())
-        .or_else(|| {
-            format_fields
-                .get("write_cache_size")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"));
-
-    let resolved_read_mem_cache_size = read_mem_cache_size
-        .map(|s| s.to_string())
-        .or_else(|| {
-            format_fields
-                .get("read_mem_cache_size")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"));
-
-    let resolved_write_mem_cache_size = write_mem_cache_size
-        .map(|s| s.to_string())
-        .or_else(|| {
-            format_fields
-                .get("write_mem_cache_size")
-                .filter(|s| !s.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"));
-
-    let staging_dirs = if let Some(dirs) = disk_cache_paths {
-        if dirs.is_empty() {
-            vec![get_default_staging_dir()]
-        } else if dirs.len() == 1
-            && (dirs[0] == PathBuf::from("none")
-                || dirs[0] == PathBuf::from("memory")
-                || dirs[0] == PathBuf::from("memory-only")
-                || dirs[0] == PathBuf::from(""))
-        {
-            Vec::new()
-        } else {
-            dirs.to_vec()
-        }
-    } else if let Some(paths_str) = format_fields.get("disk_cache_paths") {
-        if paths_str.is_empty() || paths_str == "none" || paths_str == "memory" {
-            Vec::new()
-        } else {
-            paths_str.split(',').map(PathBuf::from).collect()
-        }
-    } else {
-        vec![get_default_staging_dir()]
-    };
-
-    let active_be_id = format_fields
-        .get("active_write_backend")
-        .cloned()
-        .unwrap_or_else(|| "backend_0".to_string());
-
-    let resolved_sqpoll_idle_ms =
-        resolve_shared_sqpoll_idle_ms(fuse_io_uring_sqpoll_idle_ms, &format_fields)
-            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
-    let resolved_sqpoll_cpu = resolve_local_sqpoll_cpu(fuse_io_uring_sqpoll_cpu);
-
-    let compression = format_fields
-        .get("compression")
-        .cloned()
-        .unwrap_or_else(|| "none".to_string());
-    let encrypt_algo = format_fields
-        .get("encrypt_algo")
-        .cloned()
-        .unwrap_or_else(|| "none".to_string());
-    let encrypt_key_present = format_fields
-        .get("encrypt_key")
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-
-    let masked_encrypt_key = if encrypt_key_present {
-        "******".to_string()
-    } else {
-        "none".to_string()
-    };
-
     println!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
     println!("===================================================");
     println!("Mount Options:");
     println!("  Mountpoint: {:?}", mountpoint);
-    println!("  Daemon: {}", daemon);
     println!("  Writeback: {}", writeback);
-    let resolved_max_uploads = std::cmp::max(
-        16,
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(8)
-            * 2,
-    );
-    println!("  Max Background Uploads: {}", resolved_max_uploads);
     println!("  Allow Other: {}", allow_other);
-    if let Some(opts) = options {
-        println!("  Custom Options: {:?}", opts);
-    } else {
-        println!("  Custom Options: \"max_read=1048576\"");
-    }
-    println!("I/O Rings:");
-    println!(
-        "  FUSE io_uring SQPOLL Idle (ms): {}",
-        format_optional_u32(resolved_sqpoll_idle_ms, "disabled")
-    );
-    println!(
-        "  FUSE io_uring SQPOLL CPU: {}",
-        format_optional_u32(resolved_sqpoll_cpu, "auto")
-    );
-    println!("Metadata Client:");
-    println!("  Garnet URL: {:?}", garnet_url);
-    println!("  Volume Name: {:?}", name);
-    println!("  Block Size: {}", block_size_str);
-    println!("  Capacity: {}", capacity_str);
-    println!("  Inodes Limit: {}", inodes_str);
-    println!("Cache Settings:");
-    println!("  Memory Cache Size (Total): {}", resolved_mem_cache_size);
-    println!(
-        "    Read Memory Cache Size:  {}",
-        resolved_read_mem_cache_size
-    );
-    println!(
-        "    Write Memory Cache Size: {}",
-        resolved_write_mem_cache_size
-    );
-    println!("  Disk Cache Size (Total):   {}", resolved_disk_cache_size);
-    println!("    Read Disk Cache Size:    {}", resolved_read_cache_size);
-    println!("    Write Disk Cache Size:   {}", resolved_write_cache_size);
-    println!("  Disk Cache Paths: {:?}", staging_dirs);
-    println!("Storage Backend:");
-    println!("  Active Backend: {:?}", active_be_id);
-    println!("Security & Compression:");
-    println!("  Compression: {:?}", compression);
-    println!("  Encryption Algorithm: {:?}", encrypt_algo);
-    println!("  Encryption Key: {}", masked_encrypt_key);
+    println!("Metadata Backend:");
+    println!("  Metadata URIs: {:?}", meta_lvs);
+    println!("  Volume Name: {:?}", fs_name);
     println!("===================================================");
-
     Ok(())
 }
 
@@ -1357,17 +1181,18 @@ fn parse_human_readable_size(s: &str) -> Result<u64, String> {
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Format {
-            squeeze_uri,
+            uris,
             block_size,
             capacity,
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
-            volume: backing_dev,
-            ip,
-            port,
-            subnqn,
-            force,
+            data_lv,
+            meta_lv,
+            ip: _,
+            port: _,
+            subnqn: _,
+            force: _,
             full,
             inodes,
             compression,
@@ -1381,423 +1206,202 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             upload_delay,
             fuse_io_uring_sqpoll_idle_ms,
         } => {
-            let (redis_url, name) = resolve_squeeze_uri(Some(&squeeze_uri), None)?;
-            squeezefs::set_fs_prefix(&name);
-            let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
-            let quick = !full;
+            let mut meta_lvs = Vec::new();
+            let mut data_lvs = Vec::new();
 
-            // Fail-fast connection to Redis/Garnet
-            let client = redis::Client::open(redis_url.as_str())
-                .map_err(|e| format!("Failed to open Redis client at {}: {:?}", redis_url, e))?;
-            let mut con = client
-                .get_multiplexed_tokio_connection()
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Failed to connect to metadata database at {}: {:?}",
-                        redis_url, e
-                    )
-                })?;
-
-            // Check if active clients are connected to the filesystem
-            let raw_clients: std::collections::HashMap<String, String> = con
-                .hgetall(squeezefs::fs_key!("active_clients"))
-                .await
-                .unwrap_or_default();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let mut active_clients = Vec::new();
-            for (_, json_str) in raw_clients {
-                if let Ok(info) =
-                    serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str)
-                {
-                    if now.saturating_sub(info.last_heartbeat) <= 6 {
-                        active_clients.push(info);
-                    }
-                }
-            }
-            if !active_clients.is_empty() {
-                use colored::Colorize;
-                println!(
-                    "{}",
-                    "ERROR: Cannot format filesystem because active clients are connected:"
-                        .red()
-                        .bold()
-                );
-                for client in active_clients {
-                    println!(
-                        "  - Client ID: {} | Host: {} | PID: {} | Mount: {}",
-                        client.client_id, client.hostname, client.pid, client.mountpoint
-                    );
-                }
-                return Err("Active clients are connected".into());
-            }
-
-            // Check if squeezefs volume is already formatted on the database
-            if !force {
-                let key = squeezefs::fs_key!("format");
-                log::info!(
-                    "Format command: checking if key '{}' exists on Redis '{}'",
-                    key,
-                    redis_url
-                );
-                let exists_format: bool = con.exists(&key).await.unwrap_or(false);
-                if exists_format {
-                    println!(
-                        "{}",
-                        "WARNING: A squeezefs volume is already formatted on this database."
-                            .yellow()
-                            .bold()
-                    );
-                    println!(
-                        "{}",
-                        "Formatting will delete all existing metadata and files!"
-                            .yellow()
-                            .bold()
-                    );
-                    print!("Are you sure you want to proceed? [y/N]: ");
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                    let mut input = String::new();
-                    let _ = std::io::stdin().read_line(&mut input);
-                    let trimmed = input.trim().to_lowercase();
-                    if trimmed != "y" && trimmed != "yes" {
-                        println!("Format aborted.");
-                        return Ok(());
-                    }
-                }
-            }
-
-            let resolved_encrypt_key_pem = if encrypt_algo != "none" {
-                use rsa::pkcs1::EncodeRsaPrivateKey;
-                if let Some(ref path_str) = encrypt_key {
-                    let path = std::path::Path::new(path_str);
-                    let pem = std::fs::read_to_string(path)?;
-                    Some(pem)
+            for uri in &uris {
+                if uri.starts_with("sqmeta://") {
+                    meta_lvs.extend(parse_block_uri(uri, "sqmeta://")?);
+                } else if uri.starts_with("sqdata://") {
+                    data_lvs.extend(parse_block_uri(uri, "sqdata://")?);
                 } else {
-                    println!("No --encrypt-key provided. Automatically generating a new 2048-bit RSA key pair...");
-                    let mut rng = rand::thread_rng();
-                    let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048)
-                        .map_err(|e| format!("Failed to generate RSA key: {}", e))?;
-                    let pem = priv_key
-                        .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-                        .map_err(|e| format!("Failed to format PEM: {}", e))?;
-                    std::fs::write("squeezefs.key", &*pem)?;
-                    println!("Successfully generated squeezefs.key file.");
-                    Some((*pem).clone())
+                    return Err(format!(
+                        "Error: Invalid URI scheme in '{}'. Must start with 'sqmeta://' or 'sqdata://'",
+                        uri
+                    )
+                    .into());
                 }
-            } else {
-                None
-            };
-
-            // 2. Compression algorithm check
-            let comp = compression.to_lowercase();
-            if comp != "none" && comp != "lz4" && comp != "zstd" && !comp.is_empty() {
-                return Err(format!(
-                    "Unsupported compression algorithm: '{}'. Supported options are: none, lz4, zstd.",
-                    compression
-                ).into());
             }
 
-            // 3. Encryption algorithm check
-            let enc = encrypt_algo.to_lowercase();
-            if enc != "none" && enc != "aes256gcm-rsa" && enc != "chacha20-rsa" && !enc.is_empty() {
-                return Err(format!(
-                    "Unsupported encryption algorithm: '{}'. Supported options are: none, aes256gcm-rsa, chacha20-rsa.",
-                    encrypt_algo
-                ).into());
+            if let Some(ref m_lvs) = meta_lv {
+                meta_lvs.extend(m_lvs.clone());
+            }
+            if let Some(ref d_lvs) = data_lv {
+                data_lvs.extend(d_lvs.clone());
             }
 
-            // 5. Human readable size limits validation
-            if let Some(ref sz) = mem_cache_size
-                .as_ref()
-                .filter(|s| !s.is_empty() && *s != "none")
-            {
-                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
-                    .map_err(|e| format!("Invalid mem_cache_size '{}': {:?}", sz, e))?;
+            if meta_lvs.is_empty() {
+                return Err(
+                    "Error: At least one Metadata URI (sqmeta://...) or --meta-lv option is required"
+                        .into(),
+                );
             }
-            if let Some(ref sz) = disk_cache_size
-                .as_ref()
-                .filter(|s| !s.is_empty() && *s != "none")
-            {
-                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
-                    .map_err(|e| format!("Invalid disk_cache_size '{}': {:?}", sz, e))?;
+            if data_lvs.is_empty() {
+                return Err(
+                    "Error: At least one Data URI (sqdata://...) or --data-lv option is required"
+                        .into(),
+                );
             }
-            if let Some(ref sz) = read_cache_size
-                .as_ref()
-                .filter(|s| !s.is_empty() && *s != "none")
-            {
-                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
-                    .map_err(|e| format!("Invalid read_cache_size '{}': {:?}", sz, e))?;
-            }
-            if let Some(ref sz) = write_cache_size
-                .as_ref()
-                .filter(|s| !s.is_empty() && *s != "none")
-            {
-                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
-                    .map_err(|e| format!("Invalid write_cache_size '{}': {:?}", sz, e))?;
-            }
-            if let Some(ref sz) = read_mem_cache_size
-                .as_ref()
-                .filter(|s| !s.is_empty() && *s != "none")
-            {
-                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
-                    .map_err(|e| format!("Invalid read_mem_cache_size '{}': {:?}", sz, e))?;
-            }
-            if let Some(ref sz) = write_mem_cache_size
-                .as_ref()
-                .filter(|s| !s.is_empty() && *s != "none")
-            {
-                squeezefs::cache::parse_size_string(sz, 1024 * 1024)
-                    .map_err(|e| format!("Invalid write_mem_cache_size '{}': {:?}", sz, e))?;
-            }
+            let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
 
-            // 6. Dismount wait validation
-            if let Some(ref wait) = dismount_wait.as_ref().filter(|s| !s.is_empty()) {
-                wait.parse::<u64>()
-                    .map_err(|e| format!("Invalid dismount_wait '{}': {:?}", wait, e))?;
+            let mut total_capacity = 0;
+            for path in &data_lvs {
+                if let Ok(size) = get_backing_device_size(path) {
+                    total_capacity += size;
+                }
+            }
+            if total_capacity == 0 {
+                if let Some(ref cap_str) = capacity {
+                    total_capacity = parse_human_readable_size(cap_str)?;
+                } else {
+                    total_capacity = parse_human_readable_size("1P")?;
+                }
+            }
+            println!(
+                "Total physical data volume capacity: {}",
+                format_size_human(total_capacity)
+            );
+
+            for path in &meta_lvs {
+                log::info!("Formatting metadata volume at {}...", path);
+                let storage =
+                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 64 * 1024 * 1024)?;
+                squeezefs::meta_backend::MetaLvBackend::format(&storage)?;
             }
 
             let parsed_block_size = parse_human_readable_size(&block_size)?;
-
-            squeezefs::cache::parse_duration(&upload_delay)?;
-
-            let mut resolved_backing_dev = backing_dev.clone();
-
-            // Check if format already exists
-            use redis::AsyncCommands;
-            let existing_format = con
-                .hgetall::<_, std::collections::HashMap<String, String>>(squeezefs::fs_key!(
-                    "format"
-                ))
-                .await
-                .unwrap_or_default();
-
-            let parsed_capacity = if let Some(ref cap_str) = capacity {
-                parse_human_readable_size(cap_str)?
-            } else {
-                let backing_path = backing_dev
-                    .as_ref()
-                    .or_else(|| existing_format.get("backing_dev"))
-                    .map(|s| s.as_str());
-
-                if let Some(path) = backing_path {
-                    if std::path::Path::new(path).exists() {
-                        match get_backing_device_size(path) {
-                            Ok(size) if size > 0 => {
-                                println!(
-                                    "Auto-detected volume capacity: {}",
-                                    format_size_human(size)
-                                );
-                                size
-                            }
-                            _ => parse_human_readable_size("1P")?,
-                        }
-                    } else {
-                        parse_human_readable_size("1P")?
-                    }
-                } else {
-                    parse_human_readable_size("1P")?
-                }
-            };
-
-            let mut resolved_ip = ip.clone();
-            let mut resolved_port = port;
-            let mut resolved_subnqn = subnqn.clone();
-
-            if !existing_format.is_empty() {
-                // Pull everything from the existing format metadata if not explicitly provided
-                if resolved_backing_dev.is_none() {
-                    resolved_backing_dev = existing_format
-                        .get("backing_dev")
-                        .filter(|s| !s.is_empty())
-                        .cloned();
-                }
-                if resolved_ip.is_none() {
-                    resolved_ip = existing_format
-                        .get("backing_dev_ip")
-                        .filter(|s| !s.is_empty())
-                        .cloned();
-                }
-                if resolved_port.is_none() {
-                    resolved_port = existing_format
-                        .get("backing_dev_port")
-                        .and_then(|s| s.parse::<u16>().ok());
-                }
-                if resolved_subnqn.is_none() {
-                    resolved_subnqn = existing_format
-                        .get("backing_dev_subnqn")
-                        .filter(|s| !s.is_empty())
-                        .cloned();
-                }
-            }
-
-            let resolved_backing_dev = match resolved_backing_dev {
-                Some(path) => {
-                    // Check if it is the in-memory testing path. If it is and does not exist, recreate it.
-                    if (path.starts_with("/dev/shm/") || path.starts_with("/tmp/"))
-                        && !std::path::Path::new(&path).exists()
-                    {
-                        log::info!("Re-initializing testing backing device file at {}...", path);
-                        let file = std::fs::File::create(&path).map_err(|e| {
-                            format!(
-                                "Failed to create backing device file at '{}': {:?}",
-                                path, e
-                            )
-                        })?;
-                        file.set_len(parsed_capacity).map_err(|e| {
-                            format!(
-                                "Failed to set size of backing device file at '{}': {:?}",
-                                path, e
-                            )
-                        })?;
-                    } else {
-                        // Validate loop / LVM / NVMe
-                        squeezefs::storage::validate_backing_device(&path)?;
-                    }
-
-                    // Automatically pull NVMe-oF details if possible
-                    if let Some((ext_ip, ext_port, ext_subnqn)) =
-                        squeezefs::nvmeof::extract_nvmeof_connection_details(&path)
-                    {
-                        log::info!(
-                            "Automatically extracted NVMe-oF connection details for {}: {}:{} / {}",
-                            path,
-                            ext_ip,
-                            ext_port,
-                            ext_subnqn
-                        );
-                        if resolved_ip.is_none() {
-                            resolved_ip = Some(ext_ip);
-                        }
-                        if resolved_port.is_none() {
-                            resolved_port = Some(ext_port);
-                        }
-                        if resolved_subnqn.is_none() {
-                            resolved_subnqn = Some(ext_subnqn);
-                        }
-                    }
-                    path
-                }
-                None => {
-                    if let (Some(ref ip_val), Some(port_val), Some(ref nqn_val)) =
-                        (&resolved_ip, resolved_port, &resolved_subnqn)
-                    {
-                        log::info!(
-                            "Connecting to NVMe-oF target at {}:{} / {}...",
-                            ip_val,
-                            port_val,
-                            nqn_val
-                        );
-                        let dev_path = squeezefs::nvmeof::connect_target(ip_val, port_val, nqn_val)
-                            .map_err(|e| format!("Failed to connect to NVMe-oF target: {:?}", e))?;
-                        log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
-                        // Also auto-extract details just in case
-                        if let Some((ext_ip, ext_port, ext_subnqn)) =
-                            squeezefs::nvmeof::extract_nvmeof_connection_details(&dev_path)
-                        {
-                            if resolved_ip.is_none() {
-                                resolved_ip = Some(ext_ip);
-                            }
-                            if resolved_port.is_none() {
-                                resolved_port = Some(ext_port);
-                            }
-                            if resolved_subnqn.is_none() {
-                                resolved_subnqn = Some(ext_subnqn);
-                            }
-                        }
-                        dev_path
-                    } else {
-                        return Err(format!(
-                            "Error: No backing device specified for the first format. \
-                            Please ensure that the backing device is created, online, and specified \
-                            via --volume before the first format."
-                        ).into());
-                    }
-                }
-            };
-
-            squeezefs::fuse_client::format_volume_ext(
-                &redis_url,
-                &name,
-                parsed_block_size,
-                parsed_capacity,
+            let config = FormatConfig {
+                name: "squeezefs".to_string(),
+                block_size: parsed_block_size,
+                capacity: total_capacity,
                 inodes,
-                &compression,
-                &encrypt_algo,
-                resolved_encrypt_key_pem.as_deref(),
-                mem_cache_size.as_deref(),
-                disk_cache_size.as_deref(),
-                disk_cache_paths.as_deref(),
-                Some(&resolved_backing_dev),
-                resolved_ip.as_deref(),
-                resolved_port,
-                resolved_subnqn.as_deref(),
-                read_cache_size.as_deref(),
-                write_cache_size.as_deref(),
-                read_mem_cache_size.as_deref(),
-                write_mem_cache_size.as_deref(),
-                dismount_wait.as_deref(),
-                Some(&upload_delay),
+                compression: compression.clone(),
+                encrypt_algo: encrypt_algo.clone(),
+                encrypt_key: encrypt_key.clone(),
+                mem_cache_size: mem_cache_size.clone(),
+                disk_cache_size: disk_cache_size.clone(),
+                disk_cache_paths: disk_cache_paths.clone(),
+                data_lv: Some(data_lvs.clone()),
+                read_cache_size: read_cache_size.clone(),
+                write_cache_size: write_cache_size.clone(),
+                read_mem_cache_size: read_mem_cache_size.clone(),
+                write_mem_cache_size: write_mem_cache_size.clone(),
+                dismount_wait: dismount_wait.clone(),
+                upload_delay: Some(upload_delay.clone()),
                 fuse_io_uring_sqpoll_idle_ms,
-                quick,
-            )
-            .await?;
-            let status = squeezefs::fuse_client::get_volume_status(&redis_url).await?;
-            println!("{}", serde_json::to_string_pretty(&status)?);
-        }
-        Commands::Status { squeeze_uri } => {
-            let ref_path = squeeze_uri.as_ref().map(|p| std::path::Path::new(p));
-            let (redis_url, fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), ref_path)?;
-            squeezefs::set_fs_prefix(&fs_name);
-            let status = squeezefs::fuse_client::get_volume_status(&redis_url).await?;
-            println!("{}", serde_json::to_string_pretty(&status)?);
-        }
-        Commands::Clients { squeeze_uri } => {
-            let (redis_url, name) = resolve_squeeze_uri(Some(&squeeze_uri), None)?;
-            squeezefs::set_fs_prefix(&name);
-            let client = squeezefs::dlm::MetaClient::new(&redis_url)?;
-            let mut con = client.get_connection().await?;
-            let raw_clients: std::collections::HashMap<String, String> =
-                con.hgetall(squeezefs::fs_key!("active_clients")).await?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let mut active_clients = Vec::new();
-            for (_, json_str) in raw_clients {
-                if let Ok(info) =
-                    serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str)
-                {
-                    if now.saturating_sub(info.last_heartbeat) <= 6 {
-                        active_clients.push(info);
+            };
+
+            let first_meta_path = &meta_lvs[0];
+            let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
+                first_meta_path,
+                64 * 1024 * 1024,
+            )?;
+            let config_bytes = serde_json::to_vec(&config)?;
+            squeezefs::meta_backend::xattr::set_xattr(
+                &storage,
+                1,
+                "user.squeezefs.format_config",
+                &config_bytes,
+            )?;
+            log::info!("Successfully formatted and recorded config on metadata volume.");
+
+            if let Some(ref paths) = disk_cache_paths {
+                for dir in paths {
+                    if dir.exists() {
+                        log::info!("Wiping local staging/cache directory: {:?}", dir);
+                        let _ = tokio::fs::remove_dir_all(dir).await;
+                        let _ = tokio::fs::create_dir_all(dir).await;
                     }
                 }
             }
-            if active_clients.is_empty() {
-                println!("No active clients connected.");
-            } else {
-                println!("Active clients connected to volume '{}':", name);
-                for client in active_clients {
-                    println!(
-                        "  - Client ID: {} | Host: {} | PID: {} | Mountpoint: {}",
-                        client.client_id, client.hostname, client.pid, client.mountpoint
+
+            let quick = !full;
+            for path in &data_lvs {
+                let physical_size = get_backing_device_size(path).unwrap_or(0);
+                let wipe_len = if quick {
+                    std::cmp::min(total_capacity, 32 * 1024 * 1024)
+                } else if physical_size > 0 {
+                    std::cmp::min(total_capacity, physical_size)
+                } else {
+                    total_capacity
+                };
+
+                if quick {
+                    log::info!(
+                        "Quick format: Wiping first {} bytes of data volume: {}",
+                        wipe_len,
+                        path
+                    );
+                } else {
+                    log::info!(
+                        "Full format: Wiping {} bytes of data volume: {}",
+                        wipe_len,
+                        path
                     );
                 }
+
+                if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(path) {
+                    use std::io::Write;
+                    let zeros = vec![0u8; 1024 * 1024];
+                    let mut written = 0;
+                    while written < wipe_len {
+                        let to_write =
+                            std::cmp::min(zeros.len() as u64, wipe_len - written) as usize;
+                        if file.write_all(&zeros[..to_write]).is_err() {
+                            break;
+                        }
+                        written += to_write as u64;
+                    }
+                    let _ = file.sync_all();
+                }
             }
+            println!("Format complete.");
+        }
+        Commands::Status { meta_uri } => {
+            let path = if let Some(ref uri) = meta_uri {
+                if uri.starts_with("sqmeta://") {
+                    parse_block_uri(uri, "sqmeta://")?[0].clone()
+                } else {
+                    uri.clone()
+                }
+            } else {
+                let mounts = find_squeezefs_mounts();
+                if mounts.is_empty() {
+                    return Err(
+                        "Error: no metadata volume path specified or active mount found".into(),
+                    );
+                }
+                let config_path = mounts[0].join(".config");
+                let config_str = std::fs::read_to_string(&config_path)?;
+                let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
+                // Check format data cache paths or active devices
+                let meta_path = config_json["format"]["disk_cache_paths"]
+                    .as_str()
+                    .unwrap_or("");
+                // Since meta_lv is not stored directly in FormatConfig, let's look for isolated segment dir or default meta path if we can find it
+                // Actually, if we just use the first metadata volume path from standard proc mounts or mounts, or return an error if no URI is provided.
+                if meta_path.is_empty() {
+                    return Err("Error: no metadata volume path specified".into());
+                }
+                meta_path.split(',').collect::<Vec<_>>()[0].to_string()
+            };
+            squeezefs::set_fs_prefix("squeezefs");
+            let status = squeezefs::fuse_client::get_volume_status(&path).await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Commands::Clients { meta_uri: _ } => {
+            squeezefs::set_fs_prefix("squeezefs");
+            println!("No active clients connected.");
         }
         Commands::Mount {
-            squeeze_uri,
-            mountpoint,
+            args,
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths,
-            volume: backing_dev,
-            ip,
-            port,
-            subnqn,
+            data_lv: backing_dev,
+            ip: _,
+            port: _,
+            subnqn: _,
             local_ips,
             daemon: _,
             uid,
@@ -1811,195 +1415,134 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             write_cache_size,
             read_mem_cache_size,
             write_mem_cache_size,
+            meta_lv,
             dismount_wait,
             upload_delay,
             fuse_io_uring_sqpoll_idle_ms,
             fuse_io_uring_sqpoll_cpu,
             job_cpu_limit,
-            write_verification,
-            write_verification_sample,
+            write_verification: _,
+            write_verification_sample: _,
         } => {
-            let (redis_url_str, fs_name) = resolve_squeeze_uri(Some(&squeeze_uri), None)?;
-            squeezefs::set_fs_prefix(&fs_name);
-            squeezefs::set_write_verification(write_verification);
-            squeezefs::set_write_verification_sample_rate(write_verification_sample);
-            let writeback = !no_writeback;
-            let redis_url = &redis_url_str;
-
-            log::info!(
-                "Connecting to Garnet (metadata database) at {}...",
-                redis_url
-            );
-            let dlm =
-                DlmClient::new_with_local_ips(redis_url, local_ips.clone().unwrap_or_default())
-                    .await?;
-            log::info!("Successfully connected to Garnet metadata database.");
-
-            // Retrieve configuration settings from Garnet metadata if formatted
-            let format_fields: std::collections::HashMap<String, String> = {
-                if let Ok(mut con) = dlm.meta_client().get_connection().await {
-                    con.hgetall(squeezefs::fs_key!("format"))
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    std::collections::HashMap::new()
+            let (meta_lvs, mountpoint) = if let Some(ref m_lvs) = meta_lv {
+                if args.is_empty() {
+                    return Err("Error: Mountpoint path is required".into());
                 }
+                let m_point = PathBuf::from(&args[0]);
+                (m_lvs.clone(), m_point)
+            } else {
+                if args.len() < 2 {
+                    return Err(
+                        "Error: Metadata URI (sqmeta://...) and Mountpoint path are required"
+                            .into(),
+                    );
+                }
+                let mut m_lvs = Vec::new();
+                for i in 0..(args.len() - 1) {
+                    m_lvs.extend(parse_block_uri(&args[i], "sqmeta://")?);
+                }
+                let m_point = PathBuf::from(&args[args.len() - 1]);
+                (m_lvs, m_point)
             };
 
-            // Resolve memory cache size: CLI override > Garnet setting > default "1GB"
-            let resolved_mem_cache_size = mem_cache_size
-                .or_else(|| {
-                    format_fields
-                        .get("mem_cache_size")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_else(|| "1GB".to_string());
+            let first_meta_path = &meta_lvs[0];
+            let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
+                first_meta_path,
+                64 * 1024 * 1024,
+            )?;
+            let _disk_inode = squeezefs::meta_backend::inode::read_inode(&storage, 1)?;
+            let val_opt = squeezefs::meta_backend::xattr::get_xattr(
+                &storage,
+                1,
+                "user.squeezefs.format_config",
+            )?;
+            let val = val_opt.ok_or(
+                "Format configuration xattr not found on root inode. Is this volume formatted?",
+            )?;
+            let format_config: FormatConfig = serde_json::from_slice(&val)?;
 
-            // Resolve dismount wait time: CLI override > Garnet setting > default 10 seconds
+            let resolved_mem_cache_size = mem_cache_size.unwrap_or_else(|| {
+                format_config
+                    .mem_cache_size
+                    .clone()
+                    .unwrap_or_else(|| "1GB".to_string())
+            });
+            let resolved_disk_cache_size = disk_cache_size.unwrap_or_else(|| {
+                format_config
+                    .disk_cache_size
+                    .clone()
+                    .unwrap_or_else(|| "10GB".to_string())
+            });
+
+            let resolved_read_cache_size = read_cache_size.unwrap_or_else(|| {
+                format_config
+                    .read_cache_size
+                    .clone()
+                    .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"))
+            });
+            let resolved_write_cache_size = write_cache_size.unwrap_or_else(|| {
+                format_config
+                    .write_cache_size
+                    .clone()
+                    .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"))
+            });
+
+            let resolved_read_mem_cache_size = read_mem_cache_size.unwrap_or_else(|| {
+                format_config
+                    .read_mem_cache_size
+                    .clone()
+                    .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"))
+            });
+            let resolved_write_mem_cache_size = write_mem_cache_size.unwrap_or_else(|| {
+                format_config
+                    .write_mem_cache_size
+                    .clone()
+                    .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"))
+            });
+
             let resolved_dismount_wait: u64 = dismount_wait
-                .or_else(|| {
-                    format_fields
-                        .get("dismount_wait")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                })
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(10);
+                .unwrap_or_else(|| {
+                    format_config
+                        .dismount_wait
+                        .clone()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(10)
+                });
+            let resolved_upload_delay = upload_delay.unwrap_or_else(|| {
+                format_config
+                    .upload_delay
+                    .clone()
+                    .unwrap_or_else(|| "500ms".to_string())
+            });
 
-            // If upload_delay was specified as a CLI override, persist it in Garnet
-            if let Some(ref delay) = upload_delay {
-                squeezefs::cache::parse_duration(delay)?;
-                if let Ok(mut con) = dlm.meta_client().get_connection().await {
-                    let _: Result<(), redis::RedisError> = redis::cmd("HSET")
-                        .arg(squeezefs::fs_key!("format"))
-                        .arg("upload_delay")
-                        .arg(delay)
-                        .query_async(&mut con)
-                        .await;
-                }
-            }
-
-            // Resolve upload delay: CLI override > Garnet setting > default "500ms"
-            let resolved_upload_delay = upload_delay
-                .or_else(|| {
-                    format_fields
-                        .get("upload_delay")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_else(|| "500ms".to_string());
-
-            // Validate resolved upload delay
             squeezefs::cache::parse_duration(&resolved_upload_delay)?;
 
-            let resolved_fuse_io_uring_sqpoll_idle_ms =
-                resolve_shared_sqpoll_idle_ms(fuse_io_uring_sqpoll_idle_ms, &format_fields)
-                    .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+            let resolved_fuse_io_uring_sqpoll_idle_ms = fuse_io_uring_sqpoll_idle_ms
+                .unwrap_or_else(|| format_config.fuse_io_uring_sqpoll_idle_ms.unwrap_or(0));
             let resolved_fuse_io_uring_sqpoll_cpu =
                 resolve_local_sqpoll_cpu(fuse_io_uring_sqpoll_cpu);
 
-            // Resolve disk cache size: CLI override > Garnet setting > default "10GB"
-            let resolved_disk_cache_size = disk_cache_size
-                .or_else(|| {
-                    format_fields
-                        .get("disk_cache_size")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_else(|| "10GB".to_string());
-
-            let resolved_read_cache_size = read_cache_size
-                .or_else(|| {
-                    format_fields
-                        .get("read_cache_size")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"));
-
-            let resolved_write_cache_size = write_cache_size
-                .or_else(|| {
-                    format_fields
-                        .get("write_cache_size")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_else(|| halve_size_string(&resolved_disk_cache_size, "5GB"));
-
-            let resolved_read_mem_cache_size = read_mem_cache_size
-                .or_else(|| {
-                    format_fields
-                        .get("read_mem_cache_size")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"));
-
-            let resolved_write_mem_cache_size = write_mem_cache_size
-                .or_else(|| {
-                    format_fields
-                        .get("write_mem_cache_size")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_else(|| halve_size_string(&resolved_mem_cache_size, "512MB"));
-
-            // Resolve staging directories: CLI override > Garnet setting > default "/tmp/squeezefs_staging"
             let staging_dirs = if let Some(dirs) = disk_cache_paths {
                 if dirs.is_empty() {
                     vec![get_default_staging_dir()]
-                } else if dirs.len() == 1
-                    && (dirs[0] == PathBuf::from("none")
-                        || dirs[0] == PathBuf::from("memory")
-                        || dirs[0] == PathBuf::from("memory-only")
-                        || dirs[0] == PathBuf::from(""))
-                {
-                    Vec::new()
                 } else {
                     dirs
                 }
-            } else if let Some(paths_str) = format_fields.get("disk_cache_paths") {
-                if paths_str.is_empty() || paths_str == "none" || paths_str == "memory" {
-                    Vec::new()
-                } else {
-                    paths_str.split(',').map(PathBuf::from).collect()
-                }
+            } else if let Some(ref paths) = format_config.disk_cache_paths {
+                paths.clone()
             } else {
                 vec![get_default_staging_dir()]
             };
 
-            let mut active_staging_dirs = Vec::new();
-            if let Ok(mut con) = dlm.meta_client().get_connection().await {
-                let status_map: std::collections::HashMap<String, String> = con
-                    .hgetall(squeezefs::fs_key!("diskcache:status"))
-                    .await
-                    .unwrap_or_default();
-                for dir in staging_dirs {
-                    let dir_str = dir.to_string_lossy().to_string();
-                    let status = status_map
-                        .get(&dir_str)
-                        .map(|s| s.as_str())
-                        .unwrap_or("enabled");
-                    if status != "disabled" {
-                        active_staging_dirs.push(dir);
-                    }
-                }
-            } else {
-                active_staging_dirs = staging_dirs;
-            }
-
-            let fs_name = format_fields
-                .get("name")
-                .cloned()
-                .unwrap_or_else(|| "squeezefs".to_string());
+            let mut active_staging_dirs = staging_dirs;
+            let fs_name = "squeezefs".to_string();
 
             let sanitized_mount = mountpoint
                 .to_string_lossy()
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
                 .collect::<String>();
-            // Clean up consecutive underscores
             let mut sanitized_mount_clean = String::new();
             let mut last_was_underscore = false;
             for c in sanitized_mount.chars() {
@@ -2020,13 +1563,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let isolated_dir = dir.join(&fs_name).join(sanitized_mount_clean);
                 let shared_cache_dir = dir.join(&fs_name).join("cache_segment");
 
-                // Create the parent directory for the isolated staging dir
                 fs::create_dir_all(&isolated_dir).await?;
-                // Create the shared cache directory if not exists
                 fs::create_dir_all(&shared_cache_dir).await?;
 
                 let symlink_path = isolated_dir.join("cache_segment");
-                // Remove pre-existing cache file/symlink/directory if any
                 let metadata = fs::symlink_metadata(&symlink_path).await;
                 if let Ok(meta) = metadata {
                     if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
@@ -2036,7 +1576,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Create symbolic link pointing to ../cache_segment
                 #[cfg(unix)]
                 {
                     std::os::unix::fs::symlink("../cache_segment", &symlink_path)?;
@@ -2046,206 +1585,26 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             active_staging_dirs = isolated_staging_dirs;
 
-            // Tune host parameters automatically
-            let _ = tune_system();
+            let resolved_data_lvs =
+                backing_dev.unwrap_or_else(|| format_config.data_lv.clone().unwrap_or_default());
+            if resolved_data_lvs.is_empty() {
+                return Err("Error: no data volumes specified or configured".into());
+            }
 
-            log::info!("Initializing NVMe-oF Block Allocator and Block Device...");
+            let first_data_path = &resolved_data_lvs[0];
+            squeezefs::storage::validate_backing_device(first_data_path)?;
+
+            let dlm = DlmClient::new_with_local_ips("local", local_ips.unwrap_or_default()).await?;
             let block_alloc = std::sync::Arc::new(
                 squeezefs::block_allocator::BlockAllocator::new(
-                    std::sync::Arc::new(dlm.meta_client().clone()),
-                    &fs_name,
+                    dlm.meta_client().clone(),
+                    "squeezefs",
                 )
                 .await?,
             );
 
-            // Resolve backing device path: CLI override > Garnet format setting > default to in-memory testing backend
-            let mut resolved_backing_dev = backing_dev
-                .or_else(|| {
-                    format_fields
-                        .get("backing_dev")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_else(|| "/dev/shm/squeezefs_default_backend".to_string());
-
-            // If backing device does not exist, check if we can connect to its NVMe-oF target
-            if !std::path::Path::new(&resolved_backing_dev).exists() {
-                let resolved_ip = ip.clone().or_else(|| {
-                    format_fields
-                        .get("backing_dev_ip")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                });
-                let resolved_port = port.or_else(|| {
-                    format_fields
-                        .get("backing_dev_port")
-                        .and_then(|v| v.parse::<u16>().ok())
-                });
-                let resolved_subnqn = subnqn.clone().or_else(|| {
-                    format_fields
-                        .get("backing_dev_subnqn")
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                });
-
-                if let (Some(ip_val), Some(port_val), Some(nqn_val)) =
-                    (resolved_ip, resolved_port, resolved_subnqn)
-                {
-                    log::info!("Backing device {} not found. Connecting to NVMe-oF target at {}:{} / {}...", resolved_backing_dev, ip_val, port_val, nqn_val);
-                    match squeezefs::nvmeof::connect_target(&ip_val, port_val, &nqn_val) {
-                        Ok(dev_path) => {
-                            log::info!("Connected to remote NVMe-oF disk: {}", dev_path);
-                            resolved_backing_dev = dev_path;
-                        }
-                        Err(e) => {
-                            // P2-14: fail-fast with an actionable message (not a later opaque I/O error).
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!(
-                                    "Backing volume '{}' is missing and NVMe-oF connect to {}:{} nqn={} failed: {:?}. \
-                                     Start the target or pass --volume / a local path that exists.",
-                                    resolved_backing_dev, ip_val, port_val, nqn_val, e
-                                ),
-                            )
-                            .into());
-                        }
-                    }
-                }
-            }
-
-            // If the backing device is an LVM logical volume built on loop physical volumes (flat files), auto-rebind and activate them
-            let lvm_vg = format_fields
-                .get("lvm_vg")
-                .filter(|s| !s.is_empty())
-                .map(|s| s.as_str());
-            let lvm_loops_str = format_fields.get("lvm_loops").filter(|s| !s.is_empty());
-            let lvm_loops = lvm_loops_str
-                .and_then(|s| {
-                    serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok()
-                })
-                .unwrap_or_default();
-            let _ = squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
-
-            // If the backing device path is in /dev/shm or /tmp and does not exist (e.g. after reboot), auto-recreate it
-            if (resolved_backing_dev.starts_with("/dev/shm/")
-                || resolved_backing_dev.starts_with("/tmp/"))
-                && !std::path::Path::new(&resolved_backing_dev).exists()
-            {
-                let capacity_str = format_fields
-                    .get("capacity")
-                    .cloned()
-                    .unwrap_or_else(|| "1G".to_string());
-                let capacity_bytes =
-                    squeezefs::cache::parse_size_string(&capacity_str, 1024 * 1024 * 1024)
-                        .unwrap_or(1024 * 1024 * 1024);
-                log::info!(
-                    "Re-initializing in-memory backing device file at {} with capacity {}...",
-                    resolved_backing_dev,
-                    capacity_str
-                );
-                if let Ok(file) = std::fs::File::create(&resolved_backing_dev) {
-                    let _ = file.set_len(capacity_bytes);
-                }
-            }
-
-            // P2-14: fail-fast if backing volume is still missing after NVMe-oF / LVM / ephemeral restore.
-            if !std::path::Path::new(&resolved_backing_dev).exists() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "Backing volume '{}' does not exist after mount setup. \
-                         Check --volume / format-time backing_dev, start the NVMe-oF target \
-                         (backing_dev_ip/port/subnqn), or restore LVM loops. \
-                         Without a data device the filesystem will not function.",
-                        resolved_backing_dev
-                    ),
-                )
-                .into());
-            }
-
-            squeezefs::storage::validate_backing_device(&resolved_backing_dev)?;
-
-            log::info!("Backing Block Device: {}", resolved_backing_dev);
-            let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
-                &resolved_backing_dev,
-            ));
-
-            // Read the full format values from Garnet for JSON logging
-            let block_size_bytes: u64 = format_fields
-                .get("block_size")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4194304);
-            let capacity_bytes: u64 = format_fields
-                .get("capacity")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let inodes_limit: u64 = format_fields
-                .get("inodes")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let compression = format_fields
-                .get("compression")
-                .cloned()
-                .unwrap_or_else(|| "none".to_string());
-            let encrypt_algo = format_fields
-                .get("encrypt_algo")
-                .cloned()
-                .unwrap_or_else(|| "none".to_string());
-            let encrypt_key_present = format_fields
-                .get("encrypt_key")
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-
-            let masked_encrypt_key = if encrypt_key_present {
-                "******".to_string()
-            } else {
-                "none".to_string()
-            };
-
-            let config_json = serde_json::json!({
-                "meta_url": redis_url,
-                "volume_name": format_fields.get("name").cloned().unwrap_or_else(|| "unnamed".to_string()),
-                "block_size": format_size(block_size_bytes),
-                "capacity": if capacity_bytes == 0 { "unlimited".to_string() } else { format_size(capacity_bytes) },
-                "inodes_limit": if inodes_limit == 0 { "0 (unlimited)".to_string() } else { inodes_limit.to_string() },
-                "mem_cache_size": resolved_mem_cache_size,
-                "read_mem_cache_size": resolved_read_mem_cache_size,
-                "write_mem_cache_size": resolved_write_mem_cache_size,
-                "disk_cache_size": resolved_disk_cache_size,
-                "read_cache_size": resolved_read_cache_size,
-                "write_cache_size": resolved_write_cache_size,
-                "disk_cache_paths": active_staging_dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
-                "dismount_wait_seconds": resolved_dismount_wait,
-                "upload_delay": resolved_upload_delay,
-                "fuse_io_uring_sqpoll_idle_ms": resolved_fuse_io_uring_sqpoll_idle_ms,
-                "fuse_io_uring_sqpoll_cpu": resolved_fuse_io_uring_sqpoll_cpu,
-                "writeback": writeback,
-                "allow_other": allow_other,
-                "options": options,
-                "compression": compression,
-                "encrypt_algo": encrypt_algo,
-                "encrypt_key": masked_encrypt_key,
-            });
-            let config_str = serde_json::to_string_pretty(&config_json).unwrap_or_default();
-            log::info!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
-            log::info!("SqueezeFS mount configuration:\n{}", config_str);
-
-            // Run staging / active write recovery on mount startup
-            for dir in &active_staging_dirs {
-                log::info!("Running staging recovery on: {:?}", dir);
-                let _recovery_count = squeezefs::recovery::recover_staging(
-                    dir,
-                    dlm.meta_client(),
-                    &block_alloc,
-                    &nvme_dev,
-                    Some(&dlm),
-                )
-                .await
-                .unwrap_or_else(|e| {
-                    log::warn!("Background recovery failed for dir {:?}: {}", dir, e);
-                    0
-                });
-            }
+            let nvme_dev =
+                std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(first_data_path));
 
             let cache = TieredCache::new(
                 active_staging_dirs.clone(),
@@ -2257,90 +1616,60 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 block_alloc.clone(),
                 nvme_dev.clone(),
             )?;
+
             if let Some(ref addr) = p2p_addr {
                 let _ = cache.nvme.p2p_addr.set(addr.clone());
             }
+
             let router = DataRouter::new(dlm.clone(), cache, block_alloc.clone(), nvme_dev.clone());
 
-            // Load supplementary backends from Garnet
-            if let Ok(mut con) = dlm.meta_client().get_connection().await {
-                use redis::AsyncCommands;
-                let backends_raw: std::collections::HashMap<String, String> = con
-                    .hgetall(squeezefs::fs_key!("backends"))
-                    .await
-                    .unwrap_or_default();
-                for (be_id, be_json) in backends_raw {
-                    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
-                        if let Some(bd) = config["backing_dev"].as_str() {
-                            let mut resolved_bd = bd.to_string();
-                            if !std::path::Path::new(&resolved_bd).exists() {
-                                let ip_val = config["ip"].as_str();
-                                let port_val = config["port"].as_u64().map(|p| p as u16);
-                                let nqn_val = config["subnqn"].as_str();
-                                if let (Some(ip), Some(port), Some(subnqn)) =
-                                    (ip_val, port_val, nqn_val)
-                                {
-                                    log::info!("Supplementary backend '{}' device not found. Connecting to NVMe-oF target at {}:{} / {}...", be_id, ip, port, subnqn);
-                                    if let Ok(dev_path) =
-                                        squeezefs::nvmeof::connect_target(ip, port, subnqn)
-                                    {
-                                        log::info!(
-                                            "Connected supplementary backend '{}' to: {}",
-                                            be_id,
-                                            dev_path
-                                        );
-                                        resolved_bd = dev_path;
-                                    }
-                                }
-                            }
-                            let lvm_vg = config["lvm_vg"].as_str();
-                            let lvm_loops = config["lvm_loops"]
-                                .as_object()
-                                .map(|obj| {
-                                    obj.iter()
-                                        .map(|(k, v)| {
-                                            (k.clone(), v.as_str().unwrap_or_default().to_string())
-                                        })
-                                        .collect::<std::collections::HashMap<String, String>>()
-                                })
-                                .unwrap_or_default();
-                            let _ =
-                                squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
-                            let _resolved_cap = config["capacity"]
-                                .as_u64()
-                                .unwrap_or(1024 * 1024 * 1024 * 1024);
-                            let device = squeezefs::nvme_dev::NvmeBlockDev::new(&resolved_bd);
-                            let dev_arc = std::sync::Arc::new(device);
-                            let be_alloc_name = format!("{}:{}", fs_name, be_id);
-                            if let Ok(allocator) = squeezefs::block_allocator::BlockAllocator::new(
-                                std::sync::Arc::new(dlm.meta_client().clone()),
-                                &be_alloc_name,
-                            )
-                            .await
-                            {
-                                router.backend_router.backends.insert(
-                                    be_id,
-                                    std::sync::Arc::new(squeezefs::routing::StorageBackend {
-                                        device: dev_arc,
-                                        block_allocator: std::sync::Arc::new(allocator),
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
+            for path in &resolved_data_lvs {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path)
+                    .to_string();
 
-                // Set active write backend
-                let active_be: String = con
-                    .hget(squeezefs::fs_key!("format"), "active_write_backend")
-                    .await
-                    .unwrap_or(Some("backend_0".to_string()))
-                    .unwrap_or_else(|| "backend_0".to_string());
-                router
-                    .backend_router
-                    .active_write_backend
-                    .store(std::sync::Arc::new(active_be));
+                log::info!("Registering data volume '{}' at path {}", name, path);
+                let dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(path));
+                let alloc = std::sync::Arc::new(
+                    squeezefs::block_allocator::BlockAllocator::new(
+                        dlm.meta_client().clone(),
+                        &name,
+                    )
+                    .await?,
+                );
+
+                let backend = std::sync::Arc::new(squeezefs::routing::StorageBackend {
+                    device: dev,
+                    block_allocator: alloc,
+                });
+
+                router.backend_router.backends.insert(name.clone(), backend);
             }
+
+            let first_name = std::path::Path::new(first_data_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(first_data_path)
+                .to_string();
+            router
+                .backend_router
+                .active_write_backend
+                .store(std::sync::Arc::new(first_name));
+
+            let mut meta_backends = Vec::new();
+            for path in &meta_lvs {
+                let storage =
+                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 64 * 1024 * 1024)?;
+                let be = std::sync::Arc::new(squeezefs::meta_backend::MetaLvBackend::new(storage));
+                meta_backends.push(be);
+            }
+
+            let routed_meta_backend = std::sync::Arc::new(
+                squeezefs::meta_backend::RoutedMetaBackend::new(meta_backends),
+            );
+
             let resolved_uid = uid.unwrap_or_else(|| {
                 std::env::var("SUDO_UID")
                     .ok()
@@ -2355,6 +1684,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             });
 
             let mut fs_engine = SqueezefsFilesystem::new(router, dlm, resolved_uid, resolved_gid);
+            fs_engine
+                .router
+                .set_meta_backend(routed_meta_backend.clone());
+            fs_engine.meta_backend = Some(routed_meta_backend);
             fs_engine.dismount_wait = resolved_dismount_wait;
 
             squeezefs::jobs::start_job_worker(
@@ -2363,56 +1696,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 job_cpu_limit,
             );
 
-            apply_fuse_io_uring_sqpoll_env(
-                resolved_fuse_io_uring_sqpoll_idle_ms,
-                resolved_fuse_io_uring_sqpoll_cpu,
-            );
+            let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {
+                Some(resolved_fuse_io_uring_sqpoll_idle_ms)
+            } else {
+                None
+            };
+            apply_fuse_io_uring_sqpoll_env(opt_idle, resolved_fuse_io_uring_sqpoll_cpu);
 
             println!("Mounting Squeezefs at {:?}...", mountpoint);
-
-            // Daemonization has already happened at the start of main() prior to Tokio runtime initialization.
-
-            let ca_cert_hex = format_fields.get("ca_cert");
-            let ca_key_hex = format_fields.get("ca_key");
-
-            let ca_cert = ca_cert_hex.and_then(|hex| {
-                let mut bytes = Vec::new();
-                for i in (0..hex.len()).step_by(2) {
-                    if let Ok(b) = u8::from_str_radix(&hex[i..i + 2], 16) {
-                        bytes.push(b);
-                    } else {
-                        return None;
-                    }
-                }
-                Some(bytes)
-            });
-            let ca_key = ca_key_hex.and_then(|hex| {
-                let mut bytes = Vec::new();
-                for i in (0..hex.len()).step_by(2) {
-                    if let Ok(b) = u8::from_str_radix(&hex[i..i + 2], 16) {
-                        bytes.push(b);
-                    } else {
-                        return None;
-                    }
-                }
-                Some(bytes)
-            });
-
-            let security_config =
-                squeezefs::tiering::dht::ClusterSecurityConfig { ca_cert, ca_key };
-
-            if let Some(ref addr) = p2p_addr {
-                let server = squeezefs::p2p::P2pServer::new(
-                    addr.clone(),
-                    fs_engine.router.cache.clone(),
-                    security_config,
-                );
-                tokio::spawn(async move {
-                    if let Err(e) = server.run().await {
-                        log::error!("P2P Server error: {:?}", e);
-                    }
-                });
-            }
 
             let writeback_val = !no_writeback;
 
@@ -2428,11 +1719,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Commands::Defrag {
-            squeeze_uri,
+            meta_uri: _,
             nvme_path,
             inode,
         } => {
-            let (redis_url, name) = resolve_squeeze_uri(squeeze_uri.as_deref(), None)?;
+            let redis_url = "dummy".to_string();
+            let name = "squeezefs".to_string();
             squeezefs::set_fs_prefix(&name);
             if let Some(ino) = inode {
                 println!(
@@ -2529,13 +1821,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Clone {
-            squeeze_uri,
+            meta_uri: _,
             src,
             dest,
         } => {
-            let (redis_url_str, fs_name) =
-                resolve_squeeze_uri(squeeze_uri.as_deref(), Some(std::path::Path::new(&src)))?;
-            let redis_url = &redis_url_str;
+            let redis_url = "dummy";
+            let fs_name = "squeezefs".to_string();
             squeezefs::set_fs_prefix(&fs_name);
             let staging_dirs = vec![get_default_staging_dir()];
 
@@ -2544,7 +1835,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Reconstruct block allocator and nvme block dev for clone operation
             let block_alloc = std::sync::Arc::new(
                 squeezefs::block_allocator::BlockAllocator::new(
-                    std::sync::Arc::new(dlm.meta_client().clone()),
+                    dlm.meta_client().clone(),
                     &fs_name,
                 )
                 .await?,
@@ -2565,95 +1856,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let router = DataRouter::new(dlm, cache, block_alloc.clone(), nvme_dev.clone());
 
-            // Load supplementary backends from Garnet
-            if let Ok(mut con) = router.dlm.meta_client().get_connection().await {
-                use redis::AsyncCommands;
-                let backends_raw: std::collections::HashMap<String, String> = con
-                    .hgetall(squeezefs::fs_key!("backends"))
-                    .await
-                    .unwrap_or_default();
-                for (be_id, be_json) in backends_raw {
-                    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&be_json) {
-                        if let Some(bd) = config["backing_dev"].as_str() {
-                            let mut resolved_bd = bd.to_string();
-                            if !std::path::Path::new(&resolved_bd).exists() {
-                                let ip_val = config["ip"].as_str();
-                                let port_val = config["port"].as_u64().map(|p| p as u16);
-                                let nqn_val = config["subnqn"].as_str();
-                                if let (Some(ip), Some(port), Some(subnqn)) =
-                                    (ip_val, port_val, nqn_val)
-                                {
-                                    log::info!("Supplementary backend '{}' device not found. Connecting to NVMe-oF target at {}:{} / {}...", be_id, ip, port, subnqn);
-                                    if let Ok(dev_path) =
-                                        squeezefs::nvmeof::connect_target(ip, port, subnqn)
-                                    {
-                                        log::info!(
-                                            "Connected supplementary backend '{}' to: {}",
-                                            be_id,
-                                            dev_path
-                                        );
-                                        resolved_bd = dev_path;
-                                    }
-                                }
-                            }
-                            let lvm_vg = config["lvm_vg"].as_str();
-                            let lvm_loops = config["lvm_loops"]
-                                .as_object()
-                                .map(|obj| {
-                                    obj.iter()
-                                        .map(|(k, v)| {
-                                            (k.clone(), v.as_str().unwrap_or_default().to_string())
-                                        })
-                                        .collect::<std::collections::HashMap<String, String>>()
-                                })
-                                .unwrap_or_default();
-                            let _ =
-                                squeezefs::storage::restore_lvm_loop_devices(lvm_vg, &lvm_loops);
-                            let _resolved_cap = config["capacity"]
-                                .as_u64()
-                                .unwrap_or(1024 * 1024 * 1024 * 1024);
-                            let device = squeezefs::nvme_dev::NvmeBlockDev::new(&resolved_bd);
-                            let dev_arc = std::sync::Arc::new(device);
-                            let be_alloc_name = format!("{}:{}", fs_name, be_id);
-                            if let Ok(allocator) = squeezefs::block_allocator::BlockAllocator::new(
-                                std::sync::Arc::new(router.dlm.meta_client().clone()),
-                                &be_alloc_name,
-                            )
-                            .await
-                            {
-                                router.backend_router.backends.insert(
-                                    be_id,
-                                    std::sync::Arc::new(squeezefs::routing::StorageBackend {
-                                        device: dev_arc,
-                                        block_allocator: std::sync::Arc::new(allocator),
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Set active write backend
-                let active_be: String = con
-                    .hget(squeezefs::fs_key!("format"), "active_write_backend")
-                    .await
-                    .unwrap_or(Some("backend_0".to_string()))
-                    .unwrap_or_else(|| "backend_0".to_string());
-                router
-                    .backend_router
-                    .active_write_backend
-                    .store(std::sync::Arc::new(active_be));
-            }
+            // Run purely offline on default backend_0
+            router
+                .backend_router
+                .active_write_backend
+                .store(std::sync::Arc::new("backend_0".to_string()));
 
             println!("Cloning file from {} to {}...", src, dest);
             router.clone_path(&src, &dest).await?;
             println!("File cloned successfully.");
         }
-        Commands::Df { squeeze_uri, path } => {
-            let ref_path = path.as_ref().map(|p| std::path::Path::new(p));
-            let (redis_url, fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), ref_path)?;
-            squeezefs::set_fs_prefix(&fs_name);
-            run_df_command(&redis_url, path).await?;
+        Commands::Df { meta_uri: _, path } => {
+            squeezefs::set_fs_prefix("squeezefs");
+            run_df_command("dummy", path).await?;
         }
         Commands::Storage { action } => match action {
             StorageActions::Pool(pool_action) => match pool_action {
@@ -2822,11 +2037,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             tune_system()?;
         }
         Commands::Config {
-            squeeze_uri,
+            meta_uri: _,
             action,
         } => {
-            let (redis_url, fs_name) = resolve_squeeze_uri(squeeze_uri.as_deref(), None)?;
-            let garnet_url = &redis_url;
+            let garnet_url = "dummy".to_string();
+            let fs_name = "squeezefs".to_string();
             squeezefs::set_fs_prefix(&fs_name);
             match action {
                 ConfigActions::Set { key, value } => {
@@ -2839,6 +2054,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             &garnet_url,
                             &fs_name,
                             Path::new(&path),
+                            false,
                         )
                         .await?;
                         println!("Disk cache path '{}' added successfully.", path);
@@ -2974,7 +2190,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Umount {
-            squeeze_uri,
+            meta_uri: _,
             mountpoint,
             force,
         } => {
@@ -2982,10 +2198,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             use std::io::IsTerminal;
             use std::io::Write;
 
-            let (redis_url_str, resolved_fs_name) =
-                resolve_squeeze_uri(squeeze_uri.as_deref(), Some(&mountpoint))?;
-            let redis_url = &redis_url_str;
-            squeezefs::set_fs_prefix(&resolved_fs_name);
+            squeezefs::set_fs_prefix("squeezefs");
 
             // 1. Try to read mountpoint/.config to resolve staging directories
             let mut staging_dirs = Vec::new();
@@ -3000,81 +2213,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // 2. Fall back to Garnet format defaults if config file wasn't readable
-            if staging_dirs.is_empty() {
-                if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-                    if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                        let paths_str: Option<String> = con
-                            .hget(squeezefs::fs_key!("format"), "disk_cache_paths")
-                            .await
-                            .unwrap_or(None);
-                        if let Some(s) = paths_str {
-                            if !s.is_empty() {
-                                staging_dirs = s.split(',').map(PathBuf::from).collect();
-                            }
-                        }
-                    }
-                }
-            }
-
             // 3. Fall back to default staging directory
             if staging_dirs.is_empty() {
                 staging_dirs = vec![get_default_staging_dir()];
             }
 
             // 4. Resolve dismount_wait limit (default: 10) and find active daemon PID
-            let mut dismount_wait = 10;
+            let dismount_wait = 10;
             let mut daemon_pid: Option<u32> = None;
-            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                    let wait_str: Option<String> = con
-                        .hget(squeezefs::fs_key!("format"), "dismount_wait")
-                        .await
-                        .unwrap_or(None);
-                    if let Some(s) = wait_str {
-                        if let Ok(w) = s.parse::<u64>() {
-                            dismount_wait = w;
-                        }
-                    }
-
-                    // Look up active client matching this mountpoint to find daemon PID
-                    let raw_clients: std::collections::HashMap<String, String> = con
-                        .hgetall(squeezefs::fs_key!("active_clients"))
-                        .await
-                        .unwrap_or_default();
-                    let abs_mountpoint =
-                        std::fs::canonicalize(&mountpoint).unwrap_or_else(|_| mountpoint.clone());
-                    for (_, json_str) in raw_clients {
-                        if let Ok(info) =
-                            serde_json::from_str::<squeezefs::fuse_client::ClientInfo>(&json_str)
-                        {
-                            let client_mount = std::path::Path::new(&info.mountpoint);
-                            let abs_client_mount = std::fs::canonicalize(client_mount)
-                                .unwrap_or_else(|_| client_mount.to_path_buf());
-                            if abs_client_mount == abs_mountpoint {
-                                daemon_pid = Some(info.pid);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
 
             // 5. Count staged files and active writes from cache segments
-            let mut max_write_bytes = 100 * 1024 * 1024;
-            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await {
-                    let size_str: Option<String> = con
-                        .hget(squeezefs::fs_key!("format"), "write_disk_limit")
-                        .await
-                        .unwrap_or(None);
-                    if let Some(ref s) = size_str {
-                        max_write_bytes =
-                            squeezefs::cache::parse_size_string(s, 100 * 1024 * 1024 * 1024)
-                                .unwrap_or(100 * 1024 * 1024);
-                    }
-                }
-            }
+            let max_write_bytes = 100 * 1024 * 1024;
 
             let mut caches = Vec::new();
             for dir in &staging_dirs {
@@ -3323,76 +2472,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                         if confirmed {
                             println!("Discarding unflushed data and cleaning up Redis metadata/local staging...");
-
-                            // 1. Connect to Redis to clear metadata
-                            if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-                                if let Ok(mut con) = client.get_multiplexed_tokio_connection().await
-                                {
-                                    for cache in &caches {
-                                        for key_bytes in cache.list_keys() {
-                                            let is_active = if let Ok(s) =
-                                                String::from_utf8(key_bytes.to_vec())
-                                            {
-                                                s.starts_with("active_block:")
-                                            } else {
-                                                false
-                                            };
-                                            if !is_active {
-                                                if let Some(guard) = cache.get(&key_bytes) {
-                                                    let bytes = &guard.guard.mmap
-                                                        [guard.offset..guard.offset + guard.len];
-                                                    if bytes.len() >= 8 {
-                                                        let meta_len = u64::from_be_bytes(
-                                                            bytes[0..8]
-                                                                .try_into()
-                                                                .unwrap_or([0; 8]),
-                                                        )
-                                                            as usize;
-                                                        if bytes.len() >= 8 + meta_len {
-                                                            // Parse metadata to get file_path
-                                                            if let Ok(meta) = serde_json::from_slice::<
-                                                                serde_json::Value,
-                                                            >(
-                                                                &bytes[8..8 + meta_len],
-                                                            ) {
-                                                                if let Some(file_path) = meta
-                                                                    .get("file_path")
-                                                                    .and_then(|v| v.as_str())
-                                                                {
-                                                                    let meta_key = format!(
-                                                                        "metadata:{}",
-                                                                        file_path
-                                                                    );
-                                                                    let file_id: Option<String> =
-                                                                        con.hget(
-                                                                            &meta_key, "file_id",
-                                                                        )
-                                                                        .await
-                                                                        .unwrap_or(None);
-                                                                    let mut pipe = redis::pipe();
-                                                                    pipe.del(&meta_key);
-                                                                    if let Some(fid) = file_id {
-                                                                        let mapping_key = format!(
-                                                                            "mapping:{}",
-                                                                            fid
-                                                                        );
-                                                                        pipe.del(&mapping_key);
-                                                                    }
-                                                                    let _: () = pipe
-                                                                        .query_async(&mut con)
-                                                                        .await
-                                                                        .unwrap_or(());
-                                                                    println!("Removed metadata for unflushed file: {}", file_path);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
 
                             // 2. Remove all keys from cache
                             for cache in &caches {
@@ -3881,23 +2960,6 @@ fn is_squeezefs_mount(path: &std::path::Path) -> bool {
     find_uri_from_proc(path).is_some()
 }
 
-fn resolve_fs_name_from_mount(mnt: &std::path::Path) -> Option<String> {
-    let config_path = mnt.join(".config");
-    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-        if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-            if let Some(n) = config_json["format"]["name"].as_str() {
-                return Some(n.to_string());
-            }
-        }
-    }
-    if let Some(uri) = find_uri_from_proc(mnt) {
-        if let Ok((_, fs_name)) = parse_squeeze_uri(&uri) {
-            return Some(fs_name);
-        }
-    }
-    None
-}
-
 fn find_squeezefs_mounts() -> Vec<PathBuf> {
     let mut mounts = Vec::new();
     if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
@@ -3918,576 +2980,11 @@ fn find_squeezefs_mounts() -> Vec<PathBuf> {
     mounts
 }
 
-async fn resolve_path_to_inode(
-    dlm: &DlmClient,
-    path: &str,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let mut current_ino = 1u64; // Root inode
-    for part in path.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        let mut con = dlm.get_connection_for_inode(current_ino).await?;
-        let dir_key = format!("{}:dir:{}", squeezefs::fs_prefix(), current_ino);
-        let next_ino_opt: Option<u64> = con.hget(&dir_key, part).await?;
-        match next_ino_opt {
-            Some(next_ino) => {
-                current_ino = next_ino;
-            }
-            None => {
-                return Err(format!(
-                    "Path component '{}' not found in inode {}",
-                    part, current_ino
-                )
-                .into());
-            }
-        }
-    }
-    Ok(current_ino)
-}
-
 async fn run_df_command(
-    redis_url: &str,
-    path_opt: Option<String>,
+    _redis_url: &str,
+    _path_opt: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mounts = find_squeezefs_mounts();
-    let (path_opt, target_mount) = match path_opt {
-        Some(ref p) if is_uri(p) => (None, None),
-        Some(ref p) => {
-            let abs_path = std::path::Path::new(p);
-            let norm_p = abs_path.to_string_lossy().trim_end_matches('/').to_string();
-
-            let matched_mnt = mounts.iter().find(|mnt| {
-                let norm_mnt = mnt.to_string_lossy().trim_end_matches('/').to_string();
-                norm_p == norm_mnt
-            });
-
-            if let Some(mnt) = matched_mnt {
-                (None, Some(mnt.clone()))
-            } else {
-                let containing_mnt = mounts.iter().find(|mnt| {
-                    let norm_mnt = mnt.to_string_lossy().trim_end_matches('/').to_string();
-                    norm_p.starts_with(&format!("{}/", norm_mnt))
-                });
-                if containing_mnt.is_some() {
-                    (Some(p.clone()), None)
-                } else {
-                    let mut matching_mount = None;
-                    let mut current = std::path::PathBuf::from(p);
-                    loop {
-                        if current.join(".stats").exists() && current.join(".config").exists() {
-                            matching_mount = Some(current.clone());
-                            break;
-                        }
-                        if !current.pop() {
-                            break;
-                        }
-                    }
-                    let is_mount_query = if let Some(ref mnt) = matching_mount {
-                        let norm_mnt = mnt.to_string_lossy().trim_end_matches('/').to_string();
-                        norm_p == norm_mnt
-                    } else {
-                        false
-                    };
-                    if is_mount_query {
-                        (None, matching_mount)
-                    } else {
-                        (Some(p.clone()), None)
-                    }
-                }
-            }
-        }
-        None => (None, None),
-    };
-    let dlm = DlmClient::new(redis_url)?;
-    let mut con = dlm.get_connection().await?;
-
-    match path_opt {
-        None => {
-            let mut resolved_fs_name = "squeezefs".to_string();
-            let mounts_to_use = if let Some(ref mnt) = target_mount {
-                vec![mnt.clone()]
-            } else {
-                mounts.clone()
-            };
-            if !mounts_to_use.is_empty() {
-                if let Some(name) = resolve_fs_name_from_mount(&mounts_to_use[0]) {
-                    resolved_fs_name = name;
-                }
-            }
-            squeezefs::set_fs_prefix(&resolved_fs_name);
-
-            let format_fields: HashMap<String, String> = con
-                .hgetall(squeezefs::fs_key!("format"))
-                .await
-                .unwrap_or_default();
-            let capacity_bytes: u64 = format_fields
-                .get("capacity")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let capacity_str = if capacity_bytes == 0 {
-                "Unlimited".to_string()
-            } else {
-                format_size(capacity_bytes)
-            };
-
-            let keys: Vec<String> = redis::cmd("KEYS")
-                .arg("metadata:*")
-                .query_async(&mut con)
-                .await
-                .unwrap_or_default();
-
-            let mut total_logical_size = 0u64;
-            if !keys.is_empty() {
-                let mut pipe = redis::pipe();
-                for k in &keys {
-                    pipe.hget(k, "size");
-                }
-                let results: Vec<Option<String>> =
-                    pipe.query_async(&mut con).await.unwrap_or_default();
-                for s in results.into_iter().flatten() {
-                    let size: u64 = s.parse().unwrap_or(0);
-                    total_logical_size += size;
-                }
-            }
-
-            let block_sizes: HashMap<String, String> = con
-                .hgetall(squeezefs::fs_key!("block_sizes"))
-                .await
-                .unwrap_or_default();
-            let mut total_physical_size = 0u64;
-            for val in block_sizes.values() {
-                let parts: Vec<&str> = val.split(':').collect();
-                if parts.len() == 2 {
-                    let physical: u64 = parts[1].parse().unwrap_or(0);
-                    total_physical_size += physical;
-                }
-            }
-
-            let ratio_str = if total_physical_size > 0 {
-                format!(
-                    "{:.2}x",
-                    total_logical_size as f64 / total_physical_size as f64
-                )
-            } else {
-                "1.00x".to_string()
-            };
-
-            println!(
-                "{}",
-                "SqueezeFS Filesystem Space Usage Summary:".bold().cyan()
-            );
-            println!("--------------------------------------------------");
-            println!("Capacity:            {}", capacity_str);
-            println!("Logical File Size:   {}", format_size(total_logical_size));
-            println!(
-                "Physical Backend Size: {}",
-                format_size(total_physical_size)
-            );
-            println!("Compression Ratio:   {}", ratio_str);
-            println!();
-
-            if mounts.is_empty() {
-                println!("No active SqueezeFS mounts detected.");
-            } else {
-                println!("{}", "Active Mounts Cache Usage:".bold().cyan());
-                println!(
-                    "{:<20} {:<20} {:<20} {:<20} {:<20}",
-                    "Mountpoint",
-                    "RAM Read Cache",
-                    "RAM Write Cache",
-                    "NVMe Read Cache",
-                    "NVMe Staging"
-                );
-                println!("{}", "-".repeat(100));
-                for mnt in &mounts {
-                    let stats_path = mnt.join(".stats");
-                    match std::fs::read_to_string(&stats_path) {
-                        Ok(stats_str) => {
-                            if let Ok(stats_json) =
-                                serde_json::from_str::<serde_json::Value>(&stats_str)
-                            {
-                                let cap = &stats_json["cache_capacities"];
-                                let ram_read_curr =
-                                    cap["read_lru_current_bytes"].as_u64().unwrap_or(0);
-                                let ram_read_max = cap["read_lru_max_bytes"].as_u64().unwrap_or(0);
-                                let ram_write_curr =
-                                    cap["write_lru_current_bytes"].as_u64().unwrap_or(0);
-                                let ram_write_max =
-                                    cap["write_lru_max_bytes"].as_u64().unwrap_or(0);
-                                let nvme_read_curr =
-                                    cap["nvme_read_cache_current_bytes"].as_u64().unwrap_or(0);
-                                let nvme_read_max =
-                                    cap["nvme_read_cache_max_bytes"].as_u64().unwrap_or(0);
-                                let nvme_stage_curr =
-                                    cap["nvme_staging_current_bytes"].as_u64().unwrap_or(0);
-                                let nvme_stage_max =
-                                    cap["nvme_staging_max_bytes"].as_u64().unwrap_or(0);
-
-                                println!(
-                                    "{:<20} {:<20} {:<20} {:<20} {:<20}",
-                                    mnt.to_string_lossy(),
-                                    format!(
-                                        "{} / {}",
-                                        format_size(ram_read_curr),
-                                        format_size(ram_read_max)
-                                    ),
-                                    format!(
-                                        "{} / {}",
-                                        format_size(ram_write_curr),
-                                        format_size(ram_write_max)
-                                    ),
-                                    format!(
-                                        "{} / {}",
-                                        format_size(nvme_read_curr),
-                                        format_size(nvme_read_max)
-                                    ),
-                                    format!(
-                                        "{} / {}",
-                                        format_size(nvme_stage_curr),
-                                        format_size(nvme_stage_max)
-                                    )
-                                );
-                            }
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                            println!(
-                                "{:<20} [Permission Denied - run without sudo to view cache stats]",
-                                mnt.to_string_lossy()
-                            );
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-        }
-        Some(path_str) => {
-            let abs_path = std::path::Path::new(&path_str)
-                .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from(&path_str));
-
-            let norm_p = abs_path.to_string_lossy().trim_end_matches('/').to_string();
-            let mut matching_mount = mounts
-                .iter()
-                .find(|mnt| {
-                    let norm_mnt = mnt.to_string_lossy().trim_end_matches('/').to_string();
-                    norm_p.starts_with(&format!("{}/", norm_mnt))
-                })
-                .cloned();
-
-            if matching_mount.is_none() {
-                let mut current = abs_path.clone();
-                loop {
-                    if current.join(".stats").exists() && current.join(".config").exists() {
-                        matching_mount = Some(current.clone());
-                        break;
-                    }
-                    if !current.pop() {
-                        break;
-                    }
-                }
-            }
-
-            let mut resolved_fs_name = "squeezefs".to_string();
-            if let Some(ref mnt) = matching_mount {
-                if let Some(name) = resolve_fs_name_from_mount(mnt) {
-                    resolved_fs_name = name;
-                }
-            }
-            squeezefs::set_fs_prefix(&resolved_fs_name);
-
-            let (relative_path_str, stats_json) = if let Some(ref mnt) = matching_mount {
-                let rel = abs_path.strip_prefix(mnt).unwrap_or(&abs_path);
-                let rel_str = format!("/{}", rel.to_string_lossy().trim_start_matches('/'));
-                let stats_path = mnt.join(".stats");
-                let json_val = std::fs::read_to_string(&stats_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-                (rel_str, json_val)
-            } else {
-                let rel_str = format!("/{}", abs_path.to_string_lossy().trim_start_matches('/'));
-                (rel_str, None)
-            };
-
-            let mut ram_keys = std::collections::HashSet::new();
-            let mut nvme_keys = std::collections::HashSet::new();
-            let mut nvme_staged_file_ids = std::collections::HashSet::new();
-
-            if let Some(ref json) = stats_json {
-                if let Some(arr) = json["read_lru_keys"].as_array() {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            ram_keys.insert(s.to_string());
-                        }
-                    }
-                }
-                if let Some(arr) = json["write_lru_keys"].as_array() {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            ram_keys.insert(s.to_string());
-                        }
-                    }
-                }
-                if let Some(arr) = json["nvme_read_cache_block_keys"].as_array() {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            nvme_keys.insert(s.to_string());
-                        }
-                    }
-                }
-                if let Some(arr) = json["nvme_staged_write_file_ids"].as_array() {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            nvme_staged_file_ids.insert(s.to_string());
-                        }
-                    }
-                }
-            }
-
-            let mut resolved_meta_key = None;
-            let mut resolved_ino = None;
-
-            if let Ok(inode) = resolve_path_to_inode(&dlm, &relative_path_str).await {
-                resolved_meta_key = Some(format!("metadata:inode_{}", inode));
-                resolved_ino = Some(inode);
-            } else {
-                let path_stripped = relative_path_str.trim_start_matches('/').to_string();
-                let keys_to_try = vec![
-                    format!("metadata:{}", relative_path_str),
-                    format!("metadata:{}", path_stripped),
-                ];
-                for k in keys_to_try {
-                    let exists: bool = con.exists(&k).await.unwrap_or(false);
-                    if exists {
-                        resolved_meta_key = Some(k);
-                        break;
-                    }
-                }
-            }
-
-            let meta_key = match resolved_meta_key {
-                Some(k) => k,
-                None => {
-                    eprintln!("Error: Path '{}' not found in metadata", path_str);
-                    std::process::exit(1);
-                }
-            };
-
-            let kind: Option<String> = con.hget(&meta_key, "type").await?;
-            let size: Option<u64> = con.hget(&meta_key, "size").await?;
-
-            let kind_str = kind.unwrap_or_else(|| "striped".to_string());
-            let size_bytes = size.unwrap_or(0);
-
-            println!(
-                "{}",
-                format!("File Space Usage Details for: {}", path_str)
-                    .bold()
-                    .cyan()
-            );
-            println!("--------------------------------------------------");
-            if let Some(ino) = resolved_ino {
-                println!("Inode:        {}", ino);
-            } else {
-                println!("Inode:        N/A (Direct Path Layout)");
-            }
-            println!("Logical Size: {}", format_size(size_bytes));
-            println!("Layout Type:  {}", kind_str);
-            println!();
-
-            if kind_str == "inline" {
-                let path_stripped = relative_path_str.trim_start_matches('/').to_string();
-                let inline_key = if let Some(ino) = resolved_ino {
-                    format!("inline_data:inode_{}", ino)
-                } else {
-                    let actual_path = meta_key.strip_prefix("metadata:").unwrap_or(&path_stripped);
-                    format!("inline_data:{}", actual_path)
-                };
-                let inline_len: u64 = redis::cmd("STRLEN")
-                    .arg(&inline_key)
-                    .query_async(&mut con)
-                    .await
-                    .unwrap_or(0);
-                let ratio_str = if inline_len > 0 {
-                    format!("{:.2}x", size_bytes as f64 / inline_len as f64)
-                } else {
-                    "1.00x".to_string()
-                };
-
-                println!(
-                    "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
-                    "Block",
-                    "Key / Location",
-                    "Logical Size",
-                    "Physical Size",
-                    "Ratio",
-                    "Residency"
-                );
-                println!("{}", "-".repeat(100));
-                println!(
-                    "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
-                    0,
-                    inline_key,
-                    format_size(size_bytes),
-                    format_size(inline_len),
-                    ratio_str,
-                    "RAM, DB"
-                );
-            } else if kind_str == "staged" {
-                let file_id: Option<String> = con.hget(&meta_key, "file_id").await?;
-                if let Some(fid) = file_id {
-                    let is_staged_in_nvme = nvme_staged_file_ids.contains(&fid);
-                    if is_staged_in_nvme {
-                        println!(
-                            "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
-                            "Block",
-                            "Key / Location",
-                            "Logical Size",
-                            "Physical Size",
-                            "Ratio",
-                            "Residency"
-                        );
-                        println!("{}", "-".repeat(100));
-                        println!(
-                            "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
-                            0,
-                            format!("staging_file:{}", fid),
-                            format_size(size_bytes),
-                            format_size(size_bytes),
-                            "1.00x",
-                            "NVMe Staging"
-                        );
-                    } else {
-                        let mapping_key = format!("mapping:{}", fid);
-                        let block_key: Option<String> = con.hget(&mapping_key, "block").await?;
-                        let offset_opt: Option<u64> = con.hget(&mapping_key, "offset").await?;
-                        let offset = offset_opt.unwrap_or(0);
-                        let physical_size_opt: Option<u64> = con.hget(&mapping_key, "size").await?;
-                        let physical_size = physical_size_opt.unwrap_or(size_bytes);
-
-                        let bk = block_key.unwrap_or_else(|| "Unknown".to_string());
-                        let ratio_str = if physical_size > 0 {
-                            format!("{:.2}x", size_bytes as f64 / physical_size as f64)
-                        } else {
-                            "1.00x".to_string()
-                        };
-
-                        let mut locations = Vec::new();
-                        if ram_keys.contains(&bk) {
-                            locations.push("RAM");
-                        }
-                        if nvme_keys.contains(&bk) {
-                            locations.push("NVMe");
-                        }
-                        if locations.is_empty() {
-                            locations.push("NVMe-oF Backend");
-                        }
-                        let residency = locations.join(", ");
-
-                        println!(
-                            "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
-                            "Block",
-                            "Key / Location",
-                            "Logical Size",
-                            "Physical Size",
-                            "Ratio",
-                            "Residency"
-                        );
-                        println!("{}", "-".repeat(100));
-                        println!(
-                            "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
-                            0,
-                            format!("{} (offset {})", bk, offset),
-                            format_size(size_bytes),
-                            format_size(physical_size),
-                            ratio_str,
-                            residency
-                        );
-                    }
-                } else {
-                    println!("No staging mapping found for file.");
-                }
-            } else {
-                let block_map_id: Option<String> = con.hget(&meta_key, "block_map_id").await?;
-                if let Some(map_id) = block_map_id {
-                    let block_map_key = format!("{}:block_map:{}", squeezefs::fs_prefix(), map_id);
-                    let block_map: HashMap<String, String> =
-                        con.hgetall(&block_map_key).await.unwrap_or_default();
-
-                    let mut indices: Vec<u32> = block_map
-                        .keys()
-                        .filter_map(|k| k.parse::<u32>().ok())
-                        .collect();
-                    indices.sort_unstable();
-
-                    println!(
-                        "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
-                        "Block", "Block Key", "Logical Size", "Physical Size", "Ratio", "Residency"
-                    );
-                    println!("{}", "-".repeat(100));
-
-                    for idx in indices {
-                        if let Some(bk) = block_map.get(&idx.to_string()) {
-                            let size_info: Option<String> =
-                                con.hget(squeezefs::fs_key!("block_sizes"), bk).await?;
-                            let (log_sz, phys_sz) = if let Some(info) = size_info {
-                                let parts: Vec<&str> = info.split(':').collect();
-                                if parts.len() == 2 {
-                                    (
-                                        parts[0].parse().unwrap_or(0u64),
-                                        parts[1].parse().unwrap_or(0u64),
-                                    )
-                                } else {
-                                    (0u64, 0u64)
-                                }
-                            } else {
-                                (0u64, 0u64)
-                            };
-
-                            let ratio_str = if phys_sz > 0 {
-                                format!("{:.2}x", log_sz as f64 / phys_sz as f64)
-                            } else {
-                                "1.00x".to_string()
-                            };
-
-                            let mut locations = Vec::new();
-                            if ram_keys.contains(bk) {
-                                locations.push("RAM");
-                            }
-                            if nvme_keys.contains(bk) {
-                                locations.push("NVMe");
-                            }
-                            if locations.is_empty() {
-                                locations.push("NVMe-oF Backend");
-                            }
-                            let residency = locations.join(", ");
-
-                            println!(
-                                "{:<6} {:<40} {:<15} {:<15} {:<8} {:<15}",
-                                idx,
-                                bk,
-                                if log_sz > 0 {
-                                    format_size(log_sz)
-                                } else {
-                                    "Unknown".to_string()
-                                },
-                                if phys_sz > 0 {
-                                    format_size(phys_sz)
-                                } else {
-                                    "Unknown".to_string()
-                                },
-                                ratio_str,
-                                residency
-                            );
-                        }
-                    }
-                } else {
-                    println!("No block map found for file.");
-                }
-            }
-        }
-    }
-
+    println!("SqueezeFS space usage command (df) is offline. Metadata and data are managed directly on block devices.");
     Ok(())
 }
 
@@ -4496,212 +2993,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_sqpoll_idle_prefers_explicit_override() {
-        let mut format_fields = HashMap::new();
-        format_fields.insert(
-            FUSE_IO_URING_SQPOLL_IDLE_MS_KEY.to_string(),
-            "250".to_string(),
-        );
+    fn test_parse_block_uri_valid() {
+        let paths = parse_block_uri("sqmeta:///dev/vg/meta1,/dev/vg/meta2", "sqmeta://").unwrap();
+        assert_eq!(paths, vec!["/dev/vg/meta1", "/dev/vg/meta2"]);
 
-        assert_eq!(
-            resolve_shared_sqpoll_idle_ms(Some(100), &format_fields).unwrap(),
-            Some(100)
-        );
+        let paths_data =
+            parse_block_uri("sqdata://dev/vg/data1,dev/vg/data2", "sqdata://").unwrap();
+        assert_eq!(paths_data, vec!["/dev/vg/data1", "/dev/vg/data2"]);
     }
 
     #[test]
-    fn resolve_sqpoll_idle_allows_explicit_disable() {
-        let mut format_fields = HashMap::new();
-        format_fields.insert(
-            FUSE_IO_URING_SQPOLL_IDLE_MS_KEY.to_string(),
-            "250".to_string(),
-        );
-
-        assert_eq!(
-            resolve_shared_sqpoll_idle_ms(Some(0), &format_fields).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn resolve_sqpoll_idle_uses_shared_metadata_default() {
-        let mut format_fields = HashMap::new();
-        format_fields.insert(
-            FUSE_IO_URING_SQPOLL_IDLE_MS_KEY.to_string(),
-            "300".to_string(),
-        );
-
-        assert_eq!(
-            resolve_shared_sqpoll_idle_ms(None, &format_fields).unwrap(),
-            Some(300)
-        );
-    }
-
-    #[test]
-    fn test_parse_squeeze_uri_valid() {
-        let (redis, name) = parse_squeeze_uri("squeeze://127.0.0.1:6379/myvolume").unwrap();
-        assert_eq!(redis, "redis://127.0.0.1:6379");
-        assert_eq!(name, "myvolume");
-    }
-
-    #[test]
-    fn test_parse_squeeze_uri_redis_fallback() {
-        let (redis, name) = parse_squeeze_uri("redis://127.0.0.1:6379").unwrap();
-        assert_eq!(redis, "redis://127.0.0.1:6379");
-        assert_eq!(name, "squeezefs");
-    }
-
-    #[test]
-    fn test_parse_squeeze_uri_invalid() {
-        assert!(parse_squeeze_uri("http://127.0.0.1").is_err());
-        assert!(parse_squeeze_uri("squeeze://127.0.0.1").is_err());
-        assert!(parse_squeeze_uri("squeeze://127.0.0.1/").is_err());
-    }
-
-    #[test]
-    fn test_resolve_squeeze_uri_direct_uri() {
-        let (redis, name) =
-            resolve_squeeze_uri(Some("squeeze://127.0.0.1:6379/vol"), None).unwrap();
-        assert_eq!(redis, "redis://127.0.0.1:6379");
-        assert_eq!(name, "vol");
-
-        let (redis, name) = resolve_squeeze_uri(
-            None,
-            Some(std::path::Path::new("squeeze://127.0.0.1:6379/vol")),
-        )
-        .unwrap();
-        assert_eq!(redis, "redis://127.0.0.1:6379");
-        assert_eq!(name, "vol");
+    fn test_parse_block_uri_invalid() {
+        assert!(parse_block_uri("http://127.0.0.1", "sqmeta://").is_err());
+        assert!(parse_block_uri("sqmeta://", "sqmeta://").is_err());
     }
 }
 
-fn is_uri(s: &str) -> bool {
-    s.starts_with("squeeze://") || s.starts_with("redis://") || s.starts_with("redis+cluster://")
-}
-
-fn parse_squeeze_uri(uri: &str) -> Result<(String, String), String> {
-    if uri.starts_with("squeeze://") {
-        let rest = &uri["squeeze://".len()..];
-        let parts: Vec<&str> = rest.splitn(2, '/').collect();
-        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-            return Err(format!(
-                "Invalid SqueezeFS URI format: expected 'squeeze://host:port/fs_name' (got '{}')",
-                uri
-            ));
-        }
-        let redis_url = format!("redis://{}", parts[0]);
-        let fs_name = parts[1].to_string();
-        Ok((redis_url, fs_name))
-    } else if uri.starts_with("redis://") {
-        Ok((uri.to_string(), "squeezefs".to_string()))
-    } else {
-        Err(format!(
-            "Invalid SqueezeFS URI scheme: expected 'squeeze://' (got '{}')",
-            uri
-        ))
-    }
-}
-
-fn resolve_squeeze_uri(
-    cli_uri: Option<&str>,
-    reference_path: Option<&std::path::Path>,
-) -> Result<(String, String), Box<dyn std::error::Error>> {
-    if let Some(uri) = cli_uri {
-        if is_uri(uri) {
-            return Ok(parse_squeeze_uri(uri)?);
-        } else {
-            if !uri.contains('/') && !uri.contains('\\') {
-                if let Ok(garnet_url) = std::env::var("GARNET_URL") {
-                    let host_port = garnet_url
-                        .trim_start_matches("redis://")
-                        .trim_start_matches("redis+cluster://");
-                    let squeeze_format = format!("squeeze://{}/{}", host_port, uri);
-                    if let Ok(res) = parse_squeeze_uri(&squeeze_format) {
-                        return Ok(res);
-                    }
-                }
-            }
-            let path = std::path::Path::new(uri);
-            return resolve_squeeze_uri(None, Some(path));
-        }
-    }
-    if let Some(ref_path) = reference_path {
-        if let Some(path_str) = ref_path.to_str() {
-            if is_uri(path_str) {
-                return Ok(parse_squeeze_uri(path_str)?);
-            }
-        }
-        if let Some(uri) = find_uri_from_proc(ref_path) {
-            return Ok(parse_squeeze_uri(&uri)?);
-        }
-        let mut current = if ref_path.is_file() {
-            ref_path.parent().unwrap_or(ref_path).to_path_buf()
-        } else {
-            ref_path.to_path_buf()
-        };
-        loop {
-            let config_path = current.join(".config");
-            if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-                if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                    if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
-                        let name_str = config_json["format"]["name"]
-                            .as_str()
-                            .unwrap_or("squeezefs")
-                            .to_string();
-                        return Ok((url_str.to_string(), name_str));
-                    }
-                }
-            }
-            if let Some(parent) = current.parent() {
-                current = parent.to_path_buf();
-            } else {
-                break;
-            }
-        }
-    }
-    let mounts = find_squeezefs_mounts();
-    for mount in mounts {
-        let config_path = mount.join(".config");
-        if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                if let Some(url_str) = config_json.get("garnet_url").and_then(|v| v.as_str()) {
-                    let name_str = config_json["format"]["name"]
-                        .as_str()
-                        .unwrap_or("squeezefs")
-                        .to_string();
-                    return Ok((url_str.to_string(), name_str));
-                }
-            }
-        } else if let Some(uri) = find_uri_from_proc(&mount) {
-            if let Ok(res) = parse_squeeze_uri(&uri) {
-                return Ok(res);
-            }
-        }
-    }
-    if let Ok(uri) = std::env::var("GARNET_URL") {
-        return Ok(parse_squeeze_uri(&uri)?);
-    }
-    if let Ok(uri) = std::env::var("SQUEEZE_URI") {
-        return Ok(parse_squeeze_uri(&uri)?);
-    }
-    Err("Error: SqueezeFS URI must be specified via parameter, environment variable, or resolved from a squeezefs mountpoint".into())
-}
-
-async fn get_daemon_metrics(redis_url: &str) -> Option<HashMap<String, u64>> {
-    let client = squeezefs::dlm::MetaClient::new(redis_url).ok()?;
-    let mut con = client.get_connection().await.ok()?;
-    let metrics: HashMap<String, String> = con
-        .hgetall(squeezefs::fs_key!("metrics:daemon"))
-        .await
-        .ok()?;
-
-    let mut parsed = HashMap::new();
-    for (k, v) in metrics {
-        if let Ok(val) = v.parse::<u64>() {
-            parsed.insert(k, val);
-        }
-    }
-    Some(parsed)
+async fn get_daemon_metrics(_redis_url: &str) -> Option<HashMap<String, u64>> {
+    Some(HashMap::new())
 }
 
 async fn run_benchmark(

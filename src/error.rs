@@ -1,13 +1,17 @@
 use std::io;
 use thiserror::Error;
 
+#[derive(Debug, Error)]
+#[error("Mock Metadata Error")]
+pub struct MockRedisError;
+
 #[derive(Error, Debug)]
 pub enum SqueezefsError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
-    #[error("Redis / Garnet error: {0}")]
-    Redis(#[from] redis::RedisError),
+    #[error("Metadata Backend error: {0}")]
+    Redis(#[from] MockRedisError),
 
     #[error("NVMe-oF error: {0}")]
     NvmeOfBackend(String),

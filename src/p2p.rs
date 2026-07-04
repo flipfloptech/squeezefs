@@ -2,7 +2,6 @@ use crate::cache::TieredCache;
 use crate::error::{Result, SqueezefsError};
 use bytes::Bytes;
 use log::{error, info};
-use redis::AsyncCommands;
 use std::sync::Arc;
 use std::time::Duration;
 use xxhash_rust::xxh3::xxh3_64;
@@ -48,22 +47,6 @@ pub struct P2pServer {
     security_config: crate::tiering::dht::ClusterSecurityConfig,
 }
 
-impl Drop for P2pServer {
-    fn drop(&mut self) {
-        let redis_client = self.cache.nvme.redis_client().clone();
-        let addr = self.addr.clone();
-        tokio::spawn(async move {
-            if let Ok(mut con) = redis_client.get_connection().await {
-                let _: std::result::Result<(), redis::RedisError> = redis::cmd("ZREM")
-                    .arg("squeezefs:active_clients")
-                    .arg(&addr)
-                    .query_async(&mut con)
-                    .await;
-            }
-        });
-    }
-}
-
 impl P2pServer {
     pub fn new(
         addr: String,
@@ -101,49 +84,6 @@ impl P2pServer {
         })?;
 
         info!("P2P DHT Server: Listening on {}", self.addr);
-
-        // Start heartbeat and peer discovery loop
-        let redis_client = self.cache.nvme.redis_client().clone();
-        let p2p_addr = self.addr.clone();
-        let dht_clone = dht_node.clone();
-
-        tokio::spawn(async move {
-            loop {
-                if let Ok(mut con) = redis_client.get_connection().await {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-
-                    // 1. Heartbeat: register self in Redis active clients
-                    let _: std::result::Result<(), redis::RedisError> = redis::cmd("ZADD")
-                        .arg("squeezefs:active_clients")
-                        .arg(now + 30)
-                        .arg(&p2p_addr)
-                        .query_async(&mut con)
-                        .await;
-
-                    // 2. Discover: pull other active clients to update routing table
-                    if let Ok(peers) = con
-                        .zrangebyscore::<_, _, _, Vec<String>>(
-                            "squeezefs:active_clients",
-                            now as f64,
-                            "+inf",
-                        )
-                        .await
-                    {
-                        let mut active_set = std::collections::HashSet::new();
-                        for peer in peers {
-                            if peer != p2p_addr {
-                                active_set.insert(peer);
-                            }
-                        }
-                        dht_clone.set_peers(active_set);
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(10)).await;
-            }
-        });
 
         // Keep running (the server tasks run in the background, we just sleep)
         loop {

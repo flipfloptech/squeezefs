@@ -9,6 +9,7 @@ pub mod crypto_compress;
 pub mod dlm;
 pub mod error;
 pub mod fuse_client;
+pub mod meta_backend;
 pub mod nvmeof;
 pub mod p2p;
 pub mod recovery;
@@ -92,15 +93,6 @@ pub fn set_fs_prefix(prefix: &str) {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FsKey(pub compact_str::CompactString);
-
-impl redis::ToRedisArgs for FsKey {
-    fn write_redis_args<W>(&self, out: &mut W)
-    where
-        W: ?Sized + redis::RedisWrite,
-    {
-        self.0.as_str().write_redis_args(out)
-    }
-}
 
 impl std::ops::Deref for FsKey {
     type Target = str;
@@ -268,6 +260,40 @@ pub mod keys {
         let _ = write!(s, "{prefix}:dir:{ino}");
         FsKey(s)
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct FormatConfig {
+    pub name: String,
+    pub block_size: u64,
+    pub capacity: u64,
+    pub inodes: u64,
+    pub compression: String,
+    pub encrypt_algo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypt_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_cache_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_cache_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_cache_paths: Option<Vec<std::path::PathBuf>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_lv: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_cache_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_cache_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_mem_cache_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_mem_cache_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dismount_wait: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_delay: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuse_io_uring_sqpoll_idle_ms: Option<u32>,
 }
 
 #[cfg(test)]

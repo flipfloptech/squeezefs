@@ -13,8 +13,8 @@ rcgen = "0.13"
 tokio = { version = "1.36", features = ["full"] }
 fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged", "file-lock"] }
 io-uring = "0.6"
-redis = { version = "0.24", features = ["tokio-comp", "cluster-async", "connection-manager", "sentinel", "script", "aio"] }
 dashmap = "5.5"
+zerocopy = { version = "0.8.52", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.30"
@@ -67,13 +67,6 @@ rand_chacha = "0.3"
 sha2 = "0.10"
 nix = { version = "0.29.0", features = ["ioctl"] }
 
-[[bench]]
-name = "squeezefs_bench"
-harness = false
-
-[[bench]]
-name = "high_concurrency_bench"
-harness = false
 
 [patch.crates-io]
 fuse3 = { path = "third_party/fuse3" }

@@ -28,7 +28,7 @@ impl TieredCache {
         read_disk_cache_size: Option<&str>,
         write_disk_cache_size: Option<&str>,
 
-        redis_client: crate::dlm::MetaClient,
+        redis_client: std::sync::Arc<crate::dlm::MetaClient>,
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     ) -> Result<Self> {

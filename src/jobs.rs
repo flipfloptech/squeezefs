@@ -1,26 +1,12 @@
-/*
- * Squeezefs, Copyright 2026 Juicedata, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 use crate::error::{Result, SqueezefsError};
+use crate::meta_backend::Metadata;
 use crate::routing::DataRouter;
-use redis::AsyncCommands;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum TaskType {
@@ -41,231 +27,159 @@ pub struct JobTask {
     pub task_type: TaskType,
 }
 
-/// Submit a list of tasks as a distributed job and block/poll until they are all completed.
+struct InMemoryJobs {
+    active_jobs: HashSet<String>,
+    pending_tasks: HashMap<String, Vec<JobTask>>,
+    paused_jobs: HashSet<String>,
+}
+
+static IN_MEMORY_JOBS: Lazy<Mutex<InMemoryJobs>> = Lazy::new(|| {
+    Mutex::new(InMemoryJobs {
+        active_jobs: HashSet::new(),
+        pending_tasks: HashMap::new(),
+        paused_jobs: HashSet::new(),
+    })
+});
+
 pub async fn submit_and_wait_for_job(
-    redis_url: &str,
-    fs_name: &str,
+    _redis_url: &str,
+    _fs_name: &str,
     tasks: Vec<TaskType>,
 ) -> Result<()> {
-    let dlm = crate::dlm::DlmClient::new(redis_url)?;
-    let mut con = dlm.get_connection().await?;
-
     let job_id = uuid::Uuid::new_v4().to_string();
-    let pending_key = format!("{}:jobs:{}:pending", fs_name, job_id);
-    let completed_key = format!("{}:jobs:{}:completed", fs_name, job_id);
-    let active_set_key = format!("{}:active_jobs", fs_name);
-
-    let total_tasks = tasks.len();
-    if total_tasks == 0 {
-        return Ok(());
-    }
-
-    println!("Registering job {} with {} tasks...", job_id, total_tasks);
-
-    // Push tasks to pending set
-    let mut pipe = redis::pipe();
-    for (i, t_type) in tasks.into_iter().enumerate() {
-        let task = JobTask {
-            task_id: format!("{}_{}", job_id, i),
+    let mut job_tasks = Vec::new();
+    for (idx, task) in tasks.into_iter().enumerate() {
+        job_tasks.push(JobTask {
+            task_id: format!("{}_{}", job_id, idx),
             job_id: job_id.clone(),
-            task_type: t_type,
-        };
-        let task_json = serde_json::to_string(&task)
-            .map_err(|e| SqueezefsError::InvalidOperation(e.to_string()))?;
-        pipe.sadd(&pending_key, task_json);
+            task_type: task,
+        });
     }
-    pipe.sadd(&active_set_key, &job_id);
-    let _: () = pipe.query_async(&mut con).await?;
 
-    // Progress bar or status polling loop
-    let pb = indicatif::ProgressBar::new(total_tasks as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} tasks completed ({eta}) {msg}")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    let paused_key = format!("{}:jobs:{}:paused", fs_name, job_id);
+    {
+        let mut state = IN_MEMORY_JOBS.lock();
+        state.active_jobs.insert(job_id.clone());
+        state.pending_tasks.insert(job_id.clone(), job_tasks);
+    }
 
     loop {
-        // Check if the job has been paused globally
-        let paused_str: Option<String> = con.get(&paused_key).await.unwrap_or(None);
-        if paused_str.as_deref() == Some("1") {
-            pb.set_message(" - PAUSED (Write Verification Failure)");
-            sleep(Duration::from_millis(1000)).await;
-            continue;
-        } else {
-            pb.set_message("");
-        }
-
-        // Query pending and completed counts
-        let pending_count: u64 = con.scard(&pending_key).await.unwrap_or(0);
-        let completed_count: u64 = con.scard(&completed_key).await.unwrap_or(0);
-
-        pb.set_position(completed_count);
-
-        if pending_count == 0 && completed_count >= total_tasks as u64 {
+        let is_done = {
+            let state = IN_MEMORY_JOBS.lock();
+            if state.paused_jobs.contains(&job_id) {
+                return Err(SqueezefsError::InvalidOperation("Job paused".to_string()));
+            }
+            !state.pending_tasks.contains_key(&job_id)
+        };
+        if is_done {
             break;
         }
-
-        // Check if any clients are executing or if there is progress
-        sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-
-    pb.finish_with_message("Distributed job completed successfully");
-
-    // Cleanup keys
-    let mut cleanup_pipe = redis::pipe();
-    cleanup_pipe.srem(&active_set_key, &job_id);
-    cleanup_pipe.del(&pending_key);
-    cleanup_pipe.del(&completed_key);
-    cleanup_pipe.del(&paused_key);
-    let _: () = cleanup_pipe.query_async(&mut con).await?;
-
     Ok(())
 }
 
-/// Spawns a background loop that monitors active jobs and executes pending tasks.
-pub fn start_job_worker(
-    router: Arc<DataRouter>,
-    fs_name: String,
-    cpu_limit_pct: u32, // CPU limit percentage (1 to 100)
-) {
+pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct: u32) {
     tokio::spawn(async move {
-        let cpu_limit = cpu_limit_pct.clamp(1, 100);
-
         loop {
-            if let Err(e) = run_worker_cycle(&router, &fs_name, cpu_limit).await {
-                log::debug!("Job worker cycle error: {:?}", e);
+            let task_to_run = {
+                let mut state = IN_MEMORY_JOBS.lock();
+                let mut chosen_job = None;
+                for (job_id, tasks) in state.pending_tasks.iter() {
+                    if !state.paused_jobs.contains(job_id) && !tasks.is_empty() {
+                        chosen_job = Some(job_id.clone());
+                        break;
+                    }
+                }
+                if let Some(job_id) = chosen_job {
+                    let tasks = state.pending_tasks.get_mut(&job_id).unwrap();
+                    let task = tasks.remove(0);
+                    let is_empty = tasks.is_empty();
+                    let task_wrapper = task.clone();
+                    if is_empty {
+                        state.pending_tasks.remove(&job_id);
+                        state.active_jobs.remove(&job_id);
+                    }
+                    Some(task_wrapper)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(task_wrapper) = task_to_run {
+                let start = std::time::Instant::now();
+                match task_wrapper.task_type {
+                    TaskType::BlockMove {
+                        ino: _,
+                        map_id,
+                        idx_str,
+                        src_offset,
+                        dest_offset,
+                        len,
+                    } => {
+                        if let Ok(data) = router.nvme_writer.read_block(src_offset, len).await {
+                            match router.nvme_writer.write_block(dest_offset, &data).await {
+                                Ok(_) => {
+                                    if let Some(backend) = router.meta_backend.get() {
+                                        if let Ok(Some(bytes)) = backend
+                                            .getxattr(map_id.parse().unwrap_or(0), "layout")
+                                            .await
+                                        {
+                                            if let Ok(mut layout) = serde_json::from_slice::<
+                                                crate::routing::LayoutMetadata,
+                                            >(
+                                                bytes.as_slice()
+                                            ) {
+                                                if let Some(ref mut bm) = layout.block_map {
+                                                    let idx: u32 = idx_str.parse().unwrap_or(0);
+                                                    bm.insert(idx, dest_offset.to_string());
+                                                    if let Ok(updated_bytes) =
+                                                        serde_json::to_vec(&layout)
+                                                    {
+                                                        let _ = backend
+                                                            .setxattr(
+                                                                map_id.parse().unwrap_or(0),
+                                                                "layout",
+                                                                &updated_bytes,
+                                                            )
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Job worker: BlockMove failed: {:?}. Pausing job.",
+                                        e
+                                    );
+                                    let mut state = IN_MEMORY_JOBS.lock();
+                                    state.paused_jobs.insert(task_wrapper.job_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(delay) = job_throttle_sleep(start.elapsed(), cpu_limit_pct) {
+                    tokio::time::sleep(delay).await;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            sleep(Duration::from_millis(500)).await;
         }
     });
 }
 
-async fn run_worker_cycle(router: &DataRouter, fs_name: &str, cpu_limit: u32) -> Result<()> {
-    let active_set_key = format!("{}:active_jobs", fs_name);
-
-    // P1-10: only hold a meta connection for short Redis ops. Task bodies do NVMe
-    // I/O and must not pin a pool connection across that work.
-    let active_jobs: Vec<String> = {
-        let mut con = router.dlm.get_connection().await?;
-        con.smembers(&active_set_key).await?
-    };
-
-    for job_id in active_jobs {
-        let pending_key = format!("{}:jobs:{}:pending", fs_name, job_id);
-        let completed_key = format!("{}:jobs:{}:completed", fs_name, job_id);
-        let paused_key = format!("{}:jobs:{}:paused", fs_name, job_id);
-
-        let task_json_opt: Option<String> = {
-            let mut con = router.dlm.get_connection().await?;
-            let paused_str: Option<String> = con.get(&paused_key).await?;
-            if paused_str.as_deref() == Some("1") {
-                None
-            } else {
-                con.spop(&pending_key).await?
-            }
-        }; // meta con dropped before execute_task
-
-        if let Some(task_json) = task_json_opt {
-            let task: JobTask = match serde_json::from_str(&task_json) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-
-            let start_time = Instant::now();
-
-            // Execute task (NVMe / lease work — no meta con held from the worker)
-            let execute_result = execute_task(router, &task.task_type).await;
-
-            let elapsed = start_time.elapsed();
-
-            {
-                let mut con = router.dlm.get_connection().await?;
-                match execute_result {
-                    Ok(()) => {
-                        let _: () = con.sadd(&completed_key, &task_json).await?;
-                    }
-                    Err(e) => {
-                        log::error!("Task {} failed: {:?}", task.task_id, e);
-                        let err_msg = e.to_string();
-                        if err_msg.contains("Write verification failed") {
-                            log::warn!(
-                                "CRITICAL: Pausing job {} due to write verification failure!",
-                                task.job_id
-                            );
-                            let _: () = con.set(&paused_key, "1").await?;
-                        }
-                        // Push back to pending
-                        let _: () = con.sadd(&pending_key, &task_json).await?;
-                    }
-                }
-            }
-
-            // Duty-cycle CPU throttling (P2-15)
-            if let Some(sleep_duration) = job_throttle_sleep(elapsed, cpu_limit) {
-                sleep(sleep_duration).await;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Background job duty-cycle sleep so FUSE keeps CPU under load (P2-15).
-///
-/// For limit `L` percent: sleep = `elapsed * (100 - L) / L`.
-/// Returns `None` when no sleep is required (`L >= 100` or sleep ≤ 1ms).
 pub fn job_throttle_sleep(elapsed: Duration, cpu_limit_pct: u32) -> Option<Duration> {
-    let cpu_limit = cpu_limit_pct.clamp(1, 100);
-    if cpu_limit >= 100 {
-        return None;
-    }
-    let multiplier = (100 - cpu_limit) as f64 / cpu_limit as f64;
-    let sleep_duration = elapsed.mul_f64(multiplier);
-    if sleep_duration > Duration::from_millis(1) {
-        Some(sleep_duration)
-    } else {
+    if cpu_limit_pct >= 100 || cpu_limit_pct == 0 {
         None
-    }
-}
-
-async fn execute_task(router: &DataRouter, task_type: &TaskType) -> Result<()> {
-    match task_type {
-        TaskType::BlockMove {
-            ino,
-            map_id,
-            idx_str,
-            src_offset,
-            dest_offset,
-            len,
-        } => {
-            // Acquire lease on file being moved to serialize against concurrent FUSE client writes
-            let lock_name = crate::keys::inode_path(*ino);
-            let lease = router
-                .dlm
-                .acquire_lock_with_retry(&lock_name, None, Duration::from_secs(10), 10)
-                .await?;
-
-            // Read block from primary device
-            let data = router.nvme_writer.read_block(*src_offset, *len).await?;
-
-            // Write block to destination offset
-            router.nvme_writer.write_block(*dest_offset, &data).await?;
-
-            // Atomically update block_map metadata in database
-            let mut con = router.dlm.get_connection().await?;
-            let key = crate::keys::block_map(map_id);
-            let _: () = con.hset(&key, idx_str, dest_offset.to_string()).await?;
-
-            // Free the old high block
-            router.block_allocator.free_block(*src_offset).await?;
-
-            // Release lease
-            let _ = lease.release().await;
+    } else {
+        let factor = (100 - cpu_limit_pct) as f64 / cpu_limit_pct as f64;
+        let sleep_dur = elapsed.mul_f64(factor);
+        if sleep_dur < Duration::from_millis(1) {
+            None
+        } else {
+            Some(sleep_dur)
         }
     }
-    Ok(())
 }

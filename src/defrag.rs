@@ -24,6 +24,8 @@ pub struct DefragOptions {
     pub scan_count: usize,
     /// Max high-offset candidates retained while scanning metadata.
     pub max_high_candidates: usize,
+    /// Optional target inode to defragment. If Some, defragments only this file.
+    pub target_inode: Option<u64>,
 }
 
 impl Default for DefragOptions {
@@ -32,6 +34,7 @@ impl Default for DefragOptions {
             max_moves: 256,
             scan_count: 200,
             max_high_candidates: 512,
+            target_inode: None,
         }
     }
 }
@@ -131,20 +134,35 @@ pub async fn run_defragmentation_with_options(
     let max_hole_idx = *free_holes.last().unwrap_or(&0);
     let min_high_offset = max_hole_idx.saturating_add(1).saturating_mul(chunk_size);
 
-    // 3. SCAN layout meta, keep only top high-offset candidates (bounded map).
-    println!(
-        "Scanning metadata for high blocks (cap {} candidates, min offset {})...",
-        opts.max_high_candidates, min_high_offset
-    );
+    // 3. Collect high-offset candidates (either target inode only, or global scan)
     let mut block_to_file: BTreeMap<u64, (u64, String, String)> = BTreeMap::new();
-    collect_high_block_candidates(
-        &mut conn,
-        min_high_offset,
-        opts.max_high_candidates,
-        opts.scan_count,
-        &mut block_to_file,
-    )
-    .await?;
+    if let Some(ino) = opts.target_inode {
+        println!(
+            "Collecting block candidates for target inode {} (cap {} candidates, min offset {})...",
+            ino, opts.max_high_candidates, min_high_offset
+        );
+        collect_inode_block_candidates(
+            &mut conn,
+            ino,
+            min_high_offset,
+            opts.max_high_candidates,
+            &mut block_to_file,
+        )
+        .await?;
+    } else {
+        println!(
+            "Scanning metadata for high blocks (cap {} candidates, min offset {})...",
+            opts.max_high_candidates, min_high_offset
+        );
+        collect_high_block_candidates(
+            &mut conn,
+            min_high_offset,
+            opts.max_high_candidates,
+            opts.scan_count,
+            &mut block_to_file,
+        )
+        .await?;
+    }
 
     if block_to_file.is_empty() {
         println!("No high blocks found above the selected free holes.");
@@ -304,6 +322,48 @@ async fn collect_high_block_candidates(
         cursor = next_cursor;
         if cursor == 0 {
             break;
+        }
+    }
+    Ok(())
+}
+
+async fn collect_inode_block_candidates(
+    conn: &mut crate::dlm::MetaConnection,
+    ino: u64,
+    min_high_offset: u64,
+    max_candidates: usize,
+    out: &mut BTreeMap<u64, (u64, String, String)>,
+) -> Result<()> {
+    let meta_key = crate::keys::metadata_for_inode(ino);
+    let (file_type, block_map_id_opt): (Option<String>, Option<String>) = redis::cmd("HMGET")
+        .arg(&meta_key)
+        .arg("type")
+        .arg("block_map_id")
+        .query_async(conn)
+        .await?;
+
+    if file_type.as_deref() != Some("striped") {
+        return Ok(());
+    }
+    let Some(block_map_id) = block_map_id_opt else {
+        return Ok(());
+    };
+
+    let block_map_key = crate::keys::block_map(&block_map_id);
+    let mappings: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
+        .arg(&block_map_key)
+        .query_async(conn)
+        .await?;
+
+    for (block_idx_str, offset_str) in mappings {
+        if let Ok(offset) = offset_str.parse::<u64>() {
+            insert_high_candidate(
+                out,
+                offset,
+                (ino, block_map_id.clone(), block_idx_str),
+                min_high_offset,
+                max_candidates,
+            );
         }
     }
     Ok(())

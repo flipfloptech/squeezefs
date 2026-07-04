@@ -200,7 +200,8 @@ pub async fn flush_disk_cache_path(redis_url: &str, _fs_name: &str, path: &Path)
     let block_alloc =
         std::sync::Arc::new(BlockAllocator::new(meta_client.clone(), "default").await?);
     let nvme_dev = std::sync::Arc::new(NvmeBlockDev::new(path.to_str().unwrap()));
-    recover_staging(path, &meta_client, &block_alloc, &nvme_dev).await?;
+    let dlm = crate::dlm::DlmClient::new(redis_url)?;
+    recover_staging(path, &meta_client, &block_alloc, &nvme_dev, Some(&dlm)).await?;
     Ok(())
 }
 

@@ -295,6 +295,9 @@ enum Commands {
         /// NVMe device path
         #[arg(long)]
         nvme_path: String,
+        /// Optional target inode to defragment (only defragment this file)
+        #[arg(long, short = 'i')]
+        inode: Option<u64>,
     },
     /// Automatically tune client node configurations (requires root/sudo to apply changes)
     Tune,
@@ -2235,6 +2238,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     dlm.meta_client(),
                     &block_alloc,
                     &nvme_dev,
+                    Some(&dlm),
                 )
                 .await
                 .unwrap_or_else(|e| {
@@ -2426,11 +2430,26 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Defrag {
             squeeze_uri,
             nvme_path,
+            inode,
         } => {
             let (redis_url, name) = resolve_squeeze_uri(squeeze_uri.as_deref(), None)?;
             squeezefs::set_fs_prefix(&name);
-            println!("Starting defragmentation for volume '{}'", name);
-            squeezefs::defrag::run_defragmentation(&redis_url, &name, &nvme_path).await?;
+            if let Some(ino) = inode {
+                println!(
+                    "Starting defragmentation for volume '{}' targeting inode {}",
+                    name, ino
+                );
+            } else {
+                println!("Starting defragmentation for volume '{}'", name);
+            }
+            let opts = squeezefs::defrag::DefragOptions {
+                target_inode: inode,
+                ..Default::default()
+            };
+            squeezefs::defrag::run_defragmentation_with_options(
+                &redis_url, &name, &nvme_path, opts,
+            )
+            .await?;
         }
         Commands::Bench {
             path,

@@ -2,9 +2,9 @@
 
 ![SqueezeFS Header](github.jpeg)
 
-Squeezefs is a slimmed-down, high-performance distributed filesystem featuring a decoupled metadata store backend (Garnet) and a local or NVMe-oF block device client.
+Squeezefs is a slimmed-down, high-performance distributed POSIX FUSE filesystem (Rust + tokio + io_uring) featuring a decoupled, block-based logical volume metadata store backend (**MetaLV**) and a local or NVMe-oF block device client. Linux-only.
 
-Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal file throughput by leveraging asynchronous network and file architectures, client-side caching, and multi-rail network load balancing over NVMe-oF fabrics.
+Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal file throughput by leveraging asynchronous network and file architectures, client-side caching, and multi-rail network load balancing over NVMe-oF fabrics, with zero external database dependencies.
 
 ---
 
@@ -16,34 +16,35 @@ Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal 
    |   (Rust, Tokio Event Loop, io_uring Polling)    |
    +--------+-------------------------------+---------+
             |                               |
-  (Locking & Metadata)              (Block I/O Data)
+   (Locking & Metadata)              (Block I/O Data)
             |                               |
             v                               v
-  +-------------------+           +-------------------+
-  | Microsoft Garnet  |           |     NVMe / NVMe-oF|
-  |  (RESP Metadata)  |           |   (Local Block Dev)
-  +-------------------+           +-------------------+
+   +-------------------+           +-------------------+
+   |  Metadata Volume  |           |     NVMe / NVMe-oF|
+   | (MetaLV Superblock|           |   (Local Block Dev)
+   |    Inode Tables)  |           |   (Striped Blocks)
+   +-------------------+           +-------------------+
 ```
 
 ### 1. Asynchronous POSIX FUSE Daemon
-Built in **Rust** using the asynchronous `tokio` runtime and `io_uring` polling over `/dev/fuse` to process OS requests efficiently.
+Built in **Rust** using the asynchronous `tokio` runtime and `io_uring` polling over `/dev/fuse` to process OS requests efficiently. Standard mounts automatically switch to high-performance FUSE-over-io_uring after the INIT handshake.
 
 ### 2. Progressive Data Layout & I/O Routing
 Writes are dynamically routed based on file sizes to optimize storage overhead and network latency:
-- **Micro-Files (< 64KB):** Inlined directly in the Microsoft Garnet key-value store alongside metadata.
-- **Small Files (64KB - 4MB):** Staged locally on NVMe and asynchronously merged into physical blocks flushed to the main NVMe device.
-- **Large Files (> 4MB):** Sliced into 4MB blocks and written directly to the target NVMe block device.
+- **Inline Files (< 4KB):** Inlined directly in the Metadata Volume's inodes/attributes.
+- **Staged Files (4KB - 4MB):** Staged locally on NVMe cache and asynchronously merged into physical blocks flushed to the main NVMe device.
+- **Striped Files (> 4MB):** Sliced into 4MB blocks and written directly to the target NVMe block devices.
 
 ### 3. Distributed Lock Manager (DLM) & Consistency
-Translates POSIX FUSE locks to cluster-wide locks in Garnet using `SETNX` commands, protected by heartbeats and monotonic fencing tokens to prevent split-brain write conflicts.
+Translates POSIX FUSE locks to cluster-wide leases on the metadata backend, protected by heartbeat limits and monotonic fencing tokens to prevent split-brain write conflicts.
 
 ### 4. Tiered Caching & Zero-Copy Paths
 - **Tier 1 (GPU Direct Storage - GDS):** Routes RDMA transfers directly from NVMe to VRAM, bypassing the host CPU/RAM.
-- **Tier 2 (Unified System RAM):** LRU cache dynamically sizing to 20% of system RAM.
+- **Tier 2 (Unified System RAM):** Clock/LRU caches dynamically sizing to system memory limits.
 - **Tier 3 (Local NVMe Staging):** Staging directory (`.staging`) for async writes and local caching of read blocks to avoid RTT latency.
 
 ### 5. Multi-NIC (Multi-Rail) Network Load Balancing & HA
-Binds outbound client connections to multiple configured physical interfaces (source IPs). Distributes traffic round-robin across NICs and automatically fails over on interface drops. Fully compatible with all standard-compliant NVMe-oF targets, including user-space storage engines like SPDK (Storage Performance Development Kit).
+Binds outbound client connections to multiple configured physical interfaces (source IPs). Distributes traffic round-robin across NICs and automatically fails over on interface drops. Fully compatible with user-space storage engines like SPDK (Storage Performance Development Kit).
 
 ### 6. Built-in HPC Auto-Tuning
 Includes built-in host auto-tuning (`squeezefs tune`) to optimize virtual memory dirty page ratios, TCP socket buffers, and FUSE connection thresholds.
@@ -52,56 +53,57 @@ Includes built-in host auto-tuning (`squeezefs tune`) to optimize virtual memory
 
 ## Subcommands & CLI Usage
 
-Squeezefs exposes a clean CLI to manage formats, mounts, status, performance benchmarks, and optimize systems. 
+Squeezefs exposes a clean CLI to manage formats, mounts, status, performance benchmarks, and optimize systems.
 
 ### SqueezeFS URI Scheme
-To centralize connections, SqueezeFS utilizes a single connection URI:
-`squeeze://<ip>:<port>/<fs_name>` (e.g. `squeeze://127.0.0.1:6379/myvol`).
-* **Mount & Format**: Require this URI as a primary positional parameter.
-* **Other Subcommands**: Can dynamically resolve connection details from FUSE mount `.config` metadata files, system mount tables, environment variables (`GARNET_URL` / `SQUEEZE_URI`), or parent paths, making the URI completely optional.
+To centralize block storage connectivity, SqueezeFS utilizes two connection URIs:
+* **Metadata Volumes**: `sqmeta://<path_to_block_device_or_file>` (e.g. `sqmeta://dev/xai-meta/mds01`).
+* **Data Volumes**: `sqdata://<path_to_block_device_or_file>` (e.g. `sqdata://dev/xai-data/oss01`).
 
 ---
 
 * **Format Squeezefs Volume:**
+  Initialize physical block maps and metadata tables. Executes concurrently across all target devices.
   ```bash
-  squeezefs format squeeze://<ip>:<port>/<fs_name> [options]
+  squeezefs format sqmeta://<meta_dev> [sqmeta://...] sqdata://<data_dev> [sqdata://...] [options]
   ```
   *Options:*
-  - `--block-size <bytes>`: Block size in bytes (default: 4MB).
-  - `--capacity <bytes>`: Maximum capacity of the volume in bytes (default: 1PB).
-  - `--mem-cache-size <size>`: Memory cache limit (default: 20%).
-  - `--disk-cache-size <size>`: Staging disk cache capacity (default: 50G).
-  - `--volume <path>`: Required backing volume/device path for format (alias: `--nvme-target`, `--backing-dev`, e.g. `/dev/nvme0n1`).
+  - `--block-size <bytes>`: Block size in bytes (e.g. `4M`, `1M`, default: `4M`).
+  - `--capacity <bytes>`: Maximum capacity of the volume (default: auto-detected or 1PB).
+  - `--inodes <count>`: Hard quota limit for number of inodes (default: `1000000`).
+  - `--full`: Performs full block-aligned zero-wiping of the backing device capacity with a progress bar (default is quick-format).
 
 * **Mount Squeezefs:**
   ```bash
-  squeezefs mount squeeze://<ip>:<port>/<fs_name> <mountpoint> [options]
+  squeezefs mount sqmeta://<meta_dev> [sqmeta://...] <mountpoint> [options]
   ```
   *Options:*
   - `--disk-cache-paths <paths>`: Comma-separated paths to NVMe cache staging directories.
-  - `--local-ips <ips>`: Comma-separated list of local source IP interfaces for multi-rail network load balancing.
+  - `--local-ips <ips>`: Comma-separated list of local source IP interfaces for multi-rail load balancing.
   - `--mem-cache-size <size>`: System RAM cache size (e.g. `16GB` or `20%`).
-  - `--disk-cache-size <size>`: NVMe cache capacity threshold.
-  - `--daemon`: Run FUSE daemon in the background (detach from terminal).
-  - `--uid <id>`: Custom UID owner for the mount (default: current user or SUDO_UID).
-  - `--gid <id>`: Custom GID owner for the mount (default: current group or SUDO_GID).
+  - `--daemon`: Run FUSE daemon in the background (changes its working directory to `/` to avoid locking paths).
+  - `--allow-others` (or `--allow-other`): Allow other users/root to access the mount (required for `sudo umount`).
   - `--log-file <path>`: Path to write daemon logs to when running in background.
-  - `--volume <path>`: Backing volume/device path (alias: `--nvme-target`, `--backing-dev`, e.g. `/dev/main-pool/my-vol`).
-  - `--job-cpu-limit <percentage>`: Cap background job worker CPU utilization percentage (1 to 100, default: 50).
-  - `--write-verification`: Enable read-after-write checksum verification on all writes to cache and disk.
 
 * **Show filesystem Status:**
+  Prints a detailed formatted configuration and volume health status summary:
   ```bash
-  squeezefs status squeeze://<ip>:<port>/<fs_name>
+  squeezefs status sqmeta://<meta_dev>
   ```
 
-* **Defragment Squeezefs Volume (Cluster-Distributed Job):**
+* **Unmount Squeezefs:**
+  Safely unmounts SqueezeFS by waiting for staging caches to flush before tearing down FUSE.
   ```bash
-  squeezefs defrag --nvme-path <path> [--squeeze-uri <uri>]
+  squeezefs umount <mountpoint> [--force]
   ```
-  Calculates block fragmentation on the NVMe device, generates block migration tasks, and submits them as a cluster-distributed job. All active FUSE client mount nodes poll and execute these block moves in parallel (subject to their configured `--job-cpu-limit`).
+
+* **Defragment Squeezefs Volume:**
+  ```bash
+  squeezefs defrag --nvme-path <path>
+  ```
 
 * **Benchmark Mountpoint:**
+  Loads layout details from the FUSE mount and performs parallel read/write benchmarks, auditing metrics against the local `.stats` file.
   ```bash
   squeezefs bench <mountpoint> [options]
   ```
@@ -111,13 +113,11 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
   - `--large-size <MB>`: Large file workload size.
   - `--small-size <KB>`: Small file workload size.
   - `--small-count <count>`: Small file writes count.
-  - `--only <filters>`: Comma-separated list of workloads to run (e.g. `large-seq,small-rand`).
-  - `--skip <filters>`: Skip specific workloads.
   - `--direct`: Enable Direct I/O (O_DIRECT) path validation.
 
 * **Instant Metadata Clone (CoW):**
   ```bash
-  squeezefs clone <src> <dest> [--squeeze-uri <uri>]
+  squeezefs clone <src> <dest>
   ```
 
 * **Tune Kernel Parameters (requires root):**
@@ -133,39 +133,7 @@ To centralize connections, SqueezeFS utilizes a single connection URI:
   squeezefs storage nvmeof disconnect <nqn>
   squeezefs storage nvmeof unshare <nqn> [--spdk]
   squeezefs storage nvmeof list
-  squeezefs storage nvmeof spdk-install
-  squeezefs storage nvmeof spdk-setup [--hugepages <2GB/4GB>]
-  squeezefs storage nvmeof spdk-bind --pci <pci_addr>
-  squeezefs storage nvmeof unbind --pci <pci_addr>
-  squeezefs storage nvmeof spdk-start
   ```
-
-* **Storage Pool & Volume Management:**
-  Abstracts underlying LVM operations for seamless scale-out and multi-tenancy.
-  ```bash
-  squeezefs storage pool create <pool> <disks...>
-  squeezefs storage pool add <pool> <disks...>
-  squeezefs storage pool remove <pool> <disks...>
-  squeezefs storage volume create <pool> <volume> --size <size>
-  squeezefs storage volume extend <pool> <volume> --add-size <size>
-  squeezefs storage volume delete <pool> <volume>
-  ```
-
-* **Runtime Configuration Management:**
-  Configure limits and caches at runtime:
-  ```bash
-  squeezefs config <action> [--squeeze-uri <uri>]
-  ```
-  *Actions:*
-  - `set <key> <value>`: Updates runtime format quotas and cache limits. Supported keys are `capacity` (e.g. "100G", "2T"), `inodes` (e.g. "2000000"), `mem_cache_size`, `read_mem_cache_size`, `write_mem_cache_size`, `disk_cache_size`, `read_cache_size`, and `write_cache_size`.
-  - `disk-cache <subcommand>` (alias: `diskcaches`): Manages staging disk cache paths.
-    * `add <path>`
-    * `remove <path> [--force]`
-    * `enable <path>`
-    * `disable <path>`
-    * `list`
-  - `list`: Lists the entire unified configuration.
-  - `fsck`: Runs consistency checks on metadata and block references.
 
 ---
 

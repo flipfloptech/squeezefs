@@ -1,6 +1,6 @@
 # AGENTS.md — Squeezefs One Source of Truth
 
-Squeezefs is a high-performance distributed POSIX FUSE filesystem (Rust + tokio + io_uring) with a decoupled Microsoft Garnet (RESP) metadata backend and an NVMe / NVMe-oF block data backend. Linux-only.
+Squeezefs is a high-performance distributed POSIX FUSE filesystem (Rust + tokio + io_uring) with a decoupled block-based logical volume metadata store backend (MetaLV) and an NVMe / NVMe-oF block data backend. Linux-only.
 
 **This combined document is the single authoritative reference.** It merges architectural rules, non-negotiables, development workflow, build/test gates, profiling, and repo conventions. Read it before touching core logic.
 
@@ -18,7 +18,7 @@ Squeezefs is a high-performance distributed POSIX FUSE filesystem (Rust + tokio 
 | **FUSE_INIT only**                | Classical `/dev/fuse` once — kernel requires `fch->initialized` before REGISTER. Then over-uring. |
 | **NVMe / block data**             | `NvmeBlockDev` io_uring workers (fixed files when available). |
 | **Ad-hoc local files**            | `crate::uring_fs` (not std file APIs) where practical. |
-| **Not uring**                     | Garnet/Redis TCP, TLS peers (network stacks). Staging **mmap** segments stay mmap by design. |
+| **Not uring**                     | TLS peers, network TCP/TLS stacks. Staging **mmap** segments stay mmap by design. |
 
 If over-uring or block uring misbehaves: **debug and fix uring** — never reintroduce a classical escape hatch “just to make tests pass.”
 
@@ -43,7 +43,7 @@ Mount always enables FUSE-over-io_uring after INIT (required). Expects: "FUSE-ov
 | Mmap page hint | `IoUringPrefetcher` (`MADV_WILLNEED`) |
 | FUSE transport (default) | `fuse3` `BlockFuseConnection` (classical rings during INIT); **FUSE-over-io_uring** (`IORING_OP_URING_CMD` + REGISTER/COMMIT_AND_FETCH) after arm |
 | Staging / read-segment hot path | **mmap** (by design — zero syscall) |
-| Garnet/Redis, TLS peers | Not uring (network) |
+| TLS peers | Not uring (network) |
 
 Hardening: pool not marked ready until all queues submit REGISTER; per-qid commit channels; shared inbound queue; eventfd wake; full-size payload buffers.
 
@@ -62,18 +62,18 @@ Hardening: pool not marked ready until all queues submit REGISTER; per-qid commi
 
 ### Target Scale & Layout
 * **Scale:** 15,000+ Concurrent Nodes.
-* **Architecture Type:** Decoupled metadata (Garnet) + **block data** (local NVMe / NVMe-oF), exposed via POSIX FUSE.
+* **Architecture Type:** Decoupled metadata (MetaLV) + **block data** (local NVMe / NVMe-oF), exposed via POSIX FUSE.
 
 ### Technology Stack
 * **Client Daemon (FUSE Engine):** Built in **Rust** using the asynchronous `tokio` runtime and `io_uring` polling over `/dev/fuse`.
-* **Metadata & Distributed Lock Manager (DLM):** Microsoft Research **Garnet** (RESP-compatible). Primary meta store for attrs, layout maps, leases, and volume format.
+* **Metadata & Distributed Lock Manager (DLM):** Local or distributed logical volume backend (**MetaLV**). Primary meta store for attrs, layout maps, leases, and volume format.
 * **Data Backend (primary):** **NVMe / NVMe-oF block devices** via `NvmeBlockDev` (io_uring workers). Progressive layouts (inline / staged / striped) live on this path.
 
 ### Progressive Data Layout & I/O Routing
 
 Logical file growth uses three layouts (thresholds are implementation-defined; current code uses ~4 KiB inline, up to ~4 MiB staged when staging dirs exist, else striped):
 
-1. **Inline (tiny):** Payload in Garnet (`inline_data:…`) with type `inline`.
+1. **Inline (tiny):** Payload in Metadata Volume (`inline_data:…` key/attribute) with type `inline`.
 2. **Staged (small):** Local NVMe staging (`file_id` + optional `mapping:…`); writeback/flush promotes to durable blocks.
 3. **Striped (large):** 4 MiB (configurable) blocks on the active block backend with `block_map:…` and refcounts.
 
@@ -81,8 +81,8 @@ Writes that grow past thresholds promote layouts **durably** (block I/O before m
 
 ### Distributed Lock Manager (DLM) & Consistency
 
-POSIX FUSE locks map to cluster leases on Garnet:
-* **Acquisition:** `SET NX` + fencing token `INCR` (no Lua required for lock grant).
+POSIX FUSE locks map to cluster leases on Metadata Volumes:
+* **Acquisition:** Lease locking + fencing token `INCR` (no external distributed database required).
 * **Granularity:** File-level or byte-range; never directory-wide for data.
 * **Leases & Heartbeats:** TTL + background renewal; local caches must re-validate after lock key loss.
 * **Fencing Tokens:** Monotonic per-file tokens; writers present tokens; stale tokens → `FencingTokenExpired` / reject.
@@ -101,11 +101,11 @@ POSIX FUSE locks map to cluster leases on Garnet:
 * **FUSE transport:** vendored **fuse3** — classical `/dev/fuse` only for `FUSE_INIT` (kernel requires initialized connection before REGISTER); **FUSE-over-io_uring is required** for the request hot path after arm (`flags2` `FUSE_OVER_IO_URING`, `REGISTER` / `COMMIT_AND_FETCH`). No userspace opt-out; mount fails if setup fails. Auto-enables `fuse.enable_uring=Y` when possible. One queue per possible CPU; session arms only after all queues REGISTERed.
 * Always use io_uring when we can (non-negotiable) — see Non-Negotiables section.
 * No dead code (non-negotiable) — see Non-Negotiables section.
-* Not uring: Garnet/Redis TCP, TLS peer paths (network). Staging mmap segments stay mmap by design.
+* Not uring: TLS peer paths (network). Staging mmap segments stay mmap by design.
 
 ### Metadata Cluster Topology
 
-* Optional multi-shard Garnet URLs; keys for volume control use `fs_prefix` / `fs_key!`.
+* Keys for volume control use `fs_prefix` / `fs_key!` helpers.
 * **Layout keys** (`metadata:…`, `inline_data:…`, `block_map:…`, `mapping:…`, `active_block:…`) are **unprefixed historical** forms — use `crate::keys::*` helpers; do not migrate under `FS_PREFIX` without an on-disk format change.
 
 ### Error Handling & Crash Recovery
@@ -121,13 +121,13 @@ Always acquire in this order; **never invert** (P1-9):
 1. `active_inode_locks` (per-inode `RwLock`) — FUSE op serialization
 2. `lease_locks` (per-inode) — only while acquiring/refreshing DLM lease
 3. `BLOCK_FLUSH_LOCKS` (per block) — active-block mutation
-4. DLM/Redis — network meta work
+4. MetaLV backend — metadata/attributes storage work
 
 **Must not:**
 * Hold inode **write** guard across long backend I/O when block locks suffice (striped data path = meta-prep only under write lock — P1-8).
-* Hold a **pooled Garnet/Redis connection** across durable NVMe / staging I/O (P1-10: open → short meta → drop → I/O → re-acquire for commit).
+* Hold a **pooled MetaLV connection/handle** across durable NVMe / staging I/O (P1-10: open → short meta → drop → I/O → re-acquire for commit).
 * Acquire (1) while holding (3).
-* Burn fencing tokens on failed lock `SET NX` (SET then INCR only on success).
+* Burn fencing tokens on failed lock acquisition.
 
 ### OS / fabric notes
 
@@ -406,35 +406,7 @@ Release profile keeps `debug = true` for symbolicated profiles.
 
 ## Testing
 
-Most integration tests talk to a live **Garnet/Redis** instance. Behavior splits two ways — check before you run:
-
-- **Graceful skip** when Redis is down (safe): `dlm_tests.rs`, `defrag_tests.rs`, `recovery_tests.rs`, `failover_tests.rs`, both `benches/*.rs`.
-- **Will panic / fail** without Redis: `format_tests.rs`, `block_allocator_tests.rs`, `jobs_tests.rs`, `lock_contention_tests.rs`, `metadata_sharding_tests.rs`, `checkpoint_debug.rs`. These unwrap the Redis connection or assert on results — start Garnet first.
-
-Quickest way to get Garnet running:
-```bash
-podman run -d --rm --replace --name squeezefs-garnet -p 6379:6379 ghcr.io/microsoft/garnet:latest
-```
-`redis-server` works too.
-
-### Redis-DB isolation across tests (do not "fix" these by changing DBs)
-
-- `format_tests.rs` → db `9`
-- `metadata_sharding_tests.rs` → dbs `1`, `2`, `3`
-- `block_allocator_tests.rs`, `jobs_tests.rs`, `lock_contention_tests.rs` → **default db 0** (these will clobber live mount metadata; do not run against a Garnet instance backing a mounted volume).
-
-`GARNET_URL` env var overrides the default `redis://127.0.0.1:6379` in `dlm_tests.rs`, `recovery_tests.rs`, and `benches/*.rs`. Other tests hardcode the URL and ignore it.
-
-Run everything:
-```bash
-cargo test --all-features -- --test-threads=1
-```
-`--test-threads=1` is used because several suites share Garnet state and are order-sensitive; use it when an unknown test starts failing locally.
-
-Run a single test:
-```bash
-cargo test --all-features --test dlm_tests -- test_lock_acquisition_and_release --exact
-```
+Most integration tests execute against local file-backed MetaLV sandboxes.
 
 ### Required verification gate (every commit)
 
@@ -457,7 +429,7 @@ sudo tests/run_pjdfstest.sh
 sudo tests/run_elbencho_mount.sh
 ```
 
-Prerequisites: Garnet up, volume formatted/mounted per `QUICKSTART.md`. Failures here can pass pure unit tests and still indicate mount regressions.
+Prerequisites: Volume formatted/mounted per `QUICKSTART.md`. Failures here can pass pure unit tests and still indicate mount regressions.
 
 ---
 
@@ -467,14 +439,13 @@ Prerequisites: Garnet up, volume formatted/mounted per `QUICKSTART.md`. Failures
 
 Two Criterion benches, both `harness = false`:
 
-- `cargo bench --bench high_concurrency_bench` — in-memory lock / pool / cache contention; no Redis required.
-- `cargo bench --bench squeezefs_bench` — exercises the full FS stack; requires Garnet (skips gracefully if absent). Also contains the `CryptoCompressState` compression/encryption micro-benches.
+- `cargo bench --bench high_concurrency_bench` — in-memory lock / pool / cache contention.
+- `cargo bench --bench squeezefs_bench` — exercises the full FS stack. Also contains the `CryptoCompressState` compression/encryption micro-benches.
 
 **CI note:** Criterion is optional in PR CI (long / noisy). Prefer **nightly** or manual baseline save:
 
 ```bash
 cargo bench --bench squeezefs_bench -- --save-baseline main
-# later: --baseline main
 ```
 
 ### Profiling command set (release)
@@ -487,7 +458,6 @@ perf record -g --call-graph dwarf -o perf.data -- \
   target/release/squeezefs mount …   # or attach: -p $(pidof squeezefs)
 
 perf report -i perf.data
-# or: perf script | inferno-collapse-perf | inferno-flamegraph > flame.svg
 ```
 
 #### Heap (dhat)
@@ -505,7 +475,7 @@ cargo build --release --features coz-on
 coz run --- target/release/squeezefs mount …
 ```
 
-Use coz/dhat **after** a known-good cargo test gate, against a representative mount (Garnet + backing file or NVMe).
+Use coz/dhat **after** a known-good cargo test gate, against a representative mount.
 
 ---
 
@@ -522,7 +492,7 @@ Use coz/dhat **after** a known-good cargo test gate, against a representative mo
 
 ## Repo-specific conventions
 
-- Garnet keys are namespaced via the `fs_key!("suffix")` macro and the global `FS_PREFIX` (`src/lib.rs`). Code that touches Garnet keys must go through the macro, not hardcode prefixes.
+- Metadata keys are namespaced via the `fs_key!("suffix")` macro and the global `FS_PREFIX` (`src/lib.rs`). Code that touches metadata keys must go through the macro, not hardcode prefixes.
 - `WRITE_VERIFICATION` is a process-global `AtomicBool` toggled by `--write-verification` on mount; read-after-write checksum verification uses it. Library code should call `write_verification_enabled()` rather than reading CLI args.
 - The architecture uses the **NVMe / NVMe-oF block** backend as the sole primary data path.
 

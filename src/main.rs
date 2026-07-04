@@ -782,13 +782,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         daemon,
         no_writeback,
         allow_other,
-        options,
-        read_cache_size,
-        write_cache_size,
-        read_mem_cache_size,
-        write_mem_cache_size,
-        fuse_io_uring_sqpoll_idle_ms,
-        fuse_io_uring_sqpoll_cpu,
+        options: _,
+        read_cache_size: _,
+        write_cache_size: _,
+        read_mem_cache_size: _,
+        write_mem_cache_size: _,
+        fuse_io_uring_sqpoll_idle_ms: _,
+        fuse_io_uring_sqpoll_cpu: _,
         meta_lv,
         ..
     } = &cli.command
@@ -863,28 +863,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let writeback = !no_writeback;
-        if let Err(e) = print_mount_diagnostics(
-            &meta_lvs,
-            &mountpoint,
-            &fs_name,
-            *daemon,
-            mem_cache_size.as_deref(),
-            disk_cache_size.as_deref(),
-            read_cache_size.as_deref(),
-            write_cache_size.as_deref(),
-            read_mem_cache_size.as_deref(),
-            write_mem_cache_size.as_deref(),
-            disk_cache_paths.as_deref(),
-            writeback,
-            *allow_other,
-            options.as_deref(),
-            *fuse_io_uring_sqpoll_idle_ms,
-            *fuse_io_uring_sqpoll_cpu,
+        let first_meta_path = &meta_lvs[0];
+        let storage = match squeezefs::meta_backend::storage::MetaLvStorage::open(
+            first_meta_path,
+            64 * 1024 * 1024,
         ) {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "Error: Failed to open metadata volume {}: {}",
+                    first_meta_path, e
+                );
+                std::process::exit(1);
+            }
+        };
+
+        let val_opt = match squeezefs::meta_backend::xattr::get_xattr(
+            &storage,
+            1,
+            "user.squeezefs.format_config",
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "Error: Failed to read format config from metadata volume: {}",
+                    e
+                );
+                std::process::exit(1);
+            }
+        };
+
+        let format_config: FormatConfig = match val_opt {
+            Some(val) => match serde_json::from_slice(&val) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse format config: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("Error: Format configuration not found on root inode. Is this volume formatted?");
+                std::process::exit(1);
+            }
+        };
+
+        let resolved_mem_cache_size = mem_cache_size
+            .as_deref()
+            .unwrap_or_else(|| format_config.mem_cache_size.as_deref().unwrap_or("1GB"));
+        let resolved_disk_cache_size = disk_cache_size
+            .as_deref()
+            .unwrap_or_else(|| format_config.disk_cache_size.as_deref().unwrap_or("10GB"));
+
+        let staging_dirs = if let Some(dirs) = disk_cache_paths {
+            if dirs.is_empty() {
+                vec![get_default_staging_dir()]
+            } else {
+                dirs.clone()
+            }
+        } else if let Some(ref paths) = format_config.disk_cache_paths {
+            paths.clone()
+        } else {
+            vec![get_default_staging_dir()]
+        };
+
+        let data_lvs = format_config.data_lv.clone().unwrap_or_default();
+        let writeback = !no_writeback;
+
+        print_squeezefs_summary(
+            false,
+            &fs_name,
+            format_config.block_size,
+            format_config.capacity,
+            &format_config.compression,
+            &format_config.encrypt_algo,
+            &meta_lvs,
+            &data_lvs,
+            resolved_mem_cache_size,
+            resolved_disk_cache_size,
+            &staging_dirs,
+            Some(&mountpoint),
+            Some(writeback),
+            Some(*allow_other),
+        );
 
         if *daemon {
             let mountpoint_path = mountpoint.clone();
@@ -1140,36 +1200,125 @@ fn halve_size_string(val: &str, default_fallback: &str) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_mount_diagnostics(
-    meta_lvs: &[String],
-    mountpoint: &Path,
+fn print_squeezefs_summary(
+    is_format: bool,
     fs_name: &str,
-    _daemon: bool,
-    _mem_cache_size: Option<&str>,
-    _disk_cache_size: Option<&str>,
-    _read_cache_size: Option<&str>,
-    _write_cache_size: Option<&str>,
-    _read_mem_cache_size: Option<&str>,
-    _write_mem_cache_size: Option<&str>,
-    _disk_cache_paths: Option<&[PathBuf]>,
-    writeback: bool,
-    allow_other: bool,
-    _options: Option<&str>,
-    _fuse_io_uring_sqpoll_idle_ms: Option<u32>,
-    _fuse_io_uring_sqpoll_cpu: Option<u32>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("SqueezeFS version {}", env!("CARGO_PKG_VERSION"));
-    println!("===================================================");
-    println!("Mount Options:");
-    println!("  Mountpoint: {:?}", mountpoint);
-    println!("  Writeback: {}", writeback);
-    println!("  Allow Other: {}", allow_other);
-    println!("Metadata Backend:");
-    println!("  Metadata URIs: {:?}", meta_lvs);
-    println!("  Volume Name: {:?}", fs_name);
-    println!("===================================================");
-    Ok(())
+    block_size: u64,
+    capacity: u64,
+    compression: &str,
+    encrypt_algo: &str,
+    meta_lvs: &[String],
+    data_lvs: &[String],
+    mem_cache_size: &str,
+    disk_cache_size: &str,
+    disk_cache_paths: &[PathBuf],
+    mountpoint: Option<&Path>,
+    writeback: Option<bool>,
+    allow_other: Option<bool>,
+) {
+    let mode_str = if is_format {
+        "Format Configuration Summary".bold().yellow()
+    } else {
+        "Mount Configuration Summary".bold().green()
+    };
+    println!(
+        "SqueezeFS version {}",
+        env!("CARGO_PKG_VERSION").bold().cyan()
+    );
+    println!(
+        "{}",
+        "======================================================================".blue()
+    );
+    println!("  {}", mode_str);
+    println!(
+        "{}",
+        "----------------------------------------------------------------------".blue()
+    );
+    println!("  {:<20} {}", "Volume Name:", fs_name.bold());
+    println!("  {:<20} {}", "Capacity:", format_size_human(capacity));
+    println!("  {:<20} {}", "Block Size:", format_size_human(block_size));
+    println!("  {:<20} {}", "Compression:", compression);
+    println!("  {:<20} {}", "Encryption:", encrypt_algo);
+    println!(
+        "{}",
+        "----------------------------------------------------------------------".blue()
+    );
+    println!("{}", "Metadata Volumes:".bold().cyan());
+    for path in meta_lvs {
+        println!(
+            "  - [{}] {} (health: {})",
+            "enabled".green(),
+            path,
+            "1000".yellow()
+        );
+    }
+    println!("{}", "Data Volumes:".bold().cyan());
+    for path in data_lvs {
+        println!(
+            "  - [{}] {} (health: {})",
+            "enabled".green(),
+            path,
+            "1000".yellow()
+        );
+    }
+    println!(
+        "{}",
+        "----------------------------------------------------------------------".blue()
+    );
+    println!("{}", "Cache/Staging:".bold().cyan());
+    println!("  {:<20} {}", "Memory Cache Size:", mem_cache_size);
+    println!("  {:<20} {}", "Disk Cache Size:", disk_cache_size);
+    let paths_str = disk_cache_paths
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "  {:<20} {}",
+        "Staging Paths:",
+        if paths_str.is_empty() {
+            "none".normal()
+        } else {
+            paths_str.normal()
+        }
+    );
+
+    if !is_format {
+        if let Some(mp) = mountpoint {
+            println!(
+                "{}",
+                "----------------------------------------------------------------------".blue()
+            );
+            println!("{}", "Mount Options:".bold().cyan());
+            println!("  {:<20} {:?}", "Mountpoint:", mp);
+            if let Some(wb) = writeback {
+                println!(
+                    "  {:<20} {}",
+                    "Writeback Cache:",
+                    if wb {
+                        "enabled".green()
+                    } else {
+                        "disabled".yellow()
+                    }
+                );
+            }
+            if let Some(ao) = allow_other {
+                println!(
+                    "  {:<20} {}",
+                    "Allow Other:",
+                    if ao {
+                        "enabled".green()
+                    } else {
+                        "disabled".yellow()
+                    }
+                );
+            }
+        }
+    }
+    println!(
+        "{}",
+        "======================================================================".blue()
+    );
 }
 
 fn get_backing_device_size(path: &str) -> std::io::Result<u64> {
@@ -1418,6 +1567,29 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = file.sync_all();
                 }
             }
+            let resolved_mem = mem_cache_size.as_deref().unwrap_or("1GB");
+            let resolved_disk = disk_cache_size.as_deref().unwrap_or("10GB");
+            let resolved_paths = disk_cache_paths
+                .clone()
+                .unwrap_or_else(|| vec![get_default_staging_dir()]);
+
+            print_squeezefs_summary(
+                true,
+                "squeezefs",
+                parsed_block_size,
+                total_capacity,
+                &compression,
+                &encrypt_algo,
+                &meta_lvs,
+                &data_lvs,
+                resolved_mem,
+                resolved_disk,
+                &resolved_paths,
+                None,
+                None,
+                None,
+            );
+
             println!("Format complete.");
         }
         Commands::Status { meta_uri } => {

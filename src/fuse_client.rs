@@ -413,6 +413,7 @@ pub struct SqueezefsFilesystem {
     pub next_virtual_fh: std::sync::atomic::AtomicU64,
     pub latest_stats_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
     pub latest_config_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
+    pub inodes_limit: std::sync::Arc<std::sync::OnceLock<u64>>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -442,6 +443,7 @@ impl Clone for SqueezefsFilesystem {
             ),
             latest_stats_json: arc_swap::ArcSwap::new(self.latest_stats_json.load_full()),
             latest_config_json: arc_swap::ArcSwap::new(self.latest_config_json.load_full()),
+            inodes_limit: self.inodes_limit.clone(),
         }
     }
 }
@@ -499,6 +501,7 @@ impl SqueezefsFilesystem {
             next_virtual_fh: std::sync::atomic::AtomicU64::new(0x1000_0000_0000_0000),
             latest_stats_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
             latest_config_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
+            inodes_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -2249,10 +2252,31 @@ impl Filesystem for SqueezefsFilesystem {
 
             self.attr_cache.invalidate(&parent);
 
-            let attr = self
-                .get_attr_internal(new_ino)
-                .await
-                .map_err(map_squeezefs_err)?;
+            let attr = FileAttr {
+                ino: new_ino,
+                size: 0,
+                blocks: 0,
+                atime: Timestamp::new(sec, nsec),
+                mtime: Timestamp::new(sec, nsec),
+                ctime: Timestamp::new(sec, nsec),
+                kind: match kind_num {
+                    2 => FileType::Directory,
+                    3 => FileType::Symlink,
+                    4 => FileType::NamedPipe,
+                    5 => FileType::CharDevice,
+                    6 => FileType::BlockDevice,
+                    7 => FileType::Socket,
+                    _ => FileType::RegularFile,
+                },
+                perm: mode as u16 & 0o7777,
+                nlink: 1,
+                uid: req.uid,
+                gid: req.gid,
+                rdev,
+                blksize: 4096,
+            };
+            self.attr_cache
+                .insert(new_ino, (attr, std::time::Instant::now()));
 
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
@@ -2306,23 +2330,28 @@ impl Filesystem for SqueezefsFilesystem {
             let nsec = now.subsec_nanos();
 
             let shard_count = self.dlm.shard_count() as u64;
-            let (inodes_limit_str, used, new_ino): (Option<String>, Option<u64>, u64) =
-                redis::pipe()
-                    .cmd("HGET")
-                    .arg(crate::fs_key!("format"))
-                    .arg("inodes")
-                    .cmd("GET")
-                    .arg(crate::fs_key!("used_inodes"))
-                    .cmd("INCRBY")
-                    .arg(crate::fs_key!("inode_counter"))
-                    .arg(shard_count)
-                    .query_async(&mut con)
+            let max_inodes = if let Some(&lim) = self.inodes_limit.get() {
+                lim
+            } else {
+                let lim: u64 = con
+                    .hget(crate::fs_key!("format"), "inodes")
                     .await
-                    .map_err(map_err)?;
+                    .map_err(map_err)
+                    .unwrap_or(0);
+                let _ = self.inodes_limit.set(lim);
+                lim
+            };
 
-            let max_inodes = inodes_limit_str
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+            let (used, new_ino): (Option<u64>, u64) = redis::pipe()
+                .cmd("GET")
+                .arg(crate::fs_key!("used_inodes"))
+                .cmd("INCRBY")
+                .arg(crate::fs_key!("inode_counter"))
+                .arg(shard_count)
+                .query_async(&mut con)
+                .await
+                .map_err(map_err)?;
+
             let max_inodes_val = if max_inodes > 0 { max_inodes } else { u64::MAX };
 
             if used.unwrap_or(0) >= max_inodes_val {
@@ -2396,10 +2425,23 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache.invalidate(&parent);
             self.dir_entry_cache.invalidate(&parent);
 
-            let attr = self
-                .get_attr_internal(new_ino)
-                .await
-                .map_err(map_squeezefs_err)?;
+            let attr = FileAttr {
+                ino: new_ino,
+                size: 0,
+                blocks: 0,
+                atime: Timestamp::new(sec, nsec),
+                mtime: Timestamp::new(sec, nsec),
+                ctime: Timestamp::new(sec, nsec),
+                kind: FileType::RegularFile,
+                perm: mode as u16 & 0o7777,
+                nlink: 1,
+                uid: req.uid,
+                gid: req.gid,
+                rdev: 0,
+                blksize: 4096,
+            };
+            self.attr_cache
+                .insert(new_ino, (attr, std::time::Instant::now()));
 
             Ok(ReplyCreated {
                 ttl: Duration::from_secs(1),
@@ -2896,23 +2938,28 @@ impl Filesystem for SqueezefsFilesystem {
             let nsec = now.subsec_nanos();
 
             let shard_count = self.dlm.shard_count() as u64;
-            let (inodes_limit_str, used, new_ino): (Option<String>, Option<u64>, u64) =
-                redis::pipe()
-                    .cmd("HGET")
-                    .arg(crate::fs_key!("format"))
-                    .arg("inodes")
-                    .cmd("GET")
-                    .arg(crate::fs_key!("used_inodes"))
-                    .cmd("INCRBY")
-                    .arg(crate::fs_key!("inode_counter"))
-                    .arg(shard_count)
-                    .query_async(&mut con)
+            let max_inodes = if let Some(&lim) = self.inodes_limit.get() {
+                lim
+            } else {
+                let lim: u64 = con
+                    .hget(crate::fs_key!("format"), "inodes")
                     .await
-                    .map_err(map_err)?;
+                    .map_err(map_err)
+                    .unwrap_or(0);
+                let _ = self.inodes_limit.set(lim);
+                lim
+            };
 
-            let max_inodes = inodes_limit_str
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+            let (used, new_ino): (Option<u64>, u64) = redis::pipe()
+                .cmd("GET")
+                .arg(crate::fs_key!("used_inodes"))
+                .cmd("INCRBY")
+                .arg(crate::fs_key!("inode_counter"))
+                .arg(shard_count)
+                .query_async(&mut con)
+                .await
+                .map_err(map_err)?;
+
             let max_inodes_val = if max_inodes > 0 { max_inodes } else { u64::MAX };
 
             if used.unwrap_or(0) >= max_inodes_val {
@@ -2995,10 +3042,23 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache.invalidate(&parent);
             self.dir_entry_cache.invalidate(&parent);
 
-            let attr = self
-                .get_attr_internal(new_ino)
-                .await
-                .map_err(map_squeezefs_err)?;
+            let attr = FileAttr {
+                ino: new_ino,
+                size: 4096,
+                blocks: 8,
+                atime: Timestamp::new(sec, nsec),
+                mtime: Timestamp::new(sec, nsec),
+                ctime: Timestamp::new(sec, nsec),
+                kind: FileType::Directory,
+                perm: mode as u16 & 0o7777,
+                nlink: 2,
+                uid: req.uid,
+                gid: req.gid,
+                rdev: 0,
+                blksize: 4096,
+            };
+            self.attr_cache
+                .insert(new_ino, (attr, std::time::Instant::now()));
 
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
@@ -3168,18 +3228,13 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
             let attr_key = crate::keys::attr(ino);
 
-            // Check if inode exists first
-            let exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
-            if !exists {
-                return Err(Errno::from(libc::ENOENT));
-            }
-
-            let mut old_size = 0u64;
-            if set_attr.size.is_some() {
-                let old_size_opt: Option<u64> =
-                    con.hget(&attr_key, "size").await.map_err(map_err)?;
-                old_size = old_size_opt.unwrap_or(0);
-            }
+            let mut attr = self.get_attr_internal(ino).await.map_err(|e| match e {
+                SqueezefsError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                    Errno::from(libc::ENOENT)
+                }
+                _ => map_squeezefs_err(e),
+            })?;
+            let old_size = attr.size;
 
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -3191,12 +3246,15 @@ impl Filesystem for SqueezefsFilesystem {
 
             if let Some(mode) = set_attr.mode {
                 pipe.hset(&attr_key, "perm", mode as u16 & 0o7777);
+                attr.perm = mode as u16 & 0o7777;
             }
             if let Some(uid) = set_attr.uid {
                 pipe.hset(&attr_key, "uid", uid);
+                attr.uid = uid;
             }
             if let Some(gid) = set_attr.gid {
                 pipe.hset(&attr_key, "gid", gid);
+                attr.gid = gid;
             }
             if let Some(size) = set_attr.size {
                 // POSIX: length greater than the maximum file size → EFBIG
@@ -3218,6 +3276,14 @@ impl Filesystem for SqueezefsFilesystem {
                 }
 
                 pipe.hset(&attr_key, "size", size);
+                attr.size = size;
+                attr.blocks = match attr.kind {
+                    FileType::Directory | FileType::Symlink | FileType::RegularFile => {
+                        size.div_ceil(512)
+                    }
+                    _ => 0,
+                };
+
                 // Also update the physical/routing size in the metadata block?
                 let meta_key = crate::keys::metadata_for_inode(ino);
                 pipe.hset(&meta_key, "size", size);
@@ -3245,27 +3311,26 @@ impl Filesystem for SqueezefsFilesystem {
             if let Some(atime) = set_attr.atime {
                 pipe.hset(&attr_key, "atime_sec", atime.sec);
                 pipe.hset(&attr_key, "atime_nsec", atime.nsec);
+                attr.atime = Timestamp::new(atime.sec, atime.nsec);
             }
             if let Some(mtime) = set_attr.mtime {
                 pipe.hset(&attr_key, "mtime_sec", mtime.sec);
                 pipe.hset(&attr_key, "mtime_nsec", mtime.nsec);
+                attr.mtime = Timestamp::new(mtime.sec, mtime.nsec);
             }
 
             // Always update ctime
             pipe.hset(&attr_key, "ctime_sec", sec);
             pipe.hset(&attr_key, "ctime_nsec", nsec);
+            attr.ctime = Timestamp::new(sec, nsec);
 
             let _: () = pipe.query_async(&mut con).await.map_err(map_err)?;
 
-            // Invalidate cached attributes and router metadata
-            self.attr_cache.invalidate(&ino);
+            // Cache updated attributes directly
+            self.attr_cache
+                .insert(ino, (attr, std::time::Instant::now()));
             let file_path = crate::keys::inode_path(ino);
             self.router.metadata_cache.remove(&file_path);
-
-            let attr = self
-                .get_attr_internal(ino)
-                .await
-                .map_err(map_squeezefs_err)?;
 
             drop(_guard);
 
@@ -3361,10 +3426,23 @@ impl Filesystem for SqueezefsFilesystem {
 
             self.attr_cache.invalidate(&parent);
 
-            let attr = self
-                .get_attr_internal(new_ino)
-                .await
-                .map_err(map_squeezefs_err)?;
+            let attr = FileAttr {
+                ino: new_ino,
+                size: link_str.len() as u64,
+                blocks: 0,
+                atime: Timestamp::new(sec, nsec),
+                mtime: Timestamp::new(sec, nsec),
+                ctime: Timestamp::new(sec, nsec),
+                kind: FileType::Symlink,
+                perm: 0o777,
+                nlink: 1,
+                uid: req.uid,
+                gid: req.gid,
+                rdev: 0,
+                blksize: 4096,
+            };
+            self.attr_cache
+                .insert(new_ino, (attr, std::time::Instant::now()));
 
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
@@ -3436,19 +3514,15 @@ impl Filesystem for SqueezefsFilesystem {
                 return Err(Errno::from(libc::EEXIST));
             }
 
-            // Check if source exists
             let attr_key = crate::keys::attr(ino);
-            let source_exists: bool = con.exists(&attr_key).await.map_err(map_err)?;
-            if !source_exists {
-                return Err(Errno::from(libc::ENOENT));
-            }
+            let mut attr = self.get_attr_internal(ino).await.map_err(|e| match e {
+                SqueezefsError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                    Errno::from(libc::ENOENT)
+                }
+                _ => map_squeezefs_err(e),
+            })?;
 
-            let kind: u8 = con
-                .hget(&attr_key, "kind")
-                .await
-                .map_err(map_err)
-                .unwrap_or(1);
-            if kind == 2 {
+            if attr.kind == FileType::Directory {
                 // Directory
                 return Err(Errno::from(libc::EPERM));
             }
@@ -3467,26 +3541,25 @@ impl Filesystem for SqueezefsFilesystem {
                 .unwrap_or(Duration::ZERO);
             let sec = now.as_secs() as i64;
             let nsec = now.subsec_nanos();
+
+            let parent_attr_key = crate::keys::attr(new_parent);
             let _: () = redis::pipe()
                 .hset(&attr_key, "ctime_sec", sec)
                 .hset(&attr_key, "ctime_nsec", nsec)
+                .hset(&parent_attr_key, "mtime_sec", sec)
+                .hset(&parent_attr_key, "mtime_nsec", nsec)
+                .hset(&parent_attr_key, "ctime_sec", sec)
+                .hset(&parent_attr_key, "ctime_nsec", nsec)
                 .query_async(&mut con)
                 .await
                 .map_err(map_err)?;
 
-            // Update parent directory timestamps!
-            self.update_parent_timestamps(&mut con, new_parent)
-                .await
-                .map_err(map_err)?;
-
-            self.attr_cache.invalidate(&ino);
             self.attr_cache.invalidate(&new_parent);
 
-            let mut attr = self
-                .get_attr_internal(ino)
-                .await
-                .map_err(map_squeezefs_err)?;
             attr.nlink = new_nlink;
+            attr.ctime = Timestamp::new(sec, nsec);
+            self.attr_cache
+                .insert(ino, (attr, std::time::Instant::now()));
 
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),

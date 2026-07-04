@@ -229,28 +229,19 @@ async fn test_nvmeof_multirail_mock_connect() {
     )
     .expect("Share target should succeed");
 
-    // 3. Connect target using multiple local IPs
-    use std::net::IpAddr;
-    let local_ips = vec![
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        "127.0.0.2".parse::<IpAddr>().unwrap(),
-    ];
-    let dev =
-        squeezefs::nvmeof::connect_target_with_local_ips("127.0.0.1", 4420, &subnqn, &local_ips)
-            .expect("Multi-rail connect target should succeed");
+    // 3. Connect target
+    let dev = squeezefs::nvmeof::connect_target("127.0.0.1", 4420, &subnqn)
+        .expect("Connect target should succeed");
 
     assert_eq!(dev, "/dev/nvme0n1");
 
-    // Verify fabrics ctl write has been performed for both
+    // Verify fabrics ctl write has been performed
     let ctl_write = fs::read_to_string(mock_fabrics.join("ctl")).unwrap();
     assert!(ctl_write.contains(&subnqn));
     assert!(ctl_write.contains("127.0.0.1"));
-    assert!(ctl_write.contains("host_traddr=127.0.0.1"));
-    assert!(ctl_write.contains("host_traddr=127.0.0.2"));
 
-    // Verify that both mock controllers are created (nvme0 and nvme1)
+    // Verify that mock controller nvme0 is created
     assert!(mock_nvme.join("nvme0").exists());
-    assert!(mock_nvme.join("nvme1").exists());
 
     // 4. Disconnect target
     squeezefs::nvmeof::disconnect_target(&subnqn).expect("Disconnect target should succeed");

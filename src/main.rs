@@ -158,10 +158,6 @@ enum Commands {
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
 
-        /// Comma-separated list of local source IP interfaces for multi-rail connection bonding
-        #[arg(long, value_delimiter = ',')]
-        local_ips: Option<Vec<std::net::IpAddr>>,
-
         /// SqueezeFS LVM/Physical Data Volume paths
         #[arg(
             long,
@@ -491,9 +487,6 @@ enum NvmeofActions {
         /// Remote target Subsystem NQN
         #[arg(long)]
         subnqn: String,
-        /// Comma-separated list of local source IP interfaces for multi-rail connection
-        #[arg(long, value_delimiter = ',')]
-        local_ips: Option<Vec<std::net::IpAddr>>,
     },
     /// Disconnect local client from a remote NVMe-oF target
     Disconnect {
@@ -531,9 +524,25 @@ enum ConfigActions {
     /// Manage staging disk caches
     #[command(subcommand, alias = "diskcaches")]
     DiskCache(DiskCacheActions),
-    /// Manage storage volumes
-    #[command(subcommand, alias = "backends", alias = "backend", alias = "volumes")]
-    Volume(VolumeActions),
+    /// Manage data volumes
+    #[command(
+        subcommand,
+        alias = "datavolumes",
+        alias = "datavolume",
+        alias = "backends",
+        alias = "backend",
+        alias = "volumes"
+    )]
+    DataVolume(DataVolumeActions),
+    /// Manage metadata volumes
+    #[command(
+        subcommand,
+        alias = "metavolumes",
+        alias = "metavolume",
+        alias = "metadata_backends",
+        alias = "metadata_backend"
+    )]
+    MetadataVolume(MetadataVolumeActions),
     /// Set runtime configuration quotas (capacity, inodes, or memory cache sizes)
     Set {
         /// Quota/config key (e.g. "capacity", "inodes", "mem_cache_size", "read_mem_cache_size", "write_mem_cache_size", "fuse_io_uring_sqpoll_idle_ms")
@@ -548,8 +557,8 @@ enum ConfigActions {
 }
 
 #[derive(Subcommand, Debug, Clone)]
-enum VolumeActions {
-    /// Add a storage volume
+enum DataVolumeActions {
+    /// Add a data volume
     Add {
         /// Volume ID
         volume_id: String,
@@ -569,7 +578,7 @@ enum VolumeActions {
         #[arg(long)]
         capacity: Option<String>,
     },
-    /// Remove a storage volume
+    /// Remove a data volume
     Remove {
         /// Volume ID
         volume_id: String,
@@ -577,12 +586,66 @@ enum VolumeActions {
         #[arg(long)]
         force: bool,
     },
-    /// List all storage volumes and their status
+    /// List all data volumes and their status
     List,
-    /// Set the active write volume
-    SetActive {
+    /// Enable a data volume
+    Enable {
         /// Volume ID
         volume_id: String,
+    },
+    /// Disable a data volume
+    Disable {
+        /// Volume ID
+        volume_id: String,
+    },
+    /// Migrate data from one data volume to another
+    Migrate {
+        /// Source volume ID/backing device path
+        from_volume: String,
+        /// Destination volume ID/backing device path
+        to_volume: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum MetadataVolumeActions {
+    /// Add a metadata volume
+    Add {
+        /// Volume ID
+        volume_id: String,
+        /// Backing device path (e.g. "/dev/shm/squeezefs_pjdfs_meta")
+        #[arg(long, alias = "backing-dev")]
+        volume: Option<String>,
+        /// Optional capacity
+        #[arg(long)]
+        capacity: Option<String>,
+    },
+    /// Remove a metadata volume
+    Remove {
+        /// Volume ID
+        volume_id: String,
+        /// Force removal ignoring safety checks
+        #[arg(long)]
+        force: bool,
+    },
+    /// List all metadata volumes and their status
+    List,
+    /// Enable a metadata volume
+    Enable {
+        /// Volume ID (e.g., meta_volume_0 or index/path)
+        volume_id: String,
+    },
+    /// Disable a metadata volume
+    Disable {
+        /// Volume ID (e.g., meta_volume_0 or index/path)
+        volume_id: String,
+    },
+    /// Migrate inodes/metadata from one metadata volume to another
+    Migrate {
+        /// Source metadata volume index or ID
+        from_volume: String,
+        /// Destination metadata volume index or ID
+        to_volume: String,
     },
 }
 
@@ -1402,7 +1465,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ip: _,
             port: _,
             subnqn: _,
-            local_ips,
+
             daemon: _,
             uid,
             gid,
@@ -1594,7 +1657,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let first_data_path = &resolved_data_lvs[0];
             squeezefs::storage::validate_backing_device(first_data_path)?;
 
-            let dlm = DlmClient::new_with_local_ips("local", local_ips.unwrap_or_default()).await?;
+            let dlm = DlmClient::new("local")?;
             let block_alloc = std::sync::Arc::new(
                 squeezefs::block_allocator::BlockAllocator::new(
                     dlm.meta_client().clone(),
@@ -1973,20 +2036,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     println!("Successfully stopped sharing target NQN '{}'.", subnqn);
                 }
-                NvmeofActions::Connect {
-                    ip,
-                    port,
-                    subnqn,
-                    local_ips,
-                } => {
+                NvmeofActions::Connect { ip, port, subnqn } => {
                     println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
-                    let local_ips_vec = local_ips.unwrap_or_default();
-                    let dev = squeezefs::nvmeof::connect_target_with_local_ips(
-                        &ip,
-                        port,
-                        &subnqn,
-                        &local_ips_vec,
-                    )?;
+                    let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn)?;
                     if dev.starts_with("/dev/") {
                         println!("{}", "Connection successful!".green().bold());
                         println!("Attached Remote Disk: {}", dev.cyan().bold());
@@ -2102,73 +2154,136 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         println!("{}", serde_json::to_string_pretty(&list.diskcaches)?);
                     }
                 },
-                ConfigActions::Volume(action) => match action {
-                    VolumeActions::Add {
+                ConfigActions::DataVolume(action) => match action {
+                    DataVolumeActions::Add {
                         volume_id,
                         volume: backing_dev,
-                        ip,
-                        port,
-                        subnqn,
-                        capacity,
+                        ..
                     } => {
-                        let backend_id = volume_id;
-                        let resolved_capacity = if let Some(ref cap_str) = capacity {
-                            if let Ok(bytes) = squeezefs::cache::parse_size_string(cap_str, 0) {
-                                Some(bytes)
-                            } else {
-                                return Err(Box::new(
-                                    squeezefs::error::SqueezefsError::InvalidOperation(format!(
-                                        "Invalid capacity string: {}",
-                                        cap_str
-                                    )),
-                                ));
-                            }
-                        } else {
-                            None
-                        };
-                        squeezefs::config_ops::add_storage_backend(
+                        squeezefs::config_ops::add_data_volume(
                             &garnet_url,
                             &fs_name,
-                            &backend_id,
+                            &volume_id,
                             backing_dev.as_deref(),
-                            ip.as_deref(),
-                            port,
-                            subnqn.as_deref(),
-                            resolved_capacity,
+                        )
+                        .await?;
+                        println!("Data volume '{}' registered/added successfully.", volume_id);
+                    }
+                    DataVolumeActions::Remove { volume_id, .. } => {
+                        squeezefs::config_ops::remove_data_volume(
+                            &garnet_url,
+                            &fs_name,
+                            &volume_id,
+                        )
+                        .await?;
+                        println!("Data volume '{}' removed successfully.", volume_id);
+                    }
+                    DataVolumeActions::List => {
+                        let list =
+                            squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                        println!("{}", serde_json::to_string_pretty(&list.data_volumes)?);
+                    }
+                    DataVolumeActions::Enable { volume_id } => {
+                        squeezefs::config_ops::enable_data_volume(
+                            &garnet_url,
+                            &fs_name,
+                            &volume_id,
+                        )
+                        .await?;
+                        println!("Data volume '{}' enabled successfully.", volume_id);
+                    }
+                    DataVolumeActions::Disable { volume_id } => {
+                        squeezefs::config_ops::disable_data_volume(
+                            &garnet_url,
+                            &fs_name,
+                            &volume_id,
+                        )
+                        .await?;
+                        println!("Data volume '{}' disabled successfully.", volume_id);
+                    }
+                    DataVolumeActions::Migrate {
+                        from_volume,
+                        to_volume,
+                    } => {
+                        squeezefs::config_ops::migrate_data_volume(
+                            &garnet_url,
+                            &fs_name,
+                            &from_volume,
+                            &to_volume,
                         )
                         .await?;
                         println!(
-                            "Storage volume '{}' registered/added successfully.",
-                            backend_id
+                            "Migrated data off data volume '{}' onto '{}' successfully.",
+                            from_volume, to_volume
                         );
                     }
-                    VolumeActions::Remove { volume_id, force } => {
-                        let backend_id = volume_id;
-                        squeezefs::config_ops::remove_storage_backend(
-                            &garnet_url,
-                            &fs_name,
-                            &backend_id,
-                            force,
-                        )
-                        .await?;
-                        println!("Storage volume '{}' removed successfully.", backend_id);
-                    }
-                    VolumeActions::List => {
-                        let list =
-                            squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                        println!("{}", serde_json::to_string_pretty(&list.backends)?);
-                    }
-                    VolumeActions::SetActive { volume_id } => {
-                        let backend_id = volume_id;
-                        squeezefs::config_ops::set_active_backend(
-                            &garnet_url,
-                            &fs_name,
-                            &backend_id,
-                        )
-                        .await?;
-                        println!("Active write volume set to '{}' successfully.", backend_id);
-                    }
                 },
+                ConfigActions::MetadataVolume(action) => {
+                    match action {
+                        MetadataVolumeActions::Add {
+                            volume_id,
+                            volume: backing_dev,
+                            ..
+                        } => {
+                            squeezefs::config_ops::add_metadata_volume(
+                                &garnet_url,
+                                &fs_name,
+                                &volume_id,
+                                backing_dev.as_deref(),
+                            )
+                            .await?;
+                            println!(
+                                "Metadata volume '{}' registered/added successfully.",
+                                volume_id
+                            );
+                        }
+                        MetadataVolumeActions::Remove { volume_id, .. } => {
+                            squeezefs::config_ops::remove_metadata_volume(
+                                &garnet_url,
+                                &fs_name,
+                                &volume_id,
+                            )
+                            .await?;
+                            println!("Metadata volume '{}' removed successfully.", volume_id);
+                        }
+                        MetadataVolumeActions::List => {
+                            let list =
+                                squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
+                            println!("{}", serde_json::to_string_pretty(&list.metadata_volumes)?);
+                        }
+                        MetadataVolumeActions::Enable { volume_id } => {
+                            squeezefs::config_ops::enable_metadata_volume(
+                                &garnet_url,
+                                &fs_name,
+                                &volume_id,
+                            )
+                            .await?;
+                            println!("Metadata volume '{}' enabled successfully.", volume_id);
+                        }
+                        MetadataVolumeActions::Disable { volume_id } => {
+                            squeezefs::config_ops::disable_metadata_volume(
+                                &garnet_url,
+                                &fs_name,
+                                &volume_id,
+                            )
+                            .await?;
+                            println!("Metadata volume '{}' disabled successfully.", volume_id);
+                        }
+                        MetadataVolumeActions::Migrate {
+                            from_volume,
+                            to_volume,
+                        } => {
+                            squeezefs::config_ops::migrate_metadata_volume(
+                                &garnet_url,
+                                &fs_name,
+                                &from_volume,
+                                &to_volume,
+                            )
+                            .await?;
+                            println!("Migrated metadata off metadata volume '{}' onto '{}' successfully.", from_volume, to_volume);
+                        }
+                    }
+                }
                 ConfigActions::List => {
                     let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
                     println!("{}", serde_json::to_string_pretty(&list)?);

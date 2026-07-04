@@ -2,7 +2,6 @@ use crate::error::Result;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,9 +21,6 @@ pub enum MetaClient {
 
 impl MetaClient {
     pub fn new(_redis_url: &str) -> Result<Self> {
-        Ok(Self::Local)
-    }
-    pub async fn new_with_local_ips(_redis_url: &str, _local_ips: Vec<IpAddr>) -> Result<Self> {
         Ok(Self::Local)
     }
     pub async fn get_connection(&self) -> Result<MetaConnection> {
@@ -56,10 +52,6 @@ impl DlmClient {
             redis_url: redis_url.to_string(),
             meta_client: Arc::new(MetaClient::Local),
         })
-    }
-
-    pub async fn new_with_local_ips(redis_url: &str, _local_ips: Vec<IpAddr>) -> Result<Self> {
-        Self::new(redis_url)
     }
 
     pub fn client_id(&self) -> &str {

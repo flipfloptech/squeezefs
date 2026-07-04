@@ -735,56 +735,7 @@ fn connect_target_single(
 }
 
 pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<String> {
-    connect_target_with_local_ips(ip, port, subnqn, &[])
-}
-
-pub fn connect_target_with_local_ips(
-    ip: &str,
-    port: u16,
-    subnqn: &str,
-    local_ips: &[std::net::IpAddr],
-) -> std::io::Result<String> {
-    if local_ips.is_empty() {
-        connect_target_single(ip, port, subnqn, None)?;
-    } else {
-        let mut handles = Vec::new();
-        for &local_ip in local_ips {
-            let ip = ip.to_string();
-            let subnqn = subnqn.to_string();
-            let handle = std::thread::spawn(move || {
-                connect_target_single(&ip, port, &subnqn, Some(local_ip))
-            });
-            handles.push(handle);
-        }
-
-        let mut last_err = None;
-        let mut success = false;
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(())) => {
-                    success = true;
-                }
-                Ok(Err(e)) => {
-                    last_err = Some(e);
-                }
-                Err(_) => {
-                    last_err = Some(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Thread join failed",
-                    ));
-                }
-            }
-        }
-
-        if !success {
-            return Err(last_err.unwrap_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to connect via any local IP address",
-                )
-            }));
-        }
-    }
+    connect_target_single(ip, port, subnqn, None)?;
 
     // Wait up to 2 seconds for the block device node to appear in sysfs
     let start_time = std::time::Instant::now();

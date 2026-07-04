@@ -18,14 +18,14 @@ fn bench_metalv_metadata(c: &mut Criterion) {
             let name = format!("file_{}", rand::random::<u64>());
             let backend_ref = &backend;
             async move {
-                backend_ref.create(1, &name, 0o644).await.unwrap();
+                backend_ref.create(1, &name, 0o644, 0, 0).await.unwrap();
                 backend_ref.unlink(1, &name).await.unwrap();
             }
         });
     });
 
     group.bench_function("lookup_file", |b| {
-        let _ = rt.block_on(async { backend.create(1, "lookup_target", 0o644).await });
+        let _ = rt.block_on(async { backend.create(1, "lookup_target", 0o644, 0, 0).await });
         b.to_async(&rt).iter(|| {
             let backend_ref = &backend;
             async move {
@@ -35,7 +35,7 @@ fn bench_metalv_metadata(c: &mut Criterion) {
     });
 
     group.bench_function("set_get_xattr", |b| {
-        let _ = rt.block_on(async { backend.create(1, "xattr_target", 0o644).await });
+        let _ = rt.block_on(async { backend.create(1, "xattr_target", 0o644, 0, 0).await });
         let ino = rt.block_on(async { backend.lookup(1, "xattr_target").await.unwrap().ino });
         let val = b"benchmark_value";
         b.to_async(&rt).iter(|| {

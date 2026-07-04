@@ -82,6 +82,21 @@ fn get_flat_val(entry: &DiskXattrEntry) -> Vec<u8> {
 
 pub fn get_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<Option<Vec<u8>>> {
     let _guard = storage.lock_op();
+
+    if let Ok(inode) = crate::meta_backend::inode::read_inode(storage, ino) {
+        if (inode.mode & libc::S_IFMT) == libc::S_IFLNK {
+            if name == "system.symlink" {
+                let offset = get_xattr_block_offset(ino);
+                let mut sector_buf = [0u8; SECTOR_SIZE];
+                storage.read_blocks(offset, &mut sector_buf)?;
+                let len = std::cmp::min(inode.size as usize, SECTOR_SIZE);
+                return Ok(Some(sector_buf[..len].to_vec()));
+            } else {
+                return Ok(None);
+            }
+        }
+    }
+
     let offset = get_xattr_block_offset(ino);
     let mut block_buf = [0u8; SECTOR_SIZE];
     storage.read_blocks(offset, &mut block_buf)?;
@@ -116,13 +131,39 @@ pub fn set_xattr(storage: &MetaLvStorage, ino: u64, name: &str, value: &[u8]) ->
             "xattr key too long (max 64 bytes)".to_string(),
         ));
     }
-    if value.len() > 1024 {
+    if name == "system.symlink" {
+        if value.len() > 4096 {
+            return Err(SqueezefsError::InvalidOperation(
+                "symlink target path too long (max 4096 bytes)".to_string(),
+            ));
+        }
+    } else if value.len() > 1024 {
         return Err(SqueezefsError::InvalidOperation(
             "xattr value too long (max 1024 bytes)".to_string(),
         ));
     }
 
     let _guard = storage.lock_op();
+
+    if let Ok(mut inode) = crate::meta_backend::inode::read_inode(storage, ino) {
+        if (inode.mode & libc::S_IFMT) == libc::S_IFLNK {
+            if name == "system.symlink" {
+                inode.size = value.len() as u64;
+                crate::meta_backend::inode::write_inode(storage, ino, &inode)?;
+
+                let offset = get_xattr_block_offset(ino);
+                let mut sector_buf = [0u8; SECTOR_SIZE];
+                sector_buf[..value.len()].copy_from_slice(value);
+                storage.write_blocks(offset, &sector_buf)?;
+                return Ok(());
+            } else {
+                return Err(SqueezefsError::InvalidOperation(
+                    "custom xattrs not supported on symlinks".to_string(),
+                ));
+            }
+        }
+    }
+
     let offset = get_xattr_block_offset(ino);
     let mut block_buf = [0u8; SECTOR_SIZE];
     storage.read_blocks(offset, &mut block_buf)?;

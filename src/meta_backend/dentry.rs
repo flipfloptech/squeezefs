@@ -3,7 +3,7 @@ use crate::meta_backend::storage::{MetaLvStorage, SECTOR_SIZE};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub const DENTRY_TABLE_START: u64 = 1024 * 1024; // 1 MiB boundary
-pub const DENTRY_SLOT_SIZE: usize = 128;
+pub const DENTRY_SLOT_SIZE: usize = 512;
 pub const DENTRIES_PER_SECTOR: usize = SECTOR_SIZE / DENTRY_SLOT_SIZE;
 pub const MAX_DENTRY_SLOTS: u64 = 16384;
 
@@ -14,8 +14,9 @@ pub struct DiskDentry {
     pub child_ino: u64,
     pub file_type: u32,
     pub name_len: u32,
-    pub name: [u8; 96], // Maximum name length is 96 bytes
-    pub next_ptr: u64,  // Offset to the next dentry in the hash chain
+    pub name: [u8; 256],   // Maximum name length is 256 bytes (NAME_MAX = 255)
+    pub next_ptr: u64,     // Offset to the next dentry in the hash chain
+    pub unused: [u8; 224], // Pad to exactly 512 bytes
 }
 
 impl DiskDentry {
@@ -29,18 +30,19 @@ impl DiskDentry {
             child_ino,
             file_type,
             name_len: name.len() as u32,
-            name: [0u8; 96],
+            name: [0u8; 256],
             next_ptr: 0,
+            unused: [0u8; 224],
         };
         let bytes = name.as_bytes();
-        let copy_len = bytes.len().min(96);
+        let copy_len = bytes.len().min(256);
         d.name[..copy_len].copy_from_slice(&bytes[..copy_len]);
         d
     }
 
     pub fn get_name(&self) -> String {
         let len = self.name_len as usize;
-        let bound = len.min(96);
+        let bound = len.min(256);
         String::from_utf8_lossy(&self.name[..bound]).into_owned()
     }
 }

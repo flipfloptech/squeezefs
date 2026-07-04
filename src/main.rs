@@ -1533,7 +1533,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             &path,
                             64 * 1024 * 1024,
                         )
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| format!("Failed to open metadata volume '{}': {}", path, e))?;
                         let pb = if !quick {
                             let pb = mp_c.add(indicatif::ProgressBar::new(0));
                             pb.set_style(
@@ -1550,7 +1550,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         squeezefs::meta_backend::MetaLvBackend::format_with_options(
                             &storage, quick, pb,
                         )
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| format!("Failed to format metadata volume '{}': {}", path, e))?;
                         Ok::<(), String>(())
                     })
                     .await
@@ -1598,7 +1598,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let mut file = std::fs::OpenOptions::new()
                             .write(true)
                             .open(&path)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| format!("Failed to open data volume '{}': {}", path, e))?;
                         use std::io::Write;
                         let zeros = vec![0u8; 1024 * 1024];
                         let mut written = 0;
@@ -1606,13 +1606,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             let to_write =
                                 std::cmp::min(zeros.len() as u64, wipe_len - written) as usize;
                             file.write_all(&zeros[..to_write])
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| format!("Failed to write to data volume '{}': {}", path, e))?;
                             written += to_write as u64;
                             if let Some(ref p_bar) = pb {
                                 p_bar.inc(to_write as u64);
                             }
                         }
-                        file.sync_all().map_err(|e| e.to_string())?;
+                        file.sync_all().map_err(|e| format!("Failed to sync data volume '{}': {}", path, e))?;
                         if let Some(ref p_bar) = pb {
                             p_bar.finish_with_message("Complete");
                         }

@@ -127,6 +127,49 @@ impl BackendRouter {
         }
     }
 
+    pub fn get_backend_health(&self, be_id: &str) -> u32 {
+        if !self.is_backend_healthy(be_id) {
+            return 0;
+        }
+
+        let (allocator, device_path) = if be_id == "backend_0" {
+            (
+                self.default_allocator.clone(),
+                self.default_device.device_path.clone(),
+            )
+        } else if let Some(be) = self.backends.get(be_id) {
+            (be.block_allocator.clone(), be.device.device_path.clone())
+        } else {
+            return 0;
+        };
+
+        // Query real device capacity
+        let mut dev_size = 100 * 1024 * 1024 * 1024;
+        if let Ok(metadata) = std::fs::metadata(&device_path) {
+            let len = metadata.len();
+            if len > 0 {
+                dev_size = len;
+            } else if let Ok(mut file) = std::fs::File::open(&device_path) {
+                use std::io::Seek;
+                if let Ok(len) = file.seek(std::io::SeekFrom::End(0)) {
+                    if len > 0 {
+                        dev_size = len;
+                    }
+                }
+            }
+        }
+
+        let total_blocks = (dev_size / (4 * 1024 * 1024)).max(1);
+        let used_blocks = allocator.get_used_blocks();
+        let free_blocks = total_blocks.saturating_sub(used_blocks);
+        let free_factor = free_blocks as f64 / total_blocks as f64;
+
+        let perf_factor = 1.0;
+
+        let score = (free_factor * 1000.0 * perf_factor) as u32;
+        score.min(1000)
+    }
+
     pub fn get_active_backend(
         &self,
     ) -> Result<(
@@ -137,20 +180,24 @@ impl BackendRouter {
         let mut healthy_backends = Vec::new();
 
         if self.is_backend_healthy("backend_0") {
+            let health = self.get_backend_health("backend_0");
             healthy_backends.push((
                 "backend_0".to_string(),
                 self.default_allocator.clone(),
                 self.default_device.clone(),
+                health,
             ));
         }
 
         for entry in self.backends.iter() {
             let be_id = entry.key();
             if self.is_backend_healthy(be_id) {
+                let health = self.get_backend_health(be_id);
                 healthy_backends.push((
                     be_id.clone(),
                     entry.value().block_allocator.clone(),
                     entry.value().device.clone(),
+                    health,
                 ));
             }
         }
@@ -162,16 +209,19 @@ impl BackendRouter {
             )));
         }
 
-        let mut selected = &healthy_backends[0];
-        let mut min_used = selected.1.get_used_blocks();
+        // Sort by health descending
+        healthy_backends.sort_by(|a, b| b.3.cmp(&a.3));
 
-        for backend in &healthy_backends[1..] {
-            let used = backend.1.get_used_blocks();
-            if used < min_used {
-                min_used = used;
-                selected = backend;
-            }
-        }
+        let max_health = healthy_backends[0].3;
+        // Filter candidates within 90% of max health
+        let candidates: Vec<_> = healthy_backends
+            .into_iter()
+            .filter(|b| b.3 >= (max_health * 9) / 10)
+            .collect();
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let idx = COUNTER.fetch_add(1, Ordering::Relaxed) % candidates.len();
+        let selected = &candidates[idx];
 
         Ok((selected.0.clone(), selected.1.clone(), selected.2.clone()))
     }
@@ -224,6 +274,13 @@ impl BackendRouter {
         dest_addr: Option<u64>,
     ) -> Result<bytes::Bytes> {
         let (be_id, offset) = self.parse_block_key(block_key)?;
+
+        if !self.is_backend_healthy(&be_id) {
+            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("Storage volume '{}' is disabled/offline", be_id),
+            )));
+        }
 
         if be_id == "backend_0" {
             self.default_device
@@ -510,7 +567,11 @@ impl DataRouter {
             ))
         })?;
         backend.setxattr(ino, "layout", &bytes).await?;
-        let _ = backend.setattr(ino, None, Some(m.size)).await;
+        let _ = backend
+            .setattr(ino, None, None, None, Some(m.size), None, None, None)
+            .await;
+        let file_path = crate::keys::inode_path(ino);
+        self.metadata_cache.remove(&file_path);
         Ok(())
     }
 
@@ -1958,29 +2019,49 @@ impl DataRouter {
                             } else {
                                 // Single block cache miss: download directly in-line (zero-copy, no spawn)
                                 let downloaded = if let Some(dest) = dest_addr {
-                                    self.backend_router
-                                        .read_block_with_dest(
-                                            b_key,
-                                            block_size as usize,
-                                            Some(dest),
-                                        )
-                                        .await?;
-                                    let len = block_size as usize;
-                                    let dest_ptr = dest as *mut u8;
-                                    let b = unsafe {
-                                        bytes::Bytes::from_static(std::slice::from_raw_parts(
-                                            dest_ptr, len,
-                                        ))
-                                    };
-                                    crate::cache::pool::ReadBlockValue::Bytes(b)
+                                    if slice_start == 0 && slice_len as u64 == block_size {
+                                        self.backend_router
+                                            .read_block_with_dest(
+                                                b_key,
+                                                block_size as usize,
+                                                Some(dest),
+                                            )
+                                            .await?;
+                                        let len = block_size as usize;
+                                        let dest_ptr = dest as *mut u8;
+                                        let b = unsafe {
+                                            bytes::Bytes::from_static(std::slice::from_raw_parts(
+                                                dest_ptr, len,
+                                            ))
+                                        };
+                                        crate::cache::pool::ReadBlockValue::Bytes(b)
+                                    } else {
+                                        let val = self.get_cached_or_fetch_block(b_key).await?;
+                                        let start = std::cmp::min(slice_start as usize, val.len());
+                                        let end = std::cmp::min(
+                                            (slice_start + slice_len as u64) as usize,
+                                            val.len(),
+                                        );
+                                        let len = end - start;
+                                        let dest_ptr = dest as *mut u8;
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                val[start..end].as_ptr(),
+                                                dest_ptr,
+                                                len,
+                                            );
+                                        }
+                                        let b = unsafe {
+                                            bytes::Bytes::from_static(std::slice::from_raw_parts(
+                                                dest_ptr, len,
+                                            ))
+                                        };
+                                        crate::cache::pool::ReadBlockValue::Bytes(b)
+                                    }
                                 } else {
                                     self.get_cached_or_fetch_block(b_key).await?
                                 };
-                                let start = std::cmp::min(slice_start as usize, downloaded.len());
-                                let end = std::cmp::min(
-                                    (slice_start + slice_len as u64) as usize,
-                                    downloaded.len(),
-                                );
+
                                 if self.should_prefetch_after_striped_read(
                                     file_path,
                                     start_block,
@@ -1993,18 +2074,27 @@ impl DataRouter {
                                         block_size,
                                     );
                                 }
-                                let data = if let Some(dest) = dest_addr {
-                                    unsafe {
+
+                                if let Some(dest) = dest_addr {
+                                    let len = (end_offset - offset) as usize;
+                                    let data = unsafe {
                                         bytes::Bytes::from_static(std::slice::from_raw_parts(
                                             dest as *mut u8,
-                                            end - start,
+                                            len,
                                         ))
-                                    }
+                                    };
+                                    return Ok((data, Some(std::sync::Arc::new(downloaded))));
                                 } else {
+                                    let start =
+                                        std::cmp::min(slice_start as usize, downloaded.len());
+                                    let end = std::cmp::min(
+                                        (slice_start + slice_len as u64) as usize,
+                                        downloaded.len(),
+                                    );
                                     let slice: &[u8] = &downloaded[start..end];
-                                    bytes::Bytes::copy_from_slice(slice)
-                                };
-                                return Ok((data, Some(std::sync::Arc::new(downloaded))));
+                                    let data = bytes::Bytes::copy_from_slice(slice);
+                                    return Ok((data, Some(std::sync::Arc::new(downloaded))));
+                                }
                             }
                         } else {
                             // Hole support: return zero-filled slice
@@ -2305,10 +2395,25 @@ impl DataRouter {
         if let Some(backend) = self.inner.meta_backend.get() {
             let src_inode = backend.getattr(src_ino).await?;
             let dest_inode = backend
-                .create(parent_ino, file_name, src_inode.mode)
+                .create(
+                    parent_ino,
+                    file_name,
+                    src_inode.mode,
+                    src_inode.uid,
+                    src_inode.gid,
+                )
                 .await?;
             let _ = backend
-                .setattr(dest_inode.ino, Some(src_inode.mode), Some(src_inode.size))
+                .setattr(
+                    dest_inode.ino,
+                    Some(src_inode.mode),
+                    None,
+                    None,
+                    Some(src_inode.size),
+                    None,
+                    None,
+                    None,
+                )
                 .await?;
 
             self.clone_file(

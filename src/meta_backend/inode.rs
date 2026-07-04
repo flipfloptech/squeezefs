@@ -30,6 +30,10 @@ impl DiskInode {
     }
 
     pub fn new(ino: u64, mode: u32, uid: u32, gid: u32) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         Self {
             magic: 0x4E4F4445, // "NODE" in hex
             ino,
@@ -38,9 +42,9 @@ impl DiskInode {
             gid,
             nlink: 1,
             size: 0,
-            atime: 0,
-            mtime: 0,
-            ctime: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
             xattr_ptr: 0,
             flags: 0,
             unused: [0u8; 184],

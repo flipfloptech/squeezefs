@@ -36,7 +36,7 @@ async fn test_metalv_crud_operations() {
 
     // Create a file in root (parent ino 1)
     let file = backend
-        .create(1, "hello.txt", libc::S_IFREG | 0o644)
+        .create(1, "hello.txt", libc::S_IFREG | 0o644, 0, 0)
         .await
         .unwrap();
     assert!(file.ino > 1);
@@ -53,7 +53,10 @@ async fn test_metalv_crud_operations() {
     assert_eq!(list[0].ino, file.ino);
 
     // Setattr size
-    let updated = backend.setattr(file.ino, None, Some(1024)).await.unwrap();
+    let updated = backend
+        .setattr(file.ino, None, None, None, Some(1024), None, None, None)
+        .await
+        .unwrap();
     assert_eq!(updated.size, 1024);
 
     // Rename the file

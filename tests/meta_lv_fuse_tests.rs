@@ -3,7 +3,7 @@ use fuse3::raw::Request;
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
-use squeezefs::fuse_client::SqueezefsFilesystem;
+use squeezefs::fuse_client::{SqueezefsFilesystem, CONFIG_INODE};
 use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
@@ -227,4 +227,16 @@ async fn test_metalv_fuse_integration() {
         .lookup(req, 1, OsStr::new("hello_renamed.txt"))
         .await
         .is_err());
+
+    // 12. Read CONFIG_INODE virtual file to verify health values
+    let config_sz_attr = fs.getattr(req, CONFIG_INODE, None, 0).await.unwrap();
+    let config_len = config_sz_attr.attr.size;
+    let config_read = fs
+        .read(req, CONFIG_INODE, 0, 0, config_len as u32)
+        .await
+        .unwrap();
+    let config_str = std::str::from_utf8(&config_read.data).unwrap();
+    assert!(config_str.contains("\"health\":"));
+    assert!(config_str.contains("backend_0"));
+    assert!(config_str.contains("meta_volume_0"));
 }

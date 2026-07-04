@@ -33,7 +33,8 @@ pub struct DirEntry {
 #[async_trait::async_trait]
 pub trait Metadata: Send + Sync {
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode>;
-    async fn create(&self, parent: Ino, name: &str, mode: u32) -> Result<Inode>;
+    async fn create(&self, parent: Ino, name: &str, mode: u32, uid: u32, gid: u32)
+        -> Result<Inode>;
     async fn unlink(&self, parent: Ino, name: &str) -> Result<()>;
     async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode>;
     async fn rename(
@@ -45,11 +46,22 @@ pub trait Metadata: Send + Sync {
     ) -> Result<()>;
     async fn readdir(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>>;
     async fn getattr(&self, ino: Ino) -> Result<Inode>;
-    async fn setattr(&self, ino: Ino, mode: Option<u32>, size: Option<u64>) -> Result<Inode>;
+    async fn setattr(
+        &self,
+        ino: Ino,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+        ctime: Option<u64>,
+    ) -> Result<Inode>;
     async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>>;
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()>;
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()>;
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>>;
+    async fn destroy_inode(&self, ino: Ino) -> Result<()>;
 }
 
 pub struct MetaLvBackend {
@@ -70,7 +82,7 @@ impl MetaLvBackend {
 
     pub fn get_allocated_inode_count(&self) -> usize {
         let mut count = 0;
-        for i in 2..1000 {
+        for i in 2..20000 {
             if inode::read_inode(&self.storage, i).is_ok() {
                 count += 1;
             }
@@ -115,7 +127,14 @@ impl Metadata for MetaLvBackend {
         }
     }
 
-    async fn create(&self, parent: Ino, name: &str, mode: u32) -> Result<Inode> {
+    async fn create(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
         let _parent_guard = self.dlm.lock_exclusive(&format!("I{}", parent)).await;
         let _dentry_guard = self
             .dlm
@@ -131,7 +150,7 @@ impl Metadata for MetaLvBackend {
         let _op_guard = self.storage.lock_op();
         // Allocate a new inode by scanning table (basic allocator for Phase 0)
         let mut new_ino = 0;
-        for i in 2..1000 {
+        for i in 2..20000 {
             if let Err(_) = inode::read_inode(&self.storage, i) {
                 // Inode slot is uninitialized/magic invalid -> we can use it!
                 new_ino = i;
@@ -144,11 +163,22 @@ impl Metadata for MetaLvBackend {
             ));
         }
 
-        let disk_inode = inode::DiskInode::new(new_ino, mode, 0, 0);
+        let disk_inode = inode::DiskInode::new(new_ino, mode, uid, gid);
         inode::write_inode_raw(&self.storage, new_ino, &disk_inode)?;
         std::mem::drop(_op_guard);
 
         dentry::insert_dentry(&self.storage, parent, new_ino, name, mode & libc::S_IFMT)?;
+
+        // Update parent directory times
+        if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            parent_inode.mtime = now;
+            parent_inode.ctime = now;
+            let _ = inode::write_inode(&self.storage, parent, &parent_inode);
+        }
 
         Ok(Inode {
             ino: new_ino,
@@ -181,16 +211,27 @@ impl Metadata for MetaLvBackend {
 
             dentry::remove_dentry(&self.storage, parent, name)?;
 
+            // Update parent directory times
+            if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                parent_inode.mtime = now;
+                parent_inode.ctime = now;
+                let _ = inode::write_inode(&self.storage, parent, &parent_inode);
+            }
+
             // Decrement nlink
             let mut disk_inode = inode::read_inode(&self.storage, ino)?;
-            if disk_inode.nlink > 1 {
+            if disk_inode.nlink > 0 {
                 disk_inode.nlink -= 1;
-                inode::write_inode(&self.storage, ino, &disk_inode)?;
-            } else {
-                // Remove inode by zeroing magic
-                let empty = inode::DiskInode::new_zeroed();
-                inode::write_inode(&self.storage, ino, &empty)?;
             }
+            disk_inode.ctime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            inode::write_inode(&self.storage, ino, &disk_inode)?;
             Ok(())
         } else {
             Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -216,6 +257,10 @@ impl Metadata for MetaLvBackend {
         let _inode_guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
         let mut disk_inode = inode::read_inode(&self.storage, ino)?;
         disk_inode.nlink += 1;
+        disk_inode.ctime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         inode::write_inode(&self.storage, ino, &disk_inode)?;
 
         dentry::insert_dentry(
@@ -225,6 +270,17 @@ impl Metadata for MetaLvBackend {
             new_name,
             disk_inode.mode & libc::S_IFMT,
         )?;
+
+        // Update parent directory times
+        if let Ok(mut parent_inode) = inode::read_inode(&self.storage, new_parent) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            parent_inode.mtime = now;
+            parent_inode.ctime = now;
+            let _ = inode::write_inode(&self.storage, new_parent, &parent_inode);
+        }
 
         Ok(Inode {
             ino,
@@ -312,14 +368,49 @@ impl Metadata for MetaLvBackend {
         })
     }
 
-    async fn setattr(&self, ino: Ino, mode: Option<u32>, size: Option<u64>) -> Result<Inode> {
+    async fn setattr(
+        &self,
+        ino: Ino,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+        ctime: Option<u64>,
+    ) -> Result<Inode> {
         let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
         let mut disk_inode = inode::read_inode(&self.storage, ino)?;
+        let mut ctime_updated = false;
         if let Some(m) = mode {
             disk_inode.mode = m;
+            ctime_updated = true;
+        }
+        if let Some(u) = uid {
+            disk_inode.uid = u;
+            ctime_updated = true;
+        }
+        if let Some(g) = gid {
+            disk_inode.gid = g;
+            ctime_updated = true;
         }
         if let Some(s) = size {
             disk_inode.size = s;
+            ctime_updated = true;
+        }
+        if let Some(a) = atime {
+            disk_inode.atime = a;
+        }
+        if let Some(m) = mtime {
+            disk_inode.mtime = m;
+        }
+        if let Some(c) = ctime {
+            disk_inode.ctime = c;
+        } else if ctime_updated {
+            disk_inode.ctime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
         }
         inode::write_inode(&self.storage, ino, &disk_inode)?;
         Ok(Inode {
@@ -355,16 +446,64 @@ impl Metadata for MetaLvBackend {
         let _guard = self.dlm.lock_shared(&format!("I{}", ino)).await;
         xattr::list_xattrs(&self.storage, ino)
     }
+
+    async fn destroy_inode(&self, ino: Ino) -> Result<()> {
+        let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
+        let empty = inode::DiskInode::new_zeroed();
+        inode::write_inode(&self.storage, ino, &empty)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 pub struct RoutedMetaBackend {
     pub volumes: Vec<std::sync::Arc<MetaLvBackend>>,
+    pub disabled_volumes: std::sync::Arc<dashmap::DashMap<usize, bool, ahash::RandomState>>,
+    pub redirections: std::sync::Arc<dashmap::DashMap<usize, usize, ahash::RandomState>>,
 }
 
 impl RoutedMetaBackend {
     pub fn new(volumes: Vec<std::sync::Arc<MetaLvBackend>>) -> Self {
-        Self { volumes }
+        Self {
+            volumes,
+            disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            redirections: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+        }
+    }
+
+    pub fn check_volume_enabled(&self, idx: usize) -> Result<()> {
+        if self.disabled_volumes.contains_key(&idx) {
+            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("Metadata volume {} is disabled", idx),
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn get_volume_health(&self, idx: usize) -> u32 {
+        if self.disabled_volumes.contains_key(&idx) {
+            return 0;
+        }
+        if idx >= self.volumes.len() {
+            return 0;
+        }
+        let vol = &self.volumes[idx];
+        let allocated = vol.get_allocated_inode_count();
+        let max_inodes = 20000;
+
+        let free_factor = if max_inodes > allocated {
+            (max_inodes - allocated) as f64 / max_inodes as f64
+        } else {
+            0.0
+        };
+
+        let score = (free_factor * 1000.0) as u32;
+        score.min(1000)
     }
 
     pub fn route_ino(&self, ino: Ino) -> (usize, Ino) {
@@ -375,7 +514,13 @@ impl RoutedMetaBackend {
         if ino == 1 {
             return (0, 1);
         }
-        let volume_idx = ((ino - 2) % num_volumes as u64) as usize;
+        let mut volume_idx = ((ino - 2) % num_volumes as u64) as usize;
+
+        // Follow redirections
+        while let Some(red) = self.redirections.get(&volume_idx) {
+            volume_idx = *red;
+        }
+
         let local_ino = ((ino - 2) / num_volumes as u64) + 2;
         (volume_idx, local_ino)
     }
@@ -396,6 +541,7 @@ impl RoutedMetaBackend {
 impl Metadata for RoutedMetaBackend {
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
         let (v_idx, local_parent) = self.route_ino(parent);
+        self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
             .lock_shared(&format!("D{}:{}", local_parent, name))
@@ -411,23 +557,46 @@ impl Metadata for RoutedMetaBackend {
         }
     }
 
-    async fn create(&self, parent: Ino, name: &str, mode: u32) -> Result<Inode> {
+    async fn create(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
         let (parent_v_idx, local_parent) = self.route_ino(parent);
+        self.check_volume_enabled(parent_v_idx)?;
         let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
         let target_v_idx = if is_dir {
-            let mut min_idx = 0;
-            let mut min_count = usize::MAX;
-            for (i, vol) in self.volumes.iter().enumerate() {
-                let count = vol.get_allocated_inode_count();
-                if count < min_count {
-                    min_count = count;
-                    min_idx = i;
+            let mut candidates = Vec::new();
+            for (i, _) in self.volumes.iter().enumerate() {
+                if self.disabled_volumes.contains_key(&i) {
+                    continue;
                 }
+                let health = self.get_volume_health(i);
+                candidates.push((i, health));
             }
-            min_idx
+            if candidates.is_empty() {
+                parent_v_idx
+            } else {
+                candidates.sort_by(|a, b| b.1.cmp(&a.1));
+                let max_health = candidates[0].1;
+                let top_candidates: Vec<_> = candidates
+                    .into_iter()
+                    .filter(|c| c.1 >= (max_health * 9) / 10)
+                    .collect();
+
+                static META_COUNTER: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let idx = META_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % top_candidates.len();
+                top_candidates[idx].0
+            }
         } else {
             parent_v_idx
         };
+        self.check_volume_enabled(target_v_idx)?;
 
         let _parent_guard = self.volumes[parent_v_idx]
             .dlm
@@ -448,7 +617,7 @@ impl Metadata for RoutedMetaBackend {
 
         let _op_guard = self.volumes[target_v_idx].storage.lock_op();
         let mut new_local_ino = 0;
-        for i in 2..1000 {
+        for i in 2..20000 {
             if let Err(_) = inode::read_inode(&self.volumes[target_v_idx].storage, i) {
                 new_local_ino = i;
                 break;
@@ -460,7 +629,10 @@ impl Metadata for RoutedMetaBackend {
             ));
         }
 
-        let disk_inode = inode::DiskInode::new(new_local_ino, mode, 0, 0);
+        let mut disk_inode = inode::DiskInode::new(new_local_ino, mode, uid, gid);
+        if is_dir {
+            disk_inode.nlink = 2;
+        }
         inode::write_inode_raw(
             &self.volumes[target_v_idx].storage,
             new_local_ino,
@@ -478,6 +650,26 @@ impl Metadata for RoutedMetaBackend {
             mode & libc::S_IFMT,
         )?;
 
+        // Update parent directory times
+        if let Ok(mut parent_inode) =
+            inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            parent_inode.mtime = now;
+            parent_inode.ctime = now;
+            if is_dir {
+                parent_inode.nlink += 1;
+            }
+            let _ = inode::write_inode(
+                &self.volumes[parent_v_idx].storage,
+                local_parent,
+                &parent_inode,
+            );
+        }
+
         Ok(Inode {
             ino: global_child_ino,
             mode: disk_inode.mode,
@@ -494,6 +686,7 @@ impl Metadata for RoutedMetaBackend {
 
     async fn unlink(&self, parent: Ino, name: &str) -> Result<()> {
         let (parent_v_idx, local_parent) = self.route_ino(parent);
+        self.check_volume_enabled(parent_v_idx)?;
         let _parent_guard = self.volumes[parent_v_idx]
             .dlm
             .lock_exclusive(&format!("I{}", local_parent))
@@ -508,6 +701,7 @@ impl Metadata for RoutedMetaBackend {
         {
             let global_child_ino = dentry.child_ino;
             let (child_v_idx, local_child) = self.route_ino(global_child_ino);
+            self.check_volume_enabled(child_v_idx)?;
 
             let _inode_guard = if parent != global_child_ino {
                 Some(
@@ -522,6 +716,30 @@ impl Metadata for RoutedMetaBackend {
 
             dentry::remove_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)?;
 
+            let is_dir = dentry.file_type == libc::S_IFDIR;
+
+            // Update parent directory times
+            if let Ok(mut parent_inode) =
+                inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent)
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                parent_inode.mtime = now;
+                parent_inode.ctime = now;
+                if is_dir {
+                    if parent_inode.nlink > 2 {
+                        parent_inode.nlink -= 1;
+                    }
+                }
+                let _ = inode::write_inode(
+                    &self.volumes[parent_v_idx].storage,
+                    local_parent,
+                    &parent_inode,
+                );
+            }
+
             let mut disk_inode =
                 inode::read_inode(&self.volumes[child_v_idx].storage, local_child)?;
             log::debug!(
@@ -529,22 +747,19 @@ impl Metadata for RoutedMetaBackend {
                 local_child,
                 disk_inode.nlink
             );
-            if disk_inode.nlink > 1 {
+            if disk_inode.nlink > 0 {
                 disk_inode.nlink -= 1;
-                log::debug!(
-                    "meta_backend unlink (nlink > 1): local_child = {}, writing nlink = {}",
-                    local_child,
-                    disk_inode.nlink
-                );
-                inode::write_inode(&self.volumes[child_v_idx].storage, local_child, &disk_inode)?;
-            } else {
-                log::debug!(
-                    "meta_backend unlink (nlink <= 1): local_child = {}, zeroing inode",
-                    local_child
-                );
-                let empty = inode::DiskInode::new_zeroed();
-                inode::write_inode(&self.volumes[child_v_idx].storage, local_child, &empty)?;
             }
+            disk_inode.ctime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            log::debug!(
+                "meta_backend unlink: local_child = {}, writing nlink = {}",
+                local_child,
+                disk_inode.nlink
+            );
+            inode::write_inode(&self.volumes[child_v_idx].storage, local_child, &disk_inode)?;
             Ok(())
         } else {
             Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -557,6 +772,8 @@ impl Metadata for RoutedMetaBackend {
     async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode> {
         let (parent_v_idx, local_parent) = self.route_ino(new_parent);
         let (child_v_idx, local_child) = self.route_ino(ino);
+        self.check_volume_enabled(parent_v_idx)?;
+        self.check_volume_enabled(child_v_idx)?;
 
         let _parent_guard = self.volumes[parent_v_idx]
             .dlm
@@ -586,6 +803,10 @@ impl Metadata for RoutedMetaBackend {
             disk_inode.nlink
         );
         disk_inode.nlink += 1;
+        disk_inode.ctime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         log::debug!(
             "meta_backend link: local_child = {}, nlink after = {}",
             local_child,
@@ -600,6 +821,23 @@ impl Metadata for RoutedMetaBackend {
             new_name,
             disk_inode.mode & libc::S_IFMT,
         )?;
+
+        // Update parent directory times
+        if let Ok(mut parent_inode) =
+            inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            parent_inode.mtime = now;
+            parent_inode.ctime = now;
+            let _ = inode::write_inode(
+                &self.volumes[parent_v_idx].storage,
+                local_parent,
+                &parent_inode,
+            );
+        }
 
         Ok(Inode {
             ino,
@@ -624,6 +862,8 @@ impl Metadata for RoutedMetaBackend {
     ) -> Result<()> {
         let (old_parent_v_idx, local_old_parent) = self.route_ino(old_parent);
         let (new_parent_v_idx, local_new_parent) = self.route_ino(new_parent);
+        self.check_volume_enabled(old_parent_v_idx)?;
+        self.check_volume_enabled(new_parent_v_idx)?;
 
         let _old_pg = self.volumes[old_parent_v_idx]
             .dlm
@@ -662,6 +902,79 @@ impl Metadata for RoutedMetaBackend {
             local_old_parent,
             old_name,
         )? {
+            let is_dir = dentry.file_type == libc::S_IFDIR;
+            let cross_dir =
+                old_parent_v_idx != new_parent_v_idx || local_old_parent != local_new_parent;
+
+            if is_dir && cross_dir {
+                // Decrement old parent link count
+                if let Ok(mut old_p_inode) =
+                    inode::read_inode(&self.volumes[old_parent_v_idx].storage, local_old_parent)
+                {
+                    if old_p_inode.nlink > 2 {
+                        old_p_inode.nlink -= 1;
+                    }
+                    let _ = inode::write_inode(
+                        &self.volumes[old_parent_v_idx].storage,
+                        local_old_parent,
+                        &old_p_inode,
+                    );
+                }
+                // Increment new parent link count
+                if let Ok(mut new_p_inode) =
+                    inode::read_inode(&self.volumes[new_parent_v_idx].storage, local_new_parent)
+                {
+                    new_p_inode.nlink += 1;
+                    let _ = inode::write_inode(
+                        &self.volumes[new_parent_v_idx].storage,
+                        local_new_parent,
+                        &new_p_inode,
+                    );
+                }
+            }
+            // Check if destination already exists to decrement its link count
+            if let Some(dest_dentry) = dentry::find_dentry(
+                &self.volumes[new_parent_v_idx].storage,
+                local_new_parent,
+                new_name,
+            )? {
+                let dest_ino = dest_dentry.child_ino;
+                let (dest_v_idx, local_dest) = self.route_ino(dest_ino);
+                if let Ok(mut dest_inode) =
+                    inode::read_inode(&self.volumes[dest_v_idx].storage, local_dest)
+                {
+                    // Check if destination is a directory and is not empty
+                    if (dest_inode.mode & libc::S_IFMT) == libc::S_IFDIR {
+                        let dentries =
+                            dentry::list_dentries(&self.volumes[dest_v_idx].storage, local_dest)?;
+                        if !dentries.is_empty() {
+                            return Err(crate::error::SqueezefsError::Io(
+                                std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
+                            ));
+                        }
+                    }
+
+                    if dest_inode.nlink > 0 {
+                        dest_inode.nlink -= 1;
+                    }
+                    dest_inode.ctime = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    let _ = inode::write_inode(
+                        &self.volumes[dest_v_idx].storage,
+                        local_dest,
+                        &dest_inode,
+                    );
+                }
+                // Remove the destination dentry so it gets replaced cleanly
+                dentry::remove_dentry(
+                    &self.volumes[new_parent_v_idx].storage,
+                    local_new_parent,
+                    new_name,
+                )?;
+            }
+
             dentry::remove_dentry(
                 &self.volumes[old_parent_v_idx].storage,
                 local_old_parent,
@@ -685,6 +998,7 @@ impl Metadata for RoutedMetaBackend {
 
     async fn readdir(&self, dir: Ino, _offset: u64, _max: usize) -> Result<Vec<DirEntry>> {
         let (v_idx, local_dir) = self.route_ino(dir);
+        self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
             .lock_shared(&format!("I{}", local_dir))
@@ -703,6 +1017,7 @@ impl Metadata for RoutedMetaBackend {
 
     async fn getattr(&self, ino: Ino) -> Result<Inode> {
         let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
             .lock_shared(&format!("I{}", local_ino))
@@ -722,18 +1037,54 @@ impl Metadata for RoutedMetaBackend {
         })
     }
 
-    async fn setattr(&self, ino: Ino, mode: Option<u32>, size: Option<u64>) -> Result<Inode> {
+    async fn setattr(
+        &self,
+        ino: Ino,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+        ctime: Option<u64>,
+    ) -> Result<Inode> {
         let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
             .lock_exclusive(&format!("I{}", local_ino))
             .await;
         let mut disk_inode = inode::read_inode(&self.volumes[v_idx].storage, local_ino)?;
+        let mut ctime_updated = false;
         if let Some(m) = mode {
             disk_inode.mode = m;
+            ctime_updated = true;
+        }
+        if let Some(u) = uid {
+            disk_inode.uid = u;
+            ctime_updated = true;
+        }
+        if let Some(g) = gid {
+            disk_inode.gid = g;
+            ctime_updated = true;
         }
         if let Some(s) = size {
             disk_inode.size = s;
+            ctime_updated = true;
+        }
+        if let Some(a) = atime {
+            disk_inode.atime = a;
+        }
+        if let Some(m) = mtime {
+            disk_inode.mtime = m;
+        }
+        if let Some(c) = ctime {
+            disk_inode.ctime = c;
+        } else if ctime_updated {
+            disk_inode.ctime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
         }
         inode::write_inode(&self.volumes[v_idx].storage, local_ino, &disk_inode)?;
         Ok(Inode {
@@ -752,6 +1103,7 @@ impl Metadata for RoutedMetaBackend {
 
     async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
             .lock_shared(&format!("I{}", local_ino))
@@ -761,6 +1113,7 @@ impl Metadata for RoutedMetaBackend {
 
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
         let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
             .lock_exclusive(&format!("I{}", local_ino))
@@ -770,6 +1123,7 @@ impl Metadata for RoutedMetaBackend {
 
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
         let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
             .lock_exclusive(&format!("I{}", local_ino))
@@ -779,10 +1133,17 @@ impl Metadata for RoutedMetaBackend {
 
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
         let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
             .lock_shared(&format!("I{}", local_ino))
             .await;
         xattr::list_xattrs(&self.volumes[v_idx].storage, local_ino)
+    }
+
+    async fn destroy_inode(&self, ino: Ino) -> Result<()> {
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        self.volumes[v_idx].destroy_inode(local_ino).await
     }
 }

@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Builder;
 
-const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
-const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
+pub const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
+pub const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
 fn get_fuse_timeout() -> Duration {
     if let Ok(val) = std::env::var("SQUEEZEFS_TIMEOUT") {
@@ -411,6 +411,11 @@ fn map_squeezefs_err(e: SqueezefsError) -> Errno {
     Errno::from(e.to_errno())
 }
 
+#[inline]
+fn as_timestamp(ns: u64) -> Timestamp {
+    Timestamp::new((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as u32)
+}
+
 pub enum PosixLock {
     Local,
     Global(Box<crate::dlm::LockLease>),
@@ -484,6 +489,7 @@ pub struct SqueezefsFilesystem {
     pub inodes_limit: std::sync::Arc<std::sync::OnceLock<u64>>,
     pub session_connection:
         arc_swap::ArcSwap<Option<std::sync::Arc<fuse3::raw::connection::FuseConnection>>>,
+    pub open_inodes: std::sync::Arc<dashmap::DashMap<u64, usize, ahash::RandomState>>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -516,6 +522,7 @@ impl Clone for SqueezefsFilesystem {
             latest_config_json: arc_swap::ArcSwap::new(self.latest_config_json.load_full()),
             inodes_limit: self.inodes_limit.clone(),
             session_connection: arc_swap::ArcSwap::new(self.session_connection.load_full()),
+            open_inodes: self.open_inodes.clone(),
         }
     }
 }
@@ -576,11 +583,35 @@ impl SqueezefsFilesystem {
             latest_config_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
             inodes_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
             session_connection: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
+            open_inodes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
         }
     }
 
     pub fn max_background_uploads(&self) -> usize {
         self.max_background_uploads
+    }
+
+    pub fn add_open(&self, ino: u64) {
+        let mut entry = self.open_inodes.entry(ino).or_insert(0);
+        *entry += 1;
+    }
+
+    pub fn remove_open(&self, ino: u64) {
+        if let Some(mut entry) = self.open_inodes.get_mut(&ino) {
+            if *entry > 0 {
+                *entry -= 1;
+            }
+        }
+    }
+
+    pub fn is_open(&self, ino: u64) -> bool {
+        if let Some(entry) = self.open_inodes.get(&ino) {
+            *entry > 0
+        } else {
+            false
+        }
     }
 
     pub fn disable_background_writeback(&self) {
@@ -624,7 +655,51 @@ impl SqueezefsFilesystem {
         self.active_delegations.contains_key(&inode)
     }
 
+    async fn sync_runtime_config_to_daemon(&self) {
+        let cfg = crate::config_ops::load_or_create_config();
+
+        for (vol_name, status) in &cfg.data_volume_statuses {
+            if status == "disabled" {
+                self.router
+                    .backend_router
+                    .unhealthy_backends
+                    .insert(vol_name.clone(), true);
+            } else {
+                self.router
+                    .backend_router
+                    .unhealthy_backends
+                    .remove(vol_name);
+            }
+        }
+
+        if let Some(ref meta) = self.meta_backend {
+            for (vol_name, status) in &cfg.metadata_volume_statuses {
+                if vol_name.starts_with("meta_volume_") {
+                    if let Ok(idx) = vol_name["meta_volume_".len()..].parse::<usize>() {
+                        if status == "disabled" {
+                            meta.disabled_volumes.insert(idx, true);
+                        } else {
+                            meta.disabled_volumes.remove(&idx);
+                        }
+                    }
+                }
+            }
+
+            for (from_vol, to_vol) in &cfg.metadata_volume_redirections {
+                if from_vol.starts_with("meta_volume_") && to_vol.starts_with("meta_volume_") {
+                    let from_idx = from_vol["meta_volume_".len()..].parse::<usize>();
+                    let to_idx = to_vol["meta_volume_".len()..].parse::<usize>();
+                    if let (Ok(from_i), Ok(to_i)) = (from_idx, to_idx) {
+                        meta.redirections.insert(from_i, to_i);
+                    }
+                }
+            }
+        }
+    }
+
     async fn generate_config_json(&self) -> String {
+        self.sync_runtime_config_to_daemon().await;
+
         let mut format_fields = std::collections::HashMap::new();
         let active_dirs = self.router.cache.nvme.staging_dirs();
         let active_dirs_str = active_dirs
@@ -634,22 +709,54 @@ impl SqueezefsFilesystem {
             .join(",");
         format_fields.insert("disk_cache_paths".to_string(), active_dirs_str);
 
-        let mut backends = serde_json::Map::new();
+        let mut data_volumes = serde_json::Map::new();
+        let mut data_vol_names = vec!["backend_0".to_string()];
         for item in self.router.backend_router.backends.iter() {
-            backends.insert(
-                item.key().clone(),
+            data_vol_names.push(item.key().clone());
+        }
+
+        for name in data_vol_names {
+            let is_unhealthy = self
+                .router
+                .backend_router
+                .unhealthy_backends
+                .contains_key(&name);
+            let status = if is_unhealthy { "disabled" } else { "enabled" };
+            let health = self.router.backend_router.get_backend_health(&name);
+            data_volumes.insert(
+                name.clone(),
                 serde_json::json!({
-                    "backing_dev": item.key().clone(),
-                    "status": "enabled",
+                    "backing_dev": name,
+                    "status": status,
+                    "health": health,
                 }),
             );
         }
 
+        let mut metadata_volumes = serde_json::Map::new();
+        if let Some(ref meta) = self.meta_backend {
+            for (idx, vol) in meta.volumes.iter().enumerate() {
+                let name = format!("meta_volume_{}", idx);
+                let path_str = vol.storage.device_path().to_string_lossy().to_string();
+                let is_disabled = meta.disabled_volumes.contains_key(&idx);
+                let status = if is_disabled { "disabled" } else { "enabled" };
+                let health = meta.get_volume_health(idx);
+                metadata_volumes.insert(
+                    name,
+                    serde_json::json!({
+                        "backing_dev": path_str,
+                        "status": status,
+                        "health": health,
+                    }),
+                );
+            }
+        }
+
         let config_obj = serde_json::json!({
             "client_version": env!("CARGO_PKG_VERSION"),
-            "metadata_backend": "meta_lv",
             "format": format_fields,
-            "backends": backends,
+            "data_volumes": data_volumes,
+            "metadata_volumes": metadata_volumes,
             "uid": self.uid,
             "gid": self.gid,
             "block_size": self.router.block_size.load(Ordering::Relaxed),
@@ -1444,9 +1551,9 @@ impl SqueezefsFilesystem {
             ino: inode.ino,
             size: inode.size,
             blocks: inode.size.div_ceil(512),
-            atime: Timestamp::new(inode.atime as i64, 0),
-            mtime: Timestamp::new(inode.mtime as i64, 0),
-            ctime: Timestamp::new(inode.ctime as i64, 0),
+            atime: as_timestamp(inode.atime),
+            mtime: as_timestamp(inode.mtime),
+            ctime: as_timestamp(inode.ctime),
             kind: self.mode_to_file_type(inode.mode),
             perm: (inode.mode & 0o7777) as u16,
             nlink: inode.nlink,
@@ -1468,21 +1575,7 @@ impl SqueezefsFilesystem {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
         let inode = backend.getattr(ino).await?;
-        let attr = FileAttr {
-            ino: inode.ino,
-            size: inode.size,
-            blocks: inode.size.div_ceil(512),
-            atime: Timestamp::new(inode.atime as i64, 0),
-            mtime: Timestamp::new(inode.mtime as i64, 0),
-            ctime: Timestamp::new(inode.ctime as i64, 0),
-            kind: self.mode_to_file_type(inode.mode),
-            perm: (inode.mode & 0o7777) as u16,
-            nlink: inode.nlink,
-            uid: inode.uid,
-            gid: inode.gid,
-            rdev: 0,
-            blksize: 4096,
-        };
+        let attr = self.inode_to_file_attr(&inode);
         debug!("get_attr_internal returning: {:?}", attr);
         self.attr_cache
             .insert(ino, (attr, std::time::Instant::now()));
@@ -1502,23 +1595,36 @@ impl SqueezefsFilesystem {
         if ino <= 1 || ino == CONFIG_INODE || ino == STATS_INODE {
             return Ok(());
         }
+        if self.is_open(ino) {
+            info!("RECLAIM: ino = {} is currently open, skipping reclaim", ino);
+            return Ok(());
+        }
         let backend = self
             .meta_backend
             .as_ref()
             .ok_or(Errno::from(libc::ENOSYS))?;
+        info!("RECLAIM: reclaim_orphaned_inode called for ino = {}", ino);
         let disk_inode = match backend.getattr(ino).await {
             Ok(inode) => inode,
-            Err(_) => return Ok(()), // already gone
+            Err(e) => {
+                info!("RECLAIM: getattr({}) failed: {:?}", ino, e);
+                return Ok(());
+            }
         };
         if disk_inode.nlink > 0 {
+            info!(
+                "RECLAIM: ino = {} has nlink = {}, skipping reclaim",
+                ino, disk_inode.nlink
+            );
             return Ok(());
         }
+        info!("RECLAIM: destroying ino = {}", ino);
         let file_path = crate::keys::inode_path(ino);
         let mut dummy_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let _ = self.router.delete_file(&file_path, &mut dummy_con).await;
 
         // Remove from metadata backend
-        let _ = backend.unlink(1, &file_path).await;
+        let _ = backend.destroy_inode(ino).await;
 
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
@@ -1687,21 +1793,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .lookup(parent, &name_str)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr = FileAttr {
-                ino: inode.ino,
-                size: inode.size,
-                blocks: inode.size.div_ceil(512),
-                atime: Timestamp::new(inode.atime as i64, 0),
-                mtime: Timestamp::new(inode.mtime as i64, 0),
-                ctime: Timestamp::new(inode.ctime as i64, 0),
-                kind: self.mode_to_file_type(inode.mode),
-                perm: (inode.mode & 0o7777) as u16,
-                nlink: inode.nlink,
-                uid: inode.uid,
-                gid: inode.gid,
-                rdev: 0,
-                blksize: 4096,
-            };
+            let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             Ok(ReplyEntry {
@@ -1803,16 +1895,16 @@ impl Filesystem for SqueezefsFilesystem {
                 .as_ref()
                 .expect("meta_backend must be configured");
             let inode = backend
-                .create(parent, &name_str, mode)
+                .create(parent, &name_str, mode, req.uid, req.gid)
                 .await
                 .map_err(map_squeezefs_err)?;
             let attr = FileAttr {
                 ino: inode.ino,
                 size: inode.size,
                 blocks: inode.size.div_ceil(512),
-                atime: Timestamp::new(inode.atime as i64, 0),
-                mtime: Timestamp::new(inode.mtime as i64, 0),
-                ctime: Timestamp::new(inode.ctime as i64, 0),
+                atime: as_timestamp(inode.atime),
+                mtime: as_timestamp(inode.mtime),
+                ctime: as_timestamp(inode.ctime),
                 kind: self.mode_to_file_type(inode.mode),
                 perm: (inode.mode & 0o7777) as u16,
                 nlink: inode.nlink,
@@ -1823,6 +1915,7 @@ impl Filesystem for SqueezefsFilesystem {
             };
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
                 attr,
@@ -1866,16 +1959,16 @@ impl Filesystem for SqueezefsFilesystem {
                 .as_ref()
                 .expect("meta_backend must be configured");
             let inode = backend
-                .create(parent, &name_str, mode)
+                .create(parent, &name_str, mode, req.uid, req.gid)
                 .await
                 .map_err(map_squeezefs_err)?;
             let attr = FileAttr {
                 ino: inode.ino,
                 size: inode.size,
                 blocks: inode.size.div_ceil(512),
-                atime: Timestamp::new(inode.atime as i64, 0),
-                mtime: Timestamp::new(inode.mtime as i64, 0),
-                ctime: Timestamp::new(inode.ctime as i64, 0),
+                atime: as_timestamp(inode.atime),
+                mtime: as_timestamp(inode.mtime),
+                ctime: as_timestamp(inode.ctime),
                 kind: FileType::RegularFile,
                 perm: (inode.mode & 0o7777) as u16,
                 nlink: inode.nlink,
@@ -1886,6 +1979,8 @@ impl Filesystem for SqueezefsFilesystem {
             };
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.attr_cache.invalidate(&parent);
+            self.add_open(inode.ino);
             Ok(ReplyCreated {
                 ttl: Duration::from_secs(1),
                 attr,
@@ -1932,6 +2027,7 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(ReplyOpen { fh, flags: 0 });
         }
 
+        self.add_open(inode);
         // File handle is just the inode number for simplicity in this design
         Ok(ReplyOpen {
             fh: inode,
@@ -1943,6 +2039,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Opendir: inode = {}", inode);
 
+        self.add_open(inode);
         Ok(ReplyOpen {
             fh: inode,
             flags: 0,
@@ -2148,6 +2245,20 @@ impl Filesystem for SqueezefsFilesystem {
                 }
                 drop(guard);
             } else {
+                if file_type == "inline" || expected_new_size > old_size {
+                    let mut updated_meta = meta.clone();
+                    if file_type == "inline" {
+                        updated_meta.file_type = "striped".to_string();
+                    }
+                    updated_meta.size = expected_new_size;
+                    if let Err(e) = self
+                        .router
+                        .save_metadata_to_backend(ino, &updated_meta, fencing_token)
+                        .await
+                    {
+                        return Err(map_squeezefs_err(e));
+                    }
+                }
                 if lock_scope == InodeWriteLockScope::MetaPrepOnly {
                     // Striped: drop inode write lock before long active-block I/O.
                     drop(guard);
@@ -2222,15 +2333,15 @@ impl Filesystem for SqueezefsFilesystem {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
     ) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
         debug!(
-            "FUSE mkdir: parent = {}, name = {}, mode = {:o}",
-            parent, name_str, mode
+            "FUSE mkdir: parent = {}, name = {}, mode = {:o}, umask = {:o}",
+            parent, name_str, mode, umask
         );
 
         let mkdir_future = async {
@@ -2238,18 +2349,18 @@ impl Filesystem for SqueezefsFilesystem {
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
-            let final_mode = (mode & 0o7777) | libc::S_IFDIR;
+            let final_mode = ((mode & !umask) & 0o7777) | libc::S_IFDIR;
             let inode = backend
-                .create(parent, &name_str, final_mode)
+                .create(parent, &name_str, final_mode, req.uid, req.gid)
                 .await
                 .map_err(map_squeezefs_err)?;
             let attr = FileAttr {
                 ino: inode.ino,
                 size: inode.size,
                 blocks: inode.size.div_ceil(512),
-                atime: Timestamp::new(inode.atime as i64, 0),
-                mtime: Timestamp::new(inode.mtime as i64, 0),
-                ctime: Timestamp::new(inode.ctime as i64, 0),
+                atime: as_timestamp(inode.atime),
+                mtime: as_timestamp(inode.mtime),
+                ctime: as_timestamp(inode.ctime),
                 kind: FileType::Directory,
                 perm: (inode.mode & 0o7777) as u16,
                 nlink: inode.nlink,
@@ -2260,6 +2371,7 @@ impl Filesystem for SqueezefsFilesystem {
             };
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
                 attr,
@@ -2313,6 +2425,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
             self.dir_entry_cache.invalidate(&parent);
             self.dir_entry_cache.invalidate(&current_inode.ino);
+            self.attr_cache.invalidate(&parent);
+            self.attr_cache.invalidate(&current_inode.ino);
             Ok(())
         };
 
@@ -2357,29 +2471,44 @@ impl Filesystem for SqueezefsFilesystem {
                 }
                 size_to_set = Some(size);
             }
+            let mut uid_to_set = None;
+            let mut gid_to_set = None;
+            let mut atime_to_set = None;
+            let mut mtime_to_set = None;
+            let mut ctime_to_set = None;
             if let Some(mode) = set_attr.mode {
                 let new_mode = (current_inode.mode & libc::S_IFMT) | (mode & 0o7777);
                 mode_to_set = Some(new_mode);
             }
+            if let Some(uid) = set_attr.uid {
+                uid_to_set = Some(uid);
+            }
+            if let Some(gid) = set_attr.gid {
+                gid_to_set = Some(gid);
+            }
+            if let Some(atime) = set_attr.atime {
+                atime_to_set = Some(atime.sec as u64 * 1_000_000_000 + atime.nsec as u64);
+            }
+            if let Some(mtime) = set_attr.mtime {
+                mtime_to_set = Some(mtime.sec as u64 * 1_000_000_000 + mtime.nsec as u64);
+            }
+            if let Some(ctime) = set_attr.ctime {
+                ctime_to_set = Some(ctime.sec as u64 * 1_000_000_000 + ctime.nsec as u64);
+            }
             let inode = backend
-                .setattr(ino, mode_to_set, size_to_set)
+                .setattr(
+                    ino,
+                    mode_to_set,
+                    uid_to_set,
+                    gid_to_set,
+                    size_to_set,
+                    atime_to_set,
+                    mtime_to_set,
+                    ctime_to_set,
+                )
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr = FileAttr {
-                ino: inode.ino,
-                size: inode.size,
-                blocks: inode.size.div_ceil(512),
-                atime: Timestamp::new(inode.atime as i64, 0),
-                mtime: Timestamp::new(inode.mtime as i64, 0),
-                ctime: Timestamp::new(inode.ctime as i64, 0),
-                kind: self.mode_to_file_type(inode.mode),
-                perm: (inode.mode & 0o7777) as u16,
-                nlink: inode.nlink,
-                uid: inode.uid,
-                gid: inode.gid,
-                rdev: 0,
-                blksize: 4096,
-            };
+            let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(ino, (attr, std::time::Instant::now()));
             Ok(ReplyAttr {
@@ -2407,6 +2536,9 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
+        if link.len() > 4096 {
+            return Err(Errno::from(libc::ENAMETOOLONG));
+        }
         let name_str = osstr_to_cow(name);
         let link_str = osstr_to_cow(link);
         debug!(
@@ -2425,7 +2557,7 @@ impl Filesystem for SqueezefsFilesystem {
 
             let final_mode = 0o777 | libc::S_IFLNK;
             let inode = backend
-                .create(parent, &name_str, final_mode)
+                .create(parent, &name_str, final_mode, req.uid, req.gid)
                 .await
                 .map_err(map_squeezefs_err)?;
             backend
@@ -2436,9 +2568,9 @@ impl Filesystem for SqueezefsFilesystem {
                 ino: inode.ino,
                 size: link_str.len() as u64,
                 blocks: 1,
-                atime: Timestamp::new(inode.atime as i64, 0),
-                mtime: Timestamp::new(inode.mtime as i64, 0),
-                ctime: Timestamp::new(inode.ctime as i64, 0),
+                atime: as_timestamp(inode.atime),
+                mtime: as_timestamp(inode.mtime),
+                ctime: as_timestamp(inode.ctime),
                 kind: FileType::Symlink,
                 perm: 0o777,
                 nlink: inode.nlink,
@@ -2450,6 +2582,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.dir_entry_cache.invalidate(&parent);
+            self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
                 attr,
@@ -2518,23 +2651,11 @@ impl Filesystem for SqueezefsFilesystem {
                 .link(ino, new_parent, &new_name_str)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr = FileAttr {
-                ino: inode.ino,
-                size: inode.size,
-                blocks: inode.size.div_ceil(512),
-                atime: Timestamp::new(inode.atime as i64, 0),
-                mtime: Timestamp::new(inode.mtime as i64, 0),
-                ctime: Timestamp::new(inode.ctime as i64, 0),
-                kind: self.mode_to_file_type(inode.mode),
-                perm: (inode.mode & 0o7777) as u16,
-                nlink: inode.nlink,
-                uid: inode.uid,
-                gid: inode.gid,
-                rdev: 0,
-                blksize: 4096,
-            };
+            let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(ino, (attr, std::time::Instant::now()));
+            self.attr_cache.invalidate(&new_parent);
+            self.dir_entry_cache.invalidate(&new_parent);
             return Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
                 attr,
@@ -2571,11 +2692,26 @@ impl Filesystem for SqueezefsFilesystem {
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
+            let child_ino = if let Ok(inode) = backend.lookup(parent, &name_str).await {
+                Some(inode.ino)
+            } else {
+                None
+            };
             backend
                 .unlink(parent, &name_str)
                 .await
                 .map_err(map_squeezefs_err)?;
             self.dir_entry_cache.invalidate(&parent);
+            self.attr_cache.invalidate(&parent);
+            if let Some(c_ino) = child_ino {
+                self.attr_cache.invalidate(&c_ino);
+                if !self.is_open(c_ino) {
+                    let self_clone = self.clone();
+                    tokio::spawn(async move {
+                        let _ = self_clone.reclaim_orphaned_inode(c_ino).await;
+                    });
+                }
+            }
             Ok(())
         };
 
@@ -2620,12 +2756,28 @@ impl Filesystem for SqueezefsFilesystem {
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
+            let dest_ino = if let Ok(inode) = backend.lookup(new_parent, &new_name_str).await {
+                Some(inode.ino)
+            } else {
+                None
+            };
             backend
                 .rename(parent, &name_str, new_parent, &new_name_str)
                 .await
                 .map_err(map_squeezefs_err)?;
             self.dir_entry_cache.invalidate(&parent);
             self.dir_entry_cache.invalidate(&new_parent);
+            self.attr_cache.invalidate(&parent);
+            self.attr_cache.invalidate(&new_parent);
+            if let Some(d_ino) = dest_ino {
+                self.attr_cache.invalidate(&d_ino);
+                if !self.is_open(d_ino) {
+                    let self_clone = self.clone();
+                    tokio::spawn(async move {
+                        let _ = self_clone.reclaim_orphaned_inode(d_ino).await;
+                    });
+                }
+            }
             Ok(())
         };
 
@@ -3202,7 +3354,18 @@ impl Filesystem for SqueezefsFilesystem {
 
             // Update destination attributes size and times in metadata backend
             if let Some(ref backend) = self.meta_backend {
-                let _ = backend.setattr(inode_out, None, Some(src_size)).await;
+                let _ = backend
+                    .setattr(
+                        inode_out,
+                        None,
+                        None,
+                        None,
+                        Some(src_size),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
             }
 
             self.attr_cache.invalidate(&inode_out);
@@ -3256,7 +3419,18 @@ impl Filesystem for SqueezefsFilesystem {
         let new_dest_size = std::cmp::max(dest_size, off_out + copied_len);
 
         if let Some(ref backend) = self.meta_backend {
-            let _ = backend.setattr(inode_out, None, Some(new_dest_size)).await;
+            let _ = backend
+                .setattr(
+                    inode_out,
+                    None,
+                    None,
+                    None,
+                    Some(new_dest_size),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
         }
 
         self.attr_cache.invalidate(&inode_out);
@@ -3375,6 +3549,13 @@ impl Filesystem for SqueezefsFilesystem {
             self.active_inode_locks.remove(&ino);
         }
 
+        self.remove_open(ino);
+        if !self.is_open(ino) {
+            if let Err(e) = self.reclaim_orphaned_inode(ino).await {
+                debug!("FUSE Release: reclaim orphaned inode {} : {:?}", ino, e);
+            }
+        }
+
         Ok(())
     }
 
@@ -3450,7 +3631,7 @@ impl Filesystem for SqueezefsFilesystem {
             if target_size > old_size {
                 // Update in backend
                 backend
-                    .setattr(ino, None, Some(target_size))
+                    .setattr(ino, None, None, None, Some(target_size), None, None, None)
                     .await
                     .map_err(map_squeezefs_err)?;
 
@@ -3484,8 +3665,10 @@ impl Filesystem for SqueezefsFilesystem {
         self.attr_cache.invalidate(&ino);
         self.active_inode_locks.remove(&ino);
         // Reclaim inodes that reached nlink==0 while still open (unlink/14.t).
-        if let Err(e) = self.reclaim_orphaned_inode(ino).await {
-            debug!("FUSE Forget: reclaim orphaned inode {} : {:?}", ino, e);
+        if !self.is_open(ino) {
+            if let Err(e) = self.reclaim_orphaned_inode(ino).await {
+                debug!("FUSE Forget: reclaim orphaned inode {} : {:?}", ino, e);
+            }
         }
     }
 
@@ -4583,6 +4766,7 @@ async fn flush_single_active_block(
     let mut block_map = meta.block_map.clone().unwrap_or_default();
     block_map.insert(b, stored_block_key.clone());
     meta.block_map = Some(block_map);
+    meta.file_type = "striped".to_string();
     router
         .save_metadata_to_backend(ino, &meta, fencing_token)
         .await?;

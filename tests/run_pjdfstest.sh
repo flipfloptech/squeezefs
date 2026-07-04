@@ -75,6 +75,8 @@ if [ ! -f "pjdfstest" ]; then
 fi
 
 # 4. Prepare mounts
+killall -9 squeezefs &>/dev/null || true
+sleep 1
 umount -l "$MOUNT_DIR" &>/dev/null || true
 mkdir -p "$MOUNT_DIR" "$STAGING_DIR"
 truncate -s 128M /dev/shm/squeezefs_pjdfs_meta || true
@@ -108,8 +110,10 @@ if ! mountpoint -q "$MOUNT_DIR"; then
 fi
 
 # 5. Run tests
-echo "Running pjdfstest suite (as root on $MOUNT_DIR)..."
-if ! "$PROVE_CMD" -r "$PJDFSTEST_DIR/tests"; then
+TESTS_PATH="${1:-$PJDFSTEST_DIR/tests}"
+echo "Running pjdfstest suite (as root on $MOUNT_DIR targeting $TESTS_PATH)..."
+cd "$MOUNT_DIR"
+if ! "$PROVE_CMD" -r "$TESTS_PATH"; then
     echo "=== POSIX Verification Failed (prove exit=1) ==="
     exit 1
 fi

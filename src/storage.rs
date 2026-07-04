@@ -1,7 +1,7 @@
 use crate::error::{Result, SqueezefsError};
 use std::process::Command;
 
-fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
+pub(crate) fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(cmd).args(args).output().map_err(|e| {
         SqueezefsError::InvalidOperation(format!("Failed to execute {}: {}", cmd, e))
     })?;

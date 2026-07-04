@@ -294,9 +294,13 @@ impl FuseConnection {
                     fuse_dev_clone(worker_fd, &mut session_fd)?;
                 }
 
-                let fd = file.into(); // OwnedFd
-                let read_ring = build_io_uring(256)?;
-                let write_ring = build_io_uring(256)?;
+                let fd: std::os::fd::OwnedFd = file.into();
+                let entries = fuse_uring_entries();
+                let read_ring = build_io_uring(entries)?;
+                let write_ring = build_io_uring(entries)?;
+
+                let read_use_fixed = try_register_fuse_fd(&read_ring, fd.as_raw_fd());
+                let write_use_fixed = try_register_fuse_fd(&write_ring, fd.as_raw_fd());
 
                 let read_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
                 if read_event_fd < 0 {
@@ -337,6 +341,8 @@ impl FuseConnection {
                     read_ring_fd,
                     write_ring: std::sync::Mutex::new(write_ring),
                     write_ring_fd,
+                    read_use_fixed,
+                    write_use_fixed,
                     read: Mutex::new(()),
                     write: Mutex::new(()),
                 };
@@ -941,6 +947,11 @@ struct NonBlockFuseConnection {
     #[cfg(target_os = "linux")]
     write_ring_fd: AsyncFd<OwnedFd>,
 
+    #[cfg(target_os = "linux")]
+    read_use_fixed: bool,
+    #[cfg(target_os = "linux")]
+    write_use_fixed: bool,
+
     read: Mutex<()>,
     write: Mutex<()>,
 }
@@ -1058,8 +1069,14 @@ impl NonBlockFuseConnection {
 
         #[cfg(target_os = "linux")]
         {
-            let read_ring = build_io_uring(256)?;
-            let write_ring = build_io_uring(256)?;
+            use std::os::fd::AsRawFd;
+            let raw_fd = fd.as_raw_fd();
+            let entries = fuse_uring_entries();
+            let read_ring = build_io_uring(entries)?;
+            let write_ring = build_io_uring(entries)?;
+
+            let read_use_fixed = try_register_fuse_fd(&read_ring, raw_fd);
+            let write_use_fixed = try_register_fuse_fd(&write_ring, raw_fd);
 
             let read_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             if read_event_fd < 0 {
@@ -1100,6 +1117,8 @@ impl NonBlockFuseConnection {
                 read_ring_fd,
                 write_ring: std::sync::Mutex::new(write_ring),
                 write_ring_fd,
+                read_use_fixed,
+                write_use_fixed,
                 read: Mutex::new(()),
                 write: Mutex::new(()),
             })
@@ -1151,11 +1170,19 @@ impl NonBlockFuseConnection {
         {
             let mut guard = self.read_ring.lock().unwrap();
             let ring = &mut guard.0;
-            let read_e = opcode::Readv::new(
-                types::Fd(fd),
-                iovecs.as_ptr() as *mut libc::iovec,
-                iovecs.len() as u32,
-            )
+            let read_e = if self.read_use_fixed {
+                opcode::Readv::new(
+                    types::Fixed(0),
+                    iovecs.as_ptr() as *mut libc::iovec,
+                    iovecs.len() as u32,
+                )
+            } else {
+                opcode::Readv::new(
+                    types::Fd(fd),
+                    iovecs.as_ptr() as *mut libc::iovec,
+                    iovecs.len() as u32,
+                )
+            }
             .build()
             .user_data(0x01);
 
@@ -1303,11 +1330,19 @@ impl NonBlockFuseConnection {
         {
             let mut guard = self.write_ring.lock().unwrap();
             let ring = &mut guard.0;
-            let write_e = opcode::Writev::new(
-                types::Fd(fd),
-                iovecs.as_ptr() as *const libc::iovec,
-                num_iovecs as u32,
-            )
+            let write_e = if self.write_use_fixed {
+                opcode::Writev::new(
+                    types::Fixed(0),
+                    iovecs.as_ptr() as *const libc::iovec,
+                    num_iovecs as u32,
+                )
+            } else {
+                opcode::Writev::new(
+                    types::Fd(fd),
+                    iovecs.as_ptr() as *const libc::iovec,
+                    num_iovecs as u32,
+                )
+            }
             .build()
             .user_data(0x02);
 

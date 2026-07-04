@@ -1,6 +1,7 @@
 use crate::error::{Result, SqueezefsError};
+use crate::meta_backend::Metadata;
 use bytes::Bytes;
-use log::{debug, error, info, warn};
+use log::{error, info};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -124,7 +125,10 @@ pub struct NvmeStaging {
     pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     pub backend_router:
         std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
-    redis_client: crate::dlm::MetaClient,
+    redis_client: std::sync::Arc<crate::dlm::MetaClient>,
+    pub meta_backend: std::sync::Arc<
+        once_cell::sync::OnceCell<std::sync::Arc<crate::meta_backend::RoutedMetaBackend>>,
+    >,
     /// Bounded merge-queue sender (P1-1). Full → StorageFull / backpressure.
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
@@ -154,7 +158,7 @@ impl NvmeStaging {
         max_read_bytes: u64,
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
-        redis_client: crate::dlm::MetaClient,
+        redis_client: std::sync::Arc<crate::dlm::MetaClient>,
     ) -> Result<Self> {
         // Initialize directories for segments
         let mut read_cache_dirs = Vec::new();
@@ -270,6 +274,7 @@ impl NvmeStaging {
             nvme_writer: nvme_writer.clone(),
             backend_router,
             redis_client: redis_client.clone(),
+            meta_backend: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
             write_tx,
             p2p_addr: std::sync::Arc::new(std::sync::OnceLock::new()),
             current_staged_write_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -295,7 +300,7 @@ impl NvmeStaging {
         let _ = self.backend_router.set(router);
     }
 
-    pub fn redis_client(&self) -> &crate::dlm::MetaClient {
+    pub fn redis_client(&self) -> &std::sync::Arc<crate::dlm::MetaClient> {
         &self.redis_client
     }
 
@@ -551,7 +556,7 @@ impl NvmeStaging {
         let block_allocator = self.block_allocator.clone();
         let nvme_writer = self.nvme_writer.clone();
         let backend_router = self.backend_router.clone();
-        let redis_client = self.redis_client.clone();
+        let meta_backend = self.meta_backend.clone();
         let staged_bytes = self.current_staged_write_bytes.clone();
         let space_freed_notify = self.space_freed_notify.clone();
         let staging_nvme_cache = self.staging_nvme_cache.clone();
@@ -562,32 +567,9 @@ impl NvmeStaging {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
             let mut current_bytes = 0u64;
             let max_batch_bytes = 4 * 1024 * 1024;
-            let mut flush_timeout = Duration::from_millis(500);
-
-            let mut last_query = time::Instant::now() - Duration::from_secs(60);
-            let query_interval = Duration::from_secs(5);
+            let flush_timeout = Duration::from_millis(500);
 
             loop {
-                if last_query.elapsed() >= query_interval {
-                    if let Ok(mut con) = redis_client.get_connection().await {
-                        let delay_str: Option<String> = redis::cmd("HGET")
-                            .arg(crate::fs_key!("format"))
-                            .arg("upload_delay")
-                            .query_async(&mut con)
-                            .await
-                            .unwrap_or(None);
-                        if let Some(ds) = delay_str {
-                            if let Ok(parsed) = crate::cache::parse_duration(&ds) {
-                                if parsed != flush_timeout {
-                                    debug!("NVMe Staging: Dynamic upload_delay changed from {:?} to {:?}", flush_timeout, parsed);
-                                    flush_timeout = parsed;
-                                }
-                            }
-                        }
-                    }
-                    last_query = time::Instant::now();
-                }
-
                 let sleep = time::sleep(flush_timeout);
                 tokio::pin!(sleep);
 
@@ -598,7 +580,7 @@ impl NvmeStaging {
 
                         if current_bytes >= max_batch_bytes {
                             info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify).await {
                                 error!("Failed to flush NVMe staging batch: {:?}", e);
                             }
                         }
@@ -606,7 +588,7 @@ impl NvmeStaging {
                     _ = &mut sleep => {
                         if !batch.is_empty() {
                             info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &redis_client, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify).await {
                                 error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
                             }
                         }
@@ -618,7 +600,9 @@ impl NvmeStaging {
 
     async fn flush_batch(
         staging_nvme_cache: &crate::tiering::nvme::NvmeCache,
-        redis_client: &crate::dlm::MetaClient,
+        meta_backend: &std::sync::Arc<
+            once_cell::sync::OnceCell<std::sync::Arc<crate::meta_backend::RoutedMetaBackend>>,
+        >,
         batch: &mut Vec<PendingStagedWrite>,
         current_bytes: &mut u64,
         staged_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -637,31 +621,13 @@ impl NvmeStaging {
 
         crate::coz_progress!("nvme_flush_batch");
 
-        let mut con = redis_client.get_connection().await?;
-        use redis::AsyncCommands;
-
-        let compression: String = con
-            .hget(crate::fs_key!("format"), "compression")
-            .await
-            .unwrap_or(None)
-            .unwrap_or_else(|| "none".to_string());
-        let encrypt_algo: String = con
-            .hget(crate::fs_key!("format"), "encrypt_algo")
-            .await
-            .unwrap_or(None)
-            .unwrap_or_else(|| "none".to_string());
-        let encrypt_key: Option<String> = con
-            .hget(crate::fs_key!("format"), "encrypt_key")
-            .await
-            .unwrap_or(None);
-
         let crypto_state = crate::crypto_compress::CryptoCompressState::new(
-            compression,
-            encrypt_algo,
-            encrypt_key.as_deref(),
+            "none".to_string(),
+            "none".to_string(),
+            None,
         );
 
-        let (be_id, block_allocator, nvme_writer) = if let Some(router) = backend_router.get() {
+        let (_be_id, block_allocator, nvme_writer) = if let Some(router) = backend_router.get() {
             router.get_active_backend()?
         } else {
             (
@@ -672,17 +638,12 @@ impl NvmeStaging {
         };
 
         let offset = block_allocator.allocate_block().await?;
-        let packed_key = if be_id == "backend_0" {
-            offset.to_string()
-        } else {
-            format!("{}://{}", be_id, offset)
-        };
+        let packed_key = offset.to_string();
 
         let mut packed_payload = Vec::new();
         let mut mappings = Vec::new();
         let mut highest_fencing_token = 0u64;
 
-        let mut total_logical_size = 0usize;
         for item in batch.iter() {
             let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
             let data_res = if let Some(guard) = staging_nvme_cache.get(&key_bytes) {
@@ -713,7 +674,6 @@ impl NvmeStaging {
             };
 
             if let Some(data) = data_res {
-                total_logical_size += data.len();
                 let processed_data = crypto_state.process_write(bytes::Bytes::from(data))?;
                 let offset = packed_payload.len() as u64;
                 let size = processed_data.len() as u64;
@@ -736,39 +696,29 @@ impl NvmeStaging {
             return Err(e);
         }
 
-        if let Ok(mut con) = redis_client.get_connection().await {
-            let refcounts_key_str = crate::fs_key!("block_refcounts");
-            let refcounts_key = &refcounts_key_str;
-            let _: std::result::Result<(), redis::RedisError> = redis::cmd("HSET")
-                .arg(refcounts_key)
-                .arg(&packed_key)
-                .arg(mappings.len() as i32)
-                .query_async(&mut con)
-                .await;
+        if let Some(backend) = meta_backend.get() {
+            for (item, (_file_id, sub_offset, sub_size)) in batch.iter().zip(mappings.iter()) {
+                let file_path = &item.file_path;
+                let ino = crate::routing::parse_inode_from_path(file_path);
 
-            let _: std::result::Result<(), redis::RedisError> = redis::cmd("HSET")
-                .arg(crate::fs_key!("block_sizes"))
-                .arg(&packed_key)
-                .arg(format!("{}:{}", total_logical_size, packed_payload_len))
-                .query_async(&mut con)
-                .await;
+                let layout_bytes = backend.getxattr(ino, "layout").await.unwrap_or(None);
+                let mut meta: crate::routing::LayoutMetadata = if let Some(ref bytes) = layout_bytes
+                {
+                    serde_json::from_slice(bytes).unwrap_or_default()
+                } else {
+                    crate::routing::LayoutMetadata::default()
+                };
 
-            for (file_id, offset, size) in mappings.iter() {
-                let mapping_key = format!("mapping:{}", file_id);
-                let _: std::result::Result<(), redis::RedisError> = redis::pipe()
-                    .hset(&mapping_key, "block", &packed_key)
-                    .hset(&mapping_key, "offset", *offset)
-                    .hset(&mapping_key, "size", *size)
-                    .query_async(&mut con)
-                    .await;
+                let mut block_map = meta.block_map.unwrap_or_default();
+                let val_str = format!("{}:{}:{}", packed_key, sub_offset, sub_size);
+                block_map.insert(0, val_str);
+                meta.block_map = Some(block_map);
+                meta.file_id = None;
 
-                debug!(
-                    "NVMe Staging: Recorded Garnet offset map: mapping:{} -> block: {}, offset: {}, size: {}",
-                    file_id, packed_key, offset, size
-                );
+                if let Ok(serialized) = serde_json::to_vec(&meta) {
+                    let _ = backend.setxattr(ino, "layout", &serialized).await;
+                }
             }
-        } else {
-            warn!("NVMe Staging: Failed to connect to Redis/Garnet to register packed block mappings. Mappings will not be available in metadata.");
         }
 
         for item in batch.iter() {
@@ -825,34 +775,6 @@ impl NvmeStaging {
                             .store_remote_value(primary_owner, key_bytes, val_bytes)
                             .await;
                     }
-                }
-            });
-        }
-
-        if let Some(p2p_addr) = self.p2p_addr.get() {
-            let redis_client = self.redis_client.clone();
-            let block_key = block_key.to_string();
-            let p2p_addr = p2p_addr.clone();
-            crate::bg_admit::spawn_bg(async move {
-                if let Ok(mut con) = redis_client.get_connection().await {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let safe_name = block_key.replace(['/', ':'], "_");
-                    let peer_key = format!("block_peers:{}", safe_name);
-                    let peer_blocks_key =
-                        format!("{}:peer_blocks:{}", crate::fs_prefix(), p2p_addr);
-                    let _: std::result::Result<(), redis::RedisError> = redis::pipe()
-                        .sadd(&peer_key, &p2p_addr)
-                        .expire(&peer_key, 60)
-                        .sadd(&peer_blocks_key, &block_key)
-                        .cmd("ZADD")
-                        .arg(crate::fs_key!("peer_health_check_schedule"))
-                        .arg(now + 60)
-                        .arg(&p2p_addr)
-                        .query_async(&mut con)
-                        .await;
                 }
             });
         }

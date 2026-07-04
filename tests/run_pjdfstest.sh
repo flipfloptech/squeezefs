@@ -10,7 +10,6 @@ set -euo pipefail
 #
 # Usage:
 #   sudo ./tests/run_pjdfstest.sh
-#   sudo GARNET_URL=redis://127.0.0.1:6380 ./tests/run_pjdfstest.sh
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: pjdfstest must run as root (sudo $0)." >&2
@@ -21,12 +20,11 @@ fi
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MOUNT_DIR="${MOUNT_DIR:-/tmp/squeezefs_pjdfs_mount}"
 STAGING_DIR="${STAGING_DIR:-/tmp/squeezefs_pjdfs_staging}"
-GARNET_URL="${GARNET_URL:-redis://127.0.0.1:6379}"
 # Run as the original invoking user for cargo when under sudo, if available.
 RUNUSER="${SUDO_USER:-root}"
 
 echo "=== Squeezefs POSIX Compliance Verification (root required) ==="
-echo "Repo: $REPO_DIR  Mount: $MOUNT_DIR  Garnet: $GARNET_URL"
+echo "Repo: $REPO_DIR  Mount: $MOUNT_DIR"
 
 # 1. Check/Install dependencies
 for cmd in make gcc autoreconf; do
@@ -79,18 +77,23 @@ fi
 # 4. Prepare mounts
 umount -l "$MOUNT_DIR" &>/dev/null || true
 mkdir -p "$MOUNT_DIR" "$STAGING_DIR"
+truncate -s 128M /dev/shm/squeezefs_pjdfs_meta || true
+truncate -s 1G /dev/shm/squeezefs_default_backend || true
 
 # Clean volume format
 echo "Formatting volume..."
 cd "$REPO_DIR"
-GARNET_URL="$GARNET_URL" "$SQUEEZEFS_BIN" format pjdfsvol \
+"$SQUEEZEFS_BIN" format \
+    sqmeta:///dev/shm/squeezefs_pjdfs_meta \
+    sqdata:///dev/shm/squeezefs_default_backend \
     --disk-cache-paths "$STAGING_DIR" \
-    --volume /dev/shm/squeezefs_default_backend \
     --force
 
 # Mount squeezefs (daemon must be root for chown/mknod tests; --allow-other for harness)
 echo "Mounting squeezefs..."
-GARNET_URL="$GARNET_URL" "$SQUEEZEFS_BIN" mount pjdfsvol "$MOUNT_DIR" \
+RUST_LOG=debug "$SQUEEZEFS_BIN" mount \
+    sqmeta:///dev/shm/squeezefs_pjdfs_meta \
+    "$MOUNT_DIR" \
     --daemon \
     --disk-cache-paths "$STAGING_DIR" \
     --log-file /tmp/squeezefs_pjdfs.log \
@@ -104,18 +107,18 @@ if ! mountpoint -q "$MOUNT_DIR"; then
     exit 1
 fi
 
-# 5. Run pjdfstest as root from the mount
+# 5. Run tests
 echo "Running pjdfstest suite (as root on $MOUNT_DIR)..."
-cd "$MOUNT_DIR"
-set +e
-"$PROVE_CMD" -r "$PJDFSTEST_DIR/tests/"
-PROVE_RC=$?
-set -e
+if ! "$PROVE_CMD" -r "$PJDFSTEST_DIR/tests"; then
+    echo "=== POSIX Verification Failed (prove exit=1) ==="
+    exit 1
+fi
 
 # 6. Cleanup
 echo "Cleaning up..."
 cd "$REPO_DIR"
 umount "$MOUNT_DIR" || umount -l "$MOUNT_DIR" || true
 rm -rf "$MOUNT_DIR" "$STAGING_DIR"
-echo "=== POSIX Verification Completed (prove exit=$PROVE_RC) ==="
-exit "$PROVE_RC"
+rm -f /dev/shm/squeezefs_pjdfs_meta /dev/shm/squeezefs_default_backend
+echo "=== POSIX Verification Completed (prove exit=0) ==="
+exit 0

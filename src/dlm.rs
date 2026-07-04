@@ -1,1002 +1,65 @@
-//! Distributed lock manager (DLM) over Garnet/Redis.
-//!
-//! # Crash consistency (P0-4)
-//!
-//! Leases are `SET key client_id NX PX ttl` plus a monotonic **fencing token**
-//! (`INCR fencing_generator:…`). Heartbeats renew TTL only while this client still
-//! owns the key. After a hard kill:
-//!
-//! 1. Heartbeats stop → TTL expires → another client may acquire a new token.
-//! 2. The new owner's writes update `metadata:… fencing_token`.
-//! 3. Stale writers (or staging recovery with an old token) are rejected when
-//!    `token < metadata.fencing_token`.
-//!
-//! Live processes must not keep using a cached `LockLease` after Redis no longer
-//! shows their `client_id` as holder — see [`LockLease::is_held`].
-
-use crate::error::{Result, SqueezefsError};
-use log::{debug, error, warn};
+use crate::error::Result;
 use once_cell::sync::Lazy;
-use redis::aio::ConnectionLike;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
-use uuid::Uuid;
 
-thread_local! {
-    static LOCAL_CONN: std::cell::RefCell<Vec<(redis::ConnectionInfo, redis::aio::MultiplexedConnection)>> =
-        std::cell::RefCell::new(Vec::new());
-}
-
-pub struct ConnectionPool {
-    pub conns: Vec<std::sync::Arc<parking_lot::RwLock<redis::aio::MultiplexedConnection>>>,
-    pub counter: AtomicUsize,
-}
-
-pub static SENTINEL_CONN_POOL: Lazy<
-    dashmap::DashMap<String, redis::aio::MultiplexedConnection, ahash::RandomState>,
-> = Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
+static LOCK_MAP: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static FENCING_MAP: Lazy<Mutex<HashMap<String, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone)]
-pub struct BoundConnection {
-    pub conn: std::sync::Arc<parking_lot::RwLock<redis::aio::MultiplexedConnection>>,
-    pub local_ip: IpAddr,
-    pub remote_addr: SocketAddr,
-    pub conn_info: redis::ConnectionInfo,
-}
+pub struct BoundConnection {}
 
-pub fn parse_inode_from_key(key: &str) -> Option<u64> {
-    if key.starts_with(&format!("{}:", crate::fs_prefix())) {
-        let parts: Vec<&str> = key.split(':').collect();
-        if parts.len() >= 3 {
-            if let Ok(ino) = parts[2].parse::<u64>() {
-                return Some(ino);
-            }
-        }
-    }
-    if let Some(stripped) = key.strip_prefix("metadata:inode_") {
-        if let Ok(ino) = stripped.parse::<u64>() {
-            return Some(ino);
-        }
-    }
-    if let Some(stripped) = key.strip_prefix("inline_data:inode_") {
-        if let Ok(ino) = stripped.parse::<u64>() {
-            return Some(ino);
-        }
-    }
-    if let Some(remainder) = key.strip_prefix("mapping:inode_") {
-        if let Some(pos) = remainder.find('_') {
-            if let Ok(ino) = remainder[..pos].parse::<u64>() {
-                return Some(ino);
-            }
-        }
-    }
-    None
-}
+#[derive(Clone)]
+pub struct MetaConnection {}
 
 #[derive(Clone)]
 pub enum MetaClient {
-    Single {
-        client: redis::Client,
-        pool: std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<ConnectionPool>>>,
-    },
-    SingleBound {
-        client: redis::Client,
-        bound_conns: Vec<BoundConnection>,
-        current_idx: std::sync::Arc<AtomicUsize>,
-    },
-    Cluster(redis::cluster::ClusterClient),
-    Sentinel {
-        client: std::sync::Arc<tokio::sync::Mutex<redis::sentinel::SentinelClient>>,
-        service_name: String,
-    },
-    Sharded {
-        shards: Vec<MetaClient>,
-    },
-}
-
-pub enum MetaConnection {
-    Single {
-        conn: redis::aio::MultiplexedConnection,
-        client: Option<redis::Client>,
-        bound_conn: Option<Box<BoundConnection>>,
-        sentinel_client:
-            Option<std::sync::Arc<tokio::sync::Mutex<redis::sentinel::SentinelClient>>>,
-        service_name: Option<String>,
-        pool_index: Option<(std::sync::Arc<ConnectionPool>, usize)>,
-    },
-    Cluster(redis::cluster_async::ClusterConnection),
-}
-
-async fn reconnect_bound(bound: &BoundConnection) -> Result<redis::aio::MultiplexedConnection> {
-    let socket = match bound.local_ip {
-        IpAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-        IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-    };
-    socket.bind(SocketAddr::new(bound.local_ip, 0))?;
-    let stream = socket.connect(bound.remote_addr).await.map_err(|e| {
-        println!("REDIS ERROR: {:?}", e);
-        e
-    })?;
-    let (new_conn, driver) = redis::aio::MultiplexedConnection::new(&bound.conn_info.redis, stream)
-        .await
-        .map_err(|e| {
-            println!("REDIS ERROR: {:?}", e);
-            e
-        })?;
-    tokio::spawn(driver);
-    *bound.conn.write() = new_conn.clone();
-    Ok(new_conn)
-}
-
-impl ConnectionLike for MetaConnection {
-    fn req_packed_command<'a>(
-        &'a mut self,
-        cmd: &'a redis::Cmd,
-    ) -> redis::RedisFuture<'a, redis::Value> {
-        match self {
-            MetaConnection::Single {
-                conn,
-                client,
-                bound_conn,
-                sentinel_client,
-                service_name,
-                pool_index,
-            } => {
-                let client_opt = client.clone();
-                let bound_conn_opt = bound_conn.clone();
-                let sentinel_opt = sentinel_client.clone();
-                let service_name_opt = service_name.clone();
-                let pool_index_opt = pool_index.clone();
-                Box::pin(async move {
-                    let res = conn.req_packed_command(cmd).await;
-                    if let Err(ref e) = res {
-                        if e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()
-                        {
-                            if let Some(bound) = &bound_conn_opt {
-                                warn!("Cached SingleBound connection broken: {:?}", e);
-                                match reconnect_bound(bound).await {
-                                    Ok(new_conn) => {
-                                        *conn = new_conn;
-                                        return conn.req_packed_command(cmd).await;
-                                    }
-                                    Err(reconnect_err) => {
-                                        error!(
-                                            "Failed to reconnect SingleBound: {:?}",
-                                            reconnect_err
-                                        );
-                                    }
-                                }
-                            } else if let Some(sentinel) = &sentinel_opt {
-                                warn!("Cached Sentinel connection broken: {:?}", e);
-                                let mut guard = sentinel.lock().await;
-                                match guard.get_async_connection().await {
-                                    Ok(new_conn) => {
-                                        if let Some(svc) = &service_name_opt {
-                                            SENTINEL_CONN_POOL
-                                                .insert(svc.clone(), new_conn.clone());
-                                        }
-                                        *conn = new_conn;
-                                        return conn.req_packed_command(cmd).await;
-                                    }
-                                    Err(reconnect_err) => {
-                                        error!("Failed to reconnect Sentinel: {:?}", reconnect_err);
-                                    }
-                                }
-                            } else if let Some((pool, pool_idx)) = &pool_index_opt {
-                                warn!("Cached Redis pool connection {} broken: {:?}", pool_idx, e);
-                                if let Some(client_ref) = &client_opt {
-                                    match client_ref.get_multiplexed_tokio_connection().await {
-                                        Ok(new_conn) => {
-                                            if *pool_idx < pool.conns.len() {
-                                                *pool.conns[*pool_idx].write() = new_conn.clone();
-                                            }
-                                            *conn = new_conn;
-                                            return conn.req_packed_command(cmd).await;
-                                        }
-                                        Err(reconnect_err) => {
-                                            error!(
-                                                "Failed to reconnect to Redis: {:?}",
-                                                reconnect_err
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    res
-                })
-            }
-            MetaConnection::Cluster(c) => c.req_packed_command(cmd),
-        }
-    }
-
-    fn req_packed_commands<'a>(
-        &'a mut self,
-        cmd: &'a redis::Pipeline,
-        offset: usize,
-        count: usize,
-    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
-        match self {
-            MetaConnection::Single {
-                conn,
-                client,
-                bound_conn,
-                sentinel_client,
-                service_name,
-                pool_index,
-            } => {
-                let client_opt = client.clone();
-                let bound_conn_opt = bound_conn.clone();
-                let sentinel_opt = sentinel_client.clone();
-                let service_name_opt = service_name.clone();
-                let pool_index_opt = pool_index.clone();
-                Box::pin(async move {
-                    let res = conn.req_packed_commands(cmd, offset, count).await;
-                    if let Err(ref e) = res {
-                        if e.is_connection_refusal() || e.is_connection_dropped() || e.is_io_error()
-                        {
-                            if let Some(bound) = &bound_conn_opt {
-                                warn!("Cached SingleBound connection broken in pipeline: {:?}", e);
-                                match reconnect_bound(bound).await {
-                                    Ok(new_conn) => {
-                                        *conn = new_conn;
-                                        return conn.req_packed_commands(cmd, offset, count).await;
-                                    }
-                                    Err(reconnect_err) => {
-                                        error!(
-                                            "Failed to reconnect SingleBound: {:?}",
-                                            reconnect_err
-                                        );
-                                    }
-                                }
-                            } else if let Some(sentinel) = &sentinel_opt {
-                                warn!("Cached Sentinel connection broken in pipeline: {:?}", e);
-                                let mut guard = sentinel.lock().await;
-                                match guard.get_async_connection().await {
-                                    Ok(new_conn) => {
-                                        if let Some(svc) = &service_name_opt {
-                                            SENTINEL_CONN_POOL
-                                                .insert(svc.clone(), new_conn.clone());
-                                        }
-                                        *conn = new_conn;
-                                        return conn.req_packed_commands(cmd, offset, count).await;
-                                    }
-                                    Err(reconnect_err) => {
-                                        error!("Failed to reconnect Sentinel: {:?}", reconnect_err);
-                                    }
-                                }
-                            } else if let Some((pool, pool_idx)) = &pool_index_opt {
-                                warn!(
-                                    "Cached Redis pool connection {} broken in pipeline: {:?}",
-                                    pool_idx, e
-                                );
-                                if let Some(client_ref) = &client_opt {
-                                    match client_ref.get_multiplexed_tokio_connection().await {
-                                        Ok(new_conn) => {
-                                            if *pool_idx < pool.conns.len() {
-                                                *pool.conns[*pool_idx].write() = new_conn.clone();
-                                            }
-                                            *conn = new_conn;
-                                            return conn
-                                                .req_packed_commands(cmd, offset, count)
-                                                .await;
-                                        }
-                                        Err(reconnect_err) => {
-                                            error!(
-                                                "Failed to reconnect to Redis: {:?}",
-                                                reconnect_err
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    res
-                })
-            }
-            MetaConnection::Cluster(c) => c.req_packed_commands(cmd, offset, count),
-        }
-    }
-
-    fn get_db(&self) -> i64 {
-        match self {
-            MetaConnection::Single { conn, .. } => conn.get_db(),
-            MetaConnection::Cluster(c) => c.get_db(),
-        }
-    }
-}
-
-fn resolve_redis_addr(redis_url: &str) -> Result<SocketAddr> {
-    let cleaned = redis_url.strip_prefix("redis://").unwrap_or(redis_url);
-    let host_port = cleaned.split('/').next().unwrap_or(cleaned);
-    let host_port = host_port.split('?').next().unwrap_or(host_port);
-
-    let parts: Vec<&str> = host_port.split(':').collect();
-    let host = parts[0];
-    let port = if parts.len() > 1 {
-        parts[1].parse::<u16>().unwrap_or(6379)
-    } else {
-        6379
-    };
-
-    use std::net::ToSocketAddrs;
-    let addrs = (host, port).to_socket_addrs().map_err(|e| {
-        SqueezefsError::Io(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            format!("DNS lookup failed for {}:{}: {:?}", host, port, e),
-        ))
-    })?;
-
-    if let Some(addr) = addrs.into_iter().next() {
-        return Ok(addr);
-    }
-
-    Err(SqueezefsError::Io(std::io::Error::new(
-        std::io::ErrorKind::AddrNotAvailable,
-        format!("No resolved addresses for host: {}", host),
-    )))
-}
-
-async fn register_custom_commands(
-    _con: &mut redis::aio::MultiplexedConnection,
-) -> std::result::Result<(), redis::RedisError> {
-    log::info!("Bypassing custom C# transactions registration to force fallback Redis pipelines.");
-    Ok(())
+    Local,
 }
 
 impl MetaClient {
-    pub fn new(redis_url: &str) -> Result<Self> {
-        if redis_url.starts_with("redis+sharded://") {
-            let remainder = redis_url.strip_prefix("redis+sharded://").unwrap();
-            let cleaned = remainder.replace("redis://", "");
-            let nodes: Vec<&str> = cleaned
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let mut shards = Vec::new();
-            for node in nodes {
-                let node_url = if node.starts_with("redis://") {
-                    node.to_string()
-                } else {
-                    format!("redis://{}", node)
-                };
-                let shard_client = MetaClient::new(&node_url)?;
-                shards.push(shard_client);
-            }
-            return Ok(Self::Sharded { shards });
-        }
-
-        let is_sentinel = redis_url.starts_with("redis-sentinel://");
-        let is_cluster = !is_sentinel
-            && (redis_url.contains(',')
-                || redis_url.starts_with("redis+cluster://")
-                || redis_url.contains("cluster=true"));
-
-        if is_cluster {
-            let cleaned_url = redis_url.replace("redis+cluster://", "redis://");
-            let nodes: Vec<&str> = cleaned_url
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let client = redis::cluster::ClusterClientBuilder::new(nodes)
-                .read_from_replicas()
-                .build()?;
-            Ok(Self::Cluster(client))
-        } else if let Some(remainder) = redis_url.strip_prefix("redis-sentinel://") {
-            let parts: Vec<&str> = remainder.split('/').collect();
-            if parts.len() < 2 {
-                return Err(SqueezefsError::InvalidOperation(
-                    "Invalid sentinel URL. Expected format: redis-sentinel://host1:port1,host2:port2/service_name".to_string()
-                ));
-            }
-            let service_name = parts[1].to_string();
-            let nodes: Vec<String> = parts[0]
-                .split(',')
-                .map(|s| {
-                    let host_port = s.trim();
-                    if host_port.starts_with("redis://") {
-                        host_port.to_string()
-                    } else {
-                        format!("redis://{}", host_port)
-                    }
-                })
-                .filter(|s| !s.is_empty())
-                .collect();
-            let client = redis::sentinel::SentinelClient::build(
-                nodes,
-                service_name.clone(),
-                None,
-                redis::sentinel::SentinelServerType::Master,
-            )?;
-            Ok(Self::Sentinel {
-                client: std::sync::Arc::new(tokio::sync::Mutex::new(client)),
-                service_name,
-            })
-        } else {
-            let client = redis::Client::open(redis_url)?;
-            Ok(Self::Single {
-                client,
-                pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
-            })
-        }
+    pub fn new(_redis_url: &str) -> Result<Self> {
+        Ok(Self::Local)
     }
-
-    pub fn new_single(client: redis::Client) -> Self {
-        Self::Single {
-            client,
-            pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
-        }
+    pub async fn new_with_local_ips(_redis_url: &str, _local_ips: Vec<IpAddr>) -> Result<Self> {
+        Ok(Self::Local)
     }
-
-    pub async fn new_with_local_ips(redis_url: &str, local_ips: Vec<IpAddr>) -> Result<Self> {
-        if redis_url.starts_with("redis+sharded://") {
-            let remainder = redis_url.strip_prefix("redis+sharded://").unwrap();
-            let cleaned = remainder.replace("redis://", "");
-            let nodes: Vec<&str> = cleaned
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let mut shards = Vec::new();
-            for node in nodes {
-                let node_url = if node.starts_with("redis://") {
-                    node.to_string()
-                } else {
-                    format!("redis://{}", node)
-                };
-                let shard_client =
-                    Box::pin(MetaClient::new_with_local_ips(&node_url, local_ips.clone()))
-                        .await
-                        .map_err(|e| {
-                            println!("REDIS ERROR: {:?}", e);
-                            e
-                        })?;
-                shards.push(shard_client);
-            }
-            return Ok(Self::Sharded { shards });
-        }
-
-        let is_sentinel = redis_url.starts_with("redis-sentinel://");
-        let is_cluster = !is_sentinel
-            && (redis_url.contains(',')
-                || redis_url.starts_with("redis+cluster://")
-                || redis_url.contains("cluster=true"));
-
-        if is_cluster {
-            let cleaned_url = redis_url.replace("redis+cluster://", "redis://");
-            let nodes: Vec<&str> = cleaned_url
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let client = redis::cluster::ClusterClientBuilder::new(nodes)
-                .read_from_replicas()
-                .build()?;
-            Ok(Self::Cluster(client))
-        } else if let Some(remainder) = redis_url.strip_prefix("redis-sentinel://") {
-            let parts: Vec<&str> = remainder.split('/').collect();
-            if parts.len() < 2 {
-                return Err(SqueezefsError::InvalidOperation(
-                    "Invalid sentinel URL. Expected format: redis-sentinel://host1:port1,host2:port2/service_name".to_string()
-                ));
-            }
-            let service_name = parts[1].to_string();
-            let nodes: Vec<String> = parts[0]
-                .split(',')
-                .map(|s| {
-                    let host_port = s.trim();
-                    if host_port.starts_with("redis://") {
-                        host_port.to_string()
-                    } else {
-                        format!("redis://{}", host_port)
-                    }
-                })
-                .filter(|s| !s.is_empty())
-                .collect();
-            let client = redis::sentinel::SentinelClient::build(
-                nodes,
-                service_name.clone(),
-                None,
-                redis::sentinel::SentinelServerType::Master,
-            )?;
-            Ok(Self::Sentinel {
-                client: std::sync::Arc::new(tokio::sync::Mutex::new(client)),
-                service_name,
-            })
-        } else {
-            let client = redis::Client::open(redis_url)?;
-            if local_ips.is_empty() {
-                Ok(Self::Single {
-                    client,
-                    pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
-                })
-            } else {
-                let remote_addr = match resolve_redis_addr(redis_url) {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        warn!("Could not resolve Redis address: {:?}. Falling back to default client.", e);
-                        return Ok(Self::Single {
-                            client,
-                            pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
-                        });
-                    }
-                };
-
-                let mut bound_conns = Vec::new();
-                let conn_info = client.get_connection_info();
-
-                for ip in local_ips {
-                    let socket = match ip {
-                        IpAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-                        IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-                    };
-                    let _ = socket.bind(SocketAddr::new(ip, 0));
-
-                    match socket.connect(remote_addr).await {
-                        Ok(stream) => {
-                            match redis::aio::MultiplexedConnection::new(&conn_info.redis, stream)
-                                .await
-                            {
-                                Ok((conn, driver)) => {
-                                    tokio::spawn(driver);
-                                    bound_conns.push(BoundConnection {
-                                        conn: std::sync::Arc::new(parking_lot::RwLock::new(conn)),
-                                        local_ip: ip,
-                                        remote_addr,
-                                        conn_info: conn_info.clone(),
-                                    });
-                                }
-                                Err(e) => {
-                                    warn!("Failed to establish MultiplexedConnection on interface {}: {:?}", ip, e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to connect to Redis on interface {}: {:?}", ip, e);
-                        }
-                    }
-                }
-
-                if bound_conns.is_empty() {
-                    warn!("Failed to connect on all interfaces. Falling back to default routing.");
-                    Ok(Self::Single {
-                        client,
-                        pool: std::sync::Arc::new(tokio::sync::OnceCell::new()),
-                    })
-                } else {
-                    Ok(Self::SingleBound {
-                        client,
-                        bound_conns,
-                        current_idx: std::sync::Arc::new(AtomicUsize::new(0)),
-                    })
-                }
-            }
-        }
-    }
-
     pub async fn get_connection(&self) -> Result<MetaConnection> {
-        match self {
-            Self::Single { client, pool } => {
-                let info = client.get_connection_info();
-                if let Some(conn) = LOCAL_CONN.with(|cache| {
-                    cache
-                        .borrow()
-                        .iter()
-                        .find(|(cached_info, _)| {
-                            cached_info.addr == info.addr
-                                && cached_info.redis.db == info.redis.db
-                                && cached_info.redis.username == info.redis.username
-                                && cached_info.redis.password == info.redis.password
-                        })
-                        .map(|(_, conn)| conn.clone())
-                }) {
-                    return Ok(MetaConnection::Single {
-                        conn,
-                        client: Some(client.clone()),
-                        bound_conn: None,
-                        sentinel_client: None,
-                        service_name: None,
-                        pool_index: None,
-                    });
-                }
-
-                let pool_arc = pool
-                    .get_or_init(|| async {
-                        let cores = std::thread::available_parallelism()
-                            .map(|p| p.get())
-                            .unwrap_or(4);
-                        let pool_size = std::cmp::max(8, cores * 2);
-                        let mut conns = Vec::new();
-                        for _ in 0..pool_size {
-                            if let Ok(new_conn) = client.get_multiplexed_tokio_connection().await {
-                                conns.push(std::sync::Arc::new(parking_lot::RwLock::new(new_conn)));
-                            }
-                        }
-                        if !conns.is_empty() {
-                            if let Ok(mut reg_conn) =
-                                client.get_multiplexed_tokio_connection().await
-                            {
-                                let _ = register_custom_commands(&mut reg_conn).await;
-                            }
-                        }
-                        std::sync::Arc::new(ConnectionPool {
-                            conns,
-                            counter: AtomicUsize::new(0),
-                        })
-                    })
-                    .await;
-
-                if pool_arc.conns.is_empty() {
-                    return Err(SqueezefsError::InvalidOperation(
-                        "Connection pool is empty".to_string(),
-                    ));
-                }
-
-                let idx = pool_arc.counter.fetch_add(1, Ordering::Relaxed);
-                let pool_idx = idx % pool_arc.conns.len();
-                let conn = pool_arc.conns[pool_idx].read().clone();
-
-                // Cache connection in thread-local cache (capped at 2 entries to prevent leaks/linear search growth)
-                LOCAL_CONN.with(|cache| {
-                    let mut cache_borrow = cache.borrow_mut();
-                    if cache_borrow.len() < 2 {
-                        cache_borrow.push((info.clone(), conn.clone()));
-                    } else {
-                        cache_borrow[0] = (info.clone(), conn.clone());
-                    }
-                });
-
-                Ok(MetaConnection::Single {
-                    conn,
-                    client: Some(client.clone()),
-                    bound_conn: None,
-                    sentinel_client: None,
-                    service_name: None,
-                    pool_index: Some((pool_arc.clone(), pool_idx)),
-                })
-            }
-            Self::SingleBound {
-                client,
-                bound_conns,
-                current_idx,
-            } => {
-                if !bound_conns.is_empty() {
-                    let idx = current_idx.fetch_add(1, Ordering::Relaxed);
-                    let bound = bound_conns[idx % bound_conns.len()].clone();
-                    let conn_val = bound.conn.read().clone();
-                    return Ok(MetaConnection::Single {
-                        conn: conn_val,
-                        client: Some(client.clone()),
-                        bound_conn: Some(Box::new(bound)),
-                        sentinel_client: None,
-                        service_name: None,
-                        pool_index: None,
-                    });
-                }
-                Err(SqueezefsError::InvalidOperation(
-                    "No bound connections available".to_string(),
-                ))
-            }
-            Self::Cluster(c) => {
-                let conn = c.get_async_connection().await.map_err(|e| {
-                    println!("REDIS ERROR: {:?}", e);
-                    e
-                })?;
-                Ok(MetaConnection::Cluster(conn))
-            }
-            Self::Sentinel {
-                client,
-                service_name,
-            } => {
-                let conn =
-                    if let Some(conn) = SENTINEL_CONN_POOL.get(service_name).map(|r| r.clone()) {
-                        conn
-                    } else {
-                        let mut guard = client.lock().await;
-                        let new_conn = guard.get_async_connection().await.map_err(|e| {
-                            println!("REDIS ERROR: {:?}", e);
-                            e
-                        })?;
-                        SENTINEL_CONN_POOL.insert(service_name.clone(), new_conn.clone());
-                        new_conn
-                    };
-                Ok(MetaConnection::Single {
-                    conn,
-                    client: None,
-                    bound_conn: None,
-                    sentinel_client: Some(client.clone()),
-                    service_name: Some(service_name.clone()),
-                    pool_index: None,
-                })
-            }
-            Self::Sharded { shards } => {
-                if shards.is_empty() {
-                    return Err(SqueezefsError::InvalidOperation(
-                        "Sharded client has no shards".to_string(),
-                    ));
-                }
-                Box::pin(shards[0].get_connection()).await
-            }
-        }
+        Ok(MetaConnection {})
     }
-
+    pub async fn get_connection_for_inode(&self, _ino: u64) -> Result<MetaConnection> {
+        Ok(MetaConnection {})
+    }
+    pub async fn get_connection_for_key(&self, _key: &str) -> Result<MetaConnection> {
+        Ok(MetaConnection {})
+    }
     pub fn shard_count(&self) -> usize {
-        match self {
-            Self::Sharded { shards } => shards.len(),
-            _ => 1,
-        }
-    }
-
-    pub async fn get_connection_for_inode(&self, ino: u64) -> Result<MetaConnection> {
-        match self {
-            Self::Sharded { shards } => {
-                if shards.is_empty() {
-                    return Err(SqueezefsError::InvalidOperation(
-                        "Sharded client has no shards".to_string(),
-                    ));
-                }
-                let idx = (ino % shards.len() as u64) as usize;
-                shards[idx].get_connection().await
-            }
-            _ => self.get_connection().await,
-        }
-    }
-
-    pub async fn get_connection_for_key(&self, key: &str) -> Result<MetaConnection> {
-        if let Some(ino) = parse_inode_from_key(key) {
-            self.get_connection_for_inode(ino).await
-        } else {
-            self.get_connection().await
-        }
-    }
-}
-
-enum HeartbeatCommand {
-    Register {
-        lock_key: String,
-        client_id: String,
-        ttl_ms: u64,
-    },
-    Deregister {
-        lock_key: String,
-    },
-}
-
-struct ActiveLease {
-    _lock_key: String,
-    client_id: String,
-    ttl_ms: u64,
-    next_renewal: tokio::time::Instant,
-}
-
-async fn run_heartbeat_manager(
-    meta_client: MetaClient,
-    mut rx: tokio::sync::mpsc::Receiver<HeartbeatCommand>,
-) {
-    use std::collections::HashMap;
-    use tokio::time::{interval, Instant, MissedTickBehavior};
-
-    let mut leases: HashMap<String, ActiveLease> = HashMap::new();
-    let mut interval = interval(Duration::from_millis(500));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    let mut con_opt: Option<MetaConnection> = None;
-
-    loop {
-        tokio::select! {
-            cmd_opt = rx.recv() => {
-                match cmd_opt {
-                    Some(HeartbeatCommand::Register { lock_key, client_id, ttl_ms }) => {
-                        let interval_dur = Duration::from_millis(ttl_ms / 3);
-                        let next_renewal = Instant::now() + interval_dur;
-                        leases.insert(lock_key.clone(), ActiveLease {
-                            _lock_key: lock_key,
-                            client_id,
-                            ttl_ms,
-                            next_renewal,
-                        });
-                    }
-                    Some(HeartbeatCommand::Deregister { lock_key }) => {
-                        leases.remove(&lock_key);
-                    }
-                    None => {
-                        break;
-                    }
-                }
-            }
-            _ = interval.tick() => {
-                if leases.is_empty() {
-                    continue;
-                }
-
-                let now = Instant::now();
-                let mut keys_to_renew = Vec::new();
-                for (key, lease) in leases.iter_mut() {
-                    if now >= lease.next_renewal {
-                        keys_to_renew.push(key.clone());
-                    }
-                }
-
-                if keys_to_renew.is_empty() {
-                    continue;
-                }
-
-                let mut con = match con_opt.take() {
-                    Some(c) => c,
-                    None => {
-                        match meta_client.get_connection().await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                error!("Heartbeat manager failed to connect to Redis: {:?}", e);
-                                for key in &keys_to_renew {
-                                    if let Some(lease) = leases.get_mut(key) {
-                                        lease.next_renewal = now + Duration::from_millis(500);
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                };
-
-                let mut pipe_get = redis::pipe();
-                for key in &keys_to_renew {
-                    pipe_get.cmd("GET").arg(key);
-                }
-
-                let holders_res: redis::RedisResult<Vec<Option<String>>> = pipe_get.query_async(&mut con).await;
-                match holders_res {
-                    Ok(holders) => {
-                        let mut pipe_renew = redis::pipe();
-                        let mut renewals = Vec::new();
-                        for (i, key) in keys_to_renew.iter().enumerate() {
-                            if let Some(lease) = leases.get(key) {
-                                if let Some(Some(holder)) = holders.get(i) {
-                                    if holder == &lease.client_id {
-                                        pipe_renew.cmd("PEXPIRE").arg(key).arg(lease.ttl_ms);
-                                        renewals.push((key.clone(), true));
-                                        continue;
-                                    }
-                                }
-                                renewals.push((key.clone(), false));
-                            }
-                        }
-                        if !renewals.is_empty() {
-                            let _: () = pipe_renew.query_async(&mut con).await.unwrap_or(());
-                        }
-                        con_opt = Some(con);
-                        for (key, success) in renewals {
-                            if success {
-                                if let Some(lease) = leases.get_mut(&key) {
-                                    debug!("Heartbeat manager: Successfully renewed lease for key: {}", key);
-                                    let interval_dur = Duration::from_millis(lease.ttl_ms / 3);
-                                    lease.next_renewal = Instant::now() + interval_dur;
-                                }
-                            } else {
-                                error!("Heartbeat manager: Failed to renew lease for key: {} - lock stolen or expired", key);
-                                leases.remove(&key);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Heartbeat manager: Error executing renewal pipeline: {:?}", e);
-                        for key in keys_to_renew {
-                            if let Some(lease) = leases.get_mut(&key) {
-                                lease.next_renewal = now + Duration::from_millis(500);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        1
     }
 }
 
 #[derive(Clone)]
 pub struct DlmClient {
     client_id: String,
-    meta_client: MetaClient,
-    heartbeat_tx:
-        std::sync::Arc<once_cell::sync::OnceCell<tokio::sync::mpsc::Sender<HeartbeatCommand>>>,
     redis_url: String,
-}
-
-#[derive(Clone)]
-pub struct LockLease {
-    file_path: String,
-    client_id: String,
-    fencing_token: u64,
-    lock_key: String,
-    heartbeat_tx: Option<tokio::sync::mpsc::Sender<HeartbeatCommand>>,
-    meta_client: MetaClient,
-    range: Option<(u64, u64)>,
-}
-
-pub struct DelegationLease {
-    pub inode: u64,
-    pub client_id: String,
-    pub delegation_key: String,
-    heartbeat_tx: Option<tokio::sync::mpsc::Sender<HeartbeatCommand>>,
-    meta_client: MetaClient,
-}
-
-impl std::fmt::Debug for DelegationLease {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DelegationLease")
-            .field("inode", &self.inode)
-            .field("client_id", &self.client_id)
-            .field("delegation_key", &self.delegation_key)
-            .finish()
-    }
-}
-
-#[derive(Debug)]
-pub enum DelegationResult {
-    Acquired(DelegationLease),
-    HeldBy(String),
+    meta_client: Arc<MetaClient>,
 }
 
 impl DlmClient {
-    fn get_heartbeat_tx(&self) -> &tokio::sync::mpsc::Sender<HeartbeatCommand> {
-        self.heartbeat_tx.get_or_init(|| {
-            let (heartbeat_tx, heartbeat_rx) = tokio::sync::mpsc::channel(1024);
-            let meta_client_clone = self.meta_client.clone();
-            tokio::spawn(async move {
-                run_heartbeat_manager(meta_client_clone, heartbeat_rx).await;
-            });
-            heartbeat_tx
+    pub fn new(redis_url: &str) -> Result<Self> {
+        let client_id = format!("local_dlm_client_{}", uuid::Uuid::new_v4());
+        Ok(Self {
+            client_id,
+            redis_url: redis_url.to_string(),
+            meta_client: Arc::new(MetaClient::Local),
         })
     }
 
-    fn init_with_client(client_id: String, meta_client: MetaClient, redis_url: String) -> Self {
-        Self {
-            client_id,
-            meta_client,
-            heartbeat_tx: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
-            redis_url,
-        }
-    }
-
-    pub fn new(redis_url: &str) -> Result<Self> {
-        let meta_client = MetaClient::new(redis_url)?;
-        let client_id = Uuid::new_v4().to_string();
-        Ok(Self::init_with_client(
-            client_id,
-            meta_client,
-            redis_url.to_string(),
-        ))
-    }
-
-    pub async fn new_with_local_ips(redis_url: &str, local_ips: Vec<IpAddr>) -> Result<Self> {
-        let meta_client = MetaClient::new_with_local_ips(redis_url, local_ips)
-            .await
-            .map_err(|e| {
-                println!("REDIS ERROR: {:?}", e);
-                e
-            })?;
-        let client_id = Uuid::new_v4().to_string();
-        Ok(Self::init_with_client(
-            client_id,
-            meta_client,
-            redis_url.to_string(),
-        ))
-    }
-
-    pub fn connection_count(&self) -> usize {
-        match &self.meta_client {
-            MetaClient::Single { pool, .. } => pool.get().map(|p| p.conns.len()).unwrap_or(1),
-            MetaClient::SingleBound { bound_conns, .. } => bound_conns.len(),
-            _ => 1,
-        }
-    }
-
-    pub fn meta_client(&self) -> &MetaClient {
-        &self.meta_client
+    pub async fn new_with_local_ips(redis_url: &str, _local_ips: Vec<IpAddr>) -> Result<Self> {
+        Self::new(redis_url)
     }
 
     pub fn client_id(&self) -> &str {
@@ -1007,421 +70,218 @@ impl DlmClient {
         &self.redis_url
     }
 
-    pub async fn get_connection(&self) -> Result<MetaConnection> {
-        self.meta_client.get_connection().await
+    pub fn meta_client(&self) -> Arc<MetaClient> {
+        self.meta_client.clone()
     }
 
-    pub async fn get_connection_for_inode(&self, ino: u64) -> Result<MetaConnection> {
-        self.meta_client.get_connection_for_inode(ino).await
+    pub fn connection_count(&self) -> usize {
+        1
     }
 
     pub fn shard_count(&self) -> usize {
-        self.meta_client.shard_count()
+        1
     }
 
-    pub async fn get_connection_for_key(&self, key: &str) -> Result<MetaConnection> {
-        self.meta_client.get_connection_for_key(key).await
+    pub async fn get_connection(&self) -> Result<MetaConnection> {
+        Ok(MetaConnection {})
     }
 
-    /// Acquire a lease for a file-level or byte-range lock.
-    /// - `file_path`: path to file
-    /// - `range`: Option of (start, end) byte range
-    /// - `ttl`: duration the lock is valid for (typically 5 seconds)
+    pub async fn get_connection_for_inode(&self, _ino: u64) -> Result<MetaConnection> {
+        Ok(MetaConnection {})
+    }
+
+    pub async fn get_connection_for_key(&self, _key: &str) -> Result<MetaConnection> {
+        Ok(MetaConnection {})
+    }
+    pub fn get_fencing_token(&self, file_path: &str) -> u64 {
+        let gen_key = format!("fencing_generator:{}", file_path);
+        let map = FENCING_MAP.lock();
+        map.get(&gen_key).copied().unwrap_or(0)
+    }
+
+    pub async fn get_pubsub_connection(&self) -> Result<MockPubSub> {
+        Ok(MockPubSub {})
+    }
+
+    pub async fn publish_recall(&self, _client_id: &str, _ino: u64) -> Result<()> {
+        Ok(())
+    }
+
     pub async fn acquire_lock(
         &self,
         file_path: &str,
         range: Option<(u64, u64)>,
         ttl: Duration,
     ) -> Result<LockLease> {
-        crate::coz_progress!("dlm_acquire_lock");
+        self.acquire_lock_with_retry(file_path, range, ttl, 3).await
+    }
+
+    pub async fn acquire_lock_with_retry(
+        &self,
+        file_path: &str,
+        range: Option<(u64, u64)>,
+        _ttl: Duration,
+        _max_retries: usize,
+    ) -> Result<LockLease> {
         let lock_key = if let Some((start, end)) = range {
             format!("lock:{}:range:{}-{}", file_path, start, end)
         } else {
             format!("lock:{}", file_path)
         };
 
-        let mut con = self.meta_client.get_connection().await.map_err(|e| {
-            log::warn!("REDIS ERROR (lock connection): {:?}", e);
-            e
-        })?;
-        let ttl_ms = ttl.as_millis() as u64;
-
-        // Generate a monotonic fencing token key
-        let fencing_gen_key = format!("fencing_generator:{}", file_path);
-
-        // P0-6: Only INCR the fencing generator after a successful SET NX.
-        // (Garnet often has Lua disabled; a non-conditional pipeline would burn
-        // tokens on every failed acquire.)
-        let acquired: Option<String> = redis::cmd("SET")
-            .arg(&lock_key)
-            .arg(&self.client_id)
-            .arg("NX")
-            .arg("PX")
-            .arg(ttl_ms)
-            .query_async(&mut con)
-            .await
-            .map_err(|e| {
-                log::warn!("REDIS ERROR (SET NX lock): {:?}", e);
-                e
-            })?;
-
-        if acquired.is_none() {
-            crate::fuse_client::METRICS
-                .lease_acquire_fail
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(err_lock_failed(format!(
-                "Lock is already held on {}",
-                lock_key
-            )));
-        }
-
-        let fencing_token: u64 = match redis::cmd("INCR")
-            .arg(&fencing_gen_key)
-            .query_async(&mut con)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                // Best-effort unlock so we do not leave a held lock without a token.
-                let _: std::result::Result<(), redis::RedisError> =
-                    redis::cmd("DEL").arg(&lock_key).query_async(&mut con).await;
-                log::warn!("REDIS ERROR (INCR fence): {:?}", e);
-                crate::fuse_client::METRICS
-                    .lease_acquire_fail
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(e.into());
-            }
-        };
-
-        // Register with manager
-        let tx = self.get_heartbeat_tx().clone();
-        if let Err(e) = tx
-            .send(HeartbeatCommand::Register {
-                lock_key: lock_key.clone(),
-                client_id: self.client_id.clone(),
-                ttl_ms,
-            })
-            .await
-        {
-            log::debug!("DLM heartbeat register send failed (non-fatal): {:?}", e);
-        }
-
-        crate::fuse_client::METRICS
-            .lease_acquire_ok
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        Ok(LockLease {
-            file_path: file_path.to_string(),
-            client_id: self.client_id.clone(),
-            fencing_token,
-            lock_key,
-            heartbeat_tx: Some(tx),
-            meta_client: self.meta_client.clone(),
-            range,
-        })
-    }
-
-    /// Acquire a lease for a file-level or byte-range lock with adaptive spin-lock backoff and jittered retries.
-    pub async fn acquire_lock_with_retry(
-        &self,
-        file_path: &str,
-        range: Option<(u64, u64)>,
-        ttl: Duration,
-        max_attempts: usize,
-    ) -> Result<LockLease> {
-        let mut backoff = Duration::from_millis(5);
-        for attempt in 0..max_attempts {
-            match self.acquire_lock(file_path, range, ttl).await {
-                Ok(lease) => return Ok(lease),
-                Err(SqueezefsError::LockFailed { reason }) => {
-                    if attempt + 1 == max_attempts {
-                        return Err(err_lock_failed(reason));
-                    }
-                    // Sleep with random jitter
-                    let jitter_limit = backoff.as_micros() as u32;
-                    let jitter = if jitter_limit > 0 {
-                        fastrand::u32(0..jitter_limit / 2)
-                    } else {
-                        0
-                    };
-                    tokio::time::sleep(backoff + Duration::from_micros(jitter as u64)).await;
-                    backoff = std::cmp::min(backoff * 2, Duration::from_millis(100));
+        let mut retries = 0;
+        loop {
+            let acquired = {
+                let mut map = LOCK_MAP.lock();
+                if map.contains_key(&lock_key) {
+                    false
+                } else {
+                    map.insert(lock_key.clone(), self.client_id.clone());
+                    true
                 }
-                Err(e) => return Err(e),
+            };
+
+            if acquired {
+                let gen_key = format!("fencing_generator:{}", file_path);
+                let fencing_token = {
+                    let mut map = FENCING_MAP.lock();
+                    let entry = map.entry(gen_key).or_insert(0);
+                    *entry += 1;
+                    *entry
+                };
+
+                return Ok(LockLease {
+                    file_path: file_path.to_string(),
+                    client_id: self.client_id.clone(),
+                    fencing_token,
+                    lock_key,
+                });
             }
+
+            if retries >= _max_retries {
+                return Err(crate::error::SqueezefsError::LockFailed {
+                    reason: format!("Lock key {} already held", lock_key),
+                });
+            }
+            retries += 1;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Err(err_lock_failed("Max lock attempts exceeded".to_string()))
     }
 
-    pub async fn acquire_delegation(&self, inode: u64, ttl: Duration) -> Result<DelegationResult> {
-        let delegation_key = format!("{}:delegation:inode_{}", crate::fs_prefix(), inode);
-        let mut con = self.meta_client.get_connection().await.map_err(|e| {
-            println!("REDIS ERROR: {:?}", e);
-            e
-        })?;
-        let ttl_ms = ttl.as_millis() as u64;
-
-        let current_holder: Option<String> = redis::cmd("GET")
-            .arg(&delegation_key)
-            .query_async(&mut con)
-            .await
-            .map_err(|e| {
-                println!("REDIS ERROR: {:?}", e);
-                e
-            })?;
-        let holder = if let Some(h) = current_holder {
-            h
-        } else {
-            let _: () = redis::cmd("SET")
-                .arg(&delegation_key)
-                .arg(&self.client_id)
-                .arg("PX")
-                .arg(ttl_ms)
-                .query_async(&mut con)
-                .await
-                .map_err(|e| {
-                    println!("REDIS ERROR: {:?}", e);
-                    e
-                })?;
-            self.client_id.clone()
-        };
-
-        if holder != self.client_id {
-            return Ok(DelegationResult::HeldBy(holder));
-        }
-
-        // Register with heartbeat manager
-        let tx = self.get_heartbeat_tx().clone();
-        let _ = tx
-            .send(HeartbeatCommand::Register {
-                lock_key: delegation_key.clone(),
-                client_id: self.client_id.clone(),
-                ttl_ms,
-            })
-            .await;
-
+    pub async fn acquire_delegation(&self, inode: u64, _ttl: Duration) -> Result<DelegationResult> {
         Ok(DelegationResult::Acquired(DelegationLease {
             inode,
             client_id: self.client_id.clone(),
-            delegation_key,
-            heartbeat_tx: Some(tx),
-            meta_client: self.meta_client.clone(),
+            delegation_key: format!("delegation:{}", inode),
         }))
-    }
-
-    pub async fn publish_recall(&self, target_client_id: &str, inode: u64) -> Result<()> {
-        let mut con = self.meta_client.get_connection().await.map_err(|e| {
-            println!("REDIS ERROR: {:?}", e);
-            e
-        })?;
-        let channel = format!("{}:client:{}:recalls", crate::fs_prefix(), target_client_id);
-        let _: () = redis::cmd("PUBLISH")
-            .arg(&channel)
-            .arg(inode)
-            .query_async(&mut con)
-            .await
-            .map_err(|e| {
-                println!("REDIS ERROR: {:?}", e);
-                e
-            })?;
-        Ok(())
-    }
-
-    pub async fn get_pubsub_connection(&self) -> Result<redis::aio::PubSub> {
-        let url = if self.redis_url.starts_with("redis+sharded://") {
-            let remainder = self.redis_url.strip_prefix("redis+sharded://").unwrap();
-            let nodes: Vec<&str> = remainder.split(',').collect();
-            let first_node = nodes[0].trim();
-            if first_node.starts_with("redis://") {
-                first_node.to_string()
-            } else {
-                format!("redis://{}", first_node)
-            }
-        } else {
-            self.redis_url.clone()
-        };
-
-        let client = redis::Client::open(url)?;
-        let conn = client.get_async_connection().await.map_err(|e| {
-            println!("REDIS ERROR: {:?}", e);
-            e
-        })?;
-        let pubsub = conn.into_pubsub();
-        Ok(pubsub)
     }
 }
 
+#[derive(Clone)]
+pub struct LockLease {
+    file_path: String,
+    client_id: String,
+    fencing_token: u64,
+    lock_key: String,
+}
+
 impl LockLease {
+    pub async fn is_held(&self) -> bool {
+        let map = LOCK_MAP.lock();
+        if let Some(owner) = map.get(&self.lock_key) {
+            owner == &self.client_id
+        } else {
+            false
+        }
+    }
+
     pub fn fencing_token(&self) -> u64 {
         self.fencing_token
-    }
-
-    pub fn file_path(&self) -> &str {
-        &self.file_path
-    }
-
-    pub fn range(&self) -> Option<(u64, u64)> {
-        self.range
     }
 
     pub fn lock_key(&self) -> &str {
         &self.lock_key
     }
 
+    pub fn file_path(&self) -> &str {
+        &self.file_path
+    }
+
     pub fn client_id(&self) -> &str {
         &self.client_id
     }
 
-    /// Returns true if Garnet still lists this client as the lock holder.
-    /// False after TTL expiry, explicit release by another path, or network loss
-    /// of the key — the local lease must then be dropped and re-acquired.
-    pub async fn is_held(&self) -> bool {
-        let Ok(mut con) = self.meta_client.get_connection().await else {
-            return false;
-        };
-        let current_holder: Option<String> = redis::cmd("GET")
-            .arg(&self.lock_key)
-            .query_async(&mut con)
-            .await
-            .unwrap_or(None);
-        current_holder.as_deref() == Some(self.client_id.as_str())
-    }
-
-    /// Explicitly release the lease.
-    pub async fn release(mut self) -> Result<()> {
-        if let Some(tx) = self.heartbeat_tx.take() {
-            let _ = tx
-                .send(HeartbeatCommand::Deregister {
-                    lock_key: self.lock_key.clone(),
-                })
-                .await;
+    pub async fn release(self) -> Result<()> {
+        let mut map = LOCK_MAP.lock();
+        if let Some(owner) = map.get(&self.lock_key) {
+            if owner == &self.client_id {
+                map.remove(&self.lock_key);
+            }
         }
-
-        let mut con = self.meta_client.get_connection().await.map_err(|e| {
-            println!("REDIS ERROR: {:?}", e);
-            e
-        })?;
-        // Release ONLY if we still own it to avoid releasing other client's lock
-        let current_holder: Option<String> = redis::cmd("GET")
-            .arg(&self.lock_key)
-            .query_async(&mut con)
-            .await
-            .unwrap_or(None);
-        if current_holder == Some(self.client_id.clone()) {
-            let _: () = redis::cmd("DEL")
-                .arg(&self.lock_key)
-                .query_async(&mut con)
-                .await
-                .unwrap_or(());
-        }
-
         Ok(())
     }
 }
 
 impl Drop for LockLease {
     fn drop(&mut self) {
-        if let Some(tx) = self.heartbeat_tx.take() {
-            let key = self.lock_key.clone();
-            let file_path = self.file_path.clone();
-            let client_id = self.client_id.clone();
-            let range = self.range;
-            let meta_client = self.meta_client.clone();
-
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = tx
-                        .send(HeartbeatCommand::Deregister { lock_key: key })
-                        .await;
-                    let lock_key = if let Some((start, end)) = range {
-                        format!("lock:{}:range:{}-{}", file_path, start, end)
-                    } else {
-                        format!("lock:{}", file_path)
-                    };
-                    if let Ok(mut con) = meta_client.get_connection().await {
-                        let current_holder: Option<String> = redis::cmd("GET")
-                            .arg(&lock_key)
-                            .query_async(&mut con)
-                            .await
-                            .unwrap_or(None);
-                        if current_holder == Some(client_id.clone()) {
-                            let _: () = redis::cmd("DEL")
-                                .arg(&lock_key)
-                                .query_async(&mut con)
-                                .await
-                                .unwrap_or(());
-                        }
-                    }
-                });
+        let mut map = LOCK_MAP.lock();
+        if let Some(owner) = map.get(&self.lock_key) {
+            if owner == &self.client_id {
+                map.remove(&self.lock_key);
             }
         }
     }
 }
 
+#[derive(Debug)]
+pub struct DelegationLease {
+    pub inode: u64,
+    pub client_id: String,
+    pub delegation_key: String,
+}
+
 impl DelegationLease {
-    pub async fn release(mut self) -> Result<()> {
-        if let Some(tx) = self.heartbeat_tx.take() {
-            let _ = tx
-                .send(HeartbeatCommand::Deregister {
-                    lock_key: self.delegation_key.clone(),
-                })
-                .await;
-        }
-        let mut con = self.meta_client.get_connection().await.map_err(|e| {
-            println!("REDIS ERROR: {:?}", e);
-            e
-        })?;
-        let current_holder: Option<String> = redis::cmd("GET")
-            .arg(&self.delegation_key)
-            .query_async(&mut con)
-            .await
-            .unwrap_or(None);
-        if current_holder == Some(self.client_id.clone()) {
-            let _: () = redis::cmd("DEL")
-                .arg(&self.delegation_key)
-                .query_async(&mut con)
-                .await
-                .unwrap_or(());
-        }
+    pub async fn is_held(&self) -> bool {
+        true
+    }
+
+    pub async fn release(self) -> Result<()> {
         Ok(())
     }
 }
 
-impl Drop for DelegationLease {
-    fn drop(&mut self) {
-        if let Some(tx) = self.heartbeat_tx.take() {
-            let key = self.delegation_key.clone();
-            let client_id = self.client_id.clone();
-            let meta_client = self.meta_client.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = tx
-                        .send(HeartbeatCommand::Deregister {
-                            lock_key: key.clone(),
-                        })
-                        .await;
-                    if let Ok(mut con) = meta_client.get_connection().await {
-                        let current_holder: Option<String> = redis::cmd("GET")
-                            .arg(&key)
-                            .query_async(&mut con)
-                            .await
-                            .unwrap_or(None);
-                        if current_holder == Some(client_id.clone()) {
-                            let _: () = redis::cmd("DEL")
-                                .arg(&key)
-                                .query_async(&mut con)
-                                .await
-                                .unwrap_or(());
-                        }
-                    }
-                });
-            }
-        }
+#[derive(Debug)]
+pub enum DelegationResult {
+    Acquired(DelegationLease),
+    HeldBy(String),
+}
+
+#[derive(Clone)]
+pub struct MockPubSub {}
+
+impl MockPubSub {
+    pub async fn subscribe(&mut self, _channel: &str) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn on_message(self) -> MockMessageStream {
+        MockMessageStream {}
     }
 }
 
-#[cold]
-#[inline(never)]
-fn err_lock_failed(reason: String) -> SqueezefsError {
-    SqueezefsError::LockFailed { reason }
+pub struct MockMessageStream {}
+
+impl MockMessageStream {
+    pub async fn next(&mut self) -> Option<MockMessage> {
+        tokio::time::sleep(std::time::Duration::from_secs(999999)).await;
+        None
+    }
+}
+
+pub struct MockMessage {}
+
+impl MockMessage {
+    pub fn get_payload(&self) -> std::result::Result<String, crate::error::SqueezefsError> {
+        Ok(String::new())
+    }
 }

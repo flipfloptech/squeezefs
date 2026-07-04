@@ -1018,11 +1018,22 @@ fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
         return;
     }
     ent.header.in_out[..OUT_HDR].copy_from_slice(&header[..OUT_HDR]);
-    let n = body.len().min(ent.payload.len());
-    if n > 0 && body.as_ptr() != ent.payload.as_ptr() {
-        ent.payload[..n].copy_from_slice(&body[..n]);
+
+    let mut payload_len = 0;
+    if header.len() > OUT_HDR {
+        let extra = &header[OUT_HDR..];
+        let n = extra.len().min(ent.payload.len());
+        ent.payload[..n].copy_from_slice(&extra[..n]);
+        payload_len = n;
     }
-    ent.header.ring_ent_in_out.payload_sz = n as u32;
+
+    let body_len = body.len().min(ent.payload.len() - payload_len);
+    if body_len > 0 && body.as_ptr() != unsafe { ent.payload.as_ptr().add(payload_len) } {
+        ent.payload[payload_len..payload_len + body_len].copy_from_slice(&body[..body_len]);
+    }
+    payload_len += body_len;
+
+    ent.header.ring_ent_in_out.payload_sz = payload_len as u32;
 }
 
 fn push_cmd(

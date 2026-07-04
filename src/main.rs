@@ -199,7 +199,7 @@ enum Commands {
         no_writeback: bool,
 
         /// Allow other users to access the mount
-        #[arg(long)]
+        #[arg(long, alias = "allow-others")]
         allow_other: bool,
 
         /// Validate backend storage connectivity on startup
@@ -1084,6 +1084,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }));
 
                 libc::setsid();
+                // Change working directory to root / to prevent holding parent directory active
+                let _ = std::env::set_current_dir("/");
                 // Redirect stdin to /dev/null
                 if let Ok(null_file) = std::fs::File::open("/dev/null") {
                     use std::os::unix::io::AsRawFd;

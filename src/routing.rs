@@ -735,6 +735,18 @@ impl DataRouter {
             },
         }
 
+        // Fast path check: if metadata cache has type = striped, bypass HMGET and write directly
+        if let Some(m) = self.metadata_cache.get(file_path) {
+            if m.file_type == "striped" {
+                self.write_striped(file_path, &meta_key, offset, data, fencing_token)
+                    .await?;
+                crate::fuse_client::METRICS
+                    .layout_striped_writes
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+
         // --- Meta prep: fencing, type, and cheap existing-data fetch ---
         // P2-5: single HMGET for fence + type + file_id (one RTT instead of 2–3).
         let (file_type, mut existing_data, staged_backend) = {
@@ -1301,8 +1313,52 @@ impl DataRouter {
             return Ok(());
         }
 
+        let cached_meta = self.metadata_cache.get(file_path);
+        let mut cache_hit = false;
+        let mut cached_block_map_id = String::new();
+        let mut cached_num_blocks = 0u32;
+        let mut cached_existing_size = 0u64;
+        let mut cached_old_block_keys: Vec<Option<String>> = Vec::new();
+
+        if let Some(m) = cached_meta {
+            if m.file_type == "striped" {
+                if let Some(ref map_id) = m.block_map_id {
+                    let mut all_blocks_cached = true;
+                    let mut old_keys = Vec::new();
+                    for b in start_block..=end_block {
+                        if let Some(entry) = self.block_map_cache.get(&(map_id.clone(), b)) {
+                            let (bk, cached_at) = &entry;
+                            if cached_at.elapsed() < Duration::from_secs(5) {
+                                old_keys.push(bk.clone());
+                            } else {
+                                all_blocks_cached = false;
+                                break;
+                            }
+                        } else {
+                            all_blocks_cached = false;
+                            break;
+                        }
+                    }
+                    if all_blocks_cached {
+                        cache_hit = true;
+                        cached_block_map_id = map_id.clone();
+                        cached_existing_size = m.size;
+                        cached_num_blocks = m.size.div_ceil(block_size) as u32;
+                        cached_old_block_keys = old_keys;
+                    }
+                }
+            }
+        }
+
         // --- Meta prep (short-lived connection) ---
-        let (block_map_id, num_blocks, existing_size, old_block_keys) = {
+        let (block_map_id, num_blocks, existing_size, old_block_keys) = if cache_hit {
+            (
+                cached_block_map_id,
+                cached_num_blocks,
+                cached_existing_size,
+                cached_old_block_keys,
+            )
+        } else {
             let mut con = self.dlm.get_connection_for_inode(ino).await?;
             let (block_map_id_opt, num_blocks_opt, size_opt): (
                 Option<String>,
@@ -1541,13 +1597,16 @@ impl DataRouter {
 
         // 4. Atomically update block map + file size/fence (P0-6). Fresh meta con
         // only for redis work; backend free runs after the connection is released.
-        let mut old_keys_to_clean = Vec::new();
-        let mut keys_to_free = Vec::new();
+        let mut old_keys_to_clean: Vec<String> = Vec::new();
+        let mut keys_to_free: Vec<String> = Vec::new();
+        let new_num_blocks = std::cmp::max(num_blocks, end_block + 1);
+        let new_size = std::cmp::max(existing_size, end_pos);
         {
             let mut con = self.dlm.get_connection_for_inode(ino).await?;
             let mut pipe_update = atomic_meta_pipe();
-            for res in results {
-                let (b, old_block_key, new_block_key, logical_size, physical_size) = res;
+            for res in &results {
+                let (b, old_block_key, new_block_key, logical_size, physical_size) =
+                    (res.0, res.1.clone(), res.2.clone(), res.3, res.4);
                 pipe_update
                     .hset(refcounts_key, &new_block_key, 1)
                     .hset(&block_map_key, b.to_string(), &new_block_key)
@@ -1562,8 +1621,6 @@ impl DataRouter {
                 }
             }
 
-            let new_num_blocks = std::cmp::max(num_blocks, end_block + 1);
-            let new_size = std::cmp::max(existing_size, end_pos);
             pipe_update
                 .hset(meta_key, "size", new_size)
                 .hset(meta_key, "num_blocks", new_num_blocks)
@@ -1621,9 +1678,25 @@ impl DataRouter {
             self.cache.read_lru.remove(file_path);
         }
 
-        self.metadata_cache.invalidate(file_path);
-        for b in start_block..=end_block {
-            self.block_map_cache.invalidate(&(block_map_id.clone(), b));
+        self.metadata_cache.insert(
+            file_path.to_string(),
+            CachedMetadata {
+                file_type: "striped".to_string(),
+                size: new_size,
+                block_map_id: Some(block_map_id.clone()),
+                block_prefix: None,
+                file_id: None,
+                cached_at: std::time::Instant::now(),
+                data_key: None,
+            },
+        );
+
+        for res in results {
+            let (b, _, new_block_key, _, _) = res;
+            self.block_map_cache.insert(
+                (block_map_id.clone(), b),
+                (Some(new_block_key), std::time::Instant::now()),
+            );
         }
 
         Ok(())

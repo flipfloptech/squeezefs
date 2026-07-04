@@ -18,7 +18,7 @@ pub use connection::fuse_over_uring::{over_uring_sessions_active, over_uring_sta
 pub(crate) type FuseData = Either<Vec<u8>, (Vec<u8>, Bytes, Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>)>;
 
 pub(crate) mod abi;
-mod connection;
+pub mod connection;
 mod filesystem;
 pub mod flags;
 pub mod reply;

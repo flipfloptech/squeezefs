@@ -549,6 +549,8 @@ pub struct SqueezefsFilesystem {
     pub latest_stats_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
     pub latest_config_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
     pub inodes_limit: std::sync::Arc<std::sync::OnceLock<u64>>,
+    pub session_connection:
+        arc_swap::ArcSwap<Option<std::sync::Arc<fuse3::raw::connection::FuseConnection>>>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -579,6 +581,7 @@ impl Clone for SqueezefsFilesystem {
             latest_stats_json: arc_swap::ArcSwap::new(self.latest_stats_json.load_full()),
             latest_config_json: arc_swap::ArcSwap::new(self.latest_config_json.load_full()),
             inodes_limit: self.inodes_limit.clone(),
+            session_connection: arc_swap::ArcSwap::new(self.session_connection.load_full()),
         }
     }
 }
@@ -637,6 +640,7 @@ impl SqueezefsFilesystem {
             latest_stats_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
             latest_config_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
             inodes_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
+            session_connection: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
         }
     }
 
@@ -2739,10 +2743,17 @@ impl Filesystem for SqueezefsFilesystem {
 
         let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
 
+        let conn_guard = self.session_connection.load();
+        let dest_addr = conn_guard
+            .as_ref()
+            .as_ref()
+            .and_then(|conn| conn.get_payload_buffer(_req.unique))
+            .map(|(ptr, _sz)| ptr);
+
         // 1. Try to read from committed/cached storage zero-copy
         let read_future =
             self.router
-                .read_file_range_zero_copy(&file_path, offset, read_len as u32);
+                .read_file_range_zero_copy(&file_path, offset, read_len as u32, dest_addr);
         let read_timeout = std::cmp::max(get_fuse_timeout(), Duration::from_secs(30));
         let (data, backing) = match tokio::time::timeout(read_timeout, read_future).await {
             Ok(Ok(res)) => res,
@@ -5886,6 +5897,10 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     #[cfg(not(target_os = "linux"))]
     let mut handle = session.mount(fs.clone(), mount_path.clone()).await?;
+
+    if let Some(conn) = handle.connection() {
+        fs.session_connection.store(std::sync::Arc::new(Some(conn)));
+    }
 
     println!("\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}", mount_path);
 

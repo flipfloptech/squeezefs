@@ -98,7 +98,8 @@ pub struct InboundUringReq {
 struct CommitMsg {
     ent_idx: u16,
     commit_id: u64,
-    reply: Bytes,
+    header: Vec<u8>,
+    reply_body: Bytes,
 }
 
 struct QueueHandle {
@@ -109,6 +110,7 @@ struct QueueHandle {
     wake_fd: RawFd,
     /// Keep OwnedFd alive.
     _wake: OwnedFd,
+    payload_buffers: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 }
 
 /// Shared work queue for all session workers (primary + multi-queue clones).
@@ -173,6 +175,7 @@ pub struct FuseOverUring {
     queues: Vec<QueueHandle>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     fuse_fd: RawFd,
+    payload_sz: usize,
     // metrics
     pub stats_requests: AtomicU64,
     pub stats_replies: AtomicU64,
@@ -294,10 +297,12 @@ impl FuseOverUring {
             let wake = unsafe { OwnedFd::from_raw_fd(efd) };
             let wake_fd = wake.as_raw_fd();
             wake_fds.push(wake_fd);
+            let payload_buffers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             queue_handles.push(QueueHandle {
                 commit_tx,
                 wake_fd,
                 _wake: wake,
+                payload_buffers,
             });
             commit_rxs.push(commit_rx);
         }
@@ -315,6 +320,7 @@ impl FuseOverUring {
             queues: queue_handles,
             workers: Mutex::new(Vec::new()),
             fuse_fd,
+            payload_sz,
             stats_requests: AtomicU64::new(0),
             stats_replies: AtomicU64::new(0),
             stats_cqe_err: AtomicU64::new(0),
@@ -505,7 +511,7 @@ impl FuseOverUring {
         self.inbound.pop_timeout(&self.active, timeout)
     }
 
-    pub fn submit_reply(&self, unique: u64, reply: Bytes) -> io::Result<()> {
+    pub fn submit_reply(&self, unique: u64, header: Vec<u8>, reply_body: Bytes) -> io::Result<()> {
         let (qid, ent_idx, commit_id) = self
             .pending
             .lock()
@@ -525,7 +531,8 @@ impl FuseOverUring {
             .send(CommitMsg {
                 ent_idx,
                 commit_id,
-                reply,
+                header,
+                reply_body,
             })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring commit closed"))?;
         // Wake queue thread
@@ -534,6 +541,17 @@ impl FuseOverUring {
         self.stats_replies.fetch_add(1, Ordering::Relaxed);
         STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
+        let (qid, ent_idx, _) = {
+            let pending_guard = self.pending.lock().unwrap();
+            pending_guard.get(&unique).cloned()?
+        };
+        let q = self.queues.get(qid as usize)?;
+        let buffers = q.payload_buffers.lock().unwrap();
+        let ptr = buffers.get(ent_idx as usize).cloned()?;
+        Some((ptr as u64, self.payload_sz))
     }
 
     /// True once workers are live (may still be registering). Prefer [`is_ready`] for the
@@ -691,6 +709,11 @@ fn queue_worker(
         };
     }
 
+    {
+        let mut buffers = pool.queues[qid as usize].payload_buffers.lock().unwrap();
+        *buffers = ents.iter_mut().map(|ent| ent.payload.as_mut_ptr() as usize).collect();
+    }
+
     for (idx, ent) in ents.iter().enumerate() {
         push_cmd(
             &mut ring,
@@ -722,7 +745,7 @@ fn queue_worker(
         // Drain commits for this queue only (no demux)
         while let Ok(msg) = commit_rx.try_recv() {
             let ent = &mut ents[msg.ent_idx as usize];
-            apply_reply(ent, &msg.reply);
+            apply_reply(ent, &msg.header, &msg.reply_body);
             push_cmd(
                 &mut ring,
                 FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
@@ -847,7 +870,7 @@ fn queue_worker(
                     out[0..4].copy_from_slice(&16u32.to_le_bytes());
                     out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
                     out[8..16].copy_from_slice(&cid.to_le_bytes());
-                    apply_reply(&mut ents[ent_idx], &Bytes::copy_from_slice(&out));
+                    apply_reply(&mut ents[ent_idx], &out, &Bytes::new());
                     let _ = push_cmd(
                         &mut ring,
                         FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
@@ -899,7 +922,7 @@ fn queue_worker(
                 out[0..4].copy_from_slice(&16u32.to_le_bytes());
                 // error = 0
                 out[8..16].copy_from_slice(&unique.to_le_bytes());
-                apply_reply(&mut ents[ent_idx], &Bytes::copy_from_slice(&out));
+                apply_reply(&mut ents[ent_idx], &out, &Bytes::new());
                 push_cmd(
                     &mut ring,
                     FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
@@ -963,7 +986,7 @@ fn queue_worker(
     let mut final_commits = 0;
     while let Ok(msg) = commit_rx.try_recv() {
         let ent = &mut ents[msg.ent_idx as usize];
-        apply_reply(ent, &msg.reply);
+        apply_reply(ent, &msg.header, &msg.reply_body);
         let _ = push_cmd(
             &mut ring,
             FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
@@ -983,21 +1006,20 @@ fn queue_worker(
 
 /// Place a classical fuse reply (`fuse_out_header` || body) into the ring entry
 /// the way libfuse/`send_reply_uring` does: header in `in_out`, body in payload.
-fn apply_reply(ent: &mut Ent, reply: &Bytes) {
+fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
     const OUT_HDR: usize = 16; // sizeof(fuse_out_header)
     // Clear header region so stale request bytes cannot leak into the reply.
     ent.header.in_out = [0; FUSE_URING_IN_OUT_HEADER_SZ];
-    if reply.len() < OUT_HDR {
+    if header.len() < OUT_HDR {
         // Degenerate — treat as IO error header.
         ent.header.in_out[..4].copy_from_slice(&((OUT_HDR as u32).to_le_bytes()));
         ent.header.in_out[4..8].copy_from_slice(&((-libc::EIO as i32).to_le_bytes()));
         ent.header.ring_ent_in_out.payload_sz = 0;
         return;
     }
-    ent.header.in_out[..OUT_HDR].copy_from_slice(&reply[..OUT_HDR]);
-    let body = &reply[OUT_HDR..];
+    ent.header.in_out[..OUT_HDR].copy_from_slice(&header[..OUT_HDR]);
     let n = body.len().min(ent.payload.len());
-    if n > 0 {
+    if n > 0 && body.as_ptr() != ent.payload.as_ptr() {
         ent.payload[..n].copy_from_slice(&body[..n]);
     }
     ent.header.ring_ent_in_out.payload_sz = n as u32;

@@ -187,6 +187,15 @@ impl BackendRouter {
     }
 
     pub async fn read_block(&self, block_key: &str, size: usize) -> Result<bytes::Bytes> {
+        self.read_block_with_dest(block_key, size, None).await
+    }
+
+    pub async fn read_block_with_dest(
+        &self,
+        block_key: &str,
+        size: usize,
+        dest_addr: Option<u64>,
+    ) -> Result<bytes::Bytes> {
         let parts: Vec<&str> = block_key.split("://").collect();
         let (be_id, offset_str) = if parts.len() > 1 {
             (parts[0], parts[1])
@@ -199,9 +208,13 @@ impl BackendRouter {
             .map_err(|_| err_invalid_offset())?;
 
         if be_id == "backend_0" {
-            self.default_device.read_block(offset, size).await
+            self.default_device
+                .read_block_with_dest(offset, size, dest_addr)
+                .await
         } else if let Some(be) = self.backends.get(be_id) {
-            be.device.read_block(offset, size).await
+            be.device
+                .read_block_with_dest(offset, size, dest_addr)
+                .await
         } else {
             Err(err_backend_not_found(be_id))
         }
@@ -426,7 +439,11 @@ impl DataRouter {
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     ) -> Self {
-        let block_size = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4 * 1024 * 1024));
+        let default_block_size = std::env::var("SQUEEZEFS_DEFAULT_BLOCK_SIZE")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(4 * 1024 * 1024);
+        let block_size = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(default_block_size));
         let backend_router = std::sync::Arc::new(BackendRouter::new(
             block_allocator.clone(),
             nvme_writer.clone(),
@@ -918,7 +935,7 @@ impl DataRouter {
 
         // --- Meta prep: fencing, type, and cheap existing-data fetch ---
         // P2-5: single HMGET for fence + type + file_id (one RTT instead of 2–3).
-        let (file_type, mut existing_data, staged_backend) = {
+        let (file_type, mut existing_data, staged_backend, file_id_opt) = {
             let mut con = self.dlm.get_connection_for_inode(ino).await?;
 
             let (current_fencing, file_type, file_id_opt): (
@@ -964,11 +981,11 @@ impl DataRouter {
                     }
                 }
                 Some("staged") => {
-                    if let Some(file_id) = file_id_opt {
-                        if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
+                    if let Some(ref file_id) = file_id_opt {
+                        if let Some(staged_data) = self.cache.nvme.read_staged(file_id) {
                             staged_data
                         } else {
-                            let mapping_key = crate::keys::mapping(&file_id);
+                            let mapping_key = crate::keys::mapping(file_id);
                             let (block_key, off_val, sz_val): (
                                 Option<String>,
                                 Option<u64>,
@@ -996,7 +1013,7 @@ impl DataRouter {
                 }
                 _ => Vec::new(),
             };
-            (file_type, existing_data, staged_backend)
+            (file_type, existing_data, staged_backend, file_id_opt)
         }; // meta con dropped before any backend read
 
         if let StagedBackendRead::Mapping { block_key, off, sz } = staged_backend {
@@ -1019,7 +1036,7 @@ impl DataRouter {
         let stripe_threshold = if self.cache.nvme.staging_dirs().is_empty() {
             4 * 1024
         } else {
-            4 * 1024 * 1024
+            self.block_size.load(Ordering::Acquire) as usize
         };
 
         if end_offset > stripe_threshold && file_type.as_deref() != Some("striped") {
@@ -1045,6 +1062,7 @@ impl DataRouter {
                     fencing_token,
                     &block_mappings,
                     &sizes_to_register,
+                    file_id_opt.clone(),
                     &mut con,
                 )
                 .await?;
@@ -1067,6 +1085,7 @@ impl DataRouter {
                     fencing_token,
                     &block_mappings,
                     &sizes_to_register,
+                    file_id_opt.clone(),
                     &mut con,
                 )
                 .await?;
@@ -1095,8 +1114,8 @@ impl DataRouter {
             let processed_data = self.get_crypto().process_write(shared_data.clone())?;
 
             let mut con = self.dlm.get_connection_for_inode(ino).await?;
-            let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
-                con.hget(&meta_key, "file_id").await?
+            let old_file_id = if file_type.as_deref() == Some("staged") {
+                file_id_opt.clone()
             } else {
                 None
             };
@@ -1135,16 +1154,17 @@ impl DataRouter {
 
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
-        } else if !self.cache.nvme.staging_dirs().is_empty() && new_size <= 4 * 1024 * 1024 {
+        } else if !self.cache.nvme.staging_dirs().is_empty()
+            && (new_size as u64) <= self.block_size.load(Ordering::Acquire)
+        {
             // Layout: staged — capture old id, drop con, stage (or backend write), re-acquire for meta.
             crate::fuse_client::METRICS
                 .layout_staged_writes
                 .fetch_add(1, Ordering::Relaxed);
             let new_file_id = Uuid::new_v4().to_string();
 
-            let old_file_id: Option<String> = if file_type.as_deref() == Some("staged") {
-                let mut con = self.dlm.get_connection_for_inode(ino).await?;
-                con.hget(&meta_key, "file_id").await?
+            let old_file_id = if file_type.as_deref() == Some("staged") {
+                file_id_opt.clone()
             } else {
                 None
             };
@@ -1281,6 +1301,7 @@ impl DataRouter {
                 fencing_token,
                 &block_mappings,
                 &sizes_to_register,
+                file_id_opt.clone(),
                 &mut con,
             )
             .await?;
@@ -1396,19 +1417,13 @@ impl DataRouter {
         fencing_token: u64,
         block_mappings: &[(String, String)],
         sizes_to_register: &[(String, usize, usize)],
+        old_file_id: Option<String>,
         con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
         let block_map_key = crate::keys::block_map(&block_map_id);
         let refcounts_key_str = crate::fs_key!("block_refcounts");
         let refcounts_key = &refcounts_key_str;
         let block_sizes_key = crate::fs_key!("block_sizes");
-
-        // Reads must happen outside MULTI (WATCHed differently); capture staged id first.
-        let old_file_id: Option<String> = if file_type == Some("staged") {
-            con.hget(meta_key, "file_id").await?
-        } else {
-            None
-        };
 
         let mut pipe = atomic_meta_pipe();
         for (idx_str, key) in block_mappings {
@@ -2351,6 +2366,7 @@ impl DataRouter {
         file_path: &str,
         offset: u64,
         size: u32,
+        dest_addr: Option<u64>,
     ) -> Result<(
         bytes::Bytes,
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
@@ -2364,10 +2380,19 @@ impl DataRouter {
             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
             let start = std::cmp::min(offset as usize, cached_data.len());
             let end = std::cmp::min((offset + size as u64) as usize, cached_data.len());
-            // SAFETY: start and end are clamped to cached_data.len()
-            let data = unsafe {
-                let sub = cached_data.get_unchecked(start..end);
-                cached_data.slice_ref(sub)
+            let len = end - start;
+            let data = if let Some(dest) = dest_addr {
+                let dest_ptr = dest as *mut u8;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(cached_data[start..end].as_ptr(), dest_ptr, len);
+                    bytes::Bytes::from_static(std::slice::from_raw_parts(dest_ptr, len))
+                }
+            } else {
+                // SAFETY: start and end are clamped to cached_data.len()
+                unsafe {
+                    let sub = cached_data.get_unchecked(start..end);
+                    cached_data.slice_ref(sub)
+                }
             };
             return Ok((data, None));
         }
@@ -2398,11 +2423,36 @@ impl DataRouter {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     let start = std::cmp::min(offset as usize, guard.len);
                     let end = std::cmp::min((offset + size as u64) as usize, guard.len);
-                    let mut sliced_guard = guard;
-                    sliced_guard.offset += start;
-                    sliced_guard.len = end - start;
-                    let data = bytes::Bytes::copy_from_slice(&sliced_guard);
-                    Ok((data, Some(std::sync::Arc::new(sliced_guard))))
+                    let len = end - start;
+                    let (data, backing) = if let Some(dest) = dest_addr {
+                        let dest_ptr = dest as *mut u8;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                guard[start..end].as_ptr(),
+                                dest_ptr,
+                                len,
+                            );
+                            let d = bytes::Bytes::from_static(std::slice::from_raw_parts(
+                                dest_ptr, len,
+                            ));
+                            (
+                                d,
+                                Some(std::sync::Arc::new(guard)
+                                    as std::sync::Arc<dyn std::any::Any + Send + Sync>),
+                            )
+                        }
+                    } else {
+                        let mut sliced_guard = guard;
+                        sliced_guard.offset += start;
+                        sliced_guard.len = len;
+                        let d = bytes::Bytes::copy_from_slice(&sliced_guard);
+                        (
+                            d,
+                            Some(std::sync::Arc::new(sliced_guard)
+                                as std::sync::Arc<dyn std::any::Any + Send + Sync>),
+                        )
+                    };
+                    Ok((data, backing))
                 } else {
                     let mapping_key = crate::keys::mapping(&file_id);
                     let mut con = self
@@ -2476,11 +2526,36 @@ impl DataRouter {
                         let start = std::cmp::min(slice_start as usize, guard.len);
                         let end =
                             std::cmp::min((slice_start + slice_len as u64) as usize, guard.len);
-                        let mut sliced_guard = guard;
-                        sliced_guard.offset += start;
-                        sliced_guard.len = end - start;
-                        let data = bytes::Bytes::copy_from_slice(&sliced_guard);
-                        return Ok((data, Some(std::sync::Arc::new(sliced_guard))));
+                        let len = end - start;
+                        let (data, backing) = if let Some(dest) = dest_addr {
+                            let dest_ptr = dest as *mut u8;
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    guard[start..end].as_ptr(),
+                                    dest_ptr,
+                                    len,
+                                );
+                                let d = bytes::Bytes::from_static(std::slice::from_raw_parts(
+                                    dest_ptr, len,
+                                ));
+                                (
+                                    d,
+                                    Some(std::sync::Arc::new(guard)
+                                        as std::sync::Arc<dyn std::any::Any + Send + Sync>),
+                                )
+                            }
+                        } else {
+                            let mut sliced_guard = guard;
+                            sliced_guard.offset += start;
+                            sliced_guard.len = len;
+                            let d = bytes::Bytes::copy_from_slice(&sliced_guard);
+                            (
+                                d,
+                                Some(std::sync::Arc::new(sliced_guard)
+                                    as std::sync::Arc<dyn std::any::Any + Send + Sync>),
+                            )
+                        };
+                        return Ok((data, backing));
                     }
 
                     // Check NVMe read block cache next
@@ -2497,11 +2572,44 @@ impl DataRouter {
                                 )
                             {
                                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                let data = bytes::Bytes::copy_from_slice(&guard);
+                                let len = guard.len();
+                                let data = if let Some(dest) = dest_addr {
+                                    let dest_ptr = dest as *mut u8;
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            guard.as_ptr(),
+                                            dest_ptr,
+                                            len,
+                                        );
+                                        bytes::Bytes::from_static(std::slice::from_raw_parts(
+                                            dest_ptr, len,
+                                        ))
+                                    }
+                                } else {
+                                    bytes::Bytes::copy_from_slice(&guard)
+                                };
                                 return Ok((data, Some(std::sync::Arc::new(guard))));
                             } else {
                                 // Single block cache miss: download directly in-line (zero-copy, no spawn)
-                                let downloaded = self.get_cached_or_fetch_block(b_key).await?;
+                                let downloaded = if let Some(dest) = dest_addr {
+                                    self.backend_router
+                                        .read_block_with_dest(
+                                            b_key,
+                                            block_size as usize,
+                                            Some(dest),
+                                        )
+                                        .await?;
+                                    let len = block_size as usize;
+                                    let dest_ptr = dest as *mut u8;
+                                    let b = unsafe {
+                                        bytes::Bytes::from_static(std::slice::from_raw_parts(
+                                            dest_ptr, len,
+                                        ))
+                                    };
+                                    crate::cache::pool::ReadBlockValue::Bytes(b)
+                                } else {
+                                    self.get_cached_or_fetch_block(b_key).await?
+                                };
                                 let start = std::cmp::min(slice_start as usize, downloaded.len());
                                 let end = std::cmp::min(
                                     (slice_start + slice_len as u64) as usize,
@@ -2519,16 +2627,36 @@ impl DataRouter {
                                         block_size,
                                     );
                                 }
-                                let slice: &[u8] = &downloaded[start..end];
-                                let data = bytes::Bytes::copy_from_slice(slice);
+                                let data = if let Some(dest) = dest_addr {
+                                    unsafe {
+                                        bytes::Bytes::from_static(std::slice::from_raw_parts(
+                                            dest as *mut u8,
+                                            end - start,
+                                        ))
+                                    }
+                                } else {
+                                    let slice: &[u8] = &downloaded[start..end];
+                                    bytes::Bytes::copy_from_slice(slice)
+                                };
                                 return Ok((data, Some(std::sync::Arc::new(downloaded))));
                             }
                         } else {
                             // Hole support: return zero-filled slice
-                            let mut hole_pooled = BUFFER_POOL.alloc();
-                            hole_pooled.resize(slice_len as usize, 0);
-                            let data = bytes::Bytes::copy_from_slice(&hole_pooled);
-                            return Ok((data, Some(std::sync::Arc::new(hole_pooled))));
+                            let len = slice_len as usize;
+                            let data = if let Some(dest) = dest_addr {
+                                let dest_ptr = dest as *mut u8;
+                                unsafe {
+                                    std::ptr::write_bytes(dest_ptr, 0, len);
+                                    bytes::Bytes::from_static(std::slice::from_raw_parts(
+                                        dest_ptr, len,
+                                    ))
+                                }
+                            } else {
+                                let mut hole_pooled = BUFFER_POOL.alloc();
+                                hole_pooled.resize(len, 0);
+                                bytes::Bytes::copy_from_slice(&hole_pooled)
+                            };
+                            return Ok((data, None));
                         }
                     }
                 }
@@ -2538,10 +2666,15 @@ impl DataRouter {
                     .load_striped_block_keys(file_path, &meta, start_block, end_block)
                     .await?;
 
-                let mut final_buf = BUFFER_POOL.alloc();
                 let final_len = (end_offset - offset) as usize;
-                final_buf.resize(final_len, 0);
-                let raw_ptr = final_buf.as_mut_ptr() as usize;
+                let (raw_ptr, final_buf_opt) = if let Some(dest) = dest_addr {
+                    (dest as usize, None)
+                } else {
+                    let mut final_buf = BUFFER_POOL.alloc();
+                    final_buf.resize(final_len, 0);
+                    let ptr = final_buf.as_mut_ptr() as usize;
+                    (ptr, Some(final_buf))
+                };
 
                 // Spawn concurrent tasks to download block data in parallel
                 let mut futures = Vec::new();
@@ -2641,8 +2774,18 @@ impl DataRouter {
                     );
                 }
 
-                let data = bytes::Bytes::copy_from_slice(&final_buf[..final_len]);
-                Ok((data, Some(std::sync::Arc::new(final_buf))))
+                if let Some(final_buf) = final_buf_opt {
+                    let data = bytes::Bytes::copy_from_slice(&final_buf[..final_len]);
+                    Ok((data, Some(std::sync::Arc::new(final_buf))))
+                } else {
+                    let data = unsafe {
+                        bytes::Bytes::from_static(std::slice::from_raw_parts(
+                            dest_addr.unwrap() as *mut u8,
+                            final_len,
+                        ))
+                    };
+                    Ok((data, None))
+                }
             }
             _ => Err(SqueezefsError::InvalidOperation(format!(
                 "Unknown file type: {}",

@@ -652,7 +652,24 @@ impl NvmeBlockDev {
     }
 
     pub async fn read_block(&self, offset: u64, size: usize) -> Result<bytes::Bytes> {
-        let (buf_ptr, bytes) = crate::cache::pool::ALIGNED_BUF_POOL.alloc();
+        self.read_block_with_dest(offset, size, None).await
+    }
+
+    pub async fn read_block_with_dest(
+        &self,
+        offset: u64,
+        size: usize,
+        dest_addr: Option<u64>,
+    ) -> Result<bytes::Bytes> {
+        let (buf_ptr, bytes) = if let Some(addr) = dest_addr {
+            // SAFETY: destination address is pre-registered and pinned memory
+            let b = unsafe {
+                bytes::Bytes::from_static(std::slice::from_raw_parts(addr as *const u8, size))
+            };
+            (addr as *mut u8, b)
+        } else {
+            crate::cache::pool::ALIGNED_BUF_POOL.alloc()
+        };
 
         let (tx, rx_oneshot) = oneshot::channel();
         self.worker

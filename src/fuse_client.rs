@@ -2793,14 +2793,41 @@ impl Filesystem for SqueezefsFilesystem {
                 if lock_scope == InodeWriteLockScope::MetaPrepOnly {
                     // Striped: drop inode write lock before long active-block I/O.
                     drop(guard);
-                    if let Err(e) = self
-                        .write_file_staged(ino, offset, data, old_size, fencing_token)
-                        .await
-                    {
-                        if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
-                            self.invalidate_local_lease(ino);
+
+                    let is_aligned = is_striped
+                        && (offset % block_size == 0)
+                        && (data.len() as u64 % block_size == 0);
+
+                    if is_aligned {
+                        let data_bytes = bytes::Bytes::copy_from_slice(data);
+                        if let Err(e) = self
+                            .router
+                            .write_file(&file_path, offset, data_bytes, fencing_token)
+                            .await
+                        {
+                            if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
+                                self.invalidate_local_lease(ino);
+                            }
+                            return Err(map_squeezefs_err(e));
                         }
-                        return Err(map_squeezefs_err(e));
+                        // Clean up any stale staged/active blocks for the written block range
+                        let start_block = offset / block_size;
+                        let end_block = (offset + data.len() as u64 - 1) / block_size;
+                        for b in start_block..=end_block {
+                            let cache_key = crate::keys::active_block(ino, b).to_string();
+                            self.active_block_buffers.remove(&cache_key);
+                            self.router.cache.nvme.remove_active_block(&cache_key);
+                        }
+                    } else {
+                        if let Err(e) = self
+                            .write_file_staged(ino, offset, data, old_size, fencing_token)
+                            .await
+                        {
+                            if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
+                                self.invalidate_local_lease(ino);
+                            }
+                            return Err(map_squeezefs_err(e));
+                        }
                     }
                     self.router.cache.write_lru.remove(&file_path);
                     self.router.cache.read_lru.remove(&file_path);

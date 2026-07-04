@@ -4,9 +4,9 @@ This guide describes how to get Squeezefs up and running, execute its built-in m
 
 ---
 
-## 1. Bare-Metal Execution (Real Hardware Setup)
+## 1. Quick Local Sandbox (File-backed Testing)
 
-To avoid containerization network bridges or WSL virtualization overheads and measure true hardware capacity, run Squeezefs directly on the host system.
+You can run and test SqueezeFS on any Linux machine using simple pre-allocated loopback files. No raw disk partitions or database servers are required.
 
 ### Prerequisites (Ubuntu/Debian)
 Ensure compilation tools, clang, and the FUSE 3 user-space library are installed:
@@ -20,88 +20,102 @@ sudo apt update && sudo apt install -y \
     libclang-dev
 ```
 
-### Step 1: Start Metadata Service
-For performance evaluation, start a standard, official Microsoft Garnet container on the target host:
-
-```bash
-podman run -d --rm --replace --name squeezefs-garnet -p 6379:6379 ghcr.io/microsoft/garnet:latest
-```
-
-### Step 2: Build Squeezefs Client
-Clone and compile the repository with optimizations:
+### Step 1: Build the Squeezefs Client
+Clone and compile the repository with release optimizations:
 ```bash
 cargo build --release
 ```
 
-### Step 3: Format and Mount Squeezefs
+### Step 2: Prepare Sandbox Backing Files
+Create blank files to serve as your metadata and data block devices:
+```bash
+# Allocate 64MB for Metadata Volume
+truncate -s 64M /tmp/squeezefs_meta.bin
 
-1. **Create a storage pool and volume for Squeezefs**:
-   ```bash
-   # Assuming /dev/nvme0n1 is a local fast NVMe drive dedicated to Squeezefs
-   ./target/release/squeezefs storage pool create main-pool /dev/nvme0n1
-   ./target/release/squeezefs storage volume create main-pool my-vol --size 1P
-   ```
+# Allocate 1GB for Data Volume
+truncate -s 1G /tmp/squeezefs_data.bin
+```
 
-2. **Format the filesystem volume** (this sets up block allocation maps for your NVMe device in Garnet using SqueezeFS URI):
-   ```bash
-   ./target/release/squeezefs format squeeze://127.0.0.1:6379/squeezefs-volume \
-     --volume /dev/main-pool/my-vol
-   ```
+### Step 3: Format the Filesystem
+Format the backing files using SqueezeFS URIs:
+```bash
+./target/release/squeezefs format \
+  sqmeta:///tmp/squeezefs_meta.bin \
+  sqdata:///tmp/squeezefs_data.bin
+```
 
-3. **Create the mount point and local staging directories**:
-   ```bash
-   mkdir -p /mnt/squeezefs
-   mkdir -p /tmp/squeezefs_staging
-   ```
+### Step 4: Mount Squeezefs
+Create the mount point and staging cache directories:
+```bash
+sudo mkdir -p /mnt/squeezefs
+sudo mkdir -p /tmp/squeezefs_staging
 
-4. **Mount the FUSE daemon** (run in background with daemon mode, specify log file destination, and pass your volume path):
-   ```bash
-   ./target/release/squeezefs mount squeeze://127.0.0.1:6379/squeezefs-volume /mnt/squeezefs \
-     --disk-cache-paths /tmp/squeezefs_staging \
-     --volume /dev/main-pool/my-vol \
-     --daemon \
-     --log-file /tmp/squeezefs.log \
-     --uid 1000 \
-     --gid 1000
-   ```
+# Mount Squeezefs in the background
+sudo ./target/release/squeezefs mount \
+  sqmeta:///tmp/squeezefs_meta.bin \
+  /mnt/squeezefs \
+  --disk-cache-paths /tmp/squeezefs_staging \
+  --daemon \
+  --log-file /tmp/squeezefs.log \
+  --allow-others \
+  --uid $(id -u) \
+  --gid $(id -g)
+```
 
-5. **(Optional) Configure quotas at runtime** (Note: connection and volume settings are auto-resolved from the active FUSE mount!):
-   To dynamically adjust size or inode quotas:
-   ```bash
-   # Change filesystem capacity quota at runtime
-   ./target/release/squeezefs config set capacity 10T
-   ```
+### Step 5: Run the Benchmark
+Run SqueezeFS parallel benchmarks to stress metadata and raw data operations:
+```bash
+./target/release/squeezefs bench /mnt/squeezefs --threads 4 --large-size 64
+```
 
-6. **Run the benchmark tool** as the mounting user (Note: running with 'sudo' will be blocked by FUSE unless mounted with 'allow_other'):
-   ```bash
-   ./target/release/squeezefs bench /mnt/squeezefs --threads 8 --large-size 128
-   ```
+### Step 6: Unmount Safely
+Use SqueezeFS unmount to drain staging writes and cleanly shut down:
+```bash
+sudo ./target/release/squeezefs umount /mnt/squeezefs
+```
+*(Or use standard `/bin/umount /mnt/squeezefs`, enabled by `--allow-others` and daemon CWD setsid root isolation).*
 
 ---
 
-## 2. High-Performance Multi-Rail Configuration (NVMe-oF & 6-Node Mellanox Setup)
+## 2. Bare-Metal Execution (Real Hardware Setup)
+
+To avoid containerization network bridges or WSL virtualization overheads and measure true hardware capacity, run Squeezefs directly on the host using physical block devices.
+
+### Step 1: Create Storage Pool and Volume
+Assume `/dev/nvme0n1` and `/dev/nvme1n1` are dedicated fast NVMe drives:
+```bash
+# Initialize storage pool
+./target/release/squeezefs storage pool create main-pool /dev/nvme0n1 /dev/nvme1n1
+
+# Construct metadata and data block volumes
+./target/release/squeezefs storage volume create main-pool meta-vol --size 128G
+./target/release/squeezefs storage volume create main-pool data-vol --size 1P
+```
+
+### Step 2: Format Volumes Concurrently
+Format the logical volumes. Pass `--full` if you want a complete block-aligned zero-wipe of the devices:
+```bash
+./target/release/squeezefs format \
+  sqmeta:///dev/main-pool/meta-vol \
+  sqdata:///dev/main-pool/data-vol \
+  --full
+```
+
+### Step 3: Mount and Run
+```bash
+sudo ./target/release/squeezefs mount \
+  sqmeta:///dev/main-pool/meta-vol \
+  /mnt/squeezefs \
+  --disk-cache-paths /tmp/squeezefs_staging \
+  --daemon \
+  --allow-others
+```
+
+---
+
+## 3. High-Performance Multi-Rail Configuration (NVMe-oF Mellanox Setup)
 
 When deploying on a multi-node cluster where hosts are equipped with multiple physical NICs (e.g. 2 Mellanox NICs per host), configure Multi-Rail bonding to balance network packets over NVMe-oF at the application socket layer.
-
-```
-       +---------------------------------------------+
-       |             Squeezefs Client Node           |
-       |  (Binds sockets to local interface IPs)     |
-       +----------+-----------------------+----------+
-                  |                       |
-        Interface 1 (10.10.10.1)  Interface 2 (10.10.20.1)
-                  |                       |
-       +----------+-----------+ +---------+----------+
-       | Mellanox Fab-A (10G) | | Mellanox Fab-B (10G) |
-       +----------+-----------+ +---------+----------+
-                  |                       |
-                  +-----------+-----------+
-                              |
-                     +--------+--------+
-                     |  Storage Rack   |
-                     |  (NVMe Target)  |
-                     +-----------------+
-```
 
 ### Automatic SPDK Compilation, Setup, and Execution
 To compile SPDK from source, set up local hugepages, selectively bind target NVMe SSDs to user-space, and launch the user-space target daemon (`nvmf_tgt` listener) in the background:
@@ -118,18 +132,15 @@ sudo ./target/release/squeezefs storage nvmeof spdk-bind --pci 0000:02:00.0
 # 4. Start the background SPDK target daemon (nvmf_tgt)
 sudo ./target/release/squeezefs storage nvmeof spdk-start
 ```
-This maps only the selected data NVMe drives to SPDK polled user-space drivers while keeping your system OS disk safe under kernel control.
 
 ### Share a Target via user-space SPDK
-To share a local backing file or NVMe block device using the high-performance user-space SPDK target (`nvmf_tgt` listener):
 ```bash
 # Share a backing disk as SPDK NVMe-oF subsystem target
 sudo ./target/release/squeezefs storage nvmeof share /dev/nvme0n1 --spdk --port 4420 --ip 10.10.10.50
 ```
-This sends JSON-RPC requests directly to the SPDK daemon listening at `/var/tmp/spdk.sock` to construct bdevs, subsystems, namespaces, and bind TCP listeners, achieving bare-metal polling throughput.
 
 ### Connect to Remote NVMe-oF Storage
-To connect to an NVMe over Fabrics target device (fully compatible with standard Linux targets and user-space SPDK targets) before mounting:
+To connect to an NVMe over Fabrics target device before mounting:
 ```bash
 # Connect to the remote storage cluster
 sudo ./target/release/squeezefs storage nvmeof connect --ip 10.10.10.50 --subnqn nqn.2026-06.org.squeezefs:data
@@ -139,51 +150,22 @@ sudo ./target/release/squeezefs storage pool create fabric-pool /dev/nvme1n1
 sudo ./target/release/squeezefs storage volume create fabric-pool my-fabric-vol --size 1P
 
 # Format and mount the fabric-attached volume
-sudo ./target/release/squeezefs format default --volume /dev/fabric-pool/my-fabric-vol
-sudo ./target/release/squeezefs mount default /mnt/squeezefs --volume /dev/fabric-pool/my-fabric-vol --local-ips 10.10.10.1,10.10.20.1
+sudo ./target/release/squeezefs format sqmeta:///dev/main-pool/meta-vol sqdata:///dev/fabric-pool/my-fabric-vol
+sudo ./target/release/squeezefs mount sqmeta:///dev/main-pool/meta-vol /mnt/squeezefs --local-ips 10.10.10.1,10.10.20.1
 ```
-
-* **Load Balancing:** All IO operations will cycle and balance round-robin between the two local IPs traversing the fabric.
-* **Failover HA:** If a Mellanox NIC link drops or returns errors, Squeezefs catches the error and instantly retries the operation on the remaining healthy NIC.
+- **Load Balancing:** All IO operations will cycle and balance round-robin between the two local IPs traversing the fabric.
+- **Failover HA:** If a Mellanox NIC link drops, Squeezefs catches the error and instantly retries the operation on the remaining healthy NIC.
 
 ---
 
-## 3. Kernel Tuning for Bare Metal (Auto-Tune)
+## 4. Kernel Tuning for Bare Metal (Auto-Tune)
 
-For maximum HPC file throughput, Squeezefs includes an auto-tuning command. This script adjusts FUSE congestion thresholds, virtual memory dirty page ratios, and network socket maximum buffer sizes to matches the requirements of high-speed fabrics.
+For maximum HPC file throughput, Squeezefs includes an auto-tuning command. This script adjusts FUSE congestion thresholds, virtual memory dirty page ratios, and network socket maximum buffer sizes.
 
 Run the built-in tune command:
 ```bash
 sudo ./target/release/squeezefs tune
 ```
-
-This applies the following optimizations:
 - **`vm.dirty_ratio = 40`** & **`vm.dirty_background_ratio = 10`**: Aggressively buffers writes in memory before flushing.
 - **`net.core.rmem_max`** & **`net.core.wmem_max` to `67108864` (64MB)**: Expands TCP socket buffers for massive parallel streams.
 - **FUSE Connection Limits**: Increases `max_background` to `64` and `congestion_threshold` to `48` to prevent FUSE queue starvation.
-
----
-
-## 4. Developer Micro-Benchmarks & Disk-less Mode
-
-### Running in Disk-less (Memory-only) Staging Mode
-If you do not have a dedicated local NVMe staging drive or want to evaluate SqueezeFS core logic bypassing all physical drive write amplification, you can configure staging to run entirely in system RAM:
-```bash
-./target/release/squeezefs mount squeeze://127.0.0.1:6379/squeezefs-volume /mnt/squeezefs \
-  --disk-cache-paths memory \
-  --volume /dev/main-pool/my-vol \
-  --daemon
-```
-* **Memory Staging:** Specifying `memory` (or `none`) directs SqueezeFS to spin up virtual `MmapMut::map_anon` segments in RAM, completely bypassing local disk operations.
-
-### Running the High-Concurrency Micro-Benchmark Suite
-SqueezeFS includes a Criterion-based micro-benchmark suite to stress-test locks, writes, reads, and memory allocations under high parallel task loads:
-```bash
-# Run the concurrent micro-benchmarks
-cargo bench --bench high_concurrency_bench
-```
-This suite profiles:
-- **`concurrent_writes_16_tasks`**: Measures concurrent chunk writes to distinct files.
-- **`concurrent_reads_16_tasks_same_file`**: Measures concurrent reads from a shared file.
-- **`concurrent_locks_16_tasks`**: Measures DLM lock acquisition/release contention.
-- **`concurrent_pool_alloc_16_tasks`**: Measures allocation/deallocation concurrency in the unified buffer pool.

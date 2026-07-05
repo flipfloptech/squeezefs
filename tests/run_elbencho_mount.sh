@@ -30,9 +30,14 @@ if [ ! -f "./target/release/squeezefs" ]; then
 fi
 
 # Check if elbencho is installed
+ELBENCHO_CMD="elbencho"
 if ! command -v elbencho &> /dev/null; then
-    echo "ERROR: elbencho is not installed. Please install it first."
-    exit 1
+    if [ -x "/home/justin/.local/bin/elbencho" ]; then
+        ELBENCHO_CMD="/home/justin/.local/bin/elbencho"
+    else
+        echo "ERROR: elbencho is not installed. Please install it first."
+        exit 1
+    fi
 fi
 
 # 1. Format the SqueezeFS volume
@@ -63,7 +68,7 @@ echo "SqueezeFS is mounted and ready."
 
 # 4. Run elbencho write and read tests
 echo "Running elbencho tests..."
-elbencho -w -r -t 4 -s 1G -b 4M "$MOUNT_DIR/file"
+"$ELBENCHO_CMD" -w -r -t 4 -s 1G -b 4M "$MOUNT_DIR/file"
 
 # 5. Clean up mount
 echo "Unmounting SqueezeFS..."

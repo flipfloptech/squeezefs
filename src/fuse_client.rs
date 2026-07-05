@@ -2046,6 +2046,7 @@ impl Filesystem for SqueezefsFilesystem {
                     cached_at: std::time::Instant::now(),
                     data_key: None,
                     block_map: None,
+                    layout_dirty: false,
                 },
             );
             self.dir_entry_cache.invalidate(&parent);
@@ -3779,6 +3780,18 @@ impl Filesystem for SqueezefsFilesystem {
             );
             WRITEBACK_HARD_FAILURES.insert(ino, format!("{e:?}"));
         }
+        let file_path = crate::keys::inode_path(ino);
+        if let Err(e) = self
+            .router
+            .persist_dirty_layout_if_needed(&file_path, fencing_token)
+            .await
+        {
+            error!(
+                "FUSE Flush: layout persist failed for ino {} (will surface on fsync): {:?}",
+                ino, e
+            );
+            WRITEBACK_HARD_FAILURES.insert(ino, format!("{e:?}"));
+        }
 
         Ok(())
     }
@@ -3800,13 +3813,18 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(());
         }
 
-        // Flush any remaining active staging blocks before releasing the lease
+        // Flush any remaining active staging blocks + dirty layout before releasing.
         if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
             let _ = self
                 .flush_memory_buffers_for_inode(ino, fencing_token)
                 .await;
             let _ = self
                 .flush_active_blocks_with_retry(ino, fencing_token)
+                .await;
+            let file_path = crate::keys::inode_path(ino);
+            let _ = self
+                .router
+                .persist_dirty_layout_if_needed(&file_path, fencing_token)
                 .await;
         }
 
@@ -3860,6 +3878,10 @@ impl Filesystem for SqueezefsFilesystem {
 
         let fsync_future = async {
             self.flush_inode_to_backend(ino, fencing_token).await?;
+            let file_path = crate::keys::inode_path(ino);
+            self.router
+                .persist_dirty_layout_if_needed(&file_path, fencing_token)
+                .await?;
             if let Some(backend) = self.meta_backend.as_ref() {
                 backend.sync_all_devices().await?;
             }

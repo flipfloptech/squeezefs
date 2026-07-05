@@ -881,6 +881,63 @@ impl Metadata for RoutedMetaBackend {
         if parent_v_idx == target_v_idx {
             let backend = &self.volumes[target_v_idx];
             let is_dir_flag = is_dir;
+
+            // Regular files: lock-only direct I/O (no journal transaction). Journal
+            // run_transaction serializes all same-volume creates via transaction_lock
+            // and was the ~2ms/op floor for small-file create+write. Sector safety is
+            // still provided by inode_lock / dentry_lock RMW.
+            // Directories keep the journaled path (parent nlink multi-field update).
+            if !is_dir_flag {
+                if dentry::find_dentry(&backend.storage, local_parent, name)
+                    .await?
+                    .is_some()
+                {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(
+                        "File already exists".to_string(),
+                    ));
+                }
+
+                let parent_inode = inode::read_inode(&backend.storage, local_parent).await?;
+                let mut final_gid = gid;
+                let final_mode = mode;
+                if (parent_inode.mode & libc::S_ISGID) != 0 {
+                    final_gid = parent_inode.gid;
+                }
+
+                let new_local_ino;
+                let disk_inode;
+                {
+                    let _guard = backend.storage.inode_lock.lock().await;
+                    new_local_ino = backend.storage.alloc_inode_bit_locked().await?;
+                    let di = inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
+                    inode::write_inode_raw(&backend.storage, new_local_ino, &di).await?;
+                    disk_inode = di;
+                }
+
+                let global_child_ino = self.make_global_ino(new_local_ino, target_v_idx);
+                dentry::insert_dentry(
+                    &backend.storage,
+                    local_parent,
+                    global_child_ino,
+                    name,
+                    final_mode & libc::S_IFMT,
+                )
+                .await?;
+
+                return Ok(Inode {
+                    ino: global_child_ino,
+                    mode: disk_inode.mode,
+                    uid: disk_inode.uid,
+                    gid: disk_inode.gid,
+                    size: disk_inode.size,
+                    nlink: disk_inode.nlink,
+                    atime: disk_inode.atime,
+                    mtime: disk_inode.mtime,
+                    ctime: disk_inode.ctime,
+                    flags: disk_inode.flags,
+                });
+            }
+
             let inode = backend
                 .run_transaction(|| async {
                 if dentry::find_dentry(&backend.storage, local_parent, name)
@@ -903,7 +960,6 @@ impl Metadata for RoutedMetaBackend {
                     }
                 }
 
-                // Bitmap + child inode under one inode_lock (sector RMW safety).
                 let new_local_ino;
                 let disk_inode;
                 {
@@ -911,9 +967,7 @@ impl Metadata for RoutedMetaBackend {
                     new_local_ino = backend.storage.alloc_inode_bit_locked().await?;
                     let mut di =
                         inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
-                    if is_dir_flag {
-                        di.nlink = 2;
-                    }
+                    di.nlink = 2;
                     inode::write_inode_raw(&backend.storage, new_local_ino, &di).await?;
                     disk_inode = di;
                 }
@@ -929,20 +983,16 @@ impl Metadata for RoutedMetaBackend {
                 )
                 .await?;
 
-                // Parent mtime/nlink: required for dirs. Skip for regular files to
-                // avoid an extra parent-sector RMW on every small-file create.
-                if is_dir_flag {
-                    let mut parent_inode =
-                        inode::read_inode(&backend.storage, local_parent).await?;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    parent_inode.mtime = now;
-                    parent_inode.ctime = now;
-                    parent_inode.nlink += 1;
-                    inode::write_inode(&backend.storage, local_parent, &parent_inode).await?;
-                }
+                let mut parent_inode =
+                    inode::read_inode(&backend.storage, local_parent).await?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                parent_inode.mtime = now;
+                parent_inode.ctime = now;
+                parent_inode.nlink += 1;
+                inode::write_inode(&backend.storage, local_parent, &parent_inode).await?;
 
                 Ok(Inode {
                     ino: global_child_ino,
@@ -1894,24 +1944,21 @@ impl RoutedMetaBackend {
         Ok(())
     }
 
-    /// Persist layout xattr + size in one journaled transaction (one fdatasync window).
+    /// Persist layout xattr + size with fine locks (no journal transaction_lock).
+    /// Used on fsync/release writeback; avoids serializing all layout commits.
     pub async fn set_layout_and_size(&self, ino: Ino, layout: &[u8], size: u64) -> Result<()> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let be = self.volumes[v_idx].clone();
-        let layout_owned = layout.to_vec();
-        be.run_transaction(|| async {
-            let _guard = be.dlm.lock_exclusive(&format!("I{}", local_ino)).await;
-            xattr::set_xattr(&be.storage, local_ino, "layout", &layout_owned).await?;
-            let mut disk_inode = inode::read_inode(&be.storage, local_ino).await?;
-            disk_inode.size = size;
-            disk_inode.ctime = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            inode::write_inode(&be.storage, local_ino, &disk_inode).await?;
-            Ok(())
-        })
-        .await
+        let be = &self.volumes[v_idx];
+        let _guard = be.dlm.lock_exclusive(&format!("I{}", local_ino)).await;
+        xattr::set_xattr(&be.storage, local_ino, "layout", layout).await?;
+        let mut disk_inode = inode::read_inode(&be.storage, local_ino).await?;
+        disk_inode.size = size;
+        disk_inode.ctime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        inode::write_inode(&be.storage, local_ino, &disk_inode).await?;
+        Ok(())
     }
 }

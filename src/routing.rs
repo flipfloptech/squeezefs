@@ -44,6 +44,8 @@ pub struct CachedMetadata {
     pub cached_at: std::time::Instant,
     pub data_key: Option<Vec<u8>>,
     pub block_map: Option<std::collections::HashMap<u32, String>>,
+    /// When true, layout/size live only in RAM (+ staging mmap); must persist on fsync/release.
+    pub layout_dirty: bool,
 }
 
 impl Default for CachedMetadata {
@@ -57,6 +59,7 @@ impl Default for CachedMetadata {
             cached_at: std::time::Instant::now(),
             data_key: None,
             block_map: None,
+            layout_dirty: false,
         }
     }
 }
@@ -613,6 +616,7 @@ impl DataRouter {
                         cached_at: std::time::Instant::now(),
                         data_key: layout.data_key,
                         block_map,
+                        layout_dirty: false,
                     }));
                 }
             }
@@ -940,9 +944,33 @@ impl DataRouter {
             cached_at: std::time::Instant::now(),
             data_key: None,
             block_map: None,
+            layout_dirty: false,
         };
         self.metadata_cache.insert(file_path.to_string(), m.clone());
         Ok(m)
+    }
+
+    /// Persist layout/size if the hot cache marked it dirty (writeback path).
+    pub async fn persist_dirty_layout_if_needed(
+        &self,
+        file_path: &str,
+        fencing_token: u64,
+    ) -> Result<()> {
+        let Some(meta) = self.metadata_cache.get(file_path) else {
+            return Ok(());
+        };
+        if !meta.layout_dirty {
+            return Ok(());
+        }
+        let ino = parse_inode_from_path(file_path);
+        let mut clean = meta.clone();
+        clean.layout_dirty = false;
+        clean.cached_at = std::time::Instant::now();
+        self.save_metadata_to_backend(ino, &clean, fencing_token)
+            .await?;
+        self.metadata_cache
+            .insert(file_path.to_string(), clean);
+        Ok(())
     }
 
     pub async fn update_metadata_cache_size(&self, file_path: &str, size: u64) {
@@ -1267,7 +1295,7 @@ impl DataRouter {
         }
 
         if new_size < MAX_INLINE_SIZE {
-            // Layout: inline
+            // Layout: inline — RAM only until fsync/release (writeback).
             crate::fuse_client::METRICS
                 .layout_inline_writes
                 .fetch_add(1, Ordering::Relaxed);
@@ -1279,8 +1307,8 @@ impl DataRouter {
             updated_meta.data_key = Some(shared_data.to_vec());
             updated_meta.file_id = None;
             updated_meta.block_map = None;
-            self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
-                .await?;
+            updated_meta.layout_dirty = true;
+            updated_meta.cached_at = std::time::Instant::now();
 
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
@@ -1289,7 +1317,7 @@ impl DataRouter {
         } else if !self.cache.nvme.staging_dirs().is_empty()
             && (new_size as u64) <= self.block_size.load(Ordering::Acquire)
         {
-            // Layout: staged
+            // Layout: staged — mmap stage + RAM meta; MetaLV layout deferred to fsync.
             crate::fuse_client::METRICS
                 .layout_staged_writes
                 .fetch_add(1, Ordering::Relaxed);
@@ -1311,16 +1339,11 @@ impl DataRouter {
                     let mut updated_meta = meta.clone();
                     updated_meta.file_type = "staged".to_string();
                     updated_meta.size = new_size as u64;
-                    updated_meta.file_id = Some(new_file_id.clone());
+                    updated_meta.file_id = Some(new_file_id);
                     updated_meta.data_key = None;
                     updated_meta.block_map = None;
-
-                    let file_id_changed = meta.file_id.as_ref() != Some(&new_file_id);
-                    let size_changed = meta.size != new_size as u64;
-                    if file_id_changed || size_changed {
-                        self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
-                            .await?;
-                    }
+                    updated_meta.layout_dirty = true;
+                    updated_meta.cached_at = std::time::Instant::now();
                     self.metadata_cache
                         .insert(file_path.to_string(), updated_meta);
                 }
@@ -1347,6 +1370,8 @@ impl DataRouter {
                     updated_meta.file_id = Some(new_file_id);
                     updated_meta.data_key = None;
                     updated_meta.block_map = Some(block_map);
+                    // Durable backend write already happened — commit layout now.
+                    updated_meta.layout_dirty = false;
                     self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
                         .await?;
                     self.metadata_cache

@@ -1,9 +1,9 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use squeezefs::meta_backend::dlm::DlmLockManager;
-use squeezefs::fuse_client::StripeLocks;
 use squeezefs::cache::lru::LruCache;
-use tokio::runtime::Runtime;
+use squeezefs::fuse_client::StripeLocks;
+use squeezefs::meta_backend::dlm::DlmLockManager;
 use std::sync::Arc;
+use tokio::runtime::Runtime;
 
 fn bench_high_concurrency(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();

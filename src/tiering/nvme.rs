@@ -174,64 +174,245 @@ impl NvmeShard {
         let key_len = key.len();
         let val_len = value.len();
 
-        let mut inner = self.inner.write();
-        let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
+        let (target_offset, val_offset, block_size, old_meta, evicted, mmap_ptr) = {
+            let mut inner = self.inner.write();
+            let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
 
-        // Ensure target_offset starts aligned
-        let mut target_offset = (inner.write_offset + alignment - 1) & !(alignment - 1);
-        let val_offset = (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
-        let block_size = (val_offset - target_offset) + val_len;
+            let mut target_offset = (inner.write_offset + alignment - 1) & !(alignment - 1);
+            let val_offset =
+                (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+            let block_size = (val_offset - target_offset) + val_len;
 
-        if block_size > inner.capacity {
-            return Vec::new();
-        }
+            if block_size > inner.capacity {
+                return Vec::new();
+            }
 
-        let mut evicted = Vec::new();
+            let mut evicted = Vec::new();
 
-        // Check if we need to wrap around
-        let capacity = inner.capacity;
-        if target_offset + block_size > capacity {
-            // Evict anything at the end of the file that we are skipping
-            inner.evict_overlapping(target_offset, capacity, &mut evicted);
-            target_offset = 0;
-        }
+            // Check if we need to wrap around
+            let capacity = inner.capacity;
+            if target_offset + block_size > capacity {
+                inner.evict_overlapping(target_offset, capacity, &mut evicted);
+                target_offset = 0;
+            }
 
-        // Recompute after wrap-around to ensure aligned
-        let target_offset = (target_offset + alignment - 1) & !(alignment - 1);
-        let val_offset = (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
-        let block_size = (val_offset - target_offset) + val_len;
+            // Recompute after wrap-around to ensure aligned
+            let target_offset = (target_offset + alignment - 1) & !(alignment - 1);
+            let val_offset =
+                (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+            let block_size = (val_offset - target_offset) + val_len;
 
-        // Evict overlapping blocks in the target range
-        inner.evict_overlapping(target_offset, target_offset + block_size, &mut evicted);
+            // Evict overlapping blocks in the target range
+            inner.evict_overlapping(target_offset, target_offset + block_size, &mut evicted);
 
-        // Write magic
-        inner.mmap[target_offset..target_offset + 4].copy_from_slice(&BLOCK_MAGIC.to_le_bytes());
-        // Write key len
-        inner.mmap[target_offset + 4..target_offset + 8]
-            .copy_from_slice(&(key_len as u32).to_le_bytes());
-        // Write val len
-        inner.mmap[target_offset + 8..target_offset + 12]
-            .copy_from_slice(&(val_len as u32).to_le_bytes());
-        // Write key
-        inner.mmap[target_offset + HEADER_SIZE..target_offset + HEADER_SIZE + key_len]
-            .copy_from_slice(&key);
-        // Write val
-        inner.mmap[val_offset..val_offset + val_len].copy_from_slice(&value);
+            // Invalidate/remove key from map if it already existed
+            let old_meta = inner.map.remove(&key);
+            if old_meta.is_some() {
+                inner.active_keys.retain(|k| k != &key);
+            }
 
-        // Update tracking
-        let meta = BlockMeta {
-            offset: target_offset,
-            len: block_size,
+            inner.write_offset = target_offset + block_size;
+            let mmap_ptr = inner.mmap.as_ptr() as *mut u8;
+            (
+                target_offset,
+                val_offset,
+                block_size,
+                old_meta,
+                evicted,
+                mmap_ptr,
+            )
         };
 
-        // If the key already existed, we remove it from the old spot and invalidate its magic on disk
-        if let Some(old_meta) = inner.map.insert(key.clone(), meta) {
-            inner.mmap[old_meta.offset..old_meta.offset + 4].copy_from_slice(&0u32.to_le_bytes());
-            inner.active_keys.retain(|k| k != &key);
+        // Perform memory copy and disk flushing OUTSIDE of the lock!
+        unsafe {
+            // Write magic
+            std::ptr::copy_nonoverlapping(
+                BLOCK_MAGIC.to_le_bytes().as_ptr(),
+                mmap_ptr.add(target_offset),
+                4,
+            );
+            // Write key len
+            std::ptr::copy_nonoverlapping(
+                (key_len as u32).to_le_bytes().as_ptr(),
+                mmap_ptr.add(target_offset + 4),
+                4,
+            );
+            // Write val len
+            std::ptr::copy_nonoverlapping(
+                (val_len as u32).to_le_bytes().as_ptr(),
+                mmap_ptr.add(target_offset + 8),
+                4,
+            );
+            // Write key
+            std::ptr::copy_nonoverlapping(
+                key.as_ptr(),
+                mmap_ptr.add(target_offset + HEADER_SIZE),
+                key_len,
+            );
+            // Write val
+            std::ptr::copy_nonoverlapping(value.as_ptr(), mmap_ptr.add(val_offset), val_len);
+
+            if let Some(ref old) = old_meta {
+                std::ptr::write_bytes(mmap_ptr.add(old.offset), 0, 4);
+                libc::msync(
+                    mmap_ptr.add(old.offset) as *mut libc::c_void,
+                    4,
+                    libc::MS_SYNC,
+                );
+            }
+
+            libc::msync(
+                mmap_ptr.add(target_offset) as *mut libc::c_void,
+                block_size,
+                libc::MS_SYNC,
+            );
         }
 
-        inner.active_keys.push_back(key);
-        inner.write_offset = target_offset + block_size;
+        // Phase 2: Insert into tracking map
+        {
+            let mut inner = self.inner.write();
+            let meta = BlockMeta {
+                offset: target_offset,
+                len: block_size,
+            };
+            inner.map.insert(key.clone(), meta);
+            inner.active_keys.push_back(key);
+        }
+
+        evicted
+    }
+
+    pub fn reserve_and_write(
+        &self,
+        key: Bytes,
+        meta_len: u64,
+        meta_bytes: &[u8],
+        data: &[u8],
+        align_data_to: Option<usize>,
+    ) -> Vec<(Bytes, Bytes)> {
+        let key_len = key.len();
+        let header_size_written = 8 + meta_bytes.len();
+        let padding_needed = if let Some(align) = align_data_to {
+            align.saturating_sub(header_size_written)
+        } else {
+            0
+        };
+        let val_len = header_size_written + padding_needed + data.len();
+
+        let (target_offset, val_offset, block_size, old_meta, evicted, mmap_ptr) = {
+            let mut inner = self.inner.write();
+            let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
+
+            let mut target_offset = (inner.write_offset + alignment - 1) & !(alignment - 1);
+            let val_offset =
+                (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+            let block_size = (val_offset - target_offset) + val_len;
+
+            if block_size > inner.capacity {
+                return Vec::new();
+            }
+
+            let mut evicted = Vec::new();
+
+            // Check if we need to wrap around
+            let capacity = inner.capacity;
+            if target_offset + block_size > capacity {
+                inner.evict_overlapping(target_offset, capacity, &mut evicted);
+                target_offset = 0;
+            }
+
+            // Recompute after wrap-around to ensure aligned
+            let target_offset = (target_offset + alignment - 1) & !(alignment - 1);
+            let val_offset =
+                (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+            let block_size = (val_offset - target_offset) + val_len;
+
+            // Evict overlapping blocks in the target range
+            inner.evict_overlapping(target_offset, target_offset + block_size, &mut evicted);
+
+            // Invalidate/remove key from map if it already existed
+            let old_meta = inner.map.remove(&key);
+            if old_meta.is_some() {
+                inner.active_keys.retain(|k| k != &key);
+            }
+
+            inner.write_offset = target_offset + block_size;
+            let mmap_ptr = inner.mmap.as_ptr() as *mut u8;
+            (
+                target_offset,
+                val_offset,
+                block_size,
+                old_meta,
+                evicted,
+                mmap_ptr,
+            )
+        };
+
+        // Perform memory copy and disk flushing OUTSIDE of the lock!
+        unsafe {
+            // Write magic
+            std::ptr::copy_nonoverlapping(
+                BLOCK_MAGIC.to_le_bytes().as_ptr(),
+                mmap_ptr.add(target_offset),
+                4,
+            );
+            // Write key len
+            std::ptr::copy_nonoverlapping(
+                (key_len as u32).to_le_bytes().as_ptr(),
+                mmap_ptr.add(target_offset + 4),
+                4,
+            );
+            // Write val len
+            std::ptr::copy_nonoverlapping(
+                (val_len as u32).to_le_bytes().as_ptr(),
+                mmap_ptr.add(target_offset + 8),
+                4,
+            );
+            // Write key
+            std::ptr::copy_nonoverlapping(
+                key.as_ptr(),
+                mmap_ptr.add(target_offset + HEADER_SIZE),
+                key_len,
+            );
+
+            // Write value parts directly to inner.mmap
+            let mut cur = val_offset;
+            std::ptr::copy_nonoverlapping(meta_len.to_be_bytes().as_ptr(), mmap_ptr.add(cur), 8);
+            cur += 8;
+            std::ptr::copy_nonoverlapping(meta_bytes.as_ptr(), mmap_ptr.add(cur), meta_bytes.len());
+            cur += meta_bytes.len();
+            if padding_needed > 0 {
+                std::ptr::write_bytes(mmap_ptr.add(cur), 0, padding_needed);
+                cur += padding_needed;
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mmap_ptr.add(cur), data.len());
+
+            if let Some(ref old) = old_meta {
+                std::ptr::write_bytes(mmap_ptr.add(old.offset), 0, 4);
+                libc::msync(
+                    mmap_ptr.add(old.offset) as *mut libc::c_void,
+                    4,
+                    libc::MS_SYNC,
+                );
+            }
+
+            libc::msync(
+                mmap_ptr.add(target_offset) as *mut libc::c_void,
+                block_size,
+                libc::MS_SYNC,
+            );
+        }
+
+        // Phase 2: Insert into tracking map
+        {
+            let mut inner = self.inner.write();
+            let meta = BlockMeta {
+                offset: target_offset,
+                len: block_size,
+            };
+            inner.map.insert(key.clone(), meta);
+            inner.active_keys.push_back(key);
+        }
 
         evicted
     }
@@ -259,6 +440,7 @@ impl NvmeShard {
 
             // Overwrite magic to invalidate on disk
             inner.mmap[meta.offset..meta.offset + 4].copy_from_slice(&0u32.to_le_bytes());
+            let _ = inner.mmap.flush_range(meta.offset, 4);
 
             Some(val)
         } else {
@@ -499,6 +681,33 @@ impl NvmeCache {
         let dev = &active_devices[idx];
         let shard_idx = (xxh3_64(&key) as usize) % dev.shards.len();
         dev.shards[shard_idx].put(key, value)
+    }
+
+    pub fn reserve_and_write(
+        &self,
+        key: Bytes,
+        meta_len: u64,
+        meta_bytes: &[u8],
+        data: &[u8],
+        align_data_to: Option<usize>,
+    ) -> Vec<(Bytes, Bytes)> {
+        let active_devices = {
+            let guard = self.devices.read();
+            guard
+                .iter()
+                .filter(|d| d.online.load(Ordering::Relaxed))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        if active_devices.is_empty() {
+            return Vec::new();
+        }
+
+        let idx = self.write_counter.fetch_add(1, Ordering::Relaxed) % active_devices.len();
+        let dev = &active_devices[idx];
+        let shard_idx = (xxh3_64(&key) as usize) % dev.shards.len();
+        dev.shards[shard_idx].reserve_and_write(key, meta_len, meta_bytes, data, align_data_to)
     }
 
     pub fn remove(&self, key: &Bytes) -> Option<Bytes> {

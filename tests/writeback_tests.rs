@@ -10,10 +10,6 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile};
 
-fn redis_url() -> String {
-    std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
-}
-
 #[tokio::test]
 async fn test_writeback_queue_full_deadlock() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -22,8 +18,7 @@ async fn test_writeback_queue_full_deadlock() {
     std::env::set_var("SQUEEZEFS_WRITEBACK_QUEUE_CAP", "5");
 
     let test_id = "writeback_deadlock_test";
-    let dlm = DlmClient::new(&redis_url())
-        .unwrap_or_else(|_| DlmClient::new("redis://127.0.0.1:6379").unwrap());
+    let dlm = DlmClient::new("local").unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();
     let backing_path = backing_temp.path().to_path_buf();
@@ -146,8 +141,7 @@ async fn test_inline_file_layout_overflow() {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
 
     let test_id = "inline_overflow_test";
-    let dlm = DlmClient::new(&redis_url())
-        .unwrap_or_else(|_| DlmClient::new("redis://127.0.0.1:6379").unwrap());
+    let dlm = DlmClient::new("local").unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();
     let backing_path = backing_temp.path().to_path_buf();
@@ -233,8 +227,7 @@ async fn test_indirect_block_map() {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
 
     let test_id = "indirect_map_test";
-    let dlm = DlmClient::new(&redis_url())
-        .unwrap_or_else(|_| DlmClient::new("redis://127.0.0.1:6379").unwrap());
+    let dlm = DlmClient::new("local").unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();
     let backing_path = backing_temp.path().to_path_buf();

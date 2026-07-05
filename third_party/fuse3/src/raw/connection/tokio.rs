@@ -573,7 +573,10 @@ impl FuseConnection {
                         let dest_addr = pool.get_payload_buffer(unique).map(|(ptr, _)| ptr as *const u8);
                         if let Some(addr) = dest_addr {
                             if slice.as_ptr() == addr {
-                                unsafe { bytes::Bytes::from_static(std::slice::from_raw_parts(slice.as_ptr(), slice.len())) }
+                                bytes::Bytes::from_owner(UringBufOwner {
+                                    ptr: slice.as_ptr(),
+                                    len: slice.len(),
+                                })
                             } else {
                                 bytes::Bytes::copy_from_slice(slice)
                             }
@@ -1472,4 +1475,19 @@ impl AsFd for FuseConnection {
             ConnectionMode::NonBlock(connection) => connection.fd.as_fd(),
         }
     }
+}
+
+struct UringBufOwner {
+    ptr: *const u8,
+    len: usize,
+}
+unsafe impl Send for UringBufOwner {}
+unsafe impl Sync for UringBufOwner {}
+impl AsRef<[u8]> for UringBufOwner {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl Drop for UringBufOwner {
+    fn drop(&mut self) {}
 }

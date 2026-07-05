@@ -373,17 +373,15 @@ impl NvmeStaging {
 
         let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
 
-        let mut packed_payload = Vec::with_capacity(unpadded_len);
-        packed_payload.extend_from_slice(&meta_len.to_be_bytes());
-        packed_payload.extend_from_slice(&meta_bytes);
-        packed_payload.extend_from_slice(data);
-
-        let payload_bytes = Bytes::from(packed_payload);
-
         let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
-        // Memory-mapped copy (lock-free, zero disk syscall wait)
-        self.staging_nvme_cache
-            .put(key_bytes.clone(), payload_bytes);
+        // Memory-mapped copy directly (lock-free, zero disk syscall wait)
+        let _evicted = self.staging_nvme_cache.reserve_and_write(
+            key_bytes.clone(),
+            meta_len,
+            &meta_bytes,
+            data,
+            None,
+        );
 
         self.current_staged_write_bytes
             .fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
@@ -448,17 +446,16 @@ impl NvmeStaging {
         let meta_bytes = meta.serialize();
         let meta_len = meta_bytes.len() as u64;
 
-        let mut packed_payload = Vec::with_capacity(4096 + data.len());
-        packed_payload.extend_from_slice(&meta_len.to_be_bytes());
-        packed_payload.extend_from_slice(&meta_bytes);
-        packed_payload.resize(4096, 0); // Pad header up to 4KB page boundary
-        packed_payload.extend_from_slice(data);
-
         let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-        let payload_bytes = Bytes::from(packed_payload);
 
         let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
-        self.staging_nvme_cache.put(key_bytes, payload_bytes);
+        let _evicted = self.staging_nvme_cache.reserve_and_write(
+            key_bytes,
+            meta_len,
+            &meta_bytes,
+            data,
+            Some(4096),
+        );
         if is_new {
             self.staged_writes_in_flight
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -577,14 +574,27 @@ impl NvmeStaging {
                 tokio::pin!(sleep);
 
                 tokio::select! {
-                    Some(pending) = write_rx.recv() => {
-                        current_bytes += pending.padded_size;
-                        batch.push(pending);
+                    res = write_rx.recv() => {
+                        match res {
+                            Some(pending) => {
+                                current_bytes += pending.padded_size;
+                                batch.push(pending);
 
-                        if current_bytes >= max_batch_bytes {
-                            info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify, &crypto).await {
-                                error!("Failed to flush NVMe staging batch: {:?}", e);
+                                if current_bytes >= max_batch_bytes {
+                                    info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
+                                    if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify, &crypto).await {
+                                        error!("Failed to flush NVMe staging batch: {:?}", e);
+                                    }
+                                }
+                            }
+                            None => {
+                                if !batch.is_empty() {
+                                    info!("NVMe Staging: Channel closed. Flushing remaining {} pending writes.", batch.len());
+                                    if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify, &crypto).await {
+                                        error!("Failed to flush NVMe staging batch on channel close: {:?}", e);
+                                    }
+                                }
+                                break;
                             }
                         }
                     }
@@ -644,10 +654,13 @@ impl NvmeStaging {
 
         let offset = block_allocator.allocate_block().await?;
         let packed_key = offset.to_string();
+        let max_block_size = block_allocator.chunk_size();
 
         let mut packed_payload = Vec::new();
         let mut mappings = Vec::new();
         let mut highest_fencing_token = 0u64;
+
+        let mut processed_count = 0;
 
         for item in batch.iter() {
             let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
@@ -680,8 +693,11 @@ impl NvmeStaging {
 
             if let Some(data) = data_res {
                 let processed_data = crypto_state.process_write(bytes::Bytes::from(data))?;
-                let offset = packed_payload.len() as u64;
                 let size = processed_data.len() as u64;
+                if packed_payload.len() as u64 + size > max_block_size {
+                    break;
+                }
+                let offset = packed_payload.len() as u64;
                 packed_payload.extend_from_slice(&processed_data);
 
                 mappings.push((item.file_id.clone(), offset, size));
@@ -689,7 +705,30 @@ impl NvmeStaging {
                     highest_fencing_token = item.fencing_token;
                 }
             }
+            processed_count += 1;
         }
+
+        if processed_count == 0 && !batch.is_empty() {
+            let item = &batch[0];
+            let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
+            if let Some(guard) = staging_nvme_cache.get(&key_bytes) {
+                let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+                let meta_len =
+                    u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+                let data_start = 8 + meta_len;
+                let data = bytes[data_start..data_start + guard.len - data_start].to_vec();
+                let processed_data = crypto_state.process_write(bytes::Bytes::from(data))?;
+                let size = processed_data.len() as u64;
+                packed_payload.extend_from_slice(&processed_data);
+                mappings.push((item.file_id.clone(), 0, size));
+                if item.fencing_token > highest_fencing_token {
+                    highest_fencing_token = item.fencing_token;
+                }
+            }
+            processed_count = 1;
+        }
+
+        let processed_items: Vec<PendingStagedWrite> = batch.drain(0..processed_count).collect();
 
         let packed_payload_len = packed_payload.len();
         info!("NVMe Staging: Writing packed block {} (size {} bytes) to NVMe-oF backend volume with fencing token {}.", packed_key, packed_payload_len, highest_fencing_token);
@@ -702,7 +741,9 @@ impl NvmeStaging {
         }
 
         if let Some(backend) = meta_backend.get() {
-            for (item, (_file_id, sub_offset, sub_size)) in batch.iter().zip(mappings.iter()) {
+            for (item, (_file_id, sub_offset, sub_size)) in
+                processed_items.iter().zip(mappings.iter())
+            {
                 let file_path = &item.file_path;
                 let ino = crate::routing::parse_inode_from_path(file_path);
 
@@ -737,7 +778,7 @@ impl NvmeStaging {
             }
         }
 
-        for item in batch.iter() {
+        for item in processed_items.iter() {
             let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
             if staging_nvme_cache.remove(&key_bytes).is_some() {
                 let prev =
@@ -761,8 +802,7 @@ impl NvmeStaging {
             }
         }
 
-        batch.clear();
-        *current_bytes = 0;
+        *current_bytes = batch.iter().map(|item| item.padded_size).sum();
         space_freed_notify.notify_waiters();
 
         Ok(())

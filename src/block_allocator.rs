@@ -1,17 +1,15 @@
 use crate::dlm::MetaClient;
 use crate::error::Result;
-use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct BlockAllocator {
     _client: Arc<MetaClient>,
     _volume_id: Box<str>,
     chunk_size: u64,
-    free_blocks: Mutex<HashSet<u64>>,
+    free_blocks: dashmap::DashSet<u64>,
     highest_block: AtomicU64,
-    refcounts: Mutex<HashMap<u64, u32>>,
+    refcounts: scc::HashMap<u64, AtomicU32>,
 }
 
 impl BlockAllocator {
@@ -20,37 +18,54 @@ impl BlockAllocator {
             _client: client,
             _volume_id: volume_id.to_string().into_boxed_str(),
             chunk_size: 4 * 1024 * 1024, // 4MB
-            free_blocks: Mutex::new(HashSet::new()),
+            free_blocks: dashmap::DashSet::new(),
             highest_block: AtomicU64::new(0),
-            refcounts: Mutex::new(HashMap::new()),
+            refcounts: scc::HashMap::new(),
         })
     }
 
     pub fn increment_refcount(&self, offset: u64) {
-        let mut refs = self.refcounts.lock();
-        let count = refs.entry(offset).or_insert(1);
-        *count += 1;
+        match self.refcounts.entry_sync(offset) {
+            scc::hash_map::Entry::Occupied(mut occ) => {
+                occ.get_mut().fetch_add(1, Ordering::SeqCst);
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(AtomicU32::new(2));
+            }
+        }
+    }
+
+    pub fn chunk_size(&self) -> u64 {
+        self.chunk_size
     }
 
     pub async fn allocate_block(&self) -> Result<u64> {
-        let mut free = self.free_blocks.lock();
-        let block_idx = if let Some(&idx) = free.iter().next() {
-            free.remove(&idx);
-            idx
+        let mut found_idx = None;
+        for item in self.free_blocks.iter() {
+            found_idx = Some(*item);
+            break;
+        }
+        let block_idx = if let Some(idx) = found_idx {
+            if self.free_blocks.remove(&idx).is_some() {
+                idx
+            } else {
+                self.highest_block.fetch_add(1, Ordering::Relaxed)
+            }
         } else {
             self.highest_block.fetch_add(1, Ordering::Relaxed)
         };
         let offset = block_idx * self.chunk_size;
-        self.refcounts.lock().insert(offset, 1);
+        let _ = self.refcounts.insert_sync(offset, AtomicU32::new(1));
         Ok(offset)
     }
 
     pub async fn free_block(&self, offset: u64) -> Result<()> {
-        let mut refs = self.refcounts.lock();
-        let should_free = if let Some(count) = refs.get_mut(&offset) {
-            *count -= 1;
-            if *count == 0 {
-                refs.remove(&offset);
+        let should_free = if let Some(cell) = self
+            .refcounts
+            .read_sync(&offset, |_, v| v.fetch_sub(1, Ordering::SeqCst) == 1)
+        {
+            if cell {
+                self.refcounts.remove_sync(&offset);
                 true
             } else {
                 false
@@ -61,10 +76,10 @@ impl BlockAllocator {
 
         if should_free {
             let block_idx = offset / self.chunk_size;
-            self.free_blocks.lock().insert(block_idx);
+            self.free_blocks.insert(block_idx);
             crate::fuse_client::METRICS
                 .del_obj
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(())
@@ -79,13 +94,13 @@ impl BlockAllocator {
 
     pub fn get_used_blocks(&self) -> u64 {
         let highest = self.highest_block.load(Ordering::Relaxed);
-        let free = self.free_blocks.lock().len() as u64;
+        let free = self.free_blocks.len() as u64;
         highest.saturating_sub(free)
     }
 
     pub async fn calculate_fragmentation(&self) -> Result<(u64, u64, u64, f64)> {
         let highest_block = self.highest_block.load(Ordering::Relaxed);
-        let free_blocks = self.free_blocks.lock().len() as u64;
+        let free_blocks = self.free_blocks.len() as u64;
         let used_blocks = highest_block.saturating_sub(free_blocks);
         let frag_percent = if highest_block > 0 {
             (free_blocks as f64 / highest_block as f64) * 100.0
@@ -97,15 +112,14 @@ impl BlockAllocator {
     }
 
     pub async fn allocate_specific_block(&self, block_idx: u64) -> Result<()> {
-        let mut free = self.free_blocks.lock();
         let cur_highest = self.highest_block.load(Ordering::Relaxed);
         if block_idx >= cur_highest {
             for idx in cur_highest..block_idx {
-                free.insert(idx);
+                self.free_blocks.insert(idx);
             }
             self.highest_block.store(block_idx + 1, Ordering::Relaxed);
         } else {
-            if !free.remove(&block_idx) {
+            if !self.free_blocks.remove(&block_idx).is_some() {
                 return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                     "Block {} is not free or does not exist",
                     block_idx
@@ -113,35 +127,38 @@ impl BlockAllocator {
             }
         }
         let offset = block_idx * self.chunk_size;
-        self.refcounts.lock().insert(offset, 1);
+        let _ = self.refcounts.insert_sync(offset, AtomicU32::new(1));
         Ok(())
     }
 
     pub async fn get_free_blocks(&self) -> Result<Vec<u64>> {
-        let free = self.free_blocks.lock();
-        let mut list: Vec<u64> = free.iter().cloned().collect();
+        let mut list: Vec<u64> = self.free_blocks.iter().map(|item| *item).collect();
         list.sort_unstable();
         Ok(list)
     }
 
     pub async fn recover_block(&self, block_idx: u64) -> Result<()> {
-        let mut free = self.free_blocks.lock();
         let cur_highest = self.highest_block.load(Ordering::Relaxed);
         let offset = block_idx * self.chunk_size;
 
         if block_idx >= cur_highest {
             for idx in cur_highest..block_idx {
-                free.insert(idx);
+                self.free_blocks.insert(idx);
             }
             self.highest_block.store(block_idx + 1, Ordering::Relaxed);
-            self.refcounts.lock().insert(offset, 1);
+            let _ = self.refcounts.insert_sync(offset, AtomicU32::new(1));
         } else {
-            if free.remove(&block_idx) {
-                self.refcounts.lock().insert(offset, 1);
+            if self.free_blocks.remove(&block_idx).is_some() {
+                let _ = self.refcounts.insert_sync(offset, AtomicU32::new(1));
             } else {
-                let mut refs = self.refcounts.lock();
-                let count = refs.entry(offset).or_insert(0);
-                *count += 1;
+                match self.refcounts.entry_sync(offset) {
+                    scc::hash_map::Entry::Occupied(mut occ) => {
+                        occ.get_mut().fetch_add(1, Ordering::SeqCst);
+                    }
+                    scc::hash_map::Entry::Vacant(vac) => {
+                        let _ = vac.insert_entry(AtomicU32::new(1));
+                    }
+                }
             }
         }
         Ok(())

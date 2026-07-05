@@ -52,9 +52,23 @@ impl DerefMut for PooledBuf {
     }
 }
 
+pub struct PooledBufOwner {
+    pub buf: PooledBuf,
+}
+
+impl AsRef<[u8]> for PooledBufOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.buf.as_ref().unwrap().as_slice()
+    }
+}
+
 impl PooledBuf {
     pub fn into_inner(mut self) -> Vec<u8> {
         self.buf.take().unwrap()
+    }
+
+    pub fn into_bytes(self) -> bytes::Bytes {
+        bytes::Bytes::from_owner(PooledBufOwner { buf: self })
     }
 }
 
@@ -110,6 +124,24 @@ pub struct AlignedBufOwner {
 
 unsafe impl Send for AlignedBufOwner {}
 unsafe impl Sync for AlignedBufOwner {}
+
+pub struct UringBufOwner {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+unsafe impl Send for UringBufOwner {}
+unsafe impl Sync for UringBufOwner {}
+
+impl AsRef<[u8]> for UringBufOwner {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for UringBufOwner {
+    fn drop(&mut self) {}
+}
 
 impl AsRef<[u8]> for AlignedBufOwner {
     fn as_ref(&self) -> &[u8] {

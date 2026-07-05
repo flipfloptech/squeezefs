@@ -595,6 +595,7 @@ impl DataRouter {
             });
         }
 
+        let mut old_indirect_to_free = None;
         let mut layout = LayoutMetadata {
             file_type: m.file_type.clone(),
             size: m.size,
@@ -658,7 +659,7 @@ impl DataRouter {
             if let Some(ref map_id) = m.block_map_id {
                 if map_id.starts_with("indirect:") {
                     let old_block_key = map_id.strip_prefix("indirect:").unwrap();
-                    let _ = self.backend_router.free_block(old_block_key).await;
+                    old_indirect_to_free = Some(old_block_key.to_string());
                 }
             }
             layout.block_map_id = m.block_map.as_ref().map(|_| format!("block_map_{}", ino));
@@ -676,6 +677,11 @@ impl DataRouter {
             .setattr(ino, None, None, None, Some(m.size), None, None, None)
             .await;
         self.metadata_cache.remove(&file_path);
+
+        if let Some(ref old_key) = old_indirect_to_free {
+            let _ = self.backend_router.free_block(old_key).await;
+        }
+
         Ok(())
     }
 
@@ -1082,6 +1088,17 @@ impl DataRouter {
             return Ok(());
         }
 
+        let end_offset = (offset as usize) + data.len();
+        let _staged_block_guard = if meta.file_type == "staged"
+            || (meta.file_type == "inline"
+                && end_offset > crate::fuse_client::MAX_INLINE_SIZE as usize)
+        {
+            let block_lock = crate::fuse_client::BLOCK_FLUSH_LOCKS.get_lock(ino, 0);
+            Some(block_lock.lock().await)
+        } else {
+            None
+        };
+
         // Read existing data
         let mut existing_data = match meta.file_type.as_str() {
             "inline" => {
@@ -1118,7 +1135,6 @@ impl DataRouter {
         };
 
         // Patch the data
-        let end_offset = (offset as usize) + data.len();
         let stripe_threshold = if self.cache.nvme.staging_dirs().is_empty() {
             MAX_INLINE_SIZE
         } else {
@@ -1379,9 +1395,8 @@ impl DataRouter {
         Ok((block_mappings, sizes_to_register, block_count))
     }
 
-    /// Register a completed stripe layout in Garnet only after durable writes.
-    /// Block-map, refcounts, sizes, and file meta type flip are applied in one
-    /// MULTI/EXEC transaction so readers never observe a half-committed layout (P0-6).
+    /// Register a completed stripe layout in MetaLV after durable block writes.
+    /// Block-map, refcounts, and sizes are updated atomically using the WAL-redo transaction scope.
 
     /// Striped RMW. P1-10: meta connections are phased — open for block-map
     /// reads, **dropped** before durable block I/O, re-acquired only for the
@@ -1539,7 +1554,7 @@ impl DataRouter {
                 let offset = block_allocator.allocate_block().await?;
                 let stored_new_block_key = offset.to_string();
 
-                let block_bytes = bytes::Bytes::from(block_data.into_inner());
+                let block_bytes = block_data.into_bytes();
 
                 read_lru.put(&stored_new_block_key, block_bytes.clone());
 
@@ -1584,6 +1599,7 @@ impl DataRouter {
         }
 
         let mut updated_block_map = block_map;
+        let mut old_keys_to_free = Vec::new();
         for res in &results {
             let (b, old_block_key, new_block_key, _, _) =
                 (res.0, res.1.clone(), res.2.clone(), res.3, res.4);
@@ -1591,7 +1607,7 @@ impl DataRouter {
 
             if let Some(bk) = old_block_key {
                 self.cache.read_lru.remove(&bk);
-                let _ = self.backend_router.free_block(&bk).await;
+                old_keys_to_free.push(bk);
             }
         }
 
@@ -1601,6 +1617,10 @@ impl DataRouter {
         updated_meta.block_map = Some(updated_block_map);
         self.save_metadata_to_backend(ino, &updated_meta, _fencing_token)
             .await?;
+
+        for bk in old_keys_to_free {
+            let _ = self.backend_router.free_block(&bk).await;
+        }
 
         // If file data is fully cached in RAM, update/invalidate
         let mut found_data = self.cache.write_lru.get(file_path);
@@ -1955,7 +1975,10 @@ impl DataRouter {
                 let dest_ptr = dest as *mut u8;
                 unsafe {
                     std::ptr::copy_nonoverlapping(cached_data[start..end].as_ptr(), dest_ptr, len);
-                    bytes::Bytes::from_static(std::slice::from_raw_parts(dest_ptr, len))
+                    bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
+                        ptr: dest_ptr,
+                        len,
+                    })
                 }
             } else {
                 // SAFETY: start and end are clamped to cached_data.len()
@@ -2000,9 +2023,10 @@ impl DataRouter {
                                 dest_ptr,
                                 len,
                             );
-                            let d = bytes::Bytes::from_static(std::slice::from_raw_parts(
-                                dest_ptr, len,
-                            ));
+                            let d = bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
+                                ptr: dest_ptr,
+                                len,
+                            });
                             (
                                 d,
                                 Some(std::sync::Arc::new(guard)
@@ -2076,34 +2100,35 @@ impl DataRouter {
                         let end =
                             std::cmp::min((slice_start + slice_len as u64) as usize, guard.len);
                         let len = end - start;
-                        let (data, backing) = if let Some(dest) = dest_addr {
-                            let dest_ptr = dest as *mut u8;
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    guard[start..end].as_ptr(),
-                                    dest_ptr,
-                                    len,
-                                );
-                                let d = bytes::Bytes::from_static(std::slice::from_raw_parts(
-                                    dest_ptr, len,
-                                ));
+                        let (data, backing) =
+                            if let Some(dest) = dest_addr {
+                                let dest_ptr = dest as *mut u8;
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        guard[start..end].as_ptr(),
+                                        dest_ptr,
+                                        len,
+                                    );
+                                    let d = bytes::Bytes::from_owner(
+                                        crate::cache::pool::UringBufOwner { ptr: dest_ptr, len },
+                                    );
+                                    (
+                                        d,
+                                        Some(std::sync::Arc::new(guard)
+                                            as std::sync::Arc<dyn std::any::Any + Send + Sync>),
+                                    )
+                                }
+                            } else {
+                                let mut sliced_guard = guard;
+                                sliced_guard.offset += start;
+                                sliced_guard.len = len;
+                                let d = bytes::Bytes::copy_from_slice(&sliced_guard);
                                 (
                                     d,
-                                    Some(std::sync::Arc::new(guard)
+                                    Some(std::sync::Arc::new(sliced_guard)
                                         as std::sync::Arc<dyn std::any::Any + Send + Sync>),
                                 )
-                            }
-                        } else {
-                            let mut sliced_guard = guard;
-                            sliced_guard.offset += start;
-                            sliced_guard.len = len;
-                            let d = bytes::Bytes::copy_from_slice(&sliced_guard);
-                            (
-                                d,
-                                Some(std::sync::Arc::new(sliced_guard)
-                                    as std::sync::Arc<dyn std::any::Any + Send + Sync>),
-                            )
-                        };
+                            };
                         return Ok((data, backing));
                     }
 
@@ -2130,9 +2155,12 @@ impl DataRouter {
                                             dest_ptr,
                                             len,
                                         );
-                                        bytes::Bytes::from_static(std::slice::from_raw_parts(
-                                            dest_ptr, len,
-                                        ))
+                                        bytes::Bytes::from_owner(
+                                            crate::cache::pool::UringBufOwner {
+                                                ptr: dest_ptr,
+                                                len,
+                                            },
+                                        )
                                     }
                                 } else {
                                     bytes::Bytes::copy_from_slice(&guard)
@@ -2151,11 +2179,12 @@ impl DataRouter {
                                             .await?;
                                         let len = block_size as usize;
                                         let dest_ptr = dest as *mut u8;
-                                        let b = unsafe {
-                                            bytes::Bytes::from_static(std::slice::from_raw_parts(
-                                                dest_ptr, len,
-                                            ))
-                                        };
+                                        let b = bytes::Bytes::from_owner(
+                                            crate::cache::pool::UringBufOwner {
+                                                ptr: dest_ptr,
+                                                len,
+                                            },
+                                        );
                                         crate::cache::pool::ReadBlockValue::Bytes(b)
                                     } else {
                                         let val = self.get_cached_or_fetch_block(b_key).await?;
@@ -2173,11 +2202,12 @@ impl DataRouter {
                                                 len,
                                             );
                                         }
-                                        let b = unsafe {
-                                            bytes::Bytes::from_static(std::slice::from_raw_parts(
-                                                dest_ptr, len,
-                                            ))
-                                        };
+                                        let b = bytes::Bytes::from_owner(
+                                            crate::cache::pool::UringBufOwner {
+                                                ptr: dest_ptr,
+                                                len,
+                                            },
+                                        );
                                         crate::cache::pool::ReadBlockValue::Bytes(b)
                                     }
                                 } else {
@@ -2199,12 +2229,12 @@ impl DataRouter {
 
                                 if let Some(dest) = dest_addr {
                                     let len = (end_offset - offset) as usize;
-                                    let data = unsafe {
-                                        bytes::Bytes::from_static(std::slice::from_raw_parts(
-                                            dest as *mut u8,
+                                    let data = bytes::Bytes::from_owner(
+                                        crate::cache::pool::UringBufOwner {
+                                            ptr: dest as *mut u8,
                                             len,
-                                        ))
-                                    };
+                                        },
+                                    );
                                     return Ok((data, Some(std::sync::Arc::new(downloaded))));
                                 } else {
                                     let start =
@@ -2225,9 +2255,10 @@ impl DataRouter {
                                 let dest_ptr = dest as *mut u8;
                                 unsafe {
                                     std::ptr::write_bytes(dest_ptr, 0, len);
-                                    bytes::Bytes::from_static(std::slice::from_raw_parts(
-                                        dest_ptr, len,
-                                    ))
+                                    bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
+                                        ptr: dest_ptr,
+                                        len,
+                                    })
                                 }
                             } else {
                                 let mut hole_pooled = BUFFER_POOL.alloc();
@@ -2356,12 +2387,10 @@ impl DataRouter {
                     let data = bytes::Bytes::copy_from_slice(&final_buf[..final_len]);
                     Ok((data, Some(std::sync::Arc::new(final_buf))))
                 } else {
-                    let data = unsafe {
-                        bytes::Bytes::from_static(std::slice::from_raw_parts(
-                            dest_addr.unwrap() as *mut u8,
-                            final_len,
-                        ))
-                    };
+                    let data = bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
+                        ptr: dest_addr.unwrap() as *mut u8,
+                        len: final_len,
+                    });
                     Ok((data, None))
                 }
             }

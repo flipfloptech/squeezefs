@@ -11,16 +11,11 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile};
 
-fn redis_url() -> String {
-    std::env::var("GARNET_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
-}
-
 #[tokio::test]
 async fn test_metalv_fuse_integration() {
     let test_id = "metalv_fuse_test";
 
-    let dlm = DlmClient::new(&redis_url())
-        .unwrap_or_else(|_| DlmClient::new("redis://127.0.0.1:6379").unwrap());
+    let dlm = DlmClient::new("local").unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();
     let backing_path = backing_temp.path().to_path_buf();
@@ -33,7 +28,7 @@ async fn test_metalv_fuse_integration() {
     let block_alloc = Arc::new(
         BlockAllocator::new(dlm.meta_client().clone(), test_id)
             .await
-            .expect("Redis must be available for testing BlockAllocator"),
+            .expect("BlockAllocator initialization failed"),
     );
 
     let temp_staging = tempdir().unwrap();

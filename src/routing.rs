@@ -1164,60 +1164,80 @@ impl DataRouter {
             None
         };
 
-        // Read existing data
-        let mut existing_data = match meta.file_type.as_str() {
-            "inline" => {
-                if let Some(ref d) = meta.data_key {
-                    d.clone()
-                } else {
-                    Vec::new()
-                }
-            }
-            "staged" => {
-                if let Some(ref file_id) = meta.file_id {
-                    if let Some(staged_data) = self.cache.nvme.read_staged(file_id) {
-                        staged_data
-                    } else {
-                        let mapping_opt =
-                            meta.block_map.as_ref().and_then(|bm| bm.get(&0).cloned());
-                        if let Some(mapping_str) = mapping_opt {
-                            let (offset_u64, off, sz) = self.parse_block_mapping(&mapping_str)?;
-                            let packed_bytes =
-                                self.nvme_writer.read_block(offset_u64 + off, sz).await?;
-                            self.get_crypto()
-                                .process_read_async(packed_bytes)
-                                .await?
-                                .to_vec()
-                        } else {
-                            Vec::new()
-                        }
-                    }
-                } else {
-                    Vec::new()
-                }
-            }
-            _ => Vec::new(),
-        };
-
-        // Patch the data
         let stripe_threshold = if self.cache.nvme.staging_dirs().is_empty() {
             MAX_INLINE_SIZE
         } else {
             self.block_size.load(Ordering::Acquire) as usize
         };
 
-        if end_offset > stripe_threshold {
-            // Transition layout → striped.
+        // Full overwrite of empty / new file (common small-file create+write path):
+        // skip loading prior payload and avoid an extra Vec assemble when offset==0.
+        let full_overwrite_empty = offset == 0
+            && meta.size == 0
+            && meta.data_key.as_ref().map(|d| d.is_empty()).unwrap_or(true)
+            && meta.file_id.is_none()
+            && meta.block_map.as_ref().map(|m| m.is_empty()).unwrap_or(true);
+
+        let mut existing_data = if full_overwrite_empty {
+            Vec::new()
+        } else if let Some(cached) = self.cache.write_lru.get(file_path) {
+            cached.to_vec()
+        } else if let Some(cached) = self.cache.read_lru.get(file_path) {
+            cached.to_vec()
+        } else {
+            match meta.file_type.as_str() {
+                "inline" => {
+                    if let Some(ref d) = meta.data_key {
+                        d.clone()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                "staged" => {
+                    if let Some(ref file_id) = meta.file_id {
+                        if let Some(staged_data) = self.cache.nvme.read_staged(file_id) {
+                            staged_data
+                        } else {
+                            let mapping_opt =
+                                meta.block_map.as_ref().and_then(|bm| bm.get(&0).cloned());
+                            if let Some(mapping_str) = mapping_opt {
+                                let (offset_u64, off, sz) =
+                                    self.parse_block_mapping(&mapping_str)?;
+                                let packed_bytes =
+                                    self.nvme_writer.read_block(offset_u64 + off, sz).await?;
+                                self.get_crypto()
+                                    .process_read_async(packed_bytes)
+                                    .await?
+                                    .to_vec()
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => Vec::new(),
+            }
+        };
+
+        // Patch / assemble payload
+        let (payload_bytes, new_size) = if full_overwrite_empty && offset == 0 {
+            let new_size = data.len();
+            (data.clone(), new_size)
+        } else {
             if existing_data.len() < end_offset {
                 existing_data.resize(end_offset, 0);
             }
             existing_data[offset as usize..end_offset].copy_from_slice(&data);
+            let new_size = existing_data.len();
+            (bytes::Bytes::from(existing_data), new_size)
+        };
 
-            let existing_bytes = bytes::Bytes::from(existing_data);
-            let new_size = existing_bytes.len();
-
+        if end_offset > stripe_threshold || new_size > stripe_threshold {
+            // Transition layout → striped.
             let (block_mappings, _sizes, _block_count) =
-                self.durable_write_stripe_payload(existing_bytes).await?;
+                self.durable_write_stripe_payload(payload_bytes).await?;
 
             let mut block_map = std::collections::HashMap::new();
             for (idx_str, key) in block_mappings {
@@ -1245,18 +1265,12 @@ impl DataRouter {
             return Ok(());
         }
 
-        if existing_data.len() < end_offset {
-            existing_data.resize(end_offset, 0);
-        }
-        existing_data[offset as usize..end_offset].copy_from_slice(&data);
-        let new_size = existing_data.len();
-
         if new_size < MAX_INLINE_SIZE {
             // Layout: inline
             crate::fuse_client::METRICS
                 .layout_inline_writes
                 .fetch_add(1, Ordering::Relaxed);
-            let shared_data = bytes::Bytes::from(existing_data);
+            let shared_data = payload_bytes;
 
             let mut updated_meta = meta.clone();
             updated_meta.file_type = "inline".to_string();
@@ -1286,10 +1300,10 @@ impl DataRouter {
             let stage_res = self
                 .cache
                 .nvme
-                .stage_write(file_path, &new_file_id, &existing_data, fencing_token)
+                .stage_write(file_path, &new_file_id, &payload_bytes, fencing_token)
                 .await;
 
-            let shared_data = bytes::Bytes::from(existing_data);
+            let shared_data = payload_bytes;
 
             match stage_res {
                 Ok(_) => {
@@ -1343,12 +1357,9 @@ impl DataRouter {
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
         } else {
-            // First-time striped layout
-            let existing_bytes = bytes::Bytes::from(existing_data);
-            let new_size = existing_bytes.len();
-
+            // First-time striped layout (no staging dirs / above staged threshold).
             let (block_mappings, _sizes, _block_count) =
-                self.durable_write_stripe_payload(existing_bytes).await?;
+                self.durable_write_stripe_payload(payload_bytes).await?;
 
             let mut block_map = std::collections::HashMap::new();
             for (idx_str, key) in block_mappings {

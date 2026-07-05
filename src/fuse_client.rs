@@ -2313,20 +2313,43 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
 
             let file_path = crate::keys::inode_path(ino);
-            let meta = self
-                .router
-                .fetch_metadata(&file_path)
-                .await
-                .map_err(map_squeezefs_err)?;
-
-            let old_size = meta.size;
-            let file_type = meta.file_type.clone();
+            let block_size = self.router.block_size.load(Ordering::Relaxed);
+            // Prefer hot caches for path selection (avoids meta RTT on every small write).
+            // write_file still loads authoritative layout when it mutates data.
+            let (old_size, file_type) = if let Some(m) = self.router.metadata_cache.get(&file_path)
+            {
+                (m.size, m.file_type.clone())
+            } else if let Some((attr, cached_at)) = self.attr_cache.get(&ino) {
+                if cached_at.elapsed() < Duration::from_secs(1) {
+                    let ft = if attr.size > block_size {
+                        "striped".to_string()
+                    } else if attr.size > MAX_INLINE_SIZE {
+                        "staged".to_string()
+                    } else {
+                        "inline".to_string()
+                    };
+                    (attr.size, ft)
+                } else {
+                    let meta = self
+                        .router
+                        .fetch_metadata(&file_path)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                    (meta.size, meta.file_type.clone())
+                }
+            } else {
+                let meta = self
+                    .router
+                    .fetch_metadata(&file_path)
+                    .await
+                    .map_err(map_squeezefs_err)?;
+                (meta.size, meta.file_type.clone())
+            };
             let is_striped = file_type == "striped";
 
             let bytes_written = data.len() as u32;
             let expected_new_size = std::cmp::max(old_size, offset + bytes_written as u64);
 
-            let block_size = self.router.block_size.load(Ordering::Relaxed);
             let fits_inline = expected_new_size <= MAX_INLINE_SIZE
                 && file_type != "staged"
                 && file_type != "striped";
@@ -2387,7 +2410,12 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             } else {
                 if file_type == "inline" || file_type == "staged" {
-                    // Populate block 0 active block buffer with existing data to prevent corruption/zero-filling during promotion
+                    // Promote to striped: need full layout for block-0 seed.
+                    let meta = self
+                        .router
+                        .fetch_metadata(&file_path)
+                        .await
+                        .map_err(map_squeezefs_err)?;
                     let cache_key = crate::keys::active_block(ino, 0).to_string();
                     if file_type == "staged" {
                         if let Some(ref file_id) = meta.file_id {

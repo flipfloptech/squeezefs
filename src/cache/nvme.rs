@@ -741,6 +741,7 @@ impl NvmeStaging {
         }
 
         if let Some(backend) = meta_backend.get() {
+            let mut mapped_count = 0;
             for (item, (_file_id, sub_offset, sub_size)) in
                 processed_items.iter().zip(mappings.iter())
             {
@@ -767,7 +768,12 @@ impl NvmeStaging {
                     meta.file_id = None;
 
                     if let Ok(serialized) = bincode::serialize(&meta) {
-                        let _ = backend.setxattr(ino, "layout", &serialized).await;
+                        if backend.setxattr(ino, "layout", &serialized).await.is_ok() {
+                            mapped_count += 1;
+                            if mapped_count > 1 {
+                                block_allocator.increment_refcount(offset);
+                            }
+                        }
                     }
                 } else {
                     info!(
@@ -775,6 +781,9 @@ impl NvmeStaging {
                         file_path
                     );
                 }
+            }
+            if mapped_count == 0 {
+                let _ = block_allocator.free_block(offset).await;
             }
         }
 

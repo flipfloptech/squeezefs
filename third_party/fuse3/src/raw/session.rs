@@ -1411,12 +1411,23 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
             if let Some(pool) = fuse_connection.over_uring.lock().unwrap().clone() {
                 pool.mark_ready();
-                crate::raw::connection::fuse_over_uring::FuseOverUring::drain_classical_stranded(
-                    fuse_connection.as_fd().as_raw_fd(),
-                );
+                let fd = fuse_connection.as_fd().as_raw_fd();
+                tokio::spawn(async move {
+                    for _ in 0..150 {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        crate::raw::connection::fuse_over_uring::FuseOverUring::drain_classical_stranded(fd);
+                    }
+                });
             }
             eprintln!("FUSE-over-io_uring transport armed for this session");
             tracing::info!("FUSE-over-io_uring transport armed for this session");
+        }
+
+        if let Ok(val) = std::env::var("SQUEEZEFS_DAEMON_PIPE") {
+            if let Ok(fd_num) = val.parse::<i32>() {
+                let msg = "ready\n";
+                let _ = unsafe { libc::write(fd_num, msg.as_ptr() as *const _, msg.len()) };
+            }
         }
 
         debug!("fuse init done");

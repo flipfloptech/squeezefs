@@ -310,13 +310,40 @@ impl BackendRouter {
         }
     }
 
+    fn punch_hole_sync(device_path: &str, offset: u64, size: u64) {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(device_path) {
+                use std::os::unix::io::AsRawFd;
+                let fd = file.as_raw_fd();
+                unsafe {
+                    let _ = libc::fallocate(
+                        fd,
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        offset as libc::off_t,
+                        size as libc::off_t,
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn free_block(&self, block_key: &str) -> Result<()> {
         let (be_id, offset) = self.parse_block_key(block_key)?;
 
-        if be_id == "backend_0" {
+        let device_path = if be_id == "backend_0" {
             let _ = self.default_allocator.free_block(offset).await;
+            Some(self.default_device.device_path.clone())
         } else if let Some(be) = self.backends.get(&be_id) {
             let _ = be.block_allocator.free_block(offset).await;
+            Some(be.device.device_path.clone())
+        } else {
+            None
+        };
+
+        if let Some(path) = device_path {
+            let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
+            Self::punch_hole_sync(&path, offset, block_size);
         }
         Ok(())
     }
@@ -333,11 +360,22 @@ impl BackendRouter {
             }
         }
 
+        let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
         for (be_id, offsets) in backend_groups {
-            if be_id == "backend_0" {
+            let device_path = if be_id == "backend_0" {
                 let _ = self.default_allocator.free_blocks(&offsets).await;
+                Some(self.default_device.device_path.clone())
             } else if let Some(be) = self.backends.get(&be_id) {
                 let _ = be.block_allocator.free_blocks(&offsets).await;
+                Some(be.device.device_path.clone())
+            } else {
+                None
+            };
+
+            if let Some(path) = device_path {
+                for offset in offsets {
+                    Self::punch_hole_sync(&path, offset, block_size);
+                }
             }
         }
         Ok(())
@@ -544,11 +582,18 @@ impl DataRouter {
                                 .await?;
                             let entries = bincode::deserialize::<Vec<(u32, u64)>>(&raw_bytes)
                                 .map_err(|e| {
+                                    let sample = if raw_bytes.len() >= 32 {
+                                        format!("{:x?}", &raw_bytes[..32])
+                                    } else {
+                                        format!("{:x?}", &raw_bytes[..])
+                                    };
                                     SqueezefsError::Io(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
                                         format!(
-                                            "Failed to deserialize indirect block map: {:?}",
-                                            e
+                                            "Failed to deserialize indirect block map: {:?}, raw_bytes len: {}, sample: {}",
+                                            e,
+                                            raw_bytes.len(),
+                                            sample
                                         ),
                                     ))
                                 })?;
@@ -617,7 +662,7 @@ impl DataRouter {
             let bm = m.block_map.as_ref().unwrap();
             let mut entries: Vec<(u32, u64)> = Vec::with_capacity(bm.len());
             for (&b, s) in bm {
-                if let Ok(offset) = s.parse::<u64>() {
+                if let Ok(offset) = self.backend_router.parse_block_offset(s) {
                     entries.push((b, offset));
                 }
             }
@@ -631,25 +676,27 @@ impl DataRouter {
             serialized_map.resize(aligned_len, 0);
 
             // Allocate or reuse indirect block offset
-            let mut offset_to_use = None;
+            let mut reuse_info = None;
             if let Some(ref map_id) = m.block_map_id {
                 if map_id.starts_with("indirect:") {
-                    if let Ok(off) = map_id.strip_prefix("indirect:").unwrap().parse::<u64>() {
-                        offset_to_use = Some(off);
+                    let old_block_key = map_id.strip_prefix("indirect:").unwrap();
+                    if let Ok((be_id, off)) = self.backend_router.parse_block_key(old_block_key) {
+                        reuse_info = Some((be_id, off));
                     }
                 }
             }
 
-            let offset = if let Some(off) = offset_to_use {
-                off
+            let (be_id, offset, nvme_writer) = if let Some((be, off)) = reuse_info {
+                let (_, dev) = self.backend_router.get_backend(&be)?;
+                (be, off, dev)
             } else {
-                let (_, block_allocator, _) = self.backend_router.get_active_backend()?;
-                block_allocator.allocate_block().await?
+                let (be, block_allocator, dev) = self.backend_router.get_active_backend()?;
+                let off = block_allocator.allocate_block().await?;
+                (be, off, dev)
             };
 
-            let block_key = offset.to_string();
+            let block_key = format!("{}://{}", be_id, offset);
             let data_bytes = bytes::Bytes::from(serialized_map);
-            let (_, _, nvme_writer) = self.backend_router.get_active_backend()?;
             nvme_writer.write_block(offset, data_bytes).await?;
 
             layout.block_map = None;
@@ -914,7 +961,6 @@ impl DataRouter {
             }
         }
     }
-
 
     pub async fn load_striped_block_keys(
         &self,
@@ -2046,22 +2092,14 @@ impl DataRouter {
                                 ptr: dest_ptr,
                                 len,
                             });
-                            (
-                                d,
-                                Some(std::sync::Arc::new(guard)
-                                    as std::sync::Arc<dyn std::any::Any + Send + Sync>),
-                            )
+                            (d, None)
                         }
                     } else {
                         let mut sliced_guard = guard;
                         sliced_guard.offset += start;
                         sliced_guard.len = len;
                         let d = bytes::Bytes::copy_from_slice(&sliced_guard);
-                        (
-                            d,
-                            Some(std::sync::Arc::new(sliced_guard)
-                                as std::sync::Arc<dyn std::any::Any + Send + Sync>),
-                        )
+                        (d, None)
                     };
                     Ok((data, backing))
                 } else {
@@ -2131,22 +2169,14 @@ impl DataRouter {
                                     let d = bytes::Bytes::from_owner(
                                         crate::cache::pool::UringBufOwner { ptr: dest_ptr, len },
                                     );
-                                    (
-                                        d,
-                                        Some(std::sync::Arc::new(guard)
-                                            as std::sync::Arc<dyn std::any::Any + Send + Sync>),
-                                    )
+                                    (d, None)
                                 }
                             } else {
                                 let mut sliced_guard = guard;
                                 sliced_guard.offset += start;
                                 sliced_guard.len = len;
                                 let d = bytes::Bytes::copy_from_slice(&sliced_guard);
-                                (
-                                    d,
-                                    Some(std::sync::Arc::new(sliced_guard)
-                                        as std::sync::Arc<dyn std::any::Any + Send + Sync>),
-                                )
+                                (d, None)
                             };
                         return Ok((data, backing));
                     }
@@ -2433,18 +2463,37 @@ impl DataRouter {
     /// Clone a file metadata-only. If it's inline, copy the inline data.
     /// If it's staged, copy the staging folder/files and mapping.
     /// If it's striped, copy the block map and increment all block reference counts.
-    pub async fn clone_file(&self, src: &str, dest: &str) -> Result<()> {
+    pub async fn clone_file(
+        &self,
+        src: &str,
+        dest: &str,
+        src_token: Option<u64>,
+        dest_token: Option<u64>,
+    ) -> Result<()> {
         let _src_ino = parse_inode_from_path(src);
         let dest_ino = parse_inode_from_path(dest);
 
-        let _src_lock = self
-            .dlm
-            .acquire_lock_with_retry(src, None, std::time::Duration::from_secs(5), 5)
-            .await?;
-        let _dest_lock = self
-            .dlm
-            .acquire_lock_with_retry(dest, None, std::time::Duration::from_secs(5), 5)
-            .await?;
+        let _src_lease;
+        let _resolved_src_token = if let Some(t) = src_token {
+            t
+        } else {
+            _src_lease = self
+                .dlm
+                .acquire_lock_with_retry(src, None, std::time::Duration::from_secs(5), 5)
+                .await?;
+            _src_lease.fencing_token()
+        };
+
+        let _dest_lease;
+        let resolved_dest_token = if let Some(t) = dest_token {
+            t
+        } else {
+            _dest_lease = self
+                .dlm
+                .acquire_lock_with_retry(dest, None, std::time::Duration::from_secs(5), 5)
+                .await?;
+            _dest_lease.fencing_token()
+        };
 
         let meta = self.fetch_metadata(src).await?;
 
@@ -2457,7 +2506,7 @@ impl DataRouter {
             if let Some(data) = self.cache.nvme.read_staged(file_id) {
                 self.cache
                     .nvme
-                    .stage_write(dest, &new_file_id, &data, _dest_lock.fencing_token())
+                    .stage_write(dest, &new_file_id, &data, resolved_dest_token)
                     .await?;
             }
             updated_meta.file_id = Some(new_file_id);
@@ -2469,7 +2518,7 @@ impl DataRouter {
             }
         }
 
-        self.save_metadata_to_backend(dest_ino, &updated_meta, _dest_lock.fencing_token())
+        self.save_metadata_to_backend(dest_ino, &updated_meta, resolved_dest_token)
             .await?;
 
         let mut cached_opt = self.cache.write_lru.get(src);
@@ -2484,6 +2533,80 @@ impl DataRouter {
         Ok(())
     }
 
+    /// Truncate a file's layout metadata, reclaiming blocks that fall beyond the new size.
+    pub async fn truncate_layout(&self, ino: u64, new_size: u64, fencing_token: u64) -> Result<()> {
+        let file_path = crate::keys::inode_path(ino);
+        let mut meta = self.fetch_metadata(&file_path).await?;
+        let old_size = meta.size;
+
+        if new_size >= old_size {
+            // Growing the file: update size
+            meta.size = new_size;
+            self.save_metadata_to_backend(ino, &meta, fencing_token)
+                .await?;
+            self.metadata_cache.insert(file_path, meta);
+            return Ok(());
+        }
+
+        // Shrinking the file
+        meta.size = new_size;
+
+        let mut blocks_to_free = Vec::new();
+
+        if let Some(ref mut block_map) = meta.block_map {
+            let block_size = self.block_size.load(Ordering::Relaxed);
+            block_map.retain(|&b, bk| {
+                let block_start = b as u64 * block_size;
+                if block_start >= new_size {
+                    self.cache.read_lru.remove(bk);
+                    let clean_bk = if let Some(pos) = bk.find("://") {
+                        let proto = &bk[..pos];
+                        let rest = &bk[pos + 3..];
+                        let offset = rest.split(':').next().unwrap_or(rest);
+                        format!("{}://{}", proto, offset)
+                    } else {
+                        bk.split(':').next().unwrap_or(bk).to_string()
+                    };
+                    blocks_to_free.push(clean_bk);
+                    false // Remove from block_map
+                } else {
+                    true
+                }
+            });
+        }
+
+        if meta.file_type == "inline" {
+            if let Some(ref mut data) = meta.data_key {
+                data.truncate(new_size as usize);
+            }
+        } else if meta.file_type == "staged" {
+            if let Some(ref file_id) = meta.file_id {
+                if let Some(data) = self.cache.nvme.read_staged(file_id) {
+                    let mut updated_data = data;
+                    updated_data.truncate(new_size as usize);
+                    let _ = self
+                        .cache
+                        .nvme
+                        .stage_write(&file_path, file_id, &updated_data, fencing_token)
+                        .await;
+                }
+            }
+        }
+
+        // Save updated metadata
+        self.save_metadata_to_backend(ino, &meta, fencing_token)
+            .await?;
+        self.metadata_cache.insert(file_path, meta);
+
+        // Free the shrunken blocks
+        if !blocks_to_free.is_empty() {
+            let free_refs: Vec<&str> = blocks_to_free.iter().map(|s| s.as_str()).collect();
+            let _ = self.backend_router.free_blocks(&free_refs).await;
+        }
+
+        Ok(())
+    }
+
     /// Safely delete all underlying storage files/blocks associated with the file.
     pub async fn delete_file(
         &self,
@@ -2493,44 +2616,63 @@ impl DataRouter {
         let ino = parse_inode_from_path(file_path);
         let meta = self.fetch_metadata(file_path).await?;
 
-        if meta.file_type == "striped" {
-            if let Some(ref block_map) = meta.block_map {
-                for bk in block_map.values() {
-                    self.cache.read_lru.remove(bk);
-                    let _ = self.backend_router.free_block(bk).await;
-                }
+        let mut blocks_to_free: Vec<String> = Vec::new();
+
+        if let Some(ref block_map) = meta.block_map {
+            for bk in block_map.values() {
+                self.cache.read_lru.remove(bk);
+                let clean_bk = if let Some(pos) = bk.find("://") {
+                    let proto = &bk[..pos];
+                    let rest = &bk[pos + 3..];
+                    let offset = rest.split(':').next().unwrap_or(rest);
+                    format!("{}://{}", proto, offset)
+                } else {
+                    bk.split(':').next().unwrap_or(bk).to_string()
+                };
+                blocks_to_free.push(clean_bk);
             }
-        } else if meta.file_type == "staged" {
+        }
+
+        if meta.file_type == "staged" {
             if let Some(ref file_id) = meta.file_id {
                 self.cache.nvme.remove_staged(file_id);
-                if let Some(ref block_map) = meta.block_map {
-                    if let Some(bk) = block_map.get(&0) {
-                        let _ = self.backend_router.free_block(bk).await;
-                    }
-                }
             }
         }
 
         if let Some(ref map_id) = meta.block_map_id {
             if map_id.starts_with("indirect:") {
                 let block_key = map_id.strip_prefix("indirect:").unwrap();
-                let _ = self.backend_router.free_block(block_key).await;
+                blocks_to_free.push(block_key.to_string());
             }
+        }
+
+        if !blocks_to_free.is_empty() {
+            let free_refs: Vec<&str> = blocks_to_free.iter().map(|s| s.as_str()).collect();
+            let _ = self.backend_router.free_blocks(&free_refs).await;
         }
 
         if let Some(backend) = self.inner.meta_backend.get() {
             let _ = backend.removexattr(ino, "layout").await;
         }
 
-        let active_block_prefix = crate::keys::active_block_path_prefix(file_path);
-        let keys_to_remove: Vec<String> = self
-            .cache
-            .nvme
-            .list_staged_files()
-            .into_iter()
-            .filter(|k| k.starts_with(active_block_prefix.as_str()))
-            .collect();
-        for key in keys_to_remove {
+        // Targeted O(1) active block removals without full staging listing
+        let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
+        let max_block = if block_size > 0 {
+            (meta.size + block_size - 1) / block_size
+        } else {
+            0
+        };
+        let mut block_indices = std::collections::HashSet::new();
+        for b in 0..=max_block {
+            block_indices.insert(b);
+        }
+        if let Some(ref block_map) = meta.block_map {
+            for &b in block_map.keys() {
+                block_indices.insert(b as u64);
+            }
+        }
+        for b in block_indices {
+            let key = format!("active_block:{}:{}", file_path, b);
             self.cache.nvme.remove_active_block(&key);
         }
 
@@ -2596,6 +2738,8 @@ impl DataRouter {
             self.clone_file(
                 crate::keys::inode_path(src_ino).as_str(),
                 crate::keys::inode_path(dest_inode.ino).as_str(),
+                None,
+                None,
             )
             .await?;
         }

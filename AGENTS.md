@@ -430,8 +430,11 @@ cargo doc --no-deps
 These are **not** part of `cargo test`. Run as **root** on Linux/WSL after material write-path, layout, or FUSE lock changes:
 
 ```bash
-# POSIX compliance (mounted squeezefs)
-sudo tests/run_pjdfstest.sh
+# LTP filesystem syscall tests
+sudo tests/run_ltp_syscalls.sh
+
+# fstests filesystem checks
+sudo tests/run_fstests.sh
 
 # Mount-level IO benchmark
 sudo tests/run_elbencho_mount.sh

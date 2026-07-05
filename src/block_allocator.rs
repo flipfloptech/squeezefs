@@ -35,6 +35,10 @@ impl BlockAllocator {
         }
     }
 
+    pub fn volume_id(&self) -> &str {
+        &self._volume_id
+    }
+
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
     }
@@ -199,8 +203,33 @@ impl BlockAllocator {
                                     if map_id.starts_with("indirect:") {
                                         let indirect_key =
                                             map_id.strip_prefix("indirect:").unwrap();
-                                        if let Ok(offset) = indirect_key.parse::<u64>() {
-                                            let indirect_idx = offset / self.chunk_size;
+                                        let mut matches = false;
+                                        let mut block_offset = 0;
+                                        if let Ok((be_id, offset)) =
+                                            backend_router.parse_block_key(indirect_key)
+                                        {
+                                            if be_id == self._volume_id.as_ref()
+                                                || ((be_id == "backend_0" || be_id == "squeezefs")
+                                                    && (self._volume_id.as_ref() == "squeezefs"
+                                                        || self._volume_id.as_ref()
+                                                            == backend_router
+                                                                .default_allocator
+                                                                .volume_id()))
+                                            {
+                                                matches = true;
+                                                block_offset = offset;
+                                            }
+                                        } else if let Ok(offset) = indirect_key.parse::<u64>() {
+                                            if self._volume_id.as_ref() == "squeezefs"
+                                                || self._volume_id.as_ref()
+                                                    == backend_router.default_allocator.volume_id()
+                                            {
+                                                matches = true;
+                                                block_offset = offset;
+                                            }
+                                        }
+                                        if matches {
+                                            let indirect_idx = block_offset / self.chunk_size;
                                             let _ = self.recover_block(indirect_idx).await;
                                         }
                                         // Read the indirect block to recover its entries
@@ -227,8 +256,33 @@ impl BlockAllocator {
                                     for offset_str in bm.values() {
                                         let block_key =
                                             offset_str.split(':').next().unwrap_or(offset_str);
-                                        if let Ok(offset) = block_key.parse::<u64>() {
-                                            let block_idx = offset / self.chunk_size;
+                                        let mut matches = false;
+                                        let mut block_offset = 0;
+                                        if let Ok((be_id, offset)) =
+                                            backend_router.parse_block_key(block_key)
+                                        {
+                                            if be_id == self._volume_id.as_ref()
+                                                || ((be_id == "backend_0" || be_id == "squeezefs")
+                                                    && (self._volume_id.as_ref() == "squeezefs"
+                                                        || self._volume_id.as_ref()
+                                                            == backend_router
+                                                                .default_allocator
+                                                                .volume_id()))
+                                            {
+                                                matches = true;
+                                                block_offset = offset;
+                                            }
+                                        } else if let Ok(offset) = block_key.parse::<u64>() {
+                                            if self._volume_id.as_ref() == "squeezefs"
+                                                || self._volume_id.as_ref()
+                                                    == backend_router.default_allocator.volume_id()
+                                            {
+                                                matches = true;
+                                                block_offset = offset;
+                                            }
+                                        }
+                                        if matches {
+                                            let block_idx = block_offset / self.chunk_size;
                                             let _ = self.recover_block(block_idx).await;
                                         }
                                     }

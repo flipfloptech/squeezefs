@@ -26,14 +26,7 @@ fn get_fuse_timeout() -> Duration {
             return Duration::from_secs(secs);
         }
     }
-    #[cfg(debug_assertions)]
-    {
-        Duration::from_secs(15)
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        Duration::from_secs(2)
-    }
+    Duration::from_secs(30)
 }
 
 /// # Lock order (P1-9) — always acquire in this order; never invert.
@@ -472,6 +465,13 @@ pub struct SqueezefsFilesystem {
     pub session_connection:
         arc_swap::ArcSwap<Option<std::sync::Arc<fuse3::raw::connection::FuseConnection>>>,
     pub open_inodes: std::sync::Arc<dashmap::DashMap<u64, usize, ahash::RandomState>>,
+    pub reclaim_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    reclaim_tx: tokio::sync::mpsc::Sender<u64>,
+    reclaim_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<u64>>>>,
+    pub open_dir_streams: std::sync::Arc<
+        dashmap::DashMap<u64, std::sync::Arc<[(std::boxed::Box<str>, u64)]>, ahash::RandomState>,
+    >,
+    pub next_dir_fh: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -506,6 +506,11 @@ impl Clone for SqueezefsFilesystem {
             inodes_limit: self.inodes_limit.clone(),
             session_connection: arc_swap::ArcSwap::new(self.session_connection.load_full()),
             open_inodes: self.open_inodes.clone(),
+            reclaim_semaphore: self.reclaim_semaphore.clone(),
+            reclaim_tx: self.reclaim_tx.clone(),
+            reclaim_rx: self.reclaim_rx.clone(),
+            open_dir_streams: self.open_dir_streams.clone(),
+            next_dir_fh: self.next_dir_fh.clone(),
         }
     }
 }
@@ -516,7 +521,21 @@ impl SqueezefsFilesystem {
             .ok()
             .and_then(|val| val.parse::<usize>().ok())
             .unwrap_or(4096);
+        let reclaim_concurrency = std::env::var("SQUEEZEFS_RECLAIM_CONCURRENCY")
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                let cores = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4);
+                std::cmp::max(4, cores)
+            });
+        info!(
+            "Dynamic reclaim concurrency limit configured: {}",
+            reclaim_concurrency
+        );
         let (writeback_tx, writeback_rx) = tokio::sync::mpsc::channel(queue_cap);
+        let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::channel(100000);
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_memory = sys.total_memory();
@@ -574,6 +593,17 @@ impl SqueezefsFilesystem {
             open_inodes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            reclaim_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                reclaim_concurrency,
+            )),
+            reclaim_tx,
+            reclaim_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(reclaim_rx))),
+            open_dir_streams: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            next_dir_fh: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0x2000_0000_0000_0000,
+            )),
         }
     }
 
@@ -600,6 +630,19 @@ impl SqueezefsFilesystem {
         } else {
             false
         }
+    }
+
+    pub fn queue_reclaim_inode(&self, ino: u64) {
+        if ino <= 1 || ino == CONFIG_INODE || ino == STATS_INODE {
+            return;
+        }
+        if self.is_open(ino) {
+            return;
+        }
+        let tx = self.reclaim_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(ino).await;
+        });
     }
 
     pub fn disable_background_writeback(&self) {
@@ -1345,14 +1388,20 @@ impl SqueezefsFilesystem {
         // Durable sync of metadata size if it has changed/grown and wasn't persisted yet
         let file_path = crate::keys::inode_path(ino);
         if let Some(cached) = self.router.metadata_cache.get(&file_path) {
-            let meta_backend = self.router.fetch_metadata_from_backend(ino).await?.unwrap_or_default();
+            let meta_backend = self
+                .router
+                .fetch_metadata_from_backend(ino)
+                .await?
+                .unwrap_or_default();
             if cached.size > meta_backend.size {
                 let mut updated = meta_backend;
                 updated.size = cached.size;
                 updated.file_type = cached.file_type.clone();
                 updated.block_map = cached.block_map.clone();
                 updated.block_map_id = cached.block_map_id.clone();
-                self.router.save_metadata_to_backend(ino, &updated, fencing_token).await?;
+                self.router
+                    .save_metadata_to_backend(ino, &updated, fencing_token)
+                    .await?;
             }
         }
         Ok(())
@@ -1621,33 +1670,34 @@ impl SqueezefsFilesystem {
     /// Free storage for an inode that has `nlink == 0` and is no longer referenced
     /// by the kernel (FORGET). Open-but-unlinked files stay un
     async fn reclaim_orphaned_inode(&self, ino: u64) -> Result<(), Errno> {
+        let _permit = self.reclaim_semaphore.acquire().await.ok();
         if ino <= 1 || ino == CONFIG_INODE || ino == STATS_INODE {
             return Ok(());
         }
         if self.is_open(ino) {
-            info!("RECLAIM: ino = {} is currently open, skipping reclaim", ino);
+            debug!("RECLAIM: ino = {} is currently open, skipping reclaim", ino);
             return Ok(());
         }
         let backend = self
             .meta_backend
             .as_ref()
             .ok_or(Errno::from(libc::ENOSYS))?;
-        info!("RECLAIM: reclaim_orphaned_inode called for ino = {}", ino);
+        debug!("RECLAIM: reclaim_orphaned_inode called for ino = {}", ino);
         let disk_inode = match backend.getattr(ino).await {
             Ok(inode) => inode,
             Err(e) => {
-                info!("RECLAIM: getattr({}) failed: {:?}", ino, e);
+                debug!("RECLAIM: getattr({}) failed: {:?}", ino, e);
                 return Ok(());
             }
         };
         if disk_inode.nlink > 0 {
-            info!(
+            debug!(
                 "RECLAIM: ino = {} has nlink = {}, skipping reclaim",
                 ino, disk_inode.nlink
             );
             return Ok(());
         }
-        info!("RECLAIM: destroying ino = {}", ino);
+        debug!("RECLAIM: destroying ino = {}", ino);
         let file_path = crate::keys::inode_path(ino);
         let mut dummy_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
         let _ = self.router.delete_file(&file_path, &mut dummy_con).await;
@@ -1717,6 +1767,16 @@ impl Filesystem for SqueezefsFilesystem {
                     max_uploads,
                 )
                 .await;
+            });
+        }
+
+        // Start background GC/reclaim worker pool
+        let mut reclaim_rx_guard = self.reclaim_rx.lock().unwrap();
+        if let Some(reclaim_rx) = reclaim_rx_guard.take() {
+            let self_clone = self.clone();
+            let reclaim_concurrency = self.reclaim_semaphore.available_permits();
+            tokio::spawn(async move {
+                run_reclaim_worker_pool(reclaim_rx, self_clone, reclaim_concurrency).await;
             });
         }
 
@@ -1927,21 +1987,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .create(parent, &name_str, mode, req.uid, req.gid)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr = FileAttr {
-                ino: inode.ino,
-                size: inode.size,
-                blocks: inode.size.div_ceil(512),
-                atime: as_timestamp(inode.atime),
-                mtime: as_timestamp(inode.mtime),
-                ctime: as_timestamp(inode.ctime),
-                kind: self.mode_to_file_type(inode.mode),
-                perm: (inode.mode & 0o7777) as u16,
-                nlink: inode.nlink,
-                uid: req.uid,
-                gid: req.gid,
-                rdev,
-                blksize: 4096,
-            };
+            let mut attr = self.inode_to_file_attr(&inode);
+            attr.rdev = rdev;
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.dir_entry_cache.invalidate(&parent);
@@ -1992,21 +2039,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .create(parent, &name_str, mode, req.uid, req.gid)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr = FileAttr {
-                ino: inode.ino,
-                size: inode.size,
-                blocks: inode.size.div_ceil(512),
-                atime: as_timestamp(inode.atime),
-                mtime: as_timestamp(inode.mtime),
-                ctime: as_timestamp(inode.ctime),
-                kind: FileType::RegularFile,
-                perm: (inode.mode & 0o7777) as u16,
-                nlink: inode.nlink,
-                uid: req.uid,
-                gid: req.gid,
-                rdev: 0,
-                blksize: 4096,
-            };
+            let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.dir_entry_cache.invalidate(&parent);
@@ -2071,10 +2104,37 @@ impl Filesystem for SqueezefsFilesystem {
         debug!("FUSE Opendir: inode = {}", inode);
 
         self.add_open(inode);
-        Ok(ReplyOpen {
-            fh: inode,
-            flags: 0,
-        })
+
+        let backend = self
+            .meta_backend
+            .as_ref()
+            .expect("meta_backend must be configured");
+        let list = backend
+            .readdir(inode, 0, 100000)
+            .await
+            .map_err(map_squeezefs_err)?;
+        let mut sorted_entries: Vec<(std::boxed::Box<str>, u64)> = list
+            .into_iter()
+            .map(|d| (d.name.into_boxed_str(), d.ino))
+            .collect();
+        sorted_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let map_arc: std::sync::Arc<[(std::boxed::Box<str>, u64)]> =
+            std::sync::Arc::from(sorted_entries.into_boxed_slice());
+
+        let fh = self.next_dir_fh.fetch_add(1, Ordering::Relaxed);
+        self.open_dir_streams.insert(fh, map_arc);
+
+        Ok(ReplyOpen { fh, flags: 0 })
+    }
+
+    async fn releasedir(&self, _req: Request, ino: u64, fh: u64, _flags: u32) -> FuseResult<()> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE Releasedir: ino = {}, fh = {}", ino, fh);
+
+        self.open_dir_streams.remove(&fh);
+        self.remove_open(ino);
+        self.queue_reclaim_inode(ino);
+        Ok(())
     }
 
     async fn read(
@@ -2167,6 +2227,28 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
+
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let start_block = offset / block_size;
+        let end_block = (offset + read_len as u64 - 1) / block_size;
+
+        if start_block == end_block {
+            let cache_key = crate::keys::active_block(ino, start_block).to_string();
+            if let Some(buf) = self.active_block_buffers.get(&cache_key) {
+                let block_start = start_block * block_size;
+                let rel_offset = (offset - block_start) as usize;
+                let data = buf.value().slice(rel_offset..rel_offset + read_len);
+                return Ok(ReplyData {
+                    data,
+                    backing: None,
+                });
+            }
+        } else {
+            let fencing_token = self.dlm.get_fencing_token(&file_path);
+            let _ = self
+                .flush_active_blocks_with_retry(ino, fencing_token)
+                .await;
+        }
 
         let conn_guard = self.session_connection.load();
         let dest_addr = conn_guard
@@ -2303,6 +2385,27 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             } else {
                 if file_type == "inline" || file_type == "staged" {
+                    // Populate block 0 active block buffer with existing data to prevent corruption/zero-filling during promotion
+                    let cache_key = crate::keys::active_block(ino, 0).to_string();
+                    if file_type == "staged" {
+                        if let Some(ref file_id) = meta.file_id {
+                            if let Some(staged_data) = self.router.cache.nvme.read_staged(file_id) {
+                                self.active_block_buffers
+                                    .insert(cache_key, bytes::Bytes::from(staged_data));
+                            }
+                        }
+                    } else if file_type == "inline" {
+                        if let Some(ref inline_data) = meta.data_key {
+                            let block_size =
+                                self.router.block_size.load(Ordering::Relaxed) as usize;
+                            let mut buf = vec![0u8; block_size];
+                            let copy_len = std::cmp::min(inline_data.len(), block_size);
+                            buf[0..copy_len].copy_from_slice(&inline_data[0..copy_len]);
+                            self.active_block_buffers
+                                .insert(cache_key, bytes::Bytes::from(buf));
+                        }
+                    }
+
                     let mut updated_meta = meta.clone();
                     updated_meta.file_type = "striped".to_string();
                     updated_meta.size = expected_new_size;
@@ -2314,7 +2417,9 @@ impl Filesystem for SqueezefsFilesystem {
                         return Err(map_squeezefs_err(e));
                     }
                 } else if expected_new_size > old_size {
-                    self.router.update_metadata_cache_size(&file_path, expected_new_size).await;
+                    self.router
+                        .update_metadata_cache_size(&file_path, expected_new_size)
+                        .await;
                 }
                 if lock_scope == InodeWriteLockScope::MetaPrepOnly {
                     // Striped: drop inode write lock before long active-block I/O.
@@ -2411,21 +2516,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .create(parent, &name_str, final_mode, req.uid, req.gid)
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr = FileAttr {
-                ino: inode.ino,
-                size: inode.size,
-                blocks: inode.size.div_ceil(512),
-                atime: as_timestamp(inode.atime),
-                mtime: as_timestamp(inode.mtime),
-                ctime: as_timestamp(inode.ctime),
-                kind: FileType::Directory,
-                perm: (inode.mode & 0o7777) as u16,
-                nlink: inode.nlink,
-                uid: req.uid,
-                gid: req.gid,
-                rdev: 0,
-                blksize: 4096,
-            };
+            let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.dir_entry_cache.invalidate(&parent);
@@ -2485,6 +2576,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.dir_entry_cache.invalidate(&current_inode.ino);
             self.attr_cache.invalidate(&parent);
             self.attr_cache.invalidate(&current_inode.ino);
+            self.queue_reclaim_inode(current_inode.ino);
             Ok(())
         };
 
@@ -2553,6 +2645,21 @@ impl Filesystem for SqueezefsFilesystem {
             if let Some(ctime) = set_attr.ctime {
                 ctime_to_set = Some(ctime.sec as u64 * 1_000_000_000 + ctime.nsec as u64);
             }
+            let _guard = if size_to_set.is_some() {
+                Some(self.active_inode_locks.get_inode_lock(ino).write().await)
+            } else {
+                None
+            };
+
+            if let Some(new_size) = size_to_set {
+                let file_path = crate::keys::inode_path(ino);
+                let fencing_token = self.dlm.get_fencing_token(&file_path);
+                self.router
+                    .truncate_layout(ino, new_size, fencing_token)
+                    .await
+                    .map_err(map_squeezefs_err)?;
+            }
+
             let inode = backend
                 .setattr(
                     ino,
@@ -2622,21 +2729,9 @@ impl Filesystem for SqueezefsFilesystem {
                 .setxattr(inode.ino, "system.symlink", link_str.as_bytes())
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr = FileAttr {
-                ino: inode.ino,
-                size: link_str.len() as u64,
-                blocks: 1,
-                atime: as_timestamp(inode.atime),
-                mtime: as_timestamp(inode.mtime),
-                ctime: as_timestamp(inode.ctime),
-                kind: FileType::Symlink,
-                perm: 0o777,
-                nlink: inode.nlink,
-                uid: req.uid,
-                gid: req.gid,
-                rdev: 0,
-                blksize: 4096,
-            };
+            let mut attr = self.inode_to_file_attr(&inode);
+            attr.size = link_str.len() as u64;
+            attr.blocks = 1;
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.dir_entry_cache.invalidate(&parent);
@@ -2674,6 +2769,11 @@ impl Filesystem for SqueezefsFilesystem {
             .await
             .map_err(map_squeezefs_err)?;
         let target_bytes = target.ok_or_else(|| Errno::from(libc::ENOENT))?;
+        debug!(
+            "FUSE readlink: ino = {}, target = {}",
+            ino,
+            String::from_utf8_lossy(&target_bytes)
+        );
         Ok(ReplyData {
             data: target_bytes.into(),
             backing: None,
@@ -2750,26 +2850,14 @@ impl Filesystem for SqueezefsFilesystem {
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
-            let child_ino = if let Ok(inode) = backend.lookup(parent, &name_str).await {
-                Some(inode.ino)
-            } else {
-                None
-            };
-            backend
+            let child_ino = backend
                 .unlink(parent, &name_str)
                 .await
                 .map_err(map_squeezefs_err)?;
             self.dir_entry_cache.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
-            if let Some(c_ino) = child_ino {
-                self.attr_cache.invalidate(&c_ino);
-                if !self.is_open(c_ino) {
-                    let self_clone = self.clone();
-                    tokio::spawn(async move {
-                        let _ = self_clone.reclaim_orphaned_inode(c_ino).await;
-                    });
-                }
-            }
+            self.attr_cache.invalidate(&child_ino);
+            self.queue_reclaim_inode(child_ino);
             Ok(())
         };
 
@@ -2820,7 +2908,7 @@ impl Filesystem for SqueezefsFilesystem {
                 None
             };
             backend
-                .rename(parent, &name_str, new_parent, &new_name_str)
+                .rename(parent, &name_str, new_parent, &new_name_str, 0)
                 .await
                 .map_err(map_squeezefs_err)?;
             self.dir_entry_cache.invalidate(&parent);
@@ -2829,12 +2917,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache.invalidate(&new_parent);
             if let Some(d_ino) = dest_ino {
                 self.attr_cache.invalidate(&d_ino);
-                if !self.is_open(d_ino) {
-                    let self_clone = self.clone();
-                    tokio::spawn(async move {
-                        let _ = self_clone.reclaim_orphaned_inode(d_ino).await;
-                    });
-                }
+                self.queue_reclaim_inode(d_ino);
             }
             Ok(())
         };
@@ -2851,19 +2934,99 @@ impl Filesystem for SqueezefsFilesystem {
         }
     }
 
+    async fn rename2(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> FuseResult<()> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        check_component_name_len(name)?;
+        check_component_name_len(new_name)?;
+        let name_str = osstr_to_cow(name);
+        let new_name_str = osstr_to_cow(new_name);
+        debug!(
+            "FUSE rename2: parent = {}, name = {}, new_parent = {}, new_name = {}, flags = {}",
+            parent, name_str, new_parent, new_name_str, flags
+        );
+
+        if (parent == 1 && name_str == ".config") || (new_parent == 1 && new_name_str == ".config")
+        {
+            return Err(Errno::from(libc::EPERM));
+        }
+
+        let rename_future = async {
+            let backend = self
+                .meta_backend
+                .as_ref()
+                .expect("meta_backend must be configured");
+
+            let src_ino = if let Ok(inode) = backend.lookup(parent, &name_str).await {
+                Some(inode.ino)
+            } else {
+                None
+            };
+            let dest_ino = if let Ok(inode) = backend.lookup(new_parent, &new_name_str).await {
+                Some(inode.ino)
+            } else {
+                None
+            };
+
+            backend
+                .rename(parent, &name_str, new_parent, &new_name_str, flags)
+                .await
+                .map_err(map_squeezefs_err)?;
+
+            self.dir_entry_cache.invalidate(&parent);
+            self.dir_entry_cache.invalidate(&new_parent);
+            self.attr_cache.invalidate(&parent);
+            self.attr_cache.invalidate(&new_parent);
+            if let Some(s_ino) = src_ino {
+                self.attr_cache.invalidate(&s_ino);
+            }
+            if let Some(d_ino) = dest_ino {
+                self.attr_cache.invalidate(&d_ino);
+                if (flags & libc::RENAME_EXCHANGE) == 0 {
+                    self.queue_reclaim_inode(d_ino);
+                }
+            }
+            Ok(())
+        };
+
+        match tokio::time::timeout(get_fuse_timeout(), rename_future).await {
+            Ok(res) => res,
+            Err(_) => {
+                error!(
+                    "FUSE rename2 timeout parent = {}, name = {}, new_parent = {}, new_name = {}",
+                    parent, name_str, new_parent, new_name_str
+                );
+                Err(Errno::from(libc::ETIMEDOUT))
+            }
+        }
+    }
+
     async fn readdir<'a>(
         &'a self,
         _req: Request,
         parent: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<Self::DirEntryStream<'a>>> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_readdir");
-        debug!("FUSE readdir: parent = {}, offset = {}", parent, offset);
+        debug!(
+            "FUSE readdir: parent = {}, fh = {}, offset = {}",
+            parent, fh, offset
+        );
 
         let readdir_future = async {
-            let entries_map = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
+            let entries_map = if let Some(stream) = self.open_dir_streams.get(&fh) {
+                stream.clone()
+            } else if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
                 cached_map
             } else {
                 let backend = self
@@ -3039,15 +3202,20 @@ impl Filesystem for SqueezefsFilesystem {
         &'a self,
         _req: Request,
         parent: u64,
-        _fh: u64,
+        fh: u64,
         offset: u64,
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        debug!("FUSE readdirplus: parent = {}, offset = {}", parent, offset);
+        debug!(
+            "FUSE readdirplus: parent = {}, fh = {}, offset = {}",
+            parent, fh, offset
+        );
 
         let readdirplus_future = async {
-            let entries_map = if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
+            let entries_map = if let Some(stream) = self.open_dir_streams.get(&fh) {
+                stream.clone()
+            } else if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
                 cached_map
             } else {
                 let backend = self
@@ -3293,10 +3461,16 @@ impl Filesystem for SqueezefsFilesystem {
             None
         };
 
+        let same_lock = if let Some(dest_lock) = dest_lock_arc {
+            std::ptr::eq(src_lock_arc, dest_lock)
+        } else {
+            true
+        };
+
         let _src_read_guard;
         let _src_write_guard;
         let _dest_write_guard;
-        if inode == inode_out {
+        if same_lock {
             _src_write_guard = Some(src_lock_arc.write().await);
             _src_read_guard = None;
             _dest_write_guard = None;
@@ -3400,13 +3574,25 @@ impl Filesystem for SqueezefsFilesystem {
             .map_err(map_squeezefs_err)?;
         let dest_size = self.router.get_file_size(&dest_path).await.unwrap_or(0);
 
-        if off_in == 0 && off_out == 0 && length >= src_size && dest_size == 0 {
-            // Drop locks before cloning, clone_file will re-acquire them.
-            drop(src_lease);
-            drop(dest_lease);
+        let src_token = if let Some(ref sl) = src_lease {
+            sl.fencing_token()
+        } else if let Some(lease) = self.active_leases.get(&inode) {
+            lease.fencing_token()
+        } else {
+            0
+        };
 
+        let dest_token = if let Some(ref dl) = dest_lease {
+            dl.fencing_token()
+        } else if let Some(lease) = self.active_leases.get(&inode_out) {
+            lease.fencing_token()
+        } else {
+            0
+        };
+
+        if off_in == 0 && off_out == 0 && length >= src_size && dest_size == 0 {
             self.router
-                .clone_file(&src_path, &dest_path)
+                .clone_file(&src_path, &dest_path, Some(src_token), Some(dest_token))
                 .await
                 .map_err(map_squeezefs_err)?;
 
@@ -3604,11 +3790,7 @@ impl Filesystem for SqueezefsFilesystem {
         // Static lock array does not need dynamic cleanup
 
         self.remove_open(ino);
-        if !self.is_open(ino) {
-            if let Err(e) = self.reclaim_orphaned_inode(ino).await {
-                debug!("FUSE Release: reclaim orphaned inode {} : {:?}", ino, e);
-            }
-        }
+        self.queue_reclaim_inode(ino);
 
         Ok(())
     }
@@ -3627,7 +3809,18 @@ impl Filesystem for SqueezefsFilesystem {
             .await
             .map_err(map_squeezefs_err)?;
 
-        if let Err(e) = self.flush_inode_to_backend(ino, fencing_token).await {
+        let fsync_future = async {
+            self.flush_inode_to_backend(ino, fencing_token).await?;
+            if let Some(backend) = self.meta_backend.as_ref() {
+                backend.sync_all_devices().await?;
+            }
+            Ok::<(), SqueezefsError>(())
+        };
+
+        if let Err(e) = crate::meta_backend::storage::FORCE_SYNC_TX
+            .scope(true, fsync_future)
+            .await
+        {
             error!("FUSE Fsync failed for ino {}: {:?}", ino, e);
             WRITEBACK_HARD_FAILURES.insert(ino, format!("{e:?}"));
             return Err(map_squeezefs_err(e));
@@ -3648,7 +3841,12 @@ impl Filesystem for SqueezefsFilesystem {
     async fn fsyncdir(&self, _req: Request, ino: u64, _fh: u64, _datasync: bool) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Fsyncdir: ino = {}", ino);
-        // Directories are updated synchronously in Garnet, so we just return Ok.
+        if let Some(backend) = self.meta_backend.as_ref() {
+            backend
+                .sync_all_devices()
+                .await
+                .map_err(map_squeezefs_err)?;
+        }
         Ok(())
     }
 
@@ -3719,11 +3917,7 @@ impl Filesystem for SqueezefsFilesystem {
         self.attr_cache.invalidate(&ino);
         self.active_inode_locks.remove(&ino);
         // Reclaim inodes that reached nlink==0 while still open (unlink/14.t).
-        if !self.is_open(ino) {
-            if let Err(e) = self.reclaim_orphaned_inode(ino).await {
-                debug!("FUSE Forget: reclaim orphaned inode {} : {:?}", ino, e);
-            }
-        }
+        self.queue_reclaim_inode(ino);
     }
 
     async fn getlk(
@@ -4259,6 +4453,22 @@ pub async fn start_mount<P: AsRef<Path>>(
     options.allow_other(allow_other);
     options.write_back(writeback);
     options.default_permissions(true);
+
+    if let Some(ref opts) = custom_opts {
+        for opt in opts.split(',') {
+            let opt_trimmed = opt.trim();
+            if !opt_trimmed.is_empty() {
+                let parts: Vec<&str> = opt_trimmed.splitn(2, '=').collect();
+                if parts.len() == 2 {
+                    let key = parts[0].trim();
+                    let val = parts[1].trim();
+                    if key == "fsname" {
+                        options.fs_name(val);
+                    }
+                }
+            }
+        }
+    }
 
     if is_root {
         let filtered_opts = if let Some(ref opts) = custom_opts {
@@ -4948,6 +5158,26 @@ async fn flush_single_active_block(
     }
 
     Ok(())
+}
+
+async fn run_reclaim_worker_pool(
+    mut rx: tokio::sync::mpsc::Receiver<u64>,
+    fs: SqueezefsFilesystem,
+    concurrency: usize,
+) {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let fs_arc = std::sync::Arc::new(fs);
+    while let Some(ino) = rx.recv().await {
+        let fs_clone = fs_arc.clone();
+        let sem_clone = semaphore.clone();
+        let permit = sem_clone.acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = fs_clone.reclaim_orphaned_inode(ino).await {
+                debug!("Reclaim worker failed for ino {}: {:?}", ino, e);
+            }
+        });
+    }
 }
 
 #[cfg(test)]

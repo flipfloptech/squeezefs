@@ -28,15 +28,21 @@ impl Superblock {
 
 #[derive(Clone)]
 pub struct MetaLvStorage {
-    path: PathBuf,
+    pub path: PathBuf,
     pub superblock_lock: Arc<tokio::sync::Mutex<()>>,
     pub inode_lock: Arc<tokio::sync::Mutex<()>>,
     pub dentry_lock: Arc<tokio::sync::Mutex<()>>,
     pub xattr_lock: Arc<tokio::sync::Mutex<()>>,
+    pub transaction_lock: Arc<tokio::sync::Mutex<()>>,
+    pub dentry_index: Arc<scc::HashMap<u64, Vec<(u64, crate::meta_backend::dentry::DiskDentry)>>>,
+    pub dentry_by_offset: Arc<scc::HashMap<u64, (u64, crate::meta_backend::dentry::DiskDentry)>>,
+    pub dentry_occupied_offsets: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    pub dentry_index_initialized: Arc<tokio::sync::OnceCell<()>>,
 }
 
 tokio::task_local! {
-    pub static ACTIVE_TX: std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
+    pub static ACTIVE_TX: std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, u64, Vec<u8>)>>>;
+    pub static FORCE_SYNC_TX: bool;
 }
 
 impl MetaLvStorage {
@@ -77,9 +83,72 @@ impl MetaLvStorage {
             inode_lock: Arc::new(tokio::sync::Mutex::new(())),
             dentry_lock: Arc::new(tokio::sync::Mutex::new(())),
             xattr_lock: Arc::new(tokio::sync::Mutex::new(())),
+            transaction_lock: Arc::new(tokio::sync::Mutex::new(())),
+            dentry_index: Arc::new(scc::HashMap::new()),
+            dentry_by_offset: Arc::new(scc::HashMap::new()),
+            dentry_occupied_offsets: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+            dentry_index_initialized: Arc::new(tokio::sync::OnceCell::new()),
         };
 
         Ok(storage)
+    }
+
+    pub async fn ensure_dentry_index(&self) -> Result<()> {
+        self.dentry_index_initialized
+            .get_or_try_init(|| async {
+                use crate::meta_backend::dentry::{
+                    DiskDentry, DENTRY_SLOT_SIZE, DENTRY_TABLE_START, MAX_DENTRY_SLOTS,
+                };
+                use zerocopy::IntoBytes;
+
+                let batch_sectors = 64;
+                let batch_size = batch_sectors * SECTOR_SIZE;
+                let mut buf = vec![0u8; batch_size];
+
+                let total_slots = MAX_DENTRY_SLOTS;
+                let slots_per_batch = batch_size / DENTRY_SLOT_SIZE;
+
+                let mut local_occupied = std::collections::HashSet::new();
+
+                for batch_idx in 0..(total_slots as usize / slots_per_batch) {
+                    let batch_start_offset = DENTRY_TABLE_START + (batch_idx * batch_size) as u64;
+                    self.read_blocks_direct(batch_start_offset, &mut buf)
+                        .await?;
+
+                    for slot_idx in 0..slots_per_batch {
+                        let offset_in_buf = slot_idx * DENTRY_SLOT_SIZE;
+                        let p_ino = u64::from_le_bytes(
+                            buf[offset_in_buf..offset_in_buf + 8].try_into().unwrap(),
+                        );
+                        if p_ino != 0 {
+                            let mut d = DiskDentry::new_zeroed();
+                            d.as_mut_bytes().copy_from_slice(
+                                &buf[offset_in_buf..offset_in_buf + DENTRY_SLOT_SIZE],
+                            );
+                            let offset = batch_start_offset + (slot_idx * DENTRY_SLOT_SIZE) as u64;
+
+                            local_occupied.insert(offset);
+
+                            self.dentry_index
+                                .entry_sync(p_ino)
+                                .or_default()
+                                .get_mut()
+                                .push((offset, d));
+
+                            let _ = self.dentry_by_offset.insert_sync(offset, (p_ino, d));
+                        }
+                    }
+                }
+
+                let mut occupied = self.dentry_occupied_offsets.lock().unwrap();
+                *occupied = local_occupied;
+
+                Ok::<(), SqueezefsError>(())
+            })
+            .await?;
+        Ok(())
     }
 
     /// Read the Superblock at offset 0
@@ -125,8 +194,8 @@ impl MetaLvStorage {
         let mut found_in_tx = false;
         let _ = ACTIVE_TX.try_with(|tx| {
             let guard = tx.lock().unwrap();
-            for (off, data) in guard.iter().rev() {
-                if *off == offset && data.len() == buf.len() {
+            for (path, off, data) in guard.iter().rev() {
+                if path == &self.path && *off == offset && data.len() == buf.len() {
                     buf.copy_from_slice(data);
                     found_in_tx = true;
                     break;
@@ -141,6 +210,26 @@ impl MetaLvStorage {
         }
     }
 
+    pub fn get_size(&self) -> u64 {
+        if let Ok(file) = OpenOptions::new().read(true).open(&self.path) {
+            use std::io::Seek;
+            let mut f = file;
+            f.seek(std::io::SeekFrom::End(0)).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    pub fn max_inodes(&self) -> usize {
+        let size = self.get_size();
+        let xattr_start = 1024 * 1024 * 72; // XATTR_BLOCK_START
+        if size > xattr_start {
+            ((size - xattr_start) / 4096) as usize
+        } else {
+            0
+        }
+    }
+
     pub async fn read_blocks_direct(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         if offset % SECTOR_SIZE as u64 != 0 {
             return Err(SqueezefsError::InvalidOperation(format!(
@@ -149,7 +238,14 @@ impl MetaLvStorage {
             )));
         }
         let bytes = crate::uring_fs::read_at(&self.path, offset, buf.len()).await?;
-        buf.copy_from_slice(&bytes);
+        let read_len = bytes.len();
+        if read_len > 0 {
+            let limit = std::cmp::min(read_len, buf.len());
+            buf[..limit].copy_from_slice(&bytes[..limit]);
+        }
+        if read_len < buf.len() {
+            buf[read_len..].fill(0);
+        }
         Ok(())
     }
 
@@ -164,7 +260,9 @@ impl MetaLvStorage {
 
         let mut redirected = false;
         let _ = ACTIVE_TX.try_with(|tx| {
-            tx.lock().unwrap().push((offset, buf.to_vec()));
+            tx.lock()
+                .unwrap()
+                .push((self.path.clone(), offset, buf.to_vec()));
             redirected = true;
         });
 

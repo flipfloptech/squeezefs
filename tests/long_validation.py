@@ -8,6 +8,8 @@ import urllib.request
 import urllib.error
 import subprocess
 import shutil
+import threading
+import concurrent.futures
 
 # Predefined list of validation targets with direct links and hash reference sites
 TARGETS = [
@@ -42,7 +44,7 @@ TARGETS = [
 ]
 
 def fetch_expected_hash(target):
-    print(f"Fetching expected SHA-256 for {target['name']}...")
+    print(f"[{target['name']}] Fetching expected SHA-256...")
     req = urllib.request.Request(
         target["hash_url"],
         headers={"User-Agent": "Mozilla/5.0"}
@@ -57,19 +59,22 @@ def fetch_expected_hash(target):
                     if target["filename"] in line:
                         return line.split()[0].strip()
     except Exception as e:
-        print(f"Error fetching expected hash: {e}")
+        print(f"[{target['name']}] Error fetching expected hash: {e}")
         return None
     return None
 
-def download_and_verify(target, dest_dir):
+def download_and_verify(target, dest_dir, verbose=True):
     dest_path = os.path.join(dest_dir, target["filename"])
     expected_hash = fetch_expected_hash(target)
     if not expected_hash:
-        print("Could not obtain expected hash. Skipping this target.")
+        print(f"[{target['name']}] Could not obtain expected hash. Skipping this target.")
         return False
 
-    print(f"Expected Hash: {expected_hash}")
-    
+    if verbose:
+        print(f"[{target['name']}] Expected Hash: {expected_hash}")
+    else:
+        print(f"[{target['name']}] Started download and verification...")
+
     sha256 = hashlib.sha256()
     start_time = time.time()
     downloaded_bytes = 0
@@ -93,35 +98,35 @@ def download_and_verify(target, dest_dir):
                     sha256.update(chunk)
                     downloaded_bytes += len(chunk)
                     
-                    elapsed = time.time() - start_time
-                    speed = (downloaded_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                    
-                    if total_size > 0:
-                        pct = (downloaded_bytes / total_size) * 100
-                        print(f"\rProgress: {pct:.2f}% ({downloaded_bytes / (1024*1024):.1f}/{total_size / (1024*1024):.1f} MB) | Speed: {speed:.2f} MB/s", end="", flush=True)
-                    else:
-                        print(f"\rDownloaded: {downloaded_bytes / (1024*1024):.1f} MB | Speed: {speed:.2f} MB/s", end="", flush=True)
-        print("\nDownload complete. Verifying signature...")
+                    if verbose:
+                        elapsed = time.time() - start_time
+                        speed = (downloaded_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                        if total_size > 0:
+                            pct = (downloaded_bytes / total_size) * 100
+                            print(f"\rProgress [{target['name']}]: {pct:.2f}% ({downloaded_bytes / (1024*1024):.1f}/{total_size / (1024*1024):.1f} MB) | Speed: {speed:.2f} MB/s", end="", flush=True)
+                        else:
+                            print(f"\rDownloaded [{target['name']}]: {downloaded_bytes / (1024*1024):.1f} MB | Speed: {speed:.2f} MB/s", end="", flush=True)
+        if verbose:
+            print(f"\n[{target['name']}] Download complete. Verifying signature...")
         actual_hash = sha256.hexdigest()
-        print(f"Actual Hash:   {actual_hash}")
         
         if actual_hash == expected_hash:
-            print("🟢 Verification SUCCESS!")
+            print(f"🟢 [{target['name']}] Verification SUCCESS!")
             return True
         else:
-            print("🔴 Verification FAILURE! Hashes do not match.")
+            print(f"🔴 [{target['name']}] Verification FAILURE! Hashes do not match.")
             return False
             
     except Exception as e:
-        print(f"\nError occurred during download/verification: {e}")
+        print(f"\n[{target['name']}] Error occurred during download/verification: {e}")
         return False
     finally:
         # Clean up the file
         if os.path.exists(dest_path):
-            print(f"Cleaning up {dest_path}...")
+            if verbose:
+                print(f"Cleaning up {dest_path}...")
             try:
                 os.remove(dest_path)
-                print("Cleaned up successfully.")
             except Exception as e:
                 print(f"Error deleting file: {e}")
 
@@ -135,55 +140,65 @@ def generate_file_content(path, index, size):
     padding = (pattern * (padding_len // len(pattern) + 1))[:padding_len]
     return header_bytes + padding
 
-def create_tree_recursive(base_dir, depth, max_depth, breadth, files_per_dir, file_size_range, file_map):
-    if depth > max_depth:
-        return
-    
-    os.makedirs(base_dir, exist_ok=True)
-    
-    # Create files in this directory
+def generate_dir_files(dir_path, depth, files_per_dir, file_size_range, file_map, lock):
+    os.makedirs(dir_path, exist_ok=True)
+    local_map = {}
     for i in range(files_per_dir):
         filename = f"file_{i}.dat"
-        filepath = os.path.join(base_dir, filename)
-        # Deterministic size based on filename and index to keep it consistent
+        filepath = os.path.join(dir_path, filename)
         size = file_size_range[0] + (i * 37 + depth * 13) % (file_size_range[1] - file_size_range[0] + 1)
         content = generate_file_content(filepath, i, size)
         
         with open(filepath, "wb") as f:
             f.write(content)
             
-        file_map[filepath] = hashlib.sha256(content).hexdigest()
-        
-    # Create subdirectories
+        local_map[filepath] = hashlib.sha256(content).hexdigest()
+    with lock:
+        file_map.update(local_map)
+
+def collect_dirs_recursive(base_dir, depth, max_depth, breadth, dirs_to_create):
+    if depth > max_depth:
+        return
+    dirs_to_create.append((base_dir, depth))
     for b in range(breadth):
         subdir_name = f"dir_{b}"
         subdir_path = os.path.join(base_dir, subdir_name)
-        create_tree_recursive(subdir_path, depth + 1, max_depth, breadth, files_per_dir, file_size_range, file_map)
+        collect_dirs_recursive(subdir_path, depth + 1, max_depth, breadth, dirs_to_create)
 
-def verify_and_clean_tree(base_dir, file_map):
-    # Verify hashes
-    print(f"Verifying directory tree files in {base_dir}...")
-    verified_count = 0
-    errors = 0
-    for filepath, expected_hash in file_map.items():
-        if not os.path.exists(filepath):
-            print(f"Error: Expected file {filepath} does not exist!")
-            errors += 1
-            continue
-        try:
-            with open(filepath, "rb") as f:
-                data = f.read()
-            actual_hash = hashlib.sha256(data).hexdigest()
+def verify_single_file(filepath, expected_hash, results_lock, counter_dict):
+    if not os.path.exists(filepath):
+        print(f"Error: Expected file {filepath} does not exist!")
+        with results_lock:
+            counter_dict["errors"] += 1
+        return
+    try:
+        with open(filepath, "rb") as f:
+            data = f.read()
+        actual_hash = hashlib.sha256(data).hexdigest()
+        with results_lock:
             if actual_hash != expected_hash:
                 print(f"Error: Hash mismatch for file {filepath}!")
-                errors += 1
+                counter_dict["errors"] += 1
             else:
-                verified_count += 1
-        except Exception as e:
-            print(f"Error reading/verifying {filepath}: {e}")
-            errors += 1
-            
-    print(f"Verification complete: {verified_count} verified, {errors} errors.")
+                counter_dict["verified"] += 1
+    except Exception as e:
+        print(f"Error reading/verifying {filepath}: {e}")
+        with results_lock:
+            counter_dict["errors"] += 1
+
+def verify_and_clean_tree(base_dir, file_map, num_threads):
+    print(f"Verifying directory tree files in {base_dir} (using {num_threads} threads)...")
+    results_lock = threading.Lock()
+    counter_dict = {"verified": 0, "errors": 0}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [
+            executor.submit(verify_single_file, filepath, expected_hash, results_lock, counter_dict)
+            for filepath, expected_hash in file_map.items()
+        ]
+        concurrent.futures.wait(futures)
+        
+    print(f"Verification complete: {counter_dict['verified']} verified, {counter_dict['errors']} errors.")
     
     # Cleanup tree using recursive delete
     print("Cleaning up directory tree...")
@@ -192,9 +207,9 @@ def verify_and_clean_tree(base_dir, file_map):
         print("Directory tree cleaned up successfully.")
     except Exception as e:
         print(f"Error cleaning up directory tree: {e}")
-        errors += 1
+        counter_dict["errors"] += 1
         
-    return errors == 0
+    return counter_dict["errors"] == 0
 
 def kill_old_squeezefs_daemon(mount_dir):
     try:
@@ -233,7 +248,8 @@ def remount_squeezefs(squeezefs_bin, meta_uri, mount_dir, disk_cache_paths, log_
         "--disk-cache-paths",
         disk_cache_paths,
         "--log-file",
-        log_file
+        log_file,
+        "--allow-others"
     ]
     print(f"Running command: {' '.join(cmd)}")
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -252,6 +268,7 @@ def main():
     parser.add_argument("--limit", type=str, choices=["none", "small", "medium", "large"], default="large",
                         help="Size limit of downloads (small <= 38MB, medium <= 370MB, large <= 2.6GB)")
     parser.add_argument("--loops", type=int, default=0, help="Number of loops to run (0 for infinite)")
+    parser.add_argument("--threads", type=int, default=4, help="Number of worker threads to run validation tasks")
     
     # Remount options
     parser.add_argument("--squeezefs-bin", help="Squeezefs binary path for remount testing")
@@ -284,6 +301,7 @@ def main():
     print(f"Starting long validation test on mount: {args.dir}")
     print(f"Running with download limit: {args.limit} ({len(run_targets)} targets)")
     print(f"Tree structure: depth={args.tree_depth}, breadth={args.tree_breadth}, files/dir={args.tree_files}")
+    print(f"Running with {args.threads} worker threads")
     
     loop_count = 0
     try:
@@ -296,32 +314,64 @@ def main():
             # Phase 1: Directory Tree Creation & Verification
             tree_base = os.path.join(args.dir, f"stress_tree_loop_{loop_count}")
             file_map = {}
-            print(f"Generating recursive directory tree at {tree_base}...")
-            create_tree_recursive(
-                base_dir=tree_base,
-                depth=1,
-                max_depth=args.tree_depth,
-                breadth=args.tree_breadth,
-                files_per_dir=args.tree_files,
-                file_size_range=(100, 15000),  # 100 bytes to 15KB
-                file_map=file_map
-            )
+            print(f"Generating directory tree at {tree_base}...")
+            
+            dirs_to_create = []
+            collect_dirs_recursive(tree_base, 1, args.tree_depth, args.tree_breadth, dirs_to_create)
+            
+            map_lock = threading.Lock()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+                futures = [
+                    executor.submit(
+                        generate_dir_files,
+                        dir_path,
+                        depth,
+                        args.tree_files,
+                        (100, 15000),
+                        file_map,
+                        map_lock
+                    )
+                    for dir_path, depth in dirs_to_create
+                ]
+                concurrent.futures.wait(futures)
+                
             print(f"Successfully generated {len(file_map)} files inside directory tree.")
             
             # Verify and delete
-            if not verify_and_clean_tree(tree_base, file_map):
+            if not verify_and_clean_tree(tree_base, file_map, args.threads):
                 print("🔴 Directory tree verification or cleanup FAILED!")
                 sys.exit(3)
             print("🟢 Directory tree phase complete.")
             
-            # Phase 2: Download & Hash Verification
-            for target in run_targets:
-                print(f"\nRunning download test for target: {target['name']}")
-                success = download_and_verify(target, args.dir)
-                if not success:
-                    print("🔴 Target download validation FAILED! Halting execution.")
-                    sys.exit(2)
-                print("🟢 Target download test complete.")
+            # Phase 2: Download & Hash Verification (Parallelized if threads > 1)
+            print(f"Starting parallel download validation for {len(run_targets)} targets...")
+            is_parallel = args.threads > 1
+            
+            if is_parallel:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.threads, len(run_targets))) as executor:
+                    futures = {
+                        executor.submit(download_and_verify, target, args.dir, verbose=False): target
+                        for target in run_targets
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        target = futures[future]
+                        try:
+                            success = future.result()
+                            if not success:
+                                print(f"🔴 Target download validation FAILED for {target['name']}! Halting execution.")
+                                sys.exit(2)
+                            print(f"🟢 Target download test complete: {target['name']}")
+                        except Exception as e:
+                            print(f"🔴 Target download exception for {target['name']}: {e}")
+                            sys.exit(2)
+            else:
+                for target in run_targets:
+                    print(f"\nRunning download test for target: {target['name']}")
+                    success = download_and_verify(target, args.dir, verbose=True)
+                    if not success:
+                        print("🔴 Target download validation FAILED! Halting execution.")
+                        sys.exit(2)
+                    print("🟢 Target download test complete.")
                 
             # Phase 3: Dismount & Remount scenario
             can_remount = all([args.squeezefs_bin, args.meta_uri, args.disk_cache_paths, args.log_file])

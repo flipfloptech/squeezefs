@@ -795,32 +795,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else if pid > 0 {
                 // Parent process
                 libc::close(pipefd[1]);
-                let flags = libc::fcntl(pipefd[0], libc::F_GETFL);
-                if flags >= 0 {
-                    libc::fcntl(pipefd[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
 
                 let mut child_error = String::new();
+                let mut ready = false;
+                let start = std::time::Instant::now();
+
                 print!("Mounting Squeezefs at {:?}...", mountpoint_path);
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
 
-                let mut ready = false;
-                let start = std::time::Instant::now();
-                while start.elapsed() < std::time::Duration::from_secs(30) {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                let mut pfd = libc::pollfd {
+                    fd: pipefd[0],
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
 
+                loop {
+                    let elapsed = start.elapsed().as_millis() as i32;
+                    let timeout = (30000 - elapsed).max(0);
+                    if timeout == 0 {
+                        break;
+                    }
+                    let r = libc::poll(&mut pfd, 1, timeout);
+                    if r < 0 {
+                        let e = std::io::Error::last_os_error();
+                        if e.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        break;
+                    }
+                    if r == 0 {
+                        break;
+                    }
                     let mut buf = [0u8; 1024];
                     let n = libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len());
-                    if n > 0 {
-                        if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
-                            child_error.push_str(s);
+                    if n < 0 {
+                        let e = std::io::Error::last_os_error();
+                        if e.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        break;
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                        child_error.push_str(s);
+                        if child_error.contains("ready\n") {
+                            ready = true;
+                            break;
                         }
                     }
+                }
 
+                println!();
+                if ready {
+                    println!(
+                        "\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}",
+                        mountpoint_path
+                    );
+                    libc::close(pipefd[0]);
+                    std::process::exit(0);
+                } else {
                     let mut status = 0;
                     let wait_res = libc::waitpid(pid, &mut status, libc::WNOHANG);
                     if wait_res == pid {
+                        let mut buf = [0u8; 1024];
                         loop {
                             let n = libc::read(
                                 pipefd[0],
@@ -834,54 +874,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 child_error.push_str(s);
                             }
                         }
-                        println!();
-                        if !child_error.is_empty() {
+                        let clean_err = child_error.replace("ready\n", "");
+                        if !clean_err.trim().is_empty() {
                             eprintln!(
                                 "Failed to start squeezefs daemon. Child error:\n{}",
-                                child_error
+                                clean_err
                             );
                         } else {
                             eprintln!(
                                 "Failed to start squeezefs daemon. Child process exited early."
                             );
                         }
-                        libc::close(pipefd[0]);
-                        std::process::exit(1);
+                    } else {
+                        eprintln!("The mount point is not ready in 30 seconds, exiting");
+                        let _ = std::process::Command::new("umount")
+                            .arg("-l")
+                            .arg(&mountpoint_path)
+                            .output();
+                        libc::kill(pid, libc::SIGKILL);
                     }
-
-                    match std::fs::metadata(&mountpoint_path) {
-                        Ok(metadata) => {
-                            use std::os::unix::fs::MetadataExt;
-                            if metadata.ino() == 1 {
-                                ready = true;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                                ready = true;
-                                break;
-                            }
-                        }
-                    }
-                    print!(".");
-                    let _ = std::io::stdout().flush();
-                }
-                println!();
-                if ready {
-                    println!(
-                        "\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}",
-                        mountpoint_path
-                    );
-                    libc::close(pipefd[0]);
-                    std::process::exit(0);
-                } else {
-                    eprintln!("The mount point is not ready in 30 seconds, exiting");
-                    let _ = std::process::Command::new("umount")
-                        .arg("-l")
-                        .arg(&mountpoint_path)
-                        .output();
-                    libc::kill(pid, libc::SIGKILL);
                     libc::close(pipefd[0]);
                     std::process::exit(1);
                 }
@@ -890,6 +901,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Child process continues here
             libc::close(pipefd[0]);
             DAEMON_PIPE.store(pipefd[1], std::sync::atomic::Ordering::Relaxed);
+            std::env::set_var("SQUEEZEFS_DAEMON_PIPE", pipefd[1].to_string());
 
             std::panic::set_hook(Box::new(|panic_info| {
                 let fd = DAEMON_PIPE.load(std::sync::atomic::Ordering::Relaxed);
@@ -898,6 +910,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
                     let _ = libc::close(fd);
                 }
+                eprintln!("PANIC occurred: {}", panic_info);
             }));
 
             libc::setsid();
@@ -1915,10 +1928,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::storage::validate_backing_device(first_data_path)?;
 
             let dlm = DlmClient::new("local")?;
+
+            let first_name = std::path::Path::new(first_data_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(first_data_path)
+                .to_string();
+
             let block_alloc = std::sync::Arc::new(
                 squeezefs::block_allocator::BlockAllocator::new(
                     dlm.meta_client().clone(),
-                    "squeezefs",
+                    &first_name,
                 )
                 .await?,
             );
@@ -1951,14 +1971,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .to_string();
 
                 log::info!("Registering data volume '{}' at path {}", name, path);
-                let dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(path));
-                let alloc = std::sync::Arc::new(
-                    squeezefs::block_allocator::BlockAllocator::new(
-                        dlm.meta_client().clone(),
-                        &name,
-                    )
-                    .await?,
-                );
+                let (dev, alloc) = if path == first_data_path {
+                    (nvme_dev.clone(), block_alloc.clone())
+                } else {
+                    let d = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(path));
+                    let a = std::sync::Arc::new(
+                        squeezefs::block_allocator::BlockAllocator::new(
+                            dlm.meta_client().clone(),
+                            &name,
+                        )
+                        .await?,
+                    );
+                    (d, a)
+                };
 
                 let backend = std::sync::Arc::new(squeezefs::routing::StorageBackend {
                     device: dev,
@@ -1968,11 +1993,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 router.backend_router.backends.insert(name.clone(), backend);
             }
 
-            let first_name = std::path::Path::new(first_data_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(first_data_path)
-                .to_string();
             router
                 .backend_router
                 .active_write_backend

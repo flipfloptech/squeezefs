@@ -16,6 +16,7 @@ struct JournalInner {
 struct JournalRequest {
     record: Vec<u8>,
     tx: oneshot::Sender<Result<()>>,
+    sync: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -49,7 +50,12 @@ impl Journal {
     }
 
     /// Write a redo log record to the circular journal
-    pub async fn write_record(&self, storage: &MetaLvStorage, record: &[u8]) -> Result<()> {
+    pub async fn write_record(
+        &self,
+        storage: &MetaLvStorage,
+        record: &[u8],
+        sync: bool,
+    ) -> Result<()> {
         let inner = self.get_inner(storage).await;
         let (tx, rx) = oneshot::channel();
         inner
@@ -57,6 +63,7 @@ impl Journal {
             .send(JournalRequest {
                 record: record.to_vec(),
                 tx,
+                sync,
             })
             .await
             .map_err(|_| {
@@ -255,6 +262,31 @@ async fn journal_worker_loop(
         }
     }
 
+    let flush_interval_ms = std::env::var("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let needs_flush = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    if flush_interval_ms > 0 {
+        let needs_flush_clone = needs_flush.clone();
+        let device_path = storage.device_path().to_path_buf();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(flush_interval_ms));
+            loop {
+                interval.tick().await;
+                if std::sync::Arc::strong_count(&needs_flush_clone) <= 1 {
+                    break;
+                }
+                if needs_flush_clone.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = crate::uring_fs::fdatasync(&device_path).await;
+                }
+            }
+        });
+    }
+
     while let Some(first_req) = rx.recv().await {
         let mut reqs = vec![first_req];
         while reqs.len() < 32 {
@@ -265,7 +297,11 @@ async fn journal_worker_loop(
         }
 
         let mut write_failed = false;
+        let mut force_sync = false;
         for req in &reqs {
+            if req.sync {
+                force_sync = true;
+            }
             let payload_len = req.record.len() as u32;
             let mut record_bytes = Vec::with_capacity(4 + req.record.len() + 8);
             record_bytes.extend_from_slice(&payload_len.to_le_bytes());
@@ -310,11 +346,15 @@ async fn journal_worker_loop(
         }
 
         if !write_failed {
-            if crate::uring_fs::fdatasync(storage.device_path())
-                .await
-                .is_err()
-            {
-                write_failed = true;
+            if force_sync || flush_interval_ms == 0 {
+                if crate::uring_fs::fdatasync(storage.device_path())
+                    .await
+                    .is_err()
+                {
+                    write_failed = true;
+                }
+            } else {
+                needs_flush.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
 

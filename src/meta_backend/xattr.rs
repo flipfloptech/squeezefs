@@ -2,7 +2,7 @@ use crate::error::{Result, SqueezefsError};
 use crate::meta_backend::storage::{MetaLvStorage, SECTOR_SIZE};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-pub const XATTR_BLOCK_START: u64 = 1024 * 1024 * 24; // 24MB offset
+pub const XATTR_BLOCK_START: u64 = 1024 * 1024 * 72; // 72MB offset
 pub const ENTRY_SIZE: usize = 1092;
 
 #[derive(IntoBytes, FromBytes, Immutable, Debug, Clone, Copy)]

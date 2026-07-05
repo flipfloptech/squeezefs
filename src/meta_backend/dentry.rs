@@ -5,8 +5,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 pub const DENTRY_TABLE_START: u64 = 1024 * 1024 * 8; // 8 MiB boundary
 pub const DENTRY_SLOT_SIZE: usize = 512;
 pub const DENTRIES_PER_SECTOR: usize = SECTOR_SIZE / DENTRY_SLOT_SIZE;
-pub const MAX_HASH_BUCKETS: u64 = 8192;
-pub const MAX_DENTRY_SLOTS: u64 = 32768;
+pub const MAX_HASH_BUCKETS: u64 = 32768;
+pub const MAX_DENTRY_SLOTS: u64 = 131072;
 
 #[derive(IntoBytes, FromBytes, Immutable, Debug, Clone, Copy)]
 #[repr(C)]
@@ -112,21 +112,19 @@ pub async fn find_dentry(
     parent_ino: u64,
     name: &str,
 ) -> Result<Option<DiskDentry>> {
+    storage.ensure_dentry_index().await?;
     let _guard = storage.dentry_lock.lock().await;
-    let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
-    let mut offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
 
-    loop {
-        let d = read_dentry_raw(storage, offset).await?;
-        if d.parent_ino == parent_ino && d.get_name() == name {
-            return Ok(Some(d));
+    let mut found = None;
+    let _ = storage.dentry_index.read_sync(&parent_ino, |_, entries| {
+        for (_, d) in entries {
+            if d.get_name() == name {
+                found = Some(*d);
+                break;
+            }
         }
-        if d.next_ptr == 0 {
-            break;
-        }
-        offset = d.next_ptr;
-    }
-    Ok(None)
+    });
+    Ok(found)
 }
 
 /// Inserts a new dentry inside a parent directory.
@@ -137,40 +135,50 @@ pub async fn insert_dentry(
     name: &str,
     file_type: u32,
 ) -> Result<()> {
+    storage.ensure_dentry_index().await?;
     let _guard = storage.dentry_lock.lock().await;
     let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
     let bucket_offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
 
-    let head = read_dentry_raw(storage, bucket_offset).await?;
-    if head.parent_ino == 0 {
+    let head_occupied = {
+        let occupied = storage.dentry_occupied_offsets.lock().unwrap();
+        occupied.contains(&bucket_offset)
+    };
+
+    let new_dentry = DiskDentry::new(parent_ino, child_ino, name, file_type);
+
+    if !head_occupied {
         // Bucket head is free, insert here!
-        let new_dentry = DiskDentry::new(parent_ino, child_ino, name, file_type);
         write_dentry_raw(storage, bucket_offset, &new_dentry).await?;
+
+        // Update in-memory index
+        storage
+            .dentry_occupied_offsets
+            .lock()
+            .unwrap()
+            .insert(bucket_offset);
+        storage
+            .dentry_index
+            .entry_sync(parent_ino)
+            .or_default()
+            .get_mut()
+            .push((bucket_offset, new_dentry));
+        let _ = storage
+            .dentry_by_offset
+            .insert_sync(bucket_offset, (parent_ino, new_dentry));
         return Ok(());
     }
 
-    // Bucket head is occupied. Find a free slot using sector-batched scanning from overflow region.
+    // Bucket head is occupied. Find a free slot in overflow region.
     let mut free_offset = 0;
-    let batch_sectors = 64;
-    let batch_size = batch_sectors * SECTOR_SIZE;
-    let mut buf = vec![0u8; batch_size];
-
-    let slots_per_batch = batch_size / DENTRY_SLOT_SIZE;
-    let start_batch = (MAX_HASH_BUCKETS as usize) / slots_per_batch;
-    let end_batch = (MAX_DENTRY_SLOTS as usize) / slots_per_batch;
-
-    'outer: for batch_idx in start_batch..end_batch {
-        let batch_start_offset = DENTRY_TABLE_START + (batch_idx * batch_size) as u64;
-        storage.read_blocks(batch_start_offset, &mut buf).await?;
-
-        for slot_idx in 0..slots_per_batch {
-            let slot_offset = batch_start_offset + (slot_idx * DENTRY_SLOT_SIZE) as u64;
-            let offset_in_buf = slot_idx * DENTRY_SLOT_SIZE;
-            let parent_ino_in_slot =
-                u64::from_le_bytes(buf[offset_in_buf..offset_in_buf + 8].try_into().unwrap());
-            if parent_ino_in_slot == 0 {
-                free_offset = slot_offset;
-                break 'outer;
+    {
+        let mut occupied = storage.dentry_occupied_offsets.lock().unwrap();
+        for i in MAX_HASH_BUCKETS..MAX_DENTRY_SLOTS {
+            let offset = DENTRY_TABLE_START + i * DENTRY_SLOT_SIZE as u64;
+            if !occupied.contains(&offset) {
+                free_offset = offset;
+                occupied.insert(offset);
+                break;
             }
         }
     }
@@ -182,27 +190,69 @@ pub async fn insert_dentry(
     }
 
     // Write the new dentry to the free slot
-    let mut new_dentry = DiskDentry::new(parent_ino, child_ino, name, file_type);
-    new_dentry.next_ptr = 0;
-    write_dentry_raw(storage, free_offset, &new_dentry).await?;
+    let mut new_dentry_with_link = new_dentry;
+    new_dentry_with_link.next_ptr = 0;
+    write_dentry_raw(storage, free_offset, &new_dentry_with_link).await?;
 
-    // Now link it to the end of the chain starting at bucket_offset.
+    // Link it to the end of the chain starting at bucket_offset.
     let mut curr_offset = bucket_offset;
     loop {
-        let mut d = read_dentry_raw(storage, curr_offset).await?;
+        let mut d = DiskDentry::new_zeroed();
+        let mut p_ino = 0;
+        let found = storage
+            .dentry_by_offset
+            .read_sync(&curr_offset, |_k_p_ino, val| {
+                p_ino = val.0;
+                d = val.1;
+            });
+        if found.is_none() {
+            break;
+        }
         if d.next_ptr == 0 {
             d.next_ptr = free_offset;
             write_dentry_raw(storage, curr_offset, &d).await?;
+
+            // Update in-memory index
+            match storage.dentry_by_offset.entry_sync(curr_offset) {
+                scc::hash_map::Entry::Occupied(mut occ) => {
+                    occ.get_mut().1.next_ptr = free_offset;
+                }
+                _ => {}
+            }
+            match storage.dentry_index.entry_sync(p_ino) {
+                scc::hash_map::Entry::Occupied(mut occ) => {
+                    if let Some(tuple) = occ
+                        .get_mut()
+                        .iter_mut()
+                        .find(|(off, _)| *off == curr_offset)
+                    {
+                        tuple.1.next_ptr = free_offset;
+                    }
+                }
+                _ => {}
+            }
             break;
         }
         curr_offset = d.next_ptr;
     }
+
+    // Insert new dentry to in-memory maps
+    storage
+        .dentry_index
+        .entry_sync(parent_ino)
+        .or_default()
+        .get_mut()
+        .push((free_offset, new_dentry_with_link));
+    let _ = storage
+        .dentry_by_offset
+        .insert_sync(free_offset, (parent_ino, new_dentry_with_link));
 
     Ok(())
 }
 
 /// Removes a dentry from a parent directory.
 pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str) -> Result<()> {
+    storage.ensure_dentry_index().await?;
     let _guard = storage.dentry_lock.lock().await;
     let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
     let bucket_offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
@@ -211,7 +261,15 @@ pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str)
     let mut curr_offset = bucket_offset;
 
     loop {
-        let d = read_dentry_raw(storage, curr_offset).await?;
+        // Look up current dentry in memory
+        let mut d = DiskDentry::new_zeroed();
+        let found = storage.dentry_by_offset.read_sync(&curr_offset, |_, val| {
+            d = val.1;
+        });
+        if found.is_none() {
+            break;
+        }
+
         if d.parent_ino == parent_ino && d.get_name() == name {
             // Found the dentry!
             if prev_offset == 0 {
@@ -221,21 +279,89 @@ pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str)
                     let mut empty = DiskDentry::new_zeroed();
                     empty.parent_ino = 0;
                     write_dentry_raw(storage, curr_offset, &empty).await?;
+
+                    // Update in-memory maps
+                    storage.dentry_by_offset.remove_sync(&curr_offset);
+                    storage
+                        .dentry_occupied_offsets
+                        .lock()
+                        .unwrap()
+                        .remove(&curr_offset);
+                    match storage.dentry_index.entry_sync(parent_ino) {
+                        scc::hash_map::Entry::Occupied(mut occ) => {
+                            occ.get_mut().retain(|(off, _)| *off != curr_offset);
+                        }
+                        _ => {}
+                    }
                 } else {
                     // There are other dentries. Copy the next dentry into the head slot, and mark the next slot as free!
                     let next_offset = d.next_ptr;
-                    let next_dentry = read_dentry_raw(storage, next_offset).await?;
+                    let mut next_dentry = DiskDentry::new_zeroed();
+                    let next_found = storage.dentry_by_offset.read_sync(&next_offset, |_, val| {
+                        next_dentry = val.1;
+                    });
+                    if next_found.is_none() {
+                        return Err(SqueezefsError::InvalidOperation(
+                            "next_dentry missing".into(),
+                        ));
+                    }
                     write_dentry_raw(storage, curr_offset, &next_dentry).await?;
 
                     // Clear the next slot
                     let mut empty = DiskDentry::new_zeroed();
                     empty.parent_ino = 0;
                     write_dentry_raw(storage, next_offset, &empty).await?;
+
+                    // Update in-memory maps:
+                    // 1. Remove deleted dentry from parent_ino's entry list
+                    match storage.dentry_index.entry_sync(parent_ino) {
+                        scc::hash_map::Entry::Occupied(mut occ) => {
+                            occ.get_mut().retain(|(off, _)| *off != curr_offset);
+                        }
+                        _ => {}
+                    }
+
+                    // 2. Since next_dentry is moved from next_offset to curr_offset,
+                    // we must update next_dentry.parent_ino's entry list!
+                    match storage.dentry_index.entry_sync(next_dentry.parent_ino) {
+                        scc::hash_map::Entry::Occupied(mut occ) => {
+                            let entries = occ.get_mut();
+                            // Remove next_offset
+                            entries.retain(|(off, _)| *off != next_offset);
+                            // Add curr_offset
+                            entries.push((curr_offset, next_dentry));
+                        }
+                        scc::hash_map::Entry::Vacant(vac) => {
+                            vac.insert_entry(vec![(curr_offset, next_dentry)]);
+                        }
+                    }
+
+                    // 3. Update dentry_by_offset
+                    storage.dentry_by_offset.remove_sync(&curr_offset);
+                    let _ = storage
+                        .dentry_by_offset
+                        .insert_sync(curr_offset, (next_dentry.parent_ino, next_dentry));
+                    storage.dentry_by_offset.remove_sync(&next_offset);
+                    storage
+                        .dentry_occupied_offsets
+                        .lock()
+                        .unwrap()
+                        .remove(&next_offset);
                 }
             } else {
                 // It is a middle/tail dentry in the chain.
                 // Update predecessor's next_ptr.
-                let mut prev_dentry = read_dentry_raw(storage, prev_offset).await?;
+                let mut prev_p_ino = 0;
+                let mut prev_dentry = DiskDentry::new_zeroed();
+                let prev_found = storage.dentry_by_offset.read_sync(&prev_offset, |_, val| {
+                    prev_p_ino = val.0;
+                    prev_dentry = val.1;
+                });
+                if prev_found.is_none() {
+                    return Err(SqueezefsError::InvalidOperation(
+                        "prev_dentry missing".into(),
+                    ));
+                }
                 prev_dentry.next_ptr = d.next_ptr;
                 write_dentry_raw(storage, prev_offset, &prev_dentry).await?;
 
@@ -243,6 +369,40 @@ pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str)
                 let mut empty = DiskDentry::new_zeroed();
                 empty.parent_ino = 0;
                 write_dentry_raw(storage, curr_offset, &empty).await?;
+
+                // Update in-memory maps
+                storage.dentry_by_offset.remove_sync(&curr_offset);
+                storage
+                    .dentry_occupied_offsets
+                    .lock()
+                    .unwrap()
+                    .remove(&curr_offset);
+                match storage.dentry_index.entry_sync(parent_ino) {
+                    scc::hash_map::Entry::Occupied(mut occ) => {
+                        occ.get_mut().retain(|(off, _)| *off != curr_offset);
+                    }
+                    _ => {}
+                }
+                // Update predecessor in parent index
+                match storage.dentry_index.entry_sync(prev_p_ino) {
+                    scc::hash_map::Entry::Occupied(mut occ) => {
+                        if let Some(tuple) = occ
+                            .get_mut()
+                            .iter_mut()
+                            .find(|(off, _)| *off == prev_offset)
+                        {
+                            tuple.1.next_ptr = d.next_ptr;
+                        }
+                    }
+                    _ => {}
+                }
+                // Update predecessor in dentry_by_offset
+                match storage.dentry_by_offset.entry_sync(prev_offset) {
+                    scc::hash_map::Entry::Occupied(mut occ) => {
+                        occ.get_mut().1.next_ptr = d.next_ptr;
+                    }
+                    _ => {}
+                }
             }
             return Ok(());
         }
@@ -262,33 +422,14 @@ pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str)
 
 /// List all dentries in a parent directory.
 pub async fn list_dentries(storage: &MetaLvStorage, parent_ino: u64) -> Result<Vec<DiskDentry>> {
+    storage.ensure_dentry_index().await?;
     let _guard = storage.dentry_lock.lock().await;
+
     let mut list = Vec::new();
-
-    // We scan the dentry table in sectors/batches (sector-batched scanning).
-    let batch_sectors = 64;
-    let batch_size = batch_sectors * SECTOR_SIZE;
-    let mut buf = vec![0u8; batch_size];
-
-    let total_slots = MAX_DENTRY_SLOTS;
-    let slots_per_batch = batch_size / DENTRY_SLOT_SIZE;
-
-    for batch_idx in 0..(total_slots as usize / slots_per_batch) {
-        let batch_start_offset = DENTRY_TABLE_START + (batch_idx * batch_size) as u64;
-        storage.read_blocks(batch_start_offset, &mut buf).await?;
-
-        for slot_idx in 0..slots_per_batch {
-            let offset_in_buf = slot_idx * DENTRY_SLOT_SIZE;
-            let p_ino =
-                u64::from_le_bytes(buf[offset_in_buf..offset_in_buf + 8].try_into().unwrap());
-            if p_ino == parent_ino {
-                let mut d = DiskDentry::new_zeroed();
-                d.as_mut_bytes()
-                    .copy_from_slice(&buf[offset_in_buf..offset_in_buf + DENTRY_SLOT_SIZE]);
-                list.push(d);
-            }
+    let _ = storage.dentry_index.read_sync(&parent_ino, |_, entries| {
+        for (_, d) in entries {
+            list.push(*d);
         }
-    }
-
+    });
     Ok(list)
 }

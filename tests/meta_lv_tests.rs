@@ -61,7 +61,7 @@ async fn test_metalv_crud_operations() {
 
     // Rename the file
     backend
-        .rename(1, "hello.txt", 1, "world.txt")
+        .rename(1, "hello.txt", 1, "world.txt", 0)
         .await
         .unwrap();
 
@@ -171,5 +171,123 @@ async fn test_metalv_bitmap_and_hash_chains() {
         } else {
             assert_eq!(res.unwrap().ino, sub_file.1);
         }
+    }
+}
+
+#[tokio::test]
+async fn test_bench_rmdir_simulation() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    let storage = MetaLvStorage::open(&path, 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+    let backend = MetaLvBackend::new(storage);
+
+    let parent = backend
+        .create(1, "bench_dir_0", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+
+    // Create 100 directories
+    for i in 0..100 {
+        let name = format!("dir_{}", i);
+        backend
+            .create(parent.ino, &name, libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap();
+    }
+
+    // Verify all 100 can be looked up
+    for i in 0..100 {
+        let name = format!("dir_{}", i);
+        let found = backend.lookup(parent.ino, &name).await.unwrap();
+        assert!(found.ino > parent.ino);
+    }
+
+    // Delete them one by one
+    for i in 0..100 {
+        let name = format!("dir_{}", i);
+        backend.unlink(parent.ino, &name).await.unwrap();
+
+        // Verify it is gone
+        assert!(backend.lookup(parent.ino, &name).await.is_err());
+
+        // Verify the remaining ones are still there
+        for j in (i + 1)..100 {
+            let rem_name = format!("dir_{}", j);
+            let found = backend.lookup(parent.ino, &rem_name).await.unwrap();
+            assert!(found.ino > parent.ino);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_bench_rmdir_simulation_concurrent() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    let storage = MetaLvStorage::open(&path, 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+    use std::sync::Arc;
+    let backend = Arc::new(MetaLvBackend::new(storage));
+
+    let threads = 10;
+    let count = 100;
+
+    let mut parents = Vec::new();
+    for i in 0..threads {
+        let name = format!("bench_dir_{}", i);
+        let parent = backend
+            .create(1, &name, libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap();
+        parents.push(parent);
+    }
+
+    let mut handles = Vec::new();
+    for parent in &parents {
+        let backend = backend.clone();
+        let parent_ino = parent.ino;
+        handles.push(tokio::spawn(async move {
+            // Create 100 directories
+            for i in 0..count {
+                let name = format!("dir_{}", i);
+                backend
+                    .create(parent_ino, &name, libc::S_IFDIR | 0o755, 0, 0)
+                    .await
+                    .unwrap();
+            }
+
+            // Verify they exist
+            for i in 0..count {
+                let name = format!("dir_{}", i);
+                let found = backend.lookup(parent_ino, &name).await.unwrap();
+                assert!(found.ino > parent_ino);
+            }
+
+            // Delete them one by one
+            for i in 0..count {
+                let name = format!("dir_{}", i);
+                if let Err(e) = backend.unlink(parent_ino, &name).await {
+                    println!(
+                        "[PANIC] Unlink failed: parent_ino = {}, name = {}, error = {:?}",
+                        parent_ino, name, e
+                    );
+                    panic!("unlink failed");
+                }
+
+                // Verify it is gone
+                assert!(backend.lookup(parent_ino, &name).await.is_err());
+
+                // Verify the remaining ones are still there
+                for j in (i + 1)..count {
+                    let rem_name = format!("dir_{}", j);
+                    let found = backend.lookup(parent_ino, &rem_name).await.unwrap();
+                    assert!(found.ino > parent_ino);
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
     }
 }

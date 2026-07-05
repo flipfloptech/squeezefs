@@ -58,7 +58,17 @@ impl SqueezefsError {
             SqueezefsError::NvmeOfBackend(_) => libc::EIO,
             SqueezefsError::LockFailed { .. } => libc::EAGAIN,
             SqueezefsError::FencingTokenExpired { .. } => libc::EIO,
-            SqueezefsError::InvalidOperation(_) => libc::EINVAL,
+            SqueezefsError::InvalidOperation(msg) => {
+                if msg.contains("exists") || msg.contains("Already exists") {
+                    libc::EEXIST
+                } else if msg.contains("table full") || msg.contains("No space") {
+                    libc::ENOSPC
+                } else if msg.contains("Too many links") {
+                    libc::EMLINK
+                } else {
+                    libc::EINVAL
+                }
+            }
             SqueezefsError::GdsError(_) => libc::EIO,
             SqueezefsError::CacheOverflow => libc::ENOMEM,
             SqueezefsError::Timeout => libc::ETIMEDOUT,

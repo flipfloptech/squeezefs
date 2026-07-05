@@ -67,6 +67,13 @@ pub async fn read_inode(storage: &MetaLvStorage, index: u64) -> Result<DiskInode
         &sector_buf[slot_in_sector * INODE_SLOT_SIZE..(slot_in_sector + 1) * INODE_SLOT_SIZE];
     inode.as_mut_bytes().copy_from_slice(slot_bytes);
 
+    if inode.magic == 0 {
+        return Err(SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Inode slot {} is empty (magic 0)", index),
+        )));
+    }
+
     if inode.magic != 0x4E4F4445 {
         return Err(SqueezefsError::InvalidOperation(format!(
             "Inode slot {} has invalid magic: {:#X} (expected 0x4E4F4445), raw slot (first 32B): {:?}",

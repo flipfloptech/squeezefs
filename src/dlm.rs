@@ -1,12 +1,11 @@
 use crate::error::Result;
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-static LOCK_MAP: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static FENCING_MAP: Lazy<Mutex<HashMap<String, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static LOCK_MAP: Lazy<scc::HashMap<String, String>> = Lazy::new(|| scc::HashMap::new());
+static FENCING_MAP: Lazy<scc::HashMap<String, AtomicU64>> = Lazy::new(|| scc::HashMap::new());
 static LOCK_RELEASED: Lazy<tokio::sync::Notify> = Lazy::new(|| tokio::sync::Notify::new());
 
 #[derive(Clone)]
@@ -88,8 +87,9 @@ impl DlmClient {
     }
     pub fn get_fencing_token(&self, file_path: &str) -> u64 {
         let gen_key = format!("fencing_generator:{}", file_path);
-        let map = FENCING_MAP.lock();
-        map.get(&gen_key).copied().unwrap_or(0)
+        FENCING_MAP
+            .read_sync(&gen_key, |_, v| v.load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     pub async fn get_pubsub_connection(&self) -> Result<MockPubSub> {
@@ -127,24 +127,21 @@ impl DlmClient {
             let notified = LOCK_RELEASED.notified();
             let pinned_notified = std::pin::pin!(notified);
 
-            let acquired = {
-                let mut map = LOCK_MAP.lock();
-                if map.contains_key(&lock_key) {
-                    false
-                } else {
-                    map.insert(lock_key.clone(), self.client_id.clone());
+            let acquired = match LOCK_MAP.entry_sync(lock_key.clone()) {
+                scc::hash_map::Entry::Occupied(_) => false,
+                scc::hash_map::Entry::Vacant(vac) => {
+                    let _ = vac.insert_entry(self.client_id.clone());
                     true
                 }
             };
 
             if acquired {
                 let gen_key = format!("fencing_generator:{}", file_path);
-                let fencing_token = {
-                    let mut map = FENCING_MAP.lock();
-                    let entry = map.entry(gen_key).or_insert(0);
-                    *entry += 1;
-                    *entry
-                };
+                let fencing_token = FENCING_MAP
+                    .entry_sync(gen_key)
+                    .or_insert_with(|| AtomicU64::new(0))
+                    .fetch_add(1, Ordering::SeqCst)
+                    + 1;
 
                 return Ok(LockLease {
                     inner: std::sync::Arc::new(LockLeaseInner {
@@ -184,12 +181,15 @@ struct LockLeaseInner {
 
 impl Drop for LockLeaseInner {
     fn drop(&mut self) {
-        let mut map = LOCK_MAP.lock();
-        if let Some(owner) = map.get(&self.lock_key) {
+        let mut removed = false;
+        let _ = LOCK_MAP.read_sync(&self.lock_key, |_, owner| {
             if owner == &self.client_id {
-                map.remove(&self.lock_key);
-                LOCK_RELEASED.notify_waiters();
+                removed = true;
             }
+        });
+        if removed {
+            LOCK_MAP.remove_sync(&self.lock_key);
+            LOCK_RELEASED.notify_waiters();
         }
     }
 }
@@ -201,12 +201,11 @@ pub struct LockLease {
 
 impl LockLease {
     pub async fn is_held(&self) -> bool {
-        let map = LOCK_MAP.lock();
-        if let Some(owner) = map.get(&self.inner.lock_key) {
-            owner == &self.inner.client_id
-        } else {
-            false
-        }
+        LOCK_MAP
+            .read_sync(&self.inner.lock_key, |_, owner| {
+                owner == &self.inner.client_id
+            })
+            .unwrap_or(false)
     }
 
     pub fn fencing_token(&self) -> u64 {
@@ -226,12 +225,15 @@ impl LockLease {
     }
 
     pub async fn release(self) -> Result<()> {
-        let mut map = LOCK_MAP.lock();
-        if let Some(owner) = map.get(&self.inner.lock_key) {
+        let mut removed = false;
+        let _ = LOCK_MAP.read_sync(&self.inner.lock_key, |_, owner| {
             if owner == &self.inner.client_id {
-                map.remove(&self.inner.lock_key);
-                LOCK_RELEASED.notify_waiters();
+                removed = true;
             }
+        });
+        if removed {
+            LOCK_MAP.remove_sync(&self.inner.lock_key);
+            LOCK_RELEASED.notify_waiters();
         }
         Ok(())
     }

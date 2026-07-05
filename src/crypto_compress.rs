@@ -390,6 +390,9 @@ impl CryptoCompressState {
         if self.is_passthrough() {
             return Ok(data);
         }
+        if data.len() < 65536 {
+            return self.process_write(data);
+        }
         let state = self.clone();
         tokio::task::spawn_blocking(move || state.process_write(data))
             .await
@@ -402,6 +405,10 @@ impl CryptoCompressState {
     ) -> Result<bytes::Bytes, SqueezefsError> {
         if self.is_passthrough() {
             return Ok(data);
+        }
+        if data.len() < 65536 {
+            let res = self.process_read(&data)?;
+            return Ok(bytes::Bytes::from(res.into_owned()));
         }
         let state = self.clone();
         tokio::task::spawn_blocking(move || {

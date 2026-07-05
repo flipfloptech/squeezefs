@@ -18,11 +18,11 @@ pub mod routing;
 #[macro_export]
 macro_rules! coz_progress {
     ($name:expr) => {
-        #[cfg(feature = "coz-on")]
+        #[cfg(all(feature = "coz-on", not(test)))]
         coz::progress!($name);
     };
     () => {
-        #[cfg(feature = "coz-on")]
+        #[cfg(all(feature = "coz-on", not(test)))]
         coz::progress!();
     };
 }

@@ -1041,7 +1041,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let first_meta_path = &meta_lvs[0];
         let storage = match squeezefs::meta_backend::storage::MetaLvStorage::open(
             first_meta_path,
-            64 * 1024 * 1024,
+            128 * 1024 * 1024,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1542,7 +1542,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let _permit = sem.acquire().await.unwrap();
                     let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
                         &path,
-                        64 * 1024 * 1024,
+                        128 * 1024 * 1024,
                     )
                     .map_err(|e| format!("Failed to open metadata volume '{}': {}", path, e))?;
                     let pb = if !quick {
@@ -1640,7 +1640,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let first_meta_path = &meta_lvs[0];
             let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
                 first_meta_path,
-                64 * 1024 * 1024,
+                128 * 1024 * 1024,
             )?;
             let config_bytes = serde_json::to_vec(&config)?;
             squeezefs::meta_backend::xattr::set_xattr(
@@ -1767,7 +1767,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let first_meta_path = &meta_lvs[0];
             let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
                 first_meta_path,
-                64 * 1024 * 1024,
+                128 * 1024 * 1024,
             )?;
             let _disk_inode = squeezefs::meta_backend::inode::read_inode(&storage, 1).await?;
             let val_opt = squeezefs::meta_backend::xattr::get_xattr(
@@ -1981,7 +1981,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut meta_backends = Vec::new();
             for path in &meta_lvs {
                 let storage =
-                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 256 * 1024 * 1024)?;
+                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 128 * 1024 * 1024)?;
                 let be = std::sync::Arc::new(squeezefs::meta_backend::MetaLvBackend::new(storage));
                 meta_backends.push(be);
             }

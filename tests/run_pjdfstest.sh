@@ -93,7 +93,7 @@ cd "$REPO_DIR"
 
 # Mount squeezefs (daemon must be root for chown/mknod tests; --allow-other for harness)
 echo "Mounting squeezefs..."
-RUST_LOG=debug "$SQUEEZEFS_BIN" mount \
+SQUEEZEFS_TIMEOUT=15 RUST_LOG=debug "$SQUEEZEFS_BIN" mount \
     sqmeta:///dev/shm/squeezefs_pjdfs_meta \
     "$MOUNT_DIR" \
     --daemon \

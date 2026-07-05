@@ -757,7 +757,182 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dhat-on")]
     let _profiler = dhat::Profiler::new_heap();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    #[cfg(unix)]
+    if let Commands::Mount {
+        ref args,
+        daemon: true,
+        ref meta_lv,
+        ..
+    } = &cli.command
+    {
+        // Resolve mountpoint just for the parent process printing/waiting
+        let mountpoint_path = if let Some(ref _m_lvs) = meta_lv {
+            if args.is_empty() {
+                eprintln!("Error: Mountpoint path is required");
+                std::process::exit(1);
+            }
+            PathBuf::from(&args[0])
+        } else {
+            if args.len() < 2 {
+                eprintln!("Error: Metadata URI (sqmeta://...) and Mountpoint path are required");
+                std::process::exit(1);
+            }
+            PathBuf::from(&args[args.len() - 1])
+        };
+
+        let mut pipefd = [0; 2];
+        unsafe {
+            if libc::pipe(pipefd.as_mut_ptr()) < 0 {
+                eprintln!("Failed to create daemon pipe");
+                std::process::exit(1);
+            }
+            let pid = libc::fork();
+            if pid < 0 {
+                eprintln!("Failed to fork daemon process");
+                std::process::exit(1);
+            } else if pid > 0 {
+                // Parent process
+                libc::close(pipefd[1]);
+                let flags = libc::fcntl(pipefd[0], libc::F_GETFL);
+                if flags >= 0 {
+                    libc::fcntl(pipefd[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+
+                let mut child_error = String::new();
+                print!("Mounting Squeezefs at {:?}...", mountpoint_path);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+
+                let mut ready = false;
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_secs(30) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+
+                    let mut buf = [0u8; 1024];
+                    let n = libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                    if n > 0 {
+                        if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                            child_error.push_str(s);
+                        }
+                    }
+
+                    let mut status = 0;
+                    let wait_res = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                    if wait_res == pid {
+                        loop {
+                            let n = libc::read(
+                                pipefd[0],
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                buf.len(),
+                            );
+                            if n <= 0 {
+                                break;
+                            }
+                            if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                                child_error.push_str(s);
+                            }
+                        }
+                        println!();
+                        if !child_error.is_empty() {
+                            eprintln!(
+                                "Failed to start squeezefs daemon. Child error:\n{}",
+                                child_error
+                            );
+                        } else {
+                            eprintln!(
+                                "Failed to start squeezefs daemon. Child process exited early."
+                            );
+                        }
+                        libc::close(pipefd[0]);
+                        std::process::exit(1);
+                    }
+
+                    match std::fs::metadata(&mountpoint_path) {
+                        Ok(metadata) => {
+                            use std::os::unix::fs::MetadataExt;
+                            if metadata.ino() == 1 {
+                                ready = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                ready = true;
+                                break;
+                            }
+                        }
+                    }
+                    print!(".");
+                    let _ = std::io::stdout().flush();
+                }
+                println!();
+                if ready {
+                    println!(
+                        "\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}",
+                        mountpoint_path
+                    );
+                    libc::close(pipefd[0]);
+                    std::process::exit(0);
+                } else {
+                    eprintln!("The mount point is not ready in 30 seconds, exiting");
+                    let _ = std::process::Command::new("umount")
+                        .arg("-l")
+                        .arg(&mountpoint_path)
+                        .output();
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::close(pipefd[0]);
+                    std::process::exit(1);
+                }
+            }
+
+            // Child process continues here
+            libc::close(pipefd[0]);
+            DAEMON_PIPE.store(pipefd[1], std::sync::atomic::Ordering::Relaxed);
+
+            std::panic::set_hook(Box::new(|panic_info| {
+                let fd = DAEMON_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+                if fd >= 0 {
+                    let msg = format!("Panic: {}\n", panic_info);
+                    let _ = libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
+                    let _ = libc::close(fd);
+                }
+            }));
+
+            libc::setsid();
+            let _ = std::env::set_current_dir("/");
+            if let Ok(null_file) = std::fs::File::open("/dev/null") {
+                use std::os::unix::io::AsRawFd;
+                libc::dup2(null_file.as_raw_fd(), 0);
+            }
+            let output_file = if let Some(ref path) = cli.log_file {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            } else {
+                None
+            };
+            if let Some(out_f) = output_file {
+                use std::os::unix::io::AsRawFd;
+                let fd = out_f.as_raw_fd();
+                libc::dup2(fd, 1);
+                libc::dup2(fd, 2);
+            } else if let Ok(null_file) = std::fs::File::open("/dev/null") {
+                use std::os::unix::io::AsRawFd;
+                let fd = null_file.as_raw_fd();
+                libc::dup2(fd, 1);
+                libc::dup2(fd, 2);
+            }
+        }
+
+        // Set daemon to false so the child process mounts in foreground
+        if let Commands::Mount { ref mut daemon, .. } = &mut cli.command {
+            *daemon = false;
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -779,7 +954,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mem_cache_size,
         disk_cache_size,
         disk_cache_paths,
-        daemon,
+        daemon: _,
         no_writeback,
         allow_other,
         options: _,
@@ -949,175 +1124,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(writeback),
             Some(*allow_other),
         );
-
-        if *daemon {
-            let mountpoint_path = mountpoint.clone();
-            let mut pipefd = [0; 2];
-            unsafe {
-                if libc::pipe(pipefd.as_mut_ptr()) < 0 {
-                    eprintln!("Failed to create daemon pipe");
-                    std::process::exit(1);
-                }
-                let pid = libc::fork();
-                if pid < 0 {
-                    eprintln!("Failed to fork daemon process");
-                    std::process::exit(1);
-                } else if pid > 0 {
-                    // Close the write end of the pipe in the parent process
-                    libc::close(pipefd[1]);
-
-                    // Set read end of the pipe to non-blocking
-                    let flags = libc::fcntl(pipefd[0], libc::F_GETFL);
-                    if flags >= 0 {
-                        libc::fcntl(pipefd[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
-                    }
-
-                    let mut child_error = String::new();
-
-                    // Parent process waits for mount point to become ready
-                    print!("Mounting Squeezefs at {:?}...", mountpoint_path);
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-
-                    let mut ready = false;
-                    let start = std::time::Instant::now();
-                    while start.elapsed() < std::time::Duration::from_secs(30) {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-
-                        // Read from pipe to check for errors/panics from child
-                        let mut buf = [0u8; 1024];
-                        let n =
-                            libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len());
-                        if n > 0 {
-                            if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
-                                child_error.push_str(s);
-                            }
-                        }
-
-                        // Check if child is still running
-                        let mut status = 0;
-                        let wait_res = libc::waitpid(pid, &mut status, libc::WNOHANG);
-                        if wait_res == pid {
-                            // Child exited! Read any remaining output from pipe
-                            loop {
-                                let n = libc::read(
-                                    pipefd[0],
-                                    buf.as_mut_ptr() as *mut libc::c_void,
-                                    buf.len(),
-                                );
-                                if n <= 0 {
-                                    break;
-                                }
-                                if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
-                                    child_error.push_str(s);
-                                }
-                            }
-                            println!();
-                            if !child_error.is_empty() {
-                                eprintln!(
-                                    "Failed to start squeezefs daemon. Child error:\n{}",
-                                    child_error
-                                );
-                            } else {
-                                eprintln!(
-                                    "Failed to start squeezefs daemon. Child process exited early."
-                                );
-                            }
-                            libc::close(pipefd[0]);
-                            std::process::exit(1);
-                        }
-
-                        // Check if mountpoint is ready
-                        match std::fs::metadata(&mountpoint_path) {
-                            Ok(metadata) => {
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::MetadataExt;
-                                    if metadata.ino() == 1 {
-                                        ready = true;
-                                        break;
-                                    }
-                                }
-                                #[cfg(not(unix))]
-                                {
-                                    ready = true;
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                if e.kind() == std::io::ErrorKind::PermissionDenied {
-                                    ready = true;
-                                    break;
-                                }
-                            }
-                        }
-                        print!(".");
-                        let _ = std::io::stdout().flush();
-                    }
-                    println!();
-                    if ready {
-                        println!(
-                            "\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}",
-                            mountpoint_path
-                        );
-                        libc::close(pipefd[0]);
-                        std::process::exit(0);
-                    } else {
-                        eprintln!("The mount point is not ready in 30 seconds, exiting");
-                        let _ = std::process::Command::new("umount")
-                            .arg("-l")
-                            .arg(&mountpoint_path)
-                            .output();
-                        libc::kill(pid, libc::SIGKILL);
-                        libc::close(pipefd[0]);
-                        std::process::exit(1);
-                    }
-                }
-                // Child process detaches
-                libc::close(pipefd[0]);
-                DAEMON_PIPE.store(pipefd[1], std::sync::atomic::Ordering::Relaxed);
-
-                // Register panic hook in child process
-                std::panic::set_hook(Box::new(|panic_info| {
-                    let fd = DAEMON_PIPE.load(std::sync::atomic::Ordering::Relaxed);
-                    if fd >= 0 {
-                        let msg = format!("Panic: {}\n", panic_info);
-                        let _ = libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
-                        let _ = libc::close(fd);
-                    }
-                }));
-
-                libc::setsid();
-                // Change working directory to root / to prevent holding parent directory active
-                let _ = std::env::set_current_dir("/");
-                // Redirect stdin to /dev/null
-                if let Ok(null_file) = std::fs::File::open("/dev/null") {
-                    use std::os::unix::io::AsRawFd;
-                    libc::dup2(null_file.as_raw_fd(), 0);
-                }
-                // Redirect stdout/stderr to log_file if provided, else /dev/null
-                let output_file = if let Some(ref path) = cli.log_file {
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                        .ok()
-                } else {
-                    None
-                };
-                if let Some(out_f) = output_file {
-                    use std::os::unix::io::AsRawFd;
-                    let fd = out_f.as_raw_fd();
-                    libc::dup2(fd, 1);
-                    libc::dup2(fd, 2);
-                } else if let Ok(null_file) = std::fs::File::open("/dev/null") {
-                    use std::os::unix::io::AsRawFd;
-                    let fd = null_file.as_raw_fd();
-                    libc::dup2(fd, 1);
-                    libc::dup2(fd, 2);
-                }
-            }
-        }
     }
 
     let mut builder = env_logger::Builder::from_default_env();

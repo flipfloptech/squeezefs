@@ -157,7 +157,7 @@ pub struct FuseOverUring {
     active: AtomicBool,
     /// Number of queue workers that have submitted their initial REGISTERs.
     queues_registered: AtomicU64,
-    nqueues: u16, // used for diagnostics
+    pub(crate) nqueues: u16, // used for diagnostics
     inbound: Vec<Arc<InboundQueue>>,
     /// unique → (qid, ent_idx, commit_id)
     pending: Mutex<HashMap<u64, (u16, u16, u64)>>,

@@ -547,10 +547,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
-            let threads = crate::raw::session::tpc_thread_count();
-            if threads > 0 {
-                debug!("Multi-Queue FUSE: Spawning {} worker connections", threads);
-                for qid in 1..=threads {
+            let nqueues = fuse_connection.num_uring_queues().unwrap_or(1);
+            if nqueues > 1 {
+                debug!("Multi-Queue FUSE: Spawning {} worker connections", nqueues - 1);
+                for qid in 1..nqueues {
                     let mut worker_session = self.clone();
                     let (tx, rx) = unbounded();
                     worker_session.response_sender = tx;

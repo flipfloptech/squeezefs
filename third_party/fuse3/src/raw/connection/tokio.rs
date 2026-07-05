@@ -205,6 +205,11 @@ impl FuseConnection {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn num_uring_queues(&self) -> Option<usize> {
+        self.over_uring.lock().unwrap().as_ref().map(|p| p.nqueues as usize)
+    }
+
     /// Start kernel FUSE-over-io_uring workers after FUSE_INIT. Required transport.
     /// Shared with multi-queue clones via [`clone_connection`].
     #[cfg(target_os = "linux")]
@@ -408,20 +413,11 @@ impl FuseConnection {
             // - shut down (!active) → disconnect error
             // - not yet ready → classical (INIT only; REGISTER wait is inside enable)
             if let Some(pool) = pool.filter(|p| p.is_ready() || !p.is_active()) {
-                if !pool.is_active() {
-                    return (
-                        (header_buf, data_buf, None),
-                        Err(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "fuse-over-uring inactive (unmounted or aborted)",
-                        )),
-                    );
-                }
                 let pool2 = pool.clone();
                 let qid = self.assigned_qid.unwrap_or(0);
-                let inbound = match pool2.recv_inbound_timeout(qid, std::time::Duration::from_millis(200)).await {
-                    Some(r) => r,
-                    None => {
+                let inbound;
+                loop {
+                    if !pool2.is_active() {
                         return (
                             (header_buf, data_buf, None),
                             Err(io::Error::new(
@@ -430,7 +426,19 @@ impl FuseConnection {
                             )),
                         );
                     }
-                };
+                    match pool2.recv_inbound_timeout(qid, std::time::Duration::from_millis(200)).await {
+                        Some(r) => {
+                            inbound = r;
+                            break;
+                        }
+                        None => {
+                            if qid as usize >= pool2.nqueues as usize {
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
 
                 // Reconstruct classical fuse framing for the session dispatcher:
                 //   [fuse_in_header 40][arg0 in op_in][arg1+ in payload]

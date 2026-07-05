@@ -5,7 +5,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 pub const DENTRY_TABLE_START: u64 = 1024 * 1024 * 8; // 8 MiB boundary
 pub const DENTRY_SLOT_SIZE: usize = 512;
 pub const DENTRIES_PER_SECTOR: usize = SECTOR_SIZE / DENTRY_SLOT_SIZE;
-pub const MAX_DENTRY_SLOTS: u64 = 16384;
+pub const MAX_HASH_BUCKETS: u64 = 8192;
+pub const MAX_DENTRY_SLOTS: u64 = 32768;
 
 #[derive(IntoBytes, FromBytes, Immutable, Debug, Clone, Copy)]
 #[repr(C)]
@@ -112,7 +113,7 @@ pub async fn find_dentry(
     name: &str,
 ) -> Result<Option<DiskDentry>> {
     let _guard = storage.dentry_lock.lock().await;
-    let bucket = dentry_hash(parent_ino, name) % MAX_DENTRY_SLOTS;
+    let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
     let mut offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
 
     loop {
@@ -137,7 +138,7 @@ pub async fn insert_dentry(
     file_type: u32,
 ) -> Result<()> {
     let _guard = storage.dentry_lock.lock().await;
-    let bucket = dentry_hash(parent_ino, name) % MAX_DENTRY_SLOTS;
+    let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
     let bucket_offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
 
     let head = read_dentry_raw(storage, bucket_offset).await?;
@@ -148,16 +149,17 @@ pub async fn insert_dentry(
         return Ok(());
     }
 
-    // Bucket head is occupied. Find a free slot using sector-batched scanning.
+    // Bucket head is occupied. Find a free slot using sector-batched scanning from overflow region.
     let mut free_offset = 0;
     let batch_sectors = 64;
     let batch_size = batch_sectors * SECTOR_SIZE;
     let mut buf = vec![0u8; batch_size];
 
-    let total_slots = MAX_DENTRY_SLOTS;
     let slots_per_batch = batch_size / DENTRY_SLOT_SIZE;
+    let start_batch = (MAX_HASH_BUCKETS as usize) / slots_per_batch;
+    let end_batch = (MAX_DENTRY_SLOTS as usize) / slots_per_batch;
 
-    'outer: for batch_idx in 0..(total_slots as usize / slots_per_batch) {
+    'outer: for batch_idx in start_batch..end_batch {
         let batch_start_offset = DENTRY_TABLE_START + (batch_idx * batch_size) as u64;
         storage.read_blocks(batch_start_offset, &mut buf).await?;
 
@@ -202,7 +204,7 @@ pub async fn insert_dentry(
 /// Removes a dentry from a parent directory.
 pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str) -> Result<()> {
     let _guard = storage.dentry_lock.lock().await;
-    let bucket = dentry_hash(parent_ino, name) % MAX_DENTRY_SLOTS;
+    let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
     let bucket_offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
 
     let mut prev_offset = 0u64;

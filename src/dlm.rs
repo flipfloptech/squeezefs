@@ -147,10 +147,12 @@ impl DlmClient {
                 };
 
                 return Ok(LockLease {
-                    file_path: file_path.to_string(),
-                    client_id: self.client_id.clone(),
-                    fencing_token,
-                    lock_key,
+                    inner: std::sync::Arc::new(LockLeaseInner {
+                        file_path: file_path.to_string(),
+                        client_id: self.client_id.clone(),
+                        fencing_token,
+                        lock_key,
+                    }),
                 });
             }
 
@@ -173,53 +175,14 @@ impl DlmClient {
     }
 }
 
-#[derive(Clone)]
-pub struct LockLease {
+struct LockLeaseInner {
     file_path: String,
     client_id: String,
     fencing_token: u64,
     lock_key: String,
 }
 
-impl LockLease {
-    pub async fn is_held(&self) -> bool {
-        let map = LOCK_MAP.lock();
-        if let Some(owner) = map.get(&self.lock_key) {
-            owner == &self.client_id
-        } else {
-            false
-        }
-    }
-
-    pub fn fencing_token(&self) -> u64 {
-        self.fencing_token
-    }
-
-    pub fn lock_key(&self) -> &str {
-        &self.lock_key
-    }
-
-    pub fn file_path(&self) -> &str {
-        &self.file_path
-    }
-
-    pub fn client_id(&self) -> &str {
-        &self.client_id
-    }
-
-    pub async fn release(self) -> Result<()> {
-        let mut map = LOCK_MAP.lock();
-        if let Some(owner) = map.get(&self.lock_key) {
-            if owner == &self.client_id {
-                map.remove(&self.lock_key);
-                LOCK_RELEASED.notify_waiters();
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for LockLease {
+impl Drop for LockLeaseInner {
     fn drop(&mut self) {
         let mut map = LOCK_MAP.lock();
         if let Some(owner) = map.get(&self.lock_key) {
@@ -228,6 +191,49 @@ impl Drop for LockLease {
                 LOCK_RELEASED.notify_waiters();
             }
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct LockLease {
+    inner: std::sync::Arc<LockLeaseInner>,
+}
+
+impl LockLease {
+    pub async fn is_held(&self) -> bool {
+        let map = LOCK_MAP.lock();
+        if let Some(owner) = map.get(&self.inner.lock_key) {
+            owner == &self.inner.client_id
+        } else {
+            false
+        }
+    }
+
+    pub fn fencing_token(&self) -> u64 {
+        self.inner.fencing_token
+    }
+
+    pub fn lock_key(&self) -> &str {
+        &self.inner.lock_key
+    }
+
+    pub fn file_path(&self) -> &str {
+        &self.inner.file_path
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.inner.client_id
+    }
+
+    pub async fn release(self) -> Result<()> {
+        let mut map = LOCK_MAP.lock();
+        if let Some(owner) = map.get(&self.inner.lock_key) {
+            if owner == &self.inner.client_id {
+                map.remove(&self.inner.lock_key);
+                LOCK_RELEASED.notify_waiters();
+            }
+        }
+        Ok(())
     }
 }
 

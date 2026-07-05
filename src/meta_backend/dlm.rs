@@ -3,24 +3,22 @@ use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct DlmLockManager {
-    locks: Vec<Arc<RwLock<()>>>,
+    locks: std::sync::Arc<dashmap::DashMap<String, Arc<RwLock<()>>>>,
 }
 
 impl DlmLockManager {
     pub fn new() -> Self {
-        let mut locks = Vec::with_capacity(4096);
-        for _ in 0..4096 {
-            locks.push(Arc::new(RwLock::new(())));
+        Self {
+            locks: std::sync::Arc::new(dashmap::DashMap::new()),
         }
-        Self { locks }
     }
 
     fn get_lock(&self, key: &str) -> Arc<RwLock<()>> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        let idx = (hasher.finish() as usize) % self.locks.len();
-        self.locks[idx].clone()
+        let entry = self
+            .locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(())));
+        entry.value().clone()
     }
 
     /// Acquires an exclusive lock on the given key (e.g. `I<ino>` or `D<parent>:<name>`)

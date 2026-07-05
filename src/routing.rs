@@ -719,11 +719,12 @@ impl DataRouter {
             ))
         })?;
 
-        backend.setxattr(ino, "layout", &bytes).await?;
-        let _ = backend
-            .setattr(ino, None, None, None, Some(m.size), None, None, None)
-            .await;
-        self.metadata_cache.remove(&file_path);
+        backend.set_layout_and_size(ino, &bytes, m.size).await?;
+        // Keep hot cache coherent without a remove+refetch on the next write.
+        let mut cached = m.clone();
+        cached.cached_at = std::time::Instant::now();
+        self.metadata_cache
+            .insert(file_path.to_string(), cached);
 
         if let Some(ref old_key) = old_indirect_to_free {
             let _ = self.backend_router.free_block(old_key).await;

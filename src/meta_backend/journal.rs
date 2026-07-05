@@ -262,13 +262,13 @@ async fn journal_worker_loop(
         }
     }
 
-    // Default 10ms deferred fdatasync: same-dir create/mkdir were capped at
-    // ~1/fdatasync (~250–350 ops/s) with interval 0. Set to 0 for sync-on-commit.
+    // Default 50ms deferred fdatasync for max create/write throughput under
+    // same-dir storms. Set to 0 for sync-on-commit durability.
     // FUSE fsync/fsyncdir still force a full barrier via FORCE_SYNC_TX / sync_all_devices.
     let flush_interval_ms = std::env::var("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS")
         .ok()
         .and_then(|val| val.parse::<u64>().ok())
-        .unwrap_or(10);
+        .unwrap_or(50);
 
     let needs_flush = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 

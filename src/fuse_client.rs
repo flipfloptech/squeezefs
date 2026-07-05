@@ -955,15 +955,11 @@ impl SqueezefsFilesystem {
     }
 
     async fn get_or_acquire_lease(&self, ino: u64) -> Result<u64, SqueezefsError> {
-        // Fast path: cached lease still held in Garnet (P0-4 re-validation).
+        // Hot path: return cached fencing token without re-validating the DLM map
+        // on every write (was a lock/hash hit per op). Stale tokens are rejected by
+        // write_file / save_metadata fencing checks; callers invalidate on that path.
         if let Some(lease) = self.active_leases.get(&ino) {
-            let lease_clone = lease.clone();
-            drop(lease);
-            if lease_clone.is_held().await {
-                return Ok(lease_clone.fencing_token());
-            }
-            // Lock lost (TTL / crash of peer takeover) — drop stale local lease.
-            self.active_leases.remove(&ino);
+            return Ok(lease.fencing_token());
         }
 
         let lock_arc = self.lease_locks.get_lock(ino, 0);
@@ -972,12 +968,7 @@ impl SqueezefsFilesystem {
         METRICS.lease_lock_wait.record(start_lease_lock.elapsed());
 
         if let Some(lease) = self.active_leases.get(&ino) {
-            let lease_clone = lease.clone();
-            drop(lease);
-            if lease_clone.is_held().await {
-                return Ok(lease_clone.fencing_token());
-            }
-            self.active_leases.remove(&ino);
+            return Ok(lease.fencing_token());
         }
 
         let file_path = crate::keys::inode_path(ino);
@@ -1973,7 +1964,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
-        info!(
+        debug!(
             "FUSE mknod: parent = {}, name = {}, mode = {:o}, rdev = {}",
             parent, name_str, mode, rdev
         );
@@ -2025,7 +2016,7 @@ impl Filesystem for SqueezefsFilesystem {
         crate::coz_progress!("fuse_create");
         check_component_name_len(name)?;
         let name_str = osstr_to_cow(name);
-        info!(
+        debug!(
             "FUSE Create: parent = {}, name = {}, mode = {:o}, flags = {}",
             parent, name_str, mode, flags
         );
@@ -2042,8 +2033,23 @@ impl Filesystem for SqueezefsFilesystem {
             let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
+            // Seed layout cache so the first write skips a cold meta backend fetch.
+            let file_path = crate::keys::inode_path(inode.ino);
+            self.router.metadata_cache.insert(
+                file_path,
+                crate::routing::CachedMetadata {
+                    file_type: "inline".to_string(),
+                    size: 0,
+                    block_map_id: None,
+                    block_prefix: None,
+                    file_id: None,
+                    cached_at: std::time::Instant::now(),
+                    data_key: None,
+                    block_map: None,
+                },
+            );
             self.dir_entry_cache.invalidate(&parent);
-            self.attr_cache.invalidate(&parent);
+            // Keep parent attr in cache; only dir_entry listing is stale.
             self.add_open(inode.ino);
             Ok(ReplyCreated {
                 ttl: Duration::from_secs(1),

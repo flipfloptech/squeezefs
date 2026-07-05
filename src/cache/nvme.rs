@@ -405,23 +405,17 @@ impl NvmeStaging {
             padded_size,
         };
 
-        // Non-blocking backpressure: full queue maps to StorageFull so callers can
-        // fall back to the synchronous backend write path. Roll back the cache put
-        // so we do not leave an un-notified staged blob.
+        // Prefer never failing the FUSE write because the merge queue is full:
+        // data is already in the mmap staging segment. Dropped merge notices are
+        // repaired by capacity pressure / later flushes; closed channel is fatal.
         match self.write_tx.try_send(pending) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                let _ = self.staging_nvme_cache.remove(&key_bytes);
-                self.current_staged_write_bytes
-                    .fetch_sub(padded_size, std::sync::atomic::Ordering::Relaxed);
-                if is_new {
-                    self.staged_writes_in_flight
-                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                Err(SqueezefsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::StorageFull,
-                    "Staging merge queue full; apply backpressure / fallback",
-                )))
+                log::debug!(
+                    "Staging merge queue full; write retained in mmap for {}",
+                    file_path
+                );
+                Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 let _ = self.staging_nvme_cache.remove(&key_bytes);

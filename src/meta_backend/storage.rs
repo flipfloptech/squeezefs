@@ -34,6 +34,8 @@ pub struct MetaLvStorage {
     pub dentry_lock: Arc<tokio::sync::Mutex<()>>,
     pub xattr_lock: Arc<tokio::sync::Mutex<()>>,
     pub transaction_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Hint for next free inode bit scan (monotonic; wrap-scan on full).
+    pub free_ino_hint: Arc<std::sync::atomic::AtomicU64>,
     pub dentry_index: Arc<scc::HashMap<u64, Vec<(u64, crate::meta_backend::dentry::DiskDentry)>>>,
     pub dentry_by_offset: Arc<scc::HashMap<u64, (u64, crate::meta_backend::dentry::DiskDentry)>>,
     pub dentry_occupied_offsets: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
@@ -84,6 +86,7 @@ impl MetaLvStorage {
             dentry_lock: Arc::new(tokio::sync::Mutex::new(())),
             xattr_lock: Arc::new(tokio::sync::Mutex::new(())),
             transaction_lock: Arc::new(tokio::sync::Mutex::new(())),
+            free_ino_hint: Arc::new(std::sync::atomic::AtomicU64::new(2)),
             dentry_index: Arc::new(scc::HashMap::new()),
             dentry_by_offset: Arc::new(scc::HashMap::new()),
             dentry_occupied_offsets: Arc::new(std::sync::Mutex::new(
@@ -93,6 +96,58 @@ impl MetaLvStorage {
         };
 
         Ok(storage)
+    }
+
+    /// Allocate a free inode number and set its bitmap bit.
+    /// Caller must hold `inode_lock` (and typically be inside a transaction).
+    pub async fn alloc_inode_bit_locked(&self) -> Result<u64> {
+        use std::sync::atomic::Ordering;
+        let mut bitmap_sector = [0u8; 4096];
+        self.read_blocks(4096, &mut bitmap_sector).await?;
+        let limit = std::cmp::min(20000, self.max_inodes());
+        if limit <= 2 {
+            return Err(SqueezefsError::InvalidOperation(
+                "Inode table full".to_string(),
+            ));
+        }
+        let hint = self.free_ino_hint.load(Ordering::Relaxed).max(2) as usize;
+        let mut new_ino = 0u64;
+        // Scan from hint to end, then wrap [2, hint).
+        let ranges = [hint..limit, 2..hint.min(limit)];
+        'scan: for range in ranges {
+            for i in range {
+                let byte_idx = i / 8;
+                let bit_idx = i % 8;
+                if (bitmap_sector[byte_idx] & (1 << bit_idx)) == 0 {
+                    new_ino = i as u64;
+                    bitmap_sector[byte_idx] |= 1 << bit_idx;
+                    break 'scan;
+                }
+            }
+        }
+        if new_ino == 0 {
+            return Err(SqueezefsError::InvalidOperation(
+                "Inode table full".to_string(),
+            ));
+        }
+        self.write_blocks(4096, &bitmap_sector).await?;
+        self.free_ino_hint
+            .store(new_ino.saturating_add(1), Ordering::Relaxed);
+        Ok(new_ino)
+    }
+
+    /// Mark an inode bit free; caller must hold `inode_lock`.
+    pub async fn free_inode_bit_locked(&self, ino: u64) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let mut bitmap_sector = [0u8; 4096];
+        self.read_blocks(4096, &mut bitmap_sector).await?;
+        let byte_idx = ino as usize / 8;
+        let bit_idx = ino as usize % 8;
+        bitmap_sector[byte_idx] &= !(1 << bit_idx);
+        self.write_blocks(4096, &bitmap_sector).await?;
+        // Prefer reusing recently freed slots under create storms.
+        let _ = self.free_ino_hint.fetch_min(ino.max(2), Ordering::Relaxed);
+        Ok(())
     }
 
     pub async fn ensure_dentry_index(&self) -> Result<()> {

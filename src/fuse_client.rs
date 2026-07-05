@@ -48,60 +48,47 @@ fn get_fuse_timeout() -> Duration {
 /// Prefer dropping Redis connections before nested locks that may await
 /// (see write path connection scoping).
 pub struct StripeLocks<L, const N: usize> {
-    locks: Vec<std::sync::Arc<L>>,
+    locks: dashmap::DashMap<u64, std::sync::Arc<L>>,
 }
 
 impl<L: Default, const N: usize> StripeLocks<L, N> {
     pub fn new() -> Self {
-        let mut locks = Vec::with_capacity(N);
-        for _ in 0..N {
-            locks.push(std::sync::Arc::new(L::default()));
+        Self {
+            locks: dashmap::DashMap::new(),
         }
-        Self { locks }
+    }
+
+    #[inline]
+    fn get_hash_key<T: std::hash::Hash>(&self, key: T) -> u64 {
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        use std::hash::Hasher;
+        hasher.finish()
     }
 
     #[inline]
     pub fn get_lock(&self, ino: u64, key: u32) -> std::sync::Arc<L> {
-        let mut hasher = ahash::AHasher::default();
-        use std::hash::Hash;
-        (ino, key).hash(&mut hasher);
-        use std::hash::Hasher;
-        let idx = (hasher.finish() as usize) % N;
-        self.locks[idx].clone()
-    }
-
-    #[inline]
-    pub fn get_lock_ref(&self, ino: u64, key: u32) -> &L {
-        let mut hasher = ahash::AHasher::default();
-        use std::hash::Hash;
-        (ino, key).hash(&mut hasher);
-        use std::hash::Hasher;
-        let idx = (hasher.finish() as usize) % N;
-        &self.locks[idx]
+        let hash_key = self.get_hash_key((ino, key));
+        let entry = self
+            .locks
+            .entry(hash_key)
+            .or_insert_with(|| std::sync::Arc::new(L::default()));
+        entry.value().clone()
     }
 
     #[inline]
     pub fn get_inode_lock(&self, ino: u64) -> std::sync::Arc<L> {
-        let mut hasher = ahash::AHasher::default();
-        use std::hash::Hash;
-        ino.hash(&mut hasher);
-        use std::hash::Hasher;
-        let idx = (hasher.finish() as usize) % N;
-        self.locks[idx].clone()
+        let hash_key = self.get_hash_key(ino);
+        let entry = self
+            .locks
+            .entry(hash_key)
+            .or_insert_with(|| std::sync::Arc::new(L::default()));
+        entry.value().clone()
     }
 
-    #[inline]
-    pub fn get_inode_lock_ref(&self, ino: u64) -> &L {
-        let mut hasher = ahash::AHasher::default();
-        use std::hash::Hash;
-        ino.hash(&mut hasher);
-        use std::hash::Hasher;
-        let idx = (hasher.finish() as usize) % N;
-        &self.locks[idx]
-    }
-
-    pub fn remove(&self, _ino: &u64) {
-        // No-op for stripe locks
+    pub fn remove(&self, ino: &u64) {
+        let hash_key = self.get_hash_key(*ino);
+        self.locks.remove(&hash_key);
     }
 }
 
@@ -926,8 +913,8 @@ impl SqueezefsFilesystem {
         self.active_inode_locks.get_inode_lock(ino)
     }
 
-    pub fn get_inode_lock_ref(&self, ino: u64) -> &tokio::sync::RwLock<()> {
-        self.active_inode_locks.get_inode_lock_ref(ino)
+    pub fn get_inode_lock_ref(&self, ino: u64) -> std::sync::Arc<tokio::sync::RwLock<()>> {
+        self.active_inode_locks.get_inode_lock(ino)
     }
 
     async fn get_or_acquire_lease(&self, ino: u64) -> Result<u64, SqueezefsError> {
@@ -2223,10 +2210,16 @@ impl Filesystem for SqueezefsFilesystem {
             let bytes_written = data.len() as u32;
             let expected_new_size = std::cmp::max(old_size, offset + bytes_written as u64);
 
+            let block_size = self.router.block_size.load(Ordering::Relaxed);
             let fits_inline = expected_new_size <= MAX_INLINE_SIZE
                 && file_type != "staged"
                 && file_type != "striped";
-            let lock_scope = inode_write_lock_scope(fits_inline, is_striped);
+            let fits_staged = expected_new_size <= block_size
+                && !self.router.cache.nvme.staging_dirs().is_empty()
+                && file_type != "striped";
+
+            let use_router_write = fits_inline || fits_staged || file_type == "inline" || file_type == "staged";
+            let lock_scope = inode_write_lock_scope(use_router_write, is_striped);
 
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -2244,7 +2237,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .insert(ino, (attr, std::time::Instant::now()));
             }
 
-            if fits_inline {
+            if use_router_write {
                 let data_bytes = data.clone();
                 if let Err(e) = self
                     .router
@@ -2258,9 +2251,9 @@ impl Filesystem for SqueezefsFilesystem {
                 }
                 drop(guard);
             } else {
-                if file_type == "inline" || expected_new_size > old_size {
+                if file_type == "inline" || file_type == "staged" || expected_new_size > old_size {
                     let mut updated_meta = meta.clone();
-                    if file_type == "inline" {
+                    if file_type == "inline" || file_type == "staged" {
                         updated_meta.file_type = "striped".to_string();
                     }
                     updated_meta.size = expected_new_size;

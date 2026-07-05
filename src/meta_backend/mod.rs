@@ -134,7 +134,9 @@ impl MetaLvBackend {
         storage.write_blocks(4096, &bitmap_sector).await?;
 
         // Format root Inode (ino 1)
-        let root_inode = inode::DiskInode::new(1, libc::S_IFDIR | 0o755, 0, 0);
+        let root_uid = unsafe { libc::getuid() };
+        let root_gid = unsafe { libc::getgid() };
+        let root_inode = inode::DiskInode::new(1, libc::S_IFDIR | 0o755, root_uid, root_gid);
         inode::write_inode(storage, 1, &root_inode).await?;
 
         Ok(())

@@ -1503,8 +1503,7 @@ impl SqueezefsFilesystem {
 
                 let meta = router_clone
                     .fetch_metadata_from_backend(ino)
-                    .await
-                    .unwrap_or_default()
+                    .await?
                     .unwrap_or_default();
                 let file_type = meta.file_type.clone();
                 let is_striped = file_type == "striped";
@@ -4778,8 +4777,7 @@ async fn flush_due_active_blocks_for_inode(
 
     let mut meta = router
         .fetch_metadata_from_backend(ino)
-        .await
-        .unwrap_or_default()
+        .await?
         .unwrap_or_default();
     let mut block_map = meta.block_map.clone().unwrap_or_default();
 
@@ -4890,8 +4888,7 @@ async fn flush_single_active_block(
     // Update metadata offline in block_map
     let mut meta = router
         .fetch_metadata_from_backend(ino)
-        .await
-        .unwrap_or_default()
+        .await?
         .unwrap_or_default();
     let mut block_map = meta.block_map.clone().unwrap_or_default();
     block_map.insert(b, stored_block_key.clone());

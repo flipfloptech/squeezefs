@@ -2204,54 +2204,67 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
-        let lock = self.get_inode_lock_ref(ino);
-        let _guard = lock.read().await;
-
         let file_path = crate::keys::inode_path(ino);
+        let lock = self.get_inode_lock_ref(ino);
 
-        // Get file size to bound the read
-        let file_size = if let Some((attr, _)) = self.attr_cache.get(&ino) {
-            attr.size
-        } else {
-            let backend = self
-                .meta_backend
-                .as_ref()
-                .ok_or_else(|| {
-                    SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
-                })
-                .map_err(map_squeezefs_err)?;
-            backend
-                .getattr(ino)
-                .await
-                .map(|inode| inode.size)
-                .unwrap_or(0)
-        };
+        // Short critical section only: size bound + active-buffer hit.
+        // Must NOT hold the inode read lock across flush or backend I/O —
+        // flush_single_active_block upgrades to write() and tokio RwLock is
+        // not re-entrant (self-deadlock under multi-block / active-block reads).
+        let (file_size, active_hit) = {
+            let _guard = lock.read().await;
 
-        if offset >= file_size {
-            return Ok(ReplyData {
-                data: Vec::new().into(),
-                backing: None,
-            });
-        }
+            let file_size = if let Some((attr, _)) = self.attr_cache.get(&ino) {
+                attr.size
+            } else {
+                let backend = self
+                    .meta_backend
+                    .as_ref()
+                    .ok_or_else(|| {
+                        SqueezefsError::InvalidOperation(
+                            "Metadata backend not initialized".to_string(),
+                        )
+                    })
+                    .map_err(map_squeezefs_err)?;
+                backend
+                    .getattr(ino)
+                    .await
+                    .map(|inode| inode.size)
+                    .unwrap_or(0)
+            };
 
-        let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
-
-        let block_size = self.router.block_size.load(Ordering::Relaxed);
-        let start_block = offset / block_size;
-        let end_block = (offset + read_len as u64 - 1) / block_size;
-
-        if start_block == end_block {
-            let cache_key = crate::keys::active_block(ino, start_block).to_string();
-            if let Some(buf) = self.active_block_buffers.get(&cache_key) {
-                let block_start = start_block * block_size;
-                let rel_offset = (offset - block_start) as usize;
-                let data = buf.value().slice(rel_offset..rel_offset + read_len);
+            if offset >= file_size {
                 return Ok(ReplyData {
-                    data,
+                    data: Vec::new().into(),
                     backing: None,
                 });
             }
-        } else {
+
+            let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
+            let block_size = self.router.block_size.load(Ordering::Relaxed);
+            let start_block = offset / block_size;
+            let end_block = (offset + read_len as u64 - 1) / block_size;
+
+            if start_block == end_block {
+                let cache_key = crate::keys::active_block(ino, start_block).to_string();
+                if let Some(buf) = self.active_block_buffers.get(&cache_key) {
+                    let block_start = start_block * block_size;
+                    let rel_offset = (offset - block_start) as usize;
+                    let data = buf.value().slice(rel_offset..rel_offset + read_len);
+                    return Ok(ReplyData {
+                        data,
+                        backing: None,
+                    });
+                }
+                (file_size, false)
+            } else {
+                (file_size, true) // need flush of dirty active blocks first
+            }
+        };
+
+        let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
+
+        if active_hit {
             let fencing_token = self.dlm.get_fencing_token(&file_path);
             let _ = self
                 .flush_active_blocks_with_retry(ino, fencing_token)
@@ -2265,7 +2278,7 @@ impl Filesystem for SqueezefsFilesystem {
             .and_then(|conn| conn.get_payload_buffer(_req.unique))
             .map(|(ptr, _sz)| ptr);
 
-        // 1. Try to read from committed/cached storage zero-copy
+        // Backend / cache read without holding the inode lock (readers scale).
         let read_future =
             self.router
                 .read_file_range_zero_copy(&file_path, offset, read_len as u32, dest_addr);

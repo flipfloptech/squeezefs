@@ -709,19 +709,18 @@ impl Metadata for MetaLvBackend {
         }
 
         self.run_transaction(|| async {
-            // Update free-inode bitmap
-            {
-                let _inode_guard = self.storage.inode_lock.lock().await;
-                let mut bitmap_sector = [0u8; 4096];
-                self.storage.read_blocks(4096, &mut bitmap_sector).await?;
-                let byte_idx = ino as usize / 8;
-                let bit_idx = ino as usize % 8;
-                bitmap_sector[byte_idx] &= !(1 << bit_idx);
-                self.storage.write_blocks(4096, &bitmap_sector).await?;
-            }
+            // Bitmap free + zero slot must be one critical section so a concurrent
+            // create cannot reallocate the bit before the slot is cleared.
+            let _inode_guard = self.storage.inode_lock.lock().await;
+            let mut bitmap_sector = [0u8; 4096];
+            self.storage.read_blocks(4096, &mut bitmap_sector).await?;
+            let byte_idx = ino as usize / 8;
+            let bit_idx = ino as usize % 8;
+            bitmap_sector[byte_idx] &= !(1 << bit_idx);
+            self.storage.write_blocks(4096, &bitmap_sector).await?;
 
             let empty = inode::DiskInode::new_zeroed();
-            inode::write_inode(&self.storage, ino, &empty).await?;
+            inode::write_inode_raw(&self.storage, ino, &empty).await?;
             Ok(())
         })
         .await
@@ -903,7 +902,11 @@ impl Metadata for RoutedMetaBackend {
                     }
                 }
 
+                // Allocate bitmap bit + write child inode under one inode_lock hold.
+                // Inodes share 4 KiB sectors (16×256 B); unlocked write_inode_raw RMW
+                // races cause lost updates → magic-0 slots / ESTALE under concurrent mkdir.
                 let mut new_local_ino = 0;
+                let mut disk_inode;
                 {
                     let _guard = backend.storage.inode_lock.lock().await;
                     let mut bitmap_sector = [0u8; 4096];
@@ -924,6 +927,13 @@ impl Metadata for RoutedMetaBackend {
                         ));
                     }
                     backend.storage.write_blocks(4096, &bitmap_sector).await?;
+
+                    disk_inode =
+                        inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
+                    if is_dir {
+                        disk_inode.nlink = 2;
+                    }
+                    inode::write_inode_raw(&backend.storage, new_local_ino, &disk_inode).await?;
                 }
 
                 let global_child_ino = self.make_global_ino(new_local_ino, target_v_idx);
@@ -931,17 +941,6 @@ impl Metadata for RoutedMetaBackend {
                     .dlm
                     .lock_exclusive(&format!("I{}", new_local_ino))
                     .await;
-
-                let mut disk_inode = inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
-                if is_dir {
-                    disk_inode.nlink = 2;
-                }
-                inode::write_inode_raw(
-                    &backend.storage,
-                    new_local_ino,
-                    &disk_inode,
-                )
-                .await?;
 
                 dentry::insert_dentry(
                     &backend.storage,
@@ -991,6 +990,10 @@ impl Metadata for RoutedMetaBackend {
             }).await?;
             Ok(inode)
         } else {
+            // Cross-volume create: never mix unjournaled direct sector writes with
+            // concurrent run_transaction applies on the same volume (stale sector
+            // snapshots wipe sibling slots → magic 0 / ESTALE). Mutate each volume
+            // only inside that volume's run_transaction (holds transaction_lock).
             if let Some(_) =
                 dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name).await?
             {
@@ -1010,34 +1013,40 @@ impl Metadata for RoutedMetaBackend {
                 }
             }
 
-            let mut new_local_ino = 0;
-            {
-                let _guard = self.volumes[target_v_idx].storage.inode_lock.lock().await;
-                let mut bitmap_sector = [0u8; 4096];
-                self.volumes[target_v_idx]
-                    .storage
-                    .read_blocks(4096, &mut bitmap_sector)
-                    .await?;
-                let limit = std::cmp::min(20000, self.volumes[target_v_idx].storage.max_inodes());
-                for i in 2..limit {
-                    let byte_idx = i / 8;
-                    let bit_idx = i % 8;
-                    if (bitmap_sector[byte_idx] & (1 << bit_idx)) == 0 {
-                        new_local_ino = i as u64;
-                        bitmap_sector[byte_idx] |= 1 << bit_idx;
-                        break;
+            let target = self.volumes[target_v_idx].clone();
+            let is_dir_flag = is_dir;
+            let (new_local_ino, disk_inode) = target
+                .run_transaction(|| async {
+                    let mut new_local_ino = 0u64;
+                    let _guard = target.storage.inode_lock.lock().await;
+                    let mut bitmap_sector = [0u8; 4096];
+                    target.storage.read_blocks(4096, &mut bitmap_sector).await?;
+                    let limit = std::cmp::min(20000, target.storage.max_inodes());
+                    for i in 2..limit {
+                        let byte_idx = i / 8;
+                        let bit_idx = i % 8;
+                        if (bitmap_sector[byte_idx] & (1 << bit_idx)) == 0 {
+                            new_local_ino = i as u64;
+                            bitmap_sector[byte_idx] |= 1 << bit_idx;
+                            break;
+                        }
                     }
-                }
-                if new_local_ino == 0 {
-                    return Err(crate::error::SqueezefsError::InvalidOperation(
-                        "Inode table full".to_string(),
-                    ));
-                }
-                self.volumes[target_v_idx]
-                    .storage
-                    .write_blocks(4096, &bitmap_sector)
-                    .await?;
-            }
+                    if new_local_ino == 0 {
+                        return Err(crate::error::SqueezefsError::InvalidOperation(
+                            "Inode table full".to_string(),
+                        ));
+                    }
+                    target.storage.write_blocks(4096, &bitmap_sector).await?;
+
+                    let mut disk_inode =
+                        inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
+                    if is_dir_flag {
+                        disk_inode.nlink = 2;
+                    }
+                    inode::write_inode_raw(&target.storage, new_local_ino, &disk_inode).await?;
+                    Ok((new_local_ino, disk_inode))
+                })
+                .await?;
 
             let global_child_ino = self.make_global_ino(new_local_ino, target_v_idx);
             let _child_lock = self.volumes[target_v_idx]
@@ -1045,49 +1054,34 @@ impl Metadata for RoutedMetaBackend {
                 .lock_exclusive(&format!("I{}", new_local_ino))
                 .await;
 
-            let mut disk_inode = inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
-            if is_dir {
-                disk_inode.nlink = 2;
-            }
-            inode::write_inode_raw(
-                &self.volumes[target_v_idx].storage,
-                new_local_ino,
-                &disk_inode,
-            )
-            .await?;
+            let parent_be = self.volumes[parent_v_idx].clone();
+            let name_owned = name.to_string();
+            parent_be
+                .run_transaction(|| async {
+                    dentry::insert_dentry(
+                        &parent_be.storage,
+                        local_parent,
+                        global_child_ino,
+                        &name_owned,
+                        final_mode & libc::S_IFMT,
+                    )
+                    .await?;
 
-            dentry::insert_dentry(
-                &self.volumes[parent_v_idx].storage,
-                local_parent,
-                global_child_ino,
-                name,
-                final_mode & libc::S_IFMT,
-            )
-            .await?;
-
-            // Update parent directory times
-            let mut parent_inode =
-                inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent).await?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            parent_inode.mtime = now;
-            parent_inode.ctime = now;
-            let old_nlink = parent_inode.nlink;
-            if is_dir {
-                parent_inode.nlink += 1;
-            }
-            log::debug!(
-                "meta_backend create parent={}: name={}, is_dir={}, parent_nlink_before={}, parent_nlink_after={}",
-                local_parent, name, is_dir, old_nlink, parent_inode.nlink
-            );
-            inode::write_inode(
-                &self.volumes[parent_v_idx].storage,
-                local_parent,
-                &parent_inode,
-            )
-            .await?;
+                    let mut parent_inode =
+                        inode::read_inode(&parent_be.storage, local_parent).await?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    parent_inode.mtime = now;
+                    parent_inode.ctime = now;
+                    if is_dir_flag {
+                        parent_inode.nlink += 1;
+                    }
+                    inode::write_inode(&parent_be.storage, local_parent, &parent_inode).await?;
+                    Ok(())
+                })
+                .await?;
 
             Ok(Inode {
                 ino: global_child_ino,

@@ -291,3 +291,94 @@ async fn test_bench_rmdir_simulation_concurrent() {
         h.await.unwrap();
     }
 }
+
+/// Phase 0 / ESTALE: dual-volume RoutedMetaBackend under concurrent mkdir.
+/// Reproduces the production mount shape (2 meta volumes) and the sector-RMW
+/// race that previously zeroed sibling inode slots in the same 4 KiB sector.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_routed_concurrent_mkdir_no_lost_inodes() {
+    use std::sync::Arc;
+    use squeezefs::meta_backend::RoutedMetaBackend;
+
+    let tmp0 = NamedTempFile::new().unwrap();
+    let tmp1 = NamedTempFile::new().unwrap();
+    let s0 = MetaLvStorage::open(tmp0.path(), 256 * 1024 * 1024).unwrap();
+    let s1 = MetaLvStorage::open(tmp1.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&s0).await.unwrap();
+    MetaLvBackend::format(&s1).await.unwrap();
+
+    let backend = Arc::new(RoutedMetaBackend::new(vec![
+        Arc::new(MetaLvBackend::new(s0)),
+        Arc::new(MetaLvBackend::new(s1)),
+    ]));
+
+    let threads = 10usize;
+    let count = 100usize;
+
+    let mut parents = Vec::new();
+    for i in 0..threads {
+        let name = format!("bench_dir_{}", i);
+        let parent = backend
+            .create(1, &name, libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .expect("create parent");
+        // Parent must remain getattr-able (not magic-0 / ESTALE class failure).
+        let g = backend.getattr(parent.ino).await.expect("getattr parent");
+        assert_eq!(g.ino, parent.ino);
+        assert!(g.mode & libc::S_IFDIR != 0);
+        assert!(g.nlink >= 2);
+        parents.push(parent);
+    }
+
+    let mut handles = Vec::new();
+    for parent in &parents {
+        let backend = backend.clone();
+        let parent_ino = parent.ino;
+        handles.push(tokio::spawn(async move {
+            for i in 0..count {
+                let name = format!("dir_{}", i);
+                let child = backend
+                    .create(parent_ino, &name, libc::S_IFDIR | 0o755, 0, 0)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("create {} under {}: {:?}", name, parent_ino, e)
+                    });
+                let g = backend.getattr(child.ino).await.unwrap_or_else(|e| {
+                    panic!(
+                        "getattr child {} (ino {}) after create: {:?}",
+                        name, child.ino, e
+                    )
+                });
+                assert_eq!(g.ino, child.ino);
+                assert!(g.mode & libc::S_IFDIR != 0, "child {} not a dir", name);
+                assert!(g.nlink >= 2, "child {} nlink={}", name, g.nlink);
+            }
+
+            // Parent still valid after concurrent child creates.
+            let parent_g = backend.getattr(parent_ino).await.expect("parent after");
+            assert!(parent_g.mode & libc::S_IFDIR != 0);
+            assert!(
+                parent_g.nlink >= 2 + count as u32,
+                "parent nlink {} expected >= {}",
+                parent_g.nlink,
+                2 + count
+            );
+
+            for i in 0..count {
+                let name = format!("dir_{}", i);
+                let found = backend
+                    .lookup(parent_ino, &name)
+                    .await
+                    .unwrap_or_else(|e| panic!("lookup {}: {:?}", name, e));
+                let g = backend.getattr(found.ino).await.unwrap_or_else(|e| {
+                    panic!("getattr after lookup {}: {:?}", name, e)
+                });
+                assert_eq!(g.ino, found.ino);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.expect("join task");
+    }
+}

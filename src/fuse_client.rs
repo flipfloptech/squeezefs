@@ -2133,7 +2133,9 @@ impl Filesystem for SqueezefsFilesystem {
 
         self.open_dir_streams.remove(&fh);
         self.remove_open(ino);
-        self.queue_reclaim_inode(ino);
+        // Do not reclaim on releasedir: the directory is typically still linked.
+        // Destruction runs from forget (and release of unlinked files) only, and
+        // only after nlink==0 — avoids racing live parents under concurrent mkdir.
         Ok(())
     }
 
@@ -2576,7 +2578,9 @@ impl Filesystem for SqueezefsFilesystem {
             self.dir_entry_cache.invalidate(&current_inode.ino);
             self.attr_cache.invalidate(&parent);
             self.attr_cache.invalidate(&current_inode.ino);
-            self.queue_reclaim_inode(current_inode.ino);
+            // Reclaim only after FUSE forget (or last release if unlinked-open).
+            // Destroying before forget reuses ino numbers while the kernel still
+            // holds the nodeid (generation always 1) → ESTALE under load.
             Ok(())
         };
 
@@ -2857,7 +2861,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.dir_entry_cache.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
             self.attr_cache.invalidate(&child_ino);
-            self.queue_reclaim_inode(child_ino);
+            // Defer destroy_inode until forget/release (see rmdir comment).
             Ok(())
         };
 
@@ -2917,7 +2921,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache.invalidate(&new_parent);
             if let Some(d_ino) = dest_ino {
                 self.attr_cache.invalidate(&d_ino);
-                self.queue_reclaim_inode(d_ino);
+                // Reclaim overwritten target via forget, not here.
             }
             Ok(())
         };
@@ -2990,9 +2994,7 @@ impl Filesystem for SqueezefsFilesystem {
             }
             if let Some(d_ino) = dest_ino {
                 self.attr_cache.invalidate(&d_ino);
-                if (flags & libc::RENAME_EXCHANGE) == 0 {
-                    self.queue_reclaim_inode(d_ino);
-                }
+                // Overwritten target reclaimed on forget only (not RENAME_EXCHANGE).
             }
             Ok(())
         };

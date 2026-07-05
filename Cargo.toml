@@ -81,3 +81,15 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
+[[bench]]
+name = "meta_lv_bench"
+harness = false
+
+[[bench]]
+name = "high_concurrency_bench"
+harness = false
+
+[[bench]]
+name = "squeezefs_bench"
+harness = false
+

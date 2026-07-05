@@ -897,6 +897,25 @@ impl DataRouter {
         Ok(m)
     }
 
+    pub async fn update_metadata_cache_size(&self, file_path: &str, size: u64) {
+        if let Some(mut entry) = self.metadata_cache.get(file_path) {
+            if size > entry.size {
+                entry.size = size;
+                entry.cached_at = std::time::Instant::now();
+                self.metadata_cache.insert(file_path.to_string(), entry);
+            }
+        } else {
+            if let Ok(mut entry) = self.fetch_metadata(file_path).await {
+                if size > entry.size {
+                    entry.size = size;
+                    entry.cached_at = std::time::Instant::now();
+                    self.metadata_cache.insert(file_path.to_string(), entry);
+                }
+            }
+        }
+    }
+
+
     pub async fn load_striped_block_keys(
         &self,
         _file_path: &str,

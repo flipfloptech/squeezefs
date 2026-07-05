@@ -1340,7 +1340,22 @@ impl SqueezefsFilesystem {
         self.flush_memory_buffers_for_inode(ino, fencing_token)
             .await?;
         self.flush_active_blocks_with_retry(ino, fencing_token)
-            .await
+            .await?;
+
+        // Durable sync of metadata size if it has changed/grown and wasn't persisted yet
+        let file_path = crate::keys::inode_path(ino);
+        if let Some(cached) = self.router.metadata_cache.get(&file_path) {
+            let meta_backend = self.router.fetch_metadata_from_backend(ino).await?.unwrap_or_default();
+            if cached.size > meta_backend.size {
+                let mut updated = meta_backend;
+                updated.size = cached.size;
+                updated.file_type = cached.file_type.clone();
+                updated.block_map = cached.block_map.clone();
+                updated.block_map_id = cached.block_map_id.clone();
+                self.router.save_metadata_to_backend(ino, &updated, fencing_token).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Enqueue a writeback request; if the bounded queue is full, flush that block
@@ -2287,11 +2302,9 @@ impl Filesystem for SqueezefsFilesystem {
                     drop(guard);
                 }
             } else {
-                if file_type == "inline" || file_type == "staged" || expected_new_size > old_size {
+                if file_type == "inline" || file_type == "staged" {
                     let mut updated_meta = meta.clone();
-                    if file_type == "inline" || file_type == "staged" {
-                        updated_meta.file_type = "striped".to_string();
-                    }
+                    updated_meta.file_type = "striped".to_string();
                     updated_meta.size = expected_new_size;
                     if let Err(e) = self
                         .router
@@ -2300,6 +2313,8 @@ impl Filesystem for SqueezefsFilesystem {
                     {
                         return Err(map_squeezefs_err(e));
                     }
+                } else if expected_new_size > old_size {
+                    self.router.update_metadata_cache_size(&file_path, expected_new_size).await;
                 }
                 if lock_scope == InodeWriteLockScope::MetaPrepOnly {
                     // Striped: drop inode write lock before long active-block I/O.
@@ -4779,6 +4794,11 @@ async fn flush_due_active_blocks_for_inode(
         .fetch_metadata_from_backend(ino)
         .await?
         .unwrap_or_default();
+    if let Some(cached) = router.metadata_cache.get(&file_path) {
+        if cached.size > meta.size {
+            meta.size = cached.size;
+        }
+    }
     let mut block_map = meta.block_map.clone().unwrap_or_default();
 
     for &(b, offset, _, _) in &results {
@@ -4885,11 +4905,17 @@ async fn flush_single_active_block(
         _write_guard = Some(write_lock.write().await);
     }
 
+    let file_path = crate::keys::inode_path(ino);
     // Update metadata offline in block_map
     let mut meta = router
         .fetch_metadata_from_backend(ino)
         .await?
         .unwrap_or_default();
+    if let Some(cached) = router.metadata_cache.get(&file_path) {
+        if cached.size > meta.size {
+            meta.size = cached.size;
+        }
+    }
     let mut block_map = meta.block_map.clone().unwrap_or_default();
     block_map.insert(b, stored_block_key.clone());
     meta.block_map = Some(block_map);

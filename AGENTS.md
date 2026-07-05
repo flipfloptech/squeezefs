@@ -56,6 +56,14 @@ Hardening: pool not marked ready until all queues submit REGISTER; per-qid commi
 - **Clippy/gate:** `cargo clippy --all-targets --all-features -- -D warnings` must stay clean — that includes unused items. Fix by **removing** dead code, not by allowing warnings.
 - **Exceptions only** when the item is part of a public API surface that must stay stable (`pub` for crates/downstream) or is required for `#[cfg]` / trait impl completeness and truly cannot be omitted — document why in a one-line comment on that item. Prefer not exporting unused symbols.
 
+### Zero-copy and latch-free data paths
+
+**Policy for agents and humans:** maintain and enforce a zero-copy, latch-free hot-path design. Do not introduce traditional blocking locks (like standard `Mutex` or `RwLock`) or unnecessary data copy operations on the primary read/write data path.
+
+- **Zero-Copy Hot Path:** Hot staged files are mapped directly using memory mapping (`mmap`). Buffer segments must be returned or updated in-place via pointer/slice references. Avoid allocating new buffers or cloning vectors during standard read/write execution.
+- **Latch-Free/Lock-Free Caching & Indexes:** Hot metadata tables, directory entry indices, and block routing tables must use lock-free or latch-free data structures (e.g., `scc::HashMap`, sharded atomic clock rings, atomic reference counts). Traditional read/write synchronization locks are only permitted for FUSE operations and metadata/lease transactions (see Lock Order constraints).
+- **Zero-Copy GPU Direct (GDS):** When `gds` feature is active, bypass host RAM completely. Copy block data directly between NVMe/NVMe-oF and GPU memory via RDMA.
+
 ---
 
 ## High-Performance Distributed Filesystem Architecture

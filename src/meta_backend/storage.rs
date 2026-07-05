@@ -35,22 +35,40 @@ pub struct MetaLvStorage {
     pub xattr_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+tokio::task_local! {
+    pub static ACTIVE_TX: std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
+}
+
 impl MetaLvStorage {
     /// Opens the raw metadata partition (file or block device).
     /// If the path does not exist, a simulated file is created.
     pub fn open<P: AsRef<Path>>(path: P, size_limit: u64) -> Result<Self> {
         let path_ref = path.as_ref();
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(path_ref)
             .map_err(SqueezefsError::Io)?;
 
+        use std::io::Seek;
+        let dev_size = file
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(SqueezefsError::Io)?;
+
         use std::os::unix::fs::FileTypeExt;
         let meta = file.metadata().map_err(SqueezefsError::Io)?;
-        if !meta.file_type().is_block_device() && meta.len() < size_limit && size_limit > 0 {
-            file.set_len(size_limit).map_err(SqueezefsError::Io)?;
+        if !meta.file_type().is_block_device() {
+            if dev_size < size_limit && size_limit > 0 {
+                file.set_len(size_limit).map_err(SqueezefsError::Io)?;
+            }
+        } else {
+            if dev_size < size_limit && size_limit > 0 {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "Metadata block device {} is too small: size {} bytes, expected at least {} bytes",
+                    path_ref.display(), dev_size, size_limit
+                )));
+            }
         }
 
         let storage = Self {
@@ -103,6 +121,33 @@ impl MetaLvStorage {
                 offset
             )));
         }
+
+        let mut found_in_tx = false;
+        let _ = ACTIVE_TX.try_with(|tx| {
+            let guard = tx.lock().unwrap();
+            for (off, data) in guard.iter().rev() {
+                if *off == offset && data.len() == buf.len() {
+                    buf.copy_from_slice(data);
+                    found_in_tx = true;
+                    break;
+                }
+            }
+        });
+
+        if found_in_tx {
+            Ok(())
+        } else {
+            self.read_blocks_direct(offset, buf).await
+        }
+    }
+
+    pub async fn read_blocks_direct(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if offset % SECTOR_SIZE as u64 != 0 {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "Read offset {} must be sector-aligned",
+                offset
+            )));
+        }
         let bytes = crate::uring_fs::read_at(&self.path, offset, buf.len()).await?;
         buf.copy_from_slice(&bytes);
         Ok(())
@@ -110,6 +155,27 @@ impl MetaLvStorage {
 
     /// Direct block write at a sector-aligned offset
     pub async fn write_blocks(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        if offset % SECTOR_SIZE as u64 != 0 {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "Write offset {} must be sector-aligned",
+                offset
+            )));
+        }
+
+        let mut redirected = false;
+        let _ = ACTIVE_TX.try_with(|tx| {
+            tx.lock().unwrap().push((offset, buf.to_vec()));
+            redirected = true;
+        });
+
+        if redirected {
+            Ok(())
+        } else {
+            self.write_blocks_direct(offset, buf).await
+        }
+    }
+
+    pub async fn write_blocks_direct(&self, offset: u64, buf: &[u8]) -> Result<()> {
         if offset % SECTOR_SIZE as u64 != 0 {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "Write offset {} must be sector-aligned",
@@ -138,15 +204,15 @@ impl MetaLvStorage {
         };
         let wipe_len = if quick {
             if size > 0 {
-                std::cmp::min(size, 32 * 1024 * 1024)
+                std::cmp::min(size, 108 * 1024 * 1024)
             } else {
-                32 * 1024 * 1024
+                108 * 1024 * 1024
             }
         } else {
             if size > 0 {
-                std::cmp::max(size, 64 * 1024 * 1024)
+                std::cmp::max(size, 128 * 1024 * 1024)
             } else {
-                64 * 1024 * 1024
+                128 * 1024 * 1024
             }
         };
 

@@ -72,11 +72,46 @@ pub struct MetaLvBackend {
 
 impl MetaLvBackend {
     pub fn new(storage: storage::MetaLvStorage) -> Self {
-        let journal = journal::Journal::new(1024 * 1024 * 96, 1024 * 1024 * 4); // 96MB offset, 4MB size
+        let journal = journal::Journal::new(1024 * 1024 * 104, 1024 * 1024 * 4); // 104MB offset, 4MB size
         Self {
             storage,
             dlm: dlm::DlmLockManager::new(),
             journal,
+        }
+    }
+
+    pub async fn run_transaction<F, Fut, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<R>>,
+    {
+        use crate::meta_backend::storage::ACTIVE_TX;
+        let tx: std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tx_clone = tx.clone();
+
+        let res = ACTIVE_TX.scope(tx_clone, f()).await;
+
+        match res {
+            Ok(ret) => {
+                let ops = tx.lock().unwrap().clone();
+                if !ops.is_empty() {
+                    let record_bytes = bincode::serialize(&ops).map_err(|e| {
+                        crate::error::SqueezefsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Failed to serialize transaction record: {:?}", e),
+                        ))
+                    })?;
+                    self.journal
+                        .write_record(&self.storage, &record_bytes)
+                        .await?;
+                    for (offset, buf) in ops {
+                        self.storage.write_blocks_direct(offset, &buf).await?;
+                    }
+                }
+                Ok(ret)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -121,7 +156,7 @@ impl MetaLvBackend {
             inode_count: 1000000,
             free_inode_bitmap_root: 4096,
             dentry_root: dentry::DENTRY_TABLE_START,
-            journal_start: 1024 * 1024 * 96,
+            journal_start: 1024 * 1024 * 104,
             journal_size: 1024 * 1024 * 4,
             checksum: 0,
         };
@@ -177,56 +212,60 @@ impl Metadata for MetaLvBackend {
             ));
         }
 
-        let mut new_ino = 0;
-        {
-            let _guard = self.storage.inode_lock.lock().await;
-            let mut bitmap_sector = [0u8; 4096];
-            self.storage.read_blocks(4096, &mut bitmap_sector).await?;
-            for i in 2..20000 {
-                let byte_idx = i / 8;
-                let bit_idx = i % 8;
-                if (bitmap_sector[byte_idx] & (1 << bit_idx)) == 0 {
-                    new_ino = i as u64;
-                    bitmap_sector[byte_idx] |= 1 << bit_idx;
-                    break;
+        self.run_transaction(|| async {
+            let mut new_ino = 0;
+            {
+                let _guard = self.storage.inode_lock.lock().await;
+                let mut bitmap_sector = [0u8; 4096];
+                self.storage.read_blocks(4096, &mut bitmap_sector).await?;
+                for i in 2..20000 {
+                    let byte_idx = i / 8;
+                    let bit_idx = i % 8;
+                    if (bitmap_sector[byte_idx] & (1 << bit_idx)) == 0 {
+                        new_ino = i as u64;
+                        bitmap_sector[byte_idx] |= 1 << bit_idx;
+                        break;
+                    }
                 }
+                if new_ino == 0 {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(
+                        "Inode table full".to_string(),
+                    ));
+                }
+                self.storage.write_blocks(4096, &bitmap_sector).await?;
+                let disk_inode = inode::DiskInode::new(new_ino, mode, uid, gid);
+                inode::write_inode_raw(&self.storage, new_ino, &disk_inode).await?;
             }
-            if new_ino == 0 {
-                return Err(crate::error::SqueezefsError::InvalidOperation(
-                    "Inode table full".to_string(),
-                ));
+
+            dentry::insert_dentry(&self.storage, parent, new_ino, name, mode & libc::S_IFMT)
+                .await?;
+
+            // Update parent directory times
+            if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                parent_inode.mtime = now;
+                parent_inode.ctime = now;
+                let _ = inode::write_inode(&self.storage, parent, &parent_inode).await;
             }
-            self.storage.write_blocks(4096, &bitmap_sector).await?;
-            let disk_inode = inode::DiskInode::new(new_ino, mode, uid, gid);
-            inode::write_inode_raw(&self.storage, new_ino, &disk_inode).await?;
-        }
 
-        dentry::insert_dentry(&self.storage, parent, new_ino, name, mode & libc::S_IFMT).await?;
-
-        // Update parent directory times
-        if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            parent_inode.mtime = now;
-            parent_inode.ctime = now;
-            let _ = inode::write_inode(&self.storage, parent, &parent_inode).await;
-        }
-
-        let disk_inode = inode::read_inode(&self.storage, new_ino).await?;
-        Ok(Inode {
-            ino: new_ino,
-            mode: disk_inode.mode,
-            uid: disk_inode.uid,
-            gid: disk_inode.gid,
-            size: disk_inode.size,
-            nlink: disk_inode.nlink,
-            atime: disk_inode.atime,
-            mtime: disk_inode.mtime,
-            ctime: disk_inode.ctime,
-            flags: disk_inode.flags,
+            let disk_inode = inode::read_inode(&self.storage, new_ino).await?;
+            Ok(Inode {
+                ino: new_ino,
+                mode: disk_inode.mode,
+                uid: disk_inode.uid,
+                gid: disk_inode.gid,
+                size: disk_inode.size,
+                nlink: disk_inode.nlink,
+                atime: disk_inode.atime,
+                mtime: disk_inode.mtime,
+                ctime: disk_inode.ctime,
+                flags: disk_inode.flags,
+            })
         })
+        .await
     }
 
     async fn unlink(&self, parent: Ino, name: &str) -> Result<()> {
@@ -244,30 +283,33 @@ impl Metadata for MetaLvBackend {
                 None
             };
 
-            dentry::remove_dentry(&self.storage, parent, name).await?;
+            self.run_transaction(|| async {
+                dentry::remove_dentry(&self.storage, parent, name).await?;
 
-            // Update parent directory times
-            if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
-                let now = std::time::SystemTime::now()
+                // Update parent directory times
+                if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    parent_inode.mtime = now;
+                    parent_inode.ctime = now;
+                    let _ = inode::write_inode(&self.storage, parent, &parent_inode).await;
+                }
+
+                // Decrement nlink
+                let mut disk_inode = inode::read_inode(&self.storage, ino).await?;
+                if disk_inode.nlink > 0 {
+                    disk_inode.nlink -= 1;
+                }
+                disk_inode.ctime = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64;
-                parent_inode.mtime = now;
-                parent_inode.ctime = now;
-                let _ = inode::write_inode(&self.storage, parent, &parent_inode).await;
-            }
-
-            // Decrement nlink
-            let mut disk_inode = inode::read_inode(&self.storage, ino).await?;
-            if disk_inode.nlink > 0 {
-                disk_inode.nlink -= 1;
-            }
-            disk_inode.ctime = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            inode::write_inode(&self.storage, ino, &disk_inode).await?;
-            Ok(())
+                inode::write_inode(&self.storage, ino, &disk_inode).await?;
+                Ok(())
+            })
+            .await
         } else {
             Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -296,27 +338,32 @@ impl Metadata for MetaLvBackend {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        inode::write_inode(&self.storage, ino, &disk_inode).await?;
 
-        dentry::insert_dentry(
-            &self.storage,
-            new_parent,
-            ino,
-            new_name,
-            disk_inode.mode & libc::S_IFMT,
-        )
+        self.run_transaction(|| async {
+            inode::write_inode(&self.storage, ino, &disk_inode).await?;
+
+            dentry::insert_dentry(
+                &self.storage,
+                new_parent,
+                ino,
+                new_name,
+                disk_inode.mode & libc::S_IFMT,
+            )
+            .await?;
+
+            // Update parent directory times
+            if let Ok(mut parent_inode) = inode::read_inode(&self.storage, new_parent).await {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                parent_inode.mtime = now;
+                parent_inode.ctime = now;
+                let _ = inode::write_inode(&self.storage, new_parent, &parent_inode).await;
+            }
+            Ok(())
+        })
         .await?;
-
-        // Update parent directory times
-        if let Ok(mut parent_inode) = inode::read_inode(&self.storage, new_parent).await {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            parent_inode.mtime = now;
-            parent_inode.ctime = now;
-            let _ = inode::write_inode(&self.storage, new_parent, &parent_inode).await;
-        }
 
         Ok(Inode {
             ino,
@@ -339,33 +386,38 @@ impl Metadata for MetaLvBackend {
         new_parent: Ino,
         new_name: &str,
     ) -> Result<()> {
-        let _old_pg = self.dlm.lock_exclusive(&format!("I{}", old_parent)).await;
-        let _new_pg = if old_parent != new_parent {
-            Some(self.dlm.lock_exclusive(&format!("I{}", new_parent)).await)
-        } else {
-            None
-        };
+        let mut parents = vec![old_parent, new_parent];
+        parents.sort_unstable();
+        parents.dedup();
+        let mut _parent_guards = Vec::new();
+        for p in parents {
+            _parent_guards.push(self.dlm.lock_exclusive(&format!("I{}", p)).await);
+        }
 
         let old_dentry_key = format!("D{}:{}", old_parent, old_name);
         let new_dentry_key = format!("D{}:{}", new_parent, new_name);
-        let _old_dg = self.dlm.lock_exclusive(&old_dentry_key).await;
-        let _new_dg = if old_dentry_key != new_dentry_key {
-            Some(self.dlm.lock_exclusive(&new_dentry_key).await)
-        } else {
-            None
-        };
+        let mut dentries = vec![old_dentry_key.clone(), new_dentry_key.clone()];
+        dentries.sort_unstable();
+        dentries.dedup();
+        let mut _dentry_guards = Vec::new();
+        for d in dentries {
+            _dentry_guards.push(self.dlm.lock_exclusive(&d).await);
+        }
 
         if let Some(dentry) = dentry::find_dentry(&self.storage, old_parent, old_name).await? {
-            dentry::remove_dentry(&self.storage, old_parent, old_name).await?;
-            dentry::insert_dentry(
-                &self.storage,
-                new_parent,
-                dentry.child_ino,
-                new_name,
-                dentry.file_type,
-            )
-            .await?;
-            Ok(())
+            self.run_transaction(|| async {
+                dentry::remove_dentry(&self.storage, old_parent, old_name).await?;
+                dentry::insert_dentry(
+                    &self.storage,
+                    new_parent,
+                    dentry.child_ino,
+                    new_name,
+                    dentry.file_type,
+                )
+                .await?;
+                Ok(())
+            })
+            .await
         } else {
             Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -449,7 +501,12 @@ impl Metadata for MetaLvBackend {
                 .unwrap_or_default()
                 .as_nanos() as u64;
         }
-        inode::write_inode(&self.storage, ino, &disk_inode).await?;
+        self.run_transaction(|| async {
+            inode::write_inode(&self.storage, ino, &disk_inode).await?;
+            Ok(())
+        })
+        .await?;
+
         Ok(Inode {
             ino: disk_inode.ino,
             mode: disk_inode.mode,
@@ -471,12 +528,14 @@ impl Metadata for MetaLvBackend {
 
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
         let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
-        xattr::set_xattr(&self.storage, ino, name, value).await
+        self.run_transaction(|| async { xattr::set_xattr(&self.storage, ino, name, value).await })
+            .await
     }
 
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
         let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
-        xattr::remove_xattr(&self.storage, ino, name).await
+        self.run_transaction(|| async { xattr::remove_xattr(&self.storage, ino, name).await })
+            .await
     }
 
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
@@ -487,20 +546,23 @@ impl Metadata for MetaLvBackend {
     async fn destroy_inode(&self, ino: Ino) -> Result<()> {
         let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
 
-        // Update free-inode bitmap
-        {
-            let _inode_guard = self.storage.inode_lock.lock().await;
-            let mut bitmap_sector = [0u8; 4096];
-            self.storage.read_blocks(4096, &mut bitmap_sector).await?;
-            let byte_idx = ino as usize / 8;
-            let bit_idx = ino as usize % 8;
-            bitmap_sector[byte_idx] &= !(1 << bit_idx);
-            self.storage.write_blocks(4096, &bitmap_sector).await?;
-        }
+        self.run_transaction(|| async {
+            // Update free-inode bitmap
+            {
+                let _inode_guard = self.storage.inode_lock.lock().await;
+                let mut bitmap_sector = [0u8; 4096];
+                self.storage.read_blocks(4096, &mut bitmap_sector).await?;
+                let byte_idx = ino as usize / 8;
+                let bit_idx = ino as usize % 8;
+                bitmap_sector[byte_idx] &= !(1 << bit_idx);
+                self.storage.write_blocks(4096, &bitmap_sector).await?;
+            }
 
-        let empty = inode::DiskInode::new_zeroed();
-        inode::write_inode(&self.storage, ino, &empty).await?;
-        Ok(())
+            let empty = inode::DiskInode::new_zeroed();
+            inode::write_inode(&self.storage, ino, &empty).await?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -937,37 +999,40 @@ impl Metadata for RoutedMetaBackend {
         self.check_volume_enabled(old_parent_v_idx)?;
         self.check_volume_enabled(new_parent_v_idx)?;
 
-        let _old_pg = self.volumes[old_parent_v_idx]
-            .dlm
-            .lock_exclusive(&format!("I{}", local_old_parent))
-            .await;
-        let _new_pg = if old_parent != new_parent {
-            Some(
-                self.volumes[new_parent_v_idx]
+        let mut parent_lock_keys = vec![
+            (old_parent_v_idx, local_old_parent, old_parent),
+            (new_parent_v_idx, local_new_parent, new_parent),
+        ];
+        parent_lock_keys.sort_unstable_by_key(|&(v, l, _)| (v, l));
+        parent_lock_keys.dedup_by_key(|&mut (_, _, orig)| orig);
+
+        let mut _parent_guards = Vec::new();
+        for (v_idx, local_p, _) in parent_lock_keys {
+            _parent_guards.push(
+                self.volumes[v_idx]
                     .dlm
-                    .lock_exclusive(&format!("I{}", local_new_parent))
+                    .lock_exclusive(&format!("I{}", local_p))
                     .await,
-            )
-        } else {
-            None
-        };
+            );
+        }
 
         let old_dentry_key = format!("D{}:{}", local_old_parent, old_name);
         let new_dentry_key = format!("D{}:{}", local_new_parent, new_name);
-        let _old_dg = self.volumes[old_parent_v_idx]
-            .dlm
-            .lock_exclusive(&old_dentry_key)
-            .await;
-        let _new_dg = if old_dentry_key != new_dentry_key || old_parent_v_idx != new_parent_v_idx {
-            Some(
-                self.volumes[new_parent_v_idx]
-                    .dlm
-                    .lock_exclusive(&new_dentry_key)
-                    .await,
-            )
-        } else {
-            None
-        };
+
+        let mut dentry_lock_keys = vec![
+            (old_parent_v_idx, old_dentry_key.clone()),
+            (new_parent_v_idx, new_dentry_key.clone()),
+        ];
+        dentry_lock_keys.sort_unstable_by(|a, b| match a.0.cmp(&b.0) {
+            std::cmp::Ordering::Equal => a.1.cmp(&b.1),
+            other => other,
+        });
+        dentry_lock_keys.dedup();
+
+        let mut _dentry_guards = Vec::new();
+        for (v_idx, d_key) in dentry_lock_keys {
+            _dentry_guards.push(self.volumes[v_idx].dlm.lock_exclusive(&d_key).await);
+        }
 
         if let Some(dentry) = dentry::find_dentry(
             &self.volumes[old_parent_v_idx].storage,

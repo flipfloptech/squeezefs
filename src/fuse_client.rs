@@ -1914,6 +1914,7 @@ impl Filesystem for SqueezefsFilesystem {
             };
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.dir_entry_cache.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
@@ -1978,6 +1979,7 @@ impl Filesystem for SqueezefsFilesystem {
             };
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.dir_entry_cache.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
             self.add_open(inode.ino);
             Ok(ReplyCreated {
@@ -2377,6 +2379,7 @@ impl Filesystem for SqueezefsFilesystem {
             };
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.dir_entry_cache.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),

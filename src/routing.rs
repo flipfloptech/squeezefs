@@ -1149,6 +1149,7 @@ impl DataRouter {
             updated_meta.file_type = "striped".to_string();
             updated_meta.size = new_size as u64;
             updated_meta.block_map = Some(block_map);
+            updated_meta.file_id = None;
             self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
                 .await?;
 
@@ -1196,7 +1197,10 @@ impl DataRouter {
             crate::fuse_client::METRICS
                 .layout_staged_writes
                 .fetch_add(1, Ordering::Relaxed);
-            let new_file_id = Uuid::new_v4().to_string();
+            let new_file_id = meta
+                .file_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
 
             let stage_res = self
                 .cache
@@ -1211,11 +1215,16 @@ impl DataRouter {
                     let mut updated_meta = meta.clone();
                     updated_meta.file_type = "staged".to_string();
                     updated_meta.size = new_size as u64;
-                    updated_meta.file_id = Some(new_file_id);
+                    updated_meta.file_id = Some(new_file_id.clone());
                     updated_meta.data_key = None;
                     updated_meta.block_map = None;
-                    self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
-                        .await?;
+
+                    let file_id_changed = meta.file_id.as_ref() != Some(&new_file_id);
+                    let size_changed = meta.size != new_size as u64;
+                    if file_id_changed || size_changed {
+                        self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
+                            .await?;
+                    }
                     self.metadata_cache
                         .insert(file_path.to_string(), updated_meta);
                 }

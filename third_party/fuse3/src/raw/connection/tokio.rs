@@ -2,6 +2,7 @@
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
+use bytes::Bytes;
 
 #[cfg(target_os = "linux")]
 use io_uring::{opcode, types, IoUring};
@@ -160,6 +161,8 @@ pub struct FuseConnection {
     /// for these must use classical write even after the uring pool is armed.
     #[cfg(target_os = "linux")]
     classical_inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    #[cfg(target_os = "linux")]
+    pub(crate) assigned_qid: Option<u16>,
 }
 
 impl std::fmt::Debug for FuseConnection {
@@ -197,6 +200,7 @@ impl FuseConnection {
                 classical_inflight: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::HashSet::new(),
                 )),
+                assigned_qid: None,
             })
         }
     }
@@ -248,6 +252,7 @@ impl FuseConnection {
             classical_inflight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            assigned_qid: None,
         })
     }
 
@@ -280,6 +285,7 @@ impl FuseConnection {
                     // Share over-uring pool so multi-queue session workers pull the same inbound queue.
                     over_uring: self.over_uring.clone(),
                     classical_inflight: self.classical_inflight.clone(),
+                    assigned_qid: None,
                 })
             }
             #[cfg(feature = "unprivileged")]
@@ -361,6 +367,7 @@ impl FuseConnection {
                     // Share over-uring pool so multi-queue session workers pull the same inbound queue.
                     over_uring: self.over_uring.clone(),
                     classical_inflight: self.classical_inflight.clone(),
+                    assigned_qid: None,
                 })
             }
             #[cfg(not(feature = "unprivileged"))]
@@ -375,7 +382,7 @@ impl FuseConnection {
         &self,
         header_buf: Vec<u8>,
         data_buf: T,
-    ) -> Option<CompleteIoResult<(Vec<u8>, T), usize>> {
+    ) -> Option<((Vec<u8>, T, Option<Bytes>), io::Result<usize>)> {
         let mut unmount_fut = pin!(self.unmount_notify.notified().fuse());
         let mut read_fut = pin!(self.inner_read_vectored(header_buf, data_buf).fuse());
 
@@ -389,7 +396,7 @@ impl FuseConnection {
         &self,
         mut header_buf: Vec<u8>,
         mut data_buf: T,
-    ) -> CompleteIoResult<(Vec<u8>, T), usize> {
+    ) -> ((Vec<u8>, T, Option<Bytes>), io::Result<usize>) {
         // After arm, the request path is FUSE-over-io_uring only — never classical.
         // Pre-arm (during INIT only) still uses /dev/fuse because the kernel rejects
         // REGISTER until fch->initialized.
@@ -403,7 +410,7 @@ impl FuseConnection {
             if let Some(pool) = pool.filter(|p| p.is_ready() || !p.is_active()) {
                 if !pool.is_active() {
                     return (
-                        (header_buf, data_buf),
+                        (header_buf, data_buf, None),
                         Err(io::Error::new(
                             io::ErrorKind::NotConnected,
                             "fuse-over-uring inactive (unmounted or aborted)",
@@ -411,30 +418,16 @@ impl FuseConnection {
                     );
                 }
                 let pool2 = pool.clone();
-                let inbound = match tokio::task::spawn_blocking(move || {
-                    // Block until a request or inactivity timeout (retry while active).
-                    loop {
-                        if let Some(r) =
-                            pool2.recv_inbound_timeout(std::time::Duration::from_millis(200))
-                        {
-                            return Ok(r);
-                        }
-                        if !pool2.is_active() {
-                            return Err(io::Error::new(
+                let qid = self.assigned_qid.unwrap_or(0);
+                let inbound = match pool2.recv_inbound_timeout(qid, std::time::Duration::from_millis(200)).await {
+                    Some(r) => r,
+                    None => {
+                        return (
+                            (header_buf, data_buf, None),
+                            Err(io::Error::new(
                                 io::ErrorKind::NotConnected,
                                 "fuse-over-uring inactive (unmounted or aborted)",
-                            ));
-                        }
-                    }
-                })
-                .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => return ((header_buf, data_buf), Err(e)),
-                    Err(e) => {
-                        return (
-                            (header_buf, data_buf),
-                            Err(io::Error::other(format!("spawn_blocking: {e}"))),
+                            )),
                         );
                     }
                 };
@@ -446,7 +439,7 @@ impl FuseConnection {
                 // after the header (e.g. LOOKUP name). Use in_header.len to size it.
                 if inbound.header_and_op.len() < 40 || header_buf.len() < 40 {
                     return (
-                        (header_buf, data_buf),
+                        (header_buf, data_buf, None),
                         Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "short fuse-over-uring header",
@@ -460,6 +453,7 @@ impl FuseConnection {
                 let op_in = &inbound.header_and_op[40..];
                 let payload = &inbound.payload;
                 // Bytes of body that live in op_in (first in_arg); remainder in payload.
+                // NOTE: We keep payload as Bytes for zero-copy writes!
                 let from_op = body_need.saturating_sub(payload.len()).min(op_in.len());
                 let from_payload = body_need.saturating_sub(from_op).min(payload.len());
                 let mut filled = 0usize;
@@ -494,7 +488,7 @@ impl FuseConnection {
                         }
                     }
                 }
-                return ((header_buf, data_buf), Ok(40 + filled));
+                return ((header_buf, data_buf, Some(inbound.payload)), Ok(40 + filled));
             }
         }
 
@@ -522,7 +516,9 @@ impl FuseConnection {
                 }
             }
         }
-        result
+        let (buffers, res) = result;
+        let (hdr, data) = buffers;
+        ((hdr, data, None), res)
     }
 
     pub async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(

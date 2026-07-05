@@ -45,14 +45,9 @@ struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
-struct SendConstPtr(*const u8);
-unsafe impl Send for SendConstPtr {}
-unsafe impl Sync for SendConstPtr {}
-
 enum WriteData {
     Aligned {
-        ptr: SendConstPtr,
-        len: usize,
+        data: bytes::Bytes,
     },
     /// Heap buffer from `posix_memalign` — free with `libc::free`.
     Unaligned {
@@ -233,6 +228,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
     struct ActiveReq {
         response: UringResponse,
         free_ptr: Option<(FreePtrKind, SendPtr)>,
+        _keep_alive: Option<bytes::Bytes>,
     }
 
     let mut active: Vec<Option<ActiveReq>> = Vec::with_capacity(1024);
@@ -290,6 +286,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     active[slot_idx] = Some(ActiveReq {
                         response: UringResponse::Read { bytes, size, tx },
                         free_ptr: None,
+                        _keep_alive: None,
                     });
                     if use_fixed {
                         opcode::Read::new(types::Fixed(0), buf_ptr.0, size as _)
@@ -304,18 +301,27 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     }
                 }
                 UringRequest::Write { offset, data, tx } => {
-                    let (ptr, len, free_ptr) = match data {
-                        WriteData::Aligned { ptr, len } => (ptr.0, len, None),
-                        WriteData::Unaligned { ptr, len } => {
-                            (ptr.0 as *const u8, len, Some((FreePtrKind::Libc, ptr)))
+                    let (ptr, len, free_ptr, keep_alive) = match data {
+                        WriteData::Aligned { data } => {
+                            (data.as_ptr(), data.len(), None, Some(data))
                         }
-                        WriteData::PooledUnaligned { ptr, len } => {
-                            (ptr.0 as *const u8, len, Some((FreePtrKind::Pool, ptr)))
-                        }
+                        WriteData::Unaligned { ptr, len } => (
+                            ptr.0 as *const u8,
+                            len,
+                            Some((FreePtrKind::Libc, ptr)),
+                            None,
+                        ),
+                        WriteData::PooledUnaligned { ptr, len } => (
+                            ptr.0 as *const u8,
+                            len,
+                            Some((FreePtrKind::Pool, ptr)),
+                            None,
+                        ),
                     };
                     active[slot_idx] = Some(ActiveReq {
                         response: UringResponse::Write { tx },
                         free_ptr,
+                        _keep_alive: keep_alive,
                     });
                     if use_fixed {
                         opcode::Write::new(types::Fixed(0), ptr, len as _)
@@ -331,35 +337,94 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                 }
             };
 
-            unsafe {
-                if let Err(e) = ring.submission().push(&sqe) {
-                    log::error!("Failed to push SQE to io_uring: {:?}", e);
+            let mut pushed_sqe = false;
+            for retry in 0..3 {
+                unsafe {
+                    if let Ok(()) = ring.submission().push(&sqe) {
+                        pushed_sqe = true;
+                        break;
+                    }
+                }
+
+                // If push failed, submission queue is full. Submit existing and drain.
+                let _ = ring.submit();
+                let mut cq = ring.completion();
+                cq.sync();
+                let mut completed_slots = Vec::new();
+                for cqe in cq {
+                    let slot_idx = cqe.user_data() as usize;
+                    let res = cqe.result();
+
                     if let Some(act) = active[slot_idx].take() {
+                        let io_res = if res < 0 {
+                            Err(std::io::Error::from_raw_os_error(-res))
+                        } else {
+                            Ok(res as usize)
+                        };
+
                         match act.response {
-                            UringResponse::Read { tx, .. } => {
-                                let _ = tx.send(Err(crate::error::SqueezefsError::Io(
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        "Submission queue full",
-                                    ),
-                                )));
+                            UringResponse::Read { bytes, size, tx } => {
+                                let mapped = io_res
+                                    .map_err(crate::error::SqueezefsError::Io)
+                                    .map(|_| bytes.slice(0..size));
+                                let _ = tx.send(mapped);
                             }
                             UringResponse::Write { tx } => {
-                                let _ = tx.send(Err(crate::error::SqueezefsError::Io(
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        "Submission queue full",
-                                    ),
-                                )));
+                                let mapped =
+                                    io_res.map(|_| ()).map_err(crate::error::SqueezefsError::Io);
+                                let _ = tx.send(mapped);
                             }
                         }
+
                         if let Some((kind, p)) = act.free_ptr {
                             release_free_ptr(kind, p);
                         }
                     }
-                    free_slots.push(slot_idx);
-                    break;
+                    completed_slots.push(slot_idx);
                 }
+
+                for idx in completed_slots {
+                    free_slots.push(idx);
+                    active_count -= 1;
+                }
+
+                if retry == 1 {
+                    if let Err(e) = ring.submit_and_wait(1) {
+                        log::error!(
+                            "Uring worker: submit_and_wait(1) failed on SQ full: {:?}",
+                            e
+                        );
+                    }
+                }
+            }
+
+            if !pushed_sqe {
+                log::error!("Uring request queue full or closed (backpressure)");
+                if let Some(act) = active[slot_idx].take() {
+                    match act.response {
+                        UringResponse::Read { tx, .. } => {
+                            let _ = tx.send(Err(crate::error::SqueezefsError::Io(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "Submission queue full",
+                                ),
+                            )));
+                        }
+                        UringResponse::Write { tx } => {
+                            let _ = tx.send(Err(crate::error::SqueezefsError::Io(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "Submission queue full",
+                                ),
+                            )));
+                        }
+                    }
+                    if let Some((kind, p)) = act.free_ptr {
+                        release_free_ptr(kind, p);
+                    }
+                }
+                free_slots.push(slot_idx);
+                break;
             }
 
             active_count += 1;
@@ -480,7 +545,7 @@ impl NvmeBlockDev {
         }
     }
 
-    pub async fn write_block(&self, offset: u64, data: &[u8]) -> Result<()> {
+    pub async fn write_block(&self, offset: u64, data: bytes::Bytes) -> Result<()> {
         // Fault injection for atomicity / durability tests (no-op when counter is 0).
         loop {
             let cur = FAIL_NEXT_WRITES.load(std::sync::atomic::Ordering::SeqCst);
@@ -506,11 +571,7 @@ impl NvmeBlockDev {
         let alignment = 4096;
 
         let rx_oneshot = if (data.as_ptr() as usize) % alignment == 0 && data_len % alignment == 0 {
-            let data_ptr = data.as_ptr() as usize;
-            let data_type = WriteData::Aligned {
-                ptr: SendConstPtr(data_ptr as *const u8),
-                len: data_len,
-            };
+            let data_type = WriteData::Aligned { data: data.clone() };
             let (tx, rx) = oneshot::channel();
             self.worker
                 .sender()
@@ -630,7 +691,7 @@ impl NvmeBlockDev {
 
         // P2-9: full RAW only when verification is on *and* this write is sampled.
         if crate::write_verification_should_check() {
-            let verified = self.verify_write_block(offset, data).await?;
+            let verified = self.verify_write_block(offset, &data).await?;
             if !verified {
                 return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                     "Write verification failed: checksum mismatch at offset {} on device {}",
@@ -661,6 +722,14 @@ impl NvmeBlockDev {
         size: usize,
         dest_addr: Option<u64>,
     ) -> Result<bytes::Bytes> {
+        if dest_addr.is_none() && size > crate::cache::pool::ALIGNED_BUF_POOL.buf_size() {
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "Read size {} exceeds pool buffer size {}",
+                size,
+                crate::cache::pool::ALIGNED_BUF_POOL.buf_size()
+            )));
+        }
+
         let (buf_ptr, bytes) = if let Some(addr) = dest_addr {
             // SAFETY: destination address is pre-registered and pinned memory
             let b = unsafe {

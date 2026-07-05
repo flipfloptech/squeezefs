@@ -571,7 +571,7 @@ where
         inode: u64,
         fh: u64,
         offset: u64,
-        data: &[u8],
+        data: bytes::Bytes,
         write_flags: u32,
         flags: u32,
     ) -> Result<ReplyWrite> {
@@ -587,7 +587,7 @@ where
                 path.as_ref().map(|path| path.as_ref()),
                 fh,
                 offset,
-                data,
+                &data,
                 write_flags,
                 flags,
             )

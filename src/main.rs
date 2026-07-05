@@ -878,11 +878,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let val_opt = match squeezefs::meta_backend::xattr::get_xattr(
-            &storage,
-            1,
-            "user.squeezefs.format_config",
-        ) {
+        let temp_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let val_opt = temp_rt.block_on(async {
+            squeezefs::meta_backend::xattr::get_xattr(&storage, 1, "user.squeezefs.format_config")
+                .await
+        });
+        let val_opt = match val_opt {
             Ok(v) => v,
             Err(e) => {
                 eprintln!(
@@ -1530,33 +1534,30 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                 let handle = tokio::task::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    tokio::task::spawn_blocking(move || {
-                        let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
-                            &path,
-                            64 * 1024 * 1024,
-                        )
-                        .map_err(|e| format!("Failed to open metadata volume '{}': {}", path, e))?;
-                        let pb = if !quick {
-                            let pb = mp_c.add(indicatif::ProgressBar::new(0));
-                            pb.set_style(
-                                indicatif::ProgressStyle::default_bar()
-                                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) - {msg}")
-                                    .unwrap()
-                                    .progress_chars("#>-")
-                            );
-                            pb.set_message(format!("Meta: {}", path_basename));
-                            Some(pb)
-                        } else {
-                            None
-                        };
-                        squeezefs::meta_backend::MetaLvBackend::format_with_options(
-                            &storage, quick, pb,
-                        )
-                        .map_err(|e| format!("Failed to format metadata volume '{}': {}", path, e))?;
-                        Ok::<(), String>(())
-                    })
+                    let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
+                        &path,
+                        64 * 1024 * 1024,
+                    )
+                    .map_err(|e| format!("Failed to open metadata volume '{}': {}", path, e))?;
+                    let pb = if !quick {
+                        let pb = mp_c.add(indicatif::ProgressBar::new(0));
+                        pb.set_style(
+                            indicatif::ProgressStyle::default_bar()
+                                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) - {msg}")
+                                .unwrap()
+                                .progress_chars("#>-")
+                        );
+                        pb.set_message(format!("Meta: {}", path_basename));
+                        Some(pb)
+                    } else {
+                        None
+                    };
+                    squeezefs::meta_backend::MetaLvBackend::format_with_options(
+                        &storage, quick, pb,
+                    )
                     .await
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!("Failed to format metadata volume '{}': {}", path, e))?;
+                    Ok::<(), String>(())
                 });
                 join_handles.push(handle);
             }
@@ -1641,7 +1642,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 1,
                 "user.squeezefs.format_config",
                 &config_bytes,
-            )?;
+            )
+            .await?;
             log::info!("Successfully formatted and recorded config on metadata volume.");
             let resolved_mem = mem_cache_size.as_deref().unwrap_or("1GB");
             let resolved_disk = disk_cache_size.as_deref().unwrap_or("10GB");
@@ -1761,12 +1763,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 first_meta_path,
                 64 * 1024 * 1024,
             )?;
-            let _disk_inode = squeezefs::meta_backend::inode::read_inode(&storage, 1)?;
+            let _disk_inode = squeezefs::meta_backend::inode::read_inode(&storage, 1).await?;
             let val_opt = squeezefs::meta_backend::xattr::get_xattr(
                 &storage,
                 1,
                 "user.squeezefs.format_config",
-            )?;
+            )
+            .await?;
             let val = val_opt.ok_or(
                 "Format configuration xattr not found on root inode. Is this volume formatted?",
             )?;
@@ -1972,7 +1975,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut meta_backends = Vec::new();
             for path in &meta_lvs {
                 let storage =
-                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 64 * 1024 * 1024)?;
+                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 256 * 1024 * 1024)?;
                 let be = std::sync::Arc::new(squeezefs::meta_backend::MetaLvBackend::new(storage));
                 meta_backends.push(be);
             }
@@ -1998,6 +2001,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fs_engine
                 .router
                 .set_meta_backend(routed_meta_backend.clone());
+
+            // Run Block Allocator recovery on mount
+            for meta_be in &routed_meta_backend.volumes {
+                for entry in fs_engine.router.backend_router.backends.iter() {
+                    let backend = entry.value();
+                    log::info!("Running block allocator recovery for data volume...");
+                    if let Err(e) = backend
+                        .block_allocator
+                        .recover_active_blocks(&meta_be.storage, &fs_engine.router.backend_router)
+                        .await
+                    {
+                        log::error!("Failed to recover block allocator: {:?}", e);
+                    }
+                }
+            }
             fs_engine.meta_backend = Some(routed_meta_backend);
             fs_engine.dismount_wait = resolved_dismount_wait;
 

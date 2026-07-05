@@ -1,28 +1,29 @@
-use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct DlmLockManager {
-    locks: Arc<DashMap<String, Arc<RwLock<()>>>>,
+    locks: Vec<Arc<RwLock<()>>>,
 }
 
 impl DlmLockManager {
     pub fn new() -> Self {
-        Self {
-            locks: Arc::new(DashMap::new()),
+        let mut locks = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            locks.push(Arc::new(RwLock::new(())));
         }
+        Self { locks }
     }
 
     fn get_lock(&self, key: &str) -> Arc<RwLock<()>> {
-        self.locks
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(RwLock::new(())))
-            .value()
-            .clone()
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.locks.len();
+        self.locks[idx].clone()
     }
 
-    /// Acquires an exclusive lock on the given key (e.g. "I<ino>" or "D<parent>:<name>")
+    /// Acquires an exclusive lock on the given key (e.g. `I<ino>` or `D<parent>:<name>`)
     pub async fn lock_exclusive(&self, key: &str) -> DlmGuard {
         let lock = self.get_lock(key);
         let raw_guard = lock.write_owned().await;

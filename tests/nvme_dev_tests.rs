@@ -17,7 +17,9 @@ async fn test_write_block_to_offset() {
     let data = vec![0xAB; 4 * 1024 * 1024]; // 4MB of 0xAB
     let offset = 4 * 1024 * 1024; // 4MB offset
 
-    let result = writer.write_block(offset, &data).await;
+    let result = writer
+        .write_block(offset, bytes::Bytes::from(data.clone()))
+        .await;
     assert!(result.is_ok(), "Writing block should succeed");
 
     // Verify the data was written exactly at the offset
@@ -47,7 +49,9 @@ async fn test_read_block_from_offset() {
     let offset = 4 * 1024 * 1024; // 4MB offset
 
     // Write it
-    let result = writer.write_block(offset, &data).await;
+    let result = writer
+        .write_block(offset, bytes::Bytes::from(data.clone()))
+        .await;
     assert!(result.is_ok(), "Writing block should succeed");
 
     // Read it back
@@ -83,7 +87,7 @@ async fn test_concurrent_stress() {
             let offset = (i % 4) * 4 * 1024 * 1024; // 4MB blocks
             let data = vec![i as u8; 4 * 1024 * 1024];
             writer_clone
-                .write_block(offset as u64, &data)
+                .write_block(offset as u64, bytes::Bytes::from(data))
                 .await
                 .unwrap();
             let read_back = writer_clone
@@ -117,7 +121,7 @@ async fn test_write_unaligned_size() {
     let offset = 4096u64; // within first block but offset aligned for device
 
     writer
-        .write_block(offset, &data)
+        .write_block(offset, bytes::Bytes::from(data.clone()))
         .await
         .expect("unaligned write should succeed");
 
@@ -149,7 +153,7 @@ async fn test_drop_device_during_unaligned_writes_joins_cleanly() {
             // Force unaligned path (size not multiple of 4k, heap ptr rarely 4k-aligned).
             let data: Vec<u8> = (0u8..200).map(|x| x.wrapping_add(i as u8)).collect();
             let offset = ((i % 8) * 4096) as u64;
-            w.write_block(offset, &data).await
+            w.write_block(offset, bytes::Bytes::from(data)).await
         }));
     }
 
@@ -181,7 +185,7 @@ async fn test_drop_after_unaligned_burst_does_not_hang() {
     for i in 0..32 {
         let data: Vec<u8> = (0u8..177).map(|x| x.wrapping_add(i as u8)).collect();
         writer
-            .write_block((i % 4) * 4096, &data)
+            .write_block((i % 4) * 4096, bytes::Bytes::from(data))
             .await
             .expect("unaligned write in burst");
     }
@@ -192,4 +196,21 @@ async fn test_drop_after_unaligned_burst_does_not_hang() {
         start.elapsed() < Duration::from_secs(10),
         "Drop/join of uring worker after unaligned burst must be prompt"
     );
+}
+
+#[tokio::test]
+async fn test_read_block_exceeds_pool_size() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    let file = File::create(&path).unwrap();
+    file.set_len(16 * 1024 * 1024).unwrap();
+
+    let dev = NvmeBlockDev::new(path.to_str().unwrap());
+
+    // Attempt to read 5MB which is greater than pool size (4MB)
+    let too_large = 5 * 1024 * 1024;
+    let result = dev.read_block(0, too_large).await;
+    assert!(result.is_err());
+    let err_str = result.err().unwrap().to_string();
+    assert!(err_str.contains("exceeds pool buffer size"));
 }

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 static LOCK_MAP: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static FENCING_MAP: Lazy<Mutex<HashMap<String, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static LOCK_RELEASED: Lazy<tokio::sync::Notify> = Lazy::new(|| tokio::sync::Notify::new());
 
 #[derive(Clone)]
 pub struct BoundConnection {}
@@ -123,6 +124,9 @@ impl DlmClient {
 
         let mut retries = 0;
         loop {
+            let notified = LOCK_RELEASED.notified();
+            let pinned_notified = std::pin::pin!(notified);
+
             let acquired = {
                 let mut map = LOCK_MAP.lock();
                 if map.contains_key(&lock_key) {
@@ -156,7 +160,7 @@ impl DlmClient {
                 });
             }
             retries += 1;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            pinned_notified.await;
         }
     }
 
@@ -208,6 +212,7 @@ impl LockLease {
         if let Some(owner) = map.get(&self.lock_key) {
             if owner == &self.client_id {
                 map.remove(&self.lock_key);
+                LOCK_RELEASED.notify_waiters();
             }
         }
         Ok(())
@@ -220,6 +225,7 @@ impl Drop for LockLease {
         if let Some(owner) = map.get(&self.lock_key) {
             if owner == &self.client_id {
                 map.remove(&self.lock_key);
+                LOCK_RELEASED.notify_waiters();
             }
         }
     }

@@ -182,7 +182,7 @@ pub trait Filesystem {
         inode: Inode,
         fh: u64,
         offset: u64,
-        data: &[u8],
+        data: Bytes,
         write_flags: u32,
         flags: u32,
     ) -> Result<ReplyWrite> {

@@ -32,6 +32,18 @@ enum FsReq {
         path: PathBuf,
         tx: oneshot::Sender<Result<bytes::Bytes>>,
     },
+    ReadAt {
+        path: PathBuf,
+        offset: u64,
+        size: usize,
+        tx: oneshot::Sender<Result<bytes::Bytes>>,
+    },
+    WriteAt {
+        path: PathBuf,
+        offset: u64,
+        data: bytes::Bytes,
+        tx: oneshot::Sender<Result<()>>,
+    },
     Fdatasync {
         path: PathBuf,
         tx: oneshot::Sender<Result<()>>,
@@ -130,6 +142,52 @@ pub async fn fdatasync(path: impl AsRef<Path>) -> Result<()> {
         .map_err(|e| SqueezefsError::InvalidOperation(format!("uring-fs worker closed: {e:?}")))?
 }
 
+/// Read `size` bytes at `offset` from `path` via io_uring.
+pub async fn read_at(path: impl AsRef<Path>, offset: u64, size: usize) -> Result<bytes::Bytes> {
+    let (tx, rx) = oneshot::channel();
+    URING_FS
+        .sender()
+        .try_send(FsReq::ReadAt {
+            path: path.as_ref().to_path_buf(),
+            offset,
+            size,
+            tx,
+        })
+        .map_err(|e| {
+            crate::fuse_client::METRICS
+                .uring_queue_full
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SqueezefsError::InvalidOperation(format!("uring-fs queue full: {e:?}"))
+        })?;
+    rx.await
+        .map_err(|e| SqueezefsError::InvalidOperation(format!("uring-fs worker closed: {e:?}")))?
+}
+
+/// Write `data` at `offset` to `path` via io_uring.
+pub async fn write_at(
+    path: impl AsRef<Path>,
+    offset: u64,
+    data: impl Into<bytes::Bytes>,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    URING_FS
+        .sender()
+        .try_send(FsReq::WriteAt {
+            path: path.as_ref().to_path_buf(),
+            offset,
+            data: data.into(),
+            tx,
+        })
+        .map_err(|e| {
+            crate::fuse_client::METRICS
+                .uring_queue_full
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SqueezefsError::InvalidOperation(format!("uring-fs queue full: {e:?}"))
+        })?;
+    rx.await
+        .map_err(|e| SqueezefsError::InvalidOperation(format!("uring-fs worker closed: {e:?}")))?
+}
+
 fn map_io(e: std::io::Error) -> SqueezefsError {
     SqueezefsError::Io(e)
 }
@@ -152,6 +210,43 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                         let _ =
                             tx.send(std::fs::read(&path).map(bytes::Bytes::from).map_err(map_io));
                     }
+                    FsReq::ReadAt {
+                        path,
+                        offset,
+                        size,
+                        tx,
+                    } => {
+                        let res = OpenOptions::new()
+                            .read(true)
+                            .open(&path)
+                            .and_then(|f| {
+                                use std::os::unix::fs::FileExt;
+                                let mut buf = vec![0u8; size];
+                                f.read_exact_at(&mut buf, offset)?;
+                                Ok(bytes::Bytes::from(buf))
+                            })
+                            .map_err(map_io);
+                        let _ = tx.send(res);
+                    }
+                    FsReq::WriteAt {
+                        path,
+                        offset,
+                        data,
+                        tx,
+                    } => {
+                        let res = OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .open(&path)
+                            .and_then(|f| {
+                                use std::os::unix::fs::FileExt;
+                                f.write_all_at(&data, offset)?;
+                                f.sync_all()?;
+                                Ok(())
+                            })
+                            .map_err(map_io);
+                        let _ = tx.send(res);
+                    }
                     FsReq::Fdatasync { path, tx } => {
                         let res = OpenOptions::new()
                             .write(true)
@@ -168,6 +263,7 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
 
     // Keep open files warm for fdatasync of staging segments.
     let mut open_cache: HashMap<PathBuf, File> = HashMap::new();
+    let mut lru_keys: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
 
     while let Ok(req) = rx.recv() {
         match req {
@@ -223,7 +319,16 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                         remaining = &remaining[n..];
                     }
                     // Keep handle for possible later fdatasync.
-                    open_cache.insert(path, file);
+                    if open_cache.len() >= 1024 {
+                        if let Some(oldest) = lru_keys.pop_front() {
+                            open_cache.remove(&oldest);
+                        }
+                    }
+                    if let Some(pos) = lru_keys.iter().position(|p| p == &path) {
+                        lru_keys.remove(pos);
+                    }
+                    open_cache.insert(path.clone(), file);
+                    lru_keys.push_back(path);
                     Ok(())
                 })();
                 let _ = tx.send(res);
@@ -280,9 +385,159 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                 })();
                 let _ = tx.send(res);
             }
+            FsReq::ReadAt {
+                path,
+                offset,
+                size,
+                tx,
+            } => {
+                let res = (|| -> Result<bytes::Bytes> {
+                    let file = if let Some(f) = open_cache.get(&path) {
+                        if let Some(pos) = lru_keys.iter().position(|p| p == &path) {
+                            lru_keys.remove(pos);
+                        }
+                        lru_keys.push_back(path.clone());
+                        f
+                    } else {
+                        let f = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .custom_flags(libc::O_CLOEXEC)
+                            .open(&path)
+                            .map_err(map_io)?;
+                        if open_cache.len() >= 1024 {
+                            if let Some(oldest) = lru_keys.pop_front() {
+                                open_cache.remove(&oldest);
+                            }
+                        }
+                        open_cache.insert(path.clone(), f);
+                        lru_keys.push_back(path.clone());
+                        open_cache.get(&path).unwrap()
+                    };
+                    let fd = file.as_raw_fd();
+                    let mut buf = vec![0u8; size];
+                    let mut cur_offset = offset;
+                    let mut filled = 0usize;
+                    while filled < size {
+                        let slice = &mut buf[filled..];
+                        let read_e = opcode::Read::new(
+                            types::Fd(fd),
+                            slice.as_mut_ptr(),
+                            slice.len() as u32,
+                        )
+                        .offset(cur_offset)
+                        .build()
+                        .user_data(4);
+                        unsafe {
+                            ring.submission().push(&read_e).map_err(|e| {
+                                SqueezefsError::Io(std::io::Error::other(format!(
+                                    "uring push: {e:?}"
+                                )))
+                            })?;
+                        }
+                        ring.submit_and_wait(1).map_err(map_io)?;
+                        let mut cq = ring.completion();
+                        cq.sync();
+                        let cqe = cq.next().ok_or_else(|| {
+                            SqueezefsError::Io(std::io::Error::other("uring missing cqe"))
+                        })?;
+                        let n = cqe.result();
+                        if n < 0 {
+                            return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(-n)));
+                        }
+                        let n = n as usize;
+                        if n == 0 {
+                            break;
+                        }
+                        cur_offset += n as u64;
+                        filled += n;
+                    }
+                    buf.truncate(filled);
+                    Ok(bytes::Bytes::from(buf))
+                })();
+                let _ = tx.send(res);
+            }
+            FsReq::WriteAt {
+                path,
+                offset,
+                data,
+                tx,
+            } => {
+                let res = (|| -> Result<()> {
+                    let file = if let Some(f) = open_cache.get(&path) {
+                        if let Some(pos) = lru_keys.iter().position(|p| p == &path) {
+                            lru_keys.remove(pos);
+                        }
+                        lru_keys.push_back(path.clone());
+                        f
+                    } else {
+                        let f = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .custom_flags(libc::O_CLOEXEC)
+                            .open(&path)
+                            .map_err(map_io)?;
+                        if open_cache.len() >= 1024 {
+                            if let Some(oldest) = lru_keys.pop_front() {
+                                open_cache.remove(&oldest);
+                            }
+                        }
+                        open_cache.insert(path.clone(), f);
+                        lru_keys.push_back(path.clone());
+                        open_cache.get(&path).unwrap()
+                    };
+                    let fd = file.as_raw_fd();
+                    let mut cur_offset = offset;
+                    let mut remaining = data.as_ref();
+                    while !remaining.is_empty() {
+                        let write_e = opcode::Write::new(
+                            types::Fd(fd),
+                            remaining.as_ptr(),
+                            remaining.len() as u32,
+                        )
+                        .offset(cur_offset)
+                        .build()
+                        .user_data(5);
+                        unsafe {
+                            ring.submission().push(&write_e).map_err(|e| {
+                                SqueezefsError::Io(std::io::Error::other(format!(
+                                    "uring push: {e:?}"
+                                )))
+                            })?;
+                        }
+                        ring.submit_and_wait(1).map_err(map_io)?;
+                        let mut cq = ring.completion();
+                        cq.sync();
+                        let cqe = cq.next().ok_or_else(|| {
+                            SqueezefsError::Io(std::io::Error::other("uring missing cqe"))
+                        })?;
+                        let n = cqe.result();
+                        if n < 0 {
+                            return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(-n)));
+                        }
+                        let n = n as usize;
+                        if n == 0 {
+                            return Err(SqueezefsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "uring write returned 0",
+                            )));
+                        }
+                        cur_offset += n as u64;
+                        remaining = &remaining[n..];
+                    }
+                    Ok(())
+                })();
+                let _ = tx.send(res);
+            }
             FsReq::Fdatasync { path, tx } => {
                 let res = (|| -> Result<()> {
                     let file = if let Some(f) = open_cache.get(&path) {
+                        if let Some(pos) = lru_keys.iter().position(|p| p == &path) {
+                            lru_keys.remove(pos);
+                        }
+                        lru_keys.push_back(path.clone());
                         f
                     } else {
                         let f = OpenOptions::new()
@@ -290,7 +545,13 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                             .custom_flags(libc::O_CLOEXEC)
                             .open(&path)
                             .map_err(map_io)?;
+                        if open_cache.len() >= 1024 {
+                            if let Some(oldest) = lru_keys.pop_front() {
+                                open_cache.remove(&oldest);
+                            }
+                        }
                         open_cache.insert(path.clone(), f);
+                        lru_keys.push_back(path.clone());
                         open_cache.get(&path).unwrap()
                     };
                     let fd = file.as_raw_fd();

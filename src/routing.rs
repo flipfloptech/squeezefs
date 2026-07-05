@@ -1,6 +1,8 @@
 use crate::cache::{TieredCache, BUFFER_POOL};
 use crate::dlm::DlmClient;
 
+pub const MAX_INLINE_SIZE: usize = 512;
+
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
 use crate::meta_backend::Metadata;
@@ -21,7 +23,7 @@ pub fn parse_inode_from_path(path: &str) -> u64 {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default, Debug)]
 pub struct LayoutMetadata {
     pub file_type: String,
     pub size: u64,
@@ -32,7 +34,7 @@ pub struct LayoutMetadata {
     pub block_map: Option<std::collections::HashMap<u32, String>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CachedMetadata {
     pub file_type: String,
     pub size: u64,
@@ -524,7 +526,39 @@ impl DataRouter {
         if let Some(backend) = self.inner.meta_backend.get() {
             let xattr_res = backend.getxattr(ino, "layout").await?;
             if let Some(bytes) = xattr_res {
-                if let Ok(layout) = serde_json::from_slice::<LayoutMetadata>(&bytes) {
+                let layout_opt = if bytes.starts_with(b"{") {
+                    serde_json::from_slice::<LayoutMetadata>(&bytes).ok()
+                } else {
+                    bincode::deserialize::<LayoutMetadata>(&bytes).ok()
+                };
+                if let Some(layout) = layout_opt {
+                    let mut block_map = layout.block_map.clone();
+                    if let Some(ref map_id) = layout.block_map_id {
+                        if map_id.starts_with("indirect:") {
+                            let block_key = map_id.strip_prefix("indirect:").unwrap();
+                            let block_size =
+                                self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
+                            let raw_bytes = self
+                                .backend_router
+                                .read_block(block_key, block_size)
+                                .await?;
+                            let entries = bincode::deserialize::<Vec<(u32, u64)>>(&raw_bytes)
+                                .map_err(|e| {
+                                    SqueezefsError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "Failed to deserialize indirect block map: {:?}",
+                                            e
+                                        ),
+                                    ))
+                                })?;
+                            let mut map = std::collections::HashMap::new();
+                            for (b, offset) in entries {
+                                map.insert(b, offset.to_string());
+                            }
+                            block_map = Some(map);
+                        }
+                    }
                     return Ok(Some(CachedMetadata {
                         file_type: layout.file_type,
                         size: layout.size,
@@ -533,7 +567,7 @@ impl DataRouter {
                         file_id: layout.file_id,
                         cached_at: std::time::Instant::now(),
                         data_key: layout.data_key,
-                        block_map: layout.block_map,
+                        block_map,
                     }));
                 }
             }
@@ -545,32 +579,102 @@ impl DataRouter {
         &self,
         ino: u64,
         m: &CachedMetadata,
-        _fencing_token: u64,
+        fencing_token: u64,
     ) -> Result<()> {
         let backend = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
 
-        let layout = LayoutMetadata {
+        // Fencing check
+        let file_path = crate::keys::inode_path(ino);
+        let current_fencing = self.inner.dlm.get_fencing_token(&file_path);
+        if fencing_token < current_fencing {
+            return Err(SqueezefsError::FencingTokenExpired {
+                token: fencing_token,
+                expected: current_fencing,
+            });
+        }
+
+        let mut layout = LayoutMetadata {
             file_type: m.file_type.clone(),
             size: m.size,
-            block_map_id: m.block_map.as_ref().map(|_| format!("block_map_{}", ino)),
+            block_map_id: m.block_map_id.clone(),
             block_prefix: m.block_prefix.clone(),
             file_id: m.file_id.clone(),
             data_key: m.data_key.clone(),
             block_map: m.block_map.clone(),
         };
-        let bytes = serde_json::to_vec(&layout).map_err(|e| {
+
+        // Determine if we need an indirect block map
+        let needs_indirect = if let Some(ref bm) = m.block_map {
+            bm.len() > 32
+        } else {
+            false
+        };
+
+        if needs_indirect {
+            let bm = m.block_map.as_ref().unwrap();
+            let mut entries: Vec<(u32, u64)> = Vec::with_capacity(bm.len());
+            for (&b, s) in bm {
+                if let Ok(offset) = s.parse::<u64>() {
+                    entries.push((b, offset));
+                }
+            }
+            let mut serialized_map = bincode::serialize(&entries).map_err(|e| {
+                SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Failed to serialize indirect block map: {:?}", e),
+                ))
+            })?;
+            let aligned_len = (serialized_map.len() + 4095) & !4095;
+            serialized_map.resize(aligned_len, 0);
+
+            // Allocate or reuse indirect block offset
+            let mut offset_to_use = None;
+            if let Some(ref map_id) = m.block_map_id {
+                if map_id.starts_with("indirect:") {
+                    if let Ok(off) = map_id.strip_prefix("indirect:").unwrap().parse::<u64>() {
+                        offset_to_use = Some(off);
+                    }
+                }
+            }
+
+            let offset = if let Some(off) = offset_to_use {
+                off
+            } else {
+                let (_, block_allocator, _) = self.backend_router.get_active_backend()?;
+                block_allocator.allocate_block().await?
+            };
+
+            let block_key = offset.to_string();
+            let data_bytes = bytes::Bytes::from(serialized_map);
+            let (_, _, nvme_writer) = self.backend_router.get_active_backend()?;
+            nvme_writer.write_block(offset, data_bytes).await?;
+
+            layout.block_map = None;
+            layout.block_map_id = Some(format!("indirect:{}", block_key));
+        } else {
+            // Check if we need to free an old indirect block
+            if let Some(ref map_id) = m.block_map_id {
+                if map_id.starts_with("indirect:") {
+                    let old_block_key = map_id.strip_prefix("indirect:").unwrap();
+                    let _ = self.backend_router.free_block(old_block_key).await;
+                }
+            }
+            layout.block_map_id = m.block_map.as_ref().map(|_| format!("block_map_{}", ino));
+        }
+
+        let bytes = bincode::serialize(&layout).map_err(|e| {
             SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize layout: {:?}", e),
+                format!("Failed to serialize binary layout: {:?}", e),
             ))
         })?;
+
         backend.setxattr(ino, "layout", &bytes).await?;
         let _ = backend
             .setattr(ino, None, None, None, Some(m.size), None, None, None)
             .await;
-        let file_path = crate::keys::inode_path(ino);
         self.metadata_cache.remove(&file_path);
         Ok(())
     }
@@ -640,7 +744,8 @@ impl DataRouter {
     }
 
     pub fn set_crypto(&self, crypto: crate::crypto_compress::CryptoCompressState) {
-        let _ = self.crypto.set(crypto);
+        let _ = self.crypto.set(crypto.clone());
+        let _ = self.cache.nvme.crypto.set(crypto);
     }
 
     pub fn get_crypto(&self) -> &crate::crypto_compress::CryptoCompressState {
@@ -677,11 +782,8 @@ impl DataRouter {
             self.read_nvme_block(block_key).await?
         };
 
-        let decompressed = self.get_crypto().process_read(&raw)?;
-        match decompressed {
-            std::borrow::Cow::Borrowed(slice) => Ok(bytes::Bytes::copy_from_slice(slice)),
-            std::borrow::Cow::Owned(vec) => Ok(bytes::Bytes::from(vec)),
-        }
+        let decompressed = self.get_crypto().process_read_async(raw).await?;
+        Ok(decompressed)
     }
 
     pub async fn get_cached_or_fetch_block(
@@ -1000,7 +1102,10 @@ impl DataRouter {
                             let (offset_u64, off, sz) = self.parse_block_mapping(&mapping_str)?;
                             let packed_bytes =
                                 self.nvme_writer.read_block(offset_u64 + off, sz).await?;
-                            self.get_crypto().process_read(&packed_bytes)?.into_owned()
+                            self.get_crypto()
+                                .process_read_async(packed_bytes)
+                                .await?
+                                .to_vec()
                         } else {
                             Vec::new()
                         }
@@ -1015,7 +1120,7 @@ impl DataRouter {
         // Patch the data
         let end_offset = (offset as usize) + data.len();
         let stripe_threshold = if self.cache.nvme.staging_dirs().is_empty() {
-            4 * 1024
+            MAX_INLINE_SIZE
         } else {
             self.block_size.load(Ordering::Acquire) as usize
         };
@@ -1064,7 +1169,7 @@ impl DataRouter {
         existing_data[offset as usize..end_offset].copy_from_slice(&data);
         let new_size = existing_data.len();
 
-        if new_size < 4 * 1024 {
+        if new_size < MAX_INLINE_SIZE {
             // Layout: inline
             crate::fuse_client::METRICS
                 .layout_inline_writes
@@ -1116,14 +1221,17 @@ impl DataRouter {
                 }
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
                     log::warn!("NVMe write staging cache full. Falling back to direct synchronous backend block write for: {}", file_path);
-                    let processed_data = self.get_crypto().process_write(shared_data.clone())?;
+                    let processed_data = self
+                        .get_crypto()
+                        .process_write_async(shared_data.clone())
+                        .await?;
 
                     let (_be_id, block_allocator, nvme_writer) =
                         self.backend_router.get_active_backend()?;
                     let be_offset = block_allocator.allocate_block().await?;
                     let stored_block_key = be_offset.to_string();
 
-                    nvme_writer.write_block(be_offset, &processed_data).await?;
+                    nvme_writer.write_block(be_offset, processed_data).await?;
 
                     let mut block_map = std::collections::HashMap::new();
                     block_map.insert(0, stored_block_key);
@@ -1232,7 +1340,7 @@ impl DataRouter {
             allocated_keys.push(stored_block_key.clone());
 
             let chunk_len = chunk.len();
-            let processed = match self.get_crypto().process_write(chunk.clone()) {
+            let processed = match self.get_crypto().process_write_async(chunk.clone()).await {
                 Ok(p) => p,
                 Err(e) => {
                     for k in &allocated_keys {
@@ -1243,7 +1351,7 @@ impl DataRouter {
             };
             let processed_len = processed.len();
 
-            if let Err(e) = nvme_writer.write_block(offset, &processed).await {
+            if let Err(e) = nvme_writer.write_block(offset, processed).await {
                 for k in &allocated_keys {
                     let _ = self.backend_router.free_block(k).await;
                 }
@@ -1427,9 +1535,9 @@ impl DataRouter {
                 read_lru.put(&stored_new_block_key, block_bytes.clone());
 
                 let logical_size = block_bytes.len();
-                let processed_block = crypto.process_write(block_bytes)?;
+                let processed_block = crypto.process_write_async(block_bytes).await?;
                 let physical_size = processed_block.len();
-                nvme_writer.write_block(offset, &processed_block).await?;
+                nvme_writer.write_block(offset, processed_block).await?;
 
                 Ok::<_, SqueezefsError>((
                     b,
@@ -1551,7 +1659,10 @@ impl DataRouter {
                         let (offset_u64, off, sz) = self.parse_block_mapping(&mapping_str)?;
                         let packed_bytes =
                             self.nvme_writer.read_block(offset_u64 + off, sz).await?;
-                        self.get_crypto().process_read(&packed_bytes)?.into_owned()
+                        self.get_crypto()
+                            .process_read_async(packed_bytes)
+                            .await?
+                            .to_vec()
                     } else {
                         return Err(SqueezefsError::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
@@ -1666,7 +1777,8 @@ impl DataRouter {
                         let (offset_u64, off, sz) = self.parse_block_mapping(&mapping_str)?;
                         let packed_bytes =
                             self.nvme_writer.read_block(offset_u64 + off, sz).await?;
-                        let decompressed = self.get_crypto().process_read(&packed_bytes)?;
+                        let decompressed =
+                            self.get_crypto().process_read_async(packed_bytes).await?;
                         if offset >= decompressed.len() as u64 {
                             return Ok(Vec::new());
                         }
@@ -1906,7 +2018,8 @@ impl DataRouter {
                         let offset_u64 = self.backend_router.parse_block_offset(&bk)?;
                         let sz = self.block_size.load(Ordering::Acquire) as usize;
                         let packed_bytes = self.nvme_writer.read_block(offset_u64, sz).await?;
-                        let decompressed = self.get_crypto().process_read(&packed_bytes)?;
+                        let decompressed =
+                            self.get_crypto().process_read_async(packed_bytes).await?;
                         if offset >= decompressed.len() as u64 {
                             return Ok((bytes::Bytes::new(), None));
                         }
@@ -2338,6 +2451,13 @@ impl DataRouter {
                         let _ = self.backend_router.free_block(bk).await;
                     }
                 }
+            }
+        }
+
+        if let Some(ref map_id) = meta.block_map_id {
+            if map_id.starts_with("indirect:") {
+                let block_key = map_id.strip_prefix("indirect:").unwrap();
+                let _ = self.backend_router.free_block(block_key).await;
             }
         }
 

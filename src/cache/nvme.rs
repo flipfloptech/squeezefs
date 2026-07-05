@@ -141,6 +141,7 @@ pub struct NvmeStaging {
     pub read_nvme_cache: std::sync::Arc<crate::tiering::nvme::NvmeCache>,
     pub staging_nvme_cache: std::sync::Arc<crate::tiering::nvme::NvmeCache>,
     pub dht_node: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::tiering::dht::DhtNode>>>,
+    pub crypto: std::sync::Arc<std::sync::OnceLock<crate::crypto_compress::CryptoCompressState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +289,7 @@ impl NvmeStaging {
             read_nvme_cache,
             staging_nvme_cache,
             dht_node: std::sync::Arc::new(std::sync::OnceLock::new()),
+            crypto: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         // Spawn background merge worker
@@ -562,6 +564,7 @@ impl NvmeStaging {
         let staging_nvme_cache = self.staging_nvme_cache.clone();
         let staged_writes_in_flight = self.staged_writes_in_flight.clone();
         let staged_drained_notify = self.staged_drained_notify.clone();
+        let crypto = self.crypto.clone();
 
         tokio::spawn(async move {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
@@ -580,7 +583,7 @@ impl NvmeStaging {
 
                         if current_bytes >= max_batch_bytes {
                             info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify, &crypto).await {
                                 error!("Failed to flush NVMe staging batch: {:?}", e);
                             }
                         }
@@ -588,7 +591,7 @@ impl NvmeStaging {
                     _ = &mut sleep => {
                         if !batch.is_empty() {
                             info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify).await {
+                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify, &crypto).await {
                                 error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
                             }
                         }
@@ -614,6 +617,7 @@ impl NvmeStaging {
         default_writer: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
         staged_writes_in_flight: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
         staged_drained_notify: &tokio::sync::Notify,
+        crypto: &std::sync::Arc<std::sync::OnceLock<crate::crypto_compress::CryptoCompressState>>,
     ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -621,11 +625,12 @@ impl NvmeStaging {
 
         crate::coz_progress!("nvme_flush_batch");
 
-        let crypto_state = crate::crypto_compress::CryptoCompressState::new(
+        let default_crypto = crate::crypto_compress::CryptoCompressState::new(
             "none".to_string(),
             "none".to_string(),
             None,
         );
+        let crypto_state = crypto.get().unwrap_or(&default_crypto);
 
         let (_be_id, block_allocator, nvme_writer) = if let Some(router) = backend_router.get() {
             router.get_active_backend()?
@@ -689,7 +694,7 @@ impl NvmeStaging {
         let packed_payload_len = packed_payload.len();
         info!("NVMe Staging: Writing packed block {} (size {} bytes) to NVMe-oF backend volume with fencing token {}.", packed_key, packed_payload_len, highest_fencing_token);
         if let Err(e) = nvme_writer
-            .write_block(offset, &bytes::Bytes::from(packed_payload))
+            .write_block(offset, bytes::Bytes::from(packed_payload))
             .await
         {
             let _ = block_allocator.free_block(offset).await;
@@ -702,21 +707,32 @@ impl NvmeStaging {
                 let ino = crate::routing::parse_inode_from_path(file_path);
 
                 let layout_bytes = backend.getxattr(ino, "layout").await.unwrap_or(None);
-                let mut meta: crate::routing::LayoutMetadata = if let Some(ref bytes) = layout_bytes
-                {
-                    serde_json::from_slice(bytes).unwrap_or_default()
+                let layout_opt = if let Some(ref bytes) = layout_bytes {
+                    if bytes.starts_with(b"{") {
+                        serde_json::from_slice::<crate::routing::LayoutMetadata>(bytes).ok()
+                    } else {
+                        bincode::deserialize::<crate::routing::LayoutMetadata>(bytes).ok()
+                    }
                 } else {
-                    crate::routing::LayoutMetadata::default()
+                    None
                 };
+                let mut meta = layout_opt.unwrap_or_default();
 
-                let mut block_map = meta.block_map.unwrap_or_default();
-                let val_str = format!("{}:{}:{}", packed_key, sub_offset, sub_size);
-                block_map.insert(0, val_str);
-                meta.block_map = Some(block_map);
-                meta.file_id = None;
+                if meta.file_id.as_deref() == Some(&item.file_id) {
+                    let mut block_map = meta.block_map.unwrap_or_default();
+                    let val_str = format!("{}:{}:{}", packed_key, sub_offset, sub_size);
+                    block_map.insert(0, val_str);
+                    meta.block_map = Some(block_map);
+                    meta.file_id = None;
 
-                if let Ok(serialized) = serde_json::to_vec(&meta) {
-                    let _ = backend.setxattr(ino, "layout", &serialized).await;
+                    if let Ok(serialized) = bincode::serialize(&meta) {
+                        let _ = backend.setxattr(ino, "layout", &serialized).await;
+                    }
+                } else {
+                    info!(
+                        "NVMe Staging: Skip merge worker update for {} because file_id changed or promoted",
+                        file_path
+                    );
                 }
             }
         }

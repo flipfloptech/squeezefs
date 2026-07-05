@@ -72,7 +72,7 @@ pub struct MetaLvBackend {
 
 impl MetaLvBackend {
     pub fn new(storage: storage::MetaLvStorage) -> Self {
-        let journal = journal::Journal::new(1024 * 1024 * 16, 1024 * 1024 * 4); // 16MB offset, 4MB size
+        let journal = journal::Journal::new(1024 * 1024 * 96, 1024 * 1024 * 4); // 96MB offset, 4MB size
         Self {
             storage,
             dlm: dlm::DlmLockManager::new(),
@@ -80,10 +80,21 @@ impl MetaLvBackend {
         }
     }
 
-    pub fn get_allocated_inode_count(&self) -> usize {
+    pub async fn get_allocated_inode_count(&self) -> usize {
+        let mut bitmap_sector = [0u8; 4096];
+        if self
+            .storage
+            .read_blocks(4096, &mut bitmap_sector)
+            .await
+            .is_err()
+        {
+            return 0;
+        }
         let mut count = 0;
         for i in 2..20000 {
-            if inode::read_inode(&self.storage, i).is_ok() {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            if (bitmap_sector[byte_idx] & (1 << bit_idx)) != 0 {
                 count += 1;
             }
         }
@@ -91,34 +102,40 @@ impl MetaLvBackend {
     }
 
     /// Formats the raw block storage device with a superblock and the root inode
-    pub fn format(storage: &storage::MetaLvStorage) -> Result<()> {
-        Self::format_with_options(storage, true, None)
+    pub async fn format(storage: &storage::MetaLvStorage) -> Result<()> {
+        Self::format_with_options(storage, true, None).await
     }
 
-    pub fn format_with_options(
+    pub async fn format_with_options(
         storage: &storage::MetaLvStorage,
         quick: bool,
         pb: Option<indicatif::ProgressBar>,
     ) -> Result<()> {
         // Zero-wipe the entire metadata volume first to prevent stale garbage issues
-        storage.wipe(quick, pb)?;
+        storage.wipe(quick, pb).await?;
 
         // Initialize Superblock
         let sb = storage::Superblock {
             magic: *storage::MAGIC_VALUE,
-            version: 1,
+            version: 2,
             inode_count: 1000000,
-            free_inode_bitmap_root: 4096 * 2,
+            free_inode_bitmap_root: 4096,
             dentry_root: dentry::DENTRY_TABLE_START,
-            journal_start: 1024 * 1024 * 16,
+            journal_start: 1024 * 1024 * 96,
             journal_size: 1024 * 1024 * 4,
             checksum: 0,
         };
-        storage.write_superblock(&sb)?;
+        storage.write_superblock(&sb).await?;
+
+        // Zero-initialize the free-inode bitmap sector (sector 1, starting at 4096)
+        let mut bitmap_sector = [0u8; 4096];
+        // Mark index 0 and 1 as allocated
+        bitmap_sector[0] = 0b0000_0011;
+        storage.write_blocks(4096, &bitmap_sector).await?;
 
         // Format root Inode (ino 1)
         let root_inode = inode::DiskInode::new(1, libc::S_IFDIR | 0o755, 0, 0);
-        inode::write_inode(storage, 1, &root_inode)?;
+        inode::write_inode(storage, 1, &root_inode).await?;
 
         Ok(())
     }
@@ -128,7 +145,7 @@ impl MetaLvBackend {
 impl Metadata for MetaLvBackend {
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
         let _guard = self.dlm.lock_shared(&format!("D{}:{}", parent, name)).await;
-        if let Some(dentry) = dentry::find_dentry(&self.storage, parent, name)? {
+        if let Some(dentry) = dentry::find_dentry(&self.storage, parent, name).await? {
             self.getattr(dentry.child_ino).await
         } else {
             Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -152,45 +169,50 @@ impl Metadata for MetaLvBackend {
             .lock_exclusive(&format!("D{}:{}", parent, name))
             .await;
 
-        if let Some(_) = dentry::find_dentry(&self.storage, parent, name)? {
+        if let Some(_) = dentry::find_dentry(&self.storage, parent, name).await? {
             return Err(crate::error::SqueezefsError::InvalidOperation(
                 "File already exists".to_string(),
             ));
         }
 
-        let _op_guard = self.storage.lock_op();
-        // Allocate a new inode by scanning table (basic allocator for Phase 0)
         let mut new_ino = 0;
-        for i in 2..20000 {
-            if let Err(_) = inode::read_inode(&self.storage, i) {
-                // Inode slot is uninitialized/magic invalid -> we can use it!
-                new_ino = i;
-                break;
+        {
+            let _guard = self.storage.inode_lock.lock().await;
+            let mut bitmap_sector = [0u8; 4096];
+            self.storage.read_blocks(4096, &mut bitmap_sector).await?;
+            for i in 2..20000 {
+                let byte_idx = i / 8;
+                let bit_idx = i % 8;
+                if (bitmap_sector[byte_idx] & (1 << bit_idx)) == 0 {
+                    new_ino = i as u64;
+                    bitmap_sector[byte_idx] |= 1 << bit_idx;
+                    break;
+                }
             }
-        }
-        if new_ino == 0 {
-            return Err(crate::error::SqueezefsError::InvalidOperation(
-                "Inode table full".to_string(),
-            ));
+            if new_ino == 0 {
+                return Err(crate::error::SqueezefsError::InvalidOperation(
+                    "Inode table full".to_string(),
+                ));
+            }
+            self.storage.write_blocks(4096, &bitmap_sector).await?;
+            let disk_inode = inode::DiskInode::new(new_ino, mode, uid, gid);
+            inode::write_inode_raw(&self.storage, new_ino, &disk_inode).await?;
         }
 
-        let disk_inode = inode::DiskInode::new(new_ino, mode, uid, gid);
-        inode::write_inode_raw(&self.storage, new_ino, &disk_inode)?;
-        std::mem::drop(_op_guard);
-
-        dentry::insert_dentry(&self.storage, parent, new_ino, name, mode & libc::S_IFMT)?;
+        dentry::insert_dentry(&self.storage, parent, new_ino, name, mode & libc::S_IFMT).await?;
 
         // Update parent directory times
-        if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent) {
+        if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
             parent_inode.mtime = now;
             parent_inode.ctime = now;
-            let _ = inode::write_inode(&self.storage, parent, &parent_inode);
+            let _ = inode::write_inode(&self.storage, parent, &parent_inode).await;
         }
 
+        let disk_inode = inode::read_inode(&self.storage, new_ino).await?;
         Ok(Inode {
             ino: new_ino,
             mode: disk_inode.mode,
@@ -212,7 +234,7 @@ impl Metadata for MetaLvBackend {
             .lock_exclusive(&format!("D{}:{}", parent, name))
             .await;
 
-        if let Some(dentry) = dentry::find_dentry(&self.storage, parent, name)? {
+        if let Some(dentry) = dentry::find_dentry(&self.storage, parent, name).await? {
             let ino = dentry.child_ino;
             let _inode_guard = if parent != ino {
                 Some(self.dlm.lock_exclusive(&format!("I{}", ino)).await)
@@ -220,21 +242,21 @@ impl Metadata for MetaLvBackend {
                 None
             };
 
-            dentry::remove_dentry(&self.storage, parent, name)?;
+            dentry::remove_dentry(&self.storage, parent, name).await?;
 
             // Update parent directory times
-            if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent) {
+            if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64;
                 parent_inode.mtime = now;
                 parent_inode.ctime = now;
-                let _ = inode::write_inode(&self.storage, parent, &parent_inode);
+                let _ = inode::write_inode(&self.storage, parent, &parent_inode).await;
             }
 
             // Decrement nlink
-            let mut disk_inode = inode::read_inode(&self.storage, ino)?;
+            let mut disk_inode = inode::read_inode(&self.storage, ino).await?;
             if disk_inode.nlink > 0 {
                 disk_inode.nlink -= 1;
             }
@@ -242,7 +264,7 @@ impl Metadata for MetaLvBackend {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            inode::write_inode(&self.storage, ino, &disk_inode)?;
+            inode::write_inode(&self.storage, ino, &disk_inode).await?;
             Ok(())
         } else {
             Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -259,20 +281,20 @@ impl Metadata for MetaLvBackend {
             .lock_exclusive(&format!("D{}:{}", new_parent, new_name))
             .await;
 
-        if let Some(_) = dentry::find_dentry(&self.storage, new_parent, new_name)? {
+        if let Some(_) = dentry::find_dentry(&self.storage, new_parent, new_name).await? {
             return Err(crate::error::SqueezefsError::InvalidOperation(
                 "File already exists".to_string(),
             ));
         }
 
         let _inode_guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
-        let mut disk_inode = inode::read_inode(&self.storage, ino)?;
+        let mut disk_inode = inode::read_inode(&self.storage, ino).await?;
         disk_inode.nlink += 1;
         disk_inode.ctime = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        inode::write_inode(&self.storage, ino, &disk_inode)?;
+        inode::write_inode(&self.storage, ino, &disk_inode).await?;
 
         dentry::insert_dentry(
             &self.storage,
@@ -280,17 +302,18 @@ impl Metadata for MetaLvBackend {
             ino,
             new_name,
             disk_inode.mode & libc::S_IFMT,
-        )?;
+        )
+        .await?;
 
         // Update parent directory times
-        if let Ok(mut parent_inode) = inode::read_inode(&self.storage, new_parent) {
+        if let Ok(mut parent_inode) = inode::read_inode(&self.storage, new_parent).await {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
             parent_inode.mtime = now;
             parent_inode.ctime = now;
-            let _ = inode::write_inode(&self.storage, new_parent, &parent_inode);
+            let _ = inode::write_inode(&self.storage, new_parent, &parent_inode).await;
         }
 
         Ok(Inode {
@@ -330,15 +353,16 @@ impl Metadata for MetaLvBackend {
             None
         };
 
-        if let Some(dentry) = dentry::find_dentry(&self.storage, old_parent, old_name)? {
-            dentry::remove_dentry(&self.storage, old_parent, old_name)?;
+        if let Some(dentry) = dentry::find_dentry(&self.storage, old_parent, old_name).await? {
+            dentry::remove_dentry(&self.storage, old_parent, old_name).await?;
             dentry::insert_dentry(
                 &self.storage,
                 new_parent,
                 dentry.child_ino,
                 new_name,
                 dentry.file_type,
-            )?;
+            )
+            .await?;
             Ok(())
         } else {
             Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -350,7 +374,7 @@ impl Metadata for MetaLvBackend {
 
     async fn readdir(&self, dir: Ino, _offset: u64, _max: usize) -> Result<Vec<DirEntry>> {
         let _guard = self.dlm.lock_shared(&format!("I{}", dir)).await;
-        let dentries = dentry::list_dentries(&self.storage, dir)?;
+        let dentries = dentry::list_dentries(&self.storage, dir).await?;
         let mut list = Vec::new();
         for d in dentries {
             list.push(DirEntry {
@@ -364,7 +388,7 @@ impl Metadata for MetaLvBackend {
 
     async fn getattr(&self, ino: Ino) -> Result<Inode> {
         let _guard = self.dlm.lock_shared(&format!("I{}", ino)).await;
-        let disk_inode = inode::read_inode(&self.storage, ino)?;
+        let disk_inode = inode::read_inode(&self.storage, ino).await?;
         Ok(Inode {
             ino: disk_inode.ino,
             mode: disk_inode.mode,
@@ -391,7 +415,7 @@ impl Metadata for MetaLvBackend {
         ctime: Option<u64>,
     ) -> Result<Inode> {
         let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
-        let mut disk_inode = inode::read_inode(&self.storage, ino)?;
+        let mut disk_inode = inode::read_inode(&self.storage, ino).await?;
         let mut ctime_updated = false;
         if let Some(m) = mode {
             disk_inode.mode = m;
@@ -423,7 +447,7 @@ impl Metadata for MetaLvBackend {
                 .unwrap_or_default()
                 .as_nanos() as u64;
         }
-        inode::write_inode(&self.storage, ino, &disk_inode)?;
+        inode::write_inode(&self.storage, ino, &disk_inode).await?;
         Ok(Inode {
             ino: disk_inode.ino,
             mode: disk_inode.mode,
@@ -440,28 +464,40 @@ impl Metadata for MetaLvBackend {
 
     async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         let _guard = self.dlm.lock_shared(&format!("I{}", ino)).await;
-        xattr::get_xattr(&self.storage, ino, name)
+        xattr::get_xattr(&self.storage, ino, name).await
     }
 
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
         let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
-        xattr::set_xattr(&self.storage, ino, name, value)
+        xattr::set_xattr(&self.storage, ino, name, value).await
     }
 
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
         let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
-        xattr::remove_xattr(&self.storage, ino, name)
+        xattr::remove_xattr(&self.storage, ino, name).await
     }
 
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
         let _guard = self.dlm.lock_shared(&format!("I{}", ino)).await;
-        xattr::list_xattrs(&self.storage, ino)
+        xattr::list_xattrs(&self.storage, ino).await
     }
 
     async fn destroy_inode(&self, ino: Ino) -> Result<()> {
         let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
+
+        // Update free-inode bitmap
+        {
+            let _inode_guard = self.storage.inode_lock.lock().await;
+            let mut bitmap_sector = [0u8; 4096];
+            self.storage.read_blocks(4096, &mut bitmap_sector).await?;
+            let byte_idx = ino as usize / 8;
+            let bit_idx = ino as usize % 8;
+            bitmap_sector[byte_idx] &= !(1 << bit_idx);
+            self.storage.write_blocks(4096, &bitmap_sector).await?;
+        }
+
         let empty = inode::DiskInode::new_zeroed();
-        inode::write_inode(&self.storage, ino, &empty)?;
+        inode::write_inode(&self.storage, ino, &empty).await?;
         Ok(())
     }
 }
@@ -496,7 +532,7 @@ impl RoutedMetaBackend {
         Ok(())
     }
 
-    pub fn get_volume_health(&self, idx: usize) -> u32 {
+    pub async fn get_volume_health(&self, idx: usize) -> u32 {
         if self.disabled_volumes.contains_key(&idx) {
             return 0;
         }
@@ -504,7 +540,7 @@ impl RoutedMetaBackend {
             return 0;
         }
         let vol = &self.volumes[idx];
-        let allocated = vol.get_allocated_inode_count();
+        let allocated = vol.get_allocated_inode_count().await;
         let max_inodes = 20000;
 
         let free_factor = if max_inodes > allocated {
@@ -557,7 +593,8 @@ impl Metadata for RoutedMetaBackend {
             .dlm
             .lock_shared(&format!("D{}:{}", local_parent, name))
             .await;
-        if let Some(dentry) = dentry::find_dentry(&self.volumes[v_idx].storage, local_parent, name)?
+        if let Some(dentry) =
+            dentry::find_dentry(&self.volumes[v_idx].storage, local_parent, name).await?
         {
             self.getattr(dentry.child_ino).await
         } else {
@@ -585,7 +622,7 @@ impl Metadata for RoutedMetaBackend {
                 if self.disabled_volumes.contains_key(&i) {
                     continue;
                 }
-                let health = self.get_volume_health(i);
+                let health = self.get_volume_health(i).await;
                 candidates.push((i, health));
             }
             if candidates.is_empty() {
@@ -619,37 +656,52 @@ impl Metadata for RoutedMetaBackend {
             .await;
 
         if let Some(_) =
-            dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)?
+            dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name).await?
         {
             return Err(crate::error::SqueezefsError::InvalidOperation(
                 "File already exists".to_string(),
             ));
         }
 
-        let _op_guard = self.volumes[target_v_idx].storage.lock_op();
         let mut new_local_ino = 0;
-        for i in 2..20000 {
-            if let Err(_) = inode::read_inode(&self.volumes[target_v_idx].storage, i) {
-                new_local_ino = i;
-                break;
+        let mut disk_inode;
+        {
+            let _guard = self.volumes[target_v_idx].storage.inode_lock.lock().await;
+            let mut bitmap_sector = [0u8; 4096];
+            self.volumes[target_v_idx]
+                .storage
+                .read_blocks(4096, &mut bitmap_sector)
+                .await?;
+            for i in 2..20000 {
+                let byte_idx = i / 8;
+                let bit_idx = i % 8;
+                if (bitmap_sector[byte_idx] & (1 << bit_idx)) == 0 {
+                    new_local_ino = i as u64;
+                    bitmap_sector[byte_idx] |= 1 << bit_idx;
+                    break;
+                }
             }
-        }
-        if new_local_ino == 0 {
-            return Err(crate::error::SqueezefsError::InvalidOperation(
-                "Inode table full".to_string(),
-            ));
-        }
+            if new_local_ino == 0 {
+                return Err(crate::error::SqueezefsError::InvalidOperation(
+                    "Inode table full".to_string(),
+                ));
+            }
+            self.volumes[target_v_idx]
+                .storage
+                .write_blocks(4096, &bitmap_sector)
+                .await?;
 
-        let mut disk_inode = inode::DiskInode::new(new_local_ino, mode, uid, gid);
-        if is_dir {
-            disk_inode.nlink = 2;
+            disk_inode = inode::DiskInode::new(new_local_ino, mode, uid, gid);
+            if is_dir {
+                disk_inode.nlink = 2;
+            }
+            inode::write_inode_raw(
+                &self.volumes[target_v_idx].storage,
+                new_local_ino,
+                &disk_inode,
+            )
+            .await?;
         }
-        inode::write_inode_raw(
-            &self.volumes[target_v_idx].storage,
-            new_local_ino,
-            &disk_inode,
-        )?;
-        std::mem::drop(_op_guard);
 
         let global_child_ino = self.make_global_ino(new_local_ino, target_v_idx);
 
@@ -659,11 +711,12 @@ impl Metadata for RoutedMetaBackend {
             global_child_ino,
             name,
             mode & libc::S_IFMT,
-        )?;
+        )
+        .await?;
 
         // Update parent directory times
         if let Ok(mut parent_inode) =
-            inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent)
+            inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent).await
         {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -678,7 +731,8 @@ impl Metadata for RoutedMetaBackend {
                 &self.volumes[parent_v_idx].storage,
                 local_parent,
                 &parent_inode,
-            );
+            )
+            .await;
         }
 
         Ok(Inode {
@@ -708,7 +762,7 @@ impl Metadata for RoutedMetaBackend {
             .await;
 
         if let Some(dentry) =
-            dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)?
+            dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name).await?
         {
             let global_child_ino = dentry.child_ino;
             let (child_v_idx, local_child) = self.route_ino(global_child_ino);
@@ -725,13 +779,13 @@ impl Metadata for RoutedMetaBackend {
                 None
             };
 
-            dentry::remove_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)?;
+            dentry::remove_dentry(&self.volumes[parent_v_idx].storage, local_parent, name).await?;
 
             let is_dir = dentry.file_type == libc::S_IFDIR;
 
             // Update parent directory times
             if let Ok(mut parent_inode) =
-                inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent)
+                inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent).await
             {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -748,11 +802,12 @@ impl Metadata for RoutedMetaBackend {
                     &self.volumes[parent_v_idx].storage,
                     local_parent,
                     &parent_inode,
-                );
+                )
+                .await;
             }
 
             let mut disk_inode =
-                inode::read_inode(&self.volumes[child_v_idx].storage, local_child)?;
+                inode::read_inode(&self.volumes[child_v_idx].storage, local_child).await?;
             log::debug!(
                 "meta_backend unlink: local_child = {}, nlink = {}",
                 local_child,
@@ -770,7 +825,8 @@ impl Metadata for RoutedMetaBackend {
                 local_child,
                 disk_inode.nlink
             );
-            inode::write_inode(&self.volumes[child_v_idx].storage, local_child, &disk_inode)?;
+            inode::write_inode(&self.volumes[child_v_idx].storage, local_child, &disk_inode)
+                .await?;
             Ok(())
         } else {
             Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -796,7 +852,7 @@ impl Metadata for RoutedMetaBackend {
             .await;
 
         if let Some(_) =
-            dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, new_name)?
+            dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, new_name).await?
         {
             return Err(crate::error::SqueezefsError::InvalidOperation(
                 "File already exists".to_string(),
@@ -807,7 +863,8 @@ impl Metadata for RoutedMetaBackend {
             .dlm
             .lock_exclusive(&format!("I{}", local_child))
             .await;
-        let mut disk_inode = inode::read_inode(&self.volumes[child_v_idx].storage, local_child)?;
+        let mut disk_inode =
+            inode::read_inode(&self.volumes[child_v_idx].storage, local_child).await?;
         log::debug!(
             "meta_backend link: local_child = {}, nlink before = {}",
             local_child,
@@ -823,7 +880,7 @@ impl Metadata for RoutedMetaBackend {
             local_child,
             disk_inode.nlink
         );
-        inode::write_inode(&self.volumes[child_v_idx].storage, local_child, &disk_inode)?;
+        inode::write_inode(&self.volumes[child_v_idx].storage, local_child, &disk_inode).await?;
 
         dentry::insert_dentry(
             &self.volumes[parent_v_idx].storage,
@@ -831,11 +888,12 @@ impl Metadata for RoutedMetaBackend {
             ino,
             new_name,
             disk_inode.mode & libc::S_IFMT,
-        )?;
+        )
+        .await?;
 
         // Update parent directory times
         if let Ok(mut parent_inode) =
-            inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent)
+            inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent).await
         {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -847,7 +905,8 @@ impl Metadata for RoutedMetaBackend {
                 &self.volumes[parent_v_idx].storage,
                 local_parent,
                 &parent_inode,
-            );
+            )
+            .await;
         }
 
         Ok(Inode {
@@ -912,7 +971,9 @@ impl Metadata for RoutedMetaBackend {
             &self.volumes[old_parent_v_idx].storage,
             local_old_parent,
             old_name,
-        )? {
+        )
+        .await?
+        {
             let is_dir = dentry.file_type == libc::S_IFDIR;
             let cross_dir =
                 old_parent_v_idx != new_parent_v_idx || local_old_parent != local_new_parent;
@@ -921,6 +982,7 @@ impl Metadata for RoutedMetaBackend {
                 // Decrement old parent link count
                 if let Ok(mut old_p_inode) =
                     inode::read_inode(&self.volumes[old_parent_v_idx].storage, local_old_parent)
+                        .await
                 {
                     if old_p_inode.nlink > 2 {
                         old_p_inode.nlink -= 1;
@@ -929,18 +991,21 @@ impl Metadata for RoutedMetaBackend {
                         &self.volumes[old_parent_v_idx].storage,
                         local_old_parent,
                         &old_p_inode,
-                    );
+                    )
+                    .await;
                 }
                 // Increment new parent link count
                 if let Ok(mut new_p_inode) =
                     inode::read_inode(&self.volumes[new_parent_v_idx].storage, local_new_parent)
+                        .await
                 {
                     new_p_inode.nlink += 1;
                     let _ = inode::write_inode(
                         &self.volumes[new_parent_v_idx].storage,
                         local_new_parent,
                         &new_p_inode,
-                    );
+                    )
+                    .await;
                 }
             }
             // Check if destination already exists to decrement its link count
@@ -948,16 +1013,19 @@ impl Metadata for RoutedMetaBackend {
                 &self.volumes[new_parent_v_idx].storage,
                 local_new_parent,
                 new_name,
-            )? {
+            )
+            .await?
+            {
                 let dest_ino = dest_dentry.child_ino;
                 let (dest_v_idx, local_dest) = self.route_ino(dest_ino);
                 if let Ok(mut dest_inode) =
-                    inode::read_inode(&self.volumes[dest_v_idx].storage, local_dest)
+                    inode::read_inode(&self.volumes[dest_v_idx].storage, local_dest).await
                 {
                     // Check if destination is a directory and is not empty
                     if (dest_inode.mode & libc::S_IFMT) == libc::S_IFDIR {
                         let dentries =
-                            dentry::list_dentries(&self.volumes[dest_v_idx].storage, local_dest)?;
+                            dentry::list_dentries(&self.volumes[dest_v_idx].storage, local_dest)
+                                .await?;
                         if !dentries.is_empty() {
                             return Err(crate::error::SqueezefsError::Io(
                                 std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
@@ -976,28 +1044,32 @@ impl Metadata for RoutedMetaBackend {
                         &self.volumes[dest_v_idx].storage,
                         local_dest,
                         &dest_inode,
-                    );
+                    )
+                    .await;
                 }
                 // Remove the destination dentry so it gets replaced cleanly
                 dentry::remove_dentry(
                     &self.volumes[new_parent_v_idx].storage,
                     local_new_parent,
                     new_name,
-                )?;
+                )
+                .await?;
             }
 
             dentry::remove_dentry(
                 &self.volumes[old_parent_v_idx].storage,
                 local_old_parent,
                 old_name,
-            )?;
+            )
+            .await?;
             dentry::insert_dentry(
                 &self.volumes[new_parent_v_idx].storage,
                 local_new_parent,
                 dentry.child_ino,
                 new_name,
                 dentry.file_type,
-            )?;
+            )
+            .await?;
             Ok(())
         } else {
             Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -1014,7 +1086,7 @@ impl Metadata for RoutedMetaBackend {
             .dlm
             .lock_shared(&format!("I{}", local_dir))
             .await;
-        let dentries = dentry::list_dentries(&self.volumes[v_idx].storage, local_dir)?;
+        let dentries = dentry::list_dentries(&self.volumes[v_idx].storage, local_dir).await?;
         let mut list = Vec::new();
         for d in dentries {
             list.push(DirEntry {
@@ -1033,9 +1105,9 @@ impl Metadata for RoutedMetaBackend {
             .dlm
             .lock_shared(&format!("I{}", local_ino))
             .await;
-        let disk_inode = inode::read_inode(&self.volumes[v_idx].storage, local_ino)?;
+        let disk_inode = inode::read_inode(&self.volumes[v_idx].storage, local_ino).await?;
         Ok(Inode {
-            ino,
+            ino: ino,
             mode: disk_inode.mode,
             uid: disk_inode.uid,
             gid: disk_inode.gid,
@@ -1065,7 +1137,7 @@ impl Metadata for RoutedMetaBackend {
             .dlm
             .lock_exclusive(&format!("I{}", local_ino))
             .await;
-        let mut disk_inode = inode::read_inode(&self.volumes[v_idx].storage, local_ino)?;
+        let mut disk_inode = inode::read_inode(&self.volumes[v_idx].storage, local_ino).await?;
         let mut ctime_updated = false;
         if let Some(m) = mode {
             disk_inode.mode = m;
@@ -1097,9 +1169,9 @@ impl Metadata for RoutedMetaBackend {
                 .unwrap_or_default()
                 .as_nanos() as u64;
         }
-        inode::write_inode(&self.volumes[v_idx].storage, local_ino, &disk_inode)?;
+        inode::write_inode(&self.volumes[v_idx].storage, local_ino, &disk_inode).await?;
         Ok(Inode {
-            ino,
+            ino: ino,
             mode: disk_inode.mode,
             uid: disk_inode.uid,
             gid: disk_inode.gid,
@@ -1119,7 +1191,7 @@ impl Metadata for RoutedMetaBackend {
             .dlm
             .lock_shared(&format!("I{}", local_ino))
             .await;
-        xattr::get_xattr(&self.volumes[v_idx].storage, local_ino, name)
+        xattr::get_xattr(&self.volumes[v_idx].storage, local_ino, name).await
     }
 
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
@@ -1129,7 +1201,7 @@ impl Metadata for RoutedMetaBackend {
             .dlm
             .lock_exclusive(&format!("I{}", local_ino))
             .await;
-        xattr::set_xattr(&self.volumes[v_idx].storage, local_ino, name, value)
+        xattr::set_xattr(&self.volumes[v_idx].storage, local_ino, name, value).await
     }
 
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
@@ -1139,7 +1211,7 @@ impl Metadata for RoutedMetaBackend {
             .dlm
             .lock_exclusive(&format!("I{}", local_ino))
             .await;
-        xattr::remove_xattr(&self.volumes[v_idx].storage, local_ino, name)
+        xattr::remove_xattr(&self.volumes[v_idx].storage, local_ino, name).await
     }
 
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
@@ -1149,7 +1221,7 @@ impl Metadata for RoutedMetaBackend {
             .dlm
             .lock_shared(&format!("I{}", local_ino))
             .await;
-        xattr::list_xattrs(&self.volumes[v_idx].storage, local_ino)
+        xattr::list_xattrs(&self.volumes[v_idx].storage, local_ino).await
     }
 
     async fn destroy_inode(&self, ino: Ino) -> Result<()> {

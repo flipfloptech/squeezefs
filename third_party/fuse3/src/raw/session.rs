@@ -17,6 +17,7 @@ use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
+use bytes::Bytes;
 
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
 use async_fs::read_dir;
@@ -285,6 +286,7 @@ enum ReadResult {
         in_header: IoResult<fuse_in_header>,
         header_buffer: Vec<u8>,
         data_buffer: Vec<u8>,
+        uring_payload: Option<Bytes>,
     },
 }
 
@@ -548,13 +550,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             let threads = crate::raw::session::tpc_thread_count();
             if threads > 0 {
                 debug!("Multi-Queue FUSE: Spawning {} worker connections", threads);
-                for _ in 0..threads {
+                for qid in 1..=threads {
                     let mut worker_session = self.clone();
                     let (tx, rx) = unbounded();
                     worker_session.response_sender = tx;
                     worker_session.response_receiver = Some(rx);
 
-                    let cloned_conn = fuse_connection.clone_connection()?;
+                    let mut cloned_conn = fuse_connection.clone_connection()?;
+                    cloned_conn.assigned_qid = Some(qid as u16);
                     worker_session.fuse_connection = Some(Arc::new(cloned_conn));
                     worker_session.filesystem = self.filesystem.clone();
 
@@ -718,17 +721,17 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         mut header_buffer: Vec<u8>,
         mut data_buffer: Vec<u8>,
     ) -> ReadResult {
-        let res = match fuse_connection
+        let (uring_payload, res) = match fuse_connection
             .read_vectored(header_buffer, data_buffer)
             .await
         {
             None => return ReadResult::Destroy,
 
-            Some(((header_buf, data_buf), res)) => {
+            Some(((header_buf, data_buf, payload), res)) => {
                 header_buffer = header_buf;
                 data_buffer = data_buf;
 
-                res
+                (payload, res)
             }
         };
         let n = match res {
@@ -765,6 +768,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     in_header: Err(err),
                     header_buffer,
                     data_buffer,
+                    uring_payload,
                 };
             }
 
@@ -786,6 +790,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 )),
                 header_buffer,
                 data_buffer,
+                uring_payload,
             };
         }
 
@@ -797,6 +802,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     in_header: Err(IoError::new(ErrorKind::Other, err)),
                     header_buffer,
                     data_buffer,
+                    uring_payload,
                 };
             }
 
@@ -807,6 +813,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             in_header: Ok(in_header),
             header_buffer,
             data_buffer,
+            uring_payload,
         }
     }
 
@@ -827,6 +834,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut data_buffer = vec![0; buffer_size];
 
         loop {
+            let uring_payload;
             let in_header = match self
                 .read_fuse_request(&fuse_connection, header_buffer, data_buffer)
                 .await
@@ -847,9 +855,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     in_header,
                     header_buffer: header_buf,
                     data_buffer: data_buf,
+                    uring_payload: payload,
                 } => {
                     header_buffer = header_buf;
                     data_buffer = data_buf;
+                    uring_payload = payload;
 
                     match in_header {
                         Err(_) => continue,
@@ -971,7 +981,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 }
 
                 fuse_opcode::FUSE_WRITE => {
-                    self.handle_write(request, in_header, data_ref, &fs).await;
+                    self.handle_write(request, in_header, data_ref, uring_payload.clone(), &fs).await;
                 }
 
                 fuse_opcode::FUSE_STATFS => {
@@ -2417,6 +2427,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         request: Request,
         in_header: fuse_in_header,
         mut data: &[u8],
+        uring_payload: Option<Bytes>,
         fs: &Arc<FS>,
     ) {
         let write_in = match get_bincode_config().deserialize::<fuse_write_in>(data) {
@@ -2444,7 +2455,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             return;
         }
 
-        let data = data.to_vec();
+        let payload = match uring_payload {
+            Some(p) => p,
+            None => Bytes::copy_from_slice(data),
+        };
 
         let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
@@ -2461,7 +2475,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     in_header.nodeid,
                     write_in.fh,
                     write_in.offset,
-                    &data,
+                    payload,
                     write_in.write_flags,
                     write_in.flags,
                 )

@@ -2,7 +2,7 @@ use crate::error::{Result, SqueezefsError};
 use crate::meta_backend::storage::{MetaLvStorage, SECTOR_SIZE};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-pub const XATTR_BLOCK_START: u64 = 1024 * 1024 * 16; // 16MB offset
+pub const XATTR_BLOCK_START: u64 = 1024 * 1024 * 24; // 24MB offset
 pub const ENTRY_SIZE: usize = 1092;
 
 #[derive(IntoBytes, FromBytes, Immutable, Debug, Clone, Copy)]
@@ -80,15 +80,17 @@ fn get_flat_val(entry: &DiskXattrEntry) -> Vec<u8> {
     flat
 }
 
-pub fn get_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<Option<Vec<u8>>> {
-    let _guard = storage.lock_op();
-
-    if let Ok(inode) = crate::meta_backend::inode::read_inode(storage, ino) {
+pub async fn get_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<Option<Vec<u8>>> {
+    let inode = crate::meta_backend::inode::read_inode(storage, ino)
+        .await
+        .ok();
+    if let Some(ref inode) = inode {
         if (inode.mode & libc::S_IFMT) == libc::S_IFLNK {
             if name == "system.symlink" {
+                let _guard = storage.xattr_lock.lock().await;
                 let offset = get_xattr_block_offset(ino);
                 let mut sector_buf = [0u8; SECTOR_SIZE];
-                storage.read_blocks(offset, &mut sector_buf)?;
+                storage.read_blocks(offset, &mut sector_buf).await?;
                 let len = std::cmp::min(inode.size as usize, SECTOR_SIZE);
                 return Ok(Some(sector_buf[..len].to_vec()));
             } else {
@@ -97,9 +99,10 @@ pub fn get_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<Option
         }
     }
 
+    let _guard = storage.xattr_lock.lock().await;
     let offset = get_xattr_block_offset(ino);
     let mut block_buf = [0u8; SECTOR_SIZE];
-    storage.read_blocks(offset, &mut block_buf)?;
+    storage.read_blocks(offset, &mut block_buf).await?;
 
     let mut block = DiskXattrBlock::new_zeroed();
     block.as_mut_bytes().copy_from_slice(&block_buf);
@@ -125,7 +128,7 @@ pub fn get_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<Option
     Ok(None)
 }
 
-pub fn set_xattr(storage: &MetaLvStorage, ino: u64, name: &str, value: &[u8]) -> Result<()> {
+pub async fn set_xattr(storage: &MetaLvStorage, ino: u64, name: &str, value: &[u8]) -> Result<()> {
     if name.len() > 64 {
         return Err(SqueezefsError::InvalidOperation(
             "xattr key too long (max 64 bytes)".to_string(),
@@ -143,18 +146,20 @@ pub fn set_xattr(storage: &MetaLvStorage, ino: u64, name: &str, value: &[u8]) ->
         ));
     }
 
-    let _guard = storage.lock_op();
-
-    if let Ok(mut inode) = crate::meta_backend::inode::read_inode(storage, ino) {
+    let inode = crate::meta_backend::inode::read_inode(storage, ino)
+        .await
+        .ok();
+    if let Some(mut inode) = inode {
         if (inode.mode & libc::S_IFMT) == libc::S_IFLNK {
             if name == "system.symlink" {
                 inode.size = value.len() as u64;
-                crate::meta_backend::inode::write_inode(storage, ino, &inode)?;
+                crate::meta_backend::inode::write_inode(storage, ino, &inode).await?;
 
+                let _guard = storage.xattr_lock.lock().await;
                 let offset = get_xattr_block_offset(ino);
                 let mut sector_buf = [0u8; SECTOR_SIZE];
                 sector_buf[..value.len()].copy_from_slice(value);
-                storage.write_blocks(offset, &sector_buf)?;
+                storage.write_blocks(offset, &sector_buf).await?;
                 return Ok(());
             } else {
                 return Err(SqueezefsError::InvalidOperation(
@@ -164,9 +169,10 @@ pub fn set_xattr(storage: &MetaLvStorage, ino: u64, name: &str, value: &[u8]) ->
         }
     }
 
+    let _guard = storage.xattr_lock.lock().await;
     let offset = get_xattr_block_offset(ino);
     let mut block_buf = [0u8; SECTOR_SIZE];
-    storage.read_blocks(offset, &mut block_buf)?;
+    storage.read_blocks(offset, &mut block_buf).await?;
 
     let mut block = DiskXattrBlock::new_zeroed();
     block.as_mut_bytes().copy_from_slice(&block_buf);
@@ -222,15 +228,15 @@ pub fn set_xattr(storage: &MetaLvStorage, ino: u64, name: &str, value: &[u8]) ->
         block.num_entries += 1;
     }
 
-    storage.write_blocks(offset, block.as_bytes())?;
+    storage.write_blocks(offset, block.as_bytes()).await?;
     Ok(())
 }
 
-pub fn remove_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<()> {
-    let _guard = storage.lock_op();
+pub async fn remove_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<()> {
+    let _guard = storage.xattr_lock.lock().await;
     let offset = get_xattr_block_offset(ino);
     let mut block_buf = [0u8; SECTOR_SIZE];
-    storage.read_blocks(offset, &mut block_buf)?;
+    storage.read_blocks(offset, &mut block_buf).await?;
 
     let mut block = DiskXattrBlock::new_zeroed();
     block.as_mut_bytes().copy_from_slice(&block_buf);
@@ -266,7 +272,7 @@ pub fn remove_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<()>
             }
         }
         block.num_entries -= 1;
-        storage.write_blocks(offset, block.as_bytes())?;
+        storage.write_blocks(offset, block.as_bytes()).await?;
         Ok(())
     } else {
         Err(SqueezefsError::Io(std::io::Error::new(
@@ -276,11 +282,11 @@ pub fn remove_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<()>
     }
 }
 
-pub fn list_xattrs(storage: &MetaLvStorage, ino: u64) -> Result<Vec<String>> {
-    let _guard = storage.lock_op();
+pub async fn list_xattrs(storage: &MetaLvStorage, ino: u64) -> Result<Vec<String>> {
+    let _guard = storage.xattr_lock.lock().await;
     let offset = get_xattr_block_offset(ino);
     let mut block_buf = [0u8; SECTOR_SIZE];
-    storage.read_blocks(offset, &mut block_buf)?;
+    storage.read_blocks(offset, &mut block_buf).await?;
 
     let mut block = DiskXattrBlock::new_zeroed();
     block.as_mut_bytes().copy_from_slice(&block_buf);

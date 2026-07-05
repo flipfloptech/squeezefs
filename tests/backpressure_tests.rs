@@ -21,7 +21,8 @@ async fn test_uring_bounded_queue_handles_concurrent_burst() {
         handles.push(tokio::spawn(async move {
             let data = vec![(i % 255) as u8; 4096];
             let offset = ((i % 16) * 4096) as u64;
-            d.write_block(offset, &data).await
+            d.write_block(offset, bytes::Bytes::copy_from_slice(&data))
+                .await
         }));
     }
     let mut ok = 0usize;
@@ -51,7 +52,7 @@ async fn test_uring_sequential_unaligned_under_bound() {
     let dev = NvmeBlockDev::new(path.to_str().unwrap());
     for i in 0..32u64 {
         let data: Vec<u8> = (0u8..123).map(|x| x.wrapping_add(i as u8)).collect();
-        dev.write_block((i % 4) * 4096, &data)
+        dev.write_block((i % 4) * 4096, bytes::Bytes::copy_from_slice(&data))
             .await
             .expect("unaligned write under bounded queue");
     }

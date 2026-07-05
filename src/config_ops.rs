@@ -245,8 +245,8 @@ pub async fn migrate_metadata_volume(
         crate::meta_backend::storage::MetaLvStorage::open(&to_path, 64 * 1024 * 1024),
     ) {
         for i in 2..20000 {
-            if let Ok(inode) = crate::meta_backend::inode::read_inode(&from_storage, i) {
-                let _ = crate::meta_backend::inode::write_inode(&to_storage, i, &inode);
+            if let Ok(inode) = crate::meta_backend::inode::read_inode(&from_storage, i).await {
+                let _ = crate::meta_backend::inode::write_inode(&to_storage, i, &inode).await;
             }
         }
     }

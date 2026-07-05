@@ -31,6 +31,7 @@ struct InMemoryJobs {
     active_jobs: HashSet<String>,
     pending_tasks: HashMap<String, Vec<JobTask>>,
     paused_jobs: HashSet<String>,
+    job_notifiers: HashMap<String, Arc<tokio::sync::Notify>>,
 }
 
 static IN_MEMORY_JOBS: Lazy<Mutex<InMemoryJobs>> = Lazy::new(|| {
@@ -38,8 +39,11 @@ static IN_MEMORY_JOBS: Lazy<Mutex<InMemoryJobs>> = Lazy::new(|| {
         active_jobs: HashSet::new(),
         pending_tasks: HashMap::new(),
         paused_jobs: HashSet::new(),
+        job_notifiers: HashMap::new(),
     })
 });
+
+static WORKER_NOTIFY: Lazy<tokio::sync::Notify> = Lazy::new(|| tokio::sync::Notify::new());
 
 pub async fn submit_and_wait_for_job(
     _redis_url: &str,
@@ -56,24 +60,31 @@ pub async fn submit_and_wait_for_job(
         });
     }
 
+    let notify = Arc::new(tokio::sync::Notify::new());
     {
         let mut state = IN_MEMORY_JOBS.lock();
         state.active_jobs.insert(job_id.clone());
         state.pending_tasks.insert(job_id.clone(), job_tasks);
+        state.job_notifiers.insert(job_id.clone(), notify.clone());
     }
+    WORKER_NOTIFY.notify_waiters();
 
     loop {
-        let is_done = {
+        let n = {
             let state = IN_MEMORY_JOBS.lock();
             if state.paused_jobs.contains(&job_id) {
                 return Err(SqueezefsError::InvalidOperation("Job paused".to_string()));
             }
-            !state.pending_tasks.contains_key(&job_id)
+            if !state.pending_tasks.contains_key(&job_id) {
+                break;
+            }
+            state.job_notifiers.get(&job_id).cloned()
         };
-        if is_done {
+        if let Some(notifier) = n {
+            notifier.notified().await;
+        } else {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(())
 }
@@ -98,6 +109,9 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                     if is_empty {
                         state.pending_tasks.remove(&job_id);
                         state.active_jobs.remove(&job_id);
+                        if let Some(n) = state.job_notifiers.remove(&job_id) {
+                            n.notify_waiters();
+                        }
                     }
                     Some(task_wrapper)
                 } else {
@@ -117,7 +131,7 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                         len,
                     } => {
                         if let Ok(data) = router.nvme_writer.read_block(src_offset, len).await {
-                            match router.nvme_writer.write_block(dest_offset, &data).await {
+                            match router.nvme_writer.write_block(dest_offset, data).await {
                                 Ok(_) => {
                                     if let Some(backend) = router.meta_backend.get() {
                                         if let Ok(Some(bytes)) = backend
@@ -154,7 +168,10 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                                         e
                                     );
                                     let mut state = IN_MEMORY_JOBS.lock();
-                                    state.paused_jobs.insert(task_wrapper.job_id);
+                                    state.paused_jobs.insert(task_wrapper.job_id.clone());
+                                    if let Some(n) = state.job_notifiers.get(&task_wrapper.job_id) {
+                                        n.notify_waiters();
+                                    }
                                 }
                             }
                         }
@@ -164,7 +181,7 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                     tokio::time::sleep(delay).await;
                 }
             } else {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                WORKER_NOTIFY.notified().await;
             }
         }
     });

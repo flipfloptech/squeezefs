@@ -382,6 +382,35 @@ impl CryptoCompressState {
             None => self.decompress(data),
         }
     }
+
+    pub async fn process_write_async(
+        &self,
+        data: bytes::Bytes,
+    ) -> Result<bytes::Bytes, SqueezefsError> {
+        if self.is_passthrough() {
+            return Ok(data);
+        }
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || state.process_write(data))
+            .await
+            .map_err(|e| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+    }
+
+    pub async fn process_read_async(
+        &self,
+        data: bytes::Bytes,
+    ) -> Result<bytes::Bytes, SqueezefsError> {
+        if self.is_passthrough() {
+            return Ok(data);
+        }
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let res = state.process_read(&data)?;
+            Ok(bytes::Bytes::from(res.into_owned()))
+        })
+        .await
+        .map_err(|e| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+    }
 }
 
 #[cfg(test)]

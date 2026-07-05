@@ -24,11 +24,11 @@
 
 #![cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -89,7 +89,7 @@ struct FuseUringCmdReq {
 pub struct InboundUringReq {
     /// `fuse_in_header` || per-op header (`op_in`).
     pub header_and_op: Vec<u8>,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     /// FUSE request unique (also embedded in `header_and_op`).
     #[allow(dead_code)]
     pub unique: u64,
@@ -115,48 +115,37 @@ struct QueueHandle {
 
 /// Shared work queue for all session workers (primary + multi-queue clones).
 struct InboundQueue {
-    q: Mutex<VecDeque<InboundUringReq>>,
-    cv: Condvar,
+    tx: tokio::sync::mpsc::UnboundedSender<InboundUringReq>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<InboundUringReq>>,
 }
 
 impl InboundQueue {
     fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            q: Mutex::new(VecDeque::new()),
-            cv: Condvar::new(),
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
         }
     }
 
     fn push(&self, req: InboundUringReq) {
-        self.q.lock().unwrap().push_back(req);
-        self.cv.notify_one();
+        let _ = self.tx.send(req);
     }
 
-    /// Blocking pop with timeout; returns None if inactive and empty.
-    fn pop_timeout(&self, active: &AtomicBool, timeout: Duration) -> Option<InboundUringReq> {
-        let mut g = self.q.lock().unwrap();
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(r) = g.pop_front() {
-                return Some(r);
-            }
-            if !active.load(Ordering::Relaxed) {
-                return None;
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            let (gg, _) = self
-                .cv
-                .wait_timeout(g, deadline.saturating_duration_since(now))
-                .unwrap();
-            g = gg;
+    /// Pop with timeout (async)
+    async fn pop_timeout(&self, active: &AtomicBool, timeout: Duration) -> Option<InboundUringReq> {
+        let mut rx_guard = self.rx.lock().await;
+        if !active.load(Ordering::Relaxed) {
+            return None;
+        }
+        match tokio::time::timeout(timeout, rx_guard.recv()).await {
+            Ok(Some(r)) => Some(r),
+            _ => None,
         }
     }
 
     fn notify_all(&self) {
-        self.cv.notify_all();
+        // Async queues don't need condvar notify
     }
 }
 
@@ -169,7 +158,7 @@ pub struct FuseOverUring {
     /// Number of queue workers that have submitted their initial REGISTERs.
     queues_registered: AtomicU64,
     nqueues: u16, // used for diagnostics
-    inbound: Arc<InboundQueue>,
+    inbound: Vec<Arc<InboundQueue>>,
     /// unique → (qid, ent_idx, commit_id)
     pending: Mutex<HashMap<u64, (u16, u16, u64)>>,
     queues: Vec<QueueHandle>,
@@ -283,7 +272,10 @@ impl FuseOverUring {
             .max(FUSE_MIN_READ_BUFFER)
             .max(KERNEL_MAX_PAGES_LIMIT * page);
 
-        let inbound = Arc::new(InboundQueue::new());
+        let mut inbound = Vec::with_capacity(nqueues);
+        for _ in 0..nqueues {
+            inbound.push(Arc::new(InboundQueue::new()));
+        }
         let mut queue_handles = Vec::with_capacity(nqueues);
         let mut commit_rxs = Vec::with_capacity(nqueues);
         let mut wake_fds = Vec::with_capacity(nqueues);
@@ -506,9 +498,13 @@ impl FuseOverUring {
         self.ready.load(Ordering::Acquire) && self.active.load(Ordering::Acquire)
     }
 
-    /// Blocking pop for session read path (works from multi-queue workers).
-    pub fn recv_inbound_timeout(&self, timeout: Duration) -> Option<InboundUringReq> {
-        self.inbound.pop_timeout(&self.active, timeout)
+    /// Async pop for session read path.
+    pub async fn recv_inbound_timeout(&self, qid: u16, timeout: Duration) -> Option<InboundUringReq> {
+        if (qid as usize) < self.inbound.len() {
+            self.inbound[qid as usize].pop_timeout(&self.active, timeout).await
+        } else {
+            None
+        }
     }
 
     pub fn submit_reply(&self, unique: u64, header: Vec<u8>, reply_body: Bytes) -> io::Result<()> {
@@ -591,7 +587,9 @@ impl FuseOverUring {
             // Drop any uncommitted request map entries; kernel already aborted them.
             self.pending.lock().unwrap().clear();
         }
-        self.inbound.notify_all();
+        for iq in &self.inbound {
+            iq.notify_all();
+        }
         let one: u64 = 1;
         for q in &self.queues {
             let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
@@ -895,8 +893,9 @@ fn queue_worker(
                 Vec::with_capacity(FUSE_IN_HEADER_SIZE + FUSE_URING_OP_IN_OUT_SZ);
             header_and_op.extend_from_slice(&ents[ent_idx].header.in_out[..FUSE_IN_HEADER_SIZE]);
             header_and_op.extend_from_slice(&ents[ent_idx].header.op_in);
-            let payload = ents[ent_idx].payload[..payload_sz.min(ents[ent_idx].payload.len())]
-                .to_vec();
+            let payload = Bytes::copy_from_slice(
+                &ents[ent_idx].payload[..payload_sz.min(ents[ent_idx].payload.len())],
+            );
 
             pool.stats_requests.fetch_add(1, Ordering::Relaxed);
             STATS_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -913,7 +912,7 @@ fn queue_worker(
             const FUSE_BATCH_FORGET: u32 = 42;
             if matches!(opcode, FUSE_FORGET | FUSE_BATCH_FORGET) {
                 // Deliver for nlookup accounting only — no pending map entry.
-                pool.inbound.push(InboundUringReq {
+                pool.inbound[qid as usize].push(InboundUringReq {
                     header_and_op,
                     payload,
                     unique,
@@ -946,7 +945,7 @@ fn queue_worker(
                 .lock()
                 .unwrap()
                 .insert(unique, (qid, ent_idx as u16, commit_id));
-            pool.inbound.push(InboundUringReq {
+            pool.inbound[qid as usize].push(InboundUringReq {
                 header_and_op,
                 payload,
                 unique,

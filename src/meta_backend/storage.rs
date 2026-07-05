@@ -1,7 +1,5 @@
 use crate::error::{Result, SqueezefsError};
-use parking_lot::Mutex;
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -30,9 +28,11 @@ impl Superblock {
 
 #[derive(Clone)]
 pub struct MetaLvStorage {
-    file: Arc<Mutex<File>>,
     path: PathBuf,
-    op_lock: Arc<parking_lot::ReentrantMutex<()>>,
+    pub superblock_lock: Arc<tokio::sync::Mutex<()>>,
+    pub inode_lock: Arc<tokio::sync::Mutex<()>>,
+    pub dentry_lock: Arc<tokio::sync::Mutex<()>>,
+    pub xattr_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl MetaLvStorage {
@@ -54,29 +54,24 @@ impl MetaLvStorage {
         }
 
         let storage = Self {
-            file: Arc::new(Mutex::new(file)),
             path: path_ref.to_path_buf(),
-            op_lock: Arc::new(parking_lot::ReentrantMutex::new(())),
+            superblock_lock: Arc::new(tokio::sync::Mutex::new(())),
+            inode_lock: Arc::new(tokio::sync::Mutex::new(())),
+            dentry_lock: Arc::new(tokio::sync::Mutex::new(())),
+            xattr_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         Ok(storage)
     }
 
-    pub fn lock_op(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
-        self.op_lock.lock()
-    }
-
     /// Read the Superblock at offset 0
-    pub fn read_superblock(&self) -> Result<Superblock> {
-        let mut buf = [0u8; SECTOR_SIZE];
-        let file = self.file.lock();
-        file.read_exact_at(&mut buf, 0)
-            .map_err(SqueezefsError::Io)?;
-
+    pub async fn read_superblock(&self) -> Result<Superblock> {
+        let _guard = self.superblock_lock.lock().await;
+        let bytes = crate::uring_fs::read_at(&self.path, 0, SECTOR_SIZE).await?;
         let mut sb = Superblock::new_zeroed();
         let sb_len = sb.as_bytes().len();
-        if buf.len() >= sb_len {
-            sb.as_mut_bytes().copy_from_slice(&buf[..sb_len]);
+        if bytes.len() >= sb_len {
+            sb.as_mut_bytes().copy_from_slice(&bytes[..sb_len]);
         }
 
         if &sb.magic != MAGIC_VALUE {
@@ -90,43 +85,38 @@ impl MetaLvStorage {
     }
 
     /// Write the Superblock at offset 0
-    pub fn write_superblock(&self, sb: &Superblock) -> Result<()> {
+    pub async fn write_superblock(&self, sb: &Superblock) -> Result<()> {
+        let _guard = self.superblock_lock.lock().await;
         let mut buf = [0u8; SECTOR_SIZE];
         let sb_bytes = sb.as_bytes();
         buf[..sb_bytes.len()].copy_from_slice(sb_bytes);
 
-        let file = self.file.lock();
-        file.write_all_at(&buf, 0).map_err(SqueezefsError::Io)?;
-        file.sync_all().map_err(SqueezefsError::Io)?;
-
+        crate::uring_fs::write_at(&self.path, 0, bytes::Bytes::copy_from_slice(&buf)).await?;
         Ok(())
     }
 
     /// Direct block read at a sector-aligned offset
-    pub fn read_blocks(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+    pub async fn read_blocks(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         if offset % SECTOR_SIZE as u64 != 0 {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "Read offset {} must be sector-aligned",
                 offset
             )));
         }
-        let file = self.file.lock();
-        file.read_exact_at(buf, offset)
-            .map_err(SqueezefsError::Io)?;
+        let bytes = crate::uring_fs::read_at(&self.path, offset, buf.len()).await?;
+        buf.copy_from_slice(&bytes);
         Ok(())
     }
 
     /// Direct block write at a sector-aligned offset
-    pub fn write_blocks(&self, offset: u64, buf: &[u8]) -> Result<()> {
+    pub async fn write_blocks(&self, offset: u64, buf: &[u8]) -> Result<()> {
         if offset % SECTOR_SIZE as u64 != 0 {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "Write offset {} must be sector-aligned",
                 offset
             )));
         }
-        let file = self.file.lock();
-        file.write_all_at(buf, offset).map_err(SqueezefsError::Io)?;
-        file.sync_all().map_err(SqueezefsError::Io)?;
+        crate::uring_fs::write_at(&self.path, offset, bytes::Bytes::copy_from_slice(buf)).await?;
         Ok(())
     }
 
@@ -134,18 +124,15 @@ impl MetaLvStorage {
         &self.path
     }
 
-    pub fn wipe(&self, quick: bool, pb: Option<indicatif::ProgressBar>) -> Result<()> {
+    pub async fn wipe(&self, quick: bool, pb: Option<indicatif::ProgressBar>) -> Result<()> {
         let size = {
-            let mut file = self.file.lock();
-            use std::io::Seek;
+            let file = OpenOptions::new()
+                .read(true)
+                .open(&self.path)
+                .map_err(SqueezefsError::Io)?;
             let mut size = 0;
-            if let Ok(s) = file.seek(std::io::SeekFrom::End(0)) {
-                size = s;
-            }
-            if size == 0 {
-                if let Ok(meta) = file.metadata() {
-                    size = meta.len();
-                }
+            if let Ok(meta) = file.metadata() {
+                size = meta.len();
             }
             size
         };
@@ -168,18 +155,20 @@ impl MetaLvStorage {
         }
 
         let zeros = vec![0u8; 1024 * 1024];
-        let file = self.file.lock();
         let mut written = 0;
         while written < wipe_len {
             let to_write = std::cmp::min(zeros.len() as u64, wipe_len - written) as usize;
-            file.write_all_at(&zeros[..to_write], written)
-                .map_err(SqueezefsError::Io)?;
+            crate::uring_fs::write_at(
+                &self.path,
+                written,
+                bytes::Bytes::copy_from_slice(&zeros[..to_write]),
+            )
+            .await?;
             written += to_write as u64;
             if let Some(ref p_bar) = pb {
                 p_bar.inc(to_write as u64);
             }
         }
-        file.sync_all().map_err(SqueezefsError::Io)?;
         if let Some(ref p_bar) = pb {
             p_bar.finish_with_message("Complete");
         }

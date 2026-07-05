@@ -61,15 +61,15 @@ async fn test_metalv_fuse_integration() {
     // Initialize MetaLV storage and backend
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
-    let meta_storage = MetaLvStorage::open(&meta_path, 32 * 1024 * 1024).unwrap();
+    let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
 
     // Verify it is not formatted initially
-    assert!(meta_storage.read_superblock().is_err());
+    assert!(meta_storage.read_superblock().await.is_err());
 
-    MetaLvBackend::format(&meta_storage).unwrap();
+    MetaLvBackend::format(&meta_storage).await.unwrap();
 
     // Verify it is now formatted
-    assert!(meta_storage.read_superblock().is_ok());
+    assert!(meta_storage.read_superblock().await.is_ok());
     let meta_backend = Arc::new(MetaLvBackend::new(meta_storage));
 
     // Register MetaLV backend

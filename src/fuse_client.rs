@@ -145,6 +145,8 @@ pub enum InodeWriteLockScope {
 /// Already-striped files use block-level locks on the data path, so the full-inode
 /// write lock need only cover short meta-prep. Inline and non-striped (layout
 /// transition / whole-buffer RMW) paths keep the lock for the entire operation.
+pub const MAX_INLINE_SIZE: u64 = 512;
+
 #[inline]
 pub fn inode_write_lock_scope(fits_inline: bool, is_striped: bool) -> InodeWriteLockScope {
     if fits_inline || !is_striped {
@@ -437,8 +439,6 @@ impl std::fmt::Debug for PosixLock {
 
 /// Max automatic retries for a single background writeback unit (P0-3).
 const WRITEBACK_MAX_ATTEMPTS: u32 = 4;
-/// P1-2: bound background writeback queue depth.
-const WRITEBACK_QUEUE_CAP: usize = 4096;
 /// P1-3: max partial blocks held only in RAM (not yet staged).
 const MAX_ACTIVE_BLOCK_BUFFERS: usize = 256;
 
@@ -478,6 +478,7 @@ pub struct SqueezefsFilesystem {
     writeback_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
     writeback_rx:
         std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<WritebackRequest>>>>,
+    pub writeback_queue_cap: usize,
     pub client_id: std::sync::Arc<std::sync::Mutex<String>>,
     pub mountpoint: std::sync::Arc<std::sync::Mutex<String>>,
     pub max_background_uploads: usize,
@@ -510,6 +511,7 @@ impl Clone for SqueezefsFilesystem {
             dismount_wait: self.dismount_wait,
             writeback_tx: self.writeback_tx.clone(),
             writeback_rx: self.writeback_rx.clone(),
+            writeback_queue_cap: self.writeback_queue_cap,
             client_id: self.client_id.clone(),
             mountpoint: self.mountpoint.clone(),
             max_background_uploads: self.max_background_uploads,
@@ -529,7 +531,11 @@ impl Clone for SqueezefsFilesystem {
 
 impl SqueezefsFilesystem {
     pub fn new(router: DataRouter, dlm: DlmClient, uid: u32, gid: u32) -> Self {
-        let (writeback_tx, writeback_rx) = tokio::sync::mpsc::channel(WRITEBACK_QUEUE_CAP);
+        let queue_cap = std::env::var("SQUEEZEFS_WRITEBACK_QUEUE_CAP")
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok())
+            .unwrap_or(4096);
+        let (writeback_tx, writeback_rx) = tokio::sync::mpsc::channel(queue_cap);
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_memory = sys.total_memory();
@@ -566,6 +572,7 @@ impl SqueezefsFilesystem {
             dismount_wait: 10,
             writeback_tx,
             writeback_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(writeback_rx))),
+            writeback_queue_cap: queue_cap,
             client_id: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             mountpoint: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             max_background_uploads: {
@@ -740,7 +747,7 @@ impl SqueezefsFilesystem {
                 let path_str = vol.storage.device_path().to_string_lossy().to_string();
                 let is_disabled = meta.disabled_volumes.contains_key(&idx);
                 let status = if is_disabled { "disabled" } else { "enabled" };
-                let health = meta.get_volume_health(idx);
+                let health = meta.get_volume_health(idx).await;
                 metadata_volumes.insert(
                     name,
                     serde_json::json!({
@@ -1075,7 +1082,7 @@ impl SqueezefsFilesystem {
         &self,
         ino: u64,
         offset: u64,
-        data: &[u8],
+        data: bytes::Bytes,
         existing_size: u64,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
@@ -1122,7 +1129,7 @@ impl SqueezefsFilesystem {
                 // 0. Acquire Block-level Lock to prevent concurrent modification to the same block
                 let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b as u32);
                 let start_block_lock = std::time::Instant::now();
-                let _block_guard = block_lock.lock().await;
+                let block_guard = block_lock.lock().await;
                 METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
                 // 1. Get existing block data (either from memory cache, NVMe staging cache, or read from backend/cache)
@@ -1187,8 +1194,9 @@ impl SqueezefsFilesystem {
                                         let decompressed = self
                                             .router
                                             .get_crypto()
-                                            .process_read(&raw)?
-                                            .into_owned();
+                                            .process_read_async(raw)
+                                            .await?
+                                            .to_vec();
                                         Ok::<Vec<u8>, SqueezefsError>(decompressed)
                                     }
                                     .await;
@@ -1251,6 +1259,8 @@ impl SqueezefsFilesystem {
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+                    std::mem::drop(block_guard);
+
                     let req = WritebackRequest {
                         ino,
                         block_idx: b as u32,
@@ -1260,6 +1270,7 @@ impl SqueezefsFilesystem {
                     self.enqueue_writeback(req).await?;
                 } else {
                     self.insert_active_block_buffer(cache_key.clone(), block_data, fencing_token);
+                    std::mem::drop(block_guard);
                 }
 
                 Ok::<(), SqueezefsError>(())
@@ -1494,7 +1505,8 @@ impl SqueezefsFilesystem {
                     .unwrap_or_default();
                 let file_type = meta.file_type.clone();
                 let is_striped = file_type == "striped";
-                let fencing_token = 0;
+                let file_path = crate::keys::inode_path(ino);
+                let fencing_token = dlm_clone.get_fencing_token(&file_path);
                 let old_key = meta.block_map.as_ref().and_then(|bm| bm.get(&b).cloned());
 
                 flush_single_active_block(
@@ -2170,7 +2182,7 @@ impl Filesystem for SqueezefsFilesystem {
         ino: u64,
         _fh: u64,
         offset: u64,
-        data: &[u8],
+        data: bytes::Bytes,
         _write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
@@ -2182,7 +2194,7 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // Record writeback queue depth
-        let queue_depth = WRITEBACK_QUEUE_CAP - self.writeback_tx.capacity();
+        let queue_depth = self.writeback_queue_cap - self.writeback_tx.capacity();
         METRICS.writeback_queue_depth.record(queue_depth);
 
         let write_future = async {
@@ -2211,8 +2223,9 @@ impl Filesystem for SqueezefsFilesystem {
             let bytes_written = data.len() as u32;
             let expected_new_size = std::cmp::max(old_size, offset + bytes_written as u64);
 
-            let fits_inline =
-                expected_new_size <= 4096 && file_type != "staged" && file_type != "striped";
+            let fits_inline = expected_new_size <= MAX_INLINE_SIZE
+                && file_type != "staged"
+                && file_type != "striped";
             let lock_scope = inode_write_lock_scope(fits_inline, is_striped);
 
             let now = SystemTime::now()
@@ -2232,7 +2245,7 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             if fits_inline {
-                let data_bytes = bytes::Bytes::copy_from_slice(data);
+                let data_bytes = data.clone();
                 if let Err(e) = self
                     .router
                     .write_file(&file_path, offset, data_bytes, fencing_token)
@@ -2269,7 +2282,7 @@ impl Filesystem for SqueezefsFilesystem {
                         && (data.len() as u64 % block_size == 0);
 
                     if is_aligned {
-                        let data_bytes = bytes::Bytes::copy_from_slice(data);
+                        let data_bytes = data.clone();
                         if let Err(e) = self
                             .router
                             .write_file(&file_path, offset, data_bytes, fencing_token)
@@ -2289,7 +2302,7 @@ impl Filesystem for SqueezefsFilesystem {
                         }
                     } else {
                         if let Err(e) = self
-                            .write_file_staged(ino, offset, data, old_size, fencing_token)
+                            .write_file_staged(ino, offset, data.clone(), old_size, fencing_token)
                             .await
                         {
                             if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
@@ -2300,7 +2313,7 @@ impl Filesystem for SqueezefsFilesystem {
                     }
                 } else {
                     if let Err(e) = self
-                        .write_file_staged(ino, offset, data, old_size, fencing_token)
+                        .write_file_staged(ino, offset, data.clone(), old_size, fencing_token)
                         .await
                     {
                         if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
@@ -4730,7 +4743,7 @@ async fn flush_single_active_block(
 
     let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
     let start_block_lock = std::time::Instant::now();
-    let _block_guard = block_lock.lock().await;
+    let block_guard = block_lock.lock().await;
     METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
     let block_data_guard = match router.cache.nvme.read_staged_zero_copy(&cache_key) {
@@ -4741,12 +4754,15 @@ async fn flush_single_active_block(
     let block_bytes = bytes::Bytes::copy_from_slice(&block_data_guard);
     drop(block_data_guard);
 
-    let processed_block = router.get_crypto().process_write(block_bytes.clone())?;
+    let processed_block = router
+        .get_crypto()
+        .process_write_async(block_bytes.clone())
+        .await?;
 
     let (_be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
     let offset = block_allocator.allocate_block().await?;
 
-    if let Err(e) = nvme_writer.write_block(offset, &processed_block).await {
+    if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
         error!(
             "flush_single_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
             b, ino, e
@@ -4756,6 +4772,16 @@ async fn flush_single_active_block(
     }
 
     let stored_block_key = offset.to_string();
+
+    std::mem::drop(block_guard);
+    std::mem::drop(_inode_guard);
+
+    // Acquire exclusive write lock to serialize metadata RMW cycle
+    let write_lock = active_inode_locks.get_inode_lock(ino);
+    let mut _write_guard = None;
+    if !locked {
+        _write_guard = Some(write_lock.write().await);
+    }
 
     // Update metadata offline in block_map
     let mut meta = router

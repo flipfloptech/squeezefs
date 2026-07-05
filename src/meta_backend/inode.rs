@@ -2,7 +2,7 @@ use crate::error::{Result, SqueezefsError};
 use crate::meta_backend::storage::{MetaLvStorage, SECTOR_SIZE};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-pub const INODE_TABLE_START: u64 = 4096;
+pub const INODE_TABLE_START: u64 = 8192;
 pub const INODE_SLOT_SIZE: usize = 256;
 pub const INODES_PER_SECTOR: usize = SECTOR_SIZE / INODE_SLOT_SIZE;
 
@@ -53,14 +53,14 @@ impl DiskInode {
 }
 
 /// Reads a disk inode from the inode table by its index.
-pub fn read_inode(storage: &MetaLvStorage, index: u64) -> Result<DiskInode> {
-    let _guard = storage.lock_op();
+pub async fn read_inode(storage: &MetaLvStorage, index: u64) -> Result<DiskInode> {
+    let _guard = storage.inode_lock.lock().await;
     let offset = INODE_TABLE_START + index * INODE_SLOT_SIZE as u64;
     let sector_offset = (offset / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
     let slot_in_sector = ((offset % SECTOR_SIZE as u64) / INODE_SLOT_SIZE as u64) as usize;
 
     let mut sector_buf = [0u8; SECTOR_SIZE];
-    storage.read_blocks(sector_offset, &mut sector_buf)?;
+    storage.read_blocks(sector_offset, &mut sector_buf).await?;
 
     let mut inode = DiskInode::new_zeroed();
     let slot_bytes =
@@ -77,24 +77,24 @@ pub fn read_inode(storage: &MetaLvStorage, index: u64) -> Result<DiskInode> {
     Ok(inode)
 }
 
-pub fn write_inode_raw(storage: &MetaLvStorage, index: u64, inode: &DiskInode) -> Result<()> {
+pub async fn write_inode_raw(storage: &MetaLvStorage, index: u64, inode: &DiskInode) -> Result<()> {
     let offset = INODE_TABLE_START + index * INODE_SLOT_SIZE as u64;
     let sector_offset = (offset / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
     let slot_in_sector = ((offset % SECTOR_SIZE as u64) / INODE_SLOT_SIZE as u64) as usize;
 
     let mut sector_buf = [0u8; SECTOR_SIZE];
-    storage.read_blocks(sector_offset, &mut sector_buf)?;
+    storage.read_blocks(sector_offset, &mut sector_buf).await?;
 
     let slot_bytes = inode.as_bytes();
     sector_buf[slot_in_sector * INODE_SLOT_SIZE..(slot_in_sector + 1) * INODE_SLOT_SIZE]
         .copy_from_slice(slot_bytes);
 
-    storage.write_blocks(sector_offset, &sector_buf)?;
+    storage.write_blocks(sector_offset, &sector_buf).await?;
     Ok(())
 }
 
 /// Writes a disk inode into the inode table at its index.
-pub fn write_inode(storage: &MetaLvStorage, index: u64, inode: &DiskInode) -> Result<()> {
-    let _guard = storage.lock_op();
-    write_inode_raw(storage, index, inode)
+pub async fn write_inode(storage: &MetaLvStorage, index: u64, inode: &DiskInode) -> Result<()> {
+    let _guard = storage.inode_lock.lock().await;
+    write_inode_raw(storage, index, inode).await
 }

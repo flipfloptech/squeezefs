@@ -12,13 +12,13 @@ impl Journal {
     }
 
     /// Write a redo log record to the circular journal (Phase 0 skeleton)
-    pub fn write_record(&self, _storage: &MetaLvStorage, _record: &[u8]) -> Result<()> {
+    pub async fn write_record(&self, _storage: &MetaLvStorage, _record: &[u8]) -> Result<()> {
         // No-op skeleton for Phase 0
         Ok(())
     }
 
     /// Replays outstanding log entries on mount/recovery
-    pub fn replay(&self, _storage: &MetaLvStorage) -> Result<()> {
+    pub async fn replay(&self, _storage: &MetaLvStorage) -> Result<()> {
         // No-op skeleton for Phase 0
         Ok(())
     }

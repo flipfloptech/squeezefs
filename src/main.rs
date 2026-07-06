@@ -2195,7 +2195,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     large_size,
                     small_size,
                     small_count,
-                    is_squeeze,
                     only.as_deref(),
                     skip.as_deref(),
                     direct,
@@ -3469,7 +3468,6 @@ async fn run_benchmark(
     large_size_mb: usize,
     small_size_kb: usize,
     small_count: usize,
-    is_squeeze: bool,
     only: Option<&[String]>,
     skip: Option<&[String]>,
     direct: bool,
@@ -3537,11 +3535,10 @@ async fn run_benchmark(
     );
 
     // 1. Fetch baseline metrics
-    let baseline_metrics = if is_squeeze {
-        get_daemon_metrics_from_stats(path)
-    } else {
-        None
-    };
+    // Daemon metrics come straight from `.stats`; don't gate them on the
+    // `.config`-based mount detection. A readable/parseable `.stats` is sufficient,
+    // so metrics still show even when `.config` is momentarily unreadable.
+    let baseline_metrics = get_daemon_metrics_from_stats(path);
 
     let mp = MultiProgress::new();
     let pb_style = ProgressStyle::default_bar()
@@ -4126,11 +4123,7 @@ async fn run_benchmark(
     }
 
     // 2. Fetch post-benchmark metrics
-    let post_metrics = if is_squeeze {
-        get_daemon_metrics_from_stats(path)
-    } else {
-        None
-    };
+    let post_metrics = get_daemon_metrics_from_stats(path);
 
     // --- CALCULATE PERFORMANCE VALUES ---
     let total_large_bytes = (threads * num_chunks * chunk_size) as f64;

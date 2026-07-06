@@ -10,6 +10,14 @@ use crate::error::Result;
 
 pub type Ino = u64;
 
+/// Parse the unix-seconds heartbeat timestamp from a `client:{id}` registration
+/// value (`{"ts":<secs>,"pid":<pid>}`). Returns `None` for legacy/unparseable
+/// values, which callers treat as stale.
+fn parse_client_registration_ts(val: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(val).ok()?;
+    v.get("ts")?.as_u64()
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inode {
     pub ino: Ino,
@@ -238,17 +246,41 @@ impl MetaLvBackend {
         force: bool,
         pb: Option<indicatif::ProgressBar>,
     ) -> Result<()> {
-        // Prevent format if filesystem is currently mounted by active clients (unless force is true)
+        // Prevent format only if the volume is mounted by a *live* client. A
+        // client heartbeats its `client:{id}` registration; one whose heartbeat is
+        // older than CLIENT_STALE_TTL_SECS is stale (the client crashed / was
+        // kill -9'd without unregistering) and must not block format. Reap stale
+        // entries so a crashed mount never wedges the volume permanently.
         if !force && storage.read_superblock().await.is_ok() {
             if let Ok(attrs) = crate::meta_backend::xattr::list_xattrs(storage, 1).await {
-                let active: Vec<String> = attrs
-                    .into_iter()
-                    .filter(|k| k.starts_with("client:"))
-                    .collect();
-                if !active.is_empty() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let ttl = crate::fuse_client::CLIENT_STALE_TTL_SECS;
+                let mut live = Vec::new();
+                let mut stale = Vec::new();
+                for k in attrs.iter().filter(|k| k.starts_with("client:")) {
+                    let fresh = match crate::meta_backend::xattr::get_xattr(storage, 1, k).await {
+                        Ok(Some(val)) => parse_client_registration_ts(&val)
+                            .map(|ts| now.saturating_sub(ts) <= ttl)
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if fresh {
+                        live.push(k.clone());
+                    } else {
+                        stale.push(k.clone());
+                    }
+                }
+                // Best-effort reap of crashed-client registrations.
+                for k in &stale {
+                    let _ = crate::meta_backend::xattr::remove_xattr(storage, 1, k).await;
+                }
+                if !live.is_empty() {
                     return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                         "Cannot format: metadata volume is actively mounted by clients: {:?}",
-                        active
+                        live
                     )));
                 }
             }

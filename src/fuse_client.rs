@@ -20,6 +20,15 @@ use tokio::runtime::Builder;
 pub const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 pub const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
+/// How often a mounted client refreshes its `client:{id}` registration on the
+/// metadata volume (heartbeat), so peers can distinguish a live mount from a
+/// crashed one.
+pub const CLIENT_HEARTBEAT_INTERVAL_SECS: u64 = 10;
+/// A `client:{id}` registration whose heartbeat is older than this is stale: the
+/// client died (kill -9 / crash / power loss) without unregistering. Stale
+/// registrations do NOT block `format` and are reaped on next format attempt.
+pub const CLIENT_STALE_TTL_SECS: u64 = 45;
+
 fn get_fuse_timeout() -> Duration {
     if let Ok(val) = std::env::var("SQUEEZEFS_TIMEOUT") {
         if let Ok(secs) = val.parse::<u64>() {
@@ -965,6 +974,30 @@ impl SqueezefsFilesystem {
         self.active_inode_locks.get_inode_lock(ino)
     }
 
+    /// Write/refresh this client's mount registration (`client:{id}` xattr on the
+    /// root inode) with a fresh heartbeat timestamp. A peer reads the timestamp to
+    /// tell a live mount from a crashed one: an entry older than
+    /// [`CLIENT_STALE_TTL_SECS`] is treated as stale (kill -9 leaves no chance to
+    /// unregister). Best-effort; never fails a caller.
+    pub async fn refresh_client_registration(&self) {
+        let client_id_str = self.client_id.lock().unwrap().clone();
+        if client_id_str.is_empty() {
+            return;
+        }
+        let Some(backend) = self.meta_backend.as_ref() else {
+            return;
+        };
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        // Compact JSON: {"ts":<unix_secs>,"pid":<pid>}. pid aids same-host diagnosis;
+        // the timestamp is the authoritative cross-node liveness signal.
+        let val = format!("{{\"ts\":{},\"pid\":{}}}", ts, std::process::id());
+        let attr_name = format!("client:{}", client_id_str);
+        let _ = backend.setxattr(1, &attr_name, val.as_bytes()).await;
+    }
+
     async fn get_or_acquire_lease(&self, ino: u64) -> Result<u64, SqueezefsError> {
         // Hot path: return cached fencing token without re-validating the DLM map
         // on every write (was a lock/hash hit per op). Stale tokens are rejected by
@@ -1775,12 +1808,9 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             }
 
-            // Register this client as an active mount
-            let client_id_str = self.client_id.lock().unwrap().clone();
-            if !client_id_str.is_empty() {
-                let attr_name = format!("client:{}", client_id_str);
-                let _ = backend.setxattr(1, &attr_name, b"mounted").await;
-            }
+            // Register this client as an active mount (heartbeat-timestamped so a
+            // crashed client's entry expires instead of blocking format forever).
+            self.refresh_client_registration().await;
         }
 
         // Start background active writes flusher task
@@ -4630,7 +4660,23 @@ pub async fn start_mount<P: AsRef<Path>>(
     *fs.client_id.lock().unwrap() = client_id_str.clone();
     *fs.mountpoint.lock().unwrap() = mount_path.to_string_lossy().to_string();
 
-    let heartbeat_handle = tokio::spawn(async {});
+    // Heartbeat: periodically refresh this client's mount registration so peers
+    // can distinguish a live mount from a crashed one. If this process dies
+    // ungracefully (kill -9), the heartbeat stops and the registration goes stale
+    // after CLIENT_STALE_TTL_SECS, so it no longer blocks `format`.
+    let heartbeat_handle = {
+        let fs = fs.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                CLIENT_HEARTBEAT_INTERVAL_SECS,
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                fs.refresh_client_registration().await;
+            }
+        })
+    };
 
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options);

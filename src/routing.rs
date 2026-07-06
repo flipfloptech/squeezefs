@@ -42,7 +42,9 @@ pub struct CachedMetadata {
     pub block_prefix: Option<String>,
     pub file_id: Option<String>,
     pub cached_at: std::time::Instant,
-    pub data_key: Option<Vec<u8>>,
+    /// Inline payload held zero-copy: `Bytes` clones are O(1) refcount bumps, so
+    /// hot-path `metadata_cache` gets / `meta.clone()` don't deep-copy the file.
+    pub data_key: Option<bytes::Bytes>,
     pub block_map: Option<std::collections::HashMap<u32, String>>,
     /// When true, layout/size live only in RAM (+ staging mmap); must persist on fsync/release.
     pub layout_dirty: bool,
@@ -614,7 +616,7 @@ impl DataRouter {
                         block_prefix: layout.block_prefix,
                         file_id: layout.file_id,
                         cached_at: std::time::Instant::now(),
-                        data_key: layout.data_key,
+                        data_key: layout.data_key.map(bytes::Bytes::from),
                         block_map,
                         layout_dirty: false,
                     }));
@@ -651,7 +653,7 @@ impl DataRouter {
             block_map_id: m.block_map_id.clone(),
             block_prefix: m.block_prefix.clone(),
             file_id: m.file_id.clone(),
-            data_key: m.data_key.clone(),
+            data_key: m.data_key.as_ref().map(|b| b.to_vec()),
             block_map: m.block_map.clone(),
         };
 
@@ -1253,7 +1255,7 @@ impl DataRouter {
             match meta.file_type.as_str() {
                 "inline" => {
                     if let Some(ref d) = meta.data_key {
-                        d.clone()
+                        d.to_vec()
                     } else {
                         Vec::new()
                     }
@@ -1340,7 +1342,9 @@ impl DataRouter {
             let mut updated_meta = meta.clone();
             updated_meta.file_type = "inline".to_string();
             updated_meta.size = new_size as u64;
-            updated_meta.data_key = Some(shared_data.to_vec());
+            // Zero-copy store: `shared_data` is `Bytes`; clone is a refcount bump,
+            // not a payload copy (was `shared_data.to_vec()` = full memcpy per write).
+            updated_meta.data_key = Some(shared_data.clone());
             updated_meta.file_id = None;
             updated_meta.block_map = None;
             updated_meta.layout_dirty = true;
@@ -1807,7 +1811,7 @@ impl DataRouter {
         let data = match meta.file_type.as_str() {
             "inline" => {
                 if let Some(ref d) = meta.data_key {
-                    d.clone()
+                    d.to_vec()
                 } else {
                     Vec::new()
                 }
@@ -1920,7 +1924,7 @@ impl DataRouter {
         match meta.file_type.as_str() {
             "inline" => {
                 let decompressed = if let Some(ref data) = meta.data_key {
-                    data.clone()
+                    data.to_vec()
                 } else {
                     Vec::new()
                 };
@@ -2134,7 +2138,7 @@ impl DataRouter {
         match meta.file_type.as_str() {
             "inline" => {
                 let decompressed = if let Some(ref data) = meta.data_key {
-                    data.clone()
+                    data.to_vec()
                 } else {
                     Vec::new()
                 };

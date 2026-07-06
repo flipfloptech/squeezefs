@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use squeezefs::cache::lru::LruCache;
 use squeezefs::fuse_client::StripeLocks;
 use squeezefs::meta_backend::dlm::DlmLockManager;
@@ -73,5 +73,37 @@ fn bench_high_concurrency(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_high_concurrency);
+/// Quantifies the inline small-write zero-copy win: `CachedMetadata` is cloned
+/// ~3x per small write (moka `get`, `meta.clone()`). With `data_key: Bytes` the
+/// inline-payload clone is an O(1) refcount bump; the old `Vec<u8>` layout paid a
+/// full deep copy of the payload on every clone. Both are benched side by side.
+fn bench_metadata_clone(c: &mut Criterion) {
+    let mut group = c.benchmark_group("metadata_clone");
+
+    let inline_4k = squeezefs::routing::CachedMetadata {
+        file_type: "inline".to_string(),
+        size: 4096,
+        data_key: Some(bytes::Bytes::from(vec![0xABu8; 4096])),
+        ..Default::default()
+    };
+    group.bench_function("cached_metadata_clone_inline_4k_bytes", |b| {
+        b.iter(|| {
+            let m = black_box(&inline_4k).clone();
+            black_box(m);
+        });
+    });
+
+    // Reference point: the per-clone cost the old `data_key: Vec<u8>` layout paid.
+    let payload_vec = vec![0xABu8; 4096];
+    group.bench_function("vec_u8_deep_copy_4k", |b| {
+        b.iter(|| {
+            let v = black_box(&payload_vec).clone();
+            black_box(v);
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_high_concurrency, bench_metadata_clone);
 criterion_main!(benches);

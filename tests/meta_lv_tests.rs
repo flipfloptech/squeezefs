@@ -114,12 +114,16 @@ async fn test_refresh_bitmap_from_table_round_trip() {
     }
     assert!(!is_set(6) && !is_set(7), "unused inodes must be clear");
 
-    // get_allocated_inode_count reads the on-disk bitmap (counts [2, 20000)).
+    // `get_allocated_inode_count` is bitmap-derived on the legacy path and
+    // allocator-derived when the sector-lock path is on (the default). Seed the
+    // in-RAM allocator from the table first, exactly as the mount sequence does,
+    // so the count is meaningful under either flag.
+    storage.seed_inode_alloc_from_table().await.unwrap();
     let backend = MetaLvBackend::new(storage);
     assert_eq!(
         backend.get_allocated_inode_count().await,
         3,
-        "bitmap-derived count must equal the number of in-use inodes"
+        "allocated inode count must equal the number of in-use inodes"
     );
 }
 
@@ -229,10 +233,12 @@ async fn test_tx_full_sector_staging_overlay_unchanged() {
 }
 
 #[test]
-fn test_meta_sector_locks_flag_defaults_off() {
-    // No env var set -> the sector-sharded path is disabled by default (PR 3).
+fn test_meta_sector_locks_flag_defaults_on() {
+    // PR 4 flips the default: with no env var the sector-sharded commit path is
+    // ON. Explicit `0`/`off`/`false`/`no` selects the legacy rollback path
+    // (exercised in `meta_lv_legacy_tests.rs`).
     std::env::remove_var("SQUEEZEFS_META_SECTOR_LOCKS");
-    assert!(!squeezefs::meta_backend::storage::meta_sector_locks_enabled());
+    assert!(squeezefs::meta_backend::storage::meta_sector_locks_enabled());
 }
 
 #[tokio::test]

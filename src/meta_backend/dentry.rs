@@ -1,5 +1,7 @@
 use crate::error::{Result, SqueezefsError};
-use crate::meta_backend::storage::{MetaLvStorage, SECTOR_SIZE};
+use crate::meta_backend::storage::{
+    meta_sector_locks_enabled, MetaLvStorage, ACTIVE_TX, SECTOR_SIZE,
+};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub const DENTRY_TABLE_START: u64 = 1024 * 1024 * 8; // 8 MiB boundary
@@ -58,6 +60,62 @@ fn dentry_hash(parent_ino: u64, name: &str) -> u64 {
     hasher.finish()
 }
 
+/// The hash bucket a `(parent_ino, name)` dentry maps to. Exposed so tests (and
+/// diagnostics) can force names into the same or different buckets to exercise
+/// the per-bucket chain lock and multi-bucket ordering (design Test Strategy T1).
+pub fn dentry_bucket(parent_ino: u64, name: &str) -> u64 {
+    dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS
+}
+
+/// Acquire the dentry-bucket locks for `entries` in **ascending bucket order**
+/// into the current transaction (design §3.6 multi-bucket rule: rename/exchange).
+/// Dedups, so calling it before the individual insert/remove ops means each op
+/// finds its bucket already held. No-op on the legacy path or outside a tx (the
+/// out-of-tx cross-volume paths take an op-scoped guard per op instead).
+pub async fn tx_prelock_buckets(storage: &MetaLvStorage, entries: &[(u64, &str)]) -> Result<()> {
+    if !meta_sector_locks_enabled() || ACTIVE_TX.try_with(|_| ()).is_err() {
+        return Ok(());
+    }
+    // Order acquisition by the underlying lock's SHARD index (not bucket number),
+    // since that is the true total order over the fixed stripe array (§3.6 refined
+    // like §3.3). `tx_acquire_bucket` then dedups shared shards.
+    let mut buckets: Vec<u64> = entries
+        .iter()
+        .map(|(p, n)| dentry_hash(*p, n) % MAX_HASH_BUCKETS)
+        .collect();
+    buckets.sort_unstable_by_key(|&b| storage.dentry_bucket_locks.shard_index(b));
+    for b in buckets {
+        storage.tx_acquire_bucket(b).await?;
+    }
+    Ok(())
+}
+
+/// Acquire the per-bucket chain lock for a single dentry op. Flag-on inside a tx:
+/// an owned guard carried in `TX_STATE` (held through commit, deduped). Flag-on
+/// outside a tx (cross-volume paths): an op-scoped owned guard the caller holds.
+/// Flag-off: the global `dentry_lock`.
+async fn acquire_chain_lock(
+    storage: &MetaLvStorage,
+    bucket: u64,
+) -> Result<(
+    Option<tokio::sync::MutexGuard<'_, ()>>,
+    Option<tokio::sync::OwnedMutexGuard<()>>,
+)> {
+    if meta_sector_locks_enabled() {
+        if ACTIVE_TX.try_with(|_| ()).is_ok() {
+            storage.tx_acquire_bucket(bucket).await?;
+            Ok((None, None))
+        } else {
+            Ok((
+                None,
+                Some(storage.dentry_bucket_lock(bucket).lock_owned().await),
+            ))
+        }
+    } else {
+        Ok((Some(storage.dentry_lock.lock().await), None))
+    }
+}
+
 /// Reads a dentry from a specific disk offset without locking.
 pub async fn read_dentry_raw(storage: &MetaLvStorage, offset: u64) -> Result<DiskDentry> {
     let sector_offset = (offset / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
@@ -81,6 +139,11 @@ pub async fn read_dentry(storage: &MetaLvStorage, offset: u64) -> Result<DiskDen
 }
 
 /// Writes a dentry to a specific disk offset without locking (internal use only).
+///
+/// Flag-on, in-transaction: stages a **512-byte sub-sector patch** at the slot;
+/// the whole-sector RMW happens under the sector write lock at commit, preserving
+/// siblings. Flag-on, out-of-transaction (cross-volume paths): sector-safe full
+/// RMW under the sector write lock. Flag-off: full-sector RMW with staging.
 pub async fn write_dentry_raw(
     storage: &MetaLvStorage,
     offset: u64,
@@ -89,13 +152,30 @@ pub async fn write_dentry_raw(
     let sector_offset = (offset / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
     let slot_in_sector = ((offset % SECTOR_SIZE as u64) / DENTRY_SLOT_SIZE as u64) as usize;
 
+    if meta_sector_locks_enabled() && ACTIVE_TX.try_with(|_| ()).is_ok() {
+        // In a tx: stage the slot patch (commit does the sector RMW).
+        return storage.write_blocks(offset, dentry.as_bytes()).await;
+    }
+
+    if meta_sector_locks_enabled() {
+        // Out of a tx: sector-safe full RMW under the sector write lock.
+        let _g = storage.sector_lock(sector_offset).write().await;
+        let mut sector_buf = [0u8; SECTOR_SIZE];
+        storage
+            .read_blocks_direct(sector_offset, &mut sector_buf)
+            .await?;
+        sector_buf[slot_in_sector * DENTRY_SLOT_SIZE..(slot_in_sector + 1) * DENTRY_SLOT_SIZE]
+            .copy_from_slice(dentry.as_bytes());
+        return storage
+            .write_blocks_direct(sector_offset, &sector_buf)
+            .await;
+    }
+
+    // Flag-off: full-sector RMW with staging (today's behavior).
     let mut sector_buf = [0u8; SECTOR_SIZE];
     storage.read_blocks(sector_offset, &mut sector_buf).await?;
-
-    let slot_bytes = dentry.as_bytes();
     sector_buf[slot_in_sector * DENTRY_SLOT_SIZE..(slot_in_sector + 1) * DENTRY_SLOT_SIZE]
-        .copy_from_slice(slot_bytes);
-
+        .copy_from_slice(dentry.as_bytes());
     storage.write_blocks(sector_offset, &sector_buf).await?;
     Ok(())
 }
@@ -106,14 +186,21 @@ pub async fn write_dentry(storage: &MetaLvStorage, offset: u64, dentry: &DiskDen
     write_dentry_raw(storage, offset, dentry).await
 }
 
-/// Lookup a dentry inside a parent directory using hash chains.
+/// Lookup a dentry inside a parent directory using the in-RAM chain index.
+///
+/// The in-RAM `dentry_index` is authoritative for reads (design Open Q3); flag-on
+/// takes no lock (scc gives per-entry safety and the DLM serializes same-object
+/// mutations), flag-off takes the global `dentry_lock`.
 pub async fn find_dentry(
     storage: &MetaLvStorage,
     parent_ino: u64,
     name: &str,
 ) -> Result<Option<DiskDentry>> {
     storage.ensure_dentry_index().await?;
-    let _guard = storage.dentry_lock.lock().await;
+    let mut _legacy_guard: Option<tokio::sync::MutexGuard<()>> = None;
+    if !meta_sector_locks_enabled() {
+        _legacy_guard = Some(storage.dentry_lock.lock().await);
+    }
 
     let mut found = None;
     let _ = storage.dentry_index.read_sync(&parent_ino, |_, entries| {
@@ -128,6 +215,14 @@ pub async fn find_dentry(
 }
 
 /// Inserts a new dentry inside a parent directory.
+///
+/// Flag-on holds the per-bucket chain lock from here through the transaction's
+/// post-commit in-RAM index apply (design §3.6). The in-RAM index mutations are
+/// applied immediately (so multi-op transactions — e.g. rename over an existing
+/// target — read their own writes exactly as the legacy path does) but are
+/// snapshotted for rollback: on commit failure `run_transaction` restores them,
+/// so the in-RAM index never diverges from disk (design R4). Disk writes stage
+/// sub-sector patches; the sector lock does the whole-sector RMW at commit.
 pub async fn insert_dentry(
     storage: &MetaLvStorage,
     parent_ino: u64,
@@ -136,8 +231,9 @@ pub async fn insert_dentry(
     file_type: u32,
 ) -> Result<()> {
     storage.ensure_dentry_index().await?;
-    let _guard = storage.dentry_lock.lock().await;
     let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
+    let (_legacy_guard, _bucket_guard) = acquire_chain_lock(storage, bucket).await?;
+
     let bucket_offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
 
     let head_occupied = {
@@ -149,6 +245,10 @@ pub async fn insert_dentry(
 
     if !head_occupied {
         // Bucket head is free, insert here!
+        storage.tx_snapshot_occupied(bucket_offset);
+        storage.tx_snapshot_by_offset(bucket_offset);
+        storage.tx_snapshot_index(parent_ino);
+
         write_dentry_raw(storage, bucket_offset, &new_dentry).await?;
 
         // Update in-memory index
@@ -188,6 +288,9 @@ pub async fn insert_dentry(
             "Dentry table full".to_string(),
         ));
     }
+    // Reservation was made under the occupied lock above; record its pre-tx
+    // (absent) state so a commit failure releases it (design §3.6 rollback).
+    storage.tx_note_occupied_snapshot(free_offset, false);
 
     // Write the new dentry to the free slot
     let mut new_dentry_with_link = new_dentry;
@@ -210,26 +313,25 @@ pub async fn insert_dentry(
         }
         if d.next_ptr == 0 {
             d.next_ptr = free_offset;
+            storage.tx_snapshot_by_offset(curr_offset);
+            storage.tx_snapshot_index(p_ino);
             write_dentry_raw(storage, curr_offset, &d).await?;
 
             // Update in-memory index
-            match storage.dentry_by_offset.entry_sync(curr_offset) {
-                scc::hash_map::Entry::Occupied(mut occ) => {
-                    occ.get_mut().1.next_ptr = free_offset;
-                }
-                _ => {}
+            if let scc::hash_map::Entry::Occupied(mut occ) =
+                storage.dentry_by_offset.entry_sync(curr_offset)
+            {
+                occ.get_mut().1.next_ptr = free_offset;
             }
-            match storage.dentry_index.entry_sync(p_ino) {
-                scc::hash_map::Entry::Occupied(mut occ) => {
-                    if let Some(tuple) = occ
-                        .get_mut()
-                        .iter_mut()
-                        .find(|(off, _)| *off == curr_offset)
-                    {
-                        tuple.1.next_ptr = free_offset;
-                    }
+            if let scc::hash_map::Entry::Occupied(mut occ) = storage.dentry_index.entry_sync(p_ino)
+            {
+                if let Some(tuple) = occ
+                    .get_mut()
+                    .iter_mut()
+                    .find(|(off, _)| *off == curr_offset)
+                {
+                    tuple.1.next_ptr = free_offset;
                 }
-                _ => {}
             }
             break;
         }
@@ -237,6 +339,8 @@ pub async fn insert_dentry(
     }
 
     // Insert new dentry to in-memory maps
+    storage.tx_snapshot_by_offset(free_offset);
+    storage.tx_snapshot_index(parent_ino);
     storage
         .dentry_index
         .entry_sync(parent_ino)
@@ -250,11 +354,14 @@ pub async fn insert_dentry(
     Ok(())
 }
 
-/// Removes a dentry from a parent directory.
+/// Removes a dentry from a parent directory. See [`insert_dentry`] for the
+/// flag-on locking/rollback model; the in-RAM chain surgery is identical to the
+/// legacy path with per-mutation snapshots added for commit-failure rollback.
 pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str) -> Result<()> {
     storage.ensure_dentry_index().await?;
-    let _guard = storage.dentry_lock.lock().await;
     let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
+    let (_legacy_guard, _bucket_guard) = acquire_chain_lock(storage, bucket).await?;
+
     let bucket_offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
 
     let mut prev_offset = 0u64;
@@ -281,17 +388,19 @@ pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str)
                     write_dentry_raw(storage, curr_offset, &empty).await?;
 
                     // Update in-memory maps
+                    storage.tx_snapshot_by_offset(curr_offset);
+                    storage.tx_snapshot_occupied(curr_offset);
+                    storage.tx_snapshot_index(parent_ino);
                     storage.dentry_by_offset.remove_sync(&curr_offset);
                     storage
                         .dentry_occupied_offsets
                         .lock()
                         .unwrap()
                         .remove(&curr_offset);
-                    match storage.dentry_index.entry_sync(parent_ino) {
-                        scc::hash_map::Entry::Occupied(mut occ) => {
-                            occ.get_mut().retain(|(off, _)| *off != curr_offset);
-                        }
-                        _ => {}
+                    if let scc::hash_map::Entry::Occupied(mut occ) =
+                        storage.dentry_index.entry_sync(parent_ino)
+                    {
+                        occ.get_mut().retain(|(off, _)| *off != curr_offset);
                     }
                 } else {
                     // There are other dentries. Copy the next dentry into the head slot, and mark the next slot as free!
@@ -313,12 +422,17 @@ pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str)
                     write_dentry_raw(storage, next_offset, &empty).await?;
 
                     // Update in-memory maps:
+                    storage.tx_snapshot_index(parent_ino);
+                    storage.tx_snapshot_index(next_dentry.parent_ino);
+                    storage.tx_snapshot_by_offset(curr_offset);
+                    storage.tx_snapshot_by_offset(next_offset);
+                    storage.tx_snapshot_occupied(next_offset);
+
                     // 1. Remove deleted dentry from parent_ino's entry list
-                    match storage.dentry_index.entry_sync(parent_ino) {
-                        scc::hash_map::Entry::Occupied(mut occ) => {
-                            occ.get_mut().retain(|(off, _)| *off != curr_offset);
-                        }
-                        _ => {}
+                    if let scc::hash_map::Entry::Occupied(mut occ) =
+                        storage.dentry_index.entry_sync(parent_ino)
+                    {
+                        occ.get_mut().retain(|(off, _)| *off != curr_offset);
                     }
 
                     // 2. Since next_dentry is moved from next_offset to curr_offset,
@@ -371,37 +485,40 @@ pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str)
                 write_dentry_raw(storage, curr_offset, &empty).await?;
 
                 // Update in-memory maps
+                storage.tx_snapshot_by_offset(curr_offset);
+                storage.tx_snapshot_occupied(curr_offset);
+                storage.tx_snapshot_index(parent_ino);
+                storage.tx_snapshot_index(prev_p_ino);
+                storage.tx_snapshot_by_offset(prev_offset);
+
                 storage.dentry_by_offset.remove_sync(&curr_offset);
                 storage
                     .dentry_occupied_offsets
                     .lock()
                     .unwrap()
                     .remove(&curr_offset);
-                match storage.dentry_index.entry_sync(parent_ino) {
-                    scc::hash_map::Entry::Occupied(mut occ) => {
-                        occ.get_mut().retain(|(off, _)| *off != curr_offset);
-                    }
-                    _ => {}
+                if let scc::hash_map::Entry::Occupied(mut occ) =
+                    storage.dentry_index.entry_sync(parent_ino)
+                {
+                    occ.get_mut().retain(|(off, _)| *off != curr_offset);
                 }
                 // Update predecessor in parent index
-                match storage.dentry_index.entry_sync(prev_p_ino) {
-                    scc::hash_map::Entry::Occupied(mut occ) => {
-                        if let Some(tuple) = occ
-                            .get_mut()
-                            .iter_mut()
-                            .find(|(off, _)| *off == prev_offset)
-                        {
-                            tuple.1.next_ptr = d.next_ptr;
-                        }
+                if let scc::hash_map::Entry::Occupied(mut occ) =
+                    storage.dentry_index.entry_sync(prev_p_ino)
+                {
+                    if let Some(tuple) = occ
+                        .get_mut()
+                        .iter_mut()
+                        .find(|(off, _)| *off == prev_offset)
+                    {
+                        tuple.1.next_ptr = d.next_ptr;
                     }
-                    _ => {}
                 }
                 // Update predecessor in dentry_by_offset
-                match storage.dentry_by_offset.entry_sync(prev_offset) {
-                    scc::hash_map::Entry::Occupied(mut occ) => {
-                        occ.get_mut().1.next_ptr = d.next_ptr;
-                    }
-                    _ => {}
+                if let scc::hash_map::Entry::Occupied(mut occ) =
+                    storage.dentry_by_offset.entry_sync(prev_offset)
+                {
+                    occ.get_mut().1.next_ptr = d.next_ptr;
                 }
             }
             return Ok(());
@@ -423,7 +540,10 @@ pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str)
 /// List all dentries in a parent directory.
 pub async fn list_dentries(storage: &MetaLvStorage, parent_ino: u64) -> Result<Vec<DiskDentry>> {
     storage.ensure_dentry_index().await?;
-    let _guard = storage.dentry_lock.lock().await;
+    let mut _legacy_guard: Option<tokio::sync::MutexGuard<()>> = None;
+    if !meta_sector_locks_enabled() {
+        _legacy_guard = Some(storage.dentry_lock.lock().await);
+    }
 
     let mut list = Vec::new();
     let _ = storage.dentry_index.read_sync(&parent_ino, |_, entries| {

@@ -11,11 +11,12 @@ pub const SECTOR_SIZE: usize = 4096;
 /// `BLOCK_FLUSH_LOCKS` (`fuse_client`). See the transaction_lock-removal design.
 pub const SECTOR_LOCK_SHARDS: usize = 4096;
 
-/// Whether the sector-sharded metadata commit path is enabled
-/// (`SQUEEZEFS_META_SECTOR_LOCKS=1|on|true|yes`). Read once and cached — the flag
-/// is a mount-time choice, not per-op. Default **off** (PR 3 scaffolding; the design
-/// flips the default on when PR 4 lands the sector-locked commit). Wired into the
-/// commit/read paths in PR 4; introduced here so the machinery can reference it.
+/// Whether the sector-sharded metadata commit path is enabled. Read once and
+/// cached — the flag is a mount-time choice, not per-op, and the two writer
+/// models (sector-locked vs legacy `transaction_lock`) must never coexist in one
+/// process. **Default: on** (PR 4). Set `SQUEEZEFS_META_SECTOR_LOCKS` to
+/// `0`/`off`/`false`/`no` to select the retained legacy rollback path; any other
+/// value (or unset) is on.
 pub fn meta_sector_locks_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -23,9 +24,9 @@ pub fn meta_sector_locks_enabled() -> bool {
         std::env::var("SQUEEZEFS_META_SECTOR_LOCKS")
             .map(|v| {
                 let v = v.trim().to_ascii_lowercase();
-                v == "1" || v == "on" || v == "true" || v == "yes"
+                !(v == "0" || v == "off" || v == "false" || v == "no")
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -68,9 +69,12 @@ pub struct MetaLvStorage {
     pub sector_locks:
         Arc<crate::stripe_locks::StripeLocks<tokio::sync::RwLock<()>, SECTOR_LOCK_SHARDS>>,
     /// Per-bucket lock protecting the in-RAM dentry chain index (design §3.6).
-    /// Wired in PR 4; constructed here (PR 3).
+    /// Held from a dentry op's chain-read **through** the post-commit in-RAM
+    /// index apply, so concurrent same-bucket ops cannot traverse a stale chain.
+    /// Inner `Arc<Mutex>` so a transaction can take an **owned** guard and carry
+    /// it (via [`TX_STATE`]) from the closure across the commit.
     pub dentry_bucket_locks:
-        Arc<crate::stripe_locks::StripeLocks<tokio::sync::Mutex<()>, SECTOR_LOCK_SHARDS>>,
+        Arc<crate::stripe_locks::StripeLocks<Arc<tokio::sync::Mutex<()>>, SECTOR_LOCK_SHARDS>>,
     pub dentry_index: Arc<scc::HashMap<u64, Vec<(u64, crate::meta_backend::dentry::DiskDentry)>>>,
     pub dentry_by_offset: Arc<scc::HashMap<u64, (u64, crate::meta_backend::dentry::DiskDentry)>>,
     pub dentry_occupied_offsets: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
@@ -80,6 +84,35 @@ pub struct MetaLvStorage {
 tokio::task_local! {
     pub static ACTIVE_TX: std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, u64, Vec<u8>)>>>;
     pub static FORCE_SYNC_TX: bool;
+    /// Per-transaction lock + rollback state for the sector-sharded commit path
+    /// (flag-on). Set alongside [`ACTIVE_TX`] by `run_transaction`. Carries the
+    /// owned dentry-bucket guards (held closure→post-commit), the in-RAM index
+    /// undo log (restored on commit failure so the index never diverges from
+    /// disk, design R4), and the inodes allocated this tx (freed on failure,
+    /// design §3.5). Empty/unused on the legacy path.
+    pub static TX_STATE: std::sync::Arc<std::sync::Mutex<TxState>>;
+}
+
+/// Per-transaction mutable state for the sector-sharded commit (see [`TX_STATE`]).
+#[derive(Default)]
+pub struct TxState {
+    /// Owned dentry-bucket guards, keyed by **shard index** (not bucket number)
+    /// and deduped, held from the closure's chain-read through the post-commit
+    /// in-RAM index apply. Keying by shard index prevents re-locking a shard two
+    /// distinct buckets happen to share (self-deadlock on the non-reentrant lock).
+    pub bucket_guards: std::collections::HashMap<usize, tokio::sync::OwnedMutexGuard<()>>,
+    /// Pre-transaction snapshot of touched `dentry_index` entries (first-write-
+    /// wins). `None` == the key was absent. Restored verbatim on commit failure.
+    pub undo_index:
+        std::collections::HashMap<u64, Option<Vec<(u64, crate::meta_backend::dentry::DiskDentry)>>>,
+    /// Pre-transaction snapshot of touched `dentry_by_offset` entries.
+    pub undo_by_offset:
+        std::collections::HashMap<u64, Option<(u64, crate::meta_backend::dentry::DiskDentry)>>,
+    /// Pre-transaction membership of touched `dentry_occupied_offsets` slots.
+    pub undo_occupied: std::collections::HashMap<u64, bool>,
+    /// Inodes allocated by this transaction; freed on commit failure so a leaked
+    /// bit does not survive to the next mount reconciliation (design §3.5).
+    pub allocated_inos: Vec<u64>,
 }
 
 /// Number of inode slots a metadata volume of `size` bytes can hold. The xattr
@@ -306,10 +339,151 @@ impl MetaLvStorage {
     }
 
     /// The per-sector RwLock for `sector_offset` (a splitmix-striped array).
-    /// Wired into the sector-sharded commit/read paths in PR 4.
+    /// Read guard = consistent non-tx reads; write guard = commit-time RMW+apply.
     #[inline]
     pub fn sector_lock(&self, sector_offset: u64) -> &tokio::sync::RwLock<()> {
         self.sector_locks.get_inode_lock(sector_offset)
+    }
+
+    /// The (cloneable) per-bucket dentry-chain lock for `bucket`.
+    #[inline]
+    pub fn dentry_bucket_lock(&self, bucket: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.dentry_bucket_locks.get_inode_lock(bucket).clone()
+    }
+
+    /// Acquire the dentry-bucket lock for `bucket` as an **owned** guard held by
+    /// the current transaction ([`TX_STATE`]) from now through the post-commit
+    /// in-RAM index apply. Idempotent per bucket (dedup) so it is safe to call
+    /// from multiple dentry ops in one transaction and is reentrancy-safe against
+    /// the non-reentrant tokio mutex. Errors if called outside a sector-locked
+    /// transaction (a logic error — in-tx dentry ops only).
+    pub async fn tx_acquire_bucket(&self, bucket: u64) -> Result<()> {
+        let state = TX_STATE.try_with(|s| s.clone()).map_err(|_| {
+            SqueezefsError::InvalidOperation(
+                "tx_acquire_bucket called outside a sector-locked transaction".to_string(),
+            )
+        })?;
+        // Dedup by shard index (distinct buckets may share a shard; re-locking it
+        // would self-deadlock). Check-then-acquire without holding the std mutex
+        // across the await (single task per tx, so `state` has no concurrent user).
+        let shard = self.dentry_bucket_locks.shard_index(bucket);
+        let already = state.lock().unwrap().bucket_guards.contains_key(&shard);
+        if already {
+            return Ok(());
+        }
+        let guard = self
+            .dentry_bucket_locks
+            .get_by_index(shard)
+            .clone()
+            .lock_owned()
+            .await;
+        state.lock().unwrap().bucket_guards.insert(shard, guard);
+        Ok(())
+    }
+
+    /// Snapshot the pre-transaction value of `dentry_index[parent]` (once), for
+    /// rollback on commit failure. No-op outside a transaction.
+    pub fn tx_snapshot_index(&self, parent: u64) {
+        let _ = TX_STATE.try_with(|s| {
+            let mut st = s.lock().unwrap();
+            if !st.undo_index.contains_key(&parent) {
+                let cur = self.dentry_index.read_sync(&parent, |_, v| v.clone());
+                st.undo_index.insert(parent, cur);
+            }
+        });
+    }
+
+    /// Snapshot the pre-transaction value of `dentry_by_offset[offset]` (once).
+    pub fn tx_snapshot_by_offset(&self, offset: u64) {
+        let _ = TX_STATE.try_with(|s| {
+            let mut st = s.lock().unwrap();
+            if !st.undo_by_offset.contains_key(&offset) {
+                let cur = self.dentry_by_offset.read_sync(&offset, |_, v| *v);
+                st.undo_by_offset.insert(offset, cur);
+            }
+        });
+    }
+
+    /// Snapshot whether `offset` is currently in `dentry_occupied_offsets` (once).
+    pub fn tx_snapshot_occupied(&self, offset: u64) {
+        let _ = TX_STATE.try_with(|s| {
+            let mut st = s.lock().unwrap();
+            if let std::collections::hash_map::Entry::Vacant(e) = st.undo_occupied.entry(offset) {
+                let present = self
+                    .dentry_occupied_offsets
+                    .lock()
+                    .unwrap()
+                    .contains(&offset);
+                e.insert(present);
+            }
+        });
+    }
+
+    /// Record a known pre-transaction membership for `offset` in the occupied set
+    /// (first-write-wins). Used when a slot is reserved while the occupied lock is
+    /// already held (so [`Self::tx_snapshot_occupied`], which re-reads current
+    /// membership, would capture the post-reservation state). No-op outside a tx.
+    pub fn tx_note_occupied_snapshot(&self, offset: u64, was_present: bool) {
+        let _ = TX_STATE.try_with(|s| {
+            s.lock()
+                .unwrap()
+                .undo_occupied
+                .entry(offset)
+                .or_insert(was_present);
+        });
+    }
+
+    /// Record an inode allocated by this transaction so it is freed if the
+    /// transaction fails after allocation (design §3.5). No-op outside a tx.
+    pub fn tx_record_alloc(&self, ino: u64) {
+        let _ = TX_STATE.try_with(|s| s.lock().unwrap().allocated_inos.push(ino));
+    }
+
+    /// Roll back the in-RAM dentry index + occupied set to their pre-transaction
+    /// snapshots and free any inodes this transaction allocated. Called by
+    /// `run_transaction` on commit failure while the bucket guards are still held
+    /// (design R4 / §3.5). Restoring each key to its captured value is
+    /// order-independent (each snapshot is an absolute pre-tx value).
+    pub fn restore_tx_undo(&self, st: &TxState) {
+        for (parent, snap) in &st.undo_index {
+            match snap {
+                Some(v) => match self.dentry_index.entry_sync(*parent) {
+                    scc::hash_map::Entry::Occupied(mut o) => *o.get_mut() = v.clone(),
+                    scc::hash_map::Entry::Vacant(vac) => {
+                        vac.insert_entry(v.clone());
+                    }
+                },
+                None => {
+                    self.dentry_index.remove_sync(parent);
+                }
+            }
+        }
+        for (offset, snap) in &st.undo_by_offset {
+            match snap {
+                Some(v) => match self.dentry_by_offset.entry_sync(*offset) {
+                    scc::hash_map::Entry::Occupied(mut o) => *o.get_mut() = *v,
+                    scc::hash_map::Entry::Vacant(vac) => {
+                        vac.insert_entry(*v);
+                    }
+                },
+                None => {
+                    self.dentry_by_offset.remove_sync(offset);
+                }
+            }
+        }
+        {
+            let mut occ = self.dentry_occupied_offsets.lock().unwrap();
+            for (offset, was_present) in &st.undo_occupied {
+                if *was_present {
+                    occ.insert(*offset);
+                } else {
+                    occ.remove(offset);
+                }
+            }
+        }
+        for ino in &st.allocated_inos {
+            self.inode_alloc.free(*ino);
+        }
     }
 
     /// Block read at a sector-aligned offset, with read-your-own-writes overlay.

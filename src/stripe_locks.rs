@@ -49,13 +49,30 @@ impl<L: Default, const N: usize> StripeLocks<L, N> {
 
     #[inline]
     pub fn get_inode_lock(&self, ino: u64) -> &L {
+        &self.locks[self.shard_index(ino)]
+    }
+
+    /// The shard index a key maps to. Two distinct keys may collide on one shard
+    /// (the array is fixed-size). Callers that acquire *multiple* stripe locks in
+    /// one critical section MUST deduplicate by this index and acquire in
+    /// ascending index order — the fixed array means "ascending key" is **not** a
+    /// valid total order over the actual lock instances, and re-locking a shared
+    /// shard would self-deadlock the non-reentrant lock.
+    #[inline]
+    pub fn shard_index(&self, ino: u64) -> usize {
         let mut x = ino;
         x ^= x >> 30;
         x = x.wrapping_mul(0xbf58476d1ce4e5b9);
         x ^= x >> 27;
         x = x.wrapping_mul(0x94d049bb133111eb);
         x ^= x >> 31;
-        &self.locks[(x as usize) % N]
+        (x as usize) % N
+    }
+
+    /// The lock at a given shard index (see [`Self::shard_index`]).
+    #[inline]
+    pub fn get_by_index(&self, index: usize) -> &L {
+        &self.locks[index % N]
     }
 
     pub fn remove(&self, _ino: &u64) {

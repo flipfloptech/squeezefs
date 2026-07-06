@@ -52,14 +52,28 @@ impl InodeAllocator {
         let start = self.hint.load(Ordering::Relaxed).max(FIRST_ALLOCATABLE_INO);
         // Scan [start, limit) then wrap [2, start): every allocatable index once.
         let wrap_end = start.min(self.limit);
+        let mut lost_attempts: u64 = 0;
         for ino in (start..self.limit).chain(FIRST_ALLOCATABLE_INO..wrap_end) {
             let w = (ino / 64) as usize;
             let mask = 1u64 << (ino % 64);
             // fetch_or returns the previous word; if our bit was 0, we won the race.
             if self.words[w].fetch_or(mask, Ordering::AcqRel) & mask == 0 {
                 self.hint.store(ino + 1, Ordering::Relaxed);
+                if lost_attempts > 0 {
+                    // §Observability (PR 7): bits we raced past (contention or a
+                    // stale hint). One amortized add, never per-iteration.
+                    crate::fuse_client::METRICS
+                        .meta_inode_alloc_cas_retries
+                        .fetch_add(lost_attempts, Ordering::Relaxed);
+                }
                 return Ok(ino);
             }
+            lost_attempts += 1;
+        }
+        if lost_attempts > 0 {
+            crate::fuse_client::METRICS
+                .meta_inode_alloc_cas_retries
+                .fetch_add(lost_attempts, Ordering::Relaxed);
         }
         Err(SqueezefsError::InvalidOperation(
             "Inode table full".to_string(),

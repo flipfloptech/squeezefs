@@ -678,6 +678,23 @@ impl MetaLvStorage {
             bitmap[(ino / 8) as usize] |= 1 << (ino % 8);
         })
         .await?;
+
+        // §Observability (PR 7): bits the table-derived rebuild changed on disk
+        // (leaked allocations healed, or table-backed bits the bitmap lost).
+        // Non-zero on a clean mount is an investigate signal (design alerting).
+        let mut prior = [0u8; SECTOR_SIZE];
+        self.read_blocks_direct(4096, &mut prior).await?;
+        let healed: u64 = prior
+            .iter()
+            .zip(bitmap.iter())
+            .map(|(old, new)| (old ^ new).count_ones() as u64)
+            .sum();
+        if healed > 0 {
+            crate::fuse_client::METRICS
+                .meta_inode_alloc_reconciled
+                .fetch_add(healed, std::sync::atomic::Ordering::Relaxed);
+        }
+
         self.write_blocks_direct(4096, &bitmap).await
     }
 

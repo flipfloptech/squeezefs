@@ -1,4 +1,7 @@
 #![allow(clippy::all)]
+// The stats-inode `serde_json::json!` literal exceeds the default macro
+// recursion limit (128) — compile-time only, no runtime effect.
+#![recursion_limit = "256"]
 pub mod nvme_dev;
 pub mod tiering;
 

@@ -327,6 +327,27 @@ pub struct Metrics {
     pub lease_lock_wait: Align64<LatencyHistogram>,
     pub dlm_acquire_time: Align64<LatencyHistogram>,
     pub writeback_queue_depth: Align64<QueueDepthHistogram>,
+    /// Sector-sharded commit observability (design §Observability, PR 7) —
+    /// live regression signals for the transaction_lock removal rollout.
+    ///
+    /// Time a sector-locked commit spent acquiring its sector write locks.
+    pub meta_sector_lock_wait_ns: Align64<LatencyHistogram>,
+    /// Commits that blocked on at least one busy sector (same-sector contention).
+    pub meta_sector_lock_contended: Align64<AtomicU64>,
+    /// In-flight sector-locked `run_transaction`s right now (gauge).
+    pub meta_tx_concurrency: Align64<AtomicU64>,
+    /// High-watermark of the gauge — p50/peak > 1 under load proves the old
+    /// global-transaction-lock concurrency cap is gone.
+    pub meta_tx_concurrency_peak: Align64<AtomicU64>,
+    /// Lost `fetch_or` attempts in the lock-free inode allocator's scan
+    /// (bitmap-word contention / stale-hint occupancy).
+    pub meta_inode_alloc_cas_retries: Align64<AtomicU64>,
+    /// On-disk free-inode bitmap bits healed by table-derived reconciliation
+    /// (mount / clean unmount). Non-zero on a clean mount ⇒ investigate.
+    pub meta_inode_alloc_reconciled: Align64<AtomicU64>,
+    /// Journal-worker batch fill per drain iteration (headroom before the
+    /// single WAL worker becomes the bottleneck).
+    pub meta_wal_batch_size: Align64<QueueDepthHistogram>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -877,6 +898,13 @@ impl SqueezefsFilesystem {
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
                 "dlm_acquire_time": METRICS.dlm_acquire_time.to_json(),
                 "writeback_queue_depth": METRICS.writeback_queue_depth.to_json(),
+                "meta_sector_lock_wait_ns": METRICS.meta_sector_lock_wait_ns.to_json(),
+                "meta_sector_lock_contended": METRICS.meta_sector_lock_contended.load(Ordering::Relaxed),
+                "meta_tx_concurrency": METRICS.meta_tx_concurrency.load(Ordering::Relaxed),
+                "meta_tx_concurrency_peak": METRICS.meta_tx_concurrency_peak.load(Ordering::Relaxed),
+                "meta_inode_alloc_cas_retries": METRICS.meta_inode_alloc_cas_retries.load(Ordering::Relaxed),
+                "meta_inode_alloc_reconciled": METRICS.meta_inode_alloc_reconciled.load(Ordering::Relaxed),
+                "meta_wal_batch_size": METRICS.meta_wal_batch_size.to_json(),
             },
             "cache_capacities": {
                 "read_lru_current_bytes": self.router.cache.read_lru.current_bytes(),

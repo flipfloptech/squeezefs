@@ -298,6 +298,11 @@ async fn journal_worker_loop(
                 Err(_) => break,
             }
         }
+        // §Observability (PR 7): batch fill per drain — headroom before the
+        // single WAL worker becomes the commit bottleneck.
+        crate::fuse_client::METRICS
+            .meta_wal_batch_size
+            .record(reqs.len());
 
         let mut write_failed = false;
         let mut force_sync = false;

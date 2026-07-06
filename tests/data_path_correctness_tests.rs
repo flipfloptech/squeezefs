@@ -423,3 +423,28 @@ async fn test_concurrent_write_read_striped_no_stale_zeros() {
         }
     }
 }
+
+/// PR 7 (§Observability): the stats inode JSON must expose the sector-lock /
+/// allocator / WAL metrics used for rollout gating and live regression alerts.
+#[tokio::test]
+async fn test_stats_json_exposes_sector_commit_metrics() {
+    let h = make().await;
+    // Drive one write so the surface reflects a living filesystem.
+    let ino = create(&h, "statsprobe").await;
+    write_at(&h, ino, 0, &pattern(64)).await;
+
+    let json = h.fs.generate_stats_json().await;
+    let v: serde_json::Value = serde_json::from_str(&json).expect("stats JSON must parse");
+    let metrics = &v["metrics"];
+    for key in [
+        "meta_sector_lock_wait_ns",
+        "meta_sector_lock_contended",
+        "meta_tx_concurrency",
+        "meta_tx_concurrency_peak",
+        "meta_inode_alloc_cas_retries",
+        "meta_inode_alloc_reconciled",
+        "meta_wal_batch_size",
+    ] {
+        assert!(!metrics[key].is_null(), "stats JSON missing metrics.{key}");
+    }
+}

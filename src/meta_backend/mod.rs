@@ -260,6 +260,26 @@ impl MetaLvBackend {
         };
         use std::collections::BTreeMap;
 
+        // §Observability (PR 7): live in-flight gauge + peak watermark. The
+        // Drop guard decrements on every exit path (closure error, commit
+        // error, success) so the gauge can never leak upward.
+        struct TxConcurrencyGauge;
+        impl Drop for TxConcurrencyGauge {
+            fn drop(&mut self) {
+                crate::fuse_client::METRICS
+                    .meta_tx_concurrency
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let inflight = crate::fuse_client::METRICS
+            .meta_tx_concurrency
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        crate::fuse_client::METRICS
+            .meta_tx_concurrency_peak
+            .fetch_max(inflight, std::sync::atomic::Ordering::Relaxed);
+        let _tx_gauge = TxConcurrencyGauge;
+
         let tx: std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, u64, Vec<u8>)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let state: std::sync::Arc<std::sync::Mutex<TxState>> =
@@ -340,9 +360,29 @@ impl MetaLvBackend {
 
         // Commit: hold the sector write locks across [RMW-read → WAL → apply].
         let commit: Result<()> = async {
+            // §Observability (PR 7): time the whole sector-guard acquisition and
+            // flag the commit as contended if any needed shard was busy (the
+            // try-lock miss is the same-sector contention signal).
+            let lock_wait_start = std::time::Instant::now();
+            let mut contended = false;
             let mut guards = Vec::with_capacity(shard_indices.len());
             for &idx in &shard_indices {
-                guards.push(self.storage.sector_locks.get_by_index(idx).write().await);
+                let lock = self.storage.sector_locks.get_by_index(idx);
+                match lock.try_write() {
+                    Ok(g) => guards.push(g),
+                    Err(_) => {
+                        contended = true;
+                        guards.push(lock.write().await);
+                    }
+                }
+            }
+            crate::fuse_client::METRICS
+                .meta_sector_lock_wait_ns
+                .record(lock_wait_start.elapsed());
+            if contended {
+                crate::fuse_client::METRICS
+                    .meta_sector_lock_contended
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
 
             let mut images: Vec<(u64, Vec<u8>)> = Vec::with_capacity(by_sector.len());

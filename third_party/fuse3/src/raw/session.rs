@@ -2847,9 +2847,17 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 ReplyXAttr::Size(size) => {
                     let getxattr_out = fuse_getxattr_out { size, _padding: 0 };
 
+                    // Size probe (caller passed size == 0): a SUCCESS reply
+                    // carrying fuse_getxattr_out{size}. A positive errno here
+                    // (this used to say ERANGE) is a malformed reply — the
+                    // kernel rejects it and getxattr(2) fails with EINVAL,
+                    // breaking every probing caller (getfattr, ls, rsync -X).
+                    // ERANGE is only correct when the caller's buffer is too
+                    // small, which the filesystem signals by returning
+                    // Err(ERANGE) from its getxattr handler instead.
                     let out_header = fuse_out_header {
                         len: (FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE) as u32,
-                        error: libc::ERANGE,
+                        error: 0,
                         unique: request.unique,
                     };
 

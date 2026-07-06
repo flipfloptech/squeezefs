@@ -1183,7 +1183,13 @@ impl SqueezefsFilesystem {
                         }
 
                         let mut existing = bytes::Bytes::new();
-                        if block_map_id.is_some() {
+                        // Read the existing block for the read-modify-write whenever the
+                        // file has a block map — whether stored INLINE (`block_map`, the
+                        // common <=32-block case) or via an INDIRECT block (`block_map_id`).
+                        // Gating only on `block_map_id` skipped the existing-block read for
+                        // inline maps, so a partial (non-block-aligned) overwrite of a
+                        // striped file zeroed the un-overwritten bytes of the block.
+                        if block_map_id.is_some() || block_map.is_some() {
                             let mut old_block_key: Option<String> = None;
                             if let Some(ref bm) = block_map {
                                 old_block_key = bm.get(&(b as u32)).cloned();

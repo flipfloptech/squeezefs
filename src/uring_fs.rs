@@ -52,19 +52,31 @@ enum FsReq {
 
 struct UringFsWorker {
     tx: Option<crossbeam::channel::Sender<FsReq>>,
-    _thread: Option<std::thread::JoinHandle<()>>,
+    _threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl UringFsWorker {
     fn new() -> Self {
         let (tx, rx) = crossbeam::channel::bounded(URING_FS_QUEUE_CAP);
-        let thread = std::thread::Builder::new()
-            .name("squeezefs-uring-fs".into())
-            .spawn(move || worker_loop(rx))
-            .expect("spawn uring-fs worker");
+        // Pool of workers sharing one MPMC queue. A single worker serialized ALL
+        // path I/O (journal/inode/xattr writes + every barrier) and each
+        // `fdatasync` blocked it for a full device flush (~1 ms on NVMe), so meta
+        // writes ran one-at-a-time and fsync coalescing could never engage (only
+        // one barrier was ever in flight). With N workers a barrier-blocked worker
+        // no longer stalls the others; a free worker pulls the next request.
+        let count = worker_count();
+        let mut threads = Vec::with_capacity(count);
+        for i in 0..count {
+            let rx = rx.clone();
+            let t = std::thread::Builder::new()
+                .name(format!("squeezefs-uring-fs-{i}"))
+                .spawn(move || worker_loop(rx))
+                .expect("spawn uring-fs worker");
+            threads.push(t);
+        }
         Self {
             tx: Some(tx),
-            _thread: Some(thread),
+            _threads: threads,
         }
     }
 
@@ -73,10 +85,26 @@ impl UringFsWorker {
     }
 }
 
+/// Size of the io_uring file-worker pool. Each worker owns its own ring and pulls
+/// from the shared MPMC queue, so a worker blocked in `fdatasync` never stalls the
+/// rest. Override with `SQUEEZEFS_URING_FS_WORKERS`; defaults to `clamp(nproc, 4, 8)`.
+fn worker_count() -> usize {
+    if let Ok(v) = std::env::var("SQUEEZEFS_URING_FS_WORKERS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.clamp(1, 64);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(4, 8)
+}
+
 impl Drop for UringFsWorker {
     fn drop(&mut self) {
+        // Close the channel so every worker sees a recv error and exits.
         drop(self.tx.take());
-        if let Some(h) = self._thread.take() {
+        for h in self._threads.drain(..) {
             let _ = h.join();
         }
     }
@@ -272,7 +300,11 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent).map_err(map_io)?;
                     }
+                    // O_RDWR (not O_WRONLY): this fd is cached in `open_cache` and
+                    // may later be reused by a `ReadAt` on the same path. A write-only
+                    // cached fd makes io_uring Read return EBADF (fd not open for read).
                     let file = OpenOptions::new()
+                        .read(true)
                         .write(true)
                         .create(true)
                         .truncate(true)
@@ -540,7 +572,11 @@ fn worker_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                         lru_keys.push_back(path.clone());
                         f
                     } else {
+                        // O_RDWR (not O_WRONLY): this fd is cached in `open_cache`
+                        // and may be reused by a later `ReadAt` on the same path.
+                        // A write-only cached fd makes io_uring Read return EBADF.
                         let f = OpenOptions::new()
+                            .read(true)
                             .write(true)
                             .custom_flags(libc::O_CLOEXEC)
                             .open(&path)
@@ -609,5 +645,61 @@ mod tests {
             .await
             .expect("nested write");
         assert_eq!(std::fs::read(&path).unwrap(), b"hi");
+    }
+
+    /// The live worker is a pool, not a single thread — otherwise a blocked
+    /// `fdatasync` serializes all meta I/O (the small-write bottleneck).
+    #[test]
+    fn test_uring_fs_runs_a_worker_pool() {
+        assert!(
+            URING_FS._threads.len() >= 4,
+            "uring-fs must run a worker pool (got {} threads)",
+            URING_FS._threads.len()
+        );
+    }
+
+    /// Open-mode regression: `fdatasync` then `read_at` on the same path must not
+    /// return EBADF. `fdatasync` caches its fd; if opened write-only, the cached
+    /// fd is unreadable and io_uring Read fails. Repeated across many paths so it
+    /// exercises the pooled cache-hit path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_uring_fs_fdatasync_then_read_no_ebadf() {
+        let dir = tempdir().unwrap();
+        let mut handles = Vec::new();
+        for i in 0..64u32 {
+            let path = dir.path().join(format!("fsync_then_read_{i}.bin"));
+            handles.push(tokio::spawn(async move {
+                let payload = bytes::Bytes::from(vec![(i % 251) as u8; 4096]);
+                write_at(&path, 0, payload.clone()).await.expect("write_at");
+                fdatasync(&path).await.expect("fdatasync");
+                let got = read_at(&path, 0, payload.len()).await.expect("read_at");
+                assert_eq!(got, payload, "read after fdatasync mismatch for {i}");
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    /// Many concurrent write_at + fdatasync + read_at ops must not corrupt each
+    /// other when serviced by different pool workers (own ring / open_cache each).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_uring_fs_concurrent_ops_integrity() {
+        let dir = tempdir().unwrap();
+        let mut handles = Vec::new();
+        for i in 0..64u32 {
+            let path = dir.path().join(format!("concurrent_{i}.bin"));
+            handles.push(tokio::spawn(async move {
+                let len = 4096 + i as usize;
+                let payload = bytes::Bytes::from(vec![(i % 251) as u8; len]);
+                write_at(&path, 0, payload.clone()).await.expect("write_at");
+                fdatasync(&path).await.expect("fdatasync");
+                let got = read_at(&path, 0, len).await.expect("read_at");
+                assert_eq!(got, payload, "data corrupted for file {i} under pool");
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
     }
 }

@@ -1327,27 +1327,33 @@ impl SqueezefsFilesystem {
     ) -> Result<(), SqueezefsError> {
         let prefix = crate::keys::active_block_ino_prefix(ino);
 
-        let keys = self.router.cache.nvme.staging_nvme_cache.list_keys();
-
-        let mut active_keys = Vec::new();
-        for key_bytes in keys {
-            let key_str = String::from_utf8(key_bytes.to_vec()).unwrap_or_default();
-            if key_str.starts_with(prefix.as_str()) {
-                active_keys.push(key_str);
+        // Collect block indices from in-RAM partial buffers only. Do NOT scan the
+        // entire staging key space (was O(staged_files) per fsync and dominated
+        // small-file sync_all benches as n grew).
+        let mut block_indices: Vec<u32> = Vec::new();
+        for r in self.active_block_buffers.iter() {
+            let key = r.key();
+            if !key.starts_with(prefix.as_str()) {
+                continue;
+            }
+            let b_str = key
+                .trim_start_matches(prefix.as_str())
+                .trim_start_matches("block_");
+            if let Ok(b) = b_str.parse::<u32>() {
+                block_indices.push(b);
             }
         }
 
-        if !active_keys.is_empty() {
-            let mut block_indices = Vec::new();
-            for key_str in active_keys {
-                let b_str = key_str
-                    .trim_start_matches(prefix.as_str())
-                    .trim_start_matches("block_");
-                if let Ok(b) = b_str.parse::<u32>() {
-                    block_indices.push(b);
-                }
-            }
-
+        // Also flush complete active blocks already in the mmap staging segment
+        // under known keys (without a full list_keys scan): probe block indices
+        // that have a staged active_block entry via the in-RAM set above, plus
+        // any indices still referenced by a pending writeback for this ino is
+        // handled by the writeback worker. For pure file_id staged small files
+        // there are no active_block keys — this returns immediately.
+        if !block_indices.is_empty() {
+            // Spill RAM buffers to staging first so flush_single can see them.
+            self.flush_memory_buffers_for_inode(ino, fencing_token)
+                .await?;
             flush_due_active_blocks_for_inode(
                 ino,
                 block_indices,
@@ -1359,12 +1365,11 @@ impl SqueezefsFilesystem {
             .await?;
         }
 
-        // Successful synchronous flush clears hard-failure sticky state for this inode.
         WRITEBACK_HARD_FAILURES.remove(&ino);
         Ok(())
     }
 
-    /// Public flush of staged active blocks for an inode to the block backend (P0-3 / tests).
+    /// Public flush of staged active blocks + dirty layout for an inode.
     /// Propagates I/O errors so callers (fsync, tests) can fail the durable op.
     pub async fn flush_inode_to_backend(
         &self,
@@ -1375,26 +1380,10 @@ impl SqueezefsFilesystem {
             .await?;
         self.flush_active_blocks_with_retry(ino, fencing_token)
             .await?;
-
-        // Durable sync of metadata size if it has changed/grown and wasn't persisted yet
         let file_path = crate::keys::inode_path(ino);
-        if let Some(cached) = self.router.metadata_cache.get(&file_path) {
-            let meta_backend = self
-                .router
-                .fetch_metadata_from_backend(ino)
-                .await?
-                .unwrap_or_default();
-            if cached.size > meta_backend.size {
-                let mut updated = meta_backend;
-                updated.size = cached.size;
-                updated.file_type = cached.file_type.clone();
-                updated.block_map = cached.block_map.clone();
-                updated.block_map_id = cached.block_map_id.clone();
-                self.router
-                    .save_metadata_to_backend(ino, &updated, fencing_token)
-                    .await?;
-            }
-        }
+        self.router
+            .persist_dirty_layout_if_needed(&file_path, fencing_token)
+            .await?;
         Ok(())
     }
 
@@ -3765,33 +3754,11 @@ impl Filesystem for SqueezefsFilesystem {
             .await
             .map_err(map_squeezefs_err)?;
 
-        // Best-effort push memory → staging; durable errors reported on fsync.
+        // Soft flush path: do not block FUSE flush on MetaLV layout persist or
+        // full active-block promotion. sync_all/fsync is the durable barrier.
         let _ = self
             .flush_memory_buffers_for_inode(ino, fencing_token)
             .await;
-        if let Err(e) = self
-            .flush_active_blocks_with_retry(ino, fencing_token)
-            .await
-        {
-            // Soft for close-path flush (editor compatibility), but sticky for fsync.
-            error!(
-                "FUSE Flush: backend flush failed for ino {} (will surface on fsync): {:?}",
-                ino, e
-            );
-            WRITEBACK_HARD_FAILURES.insert(ino, format!("{e:?}"));
-        }
-        let file_path = crate::keys::inode_path(ino);
-        if let Err(e) = self
-            .router
-            .persist_dirty_layout_if_needed(&file_path, fencing_token)
-            .await
-        {
-            error!(
-                "FUSE Flush: layout persist failed for ino {} (will surface on fsync): {:?}",
-                ino, e
-            );
-            WRITEBACK_HARD_FAILURES.insert(ino, format!("{e:?}"));
-        }
 
         Ok(())
     }
@@ -3813,19 +3780,21 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(());
         }
 
-        // Flush any remaining active staging blocks + dirty layout before releasing.
+        // Non-blocking: schedule layout/active flush in background so close is
+        // cheap. fsync still waits. Staging mmap retains data for same-session reads.
         if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
-            let _ = self
-                .flush_memory_buffers_for_inode(ino, fencing_token)
-                .await;
-            let _ = self
-                .flush_active_blocks_with_retry(ino, fencing_token)
-                .await;
-            let file_path = crate::keys::inode_path(ino);
-            let _ = self
-                .router
-                .persist_dirty_layout_if_needed(&file_path, fencing_token)
-                .await;
+            let fs = self.clone();
+            crate::bg_admit::spawn_bg(async move {
+                let _ = fs
+                    .flush_memory_buffers_for_inode(ino, fencing_token)
+                    .await;
+                let _ = fs.flush_active_blocks_with_retry(ino, fencing_token).await;
+                let file_path = crate::keys::inode_path(ino);
+                let _ = fs
+                    .router
+                    .persist_dirty_layout_if_needed(&file_path, fencing_token)
+                    .await;
+            });
         }
 
         if let Err(e) = self.complete_active_multipart_upload_if_any(ino).await {
@@ -3877,13 +3846,11 @@ impl Filesystem for SqueezefsFilesystem {
             .map_err(map_squeezefs_err)?;
 
         let fsync_future = async {
+            // Single path: memory → active flush → dirty layout; no duplicate meta fetch.
             self.flush_inode_to_backend(ino, fencing_token).await?;
-            let file_path = crate::keys::inode_path(ino);
-            self.router
-                .persist_dirty_layout_if_needed(&file_path, fencing_token)
-                .await?;
             if let Some(backend) = self.meta_backend.as_ref() {
-                backend.sync_all_devices().await?;
+                // Only fdatasync the volume that owns this inode (not every MDS).
+                backend.sync_device_for_ino(ino).await?;
             }
             Ok::<(), SqueezefsError>(())
         };

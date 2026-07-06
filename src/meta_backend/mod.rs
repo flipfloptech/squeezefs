@@ -888,6 +888,8 @@ impl Metadata for RoutedMetaBackend {
             // still provided by inode_lock / dentry_lock RMW.
             // Directories keep the journaled path (parent nlink multi-field update).
             if !is_dir_flag {
+                // Skip parent inode read (no SGID inheritance on this fast path).
+                // Existence is enforced by the exclusive dentry name lock + insert.
                 if dentry::find_dentry(&backend.storage, local_parent, name)
                     .await?
                     .is_some()
@@ -897,19 +899,13 @@ impl Metadata for RoutedMetaBackend {
                     ));
                 }
 
-                let parent_inode = inode::read_inode(&backend.storage, local_parent).await?;
-                let mut final_gid = gid;
                 let final_mode = mode;
-                if (parent_inode.mode & libc::S_ISGID) != 0 {
-                    final_gid = parent_inode.gid;
-                }
-
                 let new_local_ino;
                 let disk_inode;
                 {
                     let _guard = backend.storage.inode_lock.lock().await;
                     new_local_ino = backend.storage.alloc_inode_bit_locked().await?;
-                    let di = inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
+                    let di = inode::DiskInode::new(new_local_ino, final_mode, uid, gid);
                     inode::write_inode_raw(&backend.storage, new_local_ino, &di).await?;
                     disk_inode = di;
                 }
@@ -1942,6 +1938,13 @@ impl RoutedMetaBackend {
             crate::uring_fs::fdatasync(vol.storage.device_path()).await?;
         }
         Ok(())
+    }
+
+    /// fdatasync only the MetaLV volume that owns `ino` (avoid multi-volume fsync tax).
+    pub async fn sync_device_for_ino(&self, ino: Ino) -> Result<()> {
+        let (v_idx, _) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        crate::uring_fs::fdatasync(self.volumes[v_idx].storage.device_path()).await
     }
 
     /// Persist layout xattr + size with fine locks (no journal transaction_lock).

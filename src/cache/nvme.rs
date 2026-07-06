@@ -398,38 +398,30 @@ impl NvmeStaging {
             data.len()
         );
 
+        // Do not enqueue the merge/promote worker on the write hot path.
+        // Promoting every small stage to NVMe-oF was competing with create/fsync
+        // and inflated small-write latency. Data remains in the mmap segment;
+        // merge is triggered under capacity pressure or explicit drain/fsync paths
+        // that call try_enqueue_staged_merge.
+        let _ = (fencing_token, padded_size);
+        Ok(())
+    }
+
+    /// Ask the background merge worker to promote a staged file_id (best-effort).
+    pub fn try_enqueue_staged_merge(
+        &self,
+        file_path: &str,
+        file_id: &str,
+        fencing_token: u64,
+        padded_size: u64,
+    ) {
         let pending = PendingStagedWrite {
             file_path: file_path.to_string(),
             file_id: file_id.to_string(),
             fencing_token,
             padded_size,
         };
-
-        // Prefer never failing the FUSE write because the merge queue is full:
-        // data is already in the mmap staging segment. Dropped merge notices are
-        // repaired by capacity pressure / later flushes; closed channel is fatal.
-        match self.write_tx.try_send(pending) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                log::debug!(
-                    "Staging merge queue full; write retained in mmap for {}",
-                    file_path
-                );
-                Ok(())
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                let _ = self.staging_nvme_cache.remove(&key_bytes);
-                self.current_staged_write_bytes
-                    .fetch_sub(padded_size, std::sync::atomic::Ordering::Relaxed);
-                if is_new {
-                    self.staged_writes_in_flight
-                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                Err(SqueezefsError::Io(std::io::Error::other(
-                    "Staging merge worker channel closed",
-                )))
-            }
-        }
+        let _ = self.write_tx.try_send(pending);
     }
 
     /// Put a packed active block write to staging_nvme_cache.

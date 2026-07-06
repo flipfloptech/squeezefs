@@ -1,7 +1,5 @@
 use crate::error::{Result, SqueezefsError};
-use crate::meta_backend::storage::{
-    meta_sector_locks_enabled, MetaLvStorage, ACTIVE_TX, SECTOR_SIZE,
-};
+use crate::meta_backend::storage::{MetaLvStorage, ACTIVE_TX, SECTOR_SIZE};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub const DENTRY_TABLE_START: u64 = 1024 * 1024 * 8; // 8 MiB boundary
@@ -70,10 +68,10 @@ pub fn dentry_bucket(parent_ino: u64, name: &str) -> u64 {
 /// Acquire the dentry-bucket locks for `entries` in **ascending bucket order**
 /// into the current transaction (design §3.6 multi-bucket rule: rename/exchange).
 /// Dedups, so calling it before the individual insert/remove ops means each op
-/// finds its bucket already held. No-op on the legacy path or outside a tx (the
-/// out-of-tx cross-volume paths take an op-scoped guard per op instead).
+/// finds its bucket already held. No-op outside a tx (the out-of-tx
+/// cross-volume paths take an op-scoped guard per op instead).
 pub async fn tx_prelock_buckets(storage: &MetaLvStorage, entries: &[(u64, &str)]) -> Result<()> {
-    if !meta_sector_locks_enabled() || ACTIVE_TX.try_with(|_| ()).is_err() {
+    if ACTIVE_TX.try_with(|_| ()).is_err() {
         return Ok(());
     }
     // Order acquisition by the underlying lock's SHARD index (not bucket number),
@@ -90,29 +88,19 @@ pub async fn tx_prelock_buckets(storage: &MetaLvStorage, entries: &[(u64, &str)]
     Ok(())
 }
 
-/// Acquire the per-bucket chain lock for a single dentry op. Flag-on inside a tx:
-/// an owned guard carried in `TX_STATE` (held through commit, deduped). Flag-on
-/// outside a tx (cross-volume paths): an op-scoped owned guard the caller holds.
-/// Flag-off: the global `dentry_lock`.
+/// Acquire the per-bucket chain lock for a single dentry op. Inside a tx: an
+/// owned guard carried in `TX_STATE` (held through commit, deduped) — returns
+/// `None`. Outside a tx (cross-volume paths): an op-scoped owned guard the
+/// caller holds.
 async fn acquire_chain_lock(
     storage: &MetaLvStorage,
     bucket: u64,
-) -> Result<(
-    Option<tokio::sync::MutexGuard<'_, ()>>,
-    Option<tokio::sync::OwnedMutexGuard<()>>,
-)> {
-    if meta_sector_locks_enabled() {
-        if ACTIVE_TX.try_with(|_| ()).is_ok() {
-            storage.tx_acquire_bucket(bucket).await?;
-            Ok((None, None))
-        } else {
-            Ok((
-                None,
-                Some(storage.dentry_bucket_lock(bucket).lock_owned().await),
-            ))
-        }
+) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+    if ACTIVE_TX.try_with(|_| ()).is_ok() {
+        storage.tx_acquire_bucket(bucket).await?;
+        Ok(None)
     } else {
-        Ok((Some(storage.dentry_lock.lock().await), None))
+        Ok(Some(storage.dentry_bucket_lock(bucket).lock_owned().await))
     }
 }
 
@@ -132,18 +120,12 @@ pub async fn read_dentry_raw(storage: &MetaLvStorage, offset: u64) -> Result<Dis
     Ok(dentry)
 }
 
-/// Reads a dentry from a specific disk offset.
-pub async fn read_dentry(storage: &MetaLvStorage, offset: u64) -> Result<DiskDentry> {
-    let _guard = storage.dentry_lock.lock().await;
-    read_dentry_raw(storage, offset).await
-}
-
 /// Writes a dentry to a specific disk offset without locking (internal use only).
 ///
-/// Flag-on, in-transaction: stages a **512-byte sub-sector patch** at the slot;
+/// In-transaction: stages a **512-byte sub-sector patch** at the slot;
 /// the whole-sector RMW happens under the sector write lock at commit, preserving
-/// siblings. Flag-on, out-of-transaction (cross-volume paths): sector-safe full
-/// RMW under the sector write lock. Flag-off: full-sector RMW with staging.
+/// siblings. Out-of-transaction (cross-volume paths): sector-safe full
+/// RMW under the sector write lock.
 pub async fn write_dentry_raw(
     storage: &MetaLvStorage,
     offset: u64,
@@ -152,55 +134,35 @@ pub async fn write_dentry_raw(
     let sector_offset = (offset / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
     let slot_in_sector = ((offset % SECTOR_SIZE as u64) / DENTRY_SLOT_SIZE as u64) as usize;
 
-    if meta_sector_locks_enabled() && ACTIVE_TX.try_with(|_| ()).is_ok() {
+    if ACTIVE_TX.try_with(|_| ()).is_ok() {
         // In a tx: stage the slot patch (commit does the sector RMW).
         return storage.write_blocks(offset, dentry.as_bytes()).await;
     }
 
-    if meta_sector_locks_enabled() {
-        // Out of a tx: sector-safe full RMW under the sector write lock.
-        let _g = storage.sector_lock(sector_offset).write().await;
-        let mut sector_buf = [0u8; SECTOR_SIZE];
-        storage
-            .read_blocks_direct(sector_offset, &mut sector_buf)
-            .await?;
-        sector_buf[slot_in_sector * DENTRY_SLOT_SIZE..(slot_in_sector + 1) * DENTRY_SLOT_SIZE]
-            .copy_from_slice(dentry.as_bytes());
-        return storage
-            .write_blocks_direct(sector_offset, &sector_buf)
-            .await;
-    }
-
-    // Flag-off: full-sector RMW with staging (today's behavior).
+    // Out of a tx: sector-safe full RMW under the sector write lock.
+    let _g = storage.sector_lock(sector_offset).write().await;
     let mut sector_buf = [0u8; SECTOR_SIZE];
-    storage.read_blocks(sector_offset, &mut sector_buf).await?;
+    storage
+        .read_blocks_direct(sector_offset, &mut sector_buf)
+        .await?;
     sector_buf[slot_in_sector * DENTRY_SLOT_SIZE..(slot_in_sector + 1) * DENTRY_SLOT_SIZE]
         .copy_from_slice(dentry.as_bytes());
-    storage.write_blocks(sector_offset, &sector_buf).await?;
-    Ok(())
-}
-
-/// Writes a dentry to a specific disk offset.
-pub async fn write_dentry(storage: &MetaLvStorage, offset: u64, dentry: &DiskDentry) -> Result<()> {
-    let _guard = storage.dentry_lock.lock().await;
-    write_dentry_raw(storage, offset, dentry).await
+    storage
+        .write_blocks_direct(sector_offset, &sector_buf)
+        .await
 }
 
 /// Lookup a dentry inside a parent directory using the in-RAM chain index.
 ///
-/// The in-RAM `dentry_index` is authoritative for reads (design Open Q3); flag-on
-/// takes no lock (scc gives per-entry safety and the DLM serializes same-object
-/// mutations), flag-off takes the global `dentry_lock`.
+/// The in-RAM `dentry_index` is authoritative for reads (design Open Q3); no
+/// lock is taken (scc gives per-entry safety and the DLM serializes same-object
+/// mutations).
 pub async fn find_dentry(
     storage: &MetaLvStorage,
     parent_ino: u64,
     name: &str,
 ) -> Result<Option<DiskDentry>> {
     storage.ensure_dentry_index().await?;
-    let mut _legacy_guard: Option<tokio::sync::MutexGuard<()>> = None;
-    if !meta_sector_locks_enabled() {
-        _legacy_guard = Some(storage.dentry_lock.lock().await);
-    }
 
     let mut found = None;
     let _ = storage.dentry_index.read_sync(&parent_ino, |_, entries| {
@@ -216,10 +178,10 @@ pub async fn find_dentry(
 
 /// Inserts a new dentry inside a parent directory.
 ///
-/// Flag-on holds the per-bucket chain lock from here through the transaction's
+/// Holds the per-bucket chain lock from here through the transaction's
 /// post-commit in-RAM index apply (design §3.6). The in-RAM index mutations are
 /// applied immediately (so multi-op transactions — e.g. rename over an existing
-/// target — read their own writes exactly as the legacy path does) but are
+/// target — read their own writes through the tx staging overlay) but are
 /// snapshotted for rollback: on commit failure `run_transaction` restores them,
 /// so the in-RAM index never diverges from disk (design R4). Disk writes stage
 /// sub-sector patches; the sector lock does the whole-sector RMW at commit.
@@ -232,7 +194,7 @@ pub async fn insert_dentry(
 ) -> Result<()> {
     storage.ensure_dentry_index().await?;
     let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
-    let (_legacy_guard, _bucket_guard) = acquire_chain_lock(storage, bucket).await?;
+    let _bucket_guard = acquire_chain_lock(storage, bucket).await?;
 
     let bucket_offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
 
@@ -355,12 +317,12 @@ pub async fn insert_dentry(
 }
 
 /// Removes a dentry from a parent directory. See [`insert_dentry`] for the
-/// flag-on locking/rollback model; the in-RAM chain surgery is identical to the
-/// legacy path with per-mutation snapshots added for commit-failure rollback.
+/// sector-commit locking/rollback model; the in-RAM chain surgery keeps
+/// per-mutation snapshots for commit-failure rollback.
 pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str) -> Result<()> {
     storage.ensure_dentry_index().await?;
     let bucket = dentry_hash(parent_ino, name) % MAX_HASH_BUCKETS;
-    let (_legacy_guard, _bucket_guard) = acquire_chain_lock(storage, bucket).await?;
+    let _bucket_guard = acquire_chain_lock(storage, bucket).await?;
 
     let bucket_offset = DENTRY_TABLE_START + bucket * DENTRY_SLOT_SIZE as u64;
 
@@ -540,10 +502,6 @@ pub async fn remove_dentry(storage: &MetaLvStorage, parent_ino: u64, name: &str)
 /// List all dentries in a parent directory.
 pub async fn list_dentries(storage: &MetaLvStorage, parent_ino: u64) -> Result<Vec<DiskDentry>> {
     storage.ensure_dentry_index().await?;
-    let mut _legacy_guard: Option<tokio::sync::MutexGuard<()>> = None;
-    if !meta_sector_locks_enabled() {
-        _legacy_guard = Some(storage.dentry_lock.lock().await);
-    }
 
     let mut list = Vec::new();
     let _ = storage.dentry_index.read_sync(&parent_ino, |_, entries| {

@@ -1917,7 +1917,7 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // Reconcile the on-disk inode bitmap from the authoritative inode table on
-        // clean unmount, so a subsequent rollback to the legacy allocator path
+        // clean unmount, so a subsequent mount by a pre-PR-8 binary
         // reads a correct bitmap (design PR 2b / review Issue 18).
         if let Some(ref backend) = self.meta_backend {
             for vol in &backend.volumes {

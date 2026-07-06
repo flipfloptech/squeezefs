@@ -22,7 +22,6 @@ struct JournalRequest {
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 struct JournalState {
     head: u64,
-    tail: u64,
 }
 
 impl Journal {
@@ -73,148 +72,6 @@ impl Journal {
             SqueezefsError::InvalidOperation("Journal worker task panicked".to_string())
         })?
     }
-
-    /// Replays outstanding log entries on mount/recovery
-    pub async fn replay(&self, storage: &MetaLvStorage) -> Result<()> {
-        let mut state_sector = [0u8; SECTOR_SIZE];
-        if let Err(e) = storage
-            .read_blocks_direct(self.start_offset, &mut state_sector)
-            .await
-        {
-            log::info!(
-                "Journal: No valid superblock found (read failed: {:?}). Skipping replay.",
-                e
-            );
-            return Ok(());
-        }
-        if &state_sector[0..8] != b"LVJOURNL" {
-            log::info!("Journal: Magic not found. Skipping replay.");
-            return Ok(());
-        }
-        let head = u64::from_le_bytes(state_sector[8..16].try_into().unwrap());
-        let tail = u64::from_le_bytes(state_sector[16..24].try_into().unwrap());
-        log::info!("Journal replay started: tail = {}, head = {}", tail, head);
-
-        if tail == head {
-            log::info!("Journal is empty. No replay needed.");
-            return Ok(());
-        }
-
-        let circular_start = self.start_offset + SECTOR_SIZE as u64;
-        let circular_size = self.size - SECTOR_SIZE as u64;
-
-        let mut current_pos = tail;
-        while current_pos != head {
-            // 1. Read the first sector of the record
-            let mut first_sector = [0u8; SECTOR_SIZE];
-            if let Err(e) = read_circular(
-                storage,
-                circular_start,
-                circular_size,
-                current_pos,
-                &mut first_sector,
-            )
-            .await
-            {
-                log::warn!("Journal replay: read first sector failed: {:?}", e);
-                break;
-            }
-
-            let payload_len = u32::from_le_bytes(first_sector[0..4].try_into().unwrap()) as u64;
-            if payload_len == 0 || payload_len > 20 * 1024 * 1024 {
-                break;
-            }
-
-            let raw_len = 4 + payload_len + 8;
-            let padded_len = (raw_len + SECTOR_SIZE as u64 - 1) & !(SECTOR_SIZE as u64 - 1);
-
-            let mut record_data = vec![0u8; padded_len as usize];
-            record_data[..SECTOR_SIZE].copy_from_slice(&first_sector);
-
-            if padded_len > SECTOR_SIZE as u64 {
-                let mut remaining_buf = vec![0u8; (padded_len - SECTOR_SIZE as u64) as usize];
-                if let Err(e) = read_circular(
-                    storage,
-                    circular_start,
-                    circular_size,
-                    current_pos + SECTOR_SIZE as u64,
-                    &mut remaining_buf,
-                )
-                .await
-                {
-                    log::warn!("Journal replay: read remaining sectors failed: {:?}", e);
-                    break;
-                }
-                record_data[SECTOR_SIZE..].copy_from_slice(&remaining_buf);
-            }
-
-            let payload = &record_data[4..4 + payload_len as usize];
-            let expected_checksum =
-                &record_data[4 + payload_len as usize..4 + payload_len as usize + 8];
-
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(payload);
-            if &hash[..8] != expected_checksum {
-                log::warn!("Journal replay: checksum verification failed. Stop replay.");
-                break;
-            }
-
-            // 3. Deserialize and apply writes
-            let ops: Vec<(u64, Vec<u8>)> = match bincode::deserialize(payload) {
-                Ok(o) => o,
-                Err(e) => {
-                    log::warn!("Journal replay: failed to deserialize ops: {:?}", e);
-                    break;
-                }
-            };
-
-            log::info!("Journal replay: reapplying {} write operations", ops.len());
-            for (offset, buf) in ops {
-                if let Err(e) = storage.write_blocks_direct(offset, &buf).await {
-                    log::error!("Journal replay error applying write at {}: {:?}", offset, e);
-                    return Err(e);
-                }
-            }
-
-            current_pos = (current_pos + padded_len) % circular_size;
-        }
-
-        // Reset journal state sector
-        state_sector[0..8].copy_from_slice(b"LVJOURNL");
-        state_sector[8..16].copy_from_slice(&head.to_le_bytes());
-        state_sector[16..24].copy_from_slice(&head.to_le_bytes());
-        storage
-            .write_blocks_direct(self.start_offset, &state_sector)
-            .await?;
-        crate::uring_fs::fdatasync(storage.device_path()).await?;
-        log::info!(
-            "Journal replay complete. Reset tail to match head at {}",
-            head
-        );
-        Ok(())
-    }
-}
-
-async fn read_circular(
-    storage: &MetaLvStorage,
-    circular_start: u64,
-    circular_size: u64,
-    pos: u64,
-    buf: &mut [u8],
-) -> Result<()> {
-    let mut read_len = 0;
-    let mut cur_pos = pos % circular_size;
-    while read_len < buf.len() {
-        let chunk_len = std::cmp::min(buf.len() - read_len, (circular_size - cur_pos) as usize);
-        let mut temp_buf = vec![0u8; chunk_len];
-        storage
-            .read_blocks_direct(circular_start + cur_pos, &mut temp_buf)
-            .await?;
-        buf[read_len..read_len + chunk_len].copy_from_slice(&temp_buf);
-        read_len += chunk_len;
-        cur_pos = (cur_pos + chunk_len as u64) % circular_size;
-    }
-    Ok(())
 }
 
 async fn write_circular(
@@ -249,7 +106,7 @@ async fn journal_worker_loop(
     let circular_start = start_offset + SECTOR_SIZE as u64;
     let circular_size = size - SECTOR_SIZE as u64;
 
-    let mut state = JournalState { head: 0, tail: 0 };
+    let mut state = JournalState { head: 0 };
     let mut state_sector = [0u8; SECTOR_SIZE];
     if storage
         .read_blocks_direct(start_offset, &mut state_sector)
@@ -258,7 +115,6 @@ async fn journal_worker_loop(
     {
         if &state_sector[0..8] == b"LVJOURNL" {
             state.head = u64::from_le_bytes(state_sector[8..16].try_into().unwrap());
-            state.tail = u64::from_le_bytes(state_sector[16..24].try_into().unwrap());
         }
     }
 
@@ -341,9 +197,16 @@ async fn journal_worker_loop(
         }
 
         if !write_failed {
+            // State-sector format is unchanged (magic + head + tail) so pre-PR-8
+            // binaries still mount. `tail` is persisted equal to `head`
+            // ("journal drained"): commits apply their sectors in place before
+            // the WAL record is ever needed again, and the deleted (unsound)
+            // replay was the only tail consumer — an old binary's replay now
+            // correctly sees an empty journal instead of re-applying stale
+            // records over newer data (design review Issue 15).
             state_sector[0..8].copy_from_slice(b"LVJOURNL");
             state_sector[8..16].copy_from_slice(&state.head.to_le_bytes());
-            state_sector[16..24].copy_from_slice(&state.tail.to_le_bytes());
+            state_sector[16..24].copy_from_slice(&state.head.to_le_bytes());
             if storage
                 .write_blocks_direct(start_offset, &state_sector)
                 .await

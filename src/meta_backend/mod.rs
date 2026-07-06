@@ -116,119 +116,12 @@ impl MetaLvBackend {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<R>>,
     {
-        use crate::meta_backend::storage::{meta_sector_locks_enabled, ACTIVE_TX};
-        // Nested tx: reuse the parent's staging + lock/rollback state (both paths).
+        use crate::meta_backend::storage::ACTIVE_TX;
+        // Nested tx: reuse the parent's staging + lock/rollback state.
         if ACTIVE_TX.try_with(|_| ()).is_ok() {
             return f().await;
         }
-        if meta_sector_locks_enabled() {
-            self.run_transaction_sector_locked(f).await
-        } else {
-            self.run_transaction_legacy(f).await
-        }
-    }
-
-    /// Legacy commit: single global `transaction_lock` + coarse per-type locks
-    /// across [closure → WAL append → apply]. Retained verbatim behind the
-    /// flag-off rollback path (design Rollout §2/§6); deleted in PR 8.
-    async fn run_transaction_legacy<F, Fut, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<R>>,
-    {
-        use crate::meta_backend::storage::ACTIVE_TX;
-        let _tx_lock_guard = self.storage.transaction_lock.lock().await;
-
-        let tx: std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, u64, Vec<u8>)>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let tx_clone = tx.clone();
-
-        let res = ACTIVE_TX.scope(tx_clone, f()).await;
-
-        match res {
-            Ok(ret) => {
-                let ops = tx.lock().unwrap().clone();
-                if !ops.is_empty() {
-                    let mut groups: std::collections::HashMap<
-                        std::path::PathBuf,
-                        Vec<(u64, Vec<u8>)>,
-                    > = std::collections::HashMap::new();
-                    for (path, offset, buf) in ops {
-                        groups.entry(path).or_default().push((offset, buf));
-                    }
-
-                    let sync = crate::meta_backend::storage::FORCE_SYNC_TX
-                        .try_with(|v| *v)
-                        .unwrap_or(false);
-
-                    for (path, path_ops) in groups {
-                        if path == self.storage.path {
-                            let record_bytes = bincode::serialize(&path_ops).map_err(|e| {
-                                crate::error::SqueezefsError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("Failed to serialize transaction record: {:?}", e),
-                                ))
-                            })?;
-                            self.journal
-                                .write_record(&self.storage, &record_bytes, sync)
-                                .await?;
-                            let mut need_sb = false;
-                            let mut need_inode = false;
-                            let mut need_dentry = false;
-                            let mut need_xattr = false;
-
-                            for &(offset, _) in &path_ops {
-                                if offset < 4096 {
-                                    need_sb = true;
-                                } else if offset < dentry::DENTRY_TABLE_START {
-                                    need_inode = true;
-                                } else if offset < xattr::XATTR_BLOCK_START {
-                                    need_dentry = true;
-                                } else {
-                                    need_xattr = true;
-                                }
-                            }
-
-                            let _sb_guard = if need_sb {
-                                Some(self.storage.superblock_lock.lock().await)
-                            } else {
-                                None
-                            };
-                            let _inode_guard = if need_inode {
-                                Some(self.storage.inode_lock.lock().await)
-                            } else {
-                                None
-                            };
-                            let _dentry_guard = if need_dentry {
-                                Some(self.storage.dentry_lock.lock().await)
-                            } else {
-                                None
-                            };
-                            let _xattr_guard = if need_xattr {
-                                Some(self.storage.xattr_lock.lock().await)
-                            } else {
-                                None
-                            };
-
-                            for (offset, buf) in path_ops {
-                                self.storage.write_blocks_direct(offset, &buf).await?;
-                            }
-                        } else {
-                            for (offset, buf) in path_ops {
-                                crate::uring_fs::write_at(
-                                    &path,
-                                    offset,
-                                    bytes::Bytes::copy_from_slice(&buf),
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                }
-                Ok(ret)
-            }
-            Err(e) => Err(e),
-        }
+        self.run_transaction_sector_locked(f).await
     }
 
     /// Restore this transaction's staged in-RAM dentry-index deltas and free any
@@ -411,7 +304,7 @@ impl MetaLvBackend {
             }
 
             // Foreign (non-metadata) files: direct uring writes (unjournaled, as
-            // in the legacy path). In practice a meta tx never stages these.
+            // previously). In practice a meta tx never stages these.
             for (path, path_ops) in &foreign {
                 for (offset, buf) in path_ops {
                     crate::uring_fs::write_at(path, *offset, bytes::Bytes::copy_from_slice(buf))
@@ -433,30 +326,10 @@ impl MetaLvBackend {
     }
 
     pub async fn get_allocated_inode_count(&self) -> usize {
-        // Flag-on: the on-disk bitmap is no longer authoritative (it is a
-        // lazily-reconciled cache), so popcount the in-RAM allocator instead
-        // (design §3.5 / review Issue 9). Flag-off: read the on-disk bitmap.
-        if crate::meta_backend::storage::meta_sector_locks_enabled() {
-            return self.storage.inode_alloc.allocated_count() as usize;
-        }
-        let mut bitmap_sector = [0u8; 4096];
-        if self
-            .storage
-            .read_blocks(4096, &mut bitmap_sector)
-            .await
-            .is_err()
-        {
-            return 0;
-        }
-        let mut count = 0;
-        for i in 2..20000 {
-            let byte_idx = i / 8;
-            let bit_idx = i % 8;
-            if (bitmap_sector[byte_idx] & (1 << bit_idx)) != 0 {
-                count += 1;
-            }
-        }
-        count
+        // The on-disk bitmap is a lazily-reconciled cache (kept only for
+        // mountability of pre-PR-8 binaries), not authoritative — popcount the
+        // in-RAM allocator (design §3.5 / review Issue 9).
+        self.storage.inode_alloc.allocated_count() as usize
     }
 
     /// Formats the raw block storage device with a superblock and the root inode
@@ -587,17 +460,11 @@ impl Metadata for MetaLvBackend {
         }
 
         self.run_transaction(|| async {
-            let new_ino = if crate::meta_backend::storage::meta_sector_locks_enabled() {
-                // Flag-on: atomic in-RAM allocation (no inode_lock, no bitmap
-                // write); recorded for free-on-failure (design §3.5).
+            // Atomic in-RAM allocation (no lock, no bitmap write); recorded for
+            // free-on-failure (design §3.5).
+            let new_ino = {
                 let ino = self.storage.inode_alloc.alloc()?;
                 self.storage.tx_record_alloc(ino);
-                let disk_inode = inode::DiskInode::new(ino, final_mode, uid, final_gid);
-                inode::write_inode_raw(&self.storage, ino, &disk_inode).await?;
-                ino
-            } else {
-                let _guard = self.storage.inode_lock.lock().await;
-                let ino = self.storage.alloc_inode_bit_locked().await?;
                 let disk_inode = inode::DiskInode::new(ino, final_mode, uid, final_gid);
                 inode::write_inode_raw(&self.storage, ino, &disk_inode).await?;
                 ino
@@ -1005,33 +872,20 @@ impl Metadata for MetaLvBackend {
             }
         }
 
-        if crate::meta_backend::storage::meta_sector_locks_enabled() {
-            // Flag-on: zero the slot durably in the transaction, then free the
-            // in-RAM bit ONLY after the commit succeeds. There is no DLM exclusion
-            // between this destroy and a future create reusing the ino, so a
-            // premature free could let a concurrent create write the slot before
-            // our zero applied (design Key Decision 11 / R10). free() after commit
-            // orders our durable zero strictly before any reuse.
-            self.run_transaction(|| async {
-                let empty = inode::DiskInode::new_zeroed();
-                inode::write_inode_raw(&self.storage, ino, &empty).await?;
-                Ok(())
-            })
-            .await?;
-            self.storage.inode_alloc.free(ino);
+        // Zero the slot durably in the transaction, then free the in-RAM bit
+        // ONLY after the commit succeeds. There is no DLM exclusion between
+        // this destroy and a future create reusing the ino, so a premature free
+        // could let a concurrent create write the slot before our zero applied
+        // (design Key Decision 11 / R10). free() after commit orders our
+        // durable zero strictly before any reuse.
+        self.run_transaction(|| async {
+            let empty = inode::DiskInode::new_zeroed();
+            inode::write_inode_raw(&self.storage, ino, &empty).await?;
             Ok(())
-        } else {
-            self.run_transaction(|| async {
-                // Bitmap free + zero slot must be one critical section so a concurrent
-                // create cannot reallocate the bit before the slot is cleared.
-                let _inode_guard = self.storage.inode_lock.lock().await;
-                self.storage.free_inode_bit_locked(ino).await?;
-                let empty = inode::DiskInode::new_zeroed();
-                inode::write_inode_raw(&self.storage, ino, &empty).await?;
-                Ok(())
-            })
-            .await
-        }
+        })
+        .await?;
+        self.storage.inode_alloc.free(ino);
+        Ok(())
     }
 }
 
@@ -1190,36 +1044,23 @@ impl Metadata for RoutedMetaBackend {
         };
         self.check_volume_enabled(target_v_idx)?;
 
-        // Directories need exclusive parent lock (nlink). Flag-OFF regular files
-        // only need the dentry name lock (the fast path skips the parent). Flag-ON
-        // regular files take a TEMPORARY exclusive parent lock (PR 4) so the
-        // unified sector-locked path re-establishes parent-slot safety while it
-        // does a full-slot parent write; PR 5 refines this to a shared lock + a
-        // 16-byte field patch (design §3.8 sequencing).
+        // Directories need the EXCLUSIVE parent lock (parent nlink RMW). Regular
+        // creates (PR 5) take a SHARED parent lock: they only stage a 16-byte
+        // parent mtime/ctime field patch (never nlink/mode), merged at commit
+        // under the parent sector lock — so same-dir regular creates run
+        // concurrently, while the shared lock still serializes against any
+        // exclusive parent mutator (mkdir/setattr/unlink/rename), preventing a
+        // field patch from racing a full-slot parent write (design §3.8).
         let _parent_guard = if is_dir {
-            // Directories: exclusive parent lock (parent nlink RMW).
-            Some(
-                self.volumes[parent_v_idx]
-                    .dlm
-                    .lock_exclusive(&format!("I{}", local_parent))
-                    .await,
-            )
-        } else if crate::meta_backend::storage::meta_sector_locks_enabled() {
-            // Flag-on regular create (PR 5): SHARED parent lock. The create only
-            // stages a 16-byte parent mtime/ctime field patch (never nlink/mode),
-            // merged at commit under the parent sector lock — so same-dir regular
-            // creates run concurrently, while the shared lock still serializes
-            // against any exclusive parent mutator (mkdir/setattr/unlink/rename),
-            // preventing a field patch from racing a full-slot parent write
-            // (design §3.8).
-            Some(
-                self.volumes[parent_v_idx]
-                    .dlm
-                    .lock_shared(&format!("I{}", local_parent))
-                    .await,
-            )
+            self.volumes[parent_v_idx]
+                .dlm
+                .lock_exclusive(&format!("I{}", local_parent))
+                .await
         } else {
-            None
+            self.volumes[parent_v_idx]
+                .dlm
+                .lock_shared(&format!("I{}", local_parent))
+                .await
         };
         let _dentry_guard = self.volumes[parent_v_idx]
             .dlm
@@ -1229,60 +1070,6 @@ impl Metadata for RoutedMetaBackend {
         if parent_v_idx == target_v_idx {
             let backend = &self.volumes[target_v_idx];
             let is_dir_flag = is_dir;
-
-            // Regular files (FLAG-OFF ONLY): lock-only direct I/O (no journal
-            // transaction). Sector safety here is provided by inode_lock /
-            // dentry_lock RMW — a sector-lock-*unaware* writer, so it must never
-            // run alongside the sector-locked path. When the flag is on, regular
-            // creates fall through to the unified journaled+sector-locked path
-            // below (design §3.8 sequencing / review Issue 19). Directories always
-            // take the journaled path (parent nlink multi-field update).
-            if !is_dir_flag && !crate::meta_backend::storage::meta_sector_locks_enabled() {
-                // Skip parent inode read (no SGID inheritance on this fast path).
-                // Existence is enforced by the exclusive dentry name lock + insert.
-                if dentry::find_dentry(&backend.storage, local_parent, name)
-                    .await?
-                    .is_some()
-                {
-                    return Err(crate::error::SqueezefsError::InvalidOperation(
-                        "File already exists".to_string(),
-                    ));
-                }
-
-                let final_mode = mode;
-                let new_local_ino;
-                let disk_inode;
-                {
-                    let _guard = backend.storage.inode_lock.lock().await;
-                    new_local_ino = backend.storage.alloc_inode_bit_locked().await?;
-                    let di = inode::DiskInode::new(new_local_ino, final_mode, uid, gid);
-                    inode::write_inode_raw(&backend.storage, new_local_ino, &di).await?;
-                    disk_inode = di;
-                }
-
-                let global_child_ino = self.make_global_ino(new_local_ino, target_v_idx);
-                dentry::insert_dentry(
-                    &backend.storage,
-                    local_parent,
-                    global_child_ino,
-                    name,
-                    final_mode & libc::S_IFMT,
-                )
-                .await?;
-
-                return Ok(Inode {
-                    ino: global_child_ino,
-                    mode: disk_inode.mode,
-                    uid: disk_inode.uid,
-                    gid: disk_inode.gid,
-                    size: disk_inode.size,
-                    nlink: disk_inode.nlink,
-                    atime: disk_inode.atime,
-                    mtime: disk_inode.mtime,
-                    ctime: disk_inode.ctime,
-                    flags: disk_inode.flags,
-                });
-            }
 
             let inode = backend
                 .run_transaction(|| async {
@@ -1305,32 +1092,20 @@ impl Metadata for RoutedMetaBackend {
                         }
                     }
 
-                    let new_local_ino;
-                    let disk_inode;
-                    if crate::meta_backend::storage::meta_sector_locks_enabled() {
-                        // Unified flag-on path for regular files AND directories:
-                        // atomic in-RAM alloc (freed on failure), child nlink=2
-                        // only for directories.
-                        new_local_ino = backend.storage.inode_alloc.alloc()?;
-                        backend.storage.tx_record_alloc(new_local_ino);
+                    // Unified path for regular files AND directories: atomic
+                    // in-RAM alloc (freed on failure), child nlink=2 only for
+                    // directories.
+                    let new_local_ino = backend.storage.inode_alloc.alloc()?;
+                    backend.storage.tx_record_alloc(new_local_ino);
+                    let disk_inode = {
                         let mut di =
                             inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
                         if is_dir_flag {
                             di.nlink = 2;
                         }
                         inode::write_inode_raw(&backend.storage, new_local_ino, &di).await?;
-                        disk_inode = di;
-                    } else {
-                        // Flag-off reaches this journaled path for directories only
-                        // (regular files use the fast path above).
-                        let _guard = backend.storage.inode_lock.lock().await;
-                        new_local_ino = backend.storage.alloc_inode_bit_locked().await?;
-                        let mut di =
-                            inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
-                        di.nlink = 2;
-                        inode::write_inode_raw(&backend.storage, new_local_ino, &di).await?;
-                        disk_inode = di;
-                    }
+                        di
+                    };
 
                     let global_child_ino = self.make_global_ino(new_local_ino, target_v_idx);
 
@@ -1357,11 +1132,10 @@ impl Metadata for RoutedMetaBackend {
                         parent_inode.nlink += 1;
                         inode::write_inode(&backend.storage, local_parent, &parent_inode).await?;
                     } else {
-                        // Regular file, flag-on (shared I{parent}): stage only a
+                        // Regular file (shared I{parent}): stage only a
                         // 16-byte mtime/ctime field patch — preserves parent
                         // nlink/mode/size, so concurrent same-dir creates commit
                         // without clobbering each other (design §3.8, PR 5).
-                        // (Flag-off regular never reaches here — it uses the fast path.)
                         inode::stage_parent_time_patch(&backend.storage, local_parent, now).await?;
                     }
 
@@ -1408,14 +1182,10 @@ impl Metadata for RoutedMetaBackend {
             let is_dir_flag = is_dir;
             let (new_local_ino, disk_inode) = target
                 .run_transaction(|| async {
-                    let new_local_ino = if crate::meta_backend::storage::meta_sector_locks_enabled()
-                    {
+                    let new_local_ino = {
                         let ino = target.storage.inode_alloc.alloc()?;
                         target.storage.tx_record_alloc(ino);
                         ino
-                    } else {
-                        let _guard = target.storage.inode_lock.lock().await;
-                        target.storage.alloc_inode_bit_locked().await?
                     };
                     let mut disk_inode =
                         inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
@@ -1454,10 +1224,10 @@ impl Metadata for RoutedMetaBackend {
                         parent_inode.ctime = now;
                         parent_inode.nlink += 1;
                         inode::write_inode(&parent_be.storage, local_parent, &parent_inode).await?;
-                    } else if crate::meta_backend::storage::meta_sector_locks_enabled() {
-                        // Regular file, flag-on (shared I{parent}): 16-byte
-                        // mtime/ctime field patch, consistent with the same-volume
-                        // path (design §3.8, PR 5).
+                    } else {
+                        // Regular file (shared I{parent}): 16-byte mtime/ctime
+                        // field patch, consistent with the same-volume path
+                        // (design §3.8, PR 5).
                         inode::stage_parent_time_patch(&parent_be.storage, local_parent, now)
                             .await?;
                     }

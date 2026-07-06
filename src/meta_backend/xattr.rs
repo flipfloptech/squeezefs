@@ -1,5 +1,5 @@
 use crate::error::{Result, SqueezefsError};
-use crate::meta_backend::storage::{meta_sector_locks_enabled, MetaLvStorage, ACTIVE_TX};
+use crate::meta_backend::storage::{MetaLvStorage, ACTIVE_TX};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub const XATTR_BLOCK_START: u64 = 1024 * 1024 * 72; // 72MB offset
@@ -50,20 +50,16 @@ fn get_xattr_block_offset(ino: u64) -> u64 {
 
 /// Serialization guard for one inode's 32 KiB xattr block (PR 6).
 ///
-/// Flag-on: the block's sector-lock shards (ascending-deduped, the commit
-/// protocol's order — see `MetaLvStorage::lock_sectors_*`). Xattr blocks are
-/// per-inode and 32 KiB-aligned, so no two inodes share a sector; every staged
-/// xattr patch covers the same shards, so commits and direct ops exclude each
-/// other. Inside a transaction no lock is taken: the DLM `I{ino}` lock already
-/// serializes same-inode mutators, reads see this tx's staging overlay, and the
-/// sector locks are acquired at commit (taking them here would risk
+/// Out of a transaction: the block's sector-lock shards (ascending-deduped, the
+/// commit protocol's order — see `MetaLvStorage::lock_sectors_*`). Xattr blocks
+/// are per-inode and 32 KiB-aligned, so no two inodes share a sector; every
+/// staged xattr patch covers the same shards, so commits and direct ops exclude
+/// each other. Inside a transaction no lock is taken: the DLM `I{ino}` lock
+/// already serializes same-inode mutators, reads see this tx's staging overlay,
+/// and the sector locks are acquired at commit (taking them here would risk
 /// commit-time reentrancy on the non-reentrant tokio lock, design §3.4).
-/// Flag-off: the legacy global `xattr_lock` (until PR 8).
 enum XattrGuard<'a> {
     // Fields are RAII lock guards held only for Drop (underscore-named: never read).
-    Legacy {
-        _g: tokio::sync::MutexGuard<'a, ()>,
-    },
     SectorsRead {
         _g: Vec<tokio::sync::RwLockReadGuard<'a, ()>>,
     },
@@ -74,23 +70,17 @@ enum XattrGuard<'a> {
 }
 
 async fn xattr_guard(storage: &MetaLvStorage, ino: u64, write: bool) -> XattrGuard<'_> {
-    if meta_sector_locks_enabled() {
-        if ACTIVE_TX.try_with(|_| ()).is_ok() {
-            return XattrGuard::InTx;
-        }
-        let offset = get_xattr_block_offset(ino);
-        if write {
-            XattrGuard::SectorsWrite {
-                _g: storage.lock_sectors_write(offset, XATTR_BLOCK_SIZE).await,
-            }
-        } else {
-            XattrGuard::SectorsRead {
-                _g: storage.lock_sectors_read(offset, XATTR_BLOCK_SIZE).await,
-            }
+    if ACTIVE_TX.try_with(|_| ()).is_ok() {
+        return XattrGuard::InTx;
+    }
+    let offset = get_xattr_block_offset(ino);
+    if write {
+        XattrGuard::SectorsWrite {
+            _g: storage.lock_sectors_write(offset, XATTR_BLOCK_SIZE).await,
         }
     } else {
-        XattrGuard::Legacy {
-            _g: storage.xattr_lock.lock().await,
+        XattrGuard::SectorsRead {
+            _g: storage.lock_sectors_read(offset, XATTR_BLOCK_SIZE).await,
         }
     }
 }

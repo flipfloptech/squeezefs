@@ -9,7 +9,7 @@
 //! and is rebuilt on mount via [`crate::meta_backend::storage::MetaLvStorage::seed_inode_alloc_from_table`].
 //!
 //! Inodes 0 and 1 are reserved (1 = root); allocatable range is `[2, limit)`
-//! where `limit == min(20000, max_inodes)` — matching the legacy allocator.
+//! where `limit == min(20000, max_inodes)`.
 //!
 //! NOTE (PR 2 of the transaction_lock-removal design): this type is introduced
 //! but NOT yet wired into `create`; the legacy `alloc_inode_bit_locked` remains

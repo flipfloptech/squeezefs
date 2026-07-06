@@ -232,15 +232,6 @@ async fn test_tx_full_sector_staging_overlay_unchanged() {
     );
 }
 
-#[test]
-fn test_meta_sector_locks_flag_defaults_on() {
-    // PR 4 flips the default: with no env var the sector-sharded commit path is
-    // ON. Explicit `0`/`off`/`false`/`no` selects the legacy rollback path
-    // (exercised in `meta_lv_legacy_tests.rs`).
-    std::env::remove_var("SQUEEZEFS_META_SECTOR_LOCKS");
-    assert!(squeezefs::meta_backend::storage::meta_sector_locks_enabled());
-}
-
 #[tokio::test]
 async fn test_metalv_crud_operations() {
     let tmp = NamedTempFile::new().unwrap();

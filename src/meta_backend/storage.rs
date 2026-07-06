@@ -11,24 +11,9 @@ pub const SECTOR_SIZE: usize = 4096;
 /// `BLOCK_FLUSH_LOCKS` (`fuse_client`). See the transaction_lock-removal design.
 pub const SECTOR_LOCK_SHARDS: usize = 4096;
 
-/// Whether the sector-sharded metadata commit path is enabled. Read once and
-/// cached — the flag is a mount-time choice, not per-op, and the two writer
-/// models (sector-locked vs legacy `transaction_lock`) must never coexist in one
-/// process. **Default: on** (PR 4). Set `SQUEEZEFS_META_SECTOR_LOCKS` to
-/// `0`/`off`/`false`/`no` to select the retained legacy rollback path; any other
-/// value (or unset) is on.
-pub fn meta_sector_locks_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SQUEEZEFS_META_SECTOR_LOCKS")
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                !(v == "0" || v == "off" || v == "false" || v == "no")
-            })
-            .unwrap_or(true)
-    })
-}
+// The sector-sharded commit (design PR 4) is the sole writer model since PR 8
+// deleted the legacy `transaction_lock` path and its `SQUEEZEFS_META_SECTOR_LOCKS`
+// rollback flag; rollback is now `git revert` of the PR chain.
 
 #[derive(IntoBytes, FromBytes, Immutable, Debug, Clone, Copy)]
 #[repr(C)]
@@ -52,16 +37,8 @@ impl Superblock {
 #[derive(Clone)]
 pub struct MetaLvStorage {
     pub path: PathBuf,
-    pub superblock_lock: Arc<tokio::sync::Mutex<()>>,
-    pub inode_lock: Arc<tokio::sync::Mutex<()>>,
-    pub dentry_lock: Arc<tokio::sync::Mutex<()>>,
-    pub xattr_lock: Arc<tokio::sync::Mutex<()>>,
-    pub transaction_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Hint for next free inode bit scan (monotonic; wrap-scan on full).
-    pub free_ino_hint: Arc<std::sync::atomic::AtomicU64>,
-    /// Lock-free in-RAM inode allocator (derived from the inode table; seeded on
-    /// mount). Introduced in PR 2 but not yet the live allocator — see
-    /// `crate::meta_backend::alloc`.
+    /// Lock-free in-RAM inode allocator — the sole allocator (derived from the
+    /// inode table; seeded on mount) — see `crate::meta_backend::alloc`.
     pub inode_alloc: Arc<crate::meta_backend::alloc::InodeAllocator>,
     /// Per-4KiB-sector RwLock array (keyed by sector-aligned byte offset).
     /// Read guard = consistent non-tx reads; write guard = commit-time RMW+apply.
@@ -84,12 +61,12 @@ pub struct MetaLvStorage {
 tokio::task_local! {
     pub static ACTIVE_TX: std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, u64, Vec<u8>)>>>;
     pub static FORCE_SYNC_TX: bool;
-    /// Per-transaction lock + rollback state for the sector-sharded commit path
-    /// (flag-on). Set alongside [`ACTIVE_TX`] by `run_transaction`. Carries the
+    /// Per-transaction lock + rollback state for the sector-sharded commit.
+    /// Set alongside [`ACTIVE_TX`] by `run_transaction`. Carries the
     /// owned dentry-bucket guards (held closure→post-commit), the in-RAM index
     /// undo log (restored on commit failure so the index never diverges from
     /// disk, design R4), and the inodes allocated this tx (freed on failure,
-    /// design §3.5). Empty/unused on the legacy path.
+    /// design §3.5).
     pub static TX_STATE: std::sync::Arc<std::sync::Mutex<TxState>>;
 }
 
@@ -160,9 +137,8 @@ impl MetaLvStorage {
             }
         }
 
-        // Effective device size after any set_len above; used to size the inode
-        // allocator with the SAME limit the legacy `alloc_inode_bit_locked` uses
-        // (min(20000, max_inodes)) so both allocators agree on the range.
+        // Effective device size after any set_len above; sizes the inode
+        // allocator (min(20000, max_inodes)).
         let effective_size =
             if !meta.file_type().is_block_device() && dev_size < size_limit && size_limit > 0 {
                 size_limit
@@ -173,12 +149,6 @@ impl MetaLvStorage {
 
         let storage = Self {
             path: path_ref.to_path_buf(),
-            superblock_lock: Arc::new(tokio::sync::Mutex::new(())),
-            inode_lock: Arc::new(tokio::sync::Mutex::new(())),
-            dentry_lock: Arc::new(tokio::sync::Mutex::new(())),
-            xattr_lock: Arc::new(tokio::sync::Mutex::new(())),
-            transaction_lock: Arc::new(tokio::sync::Mutex::new(())),
-            free_ino_hint: Arc::new(std::sync::atomic::AtomicU64::new(2)),
             inode_alloc: Arc::new(crate::meta_backend::alloc::InodeAllocator::new(inode_limit)),
             sector_locks: Arc::new(crate::stripe_locks::StripeLocks::new()),
             dentry_bucket_locks: Arc::new(crate::stripe_locks::StripeLocks::new()),
@@ -191,58 +161,6 @@ impl MetaLvStorage {
         };
 
         Ok(storage)
-    }
-
-    /// Allocate a free inode number and set its bitmap bit.
-    /// Caller must hold `inode_lock` (and typically be inside a transaction).
-    pub async fn alloc_inode_bit_locked(&self) -> Result<u64> {
-        use std::sync::atomic::Ordering;
-        let mut bitmap_sector = [0u8; 4096];
-        self.read_blocks(4096, &mut bitmap_sector).await?;
-        let limit = std::cmp::min(20000, self.max_inodes());
-        if limit <= 2 {
-            return Err(SqueezefsError::InvalidOperation(
-                "Inode table full".to_string(),
-            ));
-        }
-        let hint = self.free_ino_hint.load(Ordering::Relaxed).max(2) as usize;
-        let mut new_ino = 0u64;
-        // Scan from hint to end, then wrap [2, hint).
-        let ranges = [hint..limit, 2..hint.min(limit)];
-        'scan: for range in ranges {
-            for i in range {
-                let byte_idx = i / 8;
-                let bit_idx = i % 8;
-                if (bitmap_sector[byte_idx] & (1 << bit_idx)) == 0 {
-                    new_ino = i as u64;
-                    bitmap_sector[byte_idx] |= 1 << bit_idx;
-                    break 'scan;
-                }
-            }
-        }
-        if new_ino == 0 {
-            return Err(SqueezefsError::InvalidOperation(
-                "Inode table full".to_string(),
-            ));
-        }
-        self.write_blocks(4096, &bitmap_sector).await?;
-        self.free_ino_hint
-            .store(new_ino.saturating_add(1), Ordering::Relaxed);
-        Ok(new_ino)
-    }
-
-    /// Mark an inode bit free; caller must hold `inode_lock`.
-    pub async fn free_inode_bit_locked(&self, ino: u64) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        let mut bitmap_sector = [0u8; 4096];
-        self.read_blocks(4096, &mut bitmap_sector).await?;
-        let byte_idx = ino as usize / 8;
-        let bit_idx = ino as usize % 8;
-        bitmap_sector[byte_idx] &= !(1 << bit_idx);
-        self.write_blocks(4096, &bitmap_sector).await?;
-        // Prefer reusing recently freed slots under create storms.
-        let _ = self.free_ino_hint.fetch_min(ino.max(2), Ordering::Relaxed);
-        Ok(())
     }
 
     pub async fn ensure_dentry_index(&self) -> Result<()> {
@@ -321,7 +239,7 @@ impl MetaLvStorage {
 
     /// Write guards over every sector shard intersecting `[offset, offset+len)`,
     /// acquired in ascending shard-index order (mutually exclusive with the
-    /// sector-sharded commit and with same-range readers/writers). Flag-on
+    /// sector-sharded commit and with same-range readers/writers).
     /// multi-sector direct RMWs (xattr blocks, superblock) hold these across
     /// their read→modify→write.
     pub async fn lock_sectors_write(
@@ -353,15 +271,10 @@ impl MetaLvStorage {
 
     /// Read the Superblock at offset 0
     ///
-    /// Flag-on: sector-0 **read** lock (the superblock is one sector in the
-    /// sector scheme; commits that stage superblock patches lock the same
-    /// shard). Flag-off: legacy global `superblock_lock` (until PR 8).
+    /// Sector-0 **read** lock: the superblock is one sector in the sector
+    /// scheme; commits that stage superblock patches lock the same shard.
     pub async fn read_superblock(&self) -> Result<Superblock> {
-        let (_legacy, _sector) = if meta_sector_locks_enabled() {
-            (None, Some(self.sector_lock(0).read().await))
-        } else {
-            (Some(self.superblock_lock.lock().await), None)
-        };
+        let _sector = self.sector_lock(0).read().await;
         let bytes = crate::uring_fs::read_at(&self.path, 0, SECTOR_SIZE).await?;
         let mut sb = Superblock::new_zeroed();
         let sb_len = sb.as_bytes().len();
@@ -381,16 +294,11 @@ impl MetaLvStorage {
 
     /// Write the Superblock at offset 0
     ///
-    /// Flag-on: sector-0 **write** lock — mutually exclusive with readers and
-    /// with commits applying staged superblock patches (invariant R1: no
-    /// mutator writes a sector outside its sector lock). Flag-off: legacy
-    /// global `superblock_lock` (until PR 8).
+    /// Sector-0 **write** lock — mutually exclusive with readers and with
+    /// commits applying staged superblock patches (invariant R1: no mutator
+    /// writes a sector outside its sector lock).
     pub async fn write_superblock(&self, sb: &Superblock) -> Result<()> {
-        let (_legacy, _sector) = if meta_sector_locks_enabled() {
-            (None, Some(self.sector_lock(0).write().await))
-        } else {
-            (Some(self.superblock_lock.lock().await), None)
-        };
+        let _sector = self.sector_lock(0).write().await;
         let mut buf = [0u8; SECTOR_SIZE];
         let sb_bytes = sb.as_bytes();
         buf[..sb_bytes.len()].copy_from_slice(sb_bytes);
@@ -665,8 +573,8 @@ impl MetaLvStorage {
 
     /// Rewrite the on-disk free-inode bitmap sector (offset 4096) directly from
     /// the authoritative inode table. Run on mount and clean unmount so the
-    /// legacy `alloc_inode_bit_locked` (which reads this bitmap) stays consistent
-    /// and a rollback to the flag-off path is safe (design Key Decision 9 /
+    /// on-disk bitmap stays consistent for pre-PR-8 binaries, which read it to
+    /// allocate (design Key Decision 9 /
     /// review Issues 5, 18). Mirrors `format`'s convention of marking bits 0
     /// (reserved) and 1 (root) as allocated. Derives from the table — never from
     /// the in-RAM allocator — so it is correct regardless of which allocator ran

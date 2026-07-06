@@ -1,12 +1,7 @@
-//! Flag-ON (sector-sharded commit) concurrency + correctness tests.
+//! Sector-sharded commit concurrency + correctness tests (design PR 4; the
+//! sole writer model since PR 8 deleted the legacy `transaction_lock` path).
 //!
-//! These run with `SQUEEZEFS_META_SECTOR_LOCKS=1` so `run_transaction` and the
-//! inode/dentry helpers take the sector-sharded commit path (design PR 4). The
-//! flag is read once per process and cached (`meta_sector_locks_enabled`), so
-//! this file is a dedicated flag-ON test binary: every test calls `enable()`
-//! before touching any storage, and there is no flag-OFF test in this binary.
-//!
-//! The invariant under test (design R1/§3.8): **flag-on ⇒ no metadata mutator
+//! The invariant under test (design R1/§3.8): **no metadata mutator
 //! writes a 4 KiB sector outside its sector write lock** — so concurrent
 //! mutations of different slots in one physical sector never clobber a sibling
 //! (the `352d776` ESTALE class), and allocation never double-hands an inode.
@@ -15,17 +10,6 @@ use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend, Metadata, R
 use std::collections::HashSet;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
-
-/// Turn on the sector-sharded commit path for this (whole) test process. Must be
-/// called before the first `meta_sector_locks_enabled()` read; the assert proves
-/// the flag actually took effect (guards against a stale cached read).
-fn enable() {
-    std::env::set_var("SQUEEZEFS_META_SECTOR_LOCKS", "1");
-    assert!(
-        squeezefs::meta_backend::storage::meta_sector_locks_enabled(),
-        "SQUEEZEFS_META_SECTOR_LOCKS must be enabled for this binary"
-    );
-}
 
 async fn open_backend() -> (NamedTempFile, Arc<MetaLvBackend>) {
     let tmp = NamedTempFile::new().unwrap();
@@ -55,7 +39,6 @@ async fn open_routed(n: usize) -> (Vec<NamedTempFile>, Arc<RoutedMetaBackend>) {
 /// the same 4 KiB inode sector, so concurrent tasks exercise same-sector RMW.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_create_distinct_inodes_no_collision() {
-    enable();
     let (_t, backend) = open_routed(1).await;
 
     let n_tasks = 8usize;
@@ -97,7 +80,7 @@ async fn test_concurrent_create_distinct_inodes_no_collision() {
         assert_eq!(g.ino, ino);
         assert!(g.mode & libc::S_IFREG != 0, "ino {ino} lost its magic/type");
     }
-    // get_allocated_inode_count must reflect the in-RAM allocator (flag-on):
+    // get_allocated_inode_count must reflect the in-RAM allocator:
     // n_tasks parent dirs + n_tasks*m files (root ino 1 is not counted).
     let count = backend.volumes[0].get_allocated_inode_count().await;
     assert_eq!(count, n_tasks + n_tasks * m, "allocated count mismatch");
@@ -106,10 +89,9 @@ async fn test_concurrent_create_distinct_inodes_no_collision() {
 /// Force 14 inodes into ONE 4 KiB sector (inos 2..=15 share sector 8192 with the
 /// root, 16 slots/sector) and `setattr` them all concurrently with distinct
 /// sizes. Every slot must keep valid magic and its own independent size — the
-/// `352d776` sibling-slot clobber, at sector granularity, flag-on.
+/// `352d776` sibling-slot clobber, at sector granularity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_same_sector_rmw_no_lost_slot() {
-    enable();
     let (_t, backend) = open_backend().await;
 
     let mut inos = Vec::new();
@@ -157,7 +139,6 @@ async fn test_concurrent_same_sector_rmw_no_lost_slot() {
 /// commit, so it must not clobber a sibling slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_create_vs_setattr_adjacent_inodes() {
-    enable();
     let (_t, backend) = open_routed(1).await;
 
     // Pre-create 12 files (inos 2..=13, sector 8192). inos 14/15 remain free in
@@ -217,7 +198,6 @@ async fn test_concurrent_create_vs_setattr_adjacent_inodes() {
 /// child slot clobbered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_regular_create_same_parent() {
-    enable();
     let (_t, backend) = open_routed(1).await;
 
     let parent = backend
@@ -273,7 +253,6 @@ async fn test_concurrent_regular_create_same_parent() {
 /// the parent sector lock never clobber the parent's value fields (design §3.8).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_regular_create_advances_parent_mtime_preserves_fields() {
-    enable();
     let (_t, backend) = open_routed(1).await;
 
     let parent = backend
@@ -335,7 +314,6 @@ async fn test_concurrent_regular_create_advances_parent_mtime_preserves_fields()
 /// §3.6, review Issue 3/16).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_same_bucket_dentry_ops() {
-    enable();
     let (_t, backend) = open_routed(1).await;
 
     let parent = backend
@@ -437,7 +415,6 @@ async fn test_concurrent_same_bucket_dentry_ops() {
 /// lock-order inversion would deadlock and blow the deadline (design R2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_no_deadlock_multi_sector_tx() {
-    enable();
     let (_t, backend) = open_routed(1).await;
 
     let a = backend
@@ -504,7 +481,6 @@ async fn test_no_deadlock_multi_sector_tx() {
 /// (design Key Decision 11 / R10).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_destroy_realloc_no_clobber() {
-    enable();
     let (_t, backend) = open_backend().await;
 
     for iter in 0..120 {
@@ -547,7 +523,6 @@ async fn test_destroy_realloc_no_clobber() {
 /// no-lost-inode / parent-nlink guarantees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_routed_concurrent_mkdir_no_lost_inodes_flag_on() {
-    enable();
     let (_t, backend) = open_routed(2).await;
 
     let threads = 10usize;
@@ -608,31 +583,28 @@ async fn test_routed_concurrent_mkdir_no_lost_inodes_flag_on() {
 }
 
 // ---------------------------------------------------------------------------
-// PR 6 — xattr + superblock on sector locks (flag-on path).
+// PR 6 — xattr + superblock on sector locks.
 //
-// Contract (design PR 6): when the sector-sharded commit is enabled, xattr and
-// superblock access participates in the sector scheme and takes NO global
-// metadata mutex (`xattr_lock` / `superblock_lock` remain only for the flag-off
-// legacy path until PR 8). Encoded here as: the op must complete while the
-// legacy mutex is deliberately held, and concurrent/interleaved access must
-// never tear a 32 KiB xattr block or the superblock sector.
+// Contract (design PR 6): xattr and superblock access participates in the
+// sector scheme and takes NO global metadata mutex (the legacy mutexes were
+// deleted in PR 8, so their absence is enforced by the type system). Encoded
+// here as bounded completion + round-trips, and concurrent/interleaved access
+// never tearing a 32 KiB xattr block or the superblock sector.
 // ---------------------------------------------------------------------------
 
-/// Flag-on xattr ops must not serialize on the legacy global `xattr_lock`:
-/// they complete (bounded) while the mutex is held. Covers the transactional
-/// backend path (setxattr/removexattr) and the direct storage path (get/list).
+/// Xattr ops run on the sector scheme with no global mutex (PR 6; the legacy
+/// `xattr_lock` was deleted outright in PR 8, so the absence of a global lock
+/// is enforced by the type system — this pins bounded completion + round-trip
+/// across the transactional backend path (setxattr/removexattr) and the direct
+/// storage path (get/list).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_xattr_ops_do_not_take_global_xattr_lock() {
+async fn test_xattr_ops_complete_bounded_on_sector_scheme() {
     use std::time::Duration;
-    enable();
     let (_t, backend) = open_backend().await;
     let f = backend
         .create(1, "xf", libc::S_IFREG | 0o644, 0, 0)
         .await
         .unwrap();
-
-    // Deliberately hold the legacy mutex for the whole test.
-    let _legacy = backend.storage.xattr_lock.lock().await;
 
     let val = vec![0x5Au8; 512];
     tokio::time::timeout(
@@ -640,18 +612,18 @@ async fn test_xattr_ops_do_not_take_global_xattr_lock() {
         backend.setxattr(f.ino, "user.k1", &val),
     )
     .await
-    .expect("flag-on setxattr must not block on the global xattr_lock")
+    .expect("setxattr must complete bounded on the sector scheme")
     .expect("setxattr");
 
     let got = tokio::time::timeout(Duration::from_secs(5), backend.getxattr(f.ino, "user.k1"))
         .await
-        .expect("flag-on getxattr must not block on the global xattr_lock")
+        .expect("getxattr must complete bounded on the sector scheme")
         .expect("getxattr");
     assert_eq!(got.as_deref(), Some(val.as_slice()));
 
     let names = tokio::time::timeout(Duration::from_secs(5), backend.listxattr(f.ino))
         .await
-        .expect("flag-on listxattr must not block on the global xattr_lock")
+        .expect("listxattr must complete bounded on the sector scheme")
         .expect("listxattr");
     assert!(names.iter().any(|n| n == "user.k1"), "{names:?}");
 
@@ -660,25 +632,23 @@ async fn test_xattr_ops_do_not_take_global_xattr_lock() {
         backend.removexattr(f.ino, "user.k1"),
     )
     .await
-    .expect("flag-on removexattr must not block on the global xattr_lock")
+    .expect("removexattr must complete bounded on the sector scheme")
     .expect("removexattr");
     let gone = backend.getxattr(f.ino, "user.k1").await.expect("getxattr2");
     assert!(gone.is_none());
 }
 
-/// Flag-on superblock read/write must not serialize on the legacy global
-/// `superblock_lock` (they take the sector-0 lock of the sector scheme).
+/// Superblock read/write on the sector-0 lock of the sector scheme (PR 6; the
+/// legacy `superblock_lock` was deleted in PR 8): bounded completion and a
+/// write→read round-trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_superblock_ops_do_not_take_global_superblock_lock() {
+async fn test_superblock_ops_complete_bounded_on_sector_scheme() {
     use std::time::Duration;
-    enable();
     let (_t, backend) = open_backend().await;
-
-    let _legacy = backend.storage.superblock_lock.lock().await;
 
     let mut sb = tokio::time::timeout(Duration::from_secs(5), backend.storage.read_superblock())
         .await
-        .expect("flag-on read_superblock must not block on the global superblock_lock")
+        .expect("read_superblock must complete bounded on the sector scheme")
         .expect("read_superblock");
 
     sb.checksum = 0xDEAD_BEEF;
@@ -687,7 +657,7 @@ async fn test_superblock_ops_do_not_take_global_superblock_lock() {
         backend.storage.write_superblock(&sb),
     )
     .await
-    .expect("flag-on write_superblock must not block on the global superblock_lock")
+    .expect("write_superblock must complete bounded on the sector scheme")
     .expect("write_superblock");
 
     let back = backend.storage.read_superblock().await.expect("re-read");
@@ -699,7 +669,6 @@ async fn test_superblock_ops_do_not_take_global_superblock_lock() {
 /// clobber — xattr blocks are per-inode/disjoint in the sector scheme.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_xattr_distinct_inodes_roundtrip() {
-    enable();
     let (_t, backend) = open_routed(1).await;
 
     let n_tasks = 8usize;
@@ -751,7 +720,6 @@ async fn test_concurrent_xattr_distinct_inodes_roundtrip() {
 /// DLM shared/exclusive already excludes same-inode, this pins the whole stack).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_xattr_read_never_torn_under_alternating_writer() {
-    enable();
     let (_t, backend) = open_routed(1).await;
     let f = backend
         .create(1, "torn", libc::S_IFREG | 0o644, 0, 0)
@@ -805,7 +773,6 @@ async fn test_xattr_read_never_torn_under_alternating_writer() {
 /// two distinct (magic-valid) superblock images.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_superblock_never_torn_under_concurrent_writers() {
-    enable();
     let (_t, backend) = open_backend().await;
     let s = backend.storage.clone();
 
@@ -878,7 +845,6 @@ fn hist_count(buckets: &[std::sync::atomic::AtomicU64]) -> u64 {
 async fn test_metrics_tx_concurrency_peak_reaches_parallel_txs() {
     use squeezefs::fuse_client::METRICS;
     use std::sync::atomic::Ordering;
-    enable();
     let (_t, backend) = open_backend().await;
 
     // Distinct parents so the DLM D-locks don't serialize the closures.
@@ -933,7 +899,6 @@ async fn test_metrics_tx_concurrency_peak_reaches_parallel_txs() {
 async fn test_metrics_sector_lock_contended_and_wait_recorded() {
     use squeezefs::fuse_client::METRICS;
     use std::sync::atomic::Ordering;
-    enable();
     let (_t, backend) = open_backend().await;
 
     let wait_before = hist_count(&METRICS.meta_sector_lock_wait_ns.buckets);
@@ -950,7 +915,7 @@ async fn test_metrics_sector_lock_contended_and_wait_recorded() {
         "sector-lock wait histogram did not record an uncontended commit"
     );
 
-    // Contended commit: a flag-on setxattr runs a sector-locked transaction
+    // Contended commit: a setxattr runs a sector-locked transaction
     // whose staged 32 KiB xattr-block patch (PR 6) commits under the block's
     // sector locks at a KNOWN offset — hold the first of those sectors so the
     // commit's guard acquisition must block on it.
@@ -988,7 +953,6 @@ async fn test_metrics_inode_alloc_cas_retries_counted() {
     use squeezefs::fuse_client::METRICS;
     use squeezefs::meta_backend::alloc::InodeAllocator;
     use std::sync::atomic::Ordering;
-    enable();
 
     let before = METRICS.meta_inode_alloc_cas_retries.load(Ordering::Relaxed);
     let a = InodeAllocator::new(128);
@@ -1010,7 +974,6 @@ async fn test_metrics_inode_alloc_cas_retries_counted() {
 async fn test_metrics_inode_alloc_reconciled_counts_healed_bits() {
     use squeezefs::fuse_client::METRICS;
     use std::sync::atomic::Ordering;
-    enable();
     let (_t, backend) = open_backend().await;
 
     // Clean volume: a refresh heals nothing.
@@ -1052,7 +1015,6 @@ async fn test_metrics_inode_alloc_reconciled_counts_healed_bits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_metrics_wal_batch_size_recorded() {
     use squeezefs::fuse_client::METRICS;
-    enable();
     let (_t, backend) = open_backend().await;
 
     let before = hist_count(&METRICS.meta_wal_batch_size.buckets);

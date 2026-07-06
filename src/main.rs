@@ -2036,10 +2036,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Reconcile the inode allocator + on-disk bitmap from the authoritative
             // inode table before serving FUSE (design §3.9 / PR 2b). Seeds the
-            // in-RAM allocator (for the future sector-locked create path) and
-            // heals any crash-induced bitmap divergence so the legacy allocator
-            // stays correct. Does NOT invoke journal::replay (unsound as the WAL
-            // stands — review Issue 15). Then run block-allocator recovery.
+            // in-RAM allocator (the sole allocator) and heals any crash-induced
+            // bitmap divergence so pre-PR-8 binaries can still mount this
+            // volume. WAL replay was deleted in PR 8 (unsound as the WAL stood —
+            // review Issue 15); crash recovery = in-place apply + fdatasync.
+            // Then run block-allocator recovery.
             for meta_be in &routed_meta_backend.volumes {
                 if let Err(e) = meta_be.storage.seed_inode_alloc_from_table().await {
                     log::warn!("Inode allocator seed failed on mount: {:?}", e);

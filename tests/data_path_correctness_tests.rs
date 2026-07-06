@@ -260,3 +260,47 @@ async fn test_setattr_mode_preserves_size_of_pending_write() {
     let got = read_at(&h, ino, 0, 4096).await;
     assert_eq!(got, data, "chmod corrupted just-written file data");
 }
+
+/// Regression for the FUSE writeback-cache read/write coherency bug (LTP
+/// read04/write03/readv01/mmap02/mmap03/linkat01/symlinkat01, all returned
+/// zeros): a read or getattr that misses the opportunistic attr cache must
+/// still observe the size of a just-written-but-not-yet-flushed file via the
+/// router metadata cache. Otherwise it reads the stale durable inode size (0 on
+/// a fresh file), returns a short read, and (under the kernel writeback cache)
+/// the kernel caches zero pages — silent read-after-write corruption.
+///
+/// The `attr_cache.invalidate` calls simulate the real trigger: the kernel
+/// issues readahead/getattr that races the write's attr-cache update, or the
+/// entry is simply evicted, before the deferred flush persists the size.
+#[tokio::test]
+async fn test_read_and_getattr_see_size_of_unflushed_write() {
+    let h = make().await;
+    // inline, staged (block size in this harness is 65536).
+    for (idx, &size) in [26usize, 4096, 60000].iter().enumerate() {
+        let ino = create(&h, &format!("wb{idx}")).await;
+        let data = pattern(size);
+        write_at(&h, ino, 0, &data).await;
+
+        // Cold attr cache: only the router metadata cache holds the fresh size.
+        h.fs.attr_cache.invalidate(&ino);
+        let attr = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+        assert_eq!(
+            attr.size, size as u64,
+            "size {size}: getattr observed stale size {} after attr-cache eviction",
+            attr.size
+        );
+
+        h.fs.attr_cache.invalidate(&ino);
+        let got = read_at(&h, ino, 0, size as u32).await;
+        assert_eq!(
+            got.len(),
+            size,
+            "size {size}: short read ({} bytes) after attr-cache eviction",
+            got.len()
+        );
+        assert_eq!(
+            got, data,
+            "size {size}: content mismatch after attr-cache eviction"
+        );
+    }
+}

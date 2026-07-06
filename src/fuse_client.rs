@@ -1655,20 +1655,40 @@ impl SqueezefsFilesystem {
     }
 
     async fn get_attr_internal(&self, ino: u64) -> Result<FileAttr, SqueezefsError> {
-        if let Some((attr, cached_at)) = self.attr_cache.get(&ino) {
-            if cached_at.elapsed() < Duration::from_secs(1) {
-                return Ok(attr);
+        let mut attr = match self.attr_cache.get(&ino) {
+            Some((attr, cached_at)) if cached_at.elapsed() < Duration::from_secs(1) => attr,
+            _ => {
+                let backend = self.meta_backend.as_ref().ok_or_else(|| {
+                    SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
+                })?;
+                let inode = backend.getattr(ino).await?;
+                let attr = self.inode_to_file_attr(&inode);
+                self.attr_cache
+                    .insert(ino, (attr, std::time::Instant::now()));
+                attr
+            }
+        };
+
+        // Size coherency: `write_file` updates `router.metadata_cache` size
+        // synchronously, but the durable inode/layout size only catches up on
+        // the deferred flush. Trust the hot metadata cache as the authoritative
+        // logical size for regular files (both write and truncate keep it
+        // current) so a stat/read/mmap issued between a write and its flush
+        // never observes a stale size (e.g. 0 on a freshly written file) — which
+        // otherwise truncates reads to zero and SIGBUSes mmap under the FUSE
+        // writeback cache.
+        if attr.kind == FileType::RegularFile {
+            let file_path = crate::keys::inode_path(ino);
+            if let Some(m) = self.router.metadata_cache.get(&file_path) {
+                if m.size != attr.size {
+                    attr.size = m.size;
+                    attr.blocks = m.size.div_ceil(512);
+                    self.attr_cache
+                        .insert(ino, (attr, std::time::Instant::now()));
+                }
             }
         }
-
-        let backend = self.meta_backend.as_ref().ok_or_else(|| {
-            SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
-        })?;
-        let inode = backend.getattr(ino).await?;
-        let attr = self.inode_to_file_attr(&inode);
         debug!("get_attr_internal returning: {:?}", attr);
-        self.attr_cache
-            .insert(ino, (attr, std::time::Instant::now()));
         Ok(attr)
     }
 
@@ -2269,7 +2289,7 @@ impl Filesystem for SqueezefsFilesystem {
         let (file_size, active_hit) = {
             let _guard = lock.read().await;
 
-            let file_size = if let Some((attr, _)) = self.attr_cache.get(&ino) {
+            let mut file_size = if let Some((attr, _)) = self.attr_cache.get(&ino) {
                 attr.size
             } else {
                 let backend = self
@@ -2287,6 +2307,17 @@ impl Filesystem for SqueezefsFilesystem {
                     .map(|inode| inode.size)
                     .unwrap_or(0)
             };
+
+            // Size coherency: prefer the router metadata cache, which the write
+            // path updates synchronously. The durable inode/attr caches can lag
+            // a just-committed write until its deferred flush, so without this a
+            // read racing a write (kernel readahead under the writeback cache)
+            // would observe a stale size (0 on a fresh file), return a short
+            // read, and let the kernel cache zero pages — silent read-after-
+            // write corruption.
+            if let Some(m) = self.router.metadata_cache.get(&file_path) {
+                file_size = m.size;
+            }
 
             if offset >= file_size {
                 return Ok(ReplyData {

@@ -1958,6 +1958,9 @@ impl RoutedMetaBackend {
     pub async fn sync_device_for_ino(&self, ino: Ino) -> Result<()> {
         let (v_idx, _) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
+        crate::fuse_client::METRICS
+            .meta_device_syncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::uring_fs::fdatasync(self.volumes[v_idx].storage.device_path()).await
     }
 

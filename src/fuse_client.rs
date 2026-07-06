@@ -350,9 +350,13 @@ pub struct Metrics {
     pub lease_acquire_fail: Align64<AtomicU64>,
     /// Writeback path: durable flush hard failures (sticky).
     pub writeback_hard_failures: Align64<AtomicU64>,
-    /// Meta-volume durability barriers issued (`sync_device_for_ino` fdatasync).
+    /// Meta-volume durability barriers actually issued (real `fdatasync` calls).
     /// A single FUSE fsync should raise this by exactly one (no redundant barrier).
     pub meta_device_syncs: Align64<AtomicU64>,
+    /// Meta-volume barrier *requests* (callers of `sync_device_for_ino`). Under
+    /// group commit `meta_sync_requests - meta_device_syncs` is the work saved by
+    /// coalescing concurrent fsyncs into shared barriers.
+    pub meta_sync_requests: Align64<AtomicU64>,
     /// Histograms for lock wait times and queue depths.
     pub write_lock_wait: Align64<LatencyHistogram>,
     pub block_lock_wait: Align64<LatencyHistogram>,
@@ -895,6 +899,7 @@ impl SqueezefsFilesystem {
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),
                 "writeback_hard_failures": METRICS.writeback_hard_failures.load(Ordering::Relaxed),
                 "meta_device_syncs": METRICS.meta_device_syncs.load(Ordering::Relaxed),
+                "meta_sync_requests": METRICS.meta_sync_requests.load(Ordering::Relaxed),
                 "bg_admit_available_permits": crate::bg_admit::available_permits(),
                 "bg_admit_capacity": crate::bg_admit::capacity(),
                 "striped_block_concurrency": crate::bg_admit::striped_block_concurrency(),

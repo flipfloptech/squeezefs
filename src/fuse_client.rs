@@ -54,23 +54,25 @@ impl<L: Default, const N: usize> StripeLocks<L, N> {
     }
 
     #[inline]
-    fn get_hash_key<T: std::hash::Hash>(&self, key: T) -> u64 {
-        let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
-        use std::hash::Hasher;
-        hasher.finish()
-    }
-
-    #[inline]
     pub fn get_lock(&self, ino: u64, key: u32) -> &L {
-        let hash_key = self.get_hash_key((ino, key));
-        &self.locks[(hash_key as usize) % N]
+        let mut x = ino ^ ((key as u64) << 32);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d049bb133111eb);
+        x ^= x >> 31;
+        &self.locks[(x as usize) % N]
     }
 
     #[inline]
     pub fn get_inode_lock(&self, ino: u64) -> &L {
-        let hash_key = self.get_hash_key(ino);
-        &self.locks[(hash_key as usize) % N]
+        let mut x = ino;
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d049bb133111eb);
+        x ^= x >> 31;
+        &self.locks[(x as usize) % N]
     }
 
     pub fn remove(&self, _ino: &u64) {
@@ -118,7 +120,7 @@ pub enum InodeWriteLockScope {
 /// Already-striped files use block-level locks on the data path, so the full-inode
 /// write lock need only cover short meta-prep. Inline and non-striped (layout
 /// transition / whole-buffer RMW) paths keep the lock for the entire operation.
-pub const MAX_INLINE_SIZE: u64 = 512;
+pub const MAX_INLINE_SIZE: u64 = 4096;
 
 #[inline]
 pub fn inode_write_lock_scope(fits_inline: bool, is_striped: bool) -> InodeWriteLockScope {
@@ -1381,9 +1383,36 @@ impl SqueezefsFilesystem {
         self.flush_active_blocks_with_retry(ino, fencing_token)
             .await?;
         let file_path = crate::keys::inode_path(ino);
-        self.router
-            .persist_dirty_layout_if_needed(&file_path, fencing_token)
-            .await?;
+        let file_id_opt = self
+            .router
+            .metadata_cache
+            .get(&file_path)
+            .and_then(|m| m.file_id.clone());
+
+        let sync_data_fut = async {
+            if let Some(file_id) = file_id_opt {
+                let key_bytes = bytes::Bytes::copy_from_slice(file_id.as_bytes());
+                self.router
+                    .cache
+                    .nvme
+                    .staging_nvme_cache
+                    .sync_key(&key_bytes)
+                    .await?;
+            }
+            Ok::<(), SqueezefsError>(())
+        };
+
+        let sync_meta_fut = async {
+            self.router
+                .persist_dirty_layout_if_needed(&file_path, fencing_token)
+                .await?;
+            if let Some(backend) = self.meta_backend.as_ref() {
+                backend.sync_device_for_ino(ino).await?;
+            }
+            Ok::<(), SqueezefsError>(())
+        };
+
+        tokio::try_join!(sync_data_fut, sync_meta_fut)?;
         Ok(())
     }
 
@@ -1736,6 +1765,13 @@ impl Filesystem for SqueezefsFilesystem {
                     let _ = self.inodes_limit.set(config.inodes);
                 }
             }
+
+            // Register this client as an active mount
+            let client_id_str = self.client_id.lock().unwrap().clone();
+            if !client_id_str.is_empty() {
+                let attr_name = format!("client:{}", client_id_str);
+                let _ = backend.setxattr(1, &attr_name, b"mounted").await;
+            }
         }
 
         // Start background active writes flusher task
@@ -1821,6 +1857,15 @@ impl Filesystem for SqueezefsFilesystem {
             );
         } else {
             info!("FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.");
+        }
+
+        // Unregister this client on dismount
+        let client_id_str = self.client_id.lock().unwrap().clone();
+        if !client_id_str.is_empty() {
+            if let Some(ref backend) = self.meta_backend {
+                let attr_name = format!("client:{}", client_id_str);
+                let _ = backend.removexattr(1, &attr_name).await;
+            }
         }
     }
 
@@ -3794,9 +3839,7 @@ impl Filesystem for SqueezefsFilesystem {
         if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
             let fs = self.clone();
             crate::bg_admit::spawn_bg(async move {
-                let _ = fs
-                    .flush_memory_buffers_for_inode(ino, fencing_token)
-                    .await;
+                let _ = fs.flush_memory_buffers_for_inode(ino, fencing_token).await;
                 let _ = fs.flush_active_blocks_with_retry(ino, fencing_token).await;
                 let file_path = crate::keys::inode_path(ino);
                 let _ = fs

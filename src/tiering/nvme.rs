@@ -37,16 +37,33 @@ impl NvmeShardInner {
         evicted: &mut Vec<(Bytes, Bytes)>,
     ) {
         while let Some(front_key) = self.active_keys.front() {
-            let meta = self.map.get(front_key).unwrap();
+            let meta = match self.map.get(front_key) {
+                Some(m) => *m,
+                None => {
+                    self.active_keys.pop_front();
+                    continue;
+                }
+            };
             let b_start = meta.offset;
             let b_end = meta.offset + meta.len;
 
             if Self::overlaps(w_start, w_end, b_start, b_end) {
-                // Read the evicted key and value from mmap before removing
+                let val_len = self.get_val_len_at(b_start);
                 let k_start = b_start + HEADER_SIZE;
-                let k_end = k_start + (meta.len - HEADER_SIZE - self.get_val_len_at(b_start));
-                let key_bytes = Bytes::copy_from_slice(&self.mmap[k_start..k_end]);
+                if meta.len < HEADER_SIZE + val_len {
+                    self.map.remove(front_key);
+                    self.active_keys.pop_front();
+                    continue;
+                }
+                let k_end = k_start + (meta.len - HEADER_SIZE - val_len);
 
+                if k_end > self.mmap.len() || b_start + meta.len > self.mmap.len() {
+                    self.map.remove(front_key);
+                    self.active_keys.pop_front();
+                    continue;
+                }
+
+                let key_bytes = front_key.clone();
                 let v_start = k_end;
                 let v_end = b_start + meta.len;
                 let val_bytes = Bytes::copy_from_slice(&self.mmap[v_start..v_end]);
@@ -257,14 +274,14 @@ impl NvmeShard {
                 libc::msync(
                     mmap_ptr.add(old.offset) as *mut libc::c_void,
                     4,
-                    libc::MS_SYNC,
+                    libc::MS_ASYNC,
                 );
             }
 
             libc::msync(
                 mmap_ptr.add(target_offset) as *mut libc::c_void,
                 block_size,
-                libc::MS_SYNC,
+                libc::MS_ASYNC,
             );
         }
 
@@ -392,14 +409,14 @@ impl NvmeShard {
                 libc::msync(
                     mmap_ptr.add(old.offset) as *mut libc::c_void,
                     4,
-                    libc::MS_SYNC,
+                    libc::MS_ASYNC,
                 );
             }
 
             libc::msync(
                 mmap_ptr.add(target_offset) as *mut libc::c_void,
                 block_size,
-                libc::MS_SYNC,
+                libc::MS_ASYNC,
             );
         }
 
@@ -517,9 +534,14 @@ impl NvmeShard {
             if let Some(meta) = inner.map.get(last_key) {
                 inner.write_offset = meta.offset + meta.len;
             }
-        } else {
-            inner.write_offset = 0;
         }
+    }
+
+    pub fn sync_all(&self) -> std::io::Result<()> {
+        if let Some(ref file) = self._file {
+            file.sync_all()?;
+        }
+        Ok(())
     }
 }
 
@@ -854,6 +876,49 @@ impl NvmeCache {
                 shard.recover_index();
             }
         }
+    }
+
+    pub async fn sync_all(&self) -> Result<(), crate::error::SqueezefsError> {
+        let devices = {
+            let guard = self.devices.read();
+            guard.clone()
+        };
+        for dev in devices {
+            if dev.online.load(Ordering::Relaxed) {
+                for shard_idx in 0..dev.shards.len() {
+                    let dev_clone = dev.clone();
+                    tokio::task::spawn_blocking(move || dev_clone.shards[shard_idx].sync_all())
+                        .await
+                        .map_err(|e| {
+                            crate::error::SqueezefsError::Io(std::io::Error::other(e.to_string()))
+                        })??;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn sync_key(&self, key: &Bytes) -> Result<(), crate::error::SqueezefsError> {
+        let devices = {
+            let guard = self.devices.read();
+            guard.clone()
+        };
+        for dev in devices {
+            if dev.online.load(Ordering::Relaxed) {
+                let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
+                let exists = dev.shards[shard_idx].get(key).is_some();
+                if exists {
+                    let dev_clone = dev.clone();
+                    tokio::task::spawn_blocking(move || dev_clone.shards[shard_idx].sync_all())
+                        .await
+                        .map_err(|e| {
+                            crate::error::SqueezefsError::Io(std::io::Error::other(e.to_string()))
+                        })??;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 }
 

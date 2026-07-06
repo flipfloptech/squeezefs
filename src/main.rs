@@ -282,6 +282,12 @@ enum Commands {
         /// Enable direct I/O (O_DIRECT)
         #[arg(long)]
         direct: bool,
+        /// Run only small I/O and metadata workloads
+        #[arg(long)]
+        small_only: bool,
+        /// Run only large I/O workloads
+        #[arg(long)]
+        large_only: bool,
     },
     /// Clone a file metadata-only (instant Copy-on-Write cloning)
     Clone {
@@ -1429,7 +1435,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ip: _,
             port: _,
             subnqn: _,
-            force: _,
+            force,
             full,
             inodes,
             compression,
@@ -1572,7 +1578,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         None
                     };
                     squeezefs::meta_backend::MetaLvBackend::format_with_options(
-                        &storage, quick, pb,
+                        &storage, quick, force, pb,
                     )
                     .await
                     .map_err(|e| format!("Failed to format metadata volume '{}': {}", path, e))?;
@@ -2108,6 +2114,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             only,
             skip,
             direct,
+            small_only,
+            large_only,
         } => {
             let config_path = path.join(".config");
             let stats_path = path.join(".stats");
@@ -2133,7 +2141,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                  Note: FUSE mounts are restricted to the mounting user by default.\n\
                                  Please run the benchmark without 'sudo', or ensure 'allow_other' was set during mount."
                                     .red()
-                                    .bold()
+                                     .bold()
                             );
                             false
                         }
@@ -2191,6 +2199,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     only.as_deref(),
                     skip.as_deref(),
                     direct,
+                    small_only,
+                    large_only,
                 )
                 .await?;
             }
@@ -3463,6 +3473,8 @@ async fn run_benchmark(
     only: Option<&[String]>,
     skip: Option<&[String]>,
     direct: bool,
+    small_only: bool,
+    large_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rand::seq::SliceRandom;
     #[allow(unused_imports)]
@@ -3486,6 +3498,12 @@ async fn run_benchmark(
     }
 
     let is_workload_enabled = |name: &str, group: &str| -> bool {
+        if small_only && group.starts_with("large-") {
+            return false;
+        }
+        if large_only && (group.starts_with("small-") || group == "metadata") {
+            return false;
+        }
         if let Some(only_list) = only {
             if !only_list.iter().any(|s| {
                 let s_trimmed = s.trim();

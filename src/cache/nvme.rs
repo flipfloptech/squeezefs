@@ -30,7 +30,20 @@ pub fn dir_has_segment_data(path: &std::path::Path) -> bool {
     false
 }
 
+static SAFEGUARD_CACHE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static LAST_CHECK_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn check_disk_free_safeguard(path: &std::path::Path) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let last = LAST_CHECK_TIME.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 1 {
+        return SAFEGUARD_CACHE.load(std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -42,11 +55,11 @@ fn check_disk_free_safeguard(path: &std::path::Path) -> bool {
                 if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 && stat.f_blocks > 0 {
                     let free_fraction = stat.f_bavail as f64 / stat.f_blocks as f64;
                     let free_bytes = stat.f_bavail as u64 * stat.f_frsize as u64;
-                    if free_bytes < 100 * 1024 * 1024
-                        || (free_fraction < 0.01 && free_bytes < 1024 * 1024 * 1024)
-                    {
-                        return false;
-                    }
+                    let safe = !(free_bytes < 100 * 1024 * 1024
+                        || (free_fraction < 0.01 && free_bytes < 1024 * 1024 * 1024));
+                    SAFEGUARD_CACHE.store(safe, std::sync::atomic::Ordering::Relaxed);
+                    LAST_CHECK_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                    return safe;
                 }
             }
         }

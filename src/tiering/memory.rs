@@ -150,15 +150,7 @@ impl MemoryCache {
 
     #[inline]
     fn get_shard_idx(&self, key: &[u8]) -> usize {
-        let hash = if key.len() <= 32 {
-            use std::hash::Hasher;
-            let mut h = ahash::AHasher::default();
-            h.write(key);
-            h.finish()
-        } else {
-            xxh3_64(key)
-        };
-        (hash as usize) & self.shard_mask
+        (xxh3_64(key) as usize) & self.shard_mask
     }
 
     /// Retrieves an item from the cache. Clones the `Bytes` pointer (O(1), zero-copy).

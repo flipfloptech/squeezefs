@@ -208,14 +208,31 @@ impl MetaLvBackend {
 
     /// Formats the raw block storage device with a superblock and the root inode
     pub async fn format(storage: &storage::MetaLvStorage) -> Result<()> {
-        Self::format_with_options(storage, true, None).await
+        Self::format_with_options(storage, true, true, None).await
     }
 
     pub async fn format_with_options(
         storage: &storage::MetaLvStorage,
         quick: bool,
+        force: bool,
         pb: Option<indicatif::ProgressBar>,
     ) -> Result<()> {
+        // Prevent format if filesystem is currently mounted by active clients (unless force is true)
+        if !force && storage.read_superblock().await.is_ok() {
+            if let Ok(attrs) = crate::meta_backend::xattr::list_xattrs(storage, 1).await {
+                let active: Vec<String> = attrs
+                    .into_iter()
+                    .filter(|k| k.starts_with("client:"))
+                    .collect();
+                if !active.is_empty() {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                        "Cannot format: metadata volume is actively mounted by clients: {:?}",
+                        active
+                    )));
+                }
+            }
+        }
+
         // Zero-wipe the entire metadata volume first to prevent stale garbage issues
         storage.wipe(quick, pb).await?;
 
@@ -743,9 +760,8 @@ impl RoutedMetaBackend {
         }
         // Health only used for dir placement; a short cache avoids scanning the
         // free-inode bitmap on every mkdir under multi-thread load.
-        static HEALTH_CACHE: once_cell::sync::Lazy<
-            scc::HashMap<usize, (u32, std::time::Instant)>,
-        > = once_cell::sync::Lazy::new(scc::HashMap::new);
+        static HEALTH_CACHE: once_cell::sync::Lazy<scc::HashMap<usize, (u32, std::time::Instant)>> =
+            once_cell::sync::Lazy::new(scc::HashMap::new);
         if let Some(v) = HEALTH_CACHE.read_sync(&idx, |_, v| *v) {
             if v.1.elapsed() < std::time::Duration::from_millis(500) {
                 return v.0;
@@ -936,74 +952,73 @@ impl Metadata for RoutedMetaBackend {
 
             let inode = backend
                 .run_transaction(|| async {
-                if dentry::find_dentry(&backend.storage, local_parent, name)
-                    .await?
-                    .is_some()
-                {
-                    return Err(crate::error::SqueezefsError::InvalidOperation(
-                        "File already exists".to_string(),
-                    ));
-                }
-
-                let parent_inode =
-                    inode::read_inode(&backend.storage, local_parent).await?;
-                let mut final_gid = gid;
-                let mut final_mode = mode;
-                if (parent_inode.mode & libc::S_ISGID) != 0 {
-                    final_gid = parent_inode.gid;
-                    if (mode & libc::S_IFMT) == libc::S_IFDIR {
-                        final_mode |= libc::S_ISGID;
+                    if dentry::find_dentry(&backend.storage, local_parent, name)
+                        .await?
+                        .is_some()
+                    {
+                        return Err(crate::error::SqueezefsError::InvalidOperation(
+                            "File already exists".to_string(),
+                        ));
                     }
-                }
 
-                let new_local_ino;
-                let disk_inode;
-                {
-                    let _guard = backend.storage.inode_lock.lock().await;
-                    new_local_ino = backend.storage.alloc_inode_bit_locked().await?;
-                    let mut di =
-                        inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
-                    di.nlink = 2;
-                    inode::write_inode_raw(&backend.storage, new_local_ino, &di).await?;
-                    disk_inode = di;
-                }
+                    let parent_inode = inode::read_inode(&backend.storage, local_parent).await?;
+                    let mut final_gid = gid;
+                    let mut final_mode = mode;
+                    if (parent_inode.mode & libc::S_ISGID) != 0 {
+                        final_gid = parent_inode.gid;
+                        if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                            final_mode |= libc::S_ISGID;
+                        }
+                    }
 
-                let global_child_ino = self.make_global_ino(new_local_ino, target_v_idx);
+                    let new_local_ino;
+                    let disk_inode;
+                    {
+                        let _guard = backend.storage.inode_lock.lock().await;
+                        new_local_ino = backend.storage.alloc_inode_bit_locked().await?;
+                        let mut di =
+                            inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
+                        di.nlink = 2;
+                        inode::write_inode_raw(&backend.storage, new_local_ino, &di).await?;
+                        disk_inode = di;
+                    }
 
-                dentry::insert_dentry(
-                    &backend.storage,
-                    local_parent,
-                    global_child_ino,
-                    name,
-                    final_mode & libc::S_IFMT,
-                )
-                .await?;
+                    let global_child_ino = self.make_global_ino(new_local_ino, target_v_idx);
 
-                let mut parent_inode =
-                    inode::read_inode(&backend.storage, local_parent).await?;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                parent_inode.mtime = now;
-                parent_inode.ctime = now;
-                parent_inode.nlink += 1;
-                inode::write_inode(&backend.storage, local_parent, &parent_inode).await?;
+                    dentry::insert_dentry(
+                        &backend.storage,
+                        local_parent,
+                        global_child_ino,
+                        name,
+                        final_mode & libc::S_IFMT,
+                    )
+                    .await?;
 
-                Ok(Inode {
-                    ino: global_child_ino,
-                    mode: disk_inode.mode,
-                    uid: disk_inode.uid,
-                    gid: disk_inode.gid,
-                    size: disk_inode.size,
-                    nlink: disk_inode.nlink,
-                    atime: disk_inode.atime,
-                    mtime: disk_inode.mtime,
-                    ctime: disk_inode.ctime,
-                    flags: disk_inode.flags,
+                    let mut parent_inode =
+                        inode::read_inode(&backend.storage, local_parent).await?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    parent_inode.mtime = now;
+                    parent_inode.ctime = now;
+                    parent_inode.nlink += 1;
+                    inode::write_inode(&backend.storage, local_parent, &parent_inode).await?;
+
+                    Ok(Inode {
+                        ino: global_child_ino,
+                        mode: disk_inode.mode,
+                        uid: disk_inode.uid,
+                        gid: disk_inode.gid,
+                        size: disk_inode.size,
+                        nlink: disk_inode.nlink,
+                        atime: disk_inode.atime,
+                        mtime: disk_inode.mtime,
+                        ctime: disk_inode.ctime,
+                        flags: disk_inode.flags,
+                    })
                 })
-            })
-            .await?;
+                .await?;
             Ok(inode)
         } else {
             // Cross-volume create: never mix unjournaled direct sector writes with
@@ -1070,8 +1085,7 @@ impl Metadata for RoutedMetaBackend {
                         parent_inode.mtime = now;
                         parent_inode.ctime = now;
                         parent_inode.nlink += 1;
-                        inode::write_inode(&parent_be.storage, local_parent, &parent_inode)
-                            .await?;
+                        inode::write_inode(&parent_be.storage, local_parent, &parent_inode).await?;
                     }
                     Ok(())
                 })

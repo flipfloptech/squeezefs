@@ -762,8 +762,7 @@ impl NvmeBlockDev {
 
         // Never wait unbounded on the uring worker (wedged device/worker must not
         // freeze the entire FUSE session including virtual .config reads).
-        let res = match tokio::time::timeout(std::time::Duration::from_secs(30), rx_oneshot).await
-        {
+        let res = match tokio::time::timeout(std::time::Duration::from_secs(30), rx_oneshot).await {
             Ok(Ok(r)) => r?,
             Ok(Err(e)) => {
                 return Err(crate::error::SqueezefsError::InvalidOperation(format!(

@@ -297,8 +297,8 @@ async fn test_bench_rmdir_simulation_concurrent() {
 /// race that previously zeroed sibling inode slots in the same 4 KiB sector.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_routed_concurrent_mkdir_no_lost_inodes() {
-    use std::sync::Arc;
     use squeezefs::meta_backend::RoutedMetaBackend;
+    use std::sync::Arc;
 
     let tmp0 = NamedTempFile::new().unwrap();
     let tmp1 = NamedTempFile::new().unwrap();
@@ -340,9 +340,7 @@ async fn test_routed_concurrent_mkdir_no_lost_inodes() {
                 let child = backend
                     .create(parent_ino, &name, libc::S_IFDIR | 0o755, 0, 0)
                     .await
-                    .unwrap_or_else(|e| {
-                        panic!("create {} under {}: {:?}", name, parent_ino, e)
-                    });
+                    .unwrap_or_else(|e| panic!("create {} under {}: {:?}", name, parent_ino, e));
                 let g = backend.getattr(child.ino).await.unwrap_or_else(|e| {
                     panic!(
                         "getattr child {} (ino {}) after create: {:?}",
@@ -370,9 +368,10 @@ async fn test_routed_concurrent_mkdir_no_lost_inodes() {
                     .lookup(parent_ino, &name)
                     .await
                     .unwrap_or_else(|e| panic!("lookup {}: {:?}", name, e));
-                let g = backend.getattr(found.ino).await.unwrap_or_else(|e| {
-                    panic!("getattr after lookup {}: {:?}", name, e)
-                });
+                let g = backend
+                    .getattr(found.ino)
+                    .await
+                    .unwrap_or_else(|e| panic!("getattr after lookup {}: {:?}", name, e));
                 assert_eq!(g.ino, found.ino);
             }
         }));

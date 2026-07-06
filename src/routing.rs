@@ -1,7 +1,7 @@
 use crate::cache::{TieredCache, BUFFER_POOL};
 use crate::dlm::DlmClient;
 
-pub const MAX_INLINE_SIZE: usize = 512;
+pub const MAX_INLINE_SIZE: usize = 4096;
 
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
@@ -727,8 +727,7 @@ impl DataRouter {
         // Keep hot cache coherent without a remove+refetch on the next write.
         let mut cached = m.clone();
         cached.cached_at = std::time::Instant::now();
-        self.metadata_cache
-            .insert(file_path.to_string(), cached);
+        self.metadata_cache.insert(file_path.to_string(), cached);
 
         if let Some(ref old_key) = old_indirect_to_free {
             let _ = self.backend_router.free_block(old_key).await;
@@ -995,8 +994,7 @@ impl DataRouter {
         clean.cached_at = std::time::Instant::now();
         self.save_metadata_to_backend(ino, &clean, fencing_token)
             .await?;
-        self.metadata_cache
-            .insert(file_path.to_string(), clean);
+        self.metadata_cache.insert(file_path.to_string(), clean);
         Ok(())
     }
 
@@ -1239,7 +1237,11 @@ impl DataRouter {
             && meta.size == 0
             && meta.data_key.as_ref().map(|d| d.is_empty()).unwrap_or(true)
             && meta.file_id.is_none()
-            && meta.block_map.as_ref().map(|m| m.is_empty()).unwrap_or(true);
+            && meta
+                .block_map
+                .as_ref()
+                .map(|m| m.is_empty())
+                .unwrap_or(true);
 
         let mut existing_data = if full_overwrite_empty {
             Vec::new()
@@ -1328,7 +1330,7 @@ impl DataRouter {
             return Ok(());
         }
 
-        if new_size < MAX_INLINE_SIZE {
+        if new_size <= MAX_INLINE_SIZE {
             // Layout: inline — RAM only until fsync/release (writeback).
             crate::fuse_client::METRICS
                 .layout_inline_writes
@@ -2285,7 +2287,7 @@ impl DataRouter {
                                 } else {
                                     bytes::Bytes::copy_from_slice(&guard)
                                 };
-                                return Ok((data, Some(std::sync::Arc::new(guard))));
+                                return Ok((data, None));
                             } else {
                                 // Single block cache miss: download directly in-line (zero-copy, no spawn)
                                 let downloaded = if let Some(dest) = dest_addr {

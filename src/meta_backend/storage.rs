@@ -279,7 +279,7 @@ impl MetaLvStorage {
         let size = self.get_size();
         let xattr_start = 1024 * 1024 * 72; // XATTR_BLOCK_START
         if size > xattr_start {
-            ((size - xattr_start) / 4096) as usize
+            ((size - xattr_start) / 32768) as usize
         } else {
             0
         }

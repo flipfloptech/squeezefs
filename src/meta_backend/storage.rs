@@ -7,6 +7,28 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 pub const MAGIC_VALUE: &[u8; 8] = b"METALV01";
 pub const SECTOR_SIZE: usize = 4096;
 
+/// Number of shards in the per-sector lock array. Matches `active_inode_locks` /
+/// `BLOCK_FLUSH_LOCKS` (`fuse_client`). See the transaction_lock-removal design.
+pub const SECTOR_LOCK_SHARDS: usize = 4096;
+
+/// Whether the sector-sharded metadata commit path is enabled
+/// (`SQUEEZEFS_META_SECTOR_LOCKS=1|on|true|yes`). Read once and cached — the flag
+/// is a mount-time choice, not per-op. Default **off** (PR 3 scaffolding; the design
+/// flips the default on when PR 4 lands the sector-locked commit). Wired into the
+/// commit/read paths in PR 4; introduced here so the machinery can reference it.
+pub fn meta_sector_locks_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SQUEEZEFS_META_SECTOR_LOCKS")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "on" || v == "true" || v == "yes"
+            })
+            .unwrap_or(false)
+    })
+}
+
 #[derive(IntoBytes, FromBytes, Immutable, Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Superblock {
@@ -40,6 +62,15 @@ pub struct MetaLvStorage {
     /// mount). Introduced in PR 2 but not yet the live allocator — see
     /// `crate::meta_backend::alloc`.
     pub inode_alloc: Arc<crate::meta_backend::alloc::InodeAllocator>,
+    /// Per-4KiB-sector RwLock array (keyed by sector-aligned byte offset).
+    /// Read guard = consistent non-tx reads; write guard = commit-time RMW+apply.
+    /// Wired into the sector-sharded commit in PR 4; constructed here (PR 3).
+    pub sector_locks:
+        Arc<crate::stripe_locks::StripeLocks<tokio::sync::RwLock<()>, SECTOR_LOCK_SHARDS>>,
+    /// Per-bucket lock protecting the in-RAM dentry chain index (design §3.6).
+    /// Wired in PR 4; constructed here (PR 3).
+    pub dentry_bucket_locks:
+        Arc<crate::stripe_locks::StripeLocks<tokio::sync::Mutex<()>, SECTOR_LOCK_SHARDS>>,
     pub dentry_index: Arc<scc::HashMap<u64, Vec<(u64, crate::meta_backend::dentry::DiskDentry)>>>,
     pub dentry_by_offset: Arc<scc::HashMap<u64, (u64, crate::meta_backend::dentry::DiskDentry)>>,
     pub dentry_occupied_offsets: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
@@ -116,6 +147,8 @@ impl MetaLvStorage {
             transaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             free_ino_hint: Arc::new(std::sync::atomic::AtomicU64::new(2)),
             inode_alloc: Arc::new(crate::meta_backend::alloc::InodeAllocator::new(inode_limit)),
+            sector_locks: Arc::new(crate::stripe_locks::StripeLocks::new()),
+            dentry_bucket_locks: Arc::new(crate::stripe_locks::StripeLocks::new()),
             dentry_index: Arc::new(scc::HashMap::new()),
             dentry_by_offset: Arc::new(scc::HashMap::new()),
             dentry_occupied_offsets: Arc::new(std::sync::Mutex::new(
@@ -266,7 +299,29 @@ impl MetaLvStorage {
         Ok(())
     }
 
-    /// Direct block read at a sector-aligned offset
+    /// Sector-aligned byte offset containing `offset`.
+    #[inline]
+    pub fn sector_of(offset: u64) -> u64 {
+        offset & !(SECTOR_SIZE as u64 - 1)
+    }
+
+    /// The per-sector RwLock for `sector_offset` (a splitmix-striped array).
+    /// Wired into the sector-sharded commit/read paths in PR 4.
+    #[inline]
+    pub fn sector_lock(&self, sector_offset: u64) -> &tokio::sync::RwLock<()> {
+        self.sector_locks.get_inode_lock(sector_offset)
+    }
+
+    /// Block read at a sector-aligned offset, with read-your-own-writes overlay.
+    ///
+    /// Reads the on-disk sector, then overlays **every** staged patch of the
+    /// current transaction that intersects `[offset, offset+buf.len())`, applied
+    /// in stage order (last writer wins per byte). This generalizes the previous
+    /// "match a full-sector image at the exact offset" logic — for today's
+    /// full-sector staging the result is identical, and it is forward-compatible
+    /// with the sub-sector patch staging the sector-sharded commit introduces
+    /// (design §3.4 / review Issue 6). Outside a transaction it is a plain direct
+    /// read.
     pub async fn read_blocks(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         if offset % SECTOR_SIZE as u64 != 0 {
             return Err(SqueezefsError::InvalidOperation(format!(
@@ -275,23 +330,30 @@ impl MetaLvStorage {
             )));
         }
 
-        let mut found_in_tx = false;
+        // Base image from disk (also the whole answer when not inside a tx).
+        self.read_blocks_direct(offset, buf).await?;
+
+        // Overlay this transaction's staged patches (read-your-own-writes).
+        let rlo = offset;
+        let rhi = offset + buf.len() as u64;
         let _ = ACTIVE_TX.try_with(|tx| {
             let guard = tx.lock().unwrap();
-            for (path, off, data) in guard.iter().rev() {
-                if path == &self.path && *off == offset && data.len() == buf.len() {
-                    buf.copy_from_slice(data);
-                    found_in_tx = true;
-                    break;
+            for (path, off, data) in guard.iter() {
+                if path != &self.path {
+                    continue;
+                }
+                let lo = *off;
+                let hi = off + data.len() as u64;
+                if lo < rhi && rlo < hi {
+                    // Intersection [s, e) in absolute byte coordinates.
+                    let s = lo.max(rlo);
+                    let e = hi.min(rhi);
+                    buf[(s - rlo) as usize..(e - rlo) as usize]
+                        .copy_from_slice(&data[(s - lo) as usize..(e - lo) as usize]);
                 }
             }
         });
-
-        if found_in_tx {
-            Ok(())
-        } else {
-            self.read_blocks_direct(offset, buf).await
-        }
+        Ok(())
     }
 
     pub fn get_size(&self) -> u64 {
@@ -398,14 +460,12 @@ impl MetaLvStorage {
     }
 
     /// Direct block write at a sector-aligned offset
+    /// Write `buf` at `offset`. Inside a transaction this **stages a patch**
+    /// `(offset, buf)` (offset need not be sector-aligned — this is what allows
+    /// sub-sector patches such as a 16-byte parent-timestamp update); outside a
+    /// transaction it is a direct, sector-aligned write. The alignment invariant
+    /// therefore lives on the direct path (`write_blocks_direct`), not on staging.
     pub async fn write_blocks(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        if offset % SECTOR_SIZE as u64 != 0 {
-            return Err(SqueezefsError::InvalidOperation(format!(
-                "Write offset {} must be sector-aligned",
-                offset
-            )));
-        }
-
         let mut redirected = false;
         let _ = ACTIVE_TX.try_with(|tx| {
             tx.lock()

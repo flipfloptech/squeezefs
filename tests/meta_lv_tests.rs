@@ -156,6 +156,85 @@ async fn test_reconciliation_does_not_touch_journal() {
     );
 }
 
+/// Read-your-own-writes across two overlapping sub-sector patches in one
+/// transaction: the overlay must merge all intersecting staged patches in stage
+/// order (last writer wins per byte). This is the correctness the sub-sector
+/// staging in the sector-sharded commit (PR 4) depends on (design §3.4 / Issue 6).
+#[tokio::test]
+async fn test_tx_read_your_own_writes_subsector() {
+    use squeezefs::meta_backend::storage::ACTIVE_TX;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    // A sector-aligned, zeroed scratch sector inside the inode-table region.
+    let sec = 8192u64 + 4096 * 40;
+    let tx = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let buf = ACTIVE_TX
+        .scope(tx, async {
+            // Patch A: 8 bytes of 0xAA at sec+16.
+            storage.write_blocks(sec + 16, &[0xAAu8; 8]).await.unwrap();
+            // Patch B: 8 bytes of 0xBB at sec+20 — overlaps A's last 4 bytes.
+            storage.write_blocks(sec + 20, &[0xBBu8; 8]).await.unwrap();
+            let mut buf = [0u8; 4096];
+            storage.read_blocks(sec, &mut buf).await.unwrap();
+            buf
+        })
+        .await;
+
+    assert!(
+        buf[0..16].iter().all(|&b| b == 0),
+        "pre-patch bytes stay zero"
+    );
+    assert!(
+        buf[16..20].iter().all(|&b| b == 0xAA),
+        "A's non-overlapped bytes"
+    );
+    assert!(
+        buf[20..28].iter().all(|&b| b == 0xBB),
+        "B wins the [20,24) overlap and extends to 28 (stage order)"
+    );
+    assert!(
+        buf[28..].iter().all(|&b| b == 0),
+        "post-patch bytes stay zero"
+    );
+}
+
+/// Regression: full-sector staging (today's transaction_lock path) still reads
+/// back correctly through the rewritten overlay.
+#[tokio::test]
+async fn test_tx_full_sector_staging_overlay_unchanged() {
+    use squeezefs::meta_backend::storage::ACTIVE_TX;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    let sec = 8192u64 + 4096 * 41;
+    let tx = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let buf = ACTIVE_TX
+        .scope(tx, async {
+            storage.write_blocks(sec, &[0xCDu8; 4096]).await.unwrap();
+            let mut buf = [0u8; 4096];
+            storage.read_blocks(sec, &mut buf).await.unwrap();
+            buf
+        })
+        .await;
+    assert!(
+        buf.iter().all(|&b| b == 0xCD),
+        "a staged full-sector image must be read back verbatim"
+    );
+}
+
+#[test]
+fn test_meta_sector_locks_flag_defaults_off() {
+    // No env var set -> the sector-sharded path is disabled by default (PR 3).
+    std::env::remove_var("SQUEEZEFS_META_SECTOR_LOCKS");
+    assert!(!squeezefs::meta_backend::storage::meta_sector_locks_enabled());
+}
+
 #[tokio::test]
 async fn test_metalv_crud_operations() {
     let tmp = NamedTempFile::new().unwrap();

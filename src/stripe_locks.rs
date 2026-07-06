@@ -10,14 +10,19 @@
 /// # Lock order (P1-9) — always acquire in this order; never invert.
 ///
 /// 1. `active_inode_locks` (per-inode `RwLock`, striped) — FUSE op serialization
-/// 2. `lease_locks` (per-inode `Mutex`) — only while acquiring/refreshing DLM lease
+/// 2. `lease_locks` (per-inode `Mutex`) — only while acquiring/refreshing a DLM lease
 /// 3. `BLOCK_FLUSH_LOCKS` (per block) — active-block flush mutual exclusion
-/// 4. DLM/Redis — network locks via Garnet (no local lock held across unrelated Redis work)
+/// 4. MetaLV metadata-transaction locks, acquired in this sub-order:
+///    - a. DLM `I{ino}` / `D{parent:name}` (per-object; MetaLV `DlmLockManager`)
+///    - b. dentry bucket lock (`dentry_bucket_locks`) — in-RAM dentry-chain integrity
+///    - c. sector locks (`sector_locks`) — commit-time RMW+apply, acquired in
+///      **ascending sector-offset order** (total order ⇒ deadlock-free) and only
+///      at commit, never taken while holding a DLM lock across the tx closure
 ///
 /// Do not hold (1) write-guard across long backend I/O when a finer lock suffices
 /// (see [`crate::fuse_client::InodeWriteLockScope`] / P1-8). Do not acquire (1)
-/// while holding (3). Prefer dropping Redis connections before nested locks that
-/// may await (see write path connection scoping).
+/// while holding (3). The MetaLV backend is self-contained (no external
+/// Redis/Garnet); never hold a pooled backend handle across durable NVMe/staging I/O.
 pub struct StripeLocks<L, const N: usize> {
     locks: Vec<L>,
 }

@@ -36,6 +36,10 @@ pub struct MetaLvStorage {
     pub transaction_lock: Arc<tokio::sync::Mutex<()>>,
     /// Hint for next free inode bit scan (monotonic; wrap-scan on full).
     pub free_ino_hint: Arc<std::sync::atomic::AtomicU64>,
+    /// Lock-free in-RAM inode allocator (derived from the inode table; seeded on
+    /// mount). Introduced in PR 2 but not yet the live allocator — see
+    /// `crate::meta_backend::alloc`.
+    pub inode_alloc: Arc<crate::meta_backend::alloc::InodeAllocator>,
     pub dentry_index: Arc<scc::HashMap<u64, Vec<(u64, crate::meta_backend::dentry::DiskDentry)>>>,
     pub dentry_by_offset: Arc<scc::HashMap<u64, (u64, crate::meta_backend::dentry::DiskDentry)>>,
     pub dentry_occupied_offsets: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
@@ -45,6 +49,19 @@ pub struct MetaLvStorage {
 tokio::task_local! {
     pub static ACTIVE_TX: std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, u64, Vec<u8>)>>>;
     pub static FORCE_SYNC_TX: bool;
+}
+
+/// Number of inode slots a metadata volume of `size` bytes can hold. The xattr
+/// region begins at 72 MiB and each inode reserves a 32 KiB xattr block, so the
+/// inode count is `(size - 72 MiB) / 32 KiB`. Shared by `max_inodes` and the
+/// inode-allocator sizing in `open` so both agree on the range.
+pub(crate) fn inodes_for_size(size: u64) -> u64 {
+    const XATTR_BLOCK_START: u64 = 1024 * 1024 * 72;
+    if size > XATTR_BLOCK_START {
+        (size - XATTR_BLOCK_START) / 32768
+    } else {
+        0
+    }
 }
 
 impl MetaLvStorage {
@@ -79,6 +96,17 @@ impl MetaLvStorage {
             }
         }
 
+        // Effective device size after any set_len above; used to size the inode
+        // allocator with the SAME limit the legacy `alloc_inode_bit_locked` uses
+        // (min(20000, max_inodes)) so both allocators agree on the range.
+        let effective_size =
+            if !meta.file_type().is_block_device() && dev_size < size_limit && size_limit > 0 {
+                size_limit
+            } else {
+                dev_size
+            };
+        let inode_limit = std::cmp::min(20000, inodes_for_size(effective_size));
+
         let storage = Self {
             path: path_ref.to_path_buf(),
             superblock_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -87,6 +115,7 @@ impl MetaLvStorage {
             xattr_lock: Arc::new(tokio::sync::Mutex::new(())),
             transaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             free_ino_hint: Arc::new(std::sync::atomic::AtomicU64::new(2)),
+            inode_alloc: Arc::new(crate::meta_backend::alloc::InodeAllocator::new(inode_limit)),
             dentry_index: Arc::new(scc::HashMap::new()),
             dentry_by_offset: Arc::new(scc::HashMap::new()),
             dentry_occupied_offsets: Arc::new(std::sync::Mutex::new(
@@ -276,13 +305,48 @@ impl MetaLvStorage {
     }
 
     pub fn max_inodes(&self) -> usize {
-        let size = self.get_size();
-        let xattr_start = 1024 * 1024 * 72; // XATTR_BLOCK_START
-        if size > xattr_start {
-            ((size - xattr_start) / 32768) as usize
-        } else {
-            0
+        inodes_for_size(self.get_size()) as usize
+    }
+
+    /// Rebuild the in-RAM [`crate::meta_backend::alloc::InodeAllocator`] from the
+    /// on-disk inode table (a bit set for every magic-valid slot). Called on
+    /// mount before serving FUSE (design §3.9) so `alloc` never hands out a live
+    /// inode number. Reads raw sectors directly; empty/invalid slots are skipped,
+    /// never errored.
+    pub async fn seed_inode_alloc_from_table(&self) -> Result<()> {
+        use crate::meta_backend::alloc::FIRST_ALLOCATABLE_INO;
+        use crate::meta_backend::inode::{
+            DiskInode, INODES_PER_SECTOR, INODE_SLOT_SIZE, INODE_TABLE_START,
+        };
+        use zerocopy::IntoBytes;
+        const NODE_MAGIC: u32 = 0x4E4F4445;
+
+        let limit = self.inode_alloc.limit();
+        if limit <= FIRST_ALLOCATABLE_INO {
+            return Ok(());
         }
+        let mut sector = [0u8; SECTOR_SIZE];
+        let mut idx: u64 = 0;
+        while idx < limit {
+            let sector_offset =
+                INODE_TABLE_START + (idx / INODES_PER_SECTOR as u64) * SECTOR_SIZE as u64;
+            self.read_blocks_direct(sector_offset, &mut sector).await?;
+            for slot in 0..INODES_PER_SECTOR {
+                let cur = idx + slot as u64;
+                if cur >= limit {
+                    break;
+                }
+                let base = slot * INODE_SLOT_SIZE;
+                let mut di = DiskInode::new_zeroed();
+                di.as_mut_bytes()
+                    .copy_from_slice(&sector[base..base + INODE_SLOT_SIZE]);
+                if di.magic == NODE_MAGIC {
+                    self.inode_alloc.set(cur);
+                }
+            }
+            idx += INODES_PER_SECTOR as u64;
+        }
+        Ok(())
     }
 
     pub async fn read_blocks_direct(&self, offset: u64, buf: &mut [u8]) -> Result<()> {

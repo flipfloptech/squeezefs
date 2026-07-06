@@ -27,6 +27,60 @@ async fn test_metalv_format_and_mount() {
 }
 
 #[tokio::test]
+async fn test_seed_inode_alloc_from_table_reconstructs_bits() {
+    use squeezefs::meta_backend::inode::{write_inode, DiskInode};
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    // Fresh volume: only root (ino 1, skipped) exists — [2, limit) is empty.
+    storage.seed_inode_alloc_from_table().await.unwrap();
+    assert_eq!(
+        storage.inode_alloc.allocated_count(),
+        0,
+        "a freshly-formatted volume has no allocatable inodes in use"
+    );
+
+    // Persist three inodes at spread-out indices (magic set by DiskInode::new).
+    for &ino in &[5u64, 100, 250] {
+        write_inode(
+            &storage,
+            ino,
+            &DiskInode::new(ino, libc::S_IFREG | 0o644, 0, 0),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Simulate a fresh mount: re-open (new empty allocator) and seed from disk.
+    let storage2 = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    storage2.seed_inode_alloc_from_table().await.unwrap();
+
+    assert!(storage2.inode_alloc.is_set(5));
+    assert!(storage2.inode_alloc.is_set(100));
+    assert!(storage2.inode_alloc.is_set(250));
+    assert!(
+        !storage2.inode_alloc.is_set(6),
+        "an unwritten slot must remain free after seeding"
+    );
+    assert_eq!(
+        storage2.inode_alloc.allocated_count(),
+        3,
+        "seed must set exactly the magic-valid slots"
+    );
+
+    // And a subsequent alloc must skip the seeded-in-use numbers.
+    for _ in 0..10 {
+        let ino = storage2.inode_alloc.alloc().unwrap();
+        assert!(
+            ![5u64, 100, 250].contains(&ino),
+            "alloc handed out an already-in-use inode {ino}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_metalv_crud_operations() {
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();

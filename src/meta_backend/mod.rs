@@ -1,3 +1,4 @@
+pub mod alloc;
 pub mod dentry;
 pub mod dlm;
 pub mod inode;

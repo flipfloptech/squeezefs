@@ -211,3 +211,52 @@ async fn test_overwrite_then_read() {
         );
     }
 }
+
+/// Regression for LTP `mmap02` (SIGBUS) / `fchmod` zeroing the size: a
+/// metadata-only `setattr` (chmod/chown/utimes — no `size` in the request) on a
+/// file whose write is still cached (durable inode lags) must NOT reset the
+/// file size. Previously `setattr` read the stale durable inode (size 0) and
+/// overwrote the attr cache with it, truncating just-written data to zero.
+#[tokio::test]
+async fn test_setattr_mode_preserves_size_of_pending_write() {
+    let h = make().await;
+    let ino = create(&h, "chmodme").await;
+    let data = pattern(4096);
+    write_at(&h, ino, 0, &data).await;
+
+    // getattr reflects the write and populates the attr cache.
+    let before = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(
+        before.size, 4096,
+        "size after 4096-byte write should be 4096"
+    );
+
+    // chmod 0444 — the request carries no size, so the size must be preserved.
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            mode: Some(0o444),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let after = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(
+        after.size, 4096,
+        "chmod must not change file size (was reset to {})",
+        after.size
+    );
+    assert_eq!(
+        after.perm & 0o777,
+        0o444,
+        "chmod should have applied the mode"
+    );
+
+    // Data must still read back intact (mmap02 would SIGBUS on a zero size).
+    let got = read_at(&h, ino, 0, 4096).await;
+    assert_eq!(got, data, "chmod corrupted just-written file data");
+}

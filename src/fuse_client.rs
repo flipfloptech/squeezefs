@@ -2779,7 +2779,22 @@ impl Filesystem for SqueezefsFilesystem {
                 )
                 .await
                 .map_err(map_squeezefs_err)?;
-            let attr = self.inode_to_file_attr(&inode);
+            let mut attr = self.inode_to_file_attr(&inode);
+            // A metadata-only setattr (chmod/chown/utimes — no `size` in the
+            // request) must never change the file size. The durable inode can
+            // lag a deferred (cached-but-not-yet-committed) write, so reconcile
+            // against the freshest cached size and never regress it — otherwise
+            // a chmod right after a write truncates the file to the stale
+            // durable size (0), zeroing reads and causing SIGBUS on mmap
+            // (LTP mmap02).
+            if size_to_set.is_none() {
+                if let Some((cached, _)) = self.attr_cache.get(&ino) {
+                    if cached.size > attr.size {
+                        attr.size = cached.size;
+                        attr.blocks = cached.blocks;
+                    }
+                }
+            }
             self.attr_cache
                 .insert(ino, (attr, std::time::Instant::now()));
             Ok(ReplyAttr {

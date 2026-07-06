@@ -299,20 +299,28 @@ impl MetaLvBackend {
         }
 
         // Group by sector, ascending (BTreeMap) => total lock-acquisition order.
+        // R1: a patch must never write past its sector (the lock it will hold),
+        // so multi-sector patches (e.g. a staged 32 KiB xattr block, PR 6) are
+        // split into per-sector fragments here. All fragments of a patch commit
+        // in this same transaction under *all* their sector locks (guards held
+        // across WAL + apply), so the original patch still applies atomically
+        // with respect to the sector scheme.
         let mut by_sector: BTreeMap<u64, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
         for (off, buf) in meta_patches {
-            let sector = MetaLvStorage::sector_of(off);
-            // R1: a patch must never write past its sector (the lock it will hold).
-            if off + buf.len() as u64 > sector + SECTOR_SIZE as u64 {
-                self.rollback_tx(&state);
-                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                    "staged metadata patch at {} len {} spans past sector {}",
-                    off,
-                    buf.len(),
-                    sector
-                )));
+            let mut off = off;
+            let mut buf = buf;
+            loop {
+                let sector = MetaLvStorage::sector_of(off);
+                let room = (sector + SECTOR_SIZE as u64 - off) as usize;
+                if buf.len() <= room {
+                    by_sector.entry(sector).or_default().push((off, buf));
+                    break;
+                }
+                let rest = buf.split_off(room);
+                by_sector.entry(sector).or_default().push((off, buf));
+                off += room as u64;
+                buf = rest;
             }
-            by_sector.entry(sector).or_default().push((off, buf));
         }
 
         let sync = FORCE_SYNC_TX.try_with(|v| *v).unwrap_or(false);

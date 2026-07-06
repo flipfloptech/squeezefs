@@ -606,3 +606,251 @@ async fn test_routed_concurrent_mkdir_no_lost_inodes_flag_on() {
         h.await.expect("join task");
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR 6 — xattr + superblock on sector locks (flag-on path).
+//
+// Contract (design PR 6): when the sector-sharded commit is enabled, xattr and
+// superblock access participates in the sector scheme and takes NO global
+// metadata mutex (`xattr_lock` / `superblock_lock` remain only for the flag-off
+// legacy path until PR 8). Encoded here as: the op must complete while the
+// legacy mutex is deliberately held, and concurrent/interleaved access must
+// never tear a 32 KiB xattr block or the superblock sector.
+// ---------------------------------------------------------------------------
+
+/// Flag-on xattr ops must not serialize on the legacy global `xattr_lock`:
+/// they complete (bounded) while the mutex is held. Covers the transactional
+/// backend path (setxattr/removexattr) and the direct storage path (get/list).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_xattr_ops_do_not_take_global_xattr_lock() {
+    use std::time::Duration;
+    enable();
+    let (_t, backend) = open_backend().await;
+    let f = backend
+        .create(1, "xf", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+
+    // Deliberately hold the legacy mutex for the whole test.
+    let _legacy = backend.storage.xattr_lock.lock().await;
+
+    let val = vec![0x5Au8; 512];
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        backend.setxattr(f.ino, "user.k1", &val),
+    )
+    .await
+    .expect("flag-on setxattr must not block on the global xattr_lock")
+    .expect("setxattr");
+
+    let got = tokio::time::timeout(Duration::from_secs(5), backend.getxattr(f.ino, "user.k1"))
+        .await
+        .expect("flag-on getxattr must not block on the global xattr_lock")
+        .expect("getxattr");
+    assert_eq!(got.as_deref(), Some(val.as_slice()));
+
+    let names = tokio::time::timeout(Duration::from_secs(5), backend.listxattr(f.ino))
+        .await
+        .expect("flag-on listxattr must not block on the global xattr_lock")
+        .expect("listxattr");
+    assert!(names.iter().any(|n| n == "user.k1"), "{names:?}");
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        backend.removexattr(f.ino, "user.k1"),
+    )
+    .await
+    .expect("flag-on removexattr must not block on the global xattr_lock")
+    .expect("removexattr");
+    let gone = backend.getxattr(f.ino, "user.k1").await.expect("getxattr2");
+    assert!(gone.is_none());
+}
+
+/// Flag-on superblock read/write must not serialize on the legacy global
+/// `superblock_lock` (they take the sector-0 lock of the sector scheme).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_superblock_ops_do_not_take_global_superblock_lock() {
+    use std::time::Duration;
+    enable();
+    let (_t, backend) = open_backend().await;
+
+    let _legacy = backend.storage.superblock_lock.lock().await;
+
+    let mut sb = tokio::time::timeout(Duration::from_secs(5), backend.storage.read_superblock())
+        .await
+        .expect("flag-on read_superblock must not block on the global superblock_lock")
+        .expect("read_superblock");
+
+    sb.checksum = 0xDEAD_BEEF;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        backend.storage.write_superblock(&sb),
+    )
+    .await
+    .expect("flag-on write_superblock must not block on the global superblock_lock")
+    .expect("write_superblock");
+
+    let back = backend.storage.read_superblock().await.expect("re-read");
+    assert_eq!(back.checksum, 0xDEAD_BEEF);
+}
+
+/// Concurrent xattr writers on DISTINCT inodes (production path: DLM `I{ino}`
+/// held by RoutedMetaBackend) must round-trip every value with no cross-inode
+/// clobber — xattr blocks are per-inode/disjoint in the sector scheme.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_concurrent_xattr_distinct_inodes_roundtrip() {
+    enable();
+    let (_t, backend) = open_routed(1).await;
+
+    let n_tasks = 8usize;
+    let mut inos = Vec::new();
+    for i in 0..n_tasks {
+        let f = backend
+            .create(1, &format!("xr{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        inos.push(f.ino);
+    }
+
+    let mut handles = Vec::new();
+    for (i, &ino) in inos.iter().enumerate() {
+        let b = backend.clone();
+        handles.push(tokio::spawn(async move {
+            for round in 0..20u8 {
+                for k in 0..3u8 {
+                    let val = vec![(i as u8) ^ round ^ k; 1024 + i * 17];
+                    b.setxattr(ino, &format!("user.k{k}"), &val)
+                        .await
+                        .unwrap_or_else(|e| panic!("setxattr ino {ino} k{k}: {e:?}"));
+                    let got = b
+                        .getxattr(ino, &format!("user.k{k}"))
+                        .await
+                        .unwrap_or_else(|e| panic!("getxattr ino {ino} k{k}: {e:?}"))
+                        .unwrap_or_else(|| panic!("xattr ino {ino} k{k} vanished"));
+                    assert_eq!(got, val, "ino {ino} key k{k} round {round}");
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.await.expect("join");
+    }
+
+    // Final cross-check: every inode still holds exactly its own last values.
+    for (i, &ino) in inos.iter().enumerate() {
+        for k in 0..3u8 {
+            let expect = vec![(i as u8) ^ 19 ^ k; 1024 + i * 17];
+            let got = backend.getxattr(ino, &format!("user.k{k}")).await.unwrap();
+            assert_eq!(got.as_deref(), Some(expect.as_slice()), "ino {ino} k{k}");
+        }
+    }
+}
+
+/// Readers must never observe a torn xattr value while a writer alternates two
+/// full-size values on the same inode (whole-block RMW under the sector scheme;
+/// DLM shared/exclusive already excludes same-inode, this pins the whole stack).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_xattr_read_never_torn_under_alternating_writer() {
+    enable();
+    let (_t, backend) = open_routed(1).await;
+    let f = backend
+        .create(1, "torn", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let ino = f.ino;
+
+    let a = vec![0xAAu8; 8192];
+    let b = vec![0xBBu8; 8192];
+    backend.setxattr(ino, "user.t", &a).await.unwrap();
+
+    let writer = {
+        let be = backend.clone();
+        let (a, b) = (a.clone(), b.clone());
+        tokio::spawn(async move {
+            for i in 0..40 {
+                let v = if i % 2 == 0 { &b } else { &a };
+                be.setxattr(ino, "user.t", v).await.expect("setxattr");
+            }
+        })
+    };
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let be = backend.clone();
+        let (a, b) = (a.clone(), b.clone());
+        readers.push(tokio::spawn(async move {
+            for _ in 0..60 {
+                let got = be
+                    .getxattr(ino, "user.t")
+                    .await
+                    .expect("getxattr")
+                    .expect("present");
+                assert!(
+                    got == a || got == b,
+                    "torn xattr read: len {} first {:?} last {:?}",
+                    got.len(),
+                    got.first(),
+                    got.last()
+                );
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+    writer.await.expect("writer");
+    for r in readers {
+        r.await.expect("reader");
+    }
+}
+
+/// Superblock readers must never observe a torn sector while writers alternate
+/// two distinct (magic-valid) superblock images.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_superblock_never_torn_under_concurrent_writers() {
+    enable();
+    let (_t, backend) = open_backend().await;
+    let s = backend.storage.clone();
+
+    let mut sb_a = s.read_superblock().await.expect("read base");
+    sb_a.inode_count = 11_111;
+    sb_a.dentry_root = 0xAAAA_AAAA;
+    sb_a.checksum = 0xA;
+    let mut sb_b = s.read_superblock().await.expect("read base");
+    sb_b.inode_count = 22_222;
+    sb_b.dentry_root = 0xBBBB_BBBB;
+    sb_b.checksum = 0xB;
+    s.write_superblock(&sb_a).await.expect("seed");
+
+    let fields = |sb: &squeezefs::meta_backend::storage::Superblock| {
+        (sb.inode_count, sb.dentry_root, sb.checksum)
+    };
+    let (fa, fb) = (fields(&sb_a), fields(&sb_b));
+
+    let mut writers = Vec::new();
+    for w in 0..2 {
+        let s = s.clone();
+        let (sa, sb) = (sb_a, sb_b); // Superblock is Copy
+        writers.push(tokio::spawn(async move {
+            for i in 0..30 {
+                let img = if (i + w) % 2 == 0 { &sa } else { &sb };
+                s.write_superblock(img).await.expect("write sb");
+            }
+        }));
+    }
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let s = s.clone();
+        readers.push(tokio::spawn(async move {
+            for _ in 0..60 {
+                let got = s.read_superblock().await.expect("read sb (magic intact)");
+                let f = (got.inode_count, got.dentry_root, got.checksum);
+                assert!(f == fa || f == fb, "torn superblock: {f:?}");
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+    for h in writers {
+        h.await.expect("writer");
+    }
+    for h in readers {
+        h.await.expect("reader");
+    }
+}

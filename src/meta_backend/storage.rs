@@ -301,9 +301,67 @@ impl MetaLvStorage {
         Ok(())
     }
 
+    /// Ascending-deduped sector-lock shard indices covering
+    /// `[offset, offset + len)` — the commit protocol's acquisition order
+    /// (design §3.3, [`crate::stripe_locks::StripeLocks::shard_index`]): the
+    /// fixed stripe array means distinct sectors can share a shard, so the only
+    /// valid total order is ascending shard index over deduped instances.
+    pub fn sector_shard_indices(&self, offset: u64, len: usize) -> Vec<usize> {
+        let end = offset + len as u64;
+        let mut sector = Self::sector_of(offset);
+        let mut indices = Vec::new();
+        while sector < end {
+            indices.push(self.sector_locks.shard_index(sector));
+            sector += SECTOR_SIZE as u64;
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
+    /// Write guards over every sector shard intersecting `[offset, offset+len)`,
+    /// acquired in ascending shard-index order (mutually exclusive with the
+    /// sector-sharded commit and with same-range readers/writers). Flag-on
+    /// multi-sector direct RMWs (xattr blocks, superblock) hold these across
+    /// their read→modify→write.
+    pub async fn lock_sectors_write(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Vec<tokio::sync::RwLockWriteGuard<'_, ()>> {
+        let mut guards = Vec::new();
+        for idx in self.sector_shard_indices(offset, len) {
+            guards.push(self.sector_locks.get_by_index(idx).write().await);
+        }
+        guards
+    }
+
+    /// Read guards over every sector shard intersecting `[offset, offset+len)`
+    /// (same order as [`Self::lock_sectors_write`]) — a consistent, untorn view
+    /// of a multi-sector region against concurrent commits/direct writers.
+    pub async fn lock_sectors_read(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Vec<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let mut guards = Vec::new();
+        for idx in self.sector_shard_indices(offset, len) {
+            guards.push(self.sector_locks.get_by_index(idx).read().await);
+        }
+        guards
+    }
+
     /// Read the Superblock at offset 0
+    ///
+    /// Flag-on: sector-0 **read** lock (the superblock is one sector in the
+    /// sector scheme; commits that stage superblock patches lock the same
+    /// shard). Flag-off: legacy global `superblock_lock` (until PR 8).
     pub async fn read_superblock(&self) -> Result<Superblock> {
-        let _guard = self.superblock_lock.lock().await;
+        let (_legacy, _sector) = if meta_sector_locks_enabled() {
+            (None, Some(self.sector_lock(0).read().await))
+        } else {
+            (Some(self.superblock_lock.lock().await), None)
+        };
         let bytes = crate::uring_fs::read_at(&self.path, 0, SECTOR_SIZE).await?;
         let mut sb = Superblock::new_zeroed();
         let sb_len = sb.as_bytes().len();
@@ -322,8 +380,17 @@ impl MetaLvStorage {
     }
 
     /// Write the Superblock at offset 0
+    ///
+    /// Flag-on: sector-0 **write** lock — mutually exclusive with readers and
+    /// with commits applying staged superblock patches (invariant R1: no
+    /// mutator writes a sector outside its sector lock). Flag-off: legacy
+    /// global `superblock_lock` (until PR 8).
     pub async fn write_superblock(&self, sb: &Superblock) -> Result<()> {
-        let _guard = self.superblock_lock.lock().await;
+        let (_legacy, _sector) = if meta_sector_locks_enabled() {
+            (None, Some(self.sector_lock(0).write().await))
+        } else {
+            (Some(self.superblock_lock.lock().await), None)
+        };
         let mut buf = [0u8; SECTOR_SIZE];
         let sb_bytes = sb.as_bytes();
         buf[..sb_bytes.len()].copy_from_slice(sb_bytes);

@@ -266,6 +266,68 @@ async fn test_concurrent_regular_create_same_parent() {
     assert_eq!(list.len(), n * m, "some dentry lost/duplicated");
 }
 
+/// PR 5: concurrent same-parent regular creates hold only a SHARED parent lock
+/// and update the parent via a 16-byte mtime/ctime field patch. Assert the patch
+/// took effect (parent mtime advanced) while every value field the patch must NOT
+/// touch (nlink/mode/uid/gid) is preserved — i.e. concurrent field patches under
+/// the parent sector lock never clobber the parent's value fields (design §3.8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_concurrent_regular_create_advances_parent_mtime_preserves_fields() {
+    enable();
+    let (_t, backend) = open_routed(1).await;
+
+    let parent = backend
+        .create(1, "pd", libc::S_IFDIR | 0o750, 4321, 8765)
+        .await
+        .unwrap();
+    let pino = parent.ino;
+    let before = backend.getattr(pino).await.unwrap();
+
+    let n = 8usize;
+    let m = 30usize;
+    let mut handles = Vec::new();
+    for t in 0..n {
+        let b = backend.clone();
+        handles.push(tokio::spawn(async move {
+            for j in 0..m {
+                b.create(pino, &format!("g_{t}_{j}"), libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let after = backend.getattr(pino).await.unwrap();
+    assert!(
+        after.mtime > before.mtime,
+        "parent mtime must advance via the field patch ({} !> {})",
+        after.mtime,
+        before.mtime
+    );
+    assert_eq!(
+        after.nlink, before.nlink,
+        "field patch must not touch parent nlink"
+    );
+    assert_eq!(
+        after.mode, before.mode,
+        "field patch must not touch parent mode"
+    );
+    assert_eq!(
+        after.uid, before.uid,
+        "field patch must not touch parent uid"
+    );
+    assert_eq!(
+        after.gid, before.gid,
+        "field patch must not touch parent gid"
+    );
+    // All children present and correct.
+    let list = backend.readdir(pino, 0, 1_000_000).await.unwrap();
+    assert_eq!(list.len(), n * m, "some dentry lost/duplicated");
+}
+
 /// Many inserts/removes colliding on ONE dentry bucket (force overflow-chain
 /// growth). After the churn every live name is found exactly once, no name is
 /// duplicated, and no overflow slot is leaked (the occupied set returns to

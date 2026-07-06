@@ -1148,11 +1148,26 @@ impl Metadata for RoutedMetaBackend {
         // unified sector-locked path re-establishes parent-slot safety while it
         // does a full-slot parent write; PR 5 refines this to a shared lock + a
         // 16-byte field patch (design §3.8 sequencing).
-        let _parent_guard = if is_dir || crate::meta_backend::storage::meta_sector_locks_enabled() {
+        let _parent_guard = if is_dir {
+            // Directories: exclusive parent lock (parent nlink RMW).
             Some(
                 self.volumes[parent_v_idx]
                     .dlm
                     .lock_exclusive(&format!("I{}", local_parent))
+                    .await,
+            )
+        } else if crate::meta_backend::storage::meta_sector_locks_enabled() {
+            // Flag-on regular create (PR 5): SHARED parent lock. The create only
+            // stages a 16-byte parent mtime/ctime field patch (never nlink/mode),
+            // merged at commit under the parent sector lock — so same-dir regular
+            // creates run concurrently, while the shared lock still serializes
+            // against any exclusive parent mutator (mkdir/setattr/unlink/rename),
+            // preventing a field patch from racing a full-slot parent write
+            // (design §3.8).
+            Some(
+                self.volumes[parent_v_idx]
+                    .dlm
+                    .lock_shared(&format!("I{}", local_parent))
                     .await,
             )
         } else {
@@ -1280,20 +1295,27 @@ impl Metadata for RoutedMetaBackend {
                     )
                     .await?;
 
-                    let mut parent_inode =
-                        inode::read_inode(&backend.storage, local_parent).await?;
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_nanos() as u64;
-                    parent_inode.mtime = now;
-                    parent_inode.ctime = now;
-                    // Only directories bump the parent's link count; regular-file
-                    // creates must not (design §3.8 nlink gating / review Issue 1).
                     if is_dir_flag {
+                        // Directory (exclusive I{parent}): full-slot RMW to bump
+                        // nlink + update times (design §3.8 / Issue 1).
+                        let mut parent_inode =
+                            inode::read_inode(&backend.storage, local_parent).await?;
+                        parent_inode.mtime = now;
+                        parent_inode.ctime = now;
                         parent_inode.nlink += 1;
+                        inode::write_inode(&backend.storage, local_parent, &parent_inode).await?;
+                    } else {
+                        // Regular file, flag-on (shared I{parent}): stage only a
+                        // 16-byte mtime/ctime field patch — preserves parent
+                        // nlink/mode/size, so concurrent same-dir creates commit
+                        // without clobbering each other (design §3.8, PR 5).
+                        // (Flag-off regular never reaches here — it uses the fast path.)
+                        inode::stage_parent_time_patch(&backend.storage, local_parent, now).await?;
                     }
-                    inode::write_inode(&backend.storage, local_parent, &parent_inode).await?;
 
                     Ok(Inode {
                         ino: global_child_ino,
@@ -1372,17 +1394,24 @@ impl Metadata for RoutedMetaBackend {
                     )
                     .await?;
 
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
                     if is_dir_flag {
+                        // Directory (exclusive I{parent}): full-slot RMW (nlink + times).
                         let mut parent_inode =
                             inode::read_inode(&parent_be.storage, local_parent).await?;
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos() as u64;
                         parent_inode.mtime = now;
                         parent_inode.ctime = now;
                         parent_inode.nlink += 1;
                         inode::write_inode(&parent_be.storage, local_parent, &parent_inode).await?;
+                    } else if crate::meta_backend::storage::meta_sector_locks_enabled() {
+                        // Regular file, flag-on (shared I{parent}): 16-byte
+                        // mtime/ctime field patch, consistent with the same-volume
+                        // path (design §3.8, PR 5).
+                        inode::stage_parent_time_patch(&parent_be.storage, local_parent, now)
+                            .await?;
                     }
                     Ok(())
                 })

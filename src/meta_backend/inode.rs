@@ -60,6 +60,30 @@ fn slot_offset(index: u64) -> u64 {
     INODE_TABLE_START + index * INODE_SLOT_SIZE as u64
 }
 
+/// Byte offset of `mtime` within a `DiskInode` slot. `mtime` (@24) and `ctime`
+/// (@32) are adjacent `u64`s, so a 16-byte patch at this offset covers both.
+const TIME_FIELDS_OFFSET_IN_SLOT: u64 = 24;
+
+/// Stage a 16-byte `mtime`+`ctime` field patch for inode `index` (flag-on, inside
+/// a transaction). At commit the whole-sector RMW overlays only these 16 bytes,
+/// so the inode's `nlink`/`mode`/`size` (read fresh under the sector write lock)
+/// are preserved. This is what lets a same-directory regular-file `create` hold
+/// only a SHARED parent lock: concurrent creates' timestamp patches are
+/// last-writer-wins (benign) and never clobber the parent's value fields
+/// (design §3.8, PR 5). Must be called inside a `run_transaction` closure.
+pub async fn stage_parent_time_patch(
+    storage: &MetaLvStorage,
+    index: u64,
+    now_nanos: u64,
+) -> Result<()> {
+    let mut patch = [0u8; 16];
+    patch[0..8].copy_from_slice(&now_nanos.to_le_bytes()); // mtime
+    patch[8..16].copy_from_slice(&now_nanos.to_le_bytes()); // ctime
+    storage
+        .write_blocks(slot_offset(index) + TIME_FIELDS_OFFSET_IN_SLOT, &patch)
+        .await
+}
+
 /// Extract inode `index` from a full 4 KiB sector image, validating magic.
 fn extract_inode(sector_buf: &[u8], index: u64) -> Result<DiskInode> {
     let offset = slot_offset(index);

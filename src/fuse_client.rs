@@ -5109,6 +5109,7 @@ async fn upload_single_active_block_data(
         let _ = block_allocator.free_block(offset).await;
         return Err(e);
     }
+    block_allocator.publish_block(offset);
 
     Ok((b, offset, old_block_key, block_bytes))
 }
@@ -5264,6 +5265,7 @@ async fn flush_single_active_block(
         let _ = block_allocator.free_block(offset).await;
         return Err(e);
     }
+    block_allocator.publish_block(offset);
 
     let stored_block_key = offset.to_string();
 

@@ -10,6 +10,21 @@ pub struct BlockAllocator {
     free_blocks: dashmap::DashSet<u64>,
     highest_block: AtomicU64,
     refcounts: scc::HashMap<u64, AtomicU32>,
+    /// Per-offset incarnation seqlock: `gen << 1 | stable`.
+    ///
+    /// Block keys are plain offset strings, so when an offset is freed and
+    /// reallocated the *same key string* names a new incarnation. A reader that
+    /// resolved the key through a slightly stale block map can device-read the
+    /// offset mid-transition and then publish those bytes into the shared block
+    /// caches — poisoning the key for its new owner (the block then reads as
+    /// zeros or another block's data until remount, while durable data is
+    /// correct). The seqlock makes cache fills validated: `allocate_block`
+    /// marks the offset in-flight (gen+1, stable=0), the writer calls
+    /// [`Self::publish_block`] after its device write (stable=1), and
+    /// `free_block` retires it (gen+1, stable=0). A fill may publish into the
+    /// caches only if the word was stable before its device read and unchanged
+    /// after — anything else returns bytes to the caller uncached.
+    incarnations: scc::HashMap<u64, AtomicU64>,
 }
 
 impl BlockAllocator {
@@ -21,7 +36,67 @@ impl BlockAllocator {
             free_blocks: dashmap::DashSet::new(),
             highest_block: AtomicU64::new(0),
             refcounts: scc::HashMap::new(),
+            incarnations: scc::HashMap::new(),
         })
+    }
+
+    /// gen+1, stable=0 — offset owned by a writer whose data is not yet on the
+    /// device (or retired by a free). Cache fills must not publish.
+    fn mark_incarnation_unstable(&self, offset: u64) {
+        match self.incarnations.entry_sync(offset) {
+            scc::hash_map::Entry::Occupied(occ) => {
+                let _ = occ
+                    .get()
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                        Some(((cur >> 1) + 1) << 1)
+                    });
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(AtomicU64::new(1 << 1));
+            }
+        }
+    }
+
+    /// Writer's durable device write for this incarnation completed — cache
+    /// fills that observe an unchanged stable word may publish.
+    pub fn publish_block(&self, offset: u64) {
+        match self.incarnations.entry_sync(offset) {
+            scc::hash_map::Entry::Occupied(occ) => {
+                occ.get().fetch_or(1, Ordering::AcqRel);
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(AtomicU64::new(1));
+            }
+        }
+    }
+
+    /// Snapshot the incarnation word for a fill. `None` while unstable
+    /// (in-flight write or retired/free) — the fill must not publish. Offsets
+    /// with no recorded incarnation (written before this process / by another
+    /// node) are treated as stable.
+    pub fn fill_incarnation(&self, offset: u64) -> Option<u64> {
+        match self
+            .incarnations
+            .read_sync(&offset, |_, v| v.load(Ordering::Acquire))
+        {
+            Some(word) if word & 1 == 1 => Some(word),
+            Some(_) => None,
+            None => Some(u64::MAX), // unknown offset: stable sentinel
+        }
+    }
+
+    /// True if the incarnation word is unchanged since [`Self::fill_incarnation`]
+    /// (no allocate/publish/free transitioned the offset during the fill's
+    /// device read).
+    pub fn fill_incarnation_still(&self, offset: u64, before: u64) -> bool {
+        let now = self
+            .incarnations
+            .read_sync(&offset, |_, v| v.load(Ordering::Acquire));
+        match (before, now) {
+            (u64::MAX, None) => true,
+            (b, Some(n)) => b == n,
+            _ => false,
+        }
     }
 
     pub fn increment_refcount(&self, offset: u64) {
@@ -60,6 +135,9 @@ impl BlockAllocator {
         };
         let offset = block_idx * self.chunk_size;
         let _ = self.refcounts.insert_sync(offset, AtomicU32::new(1));
+        // New incarnation, not yet durable: cache fills must not publish until
+        // the owner calls `publish_block` after its device write.
+        self.mark_incarnation_unstable(offset);
         Ok(offset)
     }
 
@@ -79,6 +157,10 @@ impl BlockAllocator {
         };
 
         if should_free {
+            // Retire this incarnation before the offset becomes reallocatable so
+            // any in-flight cache fill that resolved a stale map to this key
+            // fails its seqlock validation instead of poisoning the next owner.
+            self.mark_incarnation_unstable(offset);
             let block_idx = offset / self.chunk_size;
             self.free_blocks.insert(block_idx);
             crate::fuse_client::METRICS

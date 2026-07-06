@@ -304,3 +304,122 @@ async fn test_read_and_getattr_see_size_of_unflushed_write() {
         );
     }
 }
+
+/// Regression for the striped large-file concurrent read/write coherency race:
+/// under the kernel writeback cache, readahead reads run concurrently with the
+/// still-in-flight write-flushes of a growing (striped) file. A read that
+/// observed a not-yet-written block could poison a cache with zeros that then
+/// shadowed the correct data even after the writes settled (cp of a >4 MiB file
+/// then read-back returned zero blocks; durable data was correct).
+///
+/// Drives the FUSE handlers directly from concurrent tasks (shared, Clone-backed
+/// state) so it reproduces the race without the kernel's flaky timing. Many
+/// trials so a regression is caught with high probability; after the fix it must
+/// be 100% clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_write_read_striped_no_stale_zeros() {
+    let h = make().await;
+    let req = h.req;
+    let block = 65536usize; // == harness block size (striped above this)
+    let size = 2 * 1024 * 1024usize; // 2 MiB => 32 striped blocks
+
+    for trial in 0..40 {
+        let ino = create(&h, &format!("cw{trial}")).await;
+        let data = std::sync::Arc::new(pattern(size));
+
+        // Seed the file as striped up front so the concurrent writes below all
+        // take the striped block path (mirrors the kernel flushing a large file).
+        write_at(&h, ino, 0, &vec![0u8; size]).await;
+
+        // Writers: CONCURRENT block-range writes (mirrors the kernel flushing
+        // dirty pages of a large file in parallel — the trigger for the
+        // non-atomic block_map read-modify-write lost-update race).
+        let nblocks = size / block;
+        let nwriters = 8usize;
+        let mut writers = Vec::new();
+        for w in 0..nwriters {
+            let fs = h.fs.clone();
+            let d = data.clone();
+            writers.push(tokio::spawn(async move {
+                // Interleave blocks across writers so they hit metadata concurrently.
+                let mut b = w;
+                while b < nblocks {
+                    let off = b * block;
+                    let end = std::cmp::min(off + block, size);
+                    fs.write(
+                        req,
+                        ino,
+                        0,
+                        off as u64,
+                        bytes::Bytes::copy_from_slice(&d[off..end]),
+                        0,
+                        0,
+                    )
+                    .await
+                    .expect("write");
+                    b += nwriters;
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        // Concurrent readers hammering the file while it is being written.
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let fs = h.fs.clone();
+            readers.push(tokio::spawn(async move {
+                for _ in 0..30 {
+                    let _ = fs.read(req, ino, 0, 0, size as u32).await;
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for wtask in writers {
+            wtask.await.unwrap();
+        }
+        for r in readers {
+            r.await.unwrap();
+        }
+
+        // After everything settles, the whole file must read back exactly.
+        let got = read_at(&h, ino, 0, size as u32).await;
+        assert_eq!(got.len(), size, "trial {trial}: short final read");
+        if got != *data {
+            // Concise per-block diagnosis instead of dumping 2 MiB.
+            for b in 0..(size / block) {
+                let s = b * block;
+                let e = s + block;
+                if got[s..e] != data[s..e] {
+                    let allzero = got[s..e].iter().all(|&x| x == 0);
+                    let matches_other = (0..(size / block))
+                        .find(|&ob| ob != b && got[s..e] == data[ob * block..ob * block + block]);
+                    // Bisect RAM-shadow vs durable lost-update: dump the cached
+                    // map entry, the durable backend layout entry, and whether a
+                    // whole-file RAM snapshot exists.
+                    let fp = format!("inode_{ino}");
+                    let cached_key = h.fs.router.metadata_cache.get(&fp).and_then(|m| {
+                        m.block_map
+                            .as_ref()
+                            .and_then(|bm| bm.get(&(b as u32)).cloned())
+                    });
+                    // Durable view: drop the cache entry and force a backend refill.
+                    h.fs.router.metadata_cache.invalidate(&fp);
+                    let durable_key = h.fs.router.fetch_metadata(&fp).await.ok().and_then(|m| {
+                        m.block_map
+                            .as_ref()
+                            .and_then(|bm| bm.get(&(b as u32)).cloned())
+                    });
+                    let wf_read = h.fs.router.cache.read_lru.get(&fp).map(|d| d.len());
+                    let wf_write = h.fs.router.cache.write_lru.get(&fp).map(|d| d.len());
+                    panic!(
+                        "trial {trial}: block {b} (off {s}) corrupt: all_zero={allzero} \
+                         matches_other_block={matches_other:?} cached_key={cached_key:?} \
+                         durable_key={durable_key:?} wholefile_read_lru={wf_read:?} \
+                         wholefile_write_lru={wf_write:?}"
+                    );
+                }
+            }
+        }
+    }
+}

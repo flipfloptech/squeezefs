@@ -6,11 +6,31 @@ pub const MAX_INLINE_SIZE: usize = 4096;
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
 use crate::meta_backend::Metadata;
+use crate::stripe_locks::StripeLocks;
 use log::debug;
 use std::sync::atomic::Ordering;
 
 use std::time::Duration;
 use uuid::Uuid;
+
+/// Per-inode serialization for striped layout (`block_map`/size) mutation and
+/// the `fetch_metadata` backend refill.
+///
+/// Concurrent striped writers (the kernel flushes a large file's dirty pages in
+/// parallel) each COW their blocks to fresh keys and must merge them into the
+/// file's block map. Two races corrupt data without this lock:
+///  * **Lost update:** a non-atomic read-merge-save over a stale snapshot drops
+///    the other writers' just-committed entries — a dropped entry reverts to a
+///    freed key whose physical block is then reallocated, so the block reads as
+///    zeros or, worse, as another block's data.
+///  * **Stale refill:** `fetch_metadata`'s TTL refill reads a backend snapshot
+///    and inserts it into `metadata_cache`; interleaved with a writer's commit
+///    it can clobber the fresh entry with the stale map.
+///
+/// Held only for the short read→merge→save; block *data* I/O stays concurrent
+/// (COW) outside the lock.
+static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
+    once_cell::sync::Lazy::new(StripeLocks::new);
 
 pub fn parse_inode_from_path(path: &str) -> u64 {
     if path.starts_with("inode_") {
@@ -330,6 +350,45 @@ impl BackendRouter {
                     );
                 }
             }
+        }
+    }
+
+    /// The allocator that owns a block key's offset (see incarnation seqlock in
+    /// [`crate::block_allocator::BlockAllocator`]).
+    fn allocator_for_key(
+        &self,
+        block_key: &str,
+    ) -> Option<(std::sync::Arc<crate::block_allocator::BlockAllocator>, u64)> {
+        let (be_id, offset) = self.parse_block_key(block_key).ok()?;
+        if be_id == "backend_0" {
+            Some((self.default_allocator.clone(), offset))
+        } else {
+            self.backends
+                .get(&be_id)
+                .map(|be| (be.block_allocator.clone(), offset))
+        }
+    }
+
+    /// Owner's durable device write for this block-key incarnation completed;
+    /// validated cache fills may now publish bytes for it.
+    pub fn publish_block(&self, block_key: &str) {
+        if let Some((alloc, offset)) = self.allocator_for_key(block_key) {
+            alloc.publish_block(offset);
+        }
+    }
+
+    /// Incarnation snapshot for a validated cache fill (None = unstable, do not
+    /// publish what you read).
+    pub fn fill_incarnation(&self, block_key: &str) -> Option<u64> {
+        self.allocator_for_key(block_key)
+            .and_then(|(alloc, offset)| alloc.fill_incarnation(offset))
+    }
+
+    /// True if the incarnation is unchanged since the pre-read snapshot.
+    pub fn fill_incarnation_still(&self, block_key: &str, before: u64) -> bool {
+        match self.allocator_for_key(block_key) {
+            Some((alloc, offset)) => alloc.fill_incarnation_still(offset, before),
+            None => false,
         }
     }
 
@@ -912,6 +971,16 @@ impl DataRouter {
                         tx,
                     };
 
+                    // Validated fill (block-key incarnation seqlock): block keys
+                    // are offset strings, so a freed+reallocated offset reuses
+                    // the SAME key string. A fill that raced an owner's
+                    // COW-write/free can hold pre-write or hole-punched bytes
+                    // (zeros); publishing them poisons the shared caches for the
+                    // key's next owner until remount. Snapshot the incarnation
+                    // before the device read and publish only if it is stable
+                    // and unchanged after — otherwise hand the bytes to the
+                    // caller uncached (transient, never sticky).
+                    let incarnation = self.backend_router.fill_incarnation(block_key);
                     let downloaded = match self.fetch_block_from_remote(block_key).await {
                         Ok(b) => b,
                         Err(e) => {
@@ -920,23 +989,29 @@ impl DataRouter {
                         }
                     };
                     let downloaded_bytes = downloaded;
-                    if downloaded_bytes.len() < 64 * 1024 {
-                        let _ = self
-                            .cache
-                            .nvme
-                            .cache_read_block(block_key, downloaded_bytes.clone());
-                    } else {
-                        let nvme_clone = self.cache.nvme.clone();
-                        let bk_clone = block_key.to_string();
-                        let dl_clone = downloaded_bytes.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
-                        });
-                    }
-                    // Avoid flooding RAM LRU with full 4 MiB blocks under multi-GB
-                    // sequential reads (10×1GiB thrash). Small blocks still cache.
-                    if downloaded_bytes.len() <= 256 * 1024 {
-                        self.cache.read_lru.put(block_key, downloaded_bytes.clone());
+                    let publishable = matches!(
+                        incarnation,
+                        Some(before) if self.backend_router.fill_incarnation_still(block_key, before)
+                    );
+                    if publishable {
+                        if downloaded_bytes.len() < 64 * 1024 {
+                            let _ = self
+                                .cache
+                                .nvme
+                                .cache_read_block(block_key, downloaded_bytes.clone());
+                        } else {
+                            let nvme_clone = self.cache.nvme.clone();
+                            let bk_clone = block_key.to_string();
+                            let dl_clone = downloaded_bytes.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
+                            });
+                        }
+                        // Avoid flooding RAM LRU with full 4 MiB blocks under
+                        // multi-GB sequential reads. Small blocks still cache.
+                        if downloaded_bytes.len() <= 256 * 1024 {
+                            self.cache.read_lru.put(block_key, downloaded_bytes.clone());
+                        }
                     }
                     return Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes));
                 }
@@ -957,6 +1032,17 @@ impl DataRouter {
         }
 
         let ino = parse_inode_from_path(file_path);
+
+        // Refill under the per-inode metadata lock so a stale backend snapshot
+        // can never clobber a concurrent writer's fresh cache entry (see
+        // INODE_META_LOCKS). Double-check after acquiring: a writer or racing
+        // filler may have refreshed the entry while we waited.
+        let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+        if let Some(entry) = self.metadata_cache.get(file_path) {
+            if entry.cached_at.elapsed() < Duration::from_secs(1) {
+                return Ok(entry.clone());
+            }
+        }
         if let Some(m) = self.fetch_metadata_from_backend(ino).await? {
             self.metadata_cache.insert(file_path.to_string(), m.clone());
             return Ok(m);
@@ -1400,6 +1486,7 @@ impl DataRouter {
                     let stored_block_key = be_offset.to_string();
 
                     nvme_writer.write_block(be_offset, processed_data).await?;
+                    block_allocator.publish_block(be_offset);
 
                     let mut block_map = std::collections::HashMap::new();
                     block_map.insert(0, stored_block_key);
@@ -1527,6 +1614,7 @@ impl DataRouter {
 
             // Cache plaintext block for subsequent reads (key = block key, not file path).
             self.cache.read_lru.put(&stored_block_key, chunk);
+            block_allocator.publish_block(offset);
 
             block_mappings.push((block_count.to_string(), stored_block_key.clone()));
             sizes_to_register.push((stored_block_key, chunk_len, processed_len));
@@ -1698,12 +1786,17 @@ impl DataRouter {
 
                 let block_bytes = block_data.into_bytes();
 
-                read_lru.put(&stored_new_block_key, block_bytes.clone());
-
                 let logical_size = block_bytes.len();
-                let processed_block = crypto.process_write_async(block_bytes).await?;
+                let processed_block = crypto.process_write_async(block_bytes.clone()).await?;
                 let physical_size = processed_block.len();
                 nvme_writer.write_block(offset, processed_block).await?;
+
+                // Cache + publish only after the device write: a racing
+                // validated fill for this key must either see the durable bytes
+                // or fail its incarnation check — never observe (and cache) the
+                // pre-write contents of a reused offset.
+                read_lru.put(&stored_new_block_key, block_bytes);
+                block_allocator.publish_block(offset);
 
                 Ok::<_, SqueezefsError>((
                     b,
@@ -1740,50 +1833,64 @@ impl DataRouter {
             return Err(e);
         }
 
-        let mut updated_block_map = block_map;
-        let mut old_keys_to_free = Vec::new();
-        for res in &results {
-            let (b, old_block_key, new_block_key, _, _) =
-                (res.0, res.1.clone(), res.2.clone(), res.3, res.4);
-            updated_block_map.insert(b, new_block_key);
+        // Atomic per-inode layout merge (see INODE_META_LOCKS). The block data
+        // I/O above ran concurrently (COW to fresh keys); only this short
+        // read→merge→save is serialized. Merge into the *current* map read from
+        // the authoritative backend under the lock — never into our
+        // start-of-call snapshot, which drops concurrent writers' entries and
+        // reverts blocks to freed keys (whose physical blocks the allocator
+        // then reuses: the block reads as zeros or as another block's data).
+        // NOTE: never call `fetch_metadata` here — it takes this same lock on
+        // refill and would self-deadlock.
+        let _map_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
 
-            if let Some(bk) = old_block_key {
-                self.cache.read_lru.remove(&bk);
-                old_keys_to_free.push(bk);
+        let current = match self.fetch_metadata_from_backend(ino).await? {
+            Some(m) => m,
+            None => meta.clone(),
+        };
+        let mut updated_block_map = current.block_map.clone().unwrap_or_default();
+        let mut displaced_keys = Vec::new();
+        for res in &results {
+            let (b, _old_snapshot_key, new_block_key) = (res.0, res.1.clone(), res.2.clone());
+            // COW: point block `b` at the freshly written key. Free only the key
+            // this merge actually displaces from the *current* map (never the
+            // possibly-stale snapshot key — freeing that could free a block a
+            // concurrent writer just published).
+            if let Some(prev) = updated_block_map.insert(b, new_block_key.clone()) {
+                if prev != new_block_key {
+                    // Purge every cache tier for the displaced key: its offset
+                    // will be reallocated under the SAME key string, and a stale
+                    // tier hit would serve this dead incarnation's bytes.
+                    self.cache.read_lru.remove(&prev);
+                    self.cache.nvme.remove_cached_read_block(&prev);
+                    displaced_keys.push(prev);
+                }
             }
         }
 
-        let new_size = std::cmp::max(existing_size, end_pos);
-        let mut updated_meta = meta.clone();
+        let new_size = std::cmp::max(current.size, end_pos);
+        let mut updated_meta = current.clone();
+        updated_meta.file_type = "striped".to_string();
+        updated_meta.file_id = None;
+        updated_meta.data_key = None;
         updated_meta.size = new_size;
         updated_meta.block_map = Some(updated_block_map);
         self.save_metadata_to_backend(ino, &updated_meta, _fencing_token)
             .await?;
+        self.metadata_cache
+            .insert(file_path.to_string(), updated_meta);
 
-        for bk in old_keys_to_free {
+        // Free displaced keys only after the new map is published (durable +
+        // cached), so no reader can resolve a block to a key we are freeing.
+        for bk in displaced_keys {
             let _ = self.backend_router.free_block(&bk).await;
         }
 
-        // If file data is fully cached in RAM, update/invalidate
-        let mut found_data = self.cache.write_lru.get(file_path);
-        if found_data.is_none() {
-            found_data = self.cache.read_lru.get(file_path);
-        }
-        if let Some(cached_data) = found_data {
-            let end_offset = end_pos as usize;
-            let mut data_vec = cached_data.to_vec();
-            if data_vec.len() < end_offset {
-                data_vec.resize(end_offset, 0);
-            }
-            data_vec[offset as usize..end_offset].copy_from_slice(&data);
-            self.cache
-                .write_lru
-                .put(file_path, bytes::Bytes::from(data_vec));
-            self.cache.read_lru.remove(file_path);
-        }
-
-        self.metadata_cache
-            .insert(file_path.to_string(), updated_meta);
+        // Drop any whole-file RAM snapshot: patching a shared whole-file buffer
+        // under concurrent writers is itself a lost-update hazard. Reads
+        // re-resolve through the now-consistent block map.
+        self.cache.write_lru.remove(file_path);
+        self.cache.read_lru.remove(file_path);
         Ok(())
     }
 

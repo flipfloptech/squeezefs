@@ -740,6 +740,7 @@ impl NvmeStaging {
             let _ = block_allocator.free_block(offset).await;
             return Err(e);
         }
+        block_allocator.publish_block(offset);
 
         if let Some(backend) = meta_backend.get() {
             let mut mapped_count = 0;
@@ -859,6 +860,15 @@ impl NvmeStaging {
 
     pub fn read_cached_block(&self, block_key: &str) -> Option<Vec<u8>> {
         self.get_cached_read_block(block_key)
+    }
+
+    /// Drop a read-cache entry for a block key. Called when the physical block
+    /// behind the key is freed: block keys are offset strings, so the next
+    /// allocation of that offset reuses the same key string and must never be
+    /// served this incarnation's bytes.
+    pub fn remove_cached_read_block(&self, block_key: &str) {
+        let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
+        let _ = self.read_nvme_cache.remove(&key_bytes);
     }
 
     pub fn get_cached_read_block(&self, block_key: &str) -> Option<Vec<u8>> {

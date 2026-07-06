@@ -848,41 +848,57 @@ impl DataRouter {
         &self,
         block_key: &str,
     ) -> Result<crate::cache::pool::ReadBlockValue> {
-        if let Some(cached_block) = self.cache.read_lru.get(block_key) {
-            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
-        }
+        // Single-flight block fetch. Waiters must not hang if they miss the
+        // completion broadcast (subscribe-after-send race under multi-thread
+        // large sequential reads + prefetch). Always re-check caches and use a
+        // bounded wait so FUSE cannot wedge permanently (also blocks .config).
+        const WAIT_SLICE: Duration = Duration::from_millis(50);
+        const MAX_WAIT: Duration = Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + MAX_WAIT;
 
-        if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
-            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-            let bytes = bytes::Bytes::from(cached_block);
-            self.cache.read_lru.put(block_key, bytes.clone());
-            return Ok(crate::cache::pool::ReadBlockValue::Bytes(bytes));
-        }
-
-        let (tx, _rx) = tokio::sync::broadcast::channel(1);
         loop {
+            if let Some(cached_block) = self.cache.read_lru.get(block_key) {
+                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
+            }
+
+            if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
+                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                let bytes = bytes::Bytes::from(cached_block);
+                self.cache.read_lru.put(block_key, bytes.clone());
+                return Ok(crate::cache::pool::ReadBlockValue::Bytes(bytes));
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Timed out fetching block {}", block_key),
+                )));
+            }
+
             if let Some(entry) = self.inflight_block_reads.get_sync(block_key) {
                 let tx = entry.get().clone();
                 drop(entry);
                 let mut rx = tx.subscribe();
-                let _ = rx.recv().await;
+                // Completion may have raced between get_sync and subscribe — recheck.
                 if let Some(cached_block) = self.cache.read_lru.get(block_key) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
                 }
-                if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
-                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    let bytes = bytes::Bytes::from(cached_block);
-                    self.cache.read_lru.put(block_key, bytes.clone());
-                    return Ok(crate::cache::pool::ReadBlockValue::Bytes(bytes));
+                if self.inflight_block_reads.get_sync(block_key).is_none() {
+                    // Primary finished; loop to re-read caches.
+                    continue;
                 }
-                return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Block fetch failed by the primary fetcher task",
-                )));
+                match tokio::time::timeout(WAIT_SLICE, rx.recv()).await {
+                    Ok(Ok(())) | Ok(Err(_)) | Err(_) => {
+                        // Woken, lagged, closed, or slice timeout — recheck caches.
+                        continue;
+                    }
+                }
             }
 
+            // Try to become the primary fetcher.
+            let (tx, _rx) = tokio::sync::broadcast::channel(64);
             match self
                 .inflight_block_reads
                 .insert_sync(block_key.to_string(), tx.clone())
@@ -895,7 +911,13 @@ impl DataRouter {
                         tx,
                     };
 
-                    let downloaded = self.fetch_block_from_remote(block_key).await?;
+                    let downloaded = match self.fetch_block_from_remote(block_key).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            // Guard drop still notifies waiters so they can retry/fail.
+                            return Err(e);
+                        }
+                    };
                     let downloaded_bytes = downloaded;
                     if downloaded_bytes.len() < 64 * 1024 {
                         let _ = self
@@ -914,6 +936,7 @@ impl DataRouter {
                     return Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes));
                 }
                 Err(_) => {
+                    // Lost the race to insert — loop and wait on the winner.
                     continue;
                 }
             }

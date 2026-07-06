@@ -2110,36 +2110,70 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             direct,
         } => {
             let config_path = path.join(".config");
-            let is_squeeze = if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-                serde_json::from_str::<serde_json::Value>(&config_str).is_ok()
-            } else {
-                if let Err(ref e) = std::fs::metadata(&config_path) {
-                    if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        use colored::Colorize;
-                        println!(
-                            "{}",
-                            "Error: Permission denied accessing FUSE mountpoint configuration.\n\
-                             Note: FUSE mounts are restricted to the mounting user by default.\n\
-                             Please run the benchmark without 'sudo', or ensure 'allow_other' was set during mount."
-                                .red()
+            let stats_path = path.join(".stats");
+            // Prefer a short timeout so a wedged FUSE daemon does not stall bench startup.
+            let is_squeeze = {
+                let cfg_ok = std::fs::metadata(&config_path).is_ok()
+                    && std::fs::metadata(&stats_path).is_ok();
+                if cfg_ok {
+                    // Best-effort JSON parse; existence of both virtual files is enough
+                    // to treat this as a live squeezefs mount for metrics.
+                    match std::fs::read_to_string(&config_path) {
+                        Ok(config_str) => {
+                            // Accept valid JSON, or any readable .config alongside .stats
+                            // (partial/wedged JSON should not force POSIX-only mode).
+                            serde_json::from_str::<serde_json::Value>(&config_str).is_ok()
+                                || !config_str.is_empty()
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            use colored::Colorize;
+                            println!(
+                                "{}",
+                                "Error: Permission denied accessing FUSE mountpoint configuration.\n\
+                                 Note: FUSE mounts are restricted to the mounting user by default.\n\
+                                 Please run the benchmark without 'sudo', or ensure 'allow_other' was set during mount."
+                                    .red()
+                                    .bold()
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            use colored::Colorize;
+                            println!(
+                                "{}",
+                                format!(
+                                    "Warning: could not read {}: {} (mount may be wedged or not SqueezeFS).",
+                                    config_path.display(),
+                                    e
+                                )
+                                .yellow()
                                 .bold()
-                        );
+                            );
+                            // Still allow metrics if .stats is visible.
+                            stats_path.exists()
+                        }
                     }
+                } else {
+                    false
                 }
-                false
             };
 
             if !is_squeeze {
                 use colored::Colorize;
                 println!(
                     "{}",
-                    "Warning: Path does not appear to be a SqueezeFS filesystem (could not read .config)."
-                        .yellow()
-                        .bold()
+                    format!(
+                        "Warning: {} does not look like a live SqueezeFS mount (missing .config/.stats).",
+                        path.display()
+                    )
+                    .yellow()
+                    .bold()
                 );
                 println!(
                     "{}",
-                    "Running POSIX-only benchmark override.".yellow().bold()
+                    "Running POSIX-only benchmark (no daemon metrics). Mount with allow_other and pass the real mountpoint."
+                        .yellow()
+                        .bold()
                 );
             }
 

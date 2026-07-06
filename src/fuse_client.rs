@@ -1712,7 +1712,16 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        info!("FUSE Daemon: Initialized Squeezefs Filesystem mount.");
+        info!(
+            "FUSE Daemon: Initialized Squeezefs Filesystem mount (version {}).",
+            env!("CARGO_PKG_VERSION")
+        );
+        // Also print to stderr so operators can confirm which binary is live
+        // without enabling full logging (PATH often pointed at a stale install).
+        eprintln!(
+            "squeezefs: mount ready (version {}, exe hint: rebuild target/release and reinstall)",
+            env!("CARGO_PKG_VERSION")
+        );
 
         if let Some(ref backend) = self.meta_backend {
             if let Ok(Some(val)) = backend.getxattr(1, "user.squeezefs.format_config").await {

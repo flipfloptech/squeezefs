@@ -760,12 +760,27 @@ impl NvmeBlockDev {
                 ))
             })?;
 
-        let res = rx_oneshot.await.map_err(|e| {
-            crate::error::SqueezefsError::InvalidOperation(format!(
-                "Worker thread closed receiver: {:?}",
-                e
-            ))
-        })??;
+        // Never wait unbounded on the uring worker (wedged device/worker must not
+        // freeze the entire FUSE session including virtual .config reads).
+        let res = match tokio::time::timeout(std::time::Duration::from_secs(30), rx_oneshot).await
+        {
+            Ok(Ok(r)) => r?,
+            Ok(Err(e)) => {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "Worker thread closed receiver: {:?}",
+                    e
+                )));
+            }
+            Err(_) => {
+                return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "NvmeBlockDev read timed out after 30s (offset={}, size={})",
+                        offset, size
+                    ),
+                )));
+            }
+        };
 
         crate::fuse_client::METRICS
             .get_obj

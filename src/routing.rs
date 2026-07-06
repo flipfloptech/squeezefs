@@ -932,7 +932,11 @@ impl DataRouter {
                             let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
                         });
                     }
-                    self.cache.read_lru.put(block_key, downloaded_bytes.clone());
+                    // Avoid flooding RAM LRU with full 4 MiB blocks under multi-GB
+                    // sequential reads (10×1GiB thrash). Small blocks still cache.
+                    if downloaded_bytes.len() <= 256 * 1024 {
+                        self.cache.read_lru.put(block_key, downloaded_bytes.clone());
+                    }
                     return Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes));
                 }
                 Err(_) => {
@@ -1058,6 +1062,13 @@ impl DataRouter {
         start_block: u32,
         end_block: u32,
     ) -> bool {
+        // Prefetch is best-effort only. Under multi-thread large sequential reads
+        // it previously stampeded get_cached_or_fetch_block and could wedge the
+        // daemon; require free admission permits before even scheduling.
+        if crate::bg_admit::BG_TASK_SEM.available_permits() < 4 {
+            return false;
+        }
+
         let now = std::time::Instant::now();
         let mut should_prefetch = end_block > start_block;
 
@@ -2394,7 +2405,10 @@ impl DataRouter {
                     (ptr, Some(final_buf))
                 };
 
-                // Spawn concurrent tasks to download block data in parallel
+                // Spawn concurrent tasks to download block data in parallel.
+                // Acquire the admission permit *inside* each task so the coordinator
+                // never holds N permits while spawning (can deadlock the semaphore
+                // when block_count > permit pool under nested multi-block reads).
                 let mut futures = Vec::new();
                 for (b_idx, b_key_opt) in block_keys {
                     let router = self.clone();
@@ -2407,18 +2421,14 @@ impl DataRouter {
 
                     let rel_start = (slice_start - b_start_offset) as usize;
                     let file_path_clone = file_path.to_string();
+                    let sem = crate::bg_admit::STRIPED_IO_SEM.clone();
 
-                    let permit = crate::bg_admit::STRIPED_IO_SEM
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| {
+                    futures.push(tokio::spawn(async move {
+                        let _permit = sem.acquire_owned().await.map_err(|_| {
                             SqueezefsError::InvalidOperation(
                                 "striped read admission closed".to_string(),
                             )
                         })?;
-                    futures.push(tokio::spawn(async move {
-                        let _permit = permit;
                         let cache_key =
                             crate::keys::active_block_for_path(&file_path_clone, b_idx).to_string();
                         if let Some(active_data) = router.cache.nvme.read_staged(&cache_key) {

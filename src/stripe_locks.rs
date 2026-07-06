@@ -1,0 +1,101 @@
+//! Striped lock array shared across the FUSE and metadata layers.
+//!
+//! `StripeLocks<L, N>` is a fixed array of `N` locks selected by a splitmix64
+//! hash of an inode (and optional sub-key). It is zero-allocation after
+//! construction and lock-free to index, so it backs all of SqueezeFS's
+//! per-inode / per-block / (future) per-sector serialization without a global
+//! mutex or a growing map. Extracted from `fuse_client` so `meta_backend` can
+//! depend on it without a module cycle.
+
+/// # Lock order (P1-9) — always acquire in this order; never invert.
+///
+/// 1. `active_inode_locks` (per-inode `RwLock`, striped) — FUSE op serialization
+/// 2. `lease_locks` (per-inode `Mutex`) — only while acquiring/refreshing DLM lease
+/// 3. `BLOCK_FLUSH_LOCKS` (per block) — active-block flush mutual exclusion
+/// 4. DLM/Redis — network locks via Garnet (no local lock held across unrelated Redis work)
+///
+/// Do not hold (1) write-guard across long backend I/O when a finer lock suffices
+/// (see [`crate::fuse_client::InodeWriteLockScope`] / P1-8). Do not acquire (1)
+/// while holding (3). Prefer dropping Redis connections before nested locks that
+/// may await (see write path connection scoping).
+pub struct StripeLocks<L, const N: usize> {
+    locks: Vec<L>,
+}
+
+impl<L: Default, const N: usize> StripeLocks<L, N> {
+    pub fn new() -> Self {
+        let mut locks = Vec::with_capacity(N);
+        for _ in 0..N {
+            locks.push(L::default());
+        }
+        Self { locks }
+    }
+
+    #[inline]
+    pub fn get_lock(&self, ino: u64, key: u32) -> &L {
+        let mut x = ino ^ ((key as u64) << 32);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d049bb133111eb);
+        x ^= x >> 31;
+        &self.locks[(x as usize) % N]
+    }
+
+    #[inline]
+    pub fn get_inode_lock(&self, ino: u64) -> &L {
+        let mut x = ino;
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d049bb133111eb);
+        x ^= x >> 31;
+        &self.locks[(x as usize) % N]
+    }
+
+    pub fn remove(&self, _ino: &u64) {
+        // No-op for static array locks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same key must always resolve to the same lock instance (a stable
+    /// per-inode critical section is the whole point).
+    #[test]
+    fn test_same_key_maps_to_same_lock() {
+        let locks: StripeLocks<std::sync::Mutex<()>, 256> = StripeLocks::new();
+        assert!(
+            std::ptr::eq(locks.get_inode_lock(12345), locks.get_inode_lock(12345)),
+            "same inode must map to the same stripe"
+        );
+        assert!(
+            std::ptr::eq(locks.get_lock(7, 3), locks.get_lock(7, 3)),
+            "same (ino,key) must map to the same stripe"
+        );
+    }
+
+    /// The splitmix hash must spread inodes across shards (not collapse to one).
+    #[test]
+    fn test_distributes_across_shards() {
+        let locks: StripeLocks<std::sync::Mutex<()>, 256> = StripeLocks::new();
+        let base = locks.get_inode_lock(0) as *const _;
+        let distinct = (1..1000u64)
+            .filter(|&i| locks.get_inode_lock(i) as *const _ != base)
+            .count();
+        assert!(distinct > 0, "hash must spread inodes across shards");
+    }
+
+    /// The sub-key dimension participates in shard selection.
+    #[test]
+    fn test_sub_key_varies_shard() {
+        let locks: StripeLocks<std::sync::Mutex<()>, 4096> = StripeLocks::new();
+        let base = locks.get_lock(42, 0) as *const _;
+        let distinct = (1..500u32)
+            .filter(|&k| locks.get_lock(42, k) as *const _ != base)
+            .count();
+        assert!(distinct > 0, "sub-key must participate in shard selection");
+    }
+}

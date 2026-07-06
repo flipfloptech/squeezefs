@@ -38,56 +38,11 @@ fn get_fuse_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
-/// # Lock order (P1-9) — always acquire in this order; never invert.
-///
-/// 1. `active_inode_locks` (per-inode `RwLock`, striped) — FUSE op serialization
-/// 2. `lease_locks` (per-inode `Mutex`) — only while acquiring/refreshing DLM lease
-/// 3. `BLOCK_FLUSH_LOCKS` (per block) — active-block flush mutual exclusion
-/// 4. DLM/Redis — network locks via Garnet (no local lock held across unrelated Redis work)
-///
-/// Do not hold (1) write-guard across long backend I/O when a finer lock suffices
-/// (see [`InodeWriteLockScope`] / P1-8). Do not acquire (1) while holding (3).
-/// Prefer dropping Redis connections before nested locks that may await
-/// (see write path connection scoping).
-pub struct StripeLocks<L, const N: usize> {
-    locks: Vec<L>,
-}
-
-impl<L: Default, const N: usize> StripeLocks<L, N> {
-    pub fn new() -> Self {
-        let mut locks = Vec::with_capacity(N);
-        for _ in 0..N {
-            locks.push(L::default());
-        }
-        Self { locks }
-    }
-
-    #[inline]
-    pub fn get_lock(&self, ino: u64, key: u32) -> &L {
-        let mut x = ino ^ ((key as u64) << 32);
-        x ^= x >> 30;
-        x = x.wrapping_mul(0xbf58476d1ce4e5b9);
-        x ^= x >> 27;
-        x = x.wrapping_mul(0x94d049bb133111eb);
-        x ^= x >> 31;
-        &self.locks[(x as usize) % N]
-    }
-
-    #[inline]
-    pub fn get_inode_lock(&self, ino: u64) -> &L {
-        let mut x = ino;
-        x ^= x >> 30;
-        x = x.wrapping_mul(0xbf58476d1ce4e5b9);
-        x ^= x >> 27;
-        x = x.wrapping_mul(0x94d049bb133111eb);
-        x ^= x >> 31;
-        &self.locks[(x as usize) % N]
-    }
-
-    pub fn remove(&self, _ino: &u64) {
-        // No-op for static array locks
-    }
-}
+// `StripeLocks` moved to `crate::stripe_locks` so `meta_backend` can use it
+// without a module cycle. Re-exported here for source compatibility (existing
+// `crate::fuse_client::StripeLocks` / `squeezefs::fuse_client::StripeLocks` paths
+// and the lock-order documentation continue to work).
+pub use crate::stripe_locks::StripeLocks;
 
 #[inline]
 fn osstr_to_cow(name: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {

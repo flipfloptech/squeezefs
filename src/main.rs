@@ -2034,8 +2034,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .router
                 .set_meta_backend(routed_meta_backend.clone());
 
-            // Run Block Allocator recovery on mount
+            // Reconcile the inode allocator + on-disk bitmap from the authoritative
+            // inode table before serving FUSE (design §3.9 / PR 2b). Seeds the
+            // in-RAM allocator (for the future sector-locked create path) and
+            // heals any crash-induced bitmap divergence so the legacy allocator
+            // stays correct. Does NOT invoke journal::replay (unsound as the WAL
+            // stands — review Issue 15). Then run block-allocator recovery.
             for meta_be in &routed_meta_backend.volumes {
+                if let Err(e) = meta_be.storage.seed_inode_alloc_from_table().await {
+                    log::warn!("Inode allocator seed failed on mount: {:?}", e);
+                }
+                if let Err(e) = meta_be.storage.refresh_bitmap_from_table().await {
+                    log::warn!("Inode bitmap reconciliation failed on mount: {:?}", e);
+                }
                 for entry in fs_engine.router.backend_router.backends.iter() {
                     let backend = entry.value();
                     log::info!("Running block allocator recovery for data volume...");

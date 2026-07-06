@@ -308,12 +308,12 @@ impl MetaLvStorage {
         inodes_for_size(self.get_size()) as usize
     }
 
-    /// Rebuild the in-RAM [`crate::meta_backend::alloc::InodeAllocator`] from the
-    /// on-disk inode table (a bit set for every magic-valid slot). Called on
-    /// mount before serving FUSE (design §3.9) so `alloc` never hands out a live
-    /// inode number. Reads raw sectors directly; empty/invalid slots are skipped,
-    /// never errored.
-    pub async fn seed_inode_alloc_from_table(&self) -> Result<()> {
+    /// Scan the on-disk inode table and invoke `visit(ino)` for every in-use
+    /// (`magic == NODE`) slot in the allocatable range `[2, limit)`. Reads raw
+    /// sectors directly; empty/invalid slots are skipped, never errored. Shared
+    /// by allocator seeding and bitmap reconciliation so both derive from the
+    /// same authoritative source (the inode table).
+    async fn scan_used_inodes<F: FnMut(u64)>(&self, mut visit: F) -> Result<()> {
         use crate::meta_backend::alloc::FIRST_ALLOCATABLE_INO;
         use crate::meta_backend::inode::{
             DiskInode, INODES_PER_SECTOR, INODE_SLOT_SIZE, INODE_TABLE_START,
@@ -336,17 +336,46 @@ impl MetaLvStorage {
                 if cur >= limit {
                     break;
                 }
+                if cur < FIRST_ALLOCATABLE_INO {
+                    continue;
+                }
                 let base = slot * INODE_SLOT_SIZE;
                 let mut di = DiskInode::new_zeroed();
                 di.as_mut_bytes()
                     .copy_from_slice(&sector[base..base + INODE_SLOT_SIZE]);
                 if di.magic == NODE_MAGIC {
-                    self.inode_alloc.set(cur);
+                    visit(cur);
                 }
             }
             idx += INODES_PER_SECTOR as u64;
         }
         Ok(())
+    }
+
+    /// Rebuild the in-RAM [`crate::meta_backend::alloc::InodeAllocator`] from the
+    /// on-disk inode table (a bit set for every magic-valid slot). Called on
+    /// mount before serving FUSE (design §3.9) so `alloc` never hands out a live
+    /// inode number.
+    pub async fn seed_inode_alloc_from_table(&self) -> Result<()> {
+        self.scan_used_inodes(|ino| self.inode_alloc.set(ino)).await
+    }
+
+    /// Rewrite the on-disk free-inode bitmap sector (offset 4096) directly from
+    /// the authoritative inode table. Run on mount and clean unmount so the
+    /// legacy `alloc_inode_bit_locked` (which reads this bitmap) stays consistent
+    /// and a rollback to the flag-off path is safe (design Key Decision 9 /
+    /// review Issues 5, 18). Mirrors `format`'s convention of marking bits 0
+    /// (reserved) and 1 (root) as allocated. Derives from the table — never from
+    /// the in-RAM allocator — so it is correct regardless of which allocator ran
+    /// during the session.
+    pub async fn refresh_bitmap_from_table(&self) -> Result<()> {
+        let mut bitmap = [0u8; SECTOR_SIZE];
+        bitmap[0] = 0b0000_0011; // reserved index 0 + root (ino 1), matching `format`
+        self.scan_used_inodes(|ino| {
+            bitmap[(ino / 8) as usize] |= 1 << (ino % 8);
+        })
+        .await?;
+        self.write_blocks_direct(4096, &bitmap).await
     }
 
     pub async fn read_blocks_direct(&self, offset: u64, buf: &mut [u8]) -> Result<()> {

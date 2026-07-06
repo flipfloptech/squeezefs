@@ -81,6 +81,82 @@ async fn test_seed_inode_alloc_from_table_reconstructs_bits() {
 }
 
 #[tokio::test]
+async fn test_refresh_bitmap_from_table_round_trip() {
+    use squeezefs::meta_backend::inode::{write_inode, DiskInode};
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    for &ino in &[5u64, 100, 250] {
+        write_inode(
+            &storage,
+            ino,
+            &DiskInode::new(ino, libc::S_IFREG | 0o644, 0, 0),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Reconcile the on-disk bitmap from the (now-populated) inode table.
+    storage.refresh_bitmap_from_table().await.unwrap();
+
+    // Read the raw bitmap sector (offset 4096) and verify it mirrors the table.
+    let mut bm = [0u8; 4096];
+    storage.read_blocks_direct(4096, &mut bm).await.unwrap();
+    let is_set = |i: usize| bm[i / 8] & (1 << (i % 8)) != 0;
+    assert!(
+        is_set(0) && is_set(1),
+        "reserved(0) + root(1) must be marked"
+    );
+    for ino in [5usize, 100, 250] {
+        assert!(is_set(ino), "in-use inode {ino} must be set in the bitmap");
+    }
+    assert!(!is_set(6) && !is_set(7), "unused inodes must be clear");
+
+    // get_allocated_inode_count reads the on-disk bitmap (counts [2, 20000)).
+    let backend = MetaLvBackend::new(storage);
+    assert_eq!(
+        backend.get_allocated_inode_count().await,
+        3,
+        "bitmap-derived count must equal the number of in-use inodes"
+    );
+}
+
+/// Reconciliation must NOT consume/replay the WAL (design Key Decision 10 /
+/// review Issue 15): a marker written into the journal region must survive
+/// seed + bitmap reconciliation untouched.
+#[tokio::test]
+async fn test_reconciliation_does_not_touch_journal() {
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    // Journal starts at 104 MiB (Superblock::journal_start). Stamp a marker.
+    let journal_start: u64 = 1024 * 1024 * 104;
+    let mut marker = [0u8; 4096];
+    marker[..8].copy_from_slice(b"MARKER!!");
+    storage
+        .write_blocks_direct(journal_start, &marker)
+        .await
+        .unwrap();
+
+    storage.seed_inode_alloc_from_table().await.unwrap();
+    storage.refresh_bitmap_from_table().await.unwrap();
+
+    let mut after = [0u8; 4096];
+    storage
+        .read_blocks_direct(journal_start, &mut after)
+        .await
+        .unwrap();
+    assert_eq!(
+        &after[..],
+        &marker[..],
+        "reconciliation must not replay/rewrite the journal"
+    );
+}
+
+#[tokio::test]
 async fn test_metalv_crud_operations() {
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();

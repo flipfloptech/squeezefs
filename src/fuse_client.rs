@@ -1861,6 +1861,17 @@ impl Filesystem for SqueezefsFilesystem {
                 let _ = backend.removexattr(1, &attr_name).await;
             }
         }
+
+        // Reconcile the on-disk inode bitmap from the authoritative inode table on
+        // clean unmount, so a subsequent rollback to the legacy allocator path
+        // reads a correct bitmap (design PR 2b / review Issue 18).
+        if let Some(ref backend) = self.meta_backend {
+            for vol in &backend.volumes {
+                if let Err(e) = vol.storage.refresh_bitmap_from_table().await {
+                    warn!("Inode bitmap reconciliation on unmount failed: {:?}", e);
+                }
+            }
+        }
     }
 
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {

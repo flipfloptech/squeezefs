@@ -3,6 +3,7 @@ pub mod dlm;
 pub mod inode;
 pub mod journal;
 pub mod storage;
+pub mod sync_coalescer;
 pub mod xattr;
 
 use crate::error::Result;
@@ -69,6 +70,8 @@ pub struct MetaLvBackend {
     pub storage: storage::MetaLvStorage,
     pub dlm: dlm::DlmLockManager,
     pub journal: journal::Journal,
+    /// Group-commit `fdatasync` coalescer for this volume's device.
+    pub sync_coalescer: sync_coalescer::SyncCoalescer,
 }
 
 impl MetaLvBackend {
@@ -78,7 +81,25 @@ impl MetaLvBackend {
             storage,
             dlm: dlm::DlmLockManager::new(),
             journal,
+            sync_coalescer: sync_coalescer::SyncCoalescer::new(),
         }
+    }
+
+    /// Durability barrier for this volume's device, coalesced with concurrent
+    /// callers (group commit): N in-flight fsyncs share one `fdatasync`.
+    pub async fn sync_device(&self) -> Result<()> {
+        let path = self.storage.device_path().to_path_buf();
+        self.sync_coalescer
+            .barrier(|| {
+                let path = path.clone();
+                async move {
+                    crate::fuse_client::METRICS
+                        .meta_device_syncs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::uring_fs::fdatasync(path).await
+                }
+            })
+            .await
     }
 
     pub async fn run_transaction<F, Fut, R>(&self, f: F) -> Result<R>
@@ -1959,9 +1980,9 @@ impl RoutedMetaBackend {
         let (v_idx, _) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         crate::fuse_client::METRICS
-            .meta_device_syncs
+            .meta_sync_requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::uring_fs::fdatasync(self.volumes[v_idx].storage.device_path()).await
+        self.volumes[v_idx].sync_device().await
     }
 
     /// Persist layout xattr + size with fine locks (no journal transaction_lock).

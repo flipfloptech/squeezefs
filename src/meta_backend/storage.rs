@@ -32,6 +32,18 @@ impl Superblock {
     pub fn new_zeroed() -> Self {
         unsafe { std::mem::zeroed() }
     }
+
+    /// The superblock's integrity checksum: xxh3_64 over the struct bytes with
+    /// the `checksum` field itself zeroed (the repo's established
+    /// error-detection primitive — WAL trailers, DLM keys). `repr(C)` with
+    /// zerocopy `IntoBytes` guarantees padding-free, deterministic bytes.
+    /// Written by every `write_superblock`; verified iff nonzero at mount
+    /// (design-wal-crash-consistency PR 1, resolved Open Question 4).
+    pub fn compute_checksum(&self) -> u64 {
+        let mut copy = *self;
+        copy.checksum = 0;
+        xxhash_rust::xxh3::xxh3_64(copy.as_bytes())
+    }
 }
 
 #[derive(Clone)]
@@ -297,14 +309,79 @@ impl MetaLvStorage {
     /// Sector-0 **write** lock — mutually exclusive with readers and with
     /// commits applying staged superblock patches (invariant R1: no mutator
     /// writes a sector outside its sector lock).
+    ///
+    /// Single choke point stamping the real `checksum` (xxh3_64 over the
+    /// struct bytes with the field zeroed): every writer — format included —
+    /// persists a verifiable superblock regardless of the caller-supplied
+    /// (possibly stale) checksum value.
     pub async fn write_superblock(&self, sb: &Superblock) -> Result<()> {
+        let mut stamped = *sb;
+        stamped.checksum = stamped.compute_checksum();
+
         let _sector = self.sector_lock(0).write().await;
         let mut buf = [0u8; SECTOR_SIZE];
-        let sb_bytes = sb.as_bytes();
+        let sb_bytes = stamped.as_bytes();
         buf[..sb_bytes.len()].copy_from_slice(sb_bytes);
 
         crate::uring_fs::write_at(&self.path, 0, bytes::Bytes::copy_from_slice(&buf)).await?;
         Ok(())
+    }
+
+    /// Mount-time format validation (design-wal-crash-consistency PR 1, Key
+    /// Decision 7): magic must be `METALV01`, version must be one this binary
+    /// understands (`<= 2`), and a nonzero stored checksum must verify
+    /// (verify-iff-nonzero — legacy volumes wrote 0, which skips the check;
+    /// resolved Open Question 4). Fails loud instead of limping along on a
+    /// blank or foreign volume; the blank (all-zero magic) case is
+    /// distinguished from garbage magic so the operator error — "you forgot
+    /// to run `squeezefs format`" — is actionable.
+    ///
+    /// The version check deliberately precedes checksum verification: a
+    /// future format bump may change checksum semantics, so an unknown
+    /// version must be reported as such, never as a checksum mismatch.
+    pub async fn validate_superblock(&self) -> Result<Superblock> {
+        let _sector = self.sector_lock(0).read().await;
+        let bytes = crate::uring_fs::read_at(&self.path, 0, SECTOR_SIZE).await?;
+        let mut sb = Superblock::new_zeroed();
+        let sb_len = sb.as_bytes().len();
+        if bytes.len() >= sb_len {
+            sb.as_mut_bytes().copy_from_slice(&bytes[..sb_len]);
+        }
+
+        if sb.magic == [0u8; 8] {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "Metadata volume {} is not formatted (zeroed superblock) — run `squeezefs format` first",
+                self.path.display()
+            )));
+        }
+        if &sb.magic != MAGIC_VALUE {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "Invalid superblock magic {:?} on {} (expected {:?}) — corrupted or foreign volume",
+                sb.magic,
+                self.path.display(),
+                MAGIC_VALUE
+            )));
+        }
+        if sb.version > 2 {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "Unsupported metadata format version {} on {} (this binary supports <= 2) — upgrade squeezefs",
+                sb.version,
+                self.path.display()
+            )));
+        }
+        if sb.checksum != 0 {
+            let computed = sb.compute_checksum();
+            if computed != sb.checksum {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "Superblock checksum mismatch on {}: stored {:#018x}, computed {:#018x} — corrupted superblock",
+                    self.path.display(),
+                    sb.checksum,
+                    computed
+                )));
+            }
+        }
+
+        Ok(sb)
     }
 
     /// Sector-aligned byte offset containing `offset`.

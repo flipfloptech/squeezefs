@@ -455,8 +455,11 @@ impl MetaLvBackend {
         // Zero-wipe the entire metadata volume first to prevent stale garbage issues
         storage.wipe(quick, pb).await?;
 
-        // Initialize Superblock
-        let sb = storage::Superblock {
+        // Initialize Superblock. The real checksum (xxh3_64, field zeroed) is
+        // computed here explicitly — and `write_superblock` stamps it as the
+        // choke point anyway — so a freshly formatted volume always carries a
+        // verifiable superblock (PR 1, resolved Open Question 4).
+        let mut sb = storage::Superblock {
             magic: *storage::MAGIC_VALUE,
             version: 2,
             inode_count: 1000000,
@@ -466,6 +469,7 @@ impl MetaLvBackend {
             journal_size: 1024 * 1024 * 4,
             checksum: 0,
         };
+        sb.checksum = sb.compute_checksum();
         storage.write_superblock(&sb).await?;
 
         // Zero-initialize the free-inode bitmap sector (sector 1, starting at 4096)

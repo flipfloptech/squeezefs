@@ -2008,6 +2008,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             for path in &meta_lvs {
                 let storage =
                     squeezefs::meta_backend::storage::MetaLvStorage::open(path, 128 * 1024 * 1024)?;
+                // Mount-time format validation (design-wal-crash-consistency
+                // PR 1): magic + version + checksum-iff-nonzero, hard error
+                // BEFORE any backend/worker is constructed or reconciliation
+                // runs. A blank auto-created path fails loud ("run `squeezefs
+                // format` first") instead of limping along with no root inode.
+                storage.validate_superblock().await?;
                 let be = std::sync::Arc::new(squeezefs::meta_backend::MetaLvBackend::new(storage));
                 meta_backends.push(be);
             }

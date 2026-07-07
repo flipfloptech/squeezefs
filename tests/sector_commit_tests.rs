@@ -651,7 +651,9 @@ async fn test_superblock_ops_complete_bounded_on_sector_scheme() {
         .expect("read_superblock must complete bounded on the sector scheme")
         .expect("read_superblock");
 
-    sb.checksum = 0xDEAD_BEEF;
+    // `checksum` is derived (stamped by write_superblock since PR 1 of the
+    // WAL/crash-consistency design), so round-trip a caller-owned field.
+    sb.inode_count = 0xDEAD_BEEF;
     tokio::time::timeout(
         Duration::from_secs(5),
         backend.storage.write_superblock(&sb),
@@ -661,7 +663,12 @@ async fn test_superblock_ops_complete_bounded_on_sector_scheme() {
     .expect("write_superblock");
 
     let back = backend.storage.read_superblock().await.expect("re-read");
-    assert_eq!(back.checksum, 0xDEAD_BEEF);
+    assert_eq!(back.inode_count, 0xDEAD_BEEF);
+    assert_eq!(
+        back.checksum,
+        back.compute_checksum(),
+        "write_superblock must stamp a self-consistent checksum"
+    );
 }
 
 /// Concurrent xattr writers on DISTINCT inodes (production path: DLM `I{ino}`
@@ -776,19 +783,20 @@ async fn test_superblock_never_torn_under_concurrent_writers() {
     let (_t, backend) = open_backend().await;
     let s = backend.storage.clone();
 
+    // `checksum` is derived (stamped by write_superblock since PR 1 of the
+    // WAL/crash-consistency design), so the variant identity is the two
+    // caller-owned fields; the stamped checksum gives readers an independent
+    // whole-sector tear detector on top.
     let mut sb_a = s.read_superblock().await.expect("read base");
     sb_a.inode_count = 11_111;
     sb_a.dentry_root = 0xAAAA_AAAA;
-    sb_a.checksum = 0xA;
     let mut sb_b = s.read_superblock().await.expect("read base");
     sb_b.inode_count = 22_222;
     sb_b.dentry_root = 0xBBBB_BBBB;
-    sb_b.checksum = 0xB;
     s.write_superblock(&sb_a).await.expect("seed");
 
-    let fields = |sb: &squeezefs::meta_backend::storage::Superblock| {
-        (sb.inode_count, sb.dentry_root, sb.checksum)
-    };
+    let fields =
+        |sb: &squeezefs::meta_backend::storage::Superblock| (sb.inode_count, sb.dentry_root);
     let (fa, fb) = (fields(&sb_a), fields(&sb_b));
 
     let mut writers = Vec::new();
@@ -808,8 +816,13 @@ async fn test_superblock_never_torn_under_concurrent_writers() {
         readers.push(tokio::spawn(async move {
             for _ in 0..60 {
                 let got = s.read_superblock().await.expect("read sb (magic intact)");
-                let f = (got.inode_count, got.dentry_root, got.checksum);
+                let f = (got.inode_count, got.dentry_root);
                 assert!(f == fa || f == fb, "torn superblock: {f:?}");
+                assert_eq!(
+                    got.checksum,
+                    got.compute_checksum(),
+                    "torn superblock: stored checksum does not cover the read image"
+                );
                 tokio::task::yield_now().await;
             }
         }));

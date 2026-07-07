@@ -444,34 +444,49 @@ impl NvmeStaging {
         // a concurrent promotion/unlink of the same id either completes fully
         // before (and sees the old generation) or after (and sees the bumped
         // generation) — it can never remove the ring entry we just wrote.
-        let (evicted, replaced_cost, is_new) = {
+        let (admitted, replaced_cost, is_new) = {
             let mut entry = self
                 .staged_ledger
                 .entry_sync(file_id.to_string())
                 .or_insert((0, 0));
             let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
-            // Memory-mapped copy directly (lock-free, zero disk syscall wait)
-            let evicted = self.staging_nvme_cache.reserve_and_write(
+            // Memory-mapped copy directly (lock-free, zero disk syscall wait).
+            // The segment never destroys live entries: refusal here is loud
+            // backpressure and the caller escalates to a durable spill.
+            let admitted = self.staging_nvme_cache.reserve_and_write(
                 key_bytes.clone(),
                 meta_len,
                 &meta_bytes,
                 data,
                 None,
             );
-            let (cost, gen) = *entry.get();
-            *entry.get_mut() = (padded_size, gen.wrapping_add(1));
-            (evicted, cost, is_new)
+            if admitted {
+                let (cost, gen) = *entry.get();
+                *entry.get_mut() = (padded_size, gen.wrapping_add(1));
+                (true, cost, is_new)
+            } else {
+                // Drop a placeholder created for this refused stage.
+                if entry.get().0 == 0 {
+                    let _ = entry.remove();
+                }
+                (false, 0, false)
+            }
         };
+        if !admitted {
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "Local NVMe staging segment cannot admit {} bytes without destroying live staged entries",
+                    padded_size
+                ),
+            )));
+        }
         self.current_staged_write_bytes
             .fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
         if replaced_cost > 0 {
             Self::sub_saturating(&self.current_staged_write_bytes, replaced_cost);
             self.space_freed_notify.notify_waiters();
         }
-        // Ring wrap-around may have evicted *other* staged entries: return
-        // their budget (their data is gone from the ring). Our own key is
-        // excluded — its replacement was already settled through the ledger.
-        self.credit_evicted_excluding(&evicted, Some(&key_bytes));
 
         if is_new {
             self.staged_writes_in_flight
@@ -513,22 +528,6 @@ impl NvmeStaging {
             ) {
                 Ok(_) => break,
                 Err(actual) => val = actual,
-            }
-        }
-    }
-
-    /// Credit the budget for staged entries the ring evicted on wrap-around,
-    /// skipping `exclude` (a same-key replacement settled via the ledger).
-    fn credit_evicted_excluding(&self, evicted: &[(Bytes, Bytes)], exclude: Option<&Bytes>) {
-        for (key, _) in evicted {
-            if key.starts_with(b"active_block:") || Some(key) == exclude {
-                continue;
-            }
-            if let Ok(file_id) = std::str::from_utf8(key) {
-                if let Some((_, (cost, _))) = self.staged_ledger.remove_sync(file_id) {
-                    Self::sub_saturating(&self.current_staged_write_bytes, cost);
-                    self.space_freed_notify.notify_waiters();
-                }
             }
         }
     }
@@ -631,7 +630,12 @@ impl NvmeStaging {
     }
 
     /// Put a packed active block write to staging_nvme_cache.
-    pub fn put_active_block(&self, key: &str, data: &[u8], fencing_token: u64) {
+    ///
+    /// Returns `false` when the segment cannot admit the block without
+    /// destroying live entries; the caller must keep the data (RAM buffer)
+    /// or upload it durably — never drop it.
+    #[must_use]
+    pub fn put_active_block(&self, key: &str, data: &[u8], fencing_token: u64) -> bool {
         let meta = StagedMetadata {
             fencing_token,
             original_size: data.len() as u64,
@@ -643,20 +647,18 @@ impl NvmeStaging {
         let key_bytes = Bytes::copy_from_slice(key.as_bytes());
 
         let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
-        let evicted = self.staging_nvme_cache.reserve_and_write(
+        let admitted = self.staging_nvme_cache.reserve_and_write(
             key_bytes,
             meta_len,
             &meta_bytes,
             data,
             Some(4096),
         );
-        // Active blocks share the ring with staged files: wrap-around here
-        // can evict staged entries, whose budget must be returned.
-        self.credit_evicted_excluding(&evicted, None);
-        if is_new {
+        if admitted && is_new {
             self.staged_writes_in_flight
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+        admitted
     }
 
     /// Remove a packed active block write from staging_nvme_cache.
@@ -756,6 +758,8 @@ impl NvmeStaging {
 
     fn start_merge_worker(&self, mut write_rx: mpsc::Receiver<PendingStagedWrite>) {
         let data_router = self.data_router.clone();
+        let gauge = self.current_staged_write_bytes.clone();
+        let high_water = self.max_write_bytes - self.max_write_bytes / 4;
 
         tokio::spawn(async move {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
@@ -774,7 +778,12 @@ impl NvmeStaging {
                                 current_bytes += pending.padded_size;
                                 batch.push(pending);
 
-                                if current_bytes >= max_batch_bytes {
+                                // Promote immediately under capacity pressure
+                                // (writers may be gate-blocked on freed space);
+                                // otherwise batch up to amortize.
+                                if current_bytes >= max_batch_bytes
+                                    || gauge.load(std::sync::atomic::Ordering::Relaxed) > high_water
+                                {
                                     Self::promote_batch(&data_router, &mut batch).await;
                                     current_bytes = 0;
                                 }

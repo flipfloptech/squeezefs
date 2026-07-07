@@ -246,11 +246,12 @@ async fn test_staging_full_writes_recover_and_drain() {
         "staged writes past the cap degraded to stall+spill: 50 writes took {wave_elapsed:?}"
     );
 
-    // The pool must not be left pinned near the cap: promotion + exact
-    // accounting drain it.
-    let drained = wait_budget_below(&h, h.max_write_bytes / 2, 30).await;
+    // The pool must not be left pinned at the cap: promotion + exact
+    // accounting keep it below the admission ceiling (resident data below
+    // the high-water mark is the intended fast path, not a leak).
+    let drained = wait_budget_below(&h, h.max_write_bytes, 30).await;
     assert!(
-        drained < h.max_write_bytes / 2,
+        drained < h.max_write_bytes,
         "staging budget pinned after write burst: {} / {} (dead drain)",
         drained,
         h.max_write_bytes
@@ -294,9 +295,9 @@ async fn test_staging_full_writes_recover_and_drain() {
         );
     }
 
-    let end = wait_budget_below(&fsarc, fsarc.max_write_bytes / 2, 30).await;
+    let end = wait_budget_below(&fsarc, fsarc.max_write_bytes, 30).await;
     assert!(
-        end < fsarc.max_write_bytes / 2,
+        end < fsarc.max_write_bytes,
         "staging budget pinned after concurrent wave: {} / {}",
         end,
         fsarc.max_write_bytes
@@ -350,6 +351,90 @@ async fn test_spilled_write_reads_back_new_data_and_returns_budget() {
     assert_eq!(got, vec![0xCCu8; STAGED_LEN], "post-spill rewrite corrupt");
 }
 
+/// Contract 6 (bench EIO): the staging ring must never destroy other live
+/// staged entries to make room — staged data is the sole durable copy until
+/// promotion/spill, so shard exhaustion must surface as `StorageFull`
+/// backpressure (loud), and an entry that cannot fit at all must be an
+/// error, not a silent success-with-drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_stage_write_shard_full_is_loud_never_lossy() {
+    let dlm = DlmClient::new("local").unwrap();
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let nvme_dev = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), "staging_shard_full")
+            .await
+            .unwrap(),
+    );
+    let dir = tempdir().unwrap();
+    // < 10 MiB write cap => exactly one shard of exactly this capacity.
+    let cache = TieredCache::new(
+        vec![dir.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("1MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme_dev.clone(),
+    )
+    .unwrap();
+    let st = cache.nvme.clone();
+
+    let payload = |fill: u8| vec![fill; 300 * 1024];
+    for (id, fill) in [("id-a", 0xA1u8), ("id-b", 0xB2), ("id-c", 0xC3)] {
+        st.stage_write(&format!("/{id}"), id, &payload(fill), 1)
+            .await
+            .unwrap_or_else(|e| panic!("stage {id} failed: {e:?}"));
+    }
+
+    // A fourth 300 KiB entry cannot fit without destroying id-a: it must be
+    // refused loudly (no promotion is wired on this bare cache).
+    let res = st.stage_write("/id-d", "id-d", &payload(0xD4), 1).await;
+    assert!(
+        res.is_err(),
+        "over-capacity stage_write silently destroyed a live staged entry"
+    );
+
+    // An entry larger than the whole pool must be an error, not a silent
+    // success-with-drop.
+    let res = st
+        .stage_write("/id-huge", "id-huge", &vec![0xEE; 2 * 1024 * 1024], 1)
+        .await;
+    assert!(res.is_err(), "oversized stage_write reported success");
+
+    // Every previously staged payload must still be intact.
+    for (id, fill) in [("id-a", 0xA1u8), ("id-b", 0xB2), ("id-c", 0xC3)] {
+        let got = st
+            .read_staged(id)
+            .unwrap_or_else(|| panic!("staged entry {id} destroyed by a neighbor's stage"));
+        assert_eq!(got, payload(fill), "staged entry {id} corrupted");
+    }
+
+    // Re-staging an existing id here must wrap onto its *own* live block —
+    // an in-place overwrite of the sole copy is torn on crash, so it must be
+    // refused loudly too, leaving every entry (including id-a) intact.
+    let res = st
+        .stage_write("/id-a", "id-a", &vec![0x5A; 200 * 1024], 1)
+        .await;
+    assert!(
+        res.is_err(),
+        "self-overlapping re-stage must be refused (crash-torn otherwise)"
+    );
+    for (id, fill) in [("id-a", 0xA1u8), ("id-b", 0xB2), ("id-c", 0xC3)] {
+        assert_eq!(
+            st.read_staged(id)
+                .expect("entry destroyed by refused re-stage"),
+            payload(fill),
+            "staged entry {id} corrupted"
+        );
+    }
+}
+
 /// Contract 5: remount seeds the budget from recovered *staged* entries only;
 /// orphan active blocks must not consume the staged budget, and recovered
 /// staged entries must still be creditable (ledger survives recovery).
@@ -389,8 +474,11 @@ async fn test_remount_budget_counts_staged_entries_only() {
         .stage_write("/f1", "file-id-1", &vec![0x11u8; STAGED_LEN], 7)
         .await
         .expect("stage_write failed");
-    a.nvme
-        .put_active_block("active_block:/big:0", &vec![0x22u8; BLOCK_SIZE as usize], 7);
+    assert!(
+        a.nvme
+            .put_active_block("active_block:/big:0", &vec![0x22u8; BLOCK_SIZE as usize], 7),
+        "active block put refused with an empty pool"
+    );
     drop(a);
 
     // Session B: recovery must seed the budget from the staged entry only.

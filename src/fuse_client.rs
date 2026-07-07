@@ -1095,19 +1095,35 @@ impl SqueezefsFilesystem {
                     if let Ok(b) = parts[1].parse::<u32>() {
                         let nvme_clone = self.router.cache.nvme.clone();
                         let key_clone = key.clone();
-                        tokio::task::spawn_blocking(move || {
-                            nvme_clone.put_active_block(&key_clone, &block_data, fencing_token);
+                        let staging_copy = block_data.clone();
+                        let admitted = tokio::task::spawn_blocking(move || {
+                            nvme_clone.put_active_block(&key_clone, &staging_copy, fencing_token)
                         })
                         .await
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-                        let req = WritebackRequest {
-                            ino,
-                            block_idx: b,
-                            fencing_token,
-                            attempts: 0,
-                        };
-                        self.enqueue_writeback(req).await?;
+                        if admitted {
+                            let req = WritebackRequest {
+                                ino,
+                                block_idx: b,
+                                fencing_token,
+                                attempts: 0,
+                            };
+                            self.enqueue_writeback(req).await?;
+                        } else {
+                            // Staging refused (never-lossy backpressure):
+                            // this is the fsync path, so make the block
+                            // durable right now.
+                            upload_active_block_bytes(
+                                ino,
+                                b,
+                                block_data,
+                                fencing_token,
+                                &self.router,
+                                &self.active_inode_locks,
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
@@ -1320,25 +1336,37 @@ impl SqueezefsFilesystem {
                     let cache_key_clone = cache_key.clone();
                     let fencing_token_val = fencing_token;
                     let block_data_clone = block_data.clone();
-                    tokio::task::spawn_blocking(move || {
+                    let admitted = tokio::task::spawn_blocking(move || {
                         nvme_clone.put_active_block(
                             &cache_key_clone,
                             &block_data_clone,
                             fencing_token_val,
-                        );
+                        )
                     })
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
                     std::mem::drop(block_guard);
 
-                    let req = WritebackRequest {
-                        ino,
-                        block_idx: b as u32,
-                        fencing_token,
-                        attempts: 0,
-                    };
-                    self.enqueue_writeback(req).await?;
+                    if admitted {
+                        let req = WritebackRequest {
+                            ino,
+                            block_idx: b as u32,
+                            fencing_token,
+                            attempts: 0,
+                        };
+                        self.enqueue_writeback(req).await?;
+                    } else {
+                        // Staging refused (never-lossy backpressure): keep
+                        // the block in RAM like a partial block; fsync's
+                        // buffer flush re-attempts staging or uploads it
+                        // durably.
+                        self.insert_active_block_buffer(
+                            cache_key.clone(),
+                            block_data,
+                            fencing_token,
+                        );
+                    }
                 } else {
                     self.insert_active_block_buffer(cache_key.clone(), block_data, fencing_token);
                     std::mem::drop(block_guard);
@@ -1490,10 +1518,18 @@ impl SqueezefsFilesystem {
             let spill_key = entry.key().clone();
             drop(entry);
             if let Some((_, data)) = self.active_block_buffers.remove(&spill_key) {
-                self.router
+                if !self
+                    .router
                     .cache
                     .nvme
-                    .put_active_block(&spill_key, &data, fencing_token);
+                    .put_active_block(&spill_key, &data, fencing_token)
+                {
+                    // Staging refused (never-lossy backpressure): keep the
+                    // buffer in RAM — exceeding the soft cap beats losing
+                    // dirty data. fsync drains it durably.
+                    self.active_block_buffers.insert(spill_key, data);
+                    break;
+                }
             } else {
                 break;
             }
@@ -1523,12 +1559,42 @@ impl SqueezefsFilesystem {
 
                             let nvme_clone = self.router.cache.nvme.clone();
                             let key_clone = key.clone();
-                            if let Err(e) = tokio::task::spawn_blocking(move || {
-                                nvme_clone.put_active_block(&key_clone, &block_data, fencing_token);
+                            let staging_copy = block_data.clone();
+                            let admitted = match tokio::task::spawn_blocking(move || {
+                                nvme_clone.put_active_block(
+                                    &key_clone,
+                                    &staging_copy,
+                                    fencing_token,
+                                )
                             })
                             .await
                             {
-                                error!("Failed to write active block to NVMe staging during dismount: {:?}", e);
+                                Ok(admitted) => admitted,
+                                Err(e) => {
+                                    error!("Failed to write active block to NVMe staging during dismount: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            if !admitted {
+                                // Staging refused (never-lossy backpressure):
+                                // dismount must not strand dirty RAM — upload
+                                // the block durably right now.
+                                if let Err(e) = upload_active_block_bytes(
+                                    ino,
+                                    b,
+                                    block_data,
+                                    fencing_token,
+                                    &self.router,
+                                    &self.active_inode_locks,
+                                )
+                                .await
+                                {
+                                    error!(
+                                        "Dismount durable upload failed for ino {} block {}: {:?}",
+                                        ino, b, e
+                                    );
+                                }
                                 continue;
                             }
 
@@ -5236,6 +5302,59 @@ async fn flush_due_active_blocks_for_inode(
         }
     }
 
+    Ok(())
+}
+
+/// Durable escalation when the staging segment refuses an active block
+/// (never-lossy backpressure): upload the RAM copy straight to a backend
+/// block and commit it into the inode's block map. Loud and slower than
+/// staging, but the data is durable the moment this returns.
+async fn upload_active_block_bytes(
+    ino: u64,
+    b: u32,
+    block_bytes: bytes::Bytes,
+    fencing_token: u64,
+    router: &DataRouter,
+    active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
+) -> Result<(), SqueezefsError> {
+    let processed_block = router
+        .get_crypto()
+        .process_write_async(block_bytes.clone())
+        .await?;
+    let (_be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
+    let offset = block_allocator.allocate_block().await?;
+    if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
+        let _ = block_allocator.free_block(offset).await;
+        return Err(e);
+    }
+    block_allocator.publish_block(offset);
+    let stored_block_key = offset.to_string();
+
+    let _write_guard = active_inode_locks.get_inode_lock(ino).write().await;
+    let file_path = crate::keys::inode_path(ino);
+    let mut meta = router
+        .fetch_metadata_from_backend(ino)
+        .await?
+        .unwrap_or_default();
+    if let Some(cached) = router.metadata_cache.get(&file_path) {
+        if cached.size > meta.size {
+            meta.size = cached.size;
+        }
+    }
+    let mut block_map = meta.block_map.clone().unwrap_or_default();
+    let old_key = block_map.insert(b, stored_block_key.clone());
+    meta.block_map = Some(block_map);
+    meta.file_type = "striped".to_string();
+    router
+        .save_metadata_to_backend(ino, &meta, fencing_token)
+        .await?;
+    if let Some(bk) = old_key {
+        if bk != stored_block_key {
+            router.cache.read_lru.remove(&bk);
+            router.cache.nvme.remove_cached_read_block(&bk);
+            let _ = router.backend_router.free_block(&bk).await;
+        }
+    }
     Ok(())
 }
 

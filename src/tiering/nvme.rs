@@ -299,6 +299,16 @@ impl NvmeShard {
         evicted
     }
 
+    /// Admit `key` into the staging segment **without ever destroying live
+    /// entries**. Staged payloads and active blocks are the sole copy of
+    /// dirty data until promotion/upload, so shard exhaustion must surface
+    /// as refusal (backpressure — the caller escalates to a durable direct
+    /// upload), never as silent wrap-around eviction. First-fit over the
+    /// gaps left by removed/replaced entries; the existing copy of `key` is
+    /// tombstoned only after its replacement is fully written (never
+    /// overwritten in place — a crash mid-write must leave one intact copy).
+    ///
+    /// Returns `true` when admitted.
     pub fn reserve_and_write(
         &self,
         key: Bytes,
@@ -306,7 +316,7 @@ impl NvmeShard {
         meta_bytes: &[u8],
         data: &[u8],
         align_data_to: Option<usize>,
-    ) -> Vec<(Bytes, Bytes)> {
+    ) -> bool {
         let key_len = key.len();
         let header_size_written = 8 + meta_bytes.len();
         let padding_needed = if let Some(align) = align_data_to {
@@ -316,36 +326,67 @@ impl NvmeShard {
         };
         let val_len = header_size_written + padding_needed + data.len();
 
-        let (target_offset, val_offset, block_size, old_meta, evicted, mmap_ptr) = {
+        let (target_offset, val_offset, block_size, old_meta, mmap_ptr) = {
             let mut inner = self.inner.write();
             let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
-
-            let mut target_offset = (inner.write_offset + alignment - 1) & !(alignment - 1);
-            let val_offset =
-                (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
-            let block_size = (val_offset - target_offset) + val_len;
-
-            if block_size > inner.capacity {
-                return Vec::new();
-            }
-
-            let mut evicted = Vec::new();
-
-            // Check if we need to wrap around
             let capacity = inner.capacity;
-            if target_offset + block_size > capacity {
-                inner.evict_overlapping(target_offset, capacity, &mut evicted);
-                target_offset = 0;
+
+            // Block geometry is alignment-invariant for aligned candidates:
+            // val_offset - target_offset depends only on HEADER + key length.
+            let val_delta = {
+                let t0 = 0usize;
+                let v0 = (t0 + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+                v0 - t0
+            };
+            let block_size = val_delta + val_len;
+            if block_size > capacity {
+                return false;
             }
 
-            // Recompute after wrap-around to ensure aligned
-            let target_offset = (target_offset + alignment - 1) & !(alignment - 1);
-            let val_offset =
-                (target_offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
-            let block_size = (val_offset - target_offset) + val_len;
+            // Live extents (including any current copy of `key`: replacing
+            // the sole copy in place would be torn by a crash mid-write).
+            let mut live: Vec<(usize, usize)> = inner
+                .map
+                .values()
+                .map(|m| (m.offset, m.offset + m.len))
+                .collect();
+            live.sort_unstable();
 
-            // Evict overlapping blocks in the target range
-            inner.evict_overlapping(target_offset, target_offset + block_size, &mut evicted);
+            // First-fit candidates: the write cursor, then the end of every
+            // live extent (both wrapped) — this reuses the holes that
+            // promotion/unlink punch into the ring.
+            let cursor = (inner.write_offset + alignment - 1) & !(alignment - 1);
+            let mut candidates: Vec<usize> = Vec::with_capacity(live.len() + 2);
+            candidates.push(cursor);
+            candidates.push(0);
+            for &(_, end) in &live {
+                candidates.push((end + alignment - 1) & !(alignment - 1));
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            // Try candidates at/after the cursor first, then wrapped ones.
+            let (after, before): (Vec<usize>, Vec<usize>) =
+                candidates.into_iter().partition(|&t| t >= cursor);
+
+            let fits = |t: usize| -> bool {
+                let end = t + block_size;
+                if end > capacity {
+                    return false;
+                }
+                // live is sorted: find any overlap.
+                !live
+                    .iter()
+                    .any(|&(b_start, b_end)| t < b_end && end > b_start)
+            };
+
+            let Some(target_offset) = after
+                .into_iter()
+                .chain(before.into_iter())
+                .find(|&t| fits(t))
+            else {
+                return false;
+            };
+            let val_offset = target_offset + val_delta;
 
             // Invalidate/remove key from map if it already existed
             let old_meta = inner.map.remove(&key);
@@ -355,14 +396,7 @@ impl NvmeShard {
 
             inner.write_offset = target_offset + block_size;
             let mmap_ptr = inner.mmap.as_ptr() as *mut u8;
-            (
-                target_offset,
-                val_offset,
-                block_size,
-                old_meta,
-                evicted,
-                mmap_ptr,
-            )
+            (target_offset, val_offset, block_size, old_meta, mmap_ptr)
         };
 
         // Perform memory copy and disk flushing OUTSIDE of the lock!
@@ -404,6 +438,8 @@ impl NvmeShard {
             }
             std::ptr::copy_nonoverlapping(data.as_ptr(), mmap_ptr.add(cur), data.len());
 
+            // Tombstone the replaced copy only after the new one is fully
+            // written: a crash in between leaves at most one live copy.
             if let Some(ref old) = old_meta {
                 std::ptr::write_bytes(mmap_ptr.add(old.offset), 0, 4);
                 libc::msync(
@@ -431,7 +467,12 @@ impl NvmeShard {
             inner.active_keys.push_back(key);
         }
 
-        evicted
+        true
+    }
+
+    /// Whether `key` currently has a live entry in this shard.
+    pub fn has_key(&self, key: &Bytes) -> bool {
+        self.inner.read().map.contains_key(key)
     }
 
     pub fn remove(&self, key: &Bytes) -> Option<Bytes> {
@@ -705,6 +746,11 @@ impl NvmeCache {
         dev.shards[shard_idx].put(key, value)
     }
 
+    /// Admit `key` without ever destroying live entries (see the shard-level
+    /// doc). Key-affine: an existing copy is replaced on its own device
+    /// (readers scan devices in order — divergent duplicates would serve
+    /// stale data); new keys take the first device with room. Returns `true`
+    /// when admitted.
     pub fn reserve_and_write(
         &self,
         key: Bytes,
@@ -712,7 +758,7 @@ impl NvmeCache {
         meta_bytes: &[u8],
         data: &[u8],
         align_data_to: Option<usize>,
-    ) -> Vec<(Bytes, Bytes)> {
+    ) -> bool {
         let active_devices = {
             let guard = self.devices.read();
             guard
@@ -723,13 +769,40 @@ impl NvmeCache {
         };
 
         if active_devices.is_empty() {
-            return Vec::new();
+            return false;
         }
 
-        let idx = self.write_counter.fetch_add(1, Ordering::Relaxed) % active_devices.len();
-        let dev = &active_devices[idx];
-        let shard_idx = (xxh3_64(&key) as usize) % dev.shards.len();
-        dev.shards[shard_idx].reserve_and_write(key, meta_len, meta_bytes, data, align_data_to)
+        // Replace in place on the device that already holds the key.
+        for dev in &active_devices {
+            let shard_idx = (xxh3_64(&key) as usize) % dev.shards.len();
+            if dev.shards[shard_idx].has_key(&key) {
+                return dev.shards[shard_idx].reserve_and_write(
+                    key,
+                    meta_len,
+                    meta_bytes,
+                    data,
+                    align_data_to,
+                );
+            }
+        }
+
+        // New key: spread by insertion order, falling back to any device
+        // with room before refusing.
+        let start = self.write_counter.fetch_add(1, Ordering::Relaxed) % active_devices.len();
+        for step in 0..active_devices.len() {
+            let dev = &active_devices[(start + step) % active_devices.len()];
+            let shard_idx = (xxh3_64(&key) as usize) % dev.shards.len();
+            if dev.shards[shard_idx].reserve_and_write(
+                key.clone(),
+                meta_len,
+                meta_bytes,
+                data,
+                align_data_to,
+            ) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn remove(&self, key: &Bytes) -> Option<Bytes> {

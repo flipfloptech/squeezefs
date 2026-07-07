@@ -19,7 +19,7 @@ fn bench_high_concurrency(c: &mut Criterion) {
                 let futures = (0..10).map(|_| {
                     let dlm = dlm.clone();
                     async move {
-                        let _guard = dlm.lock_shared("contended_key").await;
+                        let _guard = dlm.lock_inode_shared(42).await;
                         tokio::task::yield_now().await;
                     }
                 });

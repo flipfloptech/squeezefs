@@ -94,6 +94,39 @@ impl MetaLvBackend {
         }
     }
 
+    /// Dentry removal + nlink decrement with the full lock set already held
+    /// (`unlink` two-phase).
+    async fn unlink_locked(&self, parent: Ino, name: &str, ino: Ino) -> Result<Ino> {
+        self.run_transaction(|| async {
+            dentry::remove_dentry(&self.storage, parent, name).await?;
+
+            // Update parent directory times
+            if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                parent_inode.mtime = now;
+                parent_inode.ctime = now;
+                let _ = inode::write_inode(&self.storage, parent, &parent_inode).await;
+            }
+
+            // Decrement nlink
+            let mut disk_inode = inode::read_inode(&self.storage, ino).await?;
+            if disk_inode.nlink > 0 {
+                disk_inode.nlink -= 1;
+            }
+            disk_inode.ctime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            inode::write_inode(&self.storage, ino, &disk_inode).await?;
+            Ok(())
+        })
+        .await?;
+        Ok(ino)
+    }
+
     /// Durability barrier for this volume's device, coalesced with concurrent
     /// callers (group commit): N in-flight fsyncs share one `fdatasync`.
     pub async fn sync_device(&self) -> Result<()> {
@@ -418,15 +451,25 @@ impl MetaLvBackend {
 #[async_trait::async_trait]
 impl Metadata for MetaLvBackend {
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
-        let _guard = self.dlm.lock_shared(&format!("D{}:{}", parent, name)).await;
-        if let Some(dentry) = dentry::find_dentry(&self.storage, parent, name).await? {
-            self.getattr(dentry.child_ino).await
-        } else {
-            Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Dentry {} not found in parent {}", name, parent),
-            )))
-        }
+        // Resolve the dentry under the D-guard, but DROP it before getattr:
+        // getattr takes an I-lock, and holding a D-stripe while waiting on an
+        // I-stripe inverts the canonical class order (ABBA against unlink's
+        // held child-I under stripe collisions). Snapshot semantics are
+        // unchanged — lookup→getattr was never atomic (the child can be
+        // renamed between the two under exact keys as well).
+        let child_ino = {
+            let _guard = self.dlm.lock_dentry_shared(parent, name).await;
+            match dentry::find_dentry(&self.storage, parent, name).await? {
+                Some(dentry) => dentry.child_ino,
+                None => {
+                    return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Dentry {} not found in parent {}", name, parent),
+                    )))
+                }
+            }
+        };
+        self.getattr(child_ino).await
     }
 
     async fn create(
@@ -437,11 +480,8 @@ impl Metadata for MetaLvBackend {
         uid: u32,
         gid: u32,
     ) -> Result<Inode> {
-        let _parent_guard = self.dlm.lock_exclusive(&format!("I{}", parent)).await;
-        let _dentry_guard = self
-            .dlm
-            .lock_exclusive(&format!("D{}:{}", parent, name))
-            .await;
+        let _parent_guard = self.dlm.lock_inode_exclusive(parent).await;
+        let _dentry_guard = self.dlm.lock_dentry_exclusive(parent, name).await;
 
         if let Some(_) = dentry::find_dentry(&self.storage, parent, name).await? {
             return Err(crate::error::SqueezefsError::InvalidOperation(
@@ -508,61 +548,66 @@ impl Metadata for MetaLvBackend {
     }
 
     async fn unlink(&self, parent: Ino, name: &str) -> Result<Ino> {
-        let _parent_guard = self.dlm.lock_exclusive(&format!("I{}", parent)).await;
-        let _dentry_guard = self
-            .dlm
-            .lock_exclusive(&format!("D{}:{}", parent, name))
-            .await;
-
-        if let Some(dentry) = dentry::find_dentry(&self.storage, parent, name).await? {
-            let ino = dentry.child_ino;
-            let _inode_guard = if parent != ino {
-                Some(self.dlm.lock_exclusive(&format!("I{}", ino)).await)
-            } else {
-                None
+        // Two-phase child discovery (see dlm.rs canonical-order rules): the
+        // child ino is only known after reading the dentry, and taking its
+        // I-lock while holding the D-lock inverts the class order (ABBA on
+        // stripe collisions). Phase 1 reads the child under {I parent, D};
+        // phase 2 re-locks the full set canonically and revalidates.
+        loop {
+            let phase1 = self
+                .dlm
+                .lock_many(
+                    &[(parent, dlm::LockMode::Exclusive)],
+                    &[(parent, name, dlm::LockMode::Exclusive)],
+                )
+                .await;
+            let Some(dentry) = dentry::find_dentry(&self.storage, parent, name).await? else {
+                return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Dentry not found",
+                )));
             };
-
-            self.run_transaction(|| async {
-                dentry::remove_dentry(&self.storage, parent, name).await?;
-
-                // Update parent directory times
-                if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    parent_inode.mtime = now;
-                    parent_inode.ctime = now;
-                    let _ = inode::write_inode(&self.storage, parent, &parent_inode).await;
+            let ino = dentry.child_ino;
+            if parent == ino {
+                // Self-reference: the parent guard already covers the child.
+                return self.unlink_locked(parent, name, ino).await;
+            }
+            // Re-lock with the child included, then re-validate that the
+            // dentry still names this child (it may have been renamed or
+            // replaced while no locks were held).
+            drop(phase1);
+            let _full = self
+                .dlm
+                .lock_many(
+                    &[
+                        (parent, dlm::LockMode::Exclusive),
+                        (ino, dlm::LockMode::Exclusive),
+                    ],
+                    &[(parent, name, dlm::LockMode::Exclusive)],
+                )
+                .await;
+            match dentry::find_dentry(&self.storage, parent, name).await? {
+                Some(cur) if cur.child_ino == ino => {
+                    return self.unlink_locked(parent, name, ino).await;
                 }
-
-                // Decrement nlink
-                let mut disk_inode = inode::read_inode(&self.storage, ino).await?;
-                if disk_inode.nlink > 0 {
-                    disk_inode.nlink -= 1;
-                }
-                disk_inode.ctime = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                inode::write_inode(&self.storage, ino, &disk_inode).await?;
-                Ok(())
-            })
-            .await?;
-            Ok(ino)
-        } else {
-            Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Dentry not found",
-            )))
+                _ => continue, // dentry changed under us — rediscover
+            }
         }
     }
 
     async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode> {
-        let _parent_guard = self.dlm.lock_exclusive(&format!("I{}", new_parent)).await;
-        let _dentry_guard = self
+        // Both inodes are parameters: take the whole set upfront in
+        // canonical order (the old sequence acquired I{child} *after* the
+        // D-guard — an ABBA inversion under stripe collisions).
+        let _guards = self
             .dlm
-            .lock_exclusive(&format!("D{}:{}", new_parent, new_name))
+            .lock_many(
+                &[
+                    (new_parent, dlm::LockMode::Exclusive),
+                    (ino, dlm::LockMode::Exclusive),
+                ],
+                &[(new_parent, new_name, dlm::LockMode::Exclusive)],
+            )
             .await;
 
         if let Some(_) = dentry::find_dentry(&self.storage, new_parent, new_name).await? {
@@ -571,7 +616,6 @@ impl Metadata for MetaLvBackend {
             ));
         }
 
-        let _inode_guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
         let mut disk_inode = inode::read_inode(&self.storage, ino).await?;
         disk_inode.nlink += 1;
         disk_inode.ctime = std::time::SystemTime::now()
@@ -635,23 +679,22 @@ impl Metadata for MetaLvBackend {
             ));
         }
 
-        let mut parents = vec![old_parent, new_parent];
-        parents.sort_unstable();
-        parents.dedup();
-        let mut _parent_guards = Vec::new();
-        for p in parents {
-            _parent_guards.push(self.dlm.lock_exclusive(&format!("I{}", p)).await);
-        }
-
-        let old_dentry_key = format!("D{}:{}", old_parent, old_name);
-        let new_dentry_key = format!("D{}:{}", new_parent, new_name);
-        let mut dentries = vec![old_dentry_key.clone(), new_dentry_key.clone()];
-        dentries.sort_unstable();
-        dentries.dedup();
-        let mut _dentry_guards = Vec::new();
-        for d in dentries {
-            _dentry_guards.push(self.dlm.lock_exclusive(&d).await);
-        }
+        // Canonical multi-lock: both parents + both dentry names, deduped by
+        // stripe (string dedup missed distinct names on a shared stripe —
+        // a self-deadlock under collision).
+        let _guards = self
+            .dlm
+            .lock_many(
+                &[
+                    (old_parent, dlm::LockMode::Exclusive),
+                    (new_parent, dlm::LockMode::Exclusive),
+                ],
+                &[
+                    (old_parent, old_name, dlm::LockMode::Exclusive),
+                    (new_parent, new_name, dlm::LockMode::Exclusive),
+                ],
+            )
+            .await;
 
         let old_dentry_opt = dentry::find_dentry(&self.storage, old_parent, old_name).await?;
         let new_dentry_opt = dentry::find_dentry(&self.storage, new_parent, new_name).await?;
@@ -735,7 +778,7 @@ impl Metadata for MetaLvBackend {
     }
 
     async fn readdir(&self, dir: Ino, _offset: u64, _max: usize) -> Result<Vec<DirEntry>> {
-        let _guard = self.dlm.lock_shared(&format!("I{}", dir)).await;
+        let _guard = self.dlm.lock_inode_shared(dir).await;
         let dentries = dentry::list_dentries(&self.storage, dir).await?;
         let mut list = Vec::new();
         for d in dentries {
@@ -749,7 +792,7 @@ impl Metadata for MetaLvBackend {
     }
 
     async fn getattr(&self, ino: Ino) -> Result<Inode> {
-        let _guard = self.dlm.lock_shared(&format!("I{}", ino)).await;
+        let _guard = self.dlm.lock_inode_shared(ino).await;
         let disk_inode = inode::read_inode(&self.storage, ino).await?;
         Ok(Inode {
             ino: disk_inode.ino,
@@ -776,7 +819,7 @@ impl Metadata for MetaLvBackend {
         mtime: Option<u64>,
         ctime: Option<u64>,
     ) -> Result<Inode> {
-        let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
+        let _guard = self.dlm.lock_inode_exclusive(ino).await;
         let mut disk_inode = inode::read_inode(&self.storage, ino).await?;
         let mut ctime_updated = false;
         if let Some(m) = mode {
@@ -830,29 +873,29 @@ impl Metadata for MetaLvBackend {
     }
 
     async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
-        let _guard = self.dlm.lock_shared(&format!("I{}", ino)).await;
+        let _guard = self.dlm.lock_inode_shared(ino).await;
         xattr::get_xattr(&self.storage, ino, name).await
     }
 
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
-        let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
+        let _guard = self.dlm.lock_inode_exclusive(ino).await;
         self.run_transaction(|| async { xattr::set_xattr(&self.storage, ino, name, value).await })
             .await
     }
 
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
-        let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
+        let _guard = self.dlm.lock_inode_exclusive(ino).await;
         self.run_transaction(|| async { xattr::remove_xattr(&self.storage, ino, name).await })
             .await
     }
 
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
-        let _guard = self.dlm.lock_shared(&format!("I{}", ino)).await;
+        let _guard = self.dlm.lock_inode_shared(ino).await;
         xattr::list_xattrs(&self.storage, ino).await
     }
 
     async fn destroy_inode(&self, ino: Ino) -> Result<()> {
-        let _guard = self.dlm.lock_exclusive(&format!("I{}", ino)).await;
+        let _guard = self.dlm.lock_inode_exclusive(ino).await;
 
         // Check under exclusive lock to prevent TOCTOU race (P0-8)
         match inode::read_inode(&self.storage, ino).await {
@@ -907,6 +950,12 @@ impl RoutedMetaBackend {
                 ahash::RandomState::new(),
             )),
         }
+    }
+
+    /// The per-volume metadata lock manager (tests force stripe collisions
+    /// through its public stripe accessors).
+    pub fn volume_dlm(&self, idx: usize) -> &dlm::DlmLockManager {
+        &self.volumes[idx].dlm
     }
 
     pub fn check_volume_enabled(&self, idx: usize) -> Result<()> {
@@ -987,20 +1036,24 @@ impl Metadata for RoutedMetaBackend {
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
         let (v_idx, local_parent) = self.route_ino(parent);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx]
-            .dlm
-            .lock_shared(&format!("D{}:{}", local_parent, name))
-            .await;
-        if let Some(dentry) =
-            dentry::find_dentry(&self.volumes[v_idx].storage, local_parent, name).await?
-        {
-            self.getattr(dentry.child_ino).await
-        } else {
-            Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Dentry {} not found in parent {}", name, parent),
-            )))
-        }
+        // Drop the D-guard before getattr's I-lock (canonical class order —
+        // see MetaLvBackend::lookup).
+        let child_ino = {
+            let _guard = self.volumes[v_idx]
+                .dlm
+                .lock_dentry_shared(local_parent, name)
+                .await;
+            match dentry::find_dentry(&self.volumes[v_idx].storage, local_parent, name).await? {
+                Some(dentry) => dentry.child_ino,
+                None => {
+                    return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Dentry {} not found in parent {}", name, parent),
+                    )))
+                }
+            }
+        };
+        self.getattr(child_ino).await
     }
 
     async fn create(
@@ -1054,17 +1107,17 @@ impl Metadata for RoutedMetaBackend {
         let _parent_guard = if is_dir {
             self.volumes[parent_v_idx]
                 .dlm
-                .lock_exclusive(&format!("I{}", local_parent))
+                .lock_inode_exclusive(local_parent)
                 .await
         } else {
             self.volumes[parent_v_idx]
                 .dlm
-                .lock_shared(&format!("I{}", local_parent))
+                .lock_inode_shared(local_parent)
                 .await
         };
         let _dentry_guard = self.volumes[parent_v_idx]
             .dlm
-            .lock_exclusive(&format!("D{}:{}", local_parent, name))
+            .lock_dentry_exclusive(local_parent, name)
             .await;
 
         if parent_v_idx == target_v_idx {
@@ -1253,33 +1306,98 @@ impl Metadata for RoutedMetaBackend {
     async fn unlink(&self, parent: Ino, name: &str) -> Result<Ino> {
         let (parent_v_idx, local_parent) = self.route_ino(parent);
         self.check_volume_enabled(parent_v_idx)?;
-        let _parent_guard = self.volumes[parent_v_idx]
-            .dlm
-            .lock_exclusive(&format!("I{}", local_parent))
-            .await;
-        let _dentry_guard = self.volumes[parent_v_idx]
-            .dlm
-            .lock_exclusive(&format!("D{}:{}", local_parent, name))
-            .await;
 
-        if let Some(dentry) =
-            dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name).await?
-        {
+        // Two-phase child discovery (see dlm.rs): the child's I-lock may
+        // live on any volume and must never be taken while holding this
+        // volume's D-lock. Phase 1 reads the child; phase 2 re-locks the
+        // full set — per-volume sets in ascending volume order, each set
+        // internally canonical — and revalidates the dentry.
+        let (dentry, global_child_ino, child_v_idx, local_child, _guards) = loop {
+            let phase1 = self.volumes[parent_v_idx]
+                .dlm
+                .lock_many(
+                    &[(local_parent, dlm::LockMode::Exclusive)],
+                    &[(local_parent, name, dlm::LockMode::Exclusive)],
+                )
+                .await;
+            let Some(dentry) =
+                dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)
+                    .await?
+            else {
+                return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Dentry not found",
+                )));
+            };
             let global_child_ino = dentry.child_ino;
             let (child_v_idx, local_child) = self.route_ino(global_child_ino);
             self.check_volume_enabled(child_v_idx)?;
 
-            let _inode_guard = if parent != global_child_ino {
-                Some(
+            if parent == global_child_ino {
+                // Self-reference: the parent guards already cover the child.
+                break (dentry, global_child_ino, child_v_idx, local_child, phase1);
+            }
+            drop(phase1);
+
+            let mut guards = Vec::new();
+            if child_v_idx == parent_v_idx {
+                guards.extend(
+                    self.volumes[parent_v_idx]
+                        .dlm
+                        .lock_many(
+                            &[
+                                (local_parent, dlm::LockMode::Exclusive),
+                                (local_child, dlm::LockMode::Exclusive),
+                            ],
+                            &[(local_parent, name, dlm::LockMode::Exclusive)],
+                        )
+                        .await,
+                );
+            } else if child_v_idx < parent_v_idx {
+                guards.extend(
                     self.volumes[child_v_idx]
                         .dlm
-                        .lock_exclusive(&format!("I{}", local_child))
+                        .lock_many(&[(local_child, dlm::LockMode::Exclusive)], &[])
                         .await,
-                )
+                );
+                guards.extend(
+                    self.volumes[parent_v_idx]
+                        .dlm
+                        .lock_many(
+                            &[(local_parent, dlm::LockMode::Exclusive)],
+                            &[(local_parent, name, dlm::LockMode::Exclusive)],
+                        )
+                        .await,
+                );
             } else {
-                None
-            };
+                guards.extend(
+                    self.volumes[parent_v_idx]
+                        .dlm
+                        .lock_many(
+                            &[(local_parent, dlm::LockMode::Exclusive)],
+                            &[(local_parent, name, dlm::LockMode::Exclusive)],
+                        )
+                        .await,
+                );
+                guards.extend(
+                    self.volumes[child_v_idx]
+                        .dlm
+                        .lock_many(&[(local_child, dlm::LockMode::Exclusive)], &[])
+                        .await,
+                );
+            }
 
+            match dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)
+                .await?
+            {
+                Some(cur) if cur.child_ino == global_child_ino => {
+                    break (dentry, global_child_ino, child_v_idx, local_child, guards);
+                }
+                _ => continue, // dentry changed under us — rediscover
+            }
+        };
+
+        {
             if parent_v_idx == child_v_idx {
                 let backend = &self.volumes[parent_v_idx];
                 backend.run_transaction(|| async {
@@ -1395,11 +1513,6 @@ impl Metadata for RoutedMetaBackend {
                     .await?;
                 Ok(global_child_ino)
             }
-        } else {
-            Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Dentry not found",
-            )))
         }
     }
 
@@ -1409,14 +1522,57 @@ impl Metadata for RoutedMetaBackend {
         self.check_volume_enabled(parent_v_idx)?;
         self.check_volume_enabled(child_v_idx)?;
 
-        let _parent_guard = self.volumes[parent_v_idx]
-            .dlm
-            .lock_exclusive(&format!("I{}", local_parent))
-            .await;
-        let _dentry_guard = self.volumes[parent_v_idx]
-            .dlm
-            .lock_exclusive(&format!("D{}:{}", local_parent, new_name))
-            .await;
+        // Both inodes are parameters: acquire the full set upfront —
+        // per-volume sets in ascending volume order, each internally
+        // canonical (the old sequence took I{child} after the D-guard, an
+        // ABBA inversion under stripe collisions).
+        let mut _guards = Vec::new();
+        if child_v_idx == parent_v_idx {
+            _guards.extend(
+                self.volumes[parent_v_idx]
+                    .dlm
+                    .lock_many(
+                        &[
+                            (local_parent, dlm::LockMode::Exclusive),
+                            (local_child, dlm::LockMode::Exclusive),
+                        ],
+                        &[(local_parent, new_name, dlm::LockMode::Exclusive)],
+                    )
+                    .await,
+            );
+        } else if child_v_idx < parent_v_idx {
+            _guards.extend(
+                self.volumes[child_v_idx]
+                    .dlm
+                    .lock_many(&[(local_child, dlm::LockMode::Exclusive)], &[])
+                    .await,
+            );
+            _guards.extend(
+                self.volumes[parent_v_idx]
+                    .dlm
+                    .lock_many(
+                        &[(local_parent, dlm::LockMode::Exclusive)],
+                        &[(local_parent, new_name, dlm::LockMode::Exclusive)],
+                    )
+                    .await,
+            );
+        } else {
+            _guards.extend(
+                self.volumes[parent_v_idx]
+                    .dlm
+                    .lock_many(
+                        &[(local_parent, dlm::LockMode::Exclusive)],
+                        &[(local_parent, new_name, dlm::LockMode::Exclusive)],
+                    )
+                    .await,
+            );
+            _guards.extend(
+                self.volumes[child_v_idx]
+                    .dlm
+                    .lock_many(&[(local_child, dlm::LockMode::Exclusive)], &[])
+                    .await,
+            );
+        }
 
         if let Some(_) =
             dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, new_name).await?
@@ -1426,10 +1582,6 @@ impl Metadata for RoutedMetaBackend {
             ));
         }
 
-        let _inode_guard = self.volumes[child_v_idx]
-            .dlm
-            .lock_exclusive(&format!("I{}", local_child))
-            .await;
         if parent_v_idx == child_v_idx {
             let backend = &self.volumes[parent_v_idx];
             backend
@@ -1583,39 +1735,45 @@ impl Metadata for RoutedMetaBackend {
         self.check_volume_enabled(old_parent_v_idx)?;
         self.check_volume_enabled(new_parent_v_idx)?;
 
-        let mut parent_lock_keys = vec![
-            (old_parent_v_idx, local_old_parent, old_parent),
-            (new_parent_v_idx, local_new_parent, new_parent),
-        ];
-        parent_lock_keys.sort_unstable_by_key(|&(v, l, _)| (v, l));
-        parent_lock_keys.dedup_by_key(|&mut (_, _, orig)| orig);
-
-        let mut _parent_guards = Vec::new();
-        for (v_idx, local_p, _) in parent_lock_keys {
-            _parent_guards.push(
-                self.volumes[v_idx]
+        // Per-volume lock sets in ascending volume order, each internally
+        // canonical (I before D, stripe-deduped by lock_many). Interleaving
+        // classes across volumes (old code: both parents, then both
+        // dentries) descends the (volume, class) order and can ABBA against
+        // cross-volume unlink/link.
+        let mut _guards = Vec::new();
+        if old_parent_v_idx == new_parent_v_idx {
+            _guards.extend(
+                self.volumes[old_parent_v_idx]
                     .dlm
-                    .lock_exclusive(&format!("I{}", local_p))
+                    .lock_many(
+                        &[
+                            (local_old_parent, dlm::LockMode::Exclusive),
+                            (local_new_parent, dlm::LockMode::Exclusive),
+                        ],
+                        &[
+                            (local_old_parent, old_name, dlm::LockMode::Exclusive),
+                            (local_new_parent, new_name, dlm::LockMode::Exclusive),
+                        ],
+                    )
                     .await,
             );
-        }
-
-        let old_dentry_key = format!("D{}:{}", local_old_parent, old_name);
-        let new_dentry_key = format!("D{}:{}", local_new_parent, new_name);
-
-        let mut dentry_lock_keys = vec![
-            (old_parent_v_idx, old_dentry_key.clone()),
-            (new_parent_v_idx, new_dentry_key.clone()),
-        ];
-        dentry_lock_keys.sort_unstable_by(|a, b| match a.0.cmp(&b.0) {
-            std::cmp::Ordering::Equal => a.1.cmp(&b.1),
-            other => other,
-        });
-        dentry_lock_keys.dedup();
-
-        let mut _dentry_guards = Vec::new();
-        for (v_idx, d_key) in dentry_lock_keys {
-            _dentry_guards.push(self.volumes[v_idx].dlm.lock_exclusive(&d_key).await);
+        } else {
+            let mut sets = [
+                (old_parent_v_idx, local_old_parent, old_name),
+                (new_parent_v_idx, local_new_parent, new_name),
+            ];
+            sets.sort_unstable_by_key(|&(v, _, _)| v);
+            for (v_idx, local_p, name) in sets {
+                _guards.extend(
+                    self.volumes[v_idx]
+                        .dlm
+                        .lock_many(
+                            &[(local_p, dlm::LockMode::Exclusive)],
+                            &[(local_p, name, dlm::LockMode::Exclusive)],
+                        )
+                        .await,
+                );
+            }
         }
 
         let old_dentry_opt = dentry::find_dentry(
@@ -1948,10 +2106,7 @@ impl Metadata for RoutedMetaBackend {
     async fn readdir(&self, dir: Ino, _offset: u64, _max: usize) -> Result<Vec<DirEntry>> {
         let (v_idx, local_dir) = self.route_ino(dir);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx]
-            .dlm
-            .lock_shared(&format!("I{}", local_dir))
-            .await;
+        let _guard = self.volumes[v_idx].dlm.lock_inode_shared(local_dir).await;
         let dentries = dentry::list_dentries(&self.volumes[v_idx].storage, local_dir).await?;
         let mut list = Vec::new();
         for d in dentries {
@@ -1967,10 +2122,7 @@ impl Metadata for RoutedMetaBackend {
     async fn getattr(&self, ino: Ino) -> Result<Inode> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx]
-            .dlm
-            .lock_shared(&format!("I{}", local_ino))
-            .await;
+        let _guard = self.volumes[v_idx].dlm.lock_inode_shared(local_ino).await;
         let disk_inode = inode::read_inode(&self.volumes[v_idx].storage, local_ino).await?;
         Ok(Inode {
             ino: ino,
@@ -2001,7 +2153,7 @@ impl Metadata for RoutedMetaBackend {
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
-            .lock_exclusive(&format!("I{}", local_ino))
+            .lock_inode_exclusive(local_ino)
             .await;
         let mut disk_inode = inode::read_inode(&self.volumes[v_idx].storage, local_ino).await?;
         let mut ctime_updated = false;
@@ -2053,10 +2205,7 @@ impl Metadata for RoutedMetaBackend {
     async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx]
-            .dlm
-            .lock_shared(&format!("I{}", local_ino))
-            .await;
+        let _guard = self.volumes[v_idx].dlm.lock_inode_shared(local_ino).await;
         xattr::get_xattr(&self.volumes[v_idx].storage, local_ino, name).await
     }
 
@@ -2065,7 +2214,7 @@ impl Metadata for RoutedMetaBackend {
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
-            .lock_exclusive(&format!("I{}", local_ino))
+            .lock_inode_exclusive(local_ino)
             .await;
         xattr::set_xattr(&self.volumes[v_idx].storage, local_ino, name, value).await
     }
@@ -2075,7 +2224,7 @@ impl Metadata for RoutedMetaBackend {
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
             .dlm
-            .lock_exclusive(&format!("I{}", local_ino))
+            .lock_inode_exclusive(local_ino)
             .await;
         xattr::remove_xattr(&self.volumes[v_idx].storage, local_ino, name).await
     }
@@ -2083,10 +2232,7 @@ impl Metadata for RoutedMetaBackend {
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx]
-            .dlm
-            .lock_shared(&format!("I{}", local_ino))
-            .await;
+        let _guard = self.volumes[v_idx].dlm.lock_inode_shared(local_ino).await;
         xattr::list_xattrs(&self.volumes[v_idx].storage, local_ino).await
     }
 
@@ -2121,7 +2267,7 @@ impl RoutedMetaBackend {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let be = &self.volumes[v_idx];
-        let _guard = be.dlm.lock_exclusive(&format!("I{}", local_ino)).await;
+        let _guard = be.dlm.lock_inode_exclusive(local_ino).await;
         xattr::set_xattr(&be.storage, local_ino, "layout", layout).await?;
         let mut disk_inode = inode::read_inode(&be.storage, local_ino).await?;
         disk_inode.size = size;

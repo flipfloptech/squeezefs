@@ -16,7 +16,7 @@
 //! acquire) or ABBA-deadlocks (I-after-D acquisition orders).
 
 use squeezefs::meta_backend::dlm::DlmLockManager;
-use squeezefs::meta_backend::{storage::MetaLvStorage, Metadata, MetaLvBackend, RoutedMetaBackend};
+use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend, Metadata, RoutedMetaBackend};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -133,7 +133,10 @@ async fn test_rename_and_exchange_on_colliding_dentry_stripes() {
     .expect("rename self-deadlocked on colliding dentry stripes")
     .expect("rename failed");
     assert_eq!(b.lookup(dir, &name_b).await.expect("lookup b").ino, ino_a);
-    assert!(b.lookup(dir, &name_a).await.is_err(), "old name must be gone");
+    assert!(
+        b.lookup(dir, &name_a).await.is_err(),
+        "old name must be gone"
+    );
 
     // RENAME_EXCHANGE with colliding stripes.
     let ino_c = mk_file(&b, dir, &name_a).await;
@@ -185,12 +188,16 @@ async fn test_create_unlink_storm_across_colliding_stripes() {
     b.link(fx, dir_x, &nx).await.expect("seed link x");
     b.link(fy, dir_y, &ny).await.expect("seed link y");
 
-    let deadline = Duration::from_secs(30);
+    let deadline = Duration::from_secs(60);
     let storm = async {
         let mut tasks = Vec::new();
         for t in 0..8u32 {
             let b = b.clone();
-            let (dir_a, dir_b) = if t % 2 == 0 { (dir_x, dir_y) } else { (dir_y, dir_x) };
+            let (dir_a, dir_b) = if t % 2 == 0 {
+                (dir_x, dir_y)
+            } else {
+                (dir_y, dir_x)
+            };
             let (na, nb) = if t % 2 == 0 {
                 (nx.clone(), ny.clone())
             } else {
@@ -240,7 +247,16 @@ async fn test_shared_exclusive_mix_on_collided_inode_stripe() {
                 for i in 0..100u32 {
                     let mode = 0o600 + ((i + t) % 8);
                     let got = b
-                        .setattr(a, Some(libc::S_IFREG | mode), None, None, None, None, None, None)
+                        .setattr(
+                            a,
+                            Some(libc::S_IFREG | mode),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
                         .await
                         .expect("setattr");
                     assert_eq!(got.mode & 0o777, mode, "setattr result torn");

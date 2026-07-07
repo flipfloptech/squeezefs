@@ -4572,9 +4572,9 @@ async fn run_benchmark(
 
         show_metric("FUSE Operations", "fuse_ops");
         show_metric("Metadata Updates", "meta_updates");
-        show_metric("NVMe-oF Write Block", "put_obj");
-        show_metric("NVMe-oF Read Block", "get_obj");
-        show_metric("NVMe-oF Delete Block", "del_obj");
+        show_metric("Block Backend Write", "put_obj");
+        show_metric("Block Backend Read", "get_obj");
+        show_metric("Block Backend Delete", "del_obj");
         show_metric("Cache Hits (RAM)", "cache_hits");
         show_metric("Cache Misses", "cache_misses");
         println!(

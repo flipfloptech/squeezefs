@@ -26,11 +26,18 @@ pub struct InodeAllocator {
 }
 
 impl InodeAllocator {
-    /// Build an empty allocator for `[2, limit)`.
+    /// Build an empty allocator for `[2, limit)` with the xattr/journal
+    /// overlap range quarantined (design-wal-crash-consistency §4.4, PR 2):
+    /// inos whose xattr blocks fall inside the journal region are pre-marked
+    /// reserved — never allocated, immune to `free`, excluded from the
+    /// popcount. The bounds are compile-time pinned in `xattr.rs`.
     pub fn new(limit: u64) -> Self {
-        Self {
-            core: AllocCore::new(limit),
-        }
+        let mut core = AllocCore::new(limit);
+        core.reserve_range(
+            crate::meta_backend::xattr::QUARANTINE_INO_START,
+            crate::meta_backend::xattr::QUARANTINE_INO_END,
+        );
+        Self { core }
     }
 
     #[inline]
@@ -140,12 +147,17 @@ mod tests {
     }
 
     /// High-contention hammer: many threads racing on a small range must never
-    /// hand the same inode to two callers (the core `fetch_or` invariant #2).
-    /// The bounded-interleaving proof of the same property lives in
-    /// `loom-models/` (`tests/run_loom.sh`).
+    /// hand the same inode to two callers (the core `fetch_or` invariant #2),
+    /// and none may receive a quarantined ino (PR 2). The bounded-interleaving
+    /// proof of the same properties lives in `loom-models/`
+    /// (`tests/run_loom.sh`).
     #[test]
     fn test_concurrent_alloc_no_double_allocation() {
-        let limit = 4096u64; // allocatable {2..4096} = 4094
+        use crate::meta_backend::xattr::{QUARANTINE_INO_END, QUARANTINE_INO_START};
+
+        let limit = 4096u64; // allocatable {2..4096} minus quarantine [1024,1152)
+        let allocatable =
+            (limit - FIRST_ALLOCATABLE_INO) - (QUARANTINE_INO_END - QUARANTINE_INO_START);
         let a = Arc::new(InodeAllocator::new(limit));
         let n_threads = 8;
         let mut handles = Vec::new();
@@ -169,8 +181,13 @@ mod tests {
             unique.len(),
             "an inode was allocated to two threads"
         );
-        assert_eq!(all.len() as u64, limit - FIRST_ALLOCATABLE_INO);
-        assert_eq!(a.allocated_count(), limit - FIRST_ALLOCATABLE_INO);
+        assert!(
+            !all.iter()
+                .any(|ino| (QUARANTINE_INO_START..QUARANTINE_INO_END).contains(ino)),
+            "a quarantined ino was handed out under contention"
+        );
+        assert_eq!(all.len() as u64, allocatable);
+        assert_eq!(a.allocated_count(), allocatable);
     }
 
     /// Concurrent alloc + free churn must keep every live inode unique.

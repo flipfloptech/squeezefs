@@ -101,7 +101,10 @@ async fn test_refresh_bitmap_from_table_round_trip() {
     // Reconcile the on-disk bitmap from the (now-populated) inode table.
     storage.refresh_bitmap_from_table().await.unwrap();
 
-    // Read the raw bitmap sector (offset 4096) and verify it mirrors the table.
+    // Read the raw bitmap sector (offset 4096) and verify it mirrors the
+    // table — with one deliberate exception: the quarantined range
+    // [1024, 1152) is always marked regardless of table backing (PR 2, §4.4;
+    // see test_legacy_bitmap_marks_quarantine).
     let mut bm = [0u8; 4096];
     storage.read_blocks_direct(4096, &mut bm).await.unwrap();
     let is_set = |i: usize| bm[i / 8] & (1 << (i % 8)) != 0;
@@ -1049,8 +1052,8 @@ async fn test_legacy_bitmap_marks_quarantine() {
     // mount / clean-unmount path). Marks must come back — and be masked out
     // of the healed-bits accounting (they have no inode-table backing).
     let mut legacy = bm;
-    for byte in (Q_START / 8) as usize..(Q_END / 8) as usize {
-        legacy[byte] = 0;
+    for byte in &mut legacy[(Q_START / 8) as usize..(Q_END / 8) as usize] {
+        *byte = 0;
     }
     storage.write_blocks_direct(4096, &legacy).await.unwrap();
 

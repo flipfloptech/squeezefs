@@ -7,6 +7,14 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 pub const MAGIC_VALUE: &[u8; 8] = b"METALV01";
 pub const SECTOR_SIZE: usize = 4096;
 
+/// On-disk journal region `[start, start + size)` as written into every
+/// superblock at format time. The region stays declared/reserved on disk even
+/// as the WAL write path is deleted (design-wal-crash-consistency §4.2, R1) —
+/// and it is the geometry the ino quarantine derives from: xattr blocks of
+/// inos 1024–1151 physically overlap this range (§4.4, PR 2).
+pub const JOURNAL_REGION_START: u64 = 1024 * 1024 * 104;
+pub const JOURNAL_REGION_SIZE: u64 = 1024 * 1024 * 4;
+
 /// Number of shards in the per-sector lock array. Matches `active_inode_locks` /
 /// `BLOCK_FLUSH_LOCKS` (`fuse_client`). See the transaction_lock-removal design.
 pub const SECTOR_LOCK_SHARDS: usize = 4096;
@@ -596,12 +604,17 @@ impl MetaLvStorage {
         inodes_for_size(self.get_size()) as usize
     }
 
-    /// Scan the on-disk inode table and invoke `visit(ino)` for every in-use
-    /// (`magic == NODE`) slot in the allocatable range `[2, limit)`. Reads raw
-    /// sectors directly; empty/invalid slots are skipped, never errored. Shared
-    /// by allocator seeding and bitmap reconciliation so both derive from the
-    /// same authoritative source (the inode table).
-    async fn scan_used_inodes<F: FnMut(u64)>(&self, mut visit: F) -> Result<()> {
+    /// Scan the on-disk inode table and invoke `visit(ino, &inode)` for every
+    /// in-use (`magic == NODE`) slot in the allocatable range `[2, limit)`.
+    /// Reads raw sectors directly; empty/invalid slots are skipped, never
+    /// errored. Shared by allocator seeding and bitmap reconciliation so both
+    /// derive from the same authoritative source (the inode table); the
+    /// visited `DiskInode` lets seeding classify quarantined legacy occupants
+    /// (symlink vs regular — §4.4) without a second table pass.
+    async fn scan_used_inodes<F: FnMut(u64, &crate::meta_backend::inode::DiskInode)>(
+        &self,
+        mut visit: F,
+    ) -> Result<()> {
         use crate::meta_backend::alloc::FIRST_ALLOCATABLE_INO;
         use crate::meta_backend::inode::{
             DiskInode, INODES_PER_SECTOR, INODE_SLOT_SIZE, INODE_TABLE_START,
@@ -632,7 +645,7 @@ impl MetaLvStorage {
                 di.as_mut_bytes()
                     .copy_from_slice(&sector[base..base + INODE_SLOT_SIZE]);
                 if di.magic == NODE_MAGIC {
-                    visit(cur);
+                    visit(cur, &di);
                 }
             }
             idx += INODES_PER_SECTOR as u64;
@@ -644,8 +657,44 @@ impl MetaLvStorage {
     /// on-disk inode table (a bit set for every magic-valid slot). Called on
     /// mount before serving FUSE (design §3.9) so `alloc` never hands out a live
     /// inode number.
+    ///
+    /// Magic-valid inodes found INSIDE the quarantined range [1024, 1152) are
+    /// legacy overlap victims (created by a pre-quarantine binary): their
+    /// inode slots are fine — the table is far below 72 MiB — but their xattr
+    /// blocks overlap the journal region and are presumed corrupt (§4.4).
+    /// They stay readable/unlinkable; this counts them into
+    /// `meta_quarantined_inodes` and logs loudly, broken down symlink vs
+    /// regular (symlinks lost *content*, not just attributes).
     pub async fn seed_inode_alloc_from_table(&self) -> Result<()> {
-        self.scan_used_inodes(|ino| self.inode_alloc.set(ino)).await
+        let mut quarantined_symlinks: u64 = 0;
+        let mut quarantined_regular: u64 = 0;
+        self.scan_used_inodes(|ino, di| {
+            self.inode_alloc.set(ino);
+            if crate::meta_backend::xattr::is_quarantined(ino) {
+                if (di.mode & libc::S_IFMT) == libc::S_IFLNK {
+                    quarantined_symlinks += 1;
+                } else {
+                    quarantined_regular += 1;
+                }
+            }
+        })
+        .await?;
+
+        let total = quarantined_symlinks + quarantined_regular;
+        if total > 0 {
+            crate::fuse_client::METRICS
+                .meta_quarantined_inodes
+                .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+            log::warn!(
+                "{total} legacy inode(s) found in the quarantined range [{}, {}): \
+                 {quarantined_symlinks} symlink(s) (content lost — readlink returns EIO), \
+                 {quarantined_regular} regular (xattrs lost — reads degrade to empty). \
+                 Their xattr blocks overlap the journal region and are presumed corrupt (§4.4).",
+                crate::meta_backend::xattr::QUARANTINE_INO_START,
+                crate::meta_backend::xattr::QUARANTINE_INO_END,
+            );
+        }
+        Ok(())
     }
 
     /// Rewrite the on-disk free-inode bitmap sector (offset 4096) directly from
@@ -659,16 +708,36 @@ impl MetaLvStorage {
     pub async fn refresh_bitmap_from_table(&self) -> Result<()> {
         let mut bitmap = [0u8; SECTOR_SIZE];
         bitmap[0] = 0b0000_0011; // reserved index 0 + root (ino 1), matching `format`
-        self.scan_used_inodes(|ino| {
+        self.scan_used_inodes(|ino, _di| {
             bitmap[(ino / 8) as usize] |= 1 << (ino % 8);
         })
         .await?;
 
+        // Quarantine marks (§4.4, PR 2): bits 1024–1151 are set in the rebuilt
+        // image regardless of table backing, so pre-PR-2b legacy-allocator
+        // binaries — which allocate from this bitmap — cannot hand out the
+        // range while the marks stand. Format sets them too; this re-marks
+        // pre-quarantine volumes at their first mount/clean unmount.
+        for ino in crate::meta_backend::xattr::QUARANTINE_INO_START
+            ..crate::meta_backend::xattr::QUARANTINE_INO_END
+        {
+            bitmap[(ino / 8) as usize] |= 1 << (ino % 8);
+        }
+
         // §Observability (PR 7): bits the table-derived rebuild changed on disk
         // (leaked allocations healed, or table-backed bits the bitmap lost).
         // Non-zero on a clean mount is an investigate signal (design alerting).
+        // The quarantine range is masked out of the XOR (pre-seeded into BOTH
+        // images): format/mount-set marks have no table backing and would
+        // otherwise fire ~128 "healed" bits on every pre-quarantine volume's
+        // first refresh, destroying the metric's meaning (round-2 Issue 1).
         let mut prior = [0u8; SECTOR_SIZE];
         self.read_blocks_direct(4096, &mut prior).await?;
+        for ino in crate::meta_backend::xattr::QUARANTINE_INO_START
+            ..crate::meta_backend::xattr::QUARANTINE_INO_END
+        {
+            prior[(ino / 8) as usize] |= 1 << (ino % 8);
+        }
         let healed: u64 = prior
             .iter()
             .zip(bitmap.iter())

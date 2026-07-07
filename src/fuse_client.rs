@@ -344,7 +344,14 @@ pub struct Metrics {
     pub meta_inode_alloc_cas_retries: Align64<AtomicU64>,
     /// On-disk free-inode bitmap bits healed by table-derived reconciliation
     /// (mount / clean unmount). Non-zero on a clean mount ⇒ investigate.
+    /// The quarantined range [1024, 1152) is masked out (§4.4) so this keeps
+    /// meaning *unexplained* divergence.
     pub meta_inode_alloc_reconciled: Align64<AtomicU64>,
+    /// Magic-valid inodes found inside the quarantined range [1024, 1152) at
+    /// mount reconciliation — legacy xattr/journal-overlap victims (§4.4).
+    /// Non-zero ⇒ operator notice: those files' xattr blocks are presumed
+    /// corrupt (symlinks lost content; regular files lost xattrs).
+    pub meta_quarantined_inodes: Align64<AtomicU64>,
     /// Journal-worker batch fill per drain iteration (headroom before the
     /// single WAL worker becomes the bottleneck).
     pub meta_wal_batch_size: Align64<QueueDepthHistogram>,
@@ -928,6 +935,7 @@ impl SqueezefsFilesystem {
                 "meta_tx_concurrency_peak": METRICS.meta_tx_concurrency_peak.load(Ordering::Relaxed),
                 "meta_inode_alloc_cas_retries": METRICS.meta_inode_alloc_cas_retries.load(Ordering::Relaxed),
                 "meta_inode_alloc_reconciled": METRICS.meta_inode_alloc_reconciled.load(Ordering::Relaxed),
+                "meta_quarantined_inodes": METRICS.meta_quarantined_inodes.load(Ordering::Relaxed),
                 "meta_wal_batch_size": METRICS.meta_wal_batch_size.to_json(),
             },
             "cache_capacities": {

@@ -109,6 +109,61 @@ mod models {
         });
     }
 
+    /// Allocator invariant #3 (PR 2 quarantine): a reserved range is never
+    /// handed out under alloc races, `free` inside it is a no-op even racing
+    /// concurrent claims, and `allocated_count` stays exactly the number of
+    /// live (non-reserved) claims — claim-vs-reserved non-interference.
+    #[test]
+    fn alloc_reserved_range_never_handed_out() {
+        loom::model(|| {
+            // limit 8 -> allocatable {2..8}; reserve {4,5} -> claimable {2,3,6,7}.
+            let mut core = alloc_core::AllocCore::new(8);
+            core.reserve_range(4, 6);
+            let a = Arc::new(core);
+
+            let t = {
+                let a = a.clone();
+                thread::spawn(move || {
+                    // Racing free()s of reserved inos must release nothing.
+                    a.free(4);
+                    let m = a.alloc().ok().map(|o| o.ino);
+                    a.free(5);
+                    let n = a.alloc().ok().map(|o| o.ino);
+                    (m, n)
+                })
+            };
+            let (x, y) = {
+                let x = a.alloc().ok().map(|o| o.ino);
+                let y = a.alloc().ok().map(|o| o.ino);
+                (x, y)
+            };
+            let (m, n) = t.join().unwrap();
+
+            let claimed: Vec<u64> = [x, y, m, n].into_iter().flatten().collect();
+            for ino in &claimed {
+                assert!(
+                    *ino != 4 && *ino != 5,
+                    "reserved ino handed out under race: {claimed:?}"
+                );
+            }
+            let mut dedup = claimed.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            assert_eq!(
+                claimed.len(),
+                dedup.len(),
+                "an inode was handed to two threads: {claimed:?}"
+            );
+            assert_eq!(claimed.len(), 4, "exactly {{2,3,6,7}} must be claimable");
+            assert_eq!(
+                a.allocated_count(),
+                4,
+                "popcount must exclude reserved bits and racing frees of them"
+            );
+            assert!(a.is_set(4) && a.is_set(5), "reserved bits must survive free()");
+        });
+    }
+
     /// Seqlock invariant: a fill that passes snapshot+validate never returns
     /// bytes from a different incarnation. The payload cell is modeled as an
     /// atomic that each writer stamps with its generation, so a torn/foreign

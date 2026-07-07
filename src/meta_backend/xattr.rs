@@ -6,6 +6,47 @@ pub const XATTR_BLOCK_START: u64 = 1024 * 1024 * 72; // 72MB offset
 pub const XATTR_BLOCK_SIZE: usize = 32768; // 32 KB
 pub const ENTRY_SIZE: usize = 8260;
 
+/// Quarantined ino range `[START, END)` whose 32 KiB xattr blocks physically
+/// overlap the on-disk journal region (design-wal-crash-consistency §4.4,
+/// Key Decision 5): journal writes corrupt their xattr blocks and their
+/// xattr writes corrupt the journal. The range is derived from the geometry
+/// (not hardcoded) and compile-time pinned below; it is reserved in the
+/// in-RAM allocator, marked in the offset-4096 bitmap at format and every
+/// table-derived refresh, and legacy occupants degrade safely (EIO for
+/// mutations and symlink-target reads, empty for regular xattr reads).
+pub const QUARANTINE_INO_START: u64 = (crate::meta_backend::storage::JOURNAL_REGION_START
+    - XATTR_BLOCK_START)
+    / XATTR_BLOCK_SIZE as u64;
+pub const QUARANTINE_INO_END: u64 = (crate::meta_backend::storage::JOURNAL_REGION_START
+    + crate::meta_backend::storage::JOURNAL_REGION_SIZE
+    - XATTR_BLOCK_START)
+    .div_ceil(XATTR_BLOCK_SIZE as u64);
+
+// Pin the verified overlap (§2.6): (104−72) MiB / 32 KiB and (108−72) MiB /
+// 32 KiB. If either constant moves, the on-disk quarantine story (bitmap
+// marks, legacy-victim handling) must be re-derived — fail the build.
+const _: () = assert!(
+    QUARANTINE_INO_START == 1024 && QUARANTINE_INO_END == 1152,
+    "xattr/journal overlap geometry changed — re-derive the quarantine design (§4.4)"
+);
+
+/// Whether `ino`'s xattr block overlaps the journal region.
+#[inline]
+pub fn is_quarantined(ino: u64) -> bool {
+    (QUARANTINE_INO_START..QUARANTINE_INO_END).contains(&ino)
+}
+
+/// Clean `EIO` for xattr access whose backing block is quarantined.
+fn quarantine_eio(ino: u64, op: &str) -> SqueezefsError {
+    log::warn!(
+        "xattr {op} on quarantined ino {ino}: its xattr block overlaps the \
+         journal region [104 MiB, 108 MiB) and is presumed corrupt (EIO)"
+    );
+    SqueezefsError::Io(std::io::Error::other(format!(
+        "xattr block of ino {ino} is quarantined (overlaps the metadata journal region)"
+    )))
+}
+
 #[derive(IntoBytes, FromBytes, Immutable, Debug, Clone, Copy)]
 #[repr(C)]
 pub struct DiskXattrEntry {
@@ -121,6 +162,13 @@ pub async fn get_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<
     if let Some(ref inode) = inode {
         if (inode.mode & libc::S_IFMT) == libc::S_IFLNK {
             if name == "system.symlink" {
+                if is_quarantined(ino) {
+                    // Symlink content is `inode.size` RAW bytes of the xattr
+                    // block — no magic guard exists, so a quarantined block
+                    // would be served as a readlink target. An error beats
+                    // journal-record garbage (§4.4, review Issue 4).
+                    return Err(quarantine_eio(ino, "symlink-target read"));
+                }
                 let _guard = xattr_guard(storage, ino, false).await;
                 let offset = get_xattr_block_offset(ino);
                 let mut sector_buf = vec![0u8; XATTR_BLOCK_SIZE].into_boxed_slice();
@@ -131,6 +179,13 @@ pub async fn get_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<
                 return Ok(None);
             }
         }
+    }
+
+    if is_quarantined(ino) {
+        // Deterministic degrade-to-empty: the overlapped bytes may even LOOK
+        // like a valid xattr block (journal wrap / prior-life resurrection) —
+        // never parse them (§4.4).
+        return Ok(None);
     }
 
     let _guard = xattr_guard(storage, ino, false).await;
@@ -162,6 +217,12 @@ pub async fn get_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<
 }
 
 pub async fn set_xattr(storage: &MetaLvStorage, ino: u64, name: &str, value: &[u8]) -> Result<()> {
+    if is_quarantined(ino) {
+        // Before ANY side effect (the symlink branch below writes the inode
+        // size first): a quarantined block must never be written — that would
+        // scribble the journal region (§2.6).
+        return Err(quarantine_eio(ino, "setxattr"));
+    }
     if name.len() > 64 {
         return Err(SqueezefsError::InvalidOperation(
             "xattr key too long (max 64 bytes)".to_string(),
@@ -266,6 +327,9 @@ pub async fn set_xattr(storage: &MetaLvStorage, ino: u64, name: &str, value: &[u
 }
 
 pub async fn remove_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Result<()> {
+    if is_quarantined(ino) {
+        return Err(quarantine_eio(ino, "removexattr"));
+    }
     let _guard = xattr_guard(storage, ino, true).await;
     let offset = get_xattr_block_offset(ino);
     let mut block_buf = vec![0u8; XATTR_BLOCK_SIZE].into_boxed_slice();
@@ -316,6 +380,10 @@ pub async fn remove_xattr(storage: &MetaLvStorage, ino: u64, name: &str) -> Resu
 }
 
 pub async fn list_xattrs(storage: &MetaLvStorage, ino: u64) -> Result<Vec<String>> {
+    if is_quarantined(ino) {
+        // Same deterministic degrade-to-empty as get_xattr (§4.4).
+        return Ok(Vec::new());
+    }
     let _guard = xattr_guard(storage, ino, false).await;
     let offset = get_xattr_block_offset(ino);
     let mut block_buf = vec![0u8; XATTR_BLOCK_SIZE].into_boxed_slice();

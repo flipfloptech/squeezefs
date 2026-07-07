@@ -465,8 +465,8 @@ impl MetaLvBackend {
             inode_count: 1000000,
             free_inode_bitmap_root: 4096,
             dentry_root: dentry::DENTRY_TABLE_START,
-            journal_start: 1024 * 1024 * 104,
-            journal_size: 1024 * 1024 * 4,
+            journal_start: storage::JOURNAL_REGION_START,
+            journal_size: storage::JOURNAL_REGION_SIZE,
             checksum: 0,
         };
         sb.checksum = sb.compute_checksum();
@@ -476,6 +476,13 @@ impl MetaLvBackend {
         let mut bitmap_sector = [0u8; 4096];
         // Mark index 0 and 1 as allocated
         bitmap_sector[0] = 0b0000_0011;
+        // Quarantine marks (§4.4, PR 2): set bits 1024–1151 at format time so
+        // a volume formatted by this binary is protected even if handed
+        // straight to a pre-PR-2b legacy-allocator binary without ever being
+        // mounted by a new one (round-2 review Issue 1).
+        for ino in xattr::QUARANTINE_INO_START..xattr::QUARANTINE_INO_END {
+            bitmap_sector[(ino / 8) as usize] |= 1 << (ino % 8);
+        }
         storage.write_blocks(4096, &bitmap_sector).await?;
 
         // Format root Inode (ino 1)

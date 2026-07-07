@@ -36,6 +36,15 @@ pub struct AllocCore {
     limit: u64,
     /// Next-scan hint (monotonic-ish; reset downward on free).
     hint: AtomicU64,
+    /// Reserved (quarantined) half-open range `[reserved_start, reserved_end)`:
+    /// pre-marked at construction, skipped by `alloc` (uncounted in
+    /// `lost_attempts` — policy, not contention), immune to `free`, and
+    /// excluded from `allocated_count` so occupancy stays truthful. Plain
+    /// (non-atomic) fields: written once via `reserve_range(&mut self)`
+    /// before the allocator is shared.
+    reserved_start: u64,
+    reserved_end: u64,
+    reserved_count: u64,
 }
 
 impl AllocCore {
@@ -47,7 +56,37 @@ impl AllocCore {
             words: words.into_boxed_slice(),
             limit,
             hint: AtomicU64::new(FIRST_ALLOCATABLE_INO),
+            reserved_start: 0,
+            reserved_end: 0,
+            reserved_count: 0,
         }
+    }
+
+    /// Quarantine `[start, end)` (clamped to the allocatable range): the bits
+    /// are pre-set so every reader (`is_set`, on-disk reconciliation seeded
+    /// from this allocator's view, racing `alloc` scans) observes them as
+    /// occupied, and the range is excluded from `alloc`, `free`, and the
+    /// popcount. Construction-time only (`&mut self` — no atomics needed for
+    /// the bounds); call at most once.
+    pub fn reserve_range(&mut self, start: u64, end: u64) {
+        debug_assert_eq!(
+            self.reserved_count, 0,
+            "reserve_range must be called at most once"
+        );
+        let start = start.max(FIRST_ALLOCATABLE_INO).min(self.limit);
+        let end = end.max(start).min(self.limit);
+        for ino in start..end {
+            let w = (ino / 64) as usize;
+            self.words[w].fetch_or(1u64 << (ino % 64), Ordering::AcqRel);
+        }
+        self.reserved_start = start;
+        self.reserved_end = end;
+        self.reserved_count = end - start;
+    }
+
+    #[inline]
+    fn is_reserved(&self, ino: u64) -> bool {
+        ino >= self.reserved_start && ino < self.reserved_end
     }
 
     #[inline]
@@ -64,6 +103,11 @@ impl AllocCore {
         let wrap_end = start.min(self.limit);
         let mut lost_attempts: u64 = 0;
         for ino in (start..self.limit).chain(FIRST_ALLOCATABLE_INO..wrap_end) {
+            if self.is_reserved(ino) {
+                // Quarantined range: policy, not contention — skip without an
+                // RMW and without counting a lost attempt.
+                continue;
+            }
             let w = (ino / 64) as usize;
             let mask = 1u64 << (ino % 64);
             if self.words[w].fetch_or(mask, Ordering::AcqRel) & mask == 0 {
@@ -83,6 +127,12 @@ impl AllocCore {
     /// create reusing the ino.
     pub fn free(&self, ino: u64) {
         if ino < FIRST_ALLOCATABLE_INO || ino >= self.limit {
+            return;
+        }
+        if self.is_reserved(ino) {
+            // Destroying a legacy occupant of the quarantined range must not
+            // make its ino re-allocatable (its xattr block stays presumed
+            // corrupt) — the reserved bit is permanent for this allocator.
             return;
         }
         let w = (ino / 64) as usize;
@@ -109,11 +159,17 @@ impl AllocCore {
         self.words[w].load(Ordering::Acquire) & (1u64 << (ino % 64)) != 0
     }
 
-    /// Number of allocated inodes in `[2, limit)` (popcount).
+    /// Number of allocated inodes in `[2, limit)` (popcount, excluding the
+    /// reserved range's pre-set bits so occupancy stays truthful). Legacy
+    /// occupants *inside* the reserved range are indistinguishable from the
+    /// reservation itself (their `set` was idempotent on an already-set bit)
+    /// and are deliberately not counted.
     pub fn allocated_count(&self) -> u64 {
-        self.words
+        let popcount: u64 = self
+            .words
             .iter()
             .map(|w| w.load(Ordering::Relaxed).count_ones() as u64)
-            .sum()
+            .sum();
+        popcount - self.reserved_count
     }
 }

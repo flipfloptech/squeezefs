@@ -274,6 +274,98 @@ async fn test_shared_exclusive_mix_on_collided_inode_stripe() {
         .expect("shared/exclusive stripe mix deadlocked");
 }
 
+/// Contract 6 (delete throughput): regular-file unlink must hold the parent
+/// inode lock SHARED — mirroring regular-file create (design §3.8 / PR 5) —
+/// so same-directory delete storms overlap instead of serializing. Only the
+/// parent's mtime/ctime change on regular unlink (a 16-byte field patch);
+/// rmdir mutates parent nlink and keeps the exclusive parent lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regular_unlink_runs_under_shared_parent_lock() {
+    let (b, _f) = backend().await;
+    let dir = mk_dir(&b, ROOT, "shp").await;
+    let (_, local_dir) = b.route_ino(dir);
+    mk_file(&b, dir, "victim").await;
+    let sub = mk_dir(&b, dir, "subdir").await;
+    let _ = sub;
+
+    // Hold the parent's I-stripe SHARED: a shared-parent unlink proceeds; an
+    // exclusive-parent one blocks until we release.
+    let guard = b.volume_dlm(0).lock_inode_shared(local_dir).await;
+
+    let unlinked = tokio::time::timeout(Duration::from_secs(3), b.unlink(dir, "victim")).await;
+    assert!(
+        unlinked.is_ok(),
+        "regular-file unlink serialized on an exclusive parent lock \
+         (must be shared like regular-file create)"
+    );
+    unlinked.unwrap().expect("unlink failed");
+
+    // Control: rmdir still requires the exclusive parent (nlink RMW) and
+    // must block while we hold the shared guard.
+    let rmdir = tokio::time::timeout(Duration::from_millis(800), b.unlink(dir, "subdir")).await;
+    assert!(
+        rmdir.is_err(),
+        "rmdir proceeded under a shared parent lock — parent nlink RMW needs exclusive"
+    );
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(5), b.unlink(dir, "subdir"))
+        .await
+        .expect("rmdir hung after guard release")
+        .expect("rmdir failed");
+}
+
+/// Contract 7: concurrent same-parent regular unlinks are correct — every
+/// dentry removed exactly once, parent mtime advances, parent nlink intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_concurrent_same_parent_unlinks_correct() {
+    let (b, _f) = backend().await;
+    let dir = mk_dir(&b, ROOT, "cup").await;
+
+    let mut names = Vec::new();
+    for i in 0..200u32 {
+        let name = format!("f_{i}");
+        mk_file(&b, dir, &name).await;
+        names.push(name);
+    }
+    let before = b.getattr(dir).await.expect("getattr before");
+
+    let work = async {
+        let mut tasks = Vec::new();
+        for t in 0..8usize {
+            let b = b.clone();
+            let chunk: Vec<String> = names.iter().skip(t).step_by(8).cloned().collect();
+            tasks.push(tokio::spawn(async move {
+                for name in chunk {
+                    b.unlink(dir, &name)
+                        .await
+                        .unwrap_or_else(|e| panic!("unlink {name}: {e:?}"));
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.expect("unlink task panicked");
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), work)
+        .await
+        .expect("same-parent unlink storm deadlocked");
+
+    for name in &names {
+        assert!(
+            b.lookup(dir, name).await.is_err(),
+            "{name} still resolvable after unlink"
+        );
+    }
+    let after = b.getattr(dir).await.expect("getattr after");
+    assert!(
+        after.mtime >= before.mtime,
+        "parent mtime regressed: {} -> {}",
+        before.mtime,
+        after.mtime
+    );
+    assert_eq!(after.nlink, before.nlink, "parent nlink corrupted");
+}
+
 /// Contract 5: unlink's two-phase child discovery must revalidate — racing
 /// rename of the same dentry never double-frees, never panics, and always
 /// leaves exactly one consistent outcome.

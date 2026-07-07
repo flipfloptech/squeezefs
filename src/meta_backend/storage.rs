@@ -868,6 +868,36 @@ impl MetaLvStorage {
                 p_bar.inc(to_write as u64);
             }
         }
+        if quick {
+            // Ghost kill (design-wal-crash-consistency resolved Open
+            // Question 3): the xattr region extends to
+            // `72 MiB + limit × 32 KiB` — far past the quick window — and a
+            // surviving block keeps its valid magic (0x58415452), so a
+            // quick-reformatted volume would resurrect a dead filesystem's
+            // xattrs (and dead symlink TARGETS, which have no magic guard at
+            // all). Zero each surviving block's header sector: that kills
+            // the magic (regular xattrs unreachable) and the first 4096
+            // bytes (symlink targets are capped at 4096 and stored from
+            // block offset 0 — fully erased). One 4 KiB sector per 32 KiB
+            // block keeps "quick" quick; byte-level remanence deeper in a
+            // block is unreachable through the FS API (use a full format
+            // for forensic-grade erasure).
+            let block_start = crate::meta_backend::xattr::XATTR_BLOCK_START;
+            let block_size = crate::meta_backend::xattr::XATTR_BLOCK_SIZE as u64;
+            let limit = self.inode_alloc.limit();
+            let first_survivor = wipe_len.saturating_sub(block_start).div_ceil(block_size);
+            let zero_header = bytes::Bytes::from(vec![0u8; SECTOR_SIZE]);
+            let mut ino = first_survivor;
+            while ino < limit {
+                let chunk_end = std::cmp::min(ino + 512, limit);
+                let ops: Vec<(u64, bytes::Bytes)> = (ino..chunk_end)
+                    .map(|i| (block_start + i * block_size, zero_header.clone()))
+                    .collect();
+                self.write_blocks_direct_batch(ops).await?;
+                ino = chunk_end;
+            }
+        }
+
         if let Some(ref p_bar) = pb {
             p_bar.finish_with_message("Complete");
         }

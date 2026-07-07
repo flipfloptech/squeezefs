@@ -3,7 +3,6 @@ pub(crate) mod alloc_core;
 pub mod dentry;
 pub mod dlm;
 pub mod inode;
-pub mod journal;
 pub mod storage;
 pub mod sync_coalescer;
 pub mod xattr;
@@ -79,20 +78,82 @@ pub trait Metadata: Send + Sync {
 pub struct MetaLvBackend {
     pub storage: storage::MetaLvStorage,
     pub dlm: dlm::DlmLockManager,
-    pub journal: journal::Journal,
     /// Group-commit `fdatasync` coalescer for this volume's device.
     pub sync_coalescer: sync_coalescer::SyncCoalescer,
+    /// Deferred-durability flush interval (§4.2). `0` = strict
+    /// sync-on-commit: every commit ends with a post-apply coalesced
+    /// device barrier. Resolved once at construction from
+    /// `SQUEEZEFS_META_FLUSH_INTERVAL_MS` (canonical) with
+    /// `SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS` as the legacy alias — the new
+    /// name wins if both are set. Default 50 ms.
+    flush_interval_ms: u64,
+    /// Set by every successful commit apply; the per-volume flusher task
+    /// swaps it and issues one `fdatasync` per interval tick.
+    needs_flush: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Lazily spawns the flusher on the first deferred commit (a runtime is
+    /// guaranteed there; construction sites need not be async).
+    flusher_started: tokio::sync::OnceCell<()>,
+}
+
+/// Resolve the deferred-flush interval knob: canonical name first, legacy
+/// alias second, default 50 ms (§4.2 — a `JOURNAL_`-named knob controlling a
+/// flusher with no journal is a permanent naming wart; the alias keeps old
+/// operator scripts working).
+fn resolve_flush_interval_ms() -> u64 {
+    let parse = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+    };
+    parse("SQUEEZEFS_META_FLUSH_INTERVAL_MS")
+        .or_else(|| parse("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS"))
+        .unwrap_or(50)
 }
 
 impl MetaLvBackend {
     pub fn new(storage: storage::MetaLvStorage) -> Self {
-        let journal = journal::Journal::new(1024 * 1024 * 104, 1024 * 1024 * 4); // 104MB offset, 4MB size
         Self {
             storage,
             dlm: dlm::DlmLockManager::new(),
-            journal,
             sync_coalescer: sync_coalescer::SyncCoalescer::new(),
+            flush_interval_ms: resolve_flush_interval_ms(),
+            needs_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flusher_started: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Spawn (once) the per-volume deferred flusher: every tick, if a commit
+    /// flagged `needs_flush`, issue one `fdatasync` for the whole interval's
+    /// commits. Lifecycle is tied to the backend via the `Arc` strong-count
+    /// sentinel — when the backend drops, the task observes `<= 1` clones
+    /// and exits (dismount cannot leak it; unit-tested below via `Weak`).
+    async fn ensure_flusher(&self) {
+        debug_assert!(self.flush_interval_ms > 0);
+        self.flusher_started
+            .get_or_init(|| {
+                let needs_flush = self.needs_flush.clone();
+                let device_path = self.storage.device_path().to_path_buf();
+                let interval_ms = self.flush_interval_ms;
+                async move {
+                    tokio::spawn(async move {
+                        let mut interval =
+                            tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                        loop {
+                            interval.tick().await;
+                            if std::sync::Arc::strong_count(&needs_flush) <= 1 {
+                                break;
+                            }
+                            if needs_flush.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                crate::fuse_client::METRICS
+                                    .meta_flush_deferred
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let _ = crate::uring_fs::fdatasync(&device_path).await;
+                            }
+                        }
+                    });
+                }
+            })
+            .await;
     }
 
     /// Dentry removal + nlink decrement with the full lock set already held
@@ -193,7 +254,7 @@ impl MetaLvBackend {
         Fut: std::future::Future<Output = Result<R>>,
     {
         use crate::meta_backend::storage::{
-            MetaLvStorage, TxState, ACTIVE_TX, FORCE_SYNC_TX, SECTOR_SIZE, TX_STATE,
+            MetaLvStorage, TxState, ACTIVE_TX, SECTOR_SIZE, TX_STATE,
         };
         use std::collections::BTreeMap;
 
@@ -280,8 +341,6 @@ impl MetaLvBackend {
             }
         }
 
-        let sync = FORCE_SYNC_TX.try_with(|v| *v).unwrap_or(false);
-
         // Distinct sector-lock SHARDS this tx needs, in ascending shard-index
         // order (dedup). `StripeLocks` is a fixed array, so two distinct sector
         // offsets can share a shard; acquiring by ascending sector *offset* would
@@ -340,17 +399,15 @@ impl MetaLvBackend {
                 }
             }
 
-            let record = bincode::serialize(&images).map_err(|e| {
-                crate::error::SqueezefsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to serialize transaction record: {:?}", e),
-                ))
-            })?;
-            self.journal
-                .write_record(&self.storage, &record, sync)
-                .await?;
-
-            // Apply every sector image as one batched uring-fs message.
+            // Apply every sector image as one batched uring-fs message. No
+            // WAL round-trip: the write-only journal carried no acked
+            // durability (§2.3) and its unsound reader was deleted in PR 8 —
+            // the commit critical section is exactly [RMW read → apply], the
+            // window invariant #1 requires (design-wal-crash-consistency
+            // §4.2, Key Decision 1).
+            crate::fuse_client::METRICS
+                .meta_commit_sectors
+                .record(images.len());
             self.storage
                 .write_blocks_direct_batch(
                     images
@@ -374,7 +431,32 @@ impl MetaLvBackend {
         .await;
 
         match commit {
-            Ok(()) => Ok(ret),
+            Ok(()) => {
+                // Durability step, AFTER the sector guards dropped (they
+                // protect RAM consistency, not durability — §4.2): hot
+                // sectors stay unblocked while the device barriers.
+                if self.flush_interval_ms == 0 {
+                    // Strict sync-on-commit: the barrier covers the APPLY
+                    // bytes (the §2.5 fix — it used to cover only the WAL
+                    // record, pre-apply). Coalesced: concurrent strict
+                    // commits share one fdatasync. A failed barrier fails
+                    // the op WITHOUT rollback — the apply landed, so the
+                    // in-RAM dentry index matches disk and reverting it
+                    // would diverge them; the caller just cannot be given
+                    // the durability promise.
+                    if let Err(e) = self.sync_device().await {
+                        log::error!(
+                            "strict-mode post-apply barrier failed (state applied, durability unacked): {e:?}"
+                        );
+                        return Err(e);
+                    }
+                } else {
+                    self.needs_flush
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.ensure_flusher().await;
+                }
+                Ok(ret)
+            }
             Err(e) => {
                 self.rollback_tx(&state);
                 Err(e)
@@ -2363,5 +2445,73 @@ impl RoutedMetaBackend {
             .as_nanos() as u64;
         inode::write_inode(&be.storage, local_ino, &disk_inode).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod flusher_tests {
+    use super::*;
+
+    /// PR 4 flusher lifecycle (§4.2, R6): the deferred-flush task is tied to
+    /// the backend via the `needs_flush` Arc sentinel — dropping the backend
+    /// releases the task's clone at its next tick, proven here by watching
+    /// the `Weak` die. Guards dismount against leaked per-volume timers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flusher_task_exits_when_backend_drops() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let storage = storage::MetaLvStorage::open(tmp.path(), 64 * 1024 * 1024).unwrap();
+        let mut backend = MetaLvBackend::new(storage);
+        backend.flush_interval_ms = 1; // fast ticks; no env games
+
+        let weak = std::sync::Arc::downgrade(&backend.needs_flush);
+        backend.ensure_flusher().await;
+        // The task holds the only other strong clone now.
+        backend
+            .needs_flush
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(backend);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "flusher task leaked past backend drop (sentinel still alive)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Knob resolution (§4.2): canonical `SQUEEZEFS_META_FLUSH_INTERVAL_MS`
+    /// wins over the legacy `SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS` alias;
+    /// the alias alone still works; default is 50 ms. (Serial gate: env is
+    /// process-global.)
+    #[test]
+    fn test_flush_interval_env_alias_precedence() {
+        const NEW: &str = "SQUEEZEFS_META_FLUSH_INTERVAL_MS";
+        const OLD: &str = "SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS";
+        let saved = (std::env::var(NEW).ok(), std::env::var(OLD).ok());
+
+        std::env::remove_var(NEW);
+        std::env::remove_var(OLD);
+        assert_eq!(resolve_flush_interval_ms(), 50, "default is 50 ms");
+
+        std::env::set_var(OLD, "7");
+        assert_eq!(resolve_flush_interval_ms(), 7, "legacy alias honored");
+
+        std::env::set_var(NEW, "13");
+        assert_eq!(
+            resolve_flush_interval_ms(),
+            13,
+            "canonical name wins over alias"
+        );
+
+        match saved.0 {
+            Some(v) => std::env::set_var(NEW, v),
+            None => std::env::remove_var(NEW),
+        }
+        match saved.1 {
+            Some(v) => std::env::set_var(OLD, v),
+            None => std::env::remove_var(OLD),
+        }
     }
 }

@@ -443,7 +443,9 @@ async fn test_stats_json_exposes_sector_commit_metrics() {
         "meta_tx_concurrency_peak",
         "meta_inode_alloc_cas_retries",
         "meta_inode_alloc_reconciled",
-        "meta_wal_batch_size",
+        "meta_quarantined_inodes",
+        "meta_commit_sectors",
+        "meta_flush_deferred",
     ] {
         assert!(!metrics[key].is_null(), "stats JSON missing metrics.{key}");
     }

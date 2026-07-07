@@ -352,9 +352,15 @@ pub struct Metrics {
     /// Non-zero ⇒ operator notice: those files' xattr blocks are presumed
     /// corrupt (symlinks lost content; regular files lost xattrs).
     pub meta_quarantined_inodes: Align64<AtomicU64>,
-    /// Journal-worker batch fill per drain iteration (headroom before the
-    /// single WAL worker becomes the bottleneck).
-    pub meta_wal_batch_size: Align64<QueueDepthHistogram>,
+    /// Sectors per commit apply batch (`write_blocks_direct_batch` fill) —
+    /// the headroom signal that replaced the WAL worker's
+    /// `meta_wal_batch_size` when the write-only journal was deleted
+    /// (design-wal-crash-consistency §Observability; same-payload
+    /// replacement, flagged as a breaking stats-field change in PR 4).
+    pub meta_commit_sectors: Align64<QueueDepthHistogram>,
+    /// Deferred-flusher device barriers issued (timer path), vs
+    /// strict/fsync barriers which land in `meta_device_syncs` directly.
+    pub meta_flush_deferred: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -936,7 +942,8 @@ impl SqueezefsFilesystem {
                 "meta_inode_alloc_cas_retries": METRICS.meta_inode_alloc_cas_retries.load(Ordering::Relaxed),
                 "meta_inode_alloc_reconciled": METRICS.meta_inode_alloc_reconciled.load(Ordering::Relaxed),
                 "meta_quarantined_inodes": METRICS.meta_quarantined_inodes.load(Ordering::Relaxed),
-                "meta_wal_batch_size": METRICS.meta_wal_batch_size.to_json(),
+                "meta_commit_sectors": METRICS.meta_commit_sectors.to_json(),
+                "meta_flush_deferred": METRICS.meta_flush_deferred.load(Ordering::Relaxed),
             },
             "cache_capacities": {
                 "read_lru_current_bytes": self.router.cache.read_lru.current_bytes(),
@@ -4121,19 +4128,17 @@ impl Filesystem for SqueezefsFilesystem {
             .await
             .map_err(map_squeezefs_err)?;
 
-        let fsync_future = async {
-            // Single path: memory → active flush → dirty layout, then ONE meta barrier.
-            // `flush_inode_to_backend` already issues `sync_device_for_ino` for this
-            // inode's volume; a second barrier here flushed nothing new (redundant
-            // fdatasync = ~2x small-file fsync latency), so it is intentionally gone.
-            self.flush_inode_to_backend(ino, fencing_token).await?;
-            Ok::<(), SqueezefsError>(())
-        };
-
-        if let Err(e) = crate::meta_backend::storage::FORCE_SYNC_TX
-            .scope(true, fsync_future)
-            .await
-        {
+        // Single path: memory → active flush → dirty layout, then ONE meta barrier.
+        // `flush_inode_to_backend` already issues `sync_device_for_ino` for this
+        // inode's volume; a second barrier here flushed nothing new (redundant
+        // fdatasync = ~2x small-file fsync latency), so it is intentionally gone.
+        // (The former FORCE_SYNC_TX scope here was verified inert end-to-end and
+        // deleted in design-wal-crash-consistency PR 4 §4.3: no metadata
+        // transaction ever executed inside this scope — the layout/size persist
+        // is deliberately non-transactional — so its single reader never
+        // observed `true`. Zero fsync behavior change; the single-barrier
+        // suites are the regression guard.)
+        if let Err(e) = self.flush_inode_to_backend(ino, fencing_token).await {
             error!("FUSE Fsync failed for ino {}: {:?}", ino, e);
             WRITEBACK_HARD_FAILURES.insert(ino, format!("{e:?}"));
             return Err(map_squeezefs_err(e));

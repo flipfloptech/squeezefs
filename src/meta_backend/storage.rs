@@ -80,7 +80,6 @@ pub struct MetaLvStorage {
 
 tokio::task_local! {
     pub static ACTIVE_TX: std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, u64, Vec<u8>)>>>;
-    pub static FORCE_SYNC_TX: bool;
     /// Per-transaction lock + rollback state for the sector-sharded commit.
     /// Set alongside [`ACTIVE_TX`] by `run_transaction`. Carries the
     /// owned dentry-bucket guards (held closure→post-commit), the in-RAM index

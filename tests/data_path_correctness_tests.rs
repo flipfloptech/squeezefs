@@ -446,7 +446,28 @@ async fn test_stats_json_exposes_sector_commit_metrics() {
         "meta_quarantined_inodes",
         "meta_commit_sectors",
         "meta_flush_deferred",
+        "meta_volume_atomicity",
     ] {
         assert!(!metrics[key].is_null(), "stats JSON missing metrics.{key}");
     }
+
+    // Per-volume atomicity classification (design §4.6): one string per
+    // meta volume; "unprobed" for harness-constructed backends that never
+    // ran the mount probe, the probed class otherwise.
+    let atomicity = metrics["meta_volume_atomicity"]
+        .as_array()
+        .expect("meta_volume_atomicity must be an array (one entry per volume)");
+    assert_eq!(atomicity.len(), 1, "harness mounts exactly one meta volume");
+    assert_eq!(atomicity[0], "unprobed");
+    let vols = &h.fs.meta_backend.as_ref().unwrap().volumes;
+    vols[0]
+        .atomicity_class
+        .set(squeezefs::meta_backend::atomicity::AtomicityClass::FileBacked)
+        .expect("probe result set once");
+    let json = h.fs.generate_stats_json().await;
+    let v: serde_json::Value = serde_json::from_str(&json).expect("stats JSON must parse");
+    assert_eq!(
+        v["metrics"]["meta_volume_atomicity"][0], "file-backed",
+        "the probed classification must surface on the stats inode"
+    );
 }

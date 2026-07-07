@@ -327,6 +327,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 cargo test --all-features -- --test-threads=1
 cargo doc --no-deps
+cargo bench --benches -- --test   # criterion smoke: one iteration per bench, no measurement
 ```
 
 ### Phase 6: Merge to `dev` & Cleanup
@@ -423,6 +424,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 cargo test --all-features -- --test-threads=1
 cargo doc --no-deps
+cargo bench --benches -- --test   # criterion smoke: one iteration per bench, no measurement
 ```
 
 ### External POSIX / IO suites (require root + a mounted FS)
@@ -453,7 +455,9 @@ Two Criterion benches, both `harness = false`:
 - `cargo bench --bench high_concurrency_bench` — in-memory lock / pool / cache contention.
 - `cargo bench --bench squeezefs_bench` — exercises the full FS stack. Also contains the `CryptoCompressState` compression/encryption micro-benches.
 
-**CI note:** Criterion is optional in PR CI (long / noisy). Prefer **nightly** or manual baseline save:
+**Bench smoke is part of the required gate:** `cargo bench --benches -- --test` runs one iteration of every bench without measurement (seconds, not minutes). It exists because `meta_lv_bench` sat silently broken from PR 8 until a perf investigation tripped over it — a panicking bench must fail the gate, not wait for the next baseline run.
+
+**CI note:** Full Criterion *measurement* is optional in PR CI (long / noisy). Prefer **nightly** or manual baseline save:
 
 ```bash
 cargo bench --bench squeezefs_bench -- --save-baseline main

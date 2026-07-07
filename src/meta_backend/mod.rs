@@ -95,17 +95,27 @@ impl MetaLvBackend {
     }
 
     /// Dentry removal + nlink decrement with the full lock set already held
-    /// (`unlink` two-phase).
-    async fn unlink_locked(&self, parent: Ino, name: &str, ino: Ino) -> Result<Ino> {
+    /// (`unlink` two-phase). `parent_shared` = the parent inode lock is held
+    /// shared (regular-file unlink): parent times go through the 16-byte
+    /// field patch — a full-slot parent RMW under a shared lock would clobber
+    /// concurrent patchers (design §3.8).
+    async fn unlink_locked(
+        &self,
+        parent: Ino,
+        name: &str,
+        ino: Ino,
+        parent_shared: bool,
+    ) -> Result<Ino> {
         self.run_transaction(|| async {
             dentry::remove_dentry(&self.storage, parent, name).await?;
 
-            // Update parent directory times
-            if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            if parent_shared {
+                inode::stage_parent_time_patch(&self.storage, parent, now).await?;
+            } else if let Ok(mut parent_inode) = inode::read_inode(&self.storage, parent).await {
                 parent_inode.mtime = now;
                 parent_inode.ctime = now;
                 let _ = inode::write_inode(&self.storage, parent, &parent_inode).await;
@@ -553,11 +563,16 @@ impl Metadata for MetaLvBackend {
         // I-lock while holding the D-lock inverts the class order (ABBA on
         // stripe collisions). Phase 1 reads the child under {I parent, D};
         // phase 2 re-locks the full set canonically and revalidates.
+        //
+        // Parent lock mode mirrors create (design §3.8 / PR 5): a regular
+        // unlink changes only the parent's mtime/ctime (16-byte field
+        // patch) — SHARED parent, so same-directory delete storms overlap.
+        // Directory removal mutates parent nlink (full-slot RMW) — EXCLUSIVE.
         loop {
             let phase1 = self
                 .dlm
                 .lock_many(
-                    &[(parent, dlm::LockMode::Exclusive)],
+                    &[(parent, dlm::LockMode::Shared)],
                     &[(parent, name, dlm::LockMode::Exclusive)],
                 )
                 .await;
@@ -568,27 +583,31 @@ impl Metadata for MetaLvBackend {
                 )));
             };
             let ino = dentry.child_ino;
-            if parent == ino {
-                // Self-reference: the parent guard already covers the child.
-                return self.unlink_locked(parent, name, ino).await;
-            }
-            // Re-lock with the child included, then re-validate that the
-            // dentry still names this child (it may have been renamed or
-            // replaced while no locks were held).
+            // Self-references and directories take the exclusive-parent
+            // path; a regular file can never be its own parent.
+            let parent_mode = if dentry.file_type == libc::S_IFDIR || parent == ino {
+                dlm::LockMode::Exclusive
+            } else {
+                dlm::LockMode::Shared
+            };
+            // Re-lock with the child included (and the final parent mode),
+            // then re-validate that the dentry still names this child (it
+            // may have been renamed or replaced while no locks were held).
             drop(phase1);
+            let inode_set: &[(u64, dlm::LockMode)] = if parent == ino {
+                &[(parent, dlm::LockMode::Exclusive)]
+            } else {
+                &[(parent, parent_mode), (ino, dlm::LockMode::Exclusive)]
+            };
             let _full = self
                 .dlm
-                .lock_many(
-                    &[
-                        (parent, dlm::LockMode::Exclusive),
-                        (ino, dlm::LockMode::Exclusive),
-                    ],
-                    &[(parent, name, dlm::LockMode::Exclusive)],
-                )
+                .lock_many(inode_set, &[(parent, name, dlm::LockMode::Exclusive)])
                 .await;
             match dentry::find_dentry(&self.storage, parent, name).await? {
                 Some(cur) if cur.child_ino == ino => {
-                    return self.unlink_locked(parent, name, ino).await;
+                    return self
+                        .unlink_locked(parent, name, ino, parent_mode == dlm::LockMode::Shared)
+                        .await;
                 }
                 _ => continue, // dentry changed under us — rediscover
             }
@@ -1312,11 +1331,16 @@ impl Metadata for RoutedMetaBackend {
         // volume's D-lock. Phase 1 reads the child; phase 2 re-locks the
         // full set — per-volume sets in ascending volume order, each set
         // internally canonical — and revalidates the dentry.
-        let (dentry, global_child_ino, child_v_idx, local_child, _guards) = loop {
+        //
+        // Parent lock mode mirrors create (design §3.8 / PR 5): regular
+        // unlink patches only the parent's mtime/ctime — SHARED parent, so
+        // same-directory delete storms overlap. Directory removal mutates
+        // parent nlink (full-slot RMW) — EXCLUSIVE.
+        let (dentry, global_child_ino, child_v_idx, local_child, parent_shared, _guards) = loop {
             let phase1 = self.volumes[parent_v_idx]
                 .dlm
                 .lock_many(
-                    &[(local_parent, dlm::LockMode::Exclusive)],
+                    &[(local_parent, dlm::LockMode::Shared)],
                     &[(local_parent, name, dlm::LockMode::Exclusive)],
                 )
                 .await;
@@ -1333,20 +1357,34 @@ impl Metadata for RoutedMetaBackend {
             let (child_v_idx, local_child) = self.route_ino(global_child_ino);
             self.check_volume_enabled(child_v_idx)?;
 
-            if parent == global_child_ino {
-                // Self-reference: the parent guards already cover the child.
-                break (dentry, global_child_ino, child_v_idx, local_child, phase1);
-            }
+            // Self-references and directories take the exclusive-parent
+            // path; a regular file can never be its own parent.
+            let parent_shared = dentry.file_type != libc::S_IFDIR && parent != global_child_ino;
+            let parent_mode = if parent_shared {
+                dlm::LockMode::Shared
+            } else {
+                dlm::LockMode::Exclusive
+            };
             drop(phase1);
 
             let mut guards = Vec::new();
-            if child_v_idx == parent_v_idx {
+            if parent == global_child_ino {
+                guards.extend(
+                    self.volumes[parent_v_idx]
+                        .dlm
+                        .lock_many(
+                            &[(local_parent, dlm::LockMode::Exclusive)],
+                            &[(local_parent, name, dlm::LockMode::Exclusive)],
+                        )
+                        .await,
+                );
+            } else if child_v_idx == parent_v_idx {
                 guards.extend(
                     self.volumes[parent_v_idx]
                         .dlm
                         .lock_many(
                             &[
-                                (local_parent, dlm::LockMode::Exclusive),
+                                (local_parent, parent_mode),
                                 (local_child, dlm::LockMode::Exclusive),
                             ],
                             &[(local_parent, name, dlm::LockMode::Exclusive)],
@@ -1364,7 +1402,7 @@ impl Metadata for RoutedMetaBackend {
                     self.volumes[parent_v_idx]
                         .dlm
                         .lock_many(
-                            &[(local_parent, dlm::LockMode::Exclusive)],
+                            &[(local_parent, parent_mode)],
                             &[(local_parent, name, dlm::LockMode::Exclusive)],
                         )
                         .await,
@@ -1374,7 +1412,7 @@ impl Metadata for RoutedMetaBackend {
                     self.volumes[parent_v_idx]
                         .dlm
                         .lock_many(
-                            &[(local_parent, dlm::LockMode::Exclusive)],
+                            &[(local_parent, parent_mode)],
                             &[(local_parent, name, dlm::LockMode::Exclusive)],
                         )
                         .await,
@@ -1391,7 +1429,14 @@ impl Metadata for RoutedMetaBackend {
                 .await?
             {
                 Some(cur) if cur.child_ino == global_child_ino => {
-                    break (dentry, global_child_ino, child_v_idx, local_child, guards);
+                    break (
+                        dentry,
+                        global_child_ino,
+                        child_v_idx,
+                        local_child,
+                        parent_shared,
+                        guards,
+                    );
                 }
                 _ => continue, // dentry changed under us — rediscover
             }
@@ -1400,93 +1445,97 @@ impl Metadata for RoutedMetaBackend {
         {
             if parent_v_idx == child_v_idx {
                 let backend = &self.volumes[parent_v_idx];
-                backend.run_transaction(|| async {
-                    dentry::remove_dentry(&backend.storage, local_parent, name).await?;
+                backend
+                    .run_transaction(|| async {
+                        dentry::remove_dentry(&backend.storage, local_parent, name).await?;
 
-                    let is_dir = dentry.file_type == libc::S_IFDIR;
+                        let is_dir = dentry.file_type == libc::S_IFDIR;
 
-                    // Update parent directory times
-                    let mut parent_inode =
-                        inode::read_inode(&backend.storage, local_parent).await?;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    parent_inode.mtime = now;
-                    parent_inode.ctime = now;
-                    let old_nlink = parent_inode.nlink;
-                    if is_dir {
-                        if parent_inode.nlink > 2 {
-                            parent_inode.nlink -= 1;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        if parent_shared {
+                            // Regular file (shared I{parent}): 16-byte
+                            // mtime/ctime field patch (design §3.8) — a
+                            // full-slot RMW here would clobber concurrent
+                            // patchers.
+                            inode::stage_parent_time_patch(&backend.storage, local_parent, now)
+                                .await?;
+                        } else {
+                            // Directory (exclusive I{parent}): full-slot RMW
+                            // (times + nlink).
+                            let mut parent_inode =
+                                inode::read_inode(&backend.storage, local_parent).await?;
+                            parent_inode.mtime = now;
+                            parent_inode.ctime = now;
+                            if is_dir && parent_inode.nlink > 2 {
+                                parent_inode.nlink -= 1;
+                            }
+                            inode::write_inode(&backend.storage, local_parent, &parent_inode)
+                                .await?;
                         }
-                    }
-                    log::debug!(
-                        "meta_backend unlink parent={}: name={}, child={}, file_type={:o}, is_dir={}, parent_nlink_before={}, parent_nlink_after={}",
-                        local_parent, name, global_child_ino, dentry.file_type, is_dir, old_nlink, parent_inode.nlink
-                    );
-                    inode::write_inode(
-                        &backend.storage,
-                        local_parent,
-                        &parent_inode,
-                    )
-                    .await?;
 
-                    let mut disk_inode =
-                        inode::read_inode(&backend.storage, local_child).await?;
-                    log::debug!(
-                        "meta_backend unlink: local_child = {}, nlink = {}",
-                        local_child,
-                        disk_inode.nlink
-                    );
-                    if is_dir {
-                        disk_inode.nlink = 0;
-                    } else if disk_inode.nlink > 0 {
-                        disk_inode.nlink -= 1;
-                    }
-                    disk_inode.ctime = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    log::debug!(
-                        "meta_backend unlink: local_child = {}, writing nlink = {}",
-                        local_child,
-                        disk_inode.nlink
-                    );
-                    inode::write_inode(&backend.storage, local_child, &disk_inode)
-                        .await?;
-                    Ok(global_child_ino)
-                }).await
+                        let mut disk_inode =
+                            inode::read_inode(&backend.storage, local_child).await?;
+                        log::debug!(
+                            "meta_backend unlink: local_child = {}, nlink = {}",
+                            local_child,
+                            disk_inode.nlink
+                        );
+                        if is_dir {
+                            disk_inode.nlink = 0;
+                        } else if disk_inode.nlink > 0 {
+                            disk_inode.nlink -= 1;
+                        }
+                        disk_inode.ctime = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        log::debug!(
+                            "meta_backend unlink: local_child = {}, writing nlink = {}",
+                            local_child,
+                            disk_inode.nlink
+                        );
+                        inode::write_inode(&backend.storage, local_child, &disk_inode).await?;
+                        Ok(global_child_ino)
+                    })
+                    .await
             } else {
                 dentry::remove_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)
                     .await?;
 
                 let is_dir = dentry.file_type == libc::S_IFDIR;
 
-                // Update parent directory times
-                let mut parent_inode =
-                    inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent).await?;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64;
-                parent_inode.mtime = now;
-                parent_inode.ctime = now;
-                let old_nlink = parent_inode.nlink;
-                if is_dir {
-                    if parent_inode.nlink > 2 {
+                if parent_shared {
+                    // Regular file (shared I{parent}): field patch (§3.8).
+                    inode::stage_parent_time_patch(
+                        &self.volumes[parent_v_idx].storage,
+                        local_parent,
+                        now,
+                    )
+                    .await?;
+                } else {
+                    // Directory (exclusive I{parent}): full-slot RMW.
+                    let mut parent_inode =
+                        inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent)
+                            .await?;
+                    parent_inode.mtime = now;
+                    parent_inode.ctime = now;
+                    if is_dir && parent_inode.nlink > 2 {
                         parent_inode.nlink -= 1;
                     }
+                    inode::write_inode(
+                        &self.volumes[parent_v_idx].storage,
+                        local_parent,
+                        &parent_inode,
+                    )
+                    .await?;
                 }
-                log::debug!(
-                    "meta_backend unlink parent={}: name={}, child={}, file_type={:o}, is_dir={}, parent_nlink_before={}, parent_nlink_after={}",
-                    local_parent, name, global_child_ino, dentry.file_type, is_dir, old_nlink, parent_inode.nlink
-                );
-                inode::write_inode(
-                    &self.volumes[parent_v_idx].storage,
-                    local_parent,
-                    &parent_inode,
-                )
-                .await?;
 
                 let mut disk_inode =
                     inode::read_inode(&self.volumes[child_v_idx].storage, local_child).await?;

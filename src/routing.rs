@@ -453,47 +453,43 @@ impl BackendRouter {
         let router = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
+            // Per-backend probe hysteresis: only FAILURE_THRESHOLD consecutive
+            // hard failures mark a backend unhealthy (a starved probe under
+            // saturation is inconclusive, never a flip — see crate::health).
+            let mut states: std::collections::HashMap<String, crate::health::HealthState> =
+                std::collections::HashMap::new();
             loop {
                 interval.tick().await;
 
-                // 1. Health check default backend (backend_0)
-                let default_healthy = perform_device_health_check(&router.default_device).await;
-                if !default_healthy {
-                    if !router.unhealthy_backends.contains_key("backend_0") {
-                        log::error!("Backend health check: backend_0 (default) is UNHEALTHY!");
-                        router
-                            .unhealthy_backends
-                            .insert("backend_0".to_string(), true);
-                    }
-                } else if router.unhealthy_backends.contains_key("backend_0") {
-                    log::info!("Backend health check: backend_0 has recovered.");
-                    router.unhealthy_backends.remove("backend_0");
-                }
-
-                // 2. Health check all registered secondary backends
-                let mut failed_backends = Vec::new();
-                let mut recovered_backends = Vec::new();
-
+                let mut outcomes: Vec<(String, crate::health::Probe)> = Vec::new();
+                outcomes.push((
+                    "backend_0".to_string(),
+                    perform_device_health_check(&router.default_device).await,
+                ));
                 for entry in router.backends.iter() {
-                    let be_id = entry.key();
-                    let dev = &entry.value().device;
-                    let healthy = perform_device_health_check(dev).await;
-                    if !healthy {
-                        if !router.unhealthy_backends.contains_key(be_id) {
-                            log::error!("Backend health check: backend '{}' is UNHEALTHY!", be_id);
-                            failed_backends.push(be_id.clone());
-                        }
-                    } else if router.unhealthy_backends.contains_key(be_id) {
-                        log::info!("Backend health check: backend '{}' has recovered.", be_id);
-                        recovered_backends.push(be_id.clone());
-                    }
+                    outcomes.push((
+                        entry.key().clone(),
+                        perform_device_health_check(&entry.value().device).await,
+                    ));
                 }
 
-                for be_id in failed_backends {
-                    router.unhealthy_backends.insert(be_id, true);
-                }
-                for be_id in recovered_backends {
-                    router.unhealthy_backends.remove(&be_id);
+                for (be_id, probe) in outcomes {
+                    let state = states.entry(be_id.clone()).or_default();
+                    match state.observe(probe) {
+                        crate::health::Transition::WentUnhealthy => {
+                            log::error!(
+                                "Backend health check: backend '{}' is UNHEALTHY ({} consecutive probe failures)!",
+                                be_id,
+                                crate::health::HealthState::FAILURE_THRESHOLD
+                            );
+                            router.unhealthy_backends.insert(be_id, true);
+                        }
+                        crate::health::Transition::Recovered => {
+                            log::info!("Backend health check: backend '{}' has recovered.", be_id);
+                            router.unhealthy_backends.remove(&be_id);
+                        }
+                        crate::health::Transition::None => {}
+                    }
                 }
 
                 // 3. Trigger failover if currently active write backend is unhealthy
@@ -535,19 +531,30 @@ impl BackendRouter {
     }
 }
 
-async fn perform_device_health_check(dev: &crate::nvme_dev::NvmeBlockDev) -> bool {
+async fn perform_device_health_check(dev: &crate::nvme_dev::NvmeBlockDev) -> crate::health::Probe {
+    use crate::health::Probe;
     if !std::path::Path::new(&dev.device_path).exists() {
-        return false;
+        return Probe::Failed;
     }
-    match dev.read_block(0, 4096).await {
-        Ok(_) => true,
-        Err(e) => {
+    // The probe shares the device's I/O lanes with real traffic: a timeout
+    // means "busy", not "dead" — report it as inconclusive so saturation can
+    // never flip a healthy backend offline (hysteresis in crate::health).
+    match tokio::time::timeout(Duration::from_secs(2), dev.read_block(0, 4096)).await {
+        Ok(Ok(_)) => Probe::Ok,
+        Ok(Err(e)) => {
             log::warn!(
                 "Device health check failed for path {}: {:?}",
                 dev.device_path,
                 e
             );
-            false
+            Probe::Failed
+        }
+        Err(_) => {
+            log::debug!(
+                "Device health check timed out for path {} (busy, inconclusive)",
+                dev.device_path
+            );
+            Probe::Inconclusive
         }
     }
 }

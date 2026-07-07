@@ -1,83 +1,67 @@
-//! Lock-free in-RAM inode allocator.
+//! Lock-free in-RAM inode allocator (crate-facing wrapper).
 //!
-//! Replaces the global-`inode_lock`-guarded on-disk bitmap RMW
-//! (`MetaLvStorage::alloc_inode_bit_locked`) for the sector-sharded commit path.
+//! The atomic bitmap protocol lives in [`super::alloc_core`] — a
+//! self-contained module that the `loom-models/` crate `#[path]`-includes
+//! and exhaustively model-checks under `cfg(loom)` (`tests/run_loom.sh`).
+//! This wrapper adds error mapping and the allocator-contention metrics.
+//!
 //! Inode occupancy is a bit per inode index in a `Box<[AtomicU64]>`; `alloc`
-//! claims a free bit with a single `fetch_or` (the winner is whoever flips 0→1),
-//! so concurrent creates cannot double-allocate without any lock. The bitmap is
-//! treated as *derived* from the inode table (`DiskInode::magic == 0x4E4F4445`)
-//! and is rebuilt on mount via [`crate::meta_backend::storage::MetaLvStorage::seed_inode_alloc_from_table`].
+//! claims a free bit with a single `fetch_or` (the winner is whoever flips
+//! 0→1), so concurrent creates cannot double-allocate without any lock. The
+//! bitmap is treated as *derived* from the inode table
+//! (`DiskInode::magic == 0x4E4F4445`) and is rebuilt on mount via
+//! [`crate::meta_backend::storage::MetaLvStorage::seed_inode_alloc_from_table`].
 //!
 //! Inodes 0 and 1 are reserved (1 = root); allocatable range is `[2, limit)`
 //! where `limit == min(20000, max_inodes)`.
-//!
-//! NOTE (PR 2 of the transaction_lock-removal design): this type is introduced
-//! but NOT yet wired into `create`; the legacy `alloc_inode_bit_locked` remains
-//! the live allocator until the sector-sharded commit PR flips the flag.
 
+use super::alloc_core::AllocCore;
 use crate::error::{Result, SqueezefsError};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
-/// First allocatable inode number (0 and 1 are reserved; 1 is the root inode).
-pub const FIRST_ALLOCATABLE_INO: u64 = 2;
+pub use super::alloc_core::FIRST_ALLOCATABLE_INO;
 
 pub struct InodeAllocator {
-    /// One bit per inode index; bit set == allocated.
-    words: Box<[AtomicU64]>,
-    /// Exclusive upper bound on allocatable inode numbers (`min(20000, max_inodes)`).
-    limit: u64,
-    /// Next-scan hint (monotonic-ish; reset downward on free).
-    hint: AtomicU64,
+    core: AllocCore,
 }
 
 impl InodeAllocator {
     /// Build an empty allocator for `[2, limit)`.
     pub fn new(limit: u64) -> Self {
-        let n_words = limit.div_ceil(64) as usize;
-        let words: Vec<AtomicU64> = (0..n_words).map(|_| AtomicU64::new(0)).collect();
         Self {
-            words: words.into_boxed_slice(),
-            limit,
-            hint: AtomicU64::new(FIRST_ALLOCATABLE_INO),
+            core: AllocCore::new(limit),
         }
     }
 
     #[inline]
     pub fn limit(&self) -> u64 {
-        self.limit
+        self.core.limit()
     }
 
     /// Claim a free inode atomically. `Err` if the table is full. No lock.
     pub fn alloc(&self) -> Result<u64> {
-        let start = self.hint.load(Ordering::Relaxed).max(FIRST_ALLOCATABLE_INO);
-        // Scan [start, limit) then wrap [2, start): every allocatable index once.
-        let wrap_end = start.min(self.limit);
-        let mut lost_attempts: u64 = 0;
-        for ino in (start..self.limit).chain(FIRST_ALLOCATABLE_INO..wrap_end) {
-            let w = (ino / 64) as usize;
-            let mask = 1u64 << (ino % 64);
-            // fetch_or returns the previous word; if our bit was 0, we won the race.
-            if self.words[w].fetch_or(mask, Ordering::AcqRel) & mask == 0 {
-                self.hint.store(ino + 1, Ordering::Relaxed);
+        match self.core.alloc() {
+            Ok(outcome) => {
+                if outcome.lost_attempts > 0 {
+                    // §Observability (PR 7): bits we raced past (contention or
+                    // a stale hint). One amortized add, never per-iteration.
+                    crate::fuse_client::METRICS
+                        .meta_inode_alloc_cas_retries
+                        .fetch_add(outcome.lost_attempts, Ordering::Relaxed);
+                }
+                Ok(outcome.ino)
+            }
+            Err(lost_attempts) => {
                 if lost_attempts > 0 {
-                    // §Observability (PR 7): bits we raced past (contention or a
-                    // stale hint). One amortized add, never per-iteration.
                     crate::fuse_client::METRICS
                         .meta_inode_alloc_cas_retries
                         .fetch_add(lost_attempts, Ordering::Relaxed);
                 }
-                return Ok(ino);
+                Err(SqueezefsError::InvalidOperation(
+                    "Inode table full".to_string(),
+                ))
             }
-            lost_attempts += 1;
         }
-        if lost_attempts > 0 {
-            crate::fuse_client::METRICS
-                .meta_inode_alloc_cas_retries
-                .fetch_add(lost_attempts, Ordering::Relaxed);
-        }
-        Err(SqueezefsError::InvalidOperation(
-            "Inode table full".to_string(),
-        ))
     }
 
     /// Release an inode. Idempotent; out-of-range inos are ignored.
@@ -86,50 +70,26 @@ impl InodeAllocator {
     /// the destroy transaction durably commits, never inside the closure — there
     /// is no DLM exclusion between a destroy and a future create reusing the ino.
     pub fn free(&self, ino: u64) {
-        if ino < FIRST_ALLOCATABLE_INO || ino >= self.limit {
-            return;
-        }
-        let w = (ino / 64) as usize;
-        self.words[w].fetch_and(!(1u64 << (ino % 64)), Ordering::AcqRel);
-        // Prefer reusing recently-freed slots under create/unlink churn.
-        let _ = self.hint.fetch_min(ino, Ordering::Relaxed);
+        self.core.free(ino)
     }
 
     /// Mark an inode as allocated (used by mount-time seeding). Out-of-range ignored.
     pub fn set(&self, ino: u64) {
-        if ino < FIRST_ALLOCATABLE_INO || ino >= self.limit {
-            return;
-        }
-        let w = (ino / 64) as usize;
-        self.words[w].fetch_or(1u64 << (ino % 64), Ordering::AcqRel);
+        self.core.set(ino)
     }
 
     /// Whether `ino` is currently allocated.
     pub fn is_set(&self, ino: u64) -> bool {
-        if ino >= self.limit {
-            return false;
-        }
-        let w = (ino / 64) as usize;
-        self.words[w].load(Ordering::Acquire) & (1u64 << (ino % 64)) != 0
+        self.core.is_set(ino)
     }
 
     /// Number of allocated inodes in `[2, limit)` (popcount). Replaces the
     /// on-disk-bitmap-reading `get_allocated_inode_count`.
     pub fn allocated_count(&self) -> u64 {
-        // Only indices < limit are ever set, and 0/1 are never allocated, so a
-        // plain popcount over all words yields the [2, limit) occupancy.
-        self.words
-            .iter()
-            .map(|w| w.load(Ordering::Relaxed).count_ones() as u64)
-            .sum()
+        self.core.allocated_count()
     }
 }
 
-// NOTE: exhaustive `loom` model-checking of the fetch_or/free interleavings is
-// deferred — running `loom` needs an isolated test crate because a global
-// `--cfg loom` poisons transitive deps (concurrent-queue, etc.). The
-// high-contention real-thread stress tests below are the current no-double-alloc
-// proof.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +141,8 @@ mod tests {
 
     /// High-contention hammer: many threads racing on a small range must never
     /// hand the same inode to two callers (the core `fetch_or` invariant #2).
+    /// The bounded-interleaving proof of the same property lives in
+    /// `loom-models/` (`tests/run_loom.sh`).
     #[test]
     fn test_concurrent_alloc_no_double_allocation() {
         let limit = 4096u64; // allocatable {2..4096} = 4094

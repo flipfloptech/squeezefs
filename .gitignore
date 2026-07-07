@@ -4,3 +4,4 @@
 # scratch repro harness (user-local, intentionally untracked)
 tests/ltp_repro.sh
 ltp_syscalls.results
+loom-models/target/

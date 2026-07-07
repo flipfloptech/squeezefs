@@ -12,6 +12,8 @@ pub mod crypto_compress;
 pub mod dlm;
 pub mod error;
 pub mod fuse_client;
+pub(crate) mod gauge_core;
+pub(crate) mod incarnation_core;
 pub mod meta_backend;
 pub mod nvmeof;
 pub mod p2p;

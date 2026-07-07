@@ -1,0 +1,23 @@
+# Isolated loom model-checking crate (NOT part of the main build).
+#
+# Detached on purpose: a global `--cfg loom` RUSTFLAGS poisons transitive
+# dependencies of the main crate (tokio, scc, concurrent-queue have their own
+# loom-aware cfg branches). This crate depends only on `loom` and
+# `#[path]`-includes the self-contained protocol cores from ../src, so the
+# cfg applies exactly where it is meant to.
+#
+# Run: tests/run_loom.sh   (or: cd loom-models && RUSTFLAGS="--cfg loom" cargo test --release)
+
+[package]
+name = "squeezefs-loom-models"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+loom = "0.7"
+
+[workspace]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

@@ -1,4 +1,5 @@
 pub mod alloc;
+pub(crate) mod alloc_core;
 pub mod dentry;
 pub mod dlm;
 pub mod inode;

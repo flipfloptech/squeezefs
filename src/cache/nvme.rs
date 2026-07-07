@@ -515,21 +515,10 @@ impl NvmeStaging {
         Ok(())
     }
 
-    /// Saturating subtract on the staged-budget gauge.
+    /// Saturating subtract on the staged-budget gauge. Protocol core:
+    /// [`crate::gauge_core`] (loom-model-checked).
     fn sub_saturating(gauge: &std::sync::atomic::AtomicU64, amount: u64) {
-        let mut val = gauge.load(std::sync::atomic::Ordering::Relaxed);
-        loop {
-            let new_val = val.saturating_sub(amount);
-            match gauge.compare_exchange_weak(
-                val,
-                new_val,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => val = actual,
-            }
-        }
+        crate::gauge_core::sub_saturating(gauge, amount);
     }
 
     /// Ask the merge worker to promote up to `max_items` resident staged

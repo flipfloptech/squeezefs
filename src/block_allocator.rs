@@ -41,18 +41,15 @@ impl BlockAllocator {
     }
 
     /// gen+1, stable=0 — offset owned by a writer whose data is not yet on the
-    /// device (or retired by a free). Cache fills must not publish.
+    /// device (or retired by a free). Cache fills must not publish. Protocol
+    /// core: [`crate::incarnation_core`] (loom-model-checked).
     fn mark_incarnation_unstable(&self, offset: u64) {
         match self.incarnations.entry_sync(offset) {
             scc::hash_map::Entry::Occupied(occ) => {
-                let _ = occ
-                    .get()
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                        Some(((cur >> 1) + 1) << 1)
-                    });
+                crate::incarnation_core::retire(occ.get());
             }
             scc::hash_map::Entry::Vacant(vac) => {
-                let _ = vac.insert_entry(AtomicU64::new(1 << 1));
+                let _ = vac.insert_entry(AtomicU64::new(crate::incarnation_core::UNSTABLE_FIRST));
             }
         }
     }
@@ -62,10 +59,10 @@ impl BlockAllocator {
     pub fn publish_block(&self, offset: u64) {
         match self.incarnations.entry_sync(offset) {
             scc::hash_map::Entry::Occupied(occ) => {
-                occ.get().fetch_or(1, Ordering::AcqRel);
+                crate::incarnation_core::publish(occ.get());
             }
             scc::hash_map::Entry::Vacant(vac) => {
-                let _ = vac.insert_entry(AtomicU64::new(1));
+                let _ = vac.insert_entry(AtomicU64::new(crate::incarnation_core::STABLE_FIRST));
             }
         }
     }
@@ -77,11 +74,10 @@ impl BlockAllocator {
     pub fn fill_incarnation(&self, offset: u64) -> Option<u64> {
         match self
             .incarnations
-            .read_sync(&offset, |_, v| v.load(Ordering::Acquire))
+            .read_sync(&offset, |_, v| crate::incarnation_core::snapshot(v))
         {
-            Some(word) if word & 1 == 1 => Some(word),
-            Some(_) => None,
-            None => Some(u64::MAX), // unknown offset: stable sentinel
+            Some(snap) => snap,
+            None => Some(crate::incarnation_core::UNKNOWN_STABLE),
         }
     }
 
@@ -89,13 +85,12 @@ impl BlockAllocator {
     /// (no allocate/publish/free transitioned the offset during the fill's
     /// device read).
     pub fn fill_incarnation_still(&self, offset: u64, before: u64) -> bool {
-        let now = self
+        match self
             .incarnations
-            .read_sync(&offset, |_, v| v.load(Ordering::Acquire));
-        match (before, now) {
-            (u64::MAX, None) => true,
-            (b, Some(n)) => b == n,
-            _ => false,
+            .read_sync(&offset, |_, v| crate::incarnation_core::still(v, before))
+        {
+            Some(unchanged) => unchanged,
+            None => before == crate::incarnation_core::UNKNOWN_STABLE,
         }
     }
 

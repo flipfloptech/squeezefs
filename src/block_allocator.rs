@@ -94,18 +94,25 @@ impl BlockAllocator {
         }
     }
 
-    pub fn increment_refcount(&self, offset: u64) {
+    /// Take one reference on `offset`'s block. Returns `false` (loudly) when
+    /// the reference was NOT taken: the count already hit its terminal zero
+    /// (racing free) or the offset is untracked — callers must treat the
+    /// block as gone and re-resolve, never proceed unpinned.
+    #[must_use]
+    pub fn increment_refcount(&self, offset: u64) -> bool {
         match self.refcounts.entry_sync(offset) {
             scc::hash_map::Entry::Occupied(occ) => {
                 // Acquire-from-nonzero (loom-modeled, crate::refcount_core):
                 // a plain fetch_add could resurrect a count a concurrent
                 // free_block just took to zero, leaving this clone holding a
                 // freed (reallocatable) offset.
-                if !crate::refcount_core::try_acquire(occ.get()) {
+                let taken = crate::refcount_core::try_acquire(occ.get());
+                if !taken {
                     log::warn!(
                         "increment_refcount raced a free for offset {offset}: reference not taken"
                     );
                 }
+                taken
             }
             scc::hash_map::Entry::Vacant(_) => {
                 // Unknown offset: it was never allocated by this process or
@@ -113,6 +120,7 @@ impl BlockAllocator {
                 // fresh count for a possibly free-listed offset would alias
                 // a future allocation — refuse loudly instead.
                 log::warn!("increment_refcount on untracked offset {offset}: reference not taken");
+                false
             }
         }
     }

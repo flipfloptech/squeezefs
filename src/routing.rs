@@ -325,13 +325,21 @@ impl BackendRouter {
         }
     }
 
-    pub fn increment_refcount(&self, block_key: &str) {
+    /// Take one reference on the block behind `block_key`. `false` = the
+    /// reference was NOT taken (freed/untracked offset, unknown backend, or
+    /// unparsable key) — the caller must re-resolve, never proceed unpinned.
+    #[must_use]
+    pub fn increment_refcount(&self, block_key: &str) -> bool {
         if let Ok((be_id, offset)) = self.parse_block_key(block_key) {
             if be_id == "backend_0" {
-                self.default_allocator.increment_refcount(offset);
+                self.default_allocator.increment_refcount(offset)
             } else if let Some(be) = self.backends.get(&be_id) {
-                be.block_allocator.increment_refcount(offset);
+                be.block_allocator.increment_refcount(offset)
+            } else {
+                false
             }
+        } else {
+            false
         }
     }
 
@@ -2964,9 +2972,55 @@ impl DataRouter {
             }
             updated_meta.file_id = Some(new_file_id);
         } else if meta.file_type == "striped" {
-            if let Some(ref block_map) = meta.block_map {
-                for bk in block_map.values() {
-                    self.backend_router.increment_refcount(bk);
+            // All-or-nothing pin of every source block. A refusal means the
+            // snapshot map is stale (a block was freed/displaced since the
+            // fetch): undo partial pins, re-read the authoritative map under
+            // the per-inode metadata lock, and retry. Never proceed with an
+            // unpinned block — the clone would alias a reallocatable offset
+            // that reads as foreign bytes after reuse.
+            let src_ino = parse_inode_from_path(src);
+            let mut current = meta.clone();
+            let mut attempt = 0usize;
+            loop {
+                let map = current.block_map.clone().unwrap_or_default();
+                let mut pinned: Vec<&String> = Vec::with_capacity(map.len());
+                let mut refused = None;
+                for bk in map.values() {
+                    if self.backend_router.increment_refcount(bk) {
+                        pinned.push(bk);
+                    } else {
+                        refused = Some(bk.clone());
+                        break;
+                    }
+                }
+                match refused {
+                    None => {
+                        updated_meta = current;
+                        break;
+                    }
+                    Some(bad) => {
+                        // Undo the partial pins (free_block = one decrement).
+                        for bk in pinned {
+                            let _ = self.backend_router.free_block(bk).await;
+                        }
+                        attempt += 1;
+                        if attempt >= 3 {
+                            return Err(SqueezefsError::InvalidOperation(format!(
+                                "clone source {src} block {bad} freed concurrently \
+                                 (map still stale after {attempt} attempts); aborting \
+                                 to avoid an unpinned clone"
+                            )));
+                        }
+                        let _meta_guard = INODE_META_LOCKS.get_inode_lock(src_ino).lock().await;
+                        match self.fetch_metadata_from_backend(src_ino).await? {
+                            Some(fresh) if fresh.file_type == "striped" => current = fresh,
+                            _ => {
+                                return Err(SqueezefsError::InvalidOperation(format!(
+                                    "clone source {src} changed layout mid-clone; retry the clone"
+                                )))
+                            }
+                        }
+                    }
                 }
             }
         }

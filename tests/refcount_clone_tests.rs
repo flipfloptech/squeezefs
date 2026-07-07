@@ -17,7 +17,7 @@
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
-use squeezefs::meta_backend::{storage::MetaLvStorage, Metadata, MetaLvBackend};
+use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend, Metadata};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{CachedMetadata, DataRouter};
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use tempfile::{tempdir, NamedTempFile};
 async fn make_router() -> (
     DataRouter,
     Arc<BlockAllocator>,
+    Arc<squeezefs::meta_backend::RoutedMetaBackend>,
     NamedTempFile,
     NamedTempFile,
     tempfile::TempDir,
@@ -62,23 +63,44 @@ async fn make_router() -> (
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         Arc::new(MetaLvBackend::new(ms)),
     ]));
-    router.set_meta_backend(routed);
-    (router, ba, b, m, s)
+    router.set_meta_backend(routed.clone());
+    (router, ba, routed, b, m, s)
 }
 
-fn striped_meta(block_map: &[(u32, String)], size: u64) -> CachedMetadata {
+/// Create a real inode and return its `inode_{ino}` path (layout xattrs
+/// need an existing inode slot).
+async fn mk_ino(routed: &squeezefs::meta_backend::RoutedMetaBackend, name: &str) -> String {
+    let ino = routed
+        .create(1, name, libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("create")
+        .ino;
+    format!("inode_{ino}")
+}
+
+fn striped_meta(block_map: &[(u32, String)], size: u64, dirty: bool) -> CachedMetadata {
     CachedMetadata {
         file_type: "striped".to_string(),
         size,
         block_map: Some(block_map.iter().cloned().collect()),
+        layout_dirty: dirty,
         ..Default::default()
     }
+}
+
+/// Seed a layout into cache AND backend through the public writeback flow.
+async fn seed_meta(router: &DataRouter, path: &str, meta: CachedMetadata) {
+    router.metadata_cache.insert(path.to_string(), meta);
+    router
+        .persist_dirty_layout_if_needed(path, 1)
+        .await
+        .expect("persist seeded layout");
 }
 
 /// Contract 1: increments report whether the reference was taken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_increment_reports_refusal() {
-    let (router, ba, _b, _m, _s) = make_router().await;
+    let (router, ba, _routed, _b, _m, _s) = make_router().await;
 
     let offset = ba.allocate_block().await.expect("alloc");
     ba.publish_block(offset);
@@ -106,21 +128,20 @@ async fn test_increment_reports_refusal() {
 /// from the authoritative map) fails loudly — never Ok-with-unpinned-blocks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_clone_fails_loud_when_blocks_unpinnable() {
-    let (router, _ba, _b, _m, _s) = make_router().await;
+    let (router, _ba, routed, _b, _m, _s) = make_router().await;
 
     // Source meta (cache AND backend agree) references an untracked offset:
     // every pin attempt refuses, on the snapshot and on the refetched map.
-    let src = "inode_777001";
-    let meta = striped_meta(&[(0, "424242".to_string())], 4096);
-    router
-        .save_metadata_to_backend(777001, &meta, 1)
-        .await
-        .expect("seed backend meta");
-    router.metadata_cache.insert(src.to_string(), meta);
+    let src = mk_ino(&routed, "unpinnable_src").await;
+    let dest = mk_ino(&routed, "unpinnable_dest").await;
+    seed_meta(
+        &router,
+        &src,
+        striped_meta(&[(0, "424242".to_string())], 4096, true),
+    )
+    .await;
 
-    let res = router
-        .clone_file(src, "inode_777002", Some(1), Some(1))
-        .await;
+    let res = router.clone_file(&src, &dest, Some(1), Some(1)).await;
     assert!(
         res.is_err(),
         "clone must fail when its source blocks cannot be pinned \
@@ -132,23 +153,26 @@ async fn test_clone_fails_loud_when_blocks_unpinnable() {
 /// map — the clone retries, pins the real block, and succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_clone_retries_via_authoritative_map() {
-    let (router, ba, _b, _m, _s) = make_router().await;
+    let (router, ba, routed, _b, _m, _s) = make_router().await;
 
     // Authoritative (backend) map references a live allocated block…
     let offset = ba.allocate_block().await.expect("alloc");
     ba.publish_block(offset);
-    let src = "inode_777010";
-    let good = striped_meta(&[(0, offset.to_string())], 4096);
-    router
-        .save_metadata_to_backend(777010, &good, 1)
-        .await
-        .expect("seed backend meta");
-    // …while the hot cache holds a stale map with an unpinnable key.
-    let stale = striped_meta(&[(0, "424243".to_string())], 4096);
-    router.metadata_cache.insert(src.to_string(), stale);
+    let src = mk_ino(&routed, "heal_src").await;
+    let dest = mk_ino(&routed, "heal_dest").await;
+    seed_meta(
+        &router,
+        &src,
+        striped_meta(&[(0, offset.to_string())], 4096, true),
+    )
+    .await;
+    // …while the hot cache holds a stale map with an unpinnable key
+    // (clean flag: nothing re-persists the stale form over the good one).
+    let stale = striped_meta(&[(0, "424243".to_string())], 4096, false);
+    router.metadata_cache.insert(src.clone(), stale);
 
     router
-        .clone_file(src, "inode_777011", Some(1), Some(1))
+        .clone_file(&src, &dest, Some(1), Some(1))
         .await
         .expect("clone must heal via the authoritative map");
 

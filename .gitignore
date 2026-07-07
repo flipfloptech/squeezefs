@@ -1,2 +1,6 @@
 /target/
 **/*.rs.bk
+
+# scratch repro harness (user-local, intentionally untracked)
+tests/ltp_repro.sh
+ltp_syscalls.results

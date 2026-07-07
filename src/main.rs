@@ -35,7 +35,11 @@ enum Commands {
         /// Block size (e.g. "4M", "1M", default: 4MB)
         #[arg(long, default_value = "4M")]
         block_size: String,
-        /// Maximum capacity of the volume (e.g. "1P", "100G", default: auto-detected from volume or 1PB)
+        /// Formatted capacity (e.g. "100G"). Default: the summed physical
+        /// size of the data volumes. May be LOWER than physical (testing);
+        /// values above physical are refused — oversubscription is not
+        /// supported at the filesystem level (thin-provision underneath via
+        /// LVM/fabric instead).
         #[arg(long)]
         capacity: Option<String>,
         /// Hard quota limiting the number of inodes (default: 1000000)
@@ -1360,6 +1364,38 @@ fn print_squeezefs_summary(
     );
 }
 
+/// Resolve the filesystem's formatted capacity from the summed physical
+/// data-volume sizes and the optional `--capacity` request.
+///
+/// **Oversubscription is refused at this layer**: SqueezeFS will not
+/// advertise more bytes than its data volumes physically provide (a 400 GiB
+/// pool can no longer be formatted as 1 PiB — the legacy behavior even
+/// defaulted to a fabricated 1 PiB when probing failed). Thin provisioning
+/// belongs underneath (LVM thin pools, fabric namespaces), where the
+/// operator owns the overcommit. Undersubscription (`--capacity` below the
+/// physical total, e.g. for testing) and inode-count control are unaffected.
+fn resolve_format_capacity(physical_total: u64, requested: Option<u64>) -> Result<u64, String> {
+    if physical_total == 0 {
+        return Err(
+            "could not determine the physical size of any data volume; refusing to format \
+             (capacity oversubscription is not supported — check the sqdata:// paths/sizes)"
+                .to_string(),
+        );
+    }
+    match requested {
+        None => Ok(physical_total),
+        Some(0) => Err("requested --capacity of 0 bytes".to_string()),
+        Some(req) if req > physical_total => Err(format!(
+            "requested --capacity {} exceeds the physical data-volume total {} — \
+             oversubscription is not supported at the filesystem level; lower --capacity, \
+             add data volumes, or thin-provision underneath (LVM/fabric)",
+            format_size_human(req),
+            format_size_human(physical_total)
+        )),
+        Some(req) => Ok(req),
+    }
+}
+
 fn get_backing_device_size(path: &str) -> std::io::Result<u64> {
     use std::fs::File;
     use std::io::Seek;
@@ -1495,23 +1531,29 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
 
-            let mut total_capacity = 0;
+            let mut physical_total = 0;
             for path in &data_lvs {
                 if let Ok(size) = get_backing_device_size(path) {
-                    total_capacity += size;
-                }
-            }
-            if total_capacity == 0 {
-                if let Some(ref cap_str) = capacity {
-                    total_capacity = parse_human_readable_size(cap_str)?;
-                } else {
-                    total_capacity = parse_human_readable_size("1P")?;
+                    physical_total += size;
                 }
             }
             println!(
                 "Total physical data volume capacity: {}",
-                format_size_human(total_capacity)
+                format_size_human(physical_total)
             );
+            let requested = match capacity {
+                Some(ref cap_str) => Some(parse_human_readable_size(cap_str)?),
+                None => None,
+            };
+            // No oversubscription at this layer: advertised capacity is
+            // bounded by physical backing (undersubscribe freely for tests).
+            let total_capacity = resolve_format_capacity(physical_total, requested)?;
+            if total_capacity != physical_total {
+                println!(
+                    "Formatted capacity (requested): {}",
+                    format_size_human(total_capacity)
+                );
+            }
 
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let config = FormatConfig {
@@ -3492,6 +3534,39 @@ async fn run_df_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Formatted capacity is bounded by physical backing — oversubscription
+    /// is refused at the filesystem level (thin-provision underneath at the
+    /// LVM/fabric layer if desired). Undersubscription (testing) and inode
+    /// control remain supported.
+    #[test]
+    fn test_resolve_format_capacity_no_oversubscription() {
+        const G400: u64 = 400 * 1024 * 1024 * 1024;
+        const G100: u64 = 100 * 1024 * 1024 * 1024;
+        const P1: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
+
+        // Default: exactly the physical total.
+        assert_eq!(resolve_format_capacity(G400, None).unwrap(), G400);
+        // Undersubscribe for testing: honored.
+        assert_eq!(resolve_format_capacity(G400, Some(G100)).unwrap(), G100);
+        // Equal is the boundary and is fine.
+        assert_eq!(resolve_format_capacity(G400, Some(G400)).unwrap(), G400);
+
+        // Oversubscribe: refused, naming both numbers.
+        let err = resolve_format_capacity(G400, Some(P1)).unwrap_err();
+        assert!(
+            err.contains("oversubscription") || err.contains("exceeds"),
+            "must name the refusal: {err}"
+        );
+        assert!(err.contains("400"), "must show the physical bound: {err}");
+
+        // Unknown physical capacity: refuse loudly (the silent legacy
+        // fallback fabricated 1 PiB out of thin air).
+        assert!(resolve_format_capacity(0, None).is_err());
+        assert!(resolve_format_capacity(0, Some(G100)).is_err());
+        // Zero request is nonsense.
+        assert!(resolve_format_capacity(G400, Some(0)).is_err());
+    }
 
     #[test]
     fn test_parse_block_uri_valid() {

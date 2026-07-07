@@ -10,8 +10,16 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile};
 
+use squeezefs::crypto_compress::CryptoCompressState;
+use squeezefs::fuse_client::METRICS;
+use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
+use std::time::Duration;
+use tempfile::TempDir;
+
 #[tokio::test]
 async fn test_writeback_queue_full_deadlock() {
+    let _serial = serial().await;
     let _ = env_logger::builder().is_test(true).try_init();
     // Set default block size to 4096, and writeback queue capacity to 5
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
@@ -137,6 +145,7 @@ async fn test_writeback_queue_full_deadlock() {
 
 #[tokio::test]
 async fn test_inline_file_layout_overflow() {
+    let _serial = serial().await;
     let _ = env_logger::builder().is_test(true).try_init();
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
 
@@ -223,6 +232,7 @@ async fn test_inline_file_layout_overflow() {
 
 #[tokio::test]
 async fn test_indirect_block_map() {
+    let _serial = serial().await;
     let _ = env_logger::builder().is_test(true).try_init();
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
 
@@ -373,8 +383,629 @@ async fn test_indirect_block_map() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// PR 3 (docs/design-zero-copy-write-path.md §5.5): zero-copy staged-block
+// flush via a write-only guard-backed DMA source.
+//
+// Contract under test:
+// - `NvmeStaging::staged_dma_source` returns a guard-backed view straight
+//   over the staging mmap (zero-copy), 4 KiB-aligned for active blocks, so
+//   `write_block_from_staging` takes `write_block`'s `WriteData::Aligned`
+//   DMA branch (`nvme_unaligned_write_fallbacks` must not move — the PR 2
+//   contract detector; today's flush paths copy to a fresh heap `Bytes`
+//   first, which misses the aligned branch in test builds, so the counter
+//   assertions are RED until the guard-backed source lands).
+// - Normative sequencing: the guard is provably dead when the helper
+//   returns — a same-shard write-lock op (`remove_active_block`,
+//   `put_active_block`) immediately after the DMA must not self-deadlock.
+// - A guard-backed `Bytes` never enters any cache: striped flushes skip the
+//   read-LRU put entirely; promotion flushes put a REAL copy (its pointer
+//   must lie outside the staging mmap value range).
+// - `flush_due_active_blocks_for_inode`'s batch futures resolve carrying
+//   keys/sizes only — observable as the fsync batch path passing the same
+//   sequencing + aligned-DMA assertions.
+// - `--write-verification` read-back runs within the stated guard-hold
+//   bound: a sampled flush verifies against the guard-backed source and
+//   still releases the shard for same-shard mutations afterwards.
+// ---------------------------------------------------------------------------
+
+/// `nvme_unaligned_write_fallbacks` is process-global, so every test in this
+/// binary that submits `write_block` traffic serializes against the tests
+/// that assert counter deltas (same pattern as `tests/nvme_dev_tests.rs`).
+static WRITE_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    WRITE_SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+fn unaligned_fallbacks() -> u64 {
+    METRICS
+        .nvme_unaligned_write_fallbacks
+        .load(Ordering::Relaxed)
+}
+
+/// Direct staging + block-device sandbox (no FUSE layer): the sharpest view
+/// of the §5.5 source/helper contract.
+struct StagingSandbox {
+    nvme: squeezefs::cache::nvme::NvmeStaging,
+    dev: Arc<NvmeBlockDev>,
+    _backing: NamedTempFile,
+    _staging: TempDir,
+}
+
+async fn make_staging_sandbox(test_id: &str) -> StagingSandbox {
+    let dlm = DlmClient::new("local").unwrap();
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(32 * 1024 * 1024)
+        .unwrap();
+    let dev = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), test_id)
+            .await
+            .unwrap(),
+    );
+    let staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![staging.path().to_path_buf()],
+        Some("16MB"),
+        Some("16MB"),
+        Some("16MB"),
+        Some("16MB"),
+        dlm.meta_client().clone(),
+        ba,
+        dev.clone(),
+    )
+    .unwrap();
+    StagingSandbox {
+        nvme: cache.nvme.clone(),
+        dev,
+        _backing: backing,
+        _staging: staging,
+    }
+}
+
+/// §5.5 core + the same-shard flush-then-remove sequencing test: the DMA
+/// source is guard-backed (zero-copy over the staging mmap), aligned for the
+/// `WriteData::Aligned` branch, and provably dead when the helper returns so
+/// the same shard can be mutated immediately afterwards.
+#[tokio::test]
+async fn test_staged_dma_source_is_guard_backed_and_flush_then_remove_sequences() {
+    let _serial = serial().await;
+    let sb = make_staging_sandbox("dma_source_seq").await;
+    let key = squeezefs::keys::active_block(42, 0).to_string();
+    let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+    assert!(
+        sb.nvme.put_active_block(&key, &payload, 7),
+        "staging put refused on an empty pool"
+    );
+
+    // Zero-copy: the source must expose the exact mmap bytes the read guard
+    // exposes — not a heap copy of them.
+    let mmap_addr = {
+        let guard = sb
+            .nvme
+            .read_staged_zero_copy(&key)
+            .expect("staged entry must be readable");
+        guard.as_ptr() as usize
+    };
+    let source = sb
+        .nvme
+        .staged_dma_source(&key)
+        .expect("staged_dma_source must resolve a staged active block");
+    assert_eq!(
+        source.as_ref().as_ptr() as usize,
+        mmap_addr,
+        "StagedDmaSource must be guard-backed (a view over the staging mmap), not a copy"
+    );
+    assert_eq!(source.len(), payload.len());
+    assert!(!source.is_empty());
+    // §5.5 aligned-DMA caveat: active-block staging values sit at a 4 KiB
+    // boundary and are whole blocks, so the guard-backed source qualifies
+    // for the aligned branch by construction.
+    assert_eq!(
+        source.as_ref().as_ptr() as usize % 4096,
+        0,
+        "active-block staging value must be 4 KiB-aligned"
+    );
+    assert_eq!(
+        source.len() % 4096,
+        0,
+        "active-block staging value must be a whole block (4 KiB multiple)"
+    );
+
+    // Passthrough DMA straight off the mmap: must take the aligned branch.
+    let crypto = CryptoCompressState::new("none".to_string(), "none".to_string(), None);
+    let before = unaligned_fallbacks();
+    squeezefs::cache::nvme::write_block_from_staging(&crypto, &sb.dev, 0, source)
+        .await
+        .expect("guard-backed DMA failed");
+    assert_eq!(
+        unaligned_fallbacks() - before,
+        0,
+        "guard-backed staged flush must take write_block's zero-copy WriteData::Aligned branch"
+    );
+
+    let read_back = sb.dev.read_block(0, payload.len()).await.unwrap();
+    assert_eq!(read_back.as_ref(), &payload[..], "DMA content mismatch");
+
+    // Normative sequencing: the guard died inside the helper, so the
+    // same-shard WRITE-lock ops must proceed (a still-live guard-backed
+    // Bytes here is exactly the read->write self-deadlock §5.5 closes).
+    let nvme = sb.nvme.clone();
+    let k = key.clone();
+    let removed = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || nvme.remove_active_block(&k)),
+    )
+    .await
+    .expect("same-shard remove_active_block after the DMA self-deadlocked (guard still alive)")
+    .expect("remove task panicked")
+    .expect("staged entry vanished before removal");
+    assert_eq!(removed, payload, "removed staged value mismatch");
+
+    let nvme = sb.nvme.clone();
+    let k = key.clone();
+    let p = payload.clone();
+    let admitted = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || nvme.put_active_block(&k, &p, 8)),
+    )
+    .await
+    .expect("same-shard put_active_block after the DMA self-deadlocked (guard still alive)")
+    .expect("put task panicked");
+    assert!(
+        admitted,
+        "shard must stay writable after a guard-backed flush"
+    );
+}
+
+/// Non-passthrough leg of the normative §5.5 sequence: `process_write`
+/// consumes the guard-backed bytes into a fresh transform buffer, so the
+/// guard is dead BEFORE the DMA — and the shard is mutable right after.
+#[tokio::test]
+async fn test_write_block_from_staging_transform_leg_drops_guard_before_dma() {
+    let _serial = serial().await;
+    let sb = make_staging_sandbox("dma_source_lz4").await;
+    let key = squeezefs::keys::active_block(43, 0).to_string();
+    // Compressible payload: transform output is a fresh (smaller) buffer.
+    let payload = vec![0x5Au8; 65536];
+    assert!(sb.nvme.put_active_block(&key, &payload, 7));
+
+    let source = sb
+        .nvme
+        .staged_dma_source(&key)
+        .expect("staged_dma_source must resolve a staged active block");
+    let crypto = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    // The transform is deterministic: compute the expected on-device image
+    // from an independent copy of the plaintext.
+    let expected = crypto
+        .process_write(bytes::Bytes::copy_from_slice(&payload))
+        .expect("reference transform failed");
+    assert!(expected.len() < payload.len(), "payload must compress");
+
+    squeezefs::cache::nvme::write_block_from_staging(&crypto, &sb.dev, 0, source)
+        .await
+        .expect("transform-leg staged flush failed");
+
+    // Guard died inside process_write (fresh output buffer) — same-shard
+    // mutation must proceed.
+    let nvme = sb.nvme.clone();
+    let k = key.clone();
+    let removed = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || nvme.remove_active_block(&k)),
+    )
+    .await
+    .expect("same-shard remove_active_block after transform flush self-deadlocked")
+    .expect("remove task panicked")
+    .expect("staged entry vanished before removal");
+    assert_eq!(removed, payload);
+
+    // The device holds exactly the transform output (the compressed image),
+    // byte-for-byte.
+    let raw = sb.dev.read_block(0, expected.len()).await.unwrap();
+    assert_eq!(
+        raw.as_ref(),
+        expected.as_ref(),
+        "transform DMA image mismatch"
+    );
+    let plain = crypto
+        .process_read(&expected)
+        .expect("reference read-back failed");
+    assert_eq!(&plain[..], &payload[..], "transform round-trip mismatch");
+}
+
+/// Full FS harness used by the flush-path tests (block size 4096, so a
+/// 4097-byte write yields one content-complete staged active block plus a
+/// partial RAM tail).
+struct FlushHarness {
+    fs: SqueezefsFilesystem,
+    req: fuse3::raw::Request,
+    _backing: NamedTempFile,
+    _meta: NamedTempFile,
+    _staging: TempDir,
+}
+
+async fn make_flush_fs(test_id: &str) -> FlushHarness {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
+    let dlm = DlmClient::new("local").unwrap();
+
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let nvme_dev = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
+    let block_alloc = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), test_id)
+            .await
+            .unwrap(),
+    );
+    let staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![staging.path().to_path_buf()],
+        Some("32MB"),
+        Some("32MB"),
+        Some("64MB"),
+        Some("64MB"),
+        dlm.meta_client().clone(),
+        block_alloc.clone(),
+        nvme_dev.clone(),
+    )
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, block_alloc, nvme_dev);
+    let mut fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let meta = NamedTempFile::new().unwrap();
+    let meta_storage = MetaLvStorage::open(meta.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&meta_storage).await.unwrap();
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        Arc::new(MetaLvBackend::new(meta_storage)),
+    ]));
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed);
+
+    let req = fuse3::raw::Request {
+        unique: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        pid: 1234,
+    };
+    FlushHarness {
+        fs,
+        req,
+        _backing: backing,
+        _meta: meta,
+        _staging: staging,
+    }
+}
+
+async fn harness_write(h: &FlushHarness, ino: u64, off: u64, data: &[u8]) {
+    let w =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            off,
+            bytes::Bytes::copy_from_slice(data),
+            0,
+            0,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("write ino {ino} off {off} failed: {e:?}"));
+    assert_eq!(w.written as usize, data.len(), "short write at {off}");
+}
+
+async fn harness_read(h: &FlushHarness, ino: u64, off: u64, len: u32) -> Vec<u8> {
+    h.fs.read(h.req, ino, 0, off, len)
+        .await
+        .unwrap_or_else(|e| panic!("read ino {ino} failed: {e:?}"))
+        .data
+        .to_vec()
+}
+
+/// Striped flushes (the writeback path AND the fsync batch stage feeding
+/// `flush_due_active_blocks_for_inode` / `upload_single_active_block_data`)
+/// must DMA the staged bytes without the audit-#8 heap copy — observable as
+/// the aligned-branch counter staying flat across the flush window — and
+/// must never put a block into the read LRU (§5.5: guard-backed bytes are
+/// barred from every cache; the `!is_striped` gate keeps striped flushes
+/// put-free).
+#[tokio::test]
+async fn test_striped_flush_dma_zero_copy_aligned_no_lru_retention() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial().await;
+    let h = make_flush_fs("pr3_striped_flush").await;
+
+    let ino =
+        h.fs.create(
+            h.req,
+            1,
+            OsStr::new("pr3_striped.bin"),
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .unwrap()
+        .attr
+        .ino;
+
+    // Make the file striped first: the first big write of a fresh file
+    // routes through the router's direct striped path, not staging.
+    let p0: Vec<u8> = (0..8193u32).map(|i| (i % 199) as u8).collect();
+    harness_write(&h, ino, 0, &p0).await;
+
+    // The production staged shape: a non-block-multiple write on a striped
+    // file goes through write_file_staged — block 0 becomes content-complete
+    // (staging put + writeback enqueue), block 1 stays partial in RAM.
+    let p1: Vec<u8> = (0..4097u32).map(|i| ((i % 97) + 60) as u8).collect();
+    harness_write(&h, ino, 0, &p1).await;
+    let cache_key0 = squeezefs::keys::active_block(ino, 0).to_string();
+    assert!(
+        h.fs.router.cache.nvme.read_staged(&cache_key0).is_some(),
+        "premise: block 0 must be staged by the striped write_file_staged path"
+    );
+
+    // Flush window under measurement: spill the partial tail to staging,
+    // then flush every staged active block (deterministic: no background
+    // writeback worker without init()).
+    let fallbacks_before = unaligned_fallbacks();
+    h.fs.flush_all_memory_buffers_to_staging().await.unwrap();
+    let summary = h.fs.flush_all_staged_blocks_to_backend().await;
+    assert_eq!(summary.attempted, 2, "premise: blocks 0 and 1 staged");
+    assert_eq!(
+        summary.failed, 0,
+        "staged flush failures: {:?}",
+        summary.error_samples
+    );
+
+    // Zero-copy pin (RED pre-PR 3): every flushed block is a whole, 4 KiB-
+    // aligned staging-mmap value in passthrough mode, so every flush DMA must
+    // take WriteData::Aligned. The heap-copy flush misses the branch in test
+    // builds (system allocator) and bumps the PR 2 contract counter instead.
+    assert_eq!(
+        unaligned_fallbacks() - fallbacks_before,
+        0,
+        "staged-block flushes must DMA guard-backed aligned staging memory, \
+         not a bounced heap copy (audit #8)"
+    );
+
+    // Layout + §5.5 cache rule: striped flushes never enter the read LRU
+    // (no plaintext block cached for an already-striped file — neither a
+    // copy nor, worse, a guard-backed Bytes).
+    let file_path = squeezefs::keys::inode_path(ino);
+    h.fs.router.metadata_cache.remove(&file_path);
+    let meta = h.fs.router.fetch_metadata(&file_path).await.unwrap();
+    assert_eq!(meta.file_type, "striped");
+    let bm = meta
+        .block_map
+        .clone()
+        .expect("striped file must have a map");
+    for b in [0u32, 1u32] {
+        let k = bm
+            .get(&b)
+            .unwrap_or_else(|| panic!("block {b} mapping missing"))
+            .clone();
+        assert!(
+            h.fs.router.cache.read_lru.get(&k).is_none(),
+            "striped flush must not put block {b} ({k}) into the read LRU"
+        );
+    }
+
+    // Content: p1 over [0..4097), p0's tail beyond.
+    let mut expected = p1.clone();
+    expected.extend_from_slice(&p0[4097..]);
+    assert_eq!(
+        harness_read(&h, ino, 0, 8193).await,
+        expected,
+        "post-flush content mismatch"
+    );
+
+    // The staged active-block entries are consumed by the flush.
+    for b in [0u64, 1u64] {
+        let key = squeezefs::keys::active_block(ino, b).to_string();
+        assert!(
+            h.fs.router.cache.nvme.read_staged(&key).is_none(),
+            "flushed active block {b} must leave the staging ring"
+        );
+    }
+}
+
+/// Promotion flushes (`!is_striped`) DO seed the read LRU — but with a REAL
+/// copy, never the guard-backed staging bytes (an LRU entry has unbounded
+/// lifetime; holding the shard read lock through it would block every
+/// writer/evictor on that shard). Pointer-range check + a same-key re-stage
+/// prove the LRU entry is detached from the staging mmap.
+#[tokio::test]
+async fn test_promotion_flush_lru_entry_is_real_copy_not_guard_backed() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial().await;
+    let h = make_flush_fs("pr3_promotion_flush").await;
+
+    let ino =
+        h.fs.create(
+            h.req,
+            1,
+            OsStr::new("pr3_promo.bin"),
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .unwrap()
+        .attr
+        .ino;
+
+    // The `!is_striped` promotion flush fires when staged active blocks
+    // exist while the inode's meta is not (yet) striped — the teardown /
+    // meta-flip-race shape. Construct it directly: a staged active block for
+    // a still-inline inode, flushed through the public teardown API (which
+    // fetches meta per key and passes is_striped = false).
+    let p1: Vec<u8> = (0..4096u32).map(|i| (i % 211) as u8).collect();
+    let cache_key0 = squeezefs::keys::active_block(ino, 0).to_string();
+    let token = h.fs.dlm().get_fencing_token_ino(ino);
+    assert!(
+        h.fs.router
+            .cache
+            .nvme
+            .put_active_block(&cache_key0, &p1, token),
+        "staging put refused on an empty pool"
+    );
+
+    // Capture the staging-mmap value range of the staged block BEFORE the
+    // flush: any cache entry pointing into this range after the flush is a
+    // retained guard — the §5.5 violation.
+    let staged_range = {
+        let guard =
+            h.fs.router
+                .cache
+                .nvme
+                .read_staged_zero_copy(&cache_key0)
+                .expect("block 0 must be staged before the flush");
+        (guard.as_ptr() as usize, guard.len())
+    };
+
+    // Flush of a not-yet-striped inode: the promotion path (LRU seed).
+    let summary = h.fs.flush_all_staged_blocks_to_backend().await;
+    assert_eq!(summary.attempted, 1, "premise: exactly one staged block");
+    assert_eq!(
+        summary.failed, 0,
+        "promotion flush failures: {:?}",
+        summary.error_samples
+    );
+
+    let file_path = squeezefs::keys::inode_path(ino);
+    h.fs.router.metadata_cache.remove(&file_path);
+    let meta = h.fs.router.fetch_metadata(&file_path).await.unwrap();
+    let bm = meta
+        .block_map
+        .clone()
+        .expect("block map missing after flush");
+    let k0 = bm.get(&0).expect("block 0 mapping missing").clone();
+
+    let cached =
+        h.fs.router
+            .cache
+            .read_lru
+            .get(&k0)
+            .expect("promotion flush must seed the read LRU with block 0");
+    assert_eq!(cached.as_ref(), &p1[..], "LRU copy content mismatch");
+    let cached_addr = cached.as_ptr() as usize;
+    let (start, len) = staged_range;
+    assert!(
+        cached_addr < start || cached_addr >= start + len,
+        "read-LRU entry for {k0} aliases the staging mmap \
+         (guard-backed Bytes entered a cache — §5.5 violation)"
+    );
+
+    // With the LRU entry still alive, the SAME staging key (same shard by
+    // construction) must accept a write-lock op promptly: if the LRU held
+    // the guard, this would stall until eviction.
+    let nvme = h.fs.router.cache.nvme.clone();
+    let key0 = squeezefs::keys::active_block(ino, 0).to_string();
+    let payload = vec![0xEEu8; 4096];
+    let admitted = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || nvme.put_active_block(&key0, &payload, 99)),
+    )
+    .await
+    .expect("same-shard put stalled while a flushed block sat in the read LRU")
+    .expect("put task panicked");
+    assert!(admitted, "re-stage after promotion flush refused");
+}
+
+/// `--write-verification` read-back is part of the stated §5.5 guard-hold
+/// bound: a sampled flush verifies the DMA against the caller's (guard-
+/// backed) bytes and must still take the aligned branch, round-trip
+/// byte-exact, and release the shard afterwards.
+#[tokio::test]
+async fn test_flush_write_verification_readback_runs_within_guard_hold() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial().await;
+    let h = make_flush_fs("pr3_verified_flush").await;
+
+    let ino =
+        h.fs.create(
+            h.req,
+            1,
+            OsStr::new("pr3_verify.bin"),
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .unwrap()
+        .attr
+        .ino;
+
+    // Striped file with a staged complete block 0 + partial RAM block 1
+    // (same production shape as the striped-flush test).
+    let p0: Vec<u8> = (0..8193u32).map(|i| (i % 223) as u8).collect();
+    harness_write(&h, ino, 0, &p0).await;
+    let p1: Vec<u8> = (0..4097u32).map(|i| ((i % 113) + 5) as u8).collect();
+    harness_write(&h, ino, 0, &p1).await;
+
+    // Every flush write from here runs the sampled read-back verify against
+    // the caller's (guard-backed) payload.
+    squeezefs::set_write_verification(true);
+    squeezefs::set_write_verification_sample_rate(1);
+
+    h.fs.flush_all_memory_buffers_to_staging().await.unwrap();
+    let fallbacks_before = unaligned_fallbacks();
+    let summary = h.fs.flush_all_staged_blocks_to_backend().await;
+    squeezefs::set_write_verification(false);
+    assert_eq!(summary.attempted, 2, "premise: blocks 0 and 1 staged");
+    assert_eq!(
+        summary.failed, 0,
+        "verified flush failures: {:?}",
+        summary.error_samples
+    );
+
+    // RED pre-PR 3 for the same reason as the striped test: the flush DMA
+    // must come straight from aligned staging memory even when write_block
+    // keeps the payload alive for the sampled read-back verify.
+    assert_eq!(
+        unaligned_fallbacks() - fallbacks_before,
+        0,
+        "verified staged flush must still take the aligned zero-copy DMA branch"
+    );
+
+    let mut expected = p1.clone();
+    expected.extend_from_slice(&p0[4097..]);
+    assert_eq!(
+        harness_read(&h, ino, 0, 8193).await,
+        expected,
+        "verified flush content mismatch"
+    );
+
+    // Guard released after write+verify: the staging entries are gone and
+    // the shard accepts writes.
+    for b in 0..2u64 {
+        let key = squeezefs::keys::active_block(ino, b).to_string();
+        assert!(
+            h.fs.router.cache.nvme.read_staged(&key).is_none(),
+            "verified flush left block {b} in the staging ring"
+        );
+    }
+    let nvme = h.fs.router.cache.nvme.clone();
+    let key = squeezefs::keys::active_block(ino, 0).to_string();
+    let payload = vec![0x77u8; 4096];
+    let admitted = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || nvme.put_active_block(&key, &payload, 100)),
+    )
+    .await
+    .expect("shard write stalled after a verified flush (guard leaked past verify)")
+    .expect("put task panicked");
+    assert!(admitted);
+}
+
 #[tokio::test]
 async fn test_block_allocator_recovery() {
+    let _serial = serial().await;
     let _ = env_logger::builder().is_test(true).try_init();
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
 

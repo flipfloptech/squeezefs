@@ -435,6 +435,90 @@ async fn test_stage_write_shard_full_is_loud_never_lossy() {
     }
 }
 
+/// PR 3 eviction-latency guard (zero-copy write-path design §5.5): the
+/// guard-backed flush holds a staging-shard READ lock across exactly one
+/// transform-or-DMA (plus the sampled verify on verification mounts). That
+/// bound must keep same-pool writers/evictors live: concurrent staging churn
+/// (put/read/remove — all shard write-lock ops) racing a full guard-backed
+/// flush wave must complete promptly, and every flushed file must read back
+/// byte-exact. A retained guard (cache put, batch-future capture, drop after
+/// `remove_active_block`) turns this into a stall/deadlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_flush_guard_holds_do_not_stall_staging_churn() {
+    let h = make_with_write_cap("16MB").await;
+
+    // Four striped files, each with one content-complete STAGED active
+    // block plus a partial RAM tail: the first oversized write of a fresh
+    // file routes through the router's direct striped path, so grow the
+    // file first, then overwrite — the non-block-multiple overwrite of a
+    // striped file goes through write_file_staged and stages block 0.
+    let mut inos = Vec::new();
+    for i in 0..4u32 {
+        let fill = 0x40 + i as u8;
+        let ino = create(&h, &format!("guard_{i}.bin")).await;
+        write_at(&h, ino, 0, &vec![!fill; BLOCK_SIZE as usize + 1]).await;
+        write_at(&h, ino, 0, &vec![fill; BLOCK_SIZE as usize + 1]).await;
+        inos.push((ino, fill));
+    }
+
+    let h = Arc::new(h);
+
+    // (a) Flush everything: guard-backed DMAs in flight across the pool.
+    let flusher = {
+        let h = h.clone();
+        tokio::spawn(async move { h.fs.force_flush_all_staged_data().await })
+    };
+
+    // (b) Same-pool churn: put/read/remove active blocks while the flush
+    // wave holds staging read guards across device writes.
+    let churner = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            let payload = vec![0xEEu8; BLOCK_SIZE as usize];
+            for i in 0..64u64 {
+                let key = format!("active_block:inode_777000:block_{}", i % 4);
+                let hh = h.clone();
+                let k = key.clone();
+                let p = payload.clone();
+                let admitted =
+                    tokio::task::spawn_blocking(move || hh.nvme.put_active_block(&k, &p, 1))
+                        .await
+                        .expect("churn put panicked");
+                let _ = h.nvme.current_staged_write_bytes();
+                if admitted {
+                    let hh = h.clone();
+                    let k = key.clone();
+                    tokio::task::spawn_blocking(move || hh.nvme.remove_active_block(&k))
+                        .await
+                        .expect("churn remove panicked");
+                }
+            }
+        })
+    };
+
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let (f, c) = tokio::join!(flusher, churner);
+        f.expect("flush task panicked").expect("flush failed");
+        c.expect("churn task panicked");
+    })
+    .await;
+    assert!(
+        joined.is_ok(),
+        "guard-backed flush DMAs starved same-pool staging churn \
+         (evictor/writer wait no longer bounded — §5.5 hold-bound regression)"
+    );
+
+    // Flushed data intact after the churn race.
+    for (ino, fill) in inos {
+        let got = read_all(&h, ino, BLOCK_SIZE as u32 + 1).await;
+        assert_eq!(
+            got,
+            vec![fill; BLOCK_SIZE as usize + 1],
+            "file {fill:#x} corrupt after concurrent flush + staging churn"
+        );
+    }
+}
+
 /// Contract 5: remount seeds the budget from recovered *staged* entries only;
 /// orphan active blocks must not consume the staged budget, and recovered
 /// staged entries must still be creditable (ledger survives recovery).

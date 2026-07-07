@@ -820,3 +820,309 @@ async fn test_write_superblock_stamps_real_checksum() {
         "any byte change must change the checksum"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR 2 (design-wal-crash-consistency §4.4, Key Decision 5): quarantine inos
+// 1024–1151 — their 32 KiB xattr blocks (72 MiB + ino×32 KiB) physically
+// overlap the journal region [104 MiB, 108 MiB), a live corruption bug:
+// journaling scribbles their xattr blocks, and their xattr writes scribble
+// the journal. The range is reserved in the in-RAM allocator, marked in the
+// on-disk bitmap (format + mount/clean-unmount reconciliation, masked out of
+// the healed-bits metric), and legacy occupants degrade safely (EIO for
+// mutations and symlink-target reads, empty for regular xattr reads).
+// ---------------------------------------------------------------------------
+
+const Q_START: u64 = 1024;
+const Q_END: u64 = 1152;
+const XATTR_MAGIC: u32 = 0x5841_5452;
+
+fn eio(err: &squeezefs::error::SqueezefsError) -> bool {
+    err.to_errno() == libc::EIO
+}
+
+/// The quarantine constants are derived from the xattr/journal geometry and
+/// must pin the verified overlap: (104 MiB − 72 MiB)/32 KiB = 1024 and
+/// (108 MiB − 72 MiB)/32 KiB = 1152.
+#[test]
+fn test_quarantine_constants_pin_journal_overlap() {
+    assert_eq!(
+        squeezefs::meta_backend::xattr::QUARANTINE_INO_START,
+        Q_START
+    );
+    assert_eq!(squeezefs::meta_backend::xattr::QUARANTINE_INO_END, Q_END);
+}
+
+/// Exhaustion churn never yields a quarantined ino, and `allocated_count`
+/// stays truthful (reserved bits excluded from the popcount).
+#[test]
+fn test_quarantined_inos_never_allocated_under_exhaustion() {
+    use squeezefs::meta_backend::alloc::InodeAllocator;
+
+    let limit = 1300u64;
+    let a = InodeAllocator::new(limit);
+    let mut got = Vec::new();
+    while let Ok(ino) = a.alloc() {
+        assert!(
+            !(Q_START..Q_END).contains(&ino),
+            "alloc handed out quarantined ino {ino}"
+        );
+        got.push(ino);
+    }
+    let expect = (limit - 2) - (Q_END - Q_START);
+    assert_eq!(
+        got.len() as u64,
+        expect,
+        "exhaustion must hand out every allocatable ino exactly once, minus the quarantine range"
+    );
+    assert_eq!(
+        a.allocated_count(),
+        expect,
+        "allocated_count must exclude reserved (quarantined) bits"
+    );
+}
+
+/// `free` on a quarantined ino is a no-op: destroying a legacy occupant must
+/// not make its ino re-allocatable (its xattr block stays presumed-corrupt).
+#[test]
+fn test_quarantined_free_is_noop_realloc_never_returns_range() {
+    use squeezefs::meta_backend::alloc::InodeAllocator;
+
+    let a = InodeAllocator::new(1300);
+    while a.alloc().is_ok() {}
+    // Table full. Freeing inside the quarantine range releases nothing…
+    a.free(1024);
+    a.free(1100);
+    a.free(1151);
+    assert!(
+        a.alloc().is_err(),
+        "freeing quarantined inos must not make them allocatable"
+    );
+    assert!(a.is_set(1100), "quarantined bit must survive free()");
+    // …while freeing a real ino works normally.
+    a.free(1000);
+    assert_eq!(a.alloc().expect("freed slot reusable"), 1000);
+}
+
+/// Mutating xattr ops on a quarantined legacy ino fail with a clean EIO and
+/// never scribble the journal region; regular xattr reads degrade to empty
+/// even if the (journal-overlapped) block bytes happen to look like a valid
+/// xattr block.
+#[tokio::test]
+async fn test_setxattr_on_quarantined_legacy_ino_fails_eio_cleanly() {
+    use squeezefs::meta_backend::inode::{write_inode, DiskInode};
+    use squeezefs::meta_backend::xattr;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    // A legacy occupant: pre-fix binaries could allocate ino 1030.
+    let legacy_ino = 1030u64;
+    write_inode(
+        &storage,
+        legacy_ino,
+        &DiskInode::new(legacy_ino, libc::S_IFREG | 0o644, 0, 0),
+    )
+    .await
+    .unwrap();
+
+    // Its xattr block sits inside the journal region. Stamp bytes that LOOK
+    // like a valid xattr block (magic + one entry) — the resurrection case.
+    let block_offset = 1024 * 1024 * 72 + legacy_ino * 32768;
+    assert!(
+        (1024 * 1024 * 104..1024 * 1024 * 108).contains(&block_offset),
+        "test premise: ino {legacy_ino}'s xattr block overlaps the journal region"
+    );
+    let mut fake = vec![0u8; 4096];
+    fake[0..4].copy_from_slice(&XATTR_MAGIC.to_le_bytes());
+    fake[4..8].copy_from_slice(&1u32.to_le_bytes()); // num_entries = 1
+    fake[8..10].copy_from_slice(&5u16.to_le_bytes()); // val_len
+    fake[10] = 10; // key_len ("user.ghost")
+    fake[12..22].copy_from_slice(b"user.ghost");
+    storage
+        .write_blocks_direct(block_offset, &fake)
+        .await
+        .unwrap();
+
+    // Mutations: clean EIO, journal region untouched.
+    let err = xattr::set_xattr(&storage, legacy_ino, "user.k", b"v")
+        .await
+        .expect_err("setxattr on a quarantined ino must fail");
+    assert!(eio(&err), "setxattr must map to EIO, got {err}");
+    let err = xattr::remove_xattr(&storage, legacy_ino, "user.ghost")
+        .await
+        .expect_err("removexattr on a quarantined ino must fail");
+    assert!(eio(&err), "removexattr must map to EIO, got {err}");
+
+    let mut after = vec![0u8; 4096];
+    storage
+        .read_blocks_direct(block_offset, &mut after)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, fake,
+        "failed xattr mutations must not have written the journal region"
+    );
+
+    // Reads: deterministic degrade-to-empty, never the resurrected bytes.
+    assert_eq!(
+        xattr::get_xattr(&storage, legacy_ino, "user.ghost")
+            .await
+            .expect("regular xattr read degrades, not errors"),
+        None,
+        "quarantined regular xattr read must NOT serve journal-region bytes"
+    );
+    assert!(
+        xattr::list_xattrs(&storage, legacy_ino)
+            .await
+            .expect("list degrades, not errors")
+            .is_empty(),
+        "quarantined listxattr must be empty"
+    );
+}
+
+/// Symlink-target reads have NO magic guard (`inode.size` raw bytes are the
+/// content): a quarantined symlink must return EIO — an error beats serving
+/// journal-record garbage as a readlink target.
+#[tokio::test]
+async fn test_symlink_target_read_on_quarantined_ino_eio_not_garbage() {
+    use squeezefs::meta_backend::inode::{write_inode, DiskInode};
+    use squeezefs::meta_backend::xattr;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    let legacy_ino = 1040u64;
+    let mut di = DiskInode::new(legacy_ino, libc::S_IFLNK | 0o777, 0, 0);
+    di.size = 16; // pre-fix symlink whose target bytes are now journal records
+    write_inode(&storage, legacy_ino, &di).await.unwrap();
+
+    let block_offset = 1024 * 1024 * 72 + legacy_ino * 32768;
+    let mut garbage = vec![0u8; 4096];
+    garbage[..16].copy_from_slice(b"JOURNALGARBAGE!!");
+    storage
+        .write_blocks_direct(block_offset, &garbage)
+        .await
+        .unwrap();
+
+    let err = xattr::get_xattr(&storage, legacy_ino, "system.symlink")
+        .await
+        .expect_err("quarantined symlink-target read must error, not serve garbage");
+    assert!(eio(&err), "symlink-target read must map to EIO, got {err}");
+}
+
+/// The on-disk bitmap (offset 4096) carries the quarantine marks after
+/// format AND after every table-derived refresh (mount / clean unmount), so
+/// pre-PR-2b legacy-allocator binaries — which allocate from this bitmap —
+/// cannot hand out the range while the marks stand. The marks are masked out
+/// of the healed-bits XOR so `meta_inode_alloc_reconciled` keeps meaning
+/// *unexplained* divergence (round-2 review Issue 1).
+#[tokio::test]
+async fn test_legacy_bitmap_marks_quarantine() {
+    use squeezefs::fuse_client::METRICS;
+    use std::sync::atomic::Ordering;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    let read_bitmap = |s: &MetaLvStorage| {
+        let s = s.clone();
+        async move {
+            let mut bm = [0u8; 4096];
+            s.read_blocks_direct(4096, &mut bm).await.unwrap();
+            bm
+        }
+    };
+    let is_set = |bm: &[u8; 4096], i: u64| bm[(i / 8) as usize] & (1 << (i % 8)) != 0;
+
+    // After format.
+    let bm = read_bitmap(&storage).await;
+    for ino in Q_START..Q_END {
+        assert!(is_set(&bm, ino), "format must mark quarantined ino {ino}");
+    }
+    assert!(!is_set(&bm, Q_START - 1), "ino 1023 must stay free");
+    assert!(!is_set(&bm, Q_END), "ino 1152 must stay free");
+
+    // Simulate a pre-quarantine volume: erase the marks, then refresh (the
+    // mount / clean-unmount path). Marks must come back — and be masked out
+    // of the healed-bits accounting (they have no inode-table backing).
+    let mut legacy = bm;
+    for byte in (Q_START / 8) as usize..(Q_END / 8) as usize {
+        legacy[byte] = 0;
+    }
+    storage.write_blocks_direct(4096, &legacy).await.unwrap();
+
+    let before = METRICS.meta_inode_alloc_reconciled.load(Ordering::Relaxed);
+    storage.refresh_bitmap_from_table().await.unwrap();
+    let after = METRICS.meta_inode_alloc_reconciled.load(Ordering::Relaxed);
+    assert_eq!(
+        after - before,
+        0,
+        "quarantine bits must be masked out of the healed-bits XOR"
+    );
+
+    let bm = read_bitmap(&storage).await;
+    for ino in Q_START..Q_END {
+        assert!(
+            is_set(&bm, ino),
+            "refresh must re-mark quarantined ino {ino}"
+        );
+    }
+
+    // A second (clean) refresh still heals zero.
+    let before = METRICS.meta_inode_alloc_reconciled.load(Ordering::Relaxed);
+    storage.refresh_bitmap_from_table().await.unwrap();
+    let after = METRICS.meta_inode_alloc_reconciled.load(Ordering::Relaxed);
+    assert_eq!(after - before, 0, "clean refresh must heal zero bits");
+}
+
+/// Mount reconciliation counts magic-valid inodes found INSIDE the
+/// quarantined range (legacy overlap victims) into `meta_quarantined_inodes`
+/// and keeps them unallocatable.
+#[tokio::test]
+async fn test_quarantined_metric_counts_legacy_occupants() {
+    use squeezefs::fuse_client::METRICS;
+    use squeezefs::meta_backend::inode::{write_inode, DiskInode};
+    use std::sync::atomic::Ordering;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    write_inode(
+        &storage,
+        1030,
+        &DiskInode::new(1030, libc::S_IFREG | 0o644, 0, 0),
+    )
+    .await
+    .unwrap();
+    let mut link = DiskInode::new(1040, libc::S_IFLNK | 0o777, 0, 0);
+    link.size = 4;
+    write_inode(&storage, 1040, &link).await.unwrap();
+
+    // Fresh mount over the same bytes.
+    let storage2 = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    let before = METRICS.meta_quarantined_inodes.load(Ordering::Relaxed);
+    storage2.seed_inode_alloc_from_table().await.unwrap();
+    let after = METRICS.meta_quarantined_inodes.load(Ordering::Relaxed);
+    assert!(
+        after - before >= 2,
+        "two legacy occupants must be counted (delta {})",
+        after - before
+    );
+
+    // Their slots remain seeded/valid, and the range stays unallocatable.
+    assert!(storage2.inode_alloc.is_set(1030));
+    assert!(storage2.inode_alloc.is_set(1040));
+    for _ in 0..100 {
+        match storage2.inode_alloc.alloc() {
+            Ok(ino) => assert!(
+                !(Q_START..Q_END).contains(&ino),
+                "alloc returned quarantined ino {ino}"
+            ),
+            Err(_) => break,
+        }
+    }
+}

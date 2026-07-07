@@ -523,3 +523,144 @@ async fn test_virtual_inodes_open_direct_io() {
         "reads beyond the first page must serve the fresh generation"
     );
 }
+
+/// PR 1 of docs/design-zero-copy-write-path.md (§5.2, P0): a zero-copy read
+/// reply served from a dirty active-block buffer must stay byte-identical for
+/// its whole lifetime, even when the same block is overwritten afterwards.
+///
+/// Today the merge in `write_file_staged` mutates the *shared* `bytes::Bytes`
+/// through a raw pointer (`fuse_client.rs:1383-1390`) while the read path
+/// hands out zero-copy slices of the very same buffer (`:2617-2628`) — UB,
+/// and observable read-your-own-writes instability: the held reply changes
+/// underneath the reader. This test encodes the bug as a failure and pins the
+/// CoW contract: writers that find a live snapshot copy first, and the CoW
+/// event is observable as the `active_block_cow_copies` stat.
+#[tokio::test]
+async fn test_active_block_read_snapshot_stable_across_overwrite() {
+    let h = make().await;
+    let ino = create(&h, "ryw_snap").await;
+
+    // 200_000 bytes @ 64 KiB blocks => striped (first write goes through the
+    // router's striped path; no active buffer yet).
+    let mut content = pattern(200_000);
+    write_at(&h, ino, 0, &content).await;
+
+    // Partial overwrite inside block 3 [196608, 262144): routes through
+    // write_file_staged, RMW-seeds an in-RAM active-block buffer, and — being
+    // partial — leaves it dirty in active_block_buffers.
+    let patch1 = vec![0xABu8; 1024];
+    write_at(&h, ino, 196_608 + 512, &patch1).await;
+    content[196_608 + 512..196_608 + 512 + 1024].copy_from_slice(&patch1);
+
+    // Hold the zero-copy reply for a range of the dirty block.
+    let held =
+        h.fs.read(h.req, ino, 0, 196_608, 2048)
+            .await
+            .expect("read of dirty active block")
+            .data;
+    let expected = &content[196_608..196_608 + 2048];
+    assert_eq!(
+        &held[..],
+        expected,
+        "read returned wrong bytes at hold time"
+    );
+
+    // Overwrite an overlapping range of the same (still-dirty) block.
+    let patch2 = vec![0xCDu8; 512];
+    write_at(&h, ino, 196_608 + 256, &patch2).await;
+
+    // The held reply must not have been mutated underneath us.
+    assert_eq!(
+        &held[..],
+        expected,
+        "zero-copy read reply mutated by a later write to the same active \
+         block (shared-Bytes in-place mutation)"
+    );
+
+    // Read-your-own-writes: a fresh read observes the merged content.
+    let mut merged = expected.to_vec();
+    merged[256..256 + 512].copy_from_slice(&patch2);
+    let after = read_at(&h, ino, 196_608, 2048).await;
+    assert_eq!(after, merged, "post-overwrite read must see the merge");
+
+    // The write above collided with our live snapshot, so exactly this path
+    // must have paid the copy-on-write — observable on the stats surface.
+    let stats: serde_json::Value =
+        serde_json::from_str(&h.fs.generate_stats_json().await).expect("stats JSON parses");
+    let cow = stats["metrics"]["active_block_cow_copies"]
+        .as_u64()
+        .expect("active_block_cow_copies stat present");
+    assert!(
+        cow >= 1,
+        "a write colliding with a live snapshot must be counted as a CoW copy"
+    );
+}
+
+/// Same contract under real concurrency: N readers hold zero-copy replies of
+/// the dirty tail block while a writer keeps overwriting it. Every held reply
+/// must remain byte-identical to its at-hold copy, and the final read must
+/// observe the last write (read-your-own-writes). Coordination is via
+/// `Barrier`/`watch` — no sleeps.
+#[rstest::rstest]
+#[case::two_readers(2, 3)]
+#[case::many_readers(8, 5)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_active_block_snapshots_stable_under_concurrent_writers(
+    #[case] readers: usize,
+    #[case] write_rounds: usize,
+) {
+    let h = std::sync::Arc::new(make().await);
+    let ino = create(&h, "cow_race").await;
+
+    // Striped file, then a partial overwrite inside the tail block so
+    // [196608, 200000) becomes a dirty in-RAM active-block buffer.
+    write_at(&h, ino, 0, &pattern(200_000)).await;
+    let tail_off = 196_608u64;
+    let tail_len = 200_000usize - 196_608;
+    write_at(&h, ino, tail_off, &vec![0u8; tail_len]).await;
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(readers + 1));
+    let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..readers {
+        let h = h.clone();
+        let barrier = barrier.clone();
+        let mut done_rx = done_rx.clone();
+        tasks.spawn(async move {
+            let held =
+                h.fs.read(h.req, ino, 0, tail_off, tail_len as u32)
+                    .await
+                    .expect("read of dirty active block")
+                    .data;
+            let at_hold = held.to_vec();
+            barrier.wait().await; // writer starts only after every hold
+            while !*done_rx.borrow_and_update() {
+                done_rx.changed().await.expect("writer done signal");
+            }
+            assert_eq!(
+                &held[..],
+                &at_hold[..],
+                "held zero-copy read reply mutated by concurrent writes \
+                 (shared-Bytes in-place mutation)"
+            );
+        });
+    }
+
+    barrier.wait().await;
+    for round in 1..=write_rounds {
+        write_at(&h, ino, tail_off, &vec![round as u8; tail_len]).await;
+    }
+    done_tx.send(true).expect("readers alive");
+    while let Some(res) = tasks.join_next().await {
+        res.expect("reader task must not panic");
+    }
+
+    // Read-your-own-writes: the final content is the last round's pattern.
+    let after = read_at(&h, ino, tail_off, tail_len as u32).await;
+    assert_eq!(
+        after,
+        vec![write_rounds as u8; tail_len],
+        "final read must observe the last write"
+    );
+}

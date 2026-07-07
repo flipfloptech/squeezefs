@@ -1053,6 +1053,47 @@ mod tests {
         assert_eq!(&g3.guard.mmap[g3.offset..g3.offset + g3.len], v3.as_ref());
     }
 
+    /// Re-`put` of a key must not leave divergent duplicates across
+    /// devices, and `remove` must purge every copy: the round-robin `put`
+    /// could land a re-cache of the same block key on a different device,
+    /// and first-hit `remove` then left a stale survivor that `get` (device
+    /// scan order) served after a purge — dead bytes after a displaced-key
+    /// invalidation.
+    #[test]
+    fn test_multi_device_reput_and_remove_leave_no_stale_duplicate() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let cache =
+            NvmeCache::new(&[dir1.path(), dir2.path()], &[4096, 4096], 1).unwrap();
+
+        let key = Bytes::from("block_dup");
+        let v1 = Bytes::from(vec![0x11u8; 64]);
+        let v2 = Bytes::from(vec![0x22u8; 64]);
+
+        // Interleave with other keys so the round-robin counter points at a
+        // different device for the re-put of the same key.
+        cache.put(key.clone(), v1.clone());
+        cache.put(Bytes::from("filler_a"), Bytes::from(vec![0u8; 16]));
+        cache.put(key.clone(), v2.clone());
+
+        // Whatever device it lives on, the current value must be v2.
+        {
+            let g = cache.get(&key).expect("key must be resident");
+            assert_eq!(
+                &g.guard.mmap[g.offset..g.offset + g.len],
+                v2.as_ref(),
+                "get served a stale duplicate from another device"
+            );
+        }
+
+        // A purge must remove EVERY copy on every device.
+        assert!(cache.remove(&key).is_some());
+        assert!(
+            cache.get(&key).is_none(),
+            "a stale duplicate survived remove() on another device"
+        );
+    }
+
     #[tokio::test]
     async fn test_nvme_cache_multi_rail_migration() {
         let dir1 = tempdir().unwrap();

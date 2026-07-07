@@ -587,3 +587,236 @@ async fn test_routed_concurrent_mkdir_no_lost_inodes() {
         h.await.expect("join task");
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR 1 (design-wal-crash-consistency §PR 1, Key Decision 7, resolved OQ 4):
+// mount-time superblock validation — fail loud on unknown format — plus a
+// real xxh3_64 checksum in the (previously always-zero) `checksum` field.
+//
+// Superblock byte layout (repr(C), 56 bytes, no padding):
+//   magic 0..8 | version 8..12 | inode_count 12..16 |
+//   free_inode_bitmap_root 16..24 | dentry_root 24..32 |
+//   journal_start 32..40 | journal_size 40..48 | checksum 48..56
+// ---------------------------------------------------------------------------
+
+const SB_VERSION_OFF: usize = 8;
+const SB_DENTRY_ROOT_OFF: usize = 24;
+const SB_CHECKSUM_OFF: usize = 48;
+
+async fn read_sector0(storage: &MetaLvStorage) -> [u8; 4096] {
+    let mut buf = [0u8; 4096];
+    storage.read_blocks_direct(0, &mut buf).await.unwrap();
+    buf
+}
+
+/// Fresh format ⇒ `validate_superblock` passes, returns the parsed superblock
+/// (magic + version 2), and the on-disk `checksum` field is a real (nonzero)
+/// value — the formatted-then-mounted round-trip, including across a re-open.
+#[tokio::test]
+async fn test_validate_superblock_fresh_format_round_trip() {
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    let sb = storage
+        .validate_superblock()
+        .await
+        .expect("freshly formatted volume must validate");
+    assert_eq!(&sb.magic, squeezefs::meta_backend::storage::MAGIC_VALUE);
+    assert_eq!(sb.version, 2, "format writes version 2");
+    assert_ne!(
+        sb.checksum, 0,
+        "PR 1: format must persist a real checksum, not the legacy 0"
+    );
+
+    // Simulated remount: a fresh MetaLvStorage over the same bytes validates.
+    let storage2 = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    let sb2 = storage2
+        .validate_superblock()
+        .await
+        .expect("remount of a valid volume must validate");
+    assert_eq!(
+        sb2.checksum, sb.checksum,
+        "checksum is stable across mounts"
+    );
+}
+
+/// A blank (auto-created or zero-filled) meta path is NOT silently mounted:
+/// validation fails loud with an actionable "not formatted — run `squeezefs
+/// format`" error, distinguished from garbage-magic corruption (Key Decision 7,
+/// review Issue 7). Covers both the missing-path case (open auto-creates the
+/// backing file) and a pre-existing all-zero file.
+#[tokio::test]
+async fn test_validate_superblock_blank_volume_fails_not_formatted() {
+    // Missing path: open() creates the file (create(true) is retained by
+    // design — the format flow needs it); validation must still refuse.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("never_formatted.meta");
+    let storage = MetaLvStorage::open(&missing, 64 * 1024 * 1024).unwrap();
+    let err = storage
+        .validate_superblock()
+        .await
+        .expect_err("a blank auto-created volume must not validate");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not formatted"),
+        "blank volume error must say it is not formatted, got: {msg}"
+    );
+    assert!(
+        msg.contains("squeezefs format"),
+        "blank volume error must point at `squeezefs format`, got: {msg}"
+    );
+
+    // Pre-existing zero-filled file behaves identically.
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 64 * 1024 * 1024).unwrap();
+    let err = storage
+        .validate_superblock()
+        .await
+        .expect_err("an all-zero volume must not validate");
+    assert!(
+        err.to_string().contains("not formatted"),
+        "zero-filled volume must produce the not-formatted error, got: {err}"
+    );
+}
+
+/// Garbage magic ⇒ validation fails naming the magic (corruption / foreign
+/// format is not the same operator error as "you forgot to format").
+#[tokio::test]
+async fn test_validate_superblock_garbage_magic_names_magic() {
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    let mut sector = read_sector0(&storage).await;
+    sector[..8].copy_from_slice(b"GARBAGE!");
+    storage.write_blocks_direct(0, &sector).await.unwrap();
+
+    let err = storage
+        .validate_superblock()
+        .await
+        .expect_err("garbage magic must not validate");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("magic"),
+        "garbage-magic error must name the magic, got: {msg}"
+    );
+    assert!(
+        !msg.contains("not formatted"),
+        "garbage magic is corruption, not the blank-volume case: {msg}"
+    );
+}
+
+/// A version this binary does not know (99) ⇒ fail loud, naming the version.
+/// The version check runs BEFORE checksum verification: a future format bump
+/// may change checksum semantics, so the raw-patched (stale-checksum) sector
+/// must still report the version as the reason.
+#[tokio::test]
+async fn test_validate_superblock_future_version_fails() {
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    let mut sector = read_sector0(&storage).await;
+    sector[SB_VERSION_OFF..SB_VERSION_OFF + 4].copy_from_slice(&99u32.to_le_bytes());
+    storage.write_blocks_direct(0, &sector).await.unwrap();
+
+    let err = storage
+        .validate_superblock()
+        .await
+        .expect_err("version 99 must not validate");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("version") && msg.contains("99"),
+        "future-version error must name the version, got: {msg}"
+    );
+    assert!(
+        !msg.contains("checksum"),
+        "version must be rejected before checksum verification, got: {msg}"
+    );
+}
+
+/// A corrupted byte under a nonzero checksum ⇒ validation fails naming the
+/// checksum (resolved Open Question 4: verify-if-nonzero).
+#[tokio::test]
+async fn test_validate_superblock_corrupted_byte_names_checksum() {
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    let mut sector = read_sector0(&storage).await;
+    sector[SB_DENTRY_ROOT_OFF] ^= 0xFF; // flip a byte inside dentry_root
+    storage.write_blocks_direct(0, &sector).await.unwrap();
+
+    let err = storage
+        .validate_superblock()
+        .await
+        .expect_err("a corrupted superblock byte under a nonzero checksum must not validate");
+    assert!(
+        err.to_string().contains("checksum"),
+        "corruption error must name the checksum, got: {err}"
+    );
+}
+
+/// A legacy volume (checksum field == 0, as every pre-PR-1 binary wrote) must
+/// keep mounting: verification is skipped iff the stored checksum is zero —
+/// backward compatible in both directions (Data Model §6).
+#[tokio::test]
+async fn test_validate_superblock_legacy_zero_checksum_skips_verification() {
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    // Rewrite the superblock exactly as a pre-PR-1 binary left it: same
+    // fields, checksum zeroed (which no longer matches the struct bytes).
+    let mut sector = read_sector0(&storage).await;
+    sector[SB_CHECKSUM_OFF..SB_CHECKSUM_OFF + 8].copy_from_slice(&0u64.to_le_bytes());
+    storage.write_blocks_direct(0, &sector).await.unwrap();
+
+    let sb = storage
+        .validate_superblock()
+        .await
+        .expect("legacy zero-checksum volume must mount with verification skipped");
+    assert_eq!(
+        sb.checksum, 0,
+        "the legacy zero checksum is preserved as-read"
+    );
+    assert_eq!(sb.version, 2);
+}
+
+/// `write_superblock` is the single choke point that stamps the real checksum:
+/// writing a struct whose checksum field is 0 (or stale) must land a nonzero,
+/// self-consistent value on disk — so every writer (format included) persists
+/// a verifiable superblock without each call site computing it.
+#[tokio::test]
+async fn test_write_superblock_stamps_real_checksum() {
+    use squeezefs::meta_backend::storage::Superblock;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    let mut sb = storage.read_superblock().await.unwrap();
+    sb.inode_count = 424242; // mutate a field, leave the (now stale) checksum
+    storage.write_superblock(&sb).await.unwrap();
+
+    let on_disk = storage
+        .validate_superblock()
+        .await
+        .expect("write_superblock must leave a self-consistent checksum");
+    assert_eq!(on_disk.inode_count, 424242, "field mutation persisted");
+    assert_ne!(on_disk.checksum, 0, "stamped checksum must be nonzero");
+    assert_eq!(
+        on_disk.checksum,
+        on_disk.compute_checksum(),
+        "stored checksum must equal xxh3_64 over the struct bytes with the checksum field zeroed"
+    );
+    // Type-level pin: compute_checksum is a pure function of the struct.
+    let mut copy: Superblock = on_disk;
+    copy.dentry_root ^= 1;
+    assert_ne!(
+        copy.compute_checksum(),
+        on_disk.compute_checksum(),
+        "any byte change must change the checksum"
+    );
+}

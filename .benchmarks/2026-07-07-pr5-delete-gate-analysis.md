@@ -58,3 +58,45 @@ stated scope (its Non-Goals exclude data-path work). Closing it would mean
 investigating deferred-eviction strategies (e.g. releasing pages before
 reply, invalidation batching), which warrants its own investigation rather
 than a bolt-on here.
+
+---
+
+## Addendum: eviction-residual attribution (quiet-machine A/B, load < 5)
+
+Scratch TTL knob + `--no-writeback` A/B on otherwise-identical unprivileged
+mounts (120 × 4 MiB settled files, serialized unlink), with per-op FUSE
+round-trip counting via debug-log deltas:
+
+| Case | µs/op | FUSE round-trips per unlink |
+|---|---|---|
+| control (1 s reply TTLs, writeback on) | 346 | LOOKUP + GETATTR + UNLINK |
+| reply TTLs 30 s | 315 | GETATTR + UNLINK |
+| TTLs 30 s + `--no-writeback` | 259 | GETATTR + UNLINK |
+| fd held open (eviction deferred) | 142 | UNLINK |
+
+Decomposition of the ~205 µs above the transport floor:
+- **~30 µs — entry-TTL revalidation LOOKUP**: settled files outlive the 1 s
+  entry TTL, so the kernel re-LOOKUPs before UNLINK. (Also explains the
+  earlier "settled slower than dirty" anomaly: freshly-written files still
+  hold a valid dentry.) Raising reply TTLs is a coherency trade on a
+  distributed filesystem — not taken as a default; candidate operator knob.
+- **~30 µs — parent GETATTR**: kernel invalidates the parent's attrs after
+  every unlink (`AUTO_INVAL_DATA` posture). Inherent.
+- **~55 µs — writeback-cache eviction tax** (346→259 delta net of TTL):
+  writeback mode makes `iput_final` walk the writeback machinery per inode.
+  Toggling writeback off is not a fix (kept deliberately for the write
+  path); documented as a delete-heavy-workload operator note.
+- **~120 µs — inline `truncate_inode_pages` of 4 MiB page cache** in the
+  unlink syscall. The daemon cannot pre-drop those pages: the
+  FUSE-over-io_uring transport currently REJECTS outbound notify
+  (`fuse_notify_inval_*` unsupported in the vendored fuse3 over-uring write
+  path, `third_party/fuse3/src/raw/connection/tokio.rs:552-560`), so
+  notify-based pre-eviction (or kernel ≥ 6.16 `FUSE_NOTIFY_INC_EPOCH`-style
+  approaches) requires a transport feature first.
+
+**Follow-up filed**: "notifications over FUSE-over-io_uring" transport
+feature (enables pre-eviction invalidation, plus the long-standing inval
+use-cases the tokio path already supports) — its own design; the remaining
+per-round-trip tax (eventfd wake + re-arm submit per reply,
+`fuse_over_uring.rs:510-540`, `:961-967`) is a second, independent
+transport optimization candidate.

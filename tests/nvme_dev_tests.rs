@@ -1,10 +1,35 @@
+use squeezefs::cache::active_block::ActiveBlockBuf;
+use squeezefs::cache::pool::{BUFFER_POOL, POOLED_BUF_ALIGN};
+use squeezefs::fuse_client::METRICS;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 use tempfile::NamedTempFile;
+
+/// `nvme_unaligned_write_fallbacks` is process-global, so tests that submit
+/// writes (all of which may move the counter) serialize against the tests
+/// that assert counter deltas. Keeps every test exact under the default
+/// parallel test runner, not just under `--test-threads=1`.
+static WRITE_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    WRITE_SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+fn unaligned_fallbacks() -> u64 {
+    METRICS
+        .nvme_unaligned_write_fallbacks
+        .load(Ordering::Relaxed)
+}
 
 #[tokio::test]
 async fn test_write_block_to_offset() {
+    let _serial = serial().await;
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
 
@@ -36,6 +61,7 @@ async fn test_write_block_to_offset() {
 
 #[tokio::test]
 async fn test_read_block_from_offset() {
+    let _serial = serial().await;
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
 
@@ -69,6 +95,7 @@ async fn test_read_block_from_offset() {
 
 #[tokio::test]
 async fn test_concurrent_stress() {
+    let _serial = serial().await;
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
 
@@ -104,10 +131,123 @@ async fn test_concurrent_stress() {
     }
 }
 
+/// Zero-copy write-path design §5.6 (PR 2): pooled write sources are
+/// contractually 4 KiB-aligned, so a full-block pooled payload must take
+/// `write_block`'s zero-copy `WriteData::Aligned` DMA branch — observable as
+/// the `nvme_unaligned_write_fallbacks` counter *not* moving. Covers both
+/// pooled provenances: a `BUFFER_POOL` `PooledBuf::into_bytes` payload (the
+/// striped router write source) and an `ALIGNED_BUF_POOL`-backed
+/// `ActiveBlockBuf::snapshot` (the active-block flush/upload source).
+#[tokio::test]
+async fn test_pooled_write_sources_take_aligned_dma_branch() {
+    let _serial = serial().await;
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    let file = File::create(&path).unwrap();
+    file.set_len(16 * 1024 * 1024).unwrap();
+
+    let dev = NvmeBlockDev::new(path.to_str().unwrap());
+    let block = 4 * 1024 * 1024usize;
+
+    // (a) BUFFER_POOL source (DataRouter striped write shape).
+    let mut pooled = BUFFER_POOL.alloc();
+    pooled.resize(block, 0);
+    for (i, b) in pooled.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let payload = pooled.into_bytes();
+    assert_eq!(
+        payload.as_ptr() as usize % POOLED_BUF_ALIGN,
+        0,
+        "pooled payload pointer must honor the alignment contract"
+    );
+
+    let before = unaligned_fallbacks();
+    dev.write_block(0, payload.clone())
+        .await
+        .expect("pooled write");
+    assert_eq!(
+        unaligned_fallbacks(),
+        before,
+        "a full-block BUFFER_POOL payload must take the aligned DMA branch, \
+         not the bounce-copy fallback"
+    );
+    let read_back = dev.read_block(0, block).await.expect("read back");
+    assert_eq!(
+        read_back.as_ref(),
+        payload.as_ref(),
+        "aligned-branch write must round-trip byte-exact"
+    );
+
+    // (b) ActiveBlockBuf snapshot source (active-block flush/upload shape).
+    let mut abb = ActiveBlockBuf::zeroed(block);
+    for (i, b) in abb.make_mut().iter_mut().enumerate() {
+        *b = (i % 239) as u8;
+    }
+    let snap = abb.snapshot();
+    assert_eq!(
+        snap.as_ptr() as usize % POOLED_BUF_ALIGN,
+        0,
+        "active-block snapshot must honor the alignment contract"
+    );
+
+    let before = unaligned_fallbacks();
+    dev.write_block(block as u64, snap.clone())
+        .await
+        .expect("snapshot write");
+    assert_eq!(
+        unaligned_fallbacks(),
+        before,
+        "an ActiveBlockBuf snapshot must take the aligned DMA branch"
+    );
+    let read_back = dev
+        .read_block(block as u64, block)
+        .await
+        .expect("read back");
+    assert_eq!(
+        read_back.as_ref(),
+        snap.as_ref(),
+        "aligned-branch snapshot write must round-trip byte-exact"
+    );
+}
+
+/// The fallback detector itself: a payload that can never take the DMA
+/// branch (non-4 KiB-multiple length) must be counted as exactly one
+/// fallback — and still complete correctly via the bounce copy (the
+/// fallback stays never-lossy, just observable).
+#[tokio::test]
+async fn test_unaligned_length_write_counts_fallback() {
+    let _serial = serial().await;
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    let file = File::create(&path).unwrap();
+    file.set_len(8 * 1024 * 1024).unwrap();
+
+    let dev = NvmeBlockDev::new(path.to_str().unwrap());
+    let data: Vec<u8> = (0u8..123).collect();
+
+    let before = unaligned_fallbacks();
+    dev.write_block(4096, bytes::Bytes::from(data.clone()))
+        .await
+        .expect("unaligned-length write should succeed via the bounce copy");
+    assert_eq!(
+        unaligned_fallbacks(),
+        before + 1,
+        "a non-4KiB-multiple write must be counted as an unaligned fallback"
+    );
+
+    let read_back = dev
+        .read_block(4096, data.len())
+        .await
+        .expect("read after unaligned-length write");
+    assert_eq!(read_back.as_ref(), data.as_slice());
+}
+
 /// Exercise the unaligned write path (posix_memalign + copy in nvme_dev) to prevent
 /// regressions in buffer management / leaks on that branch.
 #[tokio::test]
 async fn test_write_unaligned_size() {
+    let _serial = serial().await;
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
 
@@ -140,6 +280,7 @@ async fn test_drop_device_during_unaligned_writes_joins_cleanly() {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    let _serial = serial().await;
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
     let file = File::create(&path).unwrap();
@@ -176,6 +317,7 @@ async fn test_drop_device_during_unaligned_writes_joins_cleanly() {
 async fn test_drop_after_unaligned_burst_does_not_hang() {
     use std::time::{Duration, Instant};
 
+    let _serial = serial().await;
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
     let file = File::create(&path).unwrap();

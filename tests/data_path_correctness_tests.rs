@@ -524,6 +524,23 @@ async fn test_virtual_inodes_open_direct_io() {
     );
 }
 
+/// PR 2 of docs/design-zero-copy-write-path.md (§5.6 / Observability): the
+/// pooled-buffer alignment-contract violation detector
+/// (`nvme_unaligned_write_fallbacks`) must be exposed on the stats surface —
+/// it is the live regression signal that `write_block`'s zero-copy DMA
+/// branch stays guaranteed for pooled sources ("must stay 0" on aligned
+/// workloads).
+#[tokio::test]
+async fn test_stats_surface_exposes_nvme_unaligned_write_fallbacks() {
+    let h = make().await;
+    let stats: serde_json::Value =
+        serde_json::from_str(&h.fs.generate_stats_json().await).expect("stats JSON parses");
+    assert!(
+        stats["metrics"]["nvme_unaligned_write_fallbacks"].is_u64(),
+        "nvme_unaligned_write_fallbacks must be exposed on the stats inode"
+    );
+}
+
 /// PR 1 of docs/design-zero-copy-write-path.md (§5.2, P0): a zero-copy read
 /// reply served from a dirty active-block buffer must stay byte-identical for
 /// its whole lifetime, even when the same block is overwritten afterwards.

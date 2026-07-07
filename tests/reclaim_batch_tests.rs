@@ -334,3 +334,175 @@ async fn test_metrics_reclaim_batch_size_recorded() {
         after - before
     );
 }
+
+/// The batched destroy also kills each corpse's xattr block (layout entry)
+/// INSIDE the same transaction — reclaim must not issue a per-corpse
+/// removexattr commit (that doubled meta-commit traffic under delete
+/// storms and its sector guards collided with foreground unlinks), and an
+/// ino reused after reclaim must not resurrect the corpse's layout xattr.
+#[tokio::test]
+async fn test_destroy_inodes_kills_xattrs_in_the_same_transaction() {
+    use squeezefs::meta_backend::xattr;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+    let backend = MetaLvBackend::new(storage);
+
+    let mut inos = Vec::new();
+    for i in 0..8 {
+        let f = backend
+            .create(1, &format!("x{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        xattr::set_xattr(&backend.storage, f.ino, "layout", b"striped-blockmap")
+            .await
+            .unwrap();
+        inos.push(f.ino);
+    }
+    for i in 0..8 {
+        backend.unlink(1, &format!("x{i}")).await.unwrap();
+    }
+
+    let commits_before = hist_count(&METRICS.meta_commit_sectors.buckets);
+    backend
+        .destroy_inodes(&inos)
+        .await
+        .expect("batch destroy with xattr-carrying corpses");
+    let commits_after = hist_count(&METRICS.meta_commit_sectors.buckets);
+    assert_eq!(
+        commits_after - commits_before,
+        1,
+        "xattr kill must ride the SAME transaction — no per-corpse removexattr commits"
+    );
+
+    // Reuse the inos: fresh files must see no layout ghost.
+    for (i, &old_ino) in inos.iter().enumerate() {
+        let f = backend
+            .create(1, &format!("fresh{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(f.ino, old_ino, "freed ino must be reused for this probe");
+        assert_eq!(
+            xattr::get_xattr(&backend.storage, f.ino, "layout")
+                .await
+                .expect("xattr read on reused ino"),
+            None,
+            "reused ino {} must not resurrect the corpse's layout xattr",
+            f.ino
+        );
+    }
+}
+
+/// BATCH_FORGET must behave exactly like N FORGETs: caches invalidated and
+/// every ino queued for reclaim. fuse3's default impl is a NO-OP — before
+/// this contract existed, batch-evicted inos (memory pressure,
+/// drop_caches, umount-time mass eviction) were simply never reclaimed:
+/// their slots leaked until the next mount's reconciliation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_batch_forget_queues_reclaim_like_forget() {
+    use fuse3::raw::prelude::Filesystem;
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::dlm::DlmClient;
+    use squeezefs::fuse_client::SqueezefsFilesystem;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::DataRouter;
+    use std::sync::Arc;
+
+    let dlm = DlmClient::new("local").unwrap();
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), "batch_forget_test")
+            .await
+            .unwrap(),
+    );
+    let s = tempfile::tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme.clone(),
+    )
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+    let m = NamedTempFile::new().unwrap();
+    let ms = MetaLvStorage::open(m.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&ms).await.unwrap();
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        Arc::new(MetaLvBackend::new(ms)),
+    ]));
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed.clone());
+
+    // Three orphans (created + unlinked), attrs cached.
+    let mut inos = Vec::new();
+    for i in 0..3 {
+        let f = routed
+            .create(1, &format!("bf{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        inos.push(f.ino);
+    }
+    for i in 0..3 {
+        routed.unlink(1, &format!("bf{i}")).await.unwrap();
+    }
+    let now = std::time::Instant::now();
+    for &ino in &inos {
+        fs.attr_cache.insert(
+            ino,
+            (
+                fuse3::raw::prelude::FileAttr {
+                    ino,
+                    size: 0,
+                    blocks: 0,
+                    atime: fuse3::Timestamp::new(0, 0),
+                    mtime: fuse3::Timestamp::new(0, 0),
+                    ctime: fuse3::Timestamp::new(0, 0),
+                    kind: fuse3::FileType::RegularFile,
+                    perm: 0o644,
+                    nlink: 0,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    blksize: 4096,
+                },
+                now,
+            ),
+        );
+    }
+
+    let req = fuse3::raw::Request {
+        unique: 0,
+        uid: 1000,
+        gid: 1000,
+        pid: 1,
+    };
+    fs.batch_forget(req, &inos).await;
+
+    for &ino in &inos {
+        assert!(
+            fs.attr_cache.get(&ino).is_none(),
+            "batch_forget must invalidate attrs for ino {ino}"
+        );
+    }
+    // The reclaim queue received all three: drain it through the batch
+    // consumer entry and observe the destroys.
+    fs.reclaim_orphaned_batch(inos.clone()).await;
+    for &ino in &inos {
+        assert!(
+            read_inode(&routed.volumes[0].storage, ino).await.is_err(),
+            "batch-forgotten orphan {ino} must be reclaimable (slot zeroed)"
+        );
+    }
+}

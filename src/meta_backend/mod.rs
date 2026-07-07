@@ -1039,39 +1039,77 @@ impl Metadata for MetaLvBackend {
     }
 
     async fn destroy_inode(&self, ino: Ino) -> Result<()> {
-        let _guard = self.dlm.lock_inode_exclusive(ino).await;
+        // Single destroy == a size-1 batch: one code path (design §4.5).
+        self.destroy_inodes(std::slice::from_ref(&ino)).await
+    }
+}
 
-        // Check under exclusive lock to prevent TOCTOU race (P0-8)
-        match inode::read_inode(&self.storage, ino).await {
-            Ok(disk_inode) => {
-                if disk_inode.nlink > 0 {
+impl MetaLvBackend {
+    /// Reclaim group-commit (design-wal-crash-consistency §4.5, Key
+    /// Decision 8): destroy a batch of inos as **one** transaction.
+    ///
+    /// - DLM exclusive locks on ALL inos via the canonical [`dlm::DlmLockManager::lock_many`]
+    ///   order (stripe-deduped ascending — the audited rename pattern, no
+    ///   new level in P1-9; a stripe collision degrades to fewer guards,
+    ///   never deadlock).
+    /// - `nlink`/existence revalidated per ino UNDER the locks (preserving
+    ///   the P0-8 TOCTOU check): live or already-zeroed inos are skipped,
+    ///   exactly like today's per-ino path.
+    /// - ONE `run_transaction` stages every slot zero — patches to the same
+    ///   sector merge into one image (up to 16 destroys per sector, one
+    ///   apply write).
+    /// - `inode_alloc.free()` runs strictly AFTER the durable commit (Key
+    ///   Decision 11): there is no DLM exclusion between a destroy and a
+    ///   future create reusing the ino, so a premature free could let a
+    ///   concurrent create write the slot before the zero applied.
+    ///
+    /// All-or-nothing per call: on commit failure nothing is freed — the
+    /// reclaim consumer bisects the batch down to singletons (§4.5).
+    pub async fn destroy_inodes(&self, inos: &[Ino]) -> Result<()> {
+        if inos.is_empty() {
+            return Ok(());
+        }
+        let lock_plan: Vec<(u64, dlm::LockMode)> = inos
+            .iter()
+            .map(|&ino| (ino, dlm::LockMode::Exclusive))
+            .collect();
+        let _guards = self.dlm.lock_many(&lock_plan, &[]).await;
+
+        // Revalidate under the exclusive locks (P0-8, per ino).
+        let mut doomed = Vec::with_capacity(inos.len());
+        for &ino in inos {
+            match inode::read_inode(&self.storage, ino).await {
+                Ok(disk_inode) if disk_inode.nlink > 0 => {
                     log::debug!(
-                        "destroy_inode: ino {} has nlink = {}, skipping destruction",
+                        "destroy_inodes: ino {} has nlink = {}, skipping destruction",
                         ino,
                         disk_inode.nlink
                     );
-                    return Ok(());
+                }
+                Ok(_) => doomed.push(ino),
+                Err(_) => {
+                    // Missing or already zeroed (magic 0): nothing to do.
                 }
             }
-            Err(_) => {
-                // If it doesn't exist or is already zeroed (magic 0), return success
-                return Ok(());
-            }
         }
+        if doomed.is_empty() {
+            return Ok(());
+        }
+        crate::fuse_client::METRICS
+            .meta_reclaim_batch_size
+            .record(doomed.len());
 
-        // Zero the slot durably in the transaction, then free the in-RAM bit
-        // ONLY after the commit succeeds. There is no DLM exclusion between
-        // this destroy and a future create reusing the ino, so a premature free
-        // could let a concurrent create write the slot before our zero applied
-        // (design Key Decision 11 / R10). free() after commit orders our
-        // durable zero strictly before any reuse.
         self.run_transaction(|| async {
-            let empty = inode::DiskInode::new_zeroed();
-            inode::write_inode_raw(&self.storage, ino, &empty).await?;
+            for &ino in &doomed {
+                let empty = inode::DiskInode::new_zeroed();
+                inode::write_inode_raw(&self.storage, ino, &empty).await?;
+            }
             Ok(())
         })
         .await?;
-        self.storage.inode_alloc.free(ino);
+        for &ino in &doomed {
+            self.storage.inode_alloc.free(ino);
+        }
         Ok(())
     }
 }
@@ -1142,6 +1180,25 @@ impl RoutedMetaBackend {
         let score = score.min(1000);
         let _ = HEALTH_CACHE.upsert_sync(idx, (score, std::time::Instant::now()));
         score
+    }
+
+    /// Batched reclaim (design §4.5): group the inos by owning volume and
+    /// destroy each volume's group as one `destroy_inodes` transaction.
+    /// All-or-nothing per call — the first failing volume aborts and the
+    /// caller bisects (volume grouping is deterministic, so halves re-route
+    /// consistently and converge to singletons).
+    pub async fn destroy_inodes(&self, inos: &[Ino]) -> Result<()> {
+        let mut per_volume: std::collections::HashMap<usize, Vec<Ino>> =
+            std::collections::HashMap::new();
+        for &ino in inos {
+            let (v_idx, local_ino) = self.route_ino(ino);
+            per_volume.entry(v_idx).or_default().push(local_ino);
+        }
+        for (v_idx, locals) in per_volume {
+            self.check_volume_enabled(v_idx)?;
+            self.volumes[v_idx].destroy_inodes(&locals).await?;
+        }
+        Ok(())
     }
 
     pub fn route_ino(&self, ino: Ino) -> (usize, Ino) {

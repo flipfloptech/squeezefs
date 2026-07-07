@@ -446,6 +446,7 @@ async fn test_stats_json_exposes_sector_commit_metrics() {
         "meta_quarantined_inodes",
         "meta_commit_sectors",
         "meta_flush_deferred",
+        "meta_reclaim_batch_size",
         "meta_volume_atomicity",
     ] {
         assert!(!metrics[key].is_null(), "stats JSON missing metrics.{key}");

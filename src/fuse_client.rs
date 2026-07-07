@@ -361,6 +361,10 @@ pub struct Metrics {
     /// Deferred-flusher device barriers issued (timer path), vs
     /// strict/fsync barriers which land in `meta_device_syncs` directly.
     pub meta_flush_deferred: Align64<AtomicU64>,
+    /// Reclaim group-commit fill: doomed inos per batched `destroy_inodes`
+    /// transaction (design §4.5) — headroom before `SQUEEZEFS_RECLAIM_BATCH`
+    /// needs raising.
+    pub meta_reclaim_batch_size: Align64<QueueDepthHistogram>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -944,6 +948,7 @@ impl SqueezefsFilesystem {
                 "meta_quarantined_inodes": METRICS.meta_quarantined_inodes.load(Ordering::Relaxed),
                 "meta_commit_sectors": METRICS.meta_commit_sectors.to_json(),
                 "meta_flush_deferred": METRICS.meta_flush_deferred.load(Ordering::Relaxed),
+                "meta_reclaim_batch_size": METRICS.meta_reclaim_batch_size.to_json(),
                 // §4.6: per-volume mount-probe classification (design
                 // §Observability — live signals over ad-hoc logging).
                 "meta_volume_atomicity": self
@@ -1883,51 +1888,127 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
-    /// Free storage for an inode that has `nlink == 0` and is no longer referenced
-    /// by the kernel (FORGET). Open-but-unlinked files stay un
-    async fn reclaim_orphaned_inode(&self, ino: u64) -> Result<(), Errno> {
+    /// Reclaim a BATCH of orphaned inos (`nlink == 0`, FORGET'd) with one
+    /// group-committed destroy transaction per volume (design §4.5, PR 5).
+    ///
+    /// Preserves today's per-ino split around the destroy:
+    /// - admission re-checks (reserved / open / getattr / nlink) per ino —
+    ///   the drain-time complement of `queue_reclaim_inode`'s enqueue check;
+    /// - `router.delete_file` (data-path teardown) runs BEFORE admission,
+    ///   log-and-proceed on failure exactly as today (its result was always
+    ///   discarded; gating on it would leak the slot forever under a
+    ///   persistently failing data teardown — the slot zero is the
+    ///   authoritative reclaim, blocks are refcount-recoverable);
+    /// - lease / POSIX-lock / cache teardown runs per ino AFTER the batch's
+    ///   commit, on success AND failure alike (invalidating before a
+    ///   now-deferred zero would let a straggling getattr repopulate
+    ///   attr_cache from the still-valid slot and survive as a ghost).
+    ///
+    /// `pub` because it is the reclaim worker's unit of work and the
+    /// integration seam the bisect tests drive directly.
+    pub async fn reclaim_orphaned_batch(&self, inos: Vec<u64>) {
         let _permit = self.reclaim_semaphore.acquire().await.ok();
-        if ino <= 1 || ino == CONFIG_INODE || ino == STATS_INODE {
-            return Ok(());
-        }
-        if self.is_open(ino) {
-            debug!("RECLAIM: ino = {} is currently open, skipping reclaim", ino);
-            return Ok(());
-        }
-        let backend = self
-            .meta_backend
-            .as_ref()
-            .ok_or(Errno::from(libc::ENOSYS))?;
-        debug!("RECLAIM: reclaim_orphaned_inode called for ino = {}", ino);
-        let disk_inode = match backend.getattr(ino).await {
-            Ok(inode) => inode,
-            Err(e) => {
-                debug!("RECLAIM: getattr({}) failed: {:?}", ino, e);
-                return Ok(());
-            }
+        let Some(backend) = self.meta_backend.as_ref() else {
+            return;
         };
-        if disk_inode.nlink > 0 {
-            debug!(
-                "RECLAIM: ino = {} has nlink = {}, skipping reclaim",
-                ino, disk_inode.nlink
-            );
-            return Ok(());
+
+        let mut admitted = Vec::with_capacity(inos.len());
+        for ino in inos {
+            if ino <= 1 || ino == CONFIG_INODE || ino == STATS_INODE {
+                continue;
+            }
+            if self.is_open(ino) {
+                debug!("RECLAIM: ino = {} is currently open, skipping reclaim", ino);
+                continue;
+            }
+            match backend.getattr(ino).await {
+                Ok(inode) if inode.nlink > 0 => {
+                    debug!(
+                        "RECLAIM: ino = {} has nlink = {}, skipping reclaim",
+                        ino, inode.nlink
+                    );
+                }
+                Ok(_) => admitted.push(ino),
+                Err(e) => {
+                    debug!("RECLAIM: getattr({}) failed: {:?}", ino, e);
+                }
+            }
         }
-        debug!("RECLAIM: destroying ino = {}", ino);
-        let file_path = crate::keys::inode_path(ino);
-        let mut dummy_con = self.dlm.get_connection().await.map_err(map_squeezefs_err)?;
-        let _ = self.router.delete_file(&file_path, &mut dummy_con).await;
+        if admitted.is_empty() {
+            return;
+        }
 
-        // Remove from metadata backend
-        let _ = backend.destroy_inode(ino).await;
+        // Data-path teardown per ino, before admission — log-and-proceed.
+        for &ino in &admitted {
+            let file_path = crate::keys::inode_path(ino);
+            match self.dlm.get_connection().await {
+                Ok(mut con) => {
+                    if let Err(e) = self.router.delete_file(&file_path, &mut con).await {
+                        debug!(
+                            "RECLAIM: delete_file({}) failed (proceeding to destroy): {:?}",
+                            ino, e
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!("RECLAIM: no DLM connection for delete_file({ino}): {e:?}");
+                }
+            }
+        }
 
+        self.destroy_batch_bisect(backend, &admitted).await;
+    }
+
+    /// Destroy `inos` as one batch; on commit failure bisect and retry the
+    /// halves, terminating at size-1 sub-batches whose behavior is
+    /// byte-for-byte today's per-ino path (§4.5: one persistently bad
+    /// sector must wedge only its own ino, never 63 innocents). The per-ino
+    /// teardown runs on BOTH edges — only `free()` (inside
+    /// `destroy_inodes`) is withheld on failure.
+    async fn destroy_batch_bisect(
+        &self,
+        backend: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+        inos: &[u64],
+    ) {
+        if inos.is_empty() {
+            return;
+        }
+        match backend.destroy_inodes(inos).await {
+            Ok(()) => {
+                for &ino in inos {
+                    self.reclaim_teardown(ino).await;
+                }
+            }
+            Err(e) if inos.len() == 1 => {
+                // Today's per-ino path discarded this error silently; the
+                // batched path logs it (a strict logging improvement) and
+                // still runs the teardown — leaving leases to TTL expiry and
+                // stale cache entries would diverge from today's behavior.
+                warn!(
+                    "RECLAIM: destroy failed for ino {} (slot retained, free() withheld): {:?}",
+                    inos[0], e
+                );
+                self.reclaim_teardown(inos[0]).await;
+            }
+            Err(_) => {
+                let mid = inos.len() / 2;
+                Box::pin(self.destroy_batch_bisect(backend, &inos[..mid])).await;
+                Box::pin(self.destroy_batch_bisect(backend, &inos[mid..])).await;
+            }
+        }
+    }
+
+    /// Per-ino post-destroy teardown, exactly today's tail: lease release,
+    /// POSIX-lock cleanup, metadata/attr cache invalidation.
+    async fn reclaim_teardown(&self, ino: u64) {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
         }
         self.active_posix_locks.retain(|key, _| key.0 != ino);
-        self.router.metadata_cache.remove(&file_path);
+        self.router
+            .metadata_cache
+            .remove(&crate::keys::inode_path(ino));
         self.attr_cache.invalidate(&ino);
-        Ok(())
     }
 }
 
@@ -5574,17 +5655,34 @@ async fn run_reclaim_worker_pool(
     fs: SqueezefsFilesystem,
     concurrency: usize,
 ) {
+    // Group-commit batching (design §4.5): drain up to SQUEEZEFS_RECLAIM_BATCH
+    // inos per unit of work — sequential allocation clusters doomed inos in
+    // the same inode-table sectors, so a batch's slot zeroes merge into
+    // shared sector images and one apply write.
+    let batch_cap = std::env::var("SQUEEZEFS_RECLAIM_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 1024))
+        .unwrap_or(64);
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let fs_arc = std::sync::Arc::new(fs);
-    while let Some(ino) = rx.recv().await {
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        while batch.len() < batch_cap {
+            match rx.try_recv() {
+                Ok(ino) => batch.push(ino),
+                Err(_) => break,
+            }
+        }
+        // FORGET can enqueue an ino more than once across sessions.
+        batch.sort_unstable();
+        batch.dedup();
         let fs_clone = fs_arc.clone();
         let sem_clone = semaphore.clone();
         let permit = sem_clone.acquire_owned().await.unwrap();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = fs_clone.reclaim_orphaned_inode(ino).await {
-                debug!("Reclaim worker failed for ino {}: {:?}", ino, e);
-            }
+            fs_clone.reclaim_orphaned_batch(batch).await;
         });
     }
 }

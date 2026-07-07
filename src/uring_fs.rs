@@ -300,6 +300,26 @@ pub static TORN_WRITE_FAULT: TornWriteFault = TornWriteFault {
 /// inert and admission does no further fault work.
 static FAULTS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Persistent per-offset write error (`u64::MAX` = disarmed): every write
+/// covering this offset fails `EIO` — nothing is written, nothing is
+/// poisoned, and the fault STAYS armed until [`clear_faults`]. Models a
+/// single bad sector (vs [`TORN_WRITE_FAULT`]'s one-shot dead-device
+/// semantics); the reclaim bisect tests use it to wedge exactly one ino.
+static SECTOR_WRITE_ERROR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Arm the persistent sector-write error at `offset`.
+pub fn arm_sector_write_error(offset: u64) {
+    SECTOR_WRITE_ERROR.store(offset, std::sync::atomic::Ordering::Relaxed);
+    FAULTS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the armed persistent write error falls inside `[offset, offset+len)`.
+fn sector_error_hits(offset: u64, len: usize) -> bool {
+    let armed = SECTOR_WRITE_ERROR.load(std::sync::atomic::Ordering::Relaxed);
+    armed != u64::MAX && armed >= offset && armed < offset + len as u64
+}
+
 #[derive(Default)]
 struct FaultState {
     /// Paths whose "device died": every request fails `EIO`.
@@ -366,7 +386,8 @@ pub fn power_cut(path: impl AsRef<Path>) -> usize {
     count
 }
 
-/// Disarm everything: torn fault, poisoned paths, power-cut tracking.
+/// Disarm everything: torn fault, sector-write error, poisoned paths,
+/// power-cut tracking.
 pub fn clear_faults() {
     TORN_WRITE_FAULT
         .offset
@@ -374,6 +395,7 @@ pub fn clear_faults() {
     TORN_WRITE_FAULT
         .keep
         .store(0, std::sync::atomic::Ordering::Relaxed);
+    SECTOR_WRITE_ERROR.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     let mut st = FAULT_STATE.lock().unwrap();
     st.poisoned.clear();
     st.tracked.clear();
@@ -475,6 +497,10 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
             data,
             tx,
         } => {
+            if sector_error_hits(offset, data.len()) {
+                let _ = tx.send(Err(fault_eio("persistent sector write error")));
+                return None;
+            }
             if let Some(keep) = tear_hits(offset, data.len()) {
                 tear_pwrite(&path, offset, &data, keep);
                 TORN_WRITE_FAULT
@@ -496,6 +522,12 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
             })
         }
         FsReq::WriteAtBatch { path, ops, tx } => {
+            if ops.iter().any(|(off, d)| sector_error_hits(*off, d.len())) {
+                // The whole logical commit fails loudly (batch semantics);
+                // nothing is written, the fault stays armed.
+                let _ = tx.send(Err(fault_eio("persistent sector write error in batch")));
+                return None;
+            }
             let torn_at = ops
                 .iter()
                 .position(|(off, d)| tear_hits(*off, d.len()).is_some());

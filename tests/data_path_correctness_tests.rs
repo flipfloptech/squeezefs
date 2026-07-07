@@ -472,3 +472,54 @@ async fn test_stats_json_exposes_sector_commit_metrics() {
         "the probed classification must surface on the stats inode"
     );
 }
+
+/// Virtual inodes (.stats/.config) must be opened FOPEN_DIRECT_IO: their
+/// content is regenerated per open, but the kernel clamps buffered reads to
+/// a PREVIOUS generation's i_size (lookup-time attr) — observed as
+/// truncated/unparseable stats JSON once the metrics payload grew between
+/// generations. DIRECT_IO makes the kernel trust the daemon's read replies
+/// (EOF on short read) instead of the stale size.
+#[tokio::test]
+async fn test_virtual_inodes_open_direct_io() {
+    const FOPEN_DIRECT_IO: u32 = 1 << 0;
+    let h = make().await;
+
+    let stats =
+        h.fs.open(h.req, squeezefs::fuse_client::STATS_INODE, 0)
+            .await
+            .expect("open .stats");
+    assert_ne!(
+        stats.flags & FOPEN_DIRECT_IO,
+        0,
+        ".stats must be FOPEN_DIRECT_IO — buffered reads clamp to a stale i_size"
+    );
+
+    let config =
+        h.fs.open(h.req, squeezefs::fuse_client::CONFIG_INODE, 0)
+            .await
+            .expect("open .config");
+    assert_ne!(
+        config.flags & FOPEN_DIRECT_IO,
+        0,
+        ".config must be FOPEN_DIRECT_IO — same stale-size clamp"
+    );
+
+    // The full fresh generation must be readable through the handler at any
+    // offset (the kernel no longer gates it): read past the first 4 KiB.
+    let json = h.fs.generate_stats_json().await;
+    assert!(json.len() > 4096, "stats JSON is multi-page by now");
+    let tail =
+        h.fs.read(
+            h.req,
+            squeezefs::fuse_client::STATS_INODE,
+            stats.fh,
+            4096,
+            1 << 20,
+        )
+        .await
+        .expect("read .stats tail");
+    assert!(
+        !tail.data.is_empty(),
+        "reads beyond the first page must serve the fresh generation"
+    );
+}

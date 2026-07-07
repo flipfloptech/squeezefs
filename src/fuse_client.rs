@@ -2442,7 +2442,17 @@ impl Filesystem for SqueezefsFilesystem {
             };
             let fh = self.next_virtual_fh.fetch_add(1, Ordering::Relaxed);
             self.open_virtual_files.insert(fh, content);
-            return Ok(ReplyOpen { fh, flags: 0 });
+            // FOPEN_DIRECT_IO: the payload is regenerated per open, but the
+            // kernel clamps buffered reads to i_size from a PREVIOUS
+            // generation's lookup — serving truncated (unparseable) JSON
+            // once the stats payload grows between generations. Direct I/O
+            // makes the kernel trust our read replies (short read = EOF)
+            // instead of the stale size.
+            const FOPEN_DIRECT_IO: u32 = 1 << 0;
+            return Ok(ReplyOpen {
+                fh,
+                flags: FOPEN_DIRECT_IO,
+            });
         }
 
         self.add_open(inode);

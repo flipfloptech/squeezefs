@@ -169,3 +169,23 @@ sudo ./target/release/squeezefs tune
 - **`vm.dirty_ratio = 40`** & **`vm.dirty_background_ratio = 10`**: Aggressively buffers writes in memory before flushing.
 - **`net.core.rmem_max`** & **`net.core.wmem_max` to `67108864` (64MB)**: Expands TCP socket buffers for massive parallel streams.
 - **FUSE Connection Limits**: Increases `max_background` to `64` and `congestion_threshold` to `48` to prevent FUSE queue starvation.
+
+---
+
+## 5. Metadata Durability Knobs
+
+The metadata crash contract (levels **D0/D1/D2**) is documented in `README.md` → *Metadata Durability* and `docs/design-wal-crash-consistency.md` §3. Operationally:
+
+```bash
+# Refuse to mount on storage that cannot promise 4 KiB atomic sector writes
+# (classification below `atomic4k` fails loud; check `.stats` → meta_volume_atomicity):
+sudo ./target/release/squeezefs mount sqmeta:///dev/main-pool/meta-vol /mnt/squeezefs --strict-meta-atomicity
+
+# Strict sync-on-commit metadata durability (default is a 50 ms deferred window):
+SQUEEZEFS_META_FLUSH_INTERVAL_MS=0 sudo -E ./target/release/squeezefs mount …
+
+# Inode-reclaim group-commit batch size (default 64):
+SQUEEZEFS_RECLAIM_BATCH=128 sudo -E ./target/release/squeezefs mount …
+```
+
+File-backed sandbox volumes (section 1) classify as `file-backed` — fine for development, but they carry the documented D2 torn-sector exposure on power loss. Use 4 KiB-LBA NVMe (or kernels ≥ 6.11 with an atomic-write unit ≥ 4 KiB) for the `atomic4k` classification in production.

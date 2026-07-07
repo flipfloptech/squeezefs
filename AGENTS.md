@@ -121,6 +121,8 @@ POSIX FUSE locks map to cluster leases on Metadata Volumes:
 * FUSE op timeouts; staging recovery on remount (`recover_staging`) with fence + layout checks.
 * Stale fencing tokens discard staged work; missing inode meta discards orphan active blocks.
 * Write verification is **opt-in** (`--write-verification`, optional sample rate).
+* **Metadata crash contract**: explicit D0/D1/D2 levels (process crash / atomic-4KiB power loss / non-atomic power loss) — see `docs/design-wal-crash-consistency.md` §3 and README → Metadata durability.
+* Mount probes each meta volume's sector atomicity (sysfs; `meta_volume_atomicity` on the stats inode); `--strict-meta-atomicity` makes below-`atomic4k` classifications fail the mount loud.
 
 ### Lock order & connection scope (must not)
 

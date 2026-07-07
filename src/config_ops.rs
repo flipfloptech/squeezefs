@@ -11,6 +11,12 @@ pub struct ConfigList {
     pub metadata_volumes: HashMap<String, String>,
     pub metadata_volume_statuses: HashMap<String, String>,
     pub metadata_volume_redirections: HashMap<String, String>,
+    /// Config-file equivalent of the `--strict-meta-atomicity` mount flag
+    /// (design §4.6): mount fails unless every metadata volume classifies
+    /// as `atomic4k`. `serde(default)` keeps pre-existing runtime configs
+    /// parseable (they read as `false` — the default-off behavior).
+    #[serde(default)]
+    pub strict_meta_atomicity: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -51,6 +57,7 @@ pub fn load_or_create_config() -> ConfigList {
         metadata_volumes,
         metadata_volume_statuses,
         metadata_volume_redirections: HashMap::new(),
+        strict_meta_atomicity: false,
     }
 }
 

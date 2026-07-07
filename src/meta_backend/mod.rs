@@ -1,5 +1,6 @@
 pub mod alloc;
 pub(crate) mod alloc_core;
+pub mod atomicity;
 pub mod dentry;
 pub mod dlm;
 pub mod inode;
@@ -93,6 +94,10 @@ pub struct MetaLvBackend {
     /// Lazily spawns the flusher on the first deferred commit (a runtime is
     /// guaranteed there; construction sites need not be async).
     flusher_started: tokio::sync::OnceCell<()>,
+    /// Mount-time atomicity classification (§4.6): set once by the mount
+    /// probe, surfaced on the stats inode as `meta_volume_atomicity`.
+    /// Unset (`"unprobed"` on the surface) for harness-built backends.
+    pub atomicity_class: std::sync::OnceLock<atomicity::AtomicityClass>,
 }
 
 /// Resolve the deferred-flush interval knob: canonical name first, legacy
@@ -119,6 +124,7 @@ impl MetaLvBackend {
             flush_interval_ms: resolve_flush_interval_ms(),
             needs_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flusher_started: tokio::sync::OnceCell::new(),
+            atomicity_class: std::sync::OnceLock::new(),
         }
     }
 

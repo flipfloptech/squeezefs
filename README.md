@@ -140,3 +140,19 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
 ## Quick Start & Verification
 
 To get up and running quickly or deploy directly onto physical bare-metal hardware over NVMe-oF, see the [QUICKSTART.md](QUICKSTART.md) guide.
+
+## Metadata Durability (crash contract)
+
+SqueezeFS states its metadata crash-consistency contract explicitly as three levels (design: `docs/design-wal-crash-consistency.md` §3):
+
+| Level | Failure | Guarantee |
+|---|---|---|
+| **D0** | Process crash (kill -9, panic, OOM) | All completed 4 KiB sector writes are intact in the page cache; the kernel writes them back. `fsync`-acked ops are durable (trailing coalesced barrier). Un-acked ops may lose at most the deferred-flush window. Per-sector consistency holds; multi-sector transactions may split mid-apply (op-level torn contract, same as D1). |
+| **D1** | Power loss / kernel crash, meta volume on storage with 4 KiB atomic writes (4 KiB-LBA, atomic-write unit ≥ 4 KiB, or PLP) | Per-sector consistency (each sector is entirely old or new). `fsync`-acked ops durable. Multi-sector transactions may split. Verified at mount by the sysfs atomicity probe; classification surfaces as `meta_volume_atomicity` on the `.stats` inode (`atomic4k` / `likely` / `unknown` / `file-backed`). |
+| **D2** | Power loss, file-backed volume or storage without 4 KiB atomic writes | A sector caught mid-writeback may tear; there is no repair path — tears surface as invalid inode/dentry/xattr magic. Dev/test exposure; production guidance is `atomic4k` volumes. |
+
+**Acked durability** (`fsync`/`fsyncdir` returning success) is carried solely by post-apply coalesced `fdatasync` barriers — exactly one physical barrier per fsync.
+
+- `--strict-meta-atomicity` (mount flag, or `strict_meta_atomicity` in the runtime config): refuse to mount unless every metadata volume classifies as `atomic4k`. Default off (file-backed dev volumes are the test substrate).
+- `SQUEEZEFS_META_FLUSH_INTERVAL_MS`: deferred metadata durability window in ms (default `50`); `0` = strict sync-on-commit — every metadata commit returns only after a post-apply device barrier. Legacy alias `SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS` is honored; the new name wins if both are set.
+- `SQUEEZEFS_RECLAIM_BATCH`: inode-reclaim group-commit batch size (default `64`, clamp 1–1024).

@@ -944,6 +944,23 @@ impl SqueezefsFilesystem {
                 "meta_quarantined_inodes": METRICS.meta_quarantined_inodes.load(Ordering::Relaxed),
                 "meta_commit_sectors": METRICS.meta_commit_sectors.to_json(),
                 "meta_flush_deferred": METRICS.meta_flush_deferred.load(Ordering::Relaxed),
+                // §4.6: per-volume mount-probe classification (design
+                // §Observability — live signals over ad-hoc logging).
+                "meta_volume_atomicity": self
+                    .meta_backend
+                    .as_ref()
+                    .map(|mb| {
+                        mb.volumes
+                            .iter()
+                            .map(|v| {
+                                v.atomicity_class
+                                    .get()
+                                    .map(|c| c.as_str())
+                                    .unwrap_or("unprobed")
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
             },
             "cache_capacities": {
                 "read_lru_current_bytes": self.router.cache.read_lru.current_bytes(),

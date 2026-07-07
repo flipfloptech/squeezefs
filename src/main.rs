@@ -237,6 +237,14 @@ enum Commands {
         /// Default 1 = verify every write. Larger values reduce RAW cost under load.
         #[arg(long, default_value_t = 1)]
         write_verification_sample: u64,
+
+        /// Fail the mount unless every metadata volume classifies as
+        /// `atomic4k` (4 KiB-LBA or kernel-advertised atomic-write unit >=
+        /// 4 KiB). Default off: file-backed dev volumes carry a documented
+        /// torn-sector exposure on power loss (D2). Config-file equivalent:
+        /// `strict_meta_atomicity` in the runtime config.
+        #[arg(long)]
+        strict_meta_atomicity: bool,
     },
     /// Cleanly unmount a squeezefs mountpoint (fusermount/umount/-f; kills zombie daemon if needed)
     Umount {
@@ -1761,6 +1769,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             job_cpu_limit,
             write_verification: _,
             write_verification_sample: _,
+            strict_meta_atomicity,
         } => {
             let (meta_lvs, mountpoint) = if let Some(ref m_lvs) = meta_lv {
                 if args.is_empty() {
@@ -2004,6 +2013,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .active_write_backend
                 .store(std::sync::Arc::new(first_name));
 
+            // Strict atomicity: CLI flag OR the runtime-config equivalent
+            // (design §4.6 — operator opt-in, default off).
+            let strict_atomicity = strict_meta_atomicity
+                || squeezefs::config_ops::load_or_create_config().strict_meta_atomicity;
+
             let mut meta_backends = Vec::new();
             for path in &meta_lvs {
                 let storage =
@@ -2014,7 +2028,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // runs. A blank auto-created path fails loud ("run `squeezefs
                 // format` first") instead of limping along with no root inode.
                 storage.validate_superblock().await?;
+                // Sector-atomicity probe (design §4.6): classify the volume,
+                // enforce the strict gate if requested, publish to the stats
+                // surface via the backend.
+                let atomicity_class = squeezefs::meta_backend::atomicity::probe_meta_volume(
+                    std::path::Path::new(path),
+                );
+                if strict_atomicity {
+                    squeezefs::meta_backend::atomicity::enforce_strict(
+                        atomicity_class,
+                        std::path::Path::new(path),
+                    )?;
+                }
                 let be = std::sync::Arc::new(squeezefs::meta_backend::MetaLvBackend::new(storage));
+                let _ = be.atomicity_class.set(atomicity_class);
                 meta_backends.push(be);
             }
 
@@ -2048,12 +2075,32 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // review Issue 15); crash recovery = in-place apply + fdatasync.
             // Then run block-allocator recovery.
             for meta_be in &routed_meta_backend.volumes {
+                let quarantined_before = squeezefs::fuse_client::METRICS
+                    .meta_quarantined_inodes
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 if let Err(e) = meta_be.storage.seed_inode_alloc_from_table().await {
                     log::warn!("Inode allocator seed failed on mount: {:?}", e);
                 }
                 if let Err(e) = meta_be.storage.refresh_bitmap_from_table().await {
                     log::warn!("Inode bitmap reconciliation failed on mount: {:?}", e);
                 }
+                // One structured line per volume (design §4.6/§Observability):
+                // atomicity classification + legacy quarantine victims +
+                // journal-region status (reserved; write path deleted, PR 4).
+                let quarantined = squeezefs::fuse_client::METRICS
+                    .meta_quarantined_inodes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    - quarantined_before;
+                log::info!(
+                    "meta volume {}: atomicity={} quarantined_legacy_inos={} journal_region=reserved(never written)",
+                    meta_be.storage.device_path().display(),
+                    meta_be
+                        .atomicity_class
+                        .get()
+                        .map(|c| c.as_str())
+                        .unwrap_or("unprobed"),
+                    quarantined,
+                );
                 for entry in fs_engine.router.backend_router.backends.iter() {
                     let backend = entry.value();
                     log::info!("Running block allocator recovery for data volume...");

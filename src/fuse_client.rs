@@ -309,6 +309,14 @@ pub struct Metrics {
     pub bg_spawn_rejected: Align64<AtomicU64>,
     /// io_uring request queue backpressure (submit rejected as full).
     pub uring_queue_full: Align64<AtomicU64>,
+    /// Block writes that missed `write_block`'s zero-copy `WriteData::Aligned`
+    /// DMA branch and paid the bounce-buffer copy (zero-copy write-path design
+    /// §5.6, PR 2 — the pooled-buffer alignment-contract violation detector).
+    /// Pooled sources are 4 KiB-aligned by construction, so on aligned
+    /// workloads this must stay 0; non-4 KiB-multiple payloads
+    /// (compressed/encrypted output, tail blocks) are the only legitimate
+    /// contributors.
+    pub nvme_unaligned_write_fallbacks: Align64<AtomicU64>,
     /// DLM lease acquire outcomes (coarse lock-wait signal).
     pub lease_acquire_ok: Align64<AtomicU64>,
     pub lease_acquire_fail: Align64<AtomicU64>,
@@ -933,6 +941,7 @@ impl SqueezefsFilesystem {
                 "bg_spawn_admitted": METRICS.bg_spawn_admitted.load(Ordering::Relaxed),
                 "bg_spawn_rejected": METRICS.bg_spawn_rejected.load(Ordering::Relaxed),
                 "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),
+                "nvme_unaligned_write_fallbacks": METRICS.nvme_unaligned_write_fallbacks.load(Ordering::Relaxed),
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),
                 "writeback_hard_failures": METRICS.writeback_hard_failures.load(Ordering::Relaxed),

@@ -568,7 +568,7 @@ impl NvmeBlockDev {
         }
 
         let data_len = data.len();
-        let alignment = 4096;
+        let alignment = crate::cache::pool::POOLED_BUF_ALIGN;
 
         let rx_oneshot = if (data.as_ptr() as usize) % alignment == 0 && data_len % alignment == 0 {
             let data_type = WriteData::Aligned { data: data.clone() };
@@ -591,6 +591,16 @@ impl NvmeBlockDev {
                 })?;
             rx
         } else {
+            // Zero-copy write-path §5.6 (PR 2): pooled write sources are
+            // 4 KiB-aligned by contract, so this bounce-copy branch must stay
+            // cold on aligned workloads. Non-4 KiB-multiple payloads
+            // (compressed/encrypted output, tail blocks) are its only
+            // legitimate traffic; growth on a passthrough full-block workload
+            // means a buffer escaped the aligned pools (contract violation).
+            crate::fuse_client::METRICS
+                .nvme_unaligned_write_fallbacks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             // P2-4: prefer the process-wide 4K-aligned buffer pool for typical
             // block sizes; fall back to posix_memalign only when the write is
             // larger than the pool buffer.
@@ -647,6 +657,12 @@ impl NvmeBlockDev {
                     },
                 )
             };
+            debug_assert_eq!(
+                rp as usize % alignment,
+                0,
+                "unaligned-write bounce buffer violates the 4 KiB pooled-buffer \
+                 alignment contract"
+            );
             let (tx, rx) = oneshot::channel();
             if self
                 .worker

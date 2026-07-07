@@ -20,7 +20,7 @@ use squeezefs::cache::pool::{AlignedBufPool, BufferPool, POOLED_BUF_ALIGN};
 use std::sync::Arc;
 
 fn is_aligned(ptr: *const u8) -> bool {
-    ptr as usize % POOLED_BUF_ALIGN == 0
+    (ptr as usize).is_multiple_of(POOLED_BUF_ALIGN)
 }
 
 #[test]
@@ -126,7 +126,11 @@ fn test_grow_beyond_pool_capacity_stays_aligned_and_recycles() {
         is_aligned(buf.as_ptr()),
         "grown buffer must keep the 4 KiB alignment contract"
     );
-    assert_eq!(buf.capacity() % POOLED_BUF_ALIGN, 0, "grown capacity rounded");
+    assert_eq!(
+        buf.capacity() % POOLED_BUF_ALIGN,
+        0,
+        "grown capacity rounded"
+    );
     assert!(
         buf[..8192].iter().all(|&b| b == 0x5A),
         "grow must preserve the initialized prefix"
@@ -183,7 +187,11 @@ fn test_into_bytes_is_aligned_zero_copy_and_recycles() {
         bytes.iter().all(|&b| b == 7),
         "resize fill value must be visible through the Bytes view"
     );
-    assert_eq!(pool.len(), 0, "backing is out of the pool while Bytes lives");
+    assert_eq!(
+        pool.len(),
+        0,
+        "backing is out of the pool while Bytes lives"
+    );
 
     drop(bytes);
     assert_eq!(
@@ -228,7 +236,7 @@ fn test_aligned_buf_pool_alloc_raw_contract() {
     let c = pool.alloc_raw(); // pool empty -> fresh allocation
     for (name, p) in [("pooled a", a), ("pooled b", b), ("fresh c", c)] {
         assert!(
-            !p.is_null() && p as usize % POOLED_BUF_ALIGN == 0,
+            !p.is_null() && is_aligned(p),
             "{name} handout must be 4 KiB-aligned"
         );
     }
@@ -238,10 +246,7 @@ fn test_aligned_buf_pool_alloc_raw_contract() {
     pool.recycle(c); // queue full -> freed, must not poison the pool
 
     let again = pool.alloc_raw();
-    assert!(
-        again as usize % POOLED_BUF_ALIGN == 0,
-        "recycled handout must stay aligned"
-    );
+    assert!(is_aligned(again), "recycled handout must stay aligned");
     pool.recycle(again);
 }
 
@@ -256,7 +261,7 @@ async fn test_pool_concurrent_stress() {
                 let mut buf = pool_clone.alloc();
                 buf.resize(1024, 0);
                 assert!(
-                    buf.as_ptr() as usize % POOLED_BUF_ALIGN == 0,
+                    (buf.as_ptr() as usize).is_multiple_of(POOLED_BUF_ALIGN),
                     "alignment contract must hold under concurrency"
                 );
                 buf[0] = 1;

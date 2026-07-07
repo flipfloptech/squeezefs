@@ -262,9 +262,27 @@ def remount_squeezefs(squeezefs_bin, meta_uri, mount_dir, disk_cache_paths, log_
     time.sleep(2)
     return True
 
+def run_crash_soak(rounds):
+    """Nightly kill-9 remount soak (design-wal-crash-consistency §4.7b):
+    the 500-round variant of tests/crash_kill_tests.rs. Runs against
+    file-backed temp volumes — no mount required."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, SQUEEZEFS_CRASH_ROUNDS=str(rounds))
+    print(f"[crash-soak] kill-9 remount soak: {rounds} rounds")
+    result = subprocess.run(
+        ["cargo", "test", "--release", "--test", "crash_kill_tests", "--",
+         "--exact", "test_kill9_remount_soak", "--test-threads=1", "--nocapture"],
+        cwd=repo_root, env=env,
+    )
+    if result.returncode != 0:
+        print("[crash-soak] FAILED")
+        sys.exit(result.returncode)
+    print("[crash-soak] PASSED")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Long running validation test for squeezefs mounts.")
-    parser.add_argument("--dir", required=True, help="Target directory (usually the squeezefs mount point)")
+    parser.add_argument("--dir", help="Target directory (usually the squeezefs mount point)")
     parser.add_argument("--limit", type=str, choices=["none", "small", "medium", "large"], default="large",
                         help="Size limit of downloads (small <= 38MB, medium <= 370MB, large <= 2.6GB)")
     parser.add_argument("--loops", type=int, default=0, help="Number of loops to run (0 for infinite)")
@@ -281,10 +299,18 @@ def main():
     parser.add_argument("--tree-depth", type=int, default=4, help="Recursive tree depth")
     parser.add_argument("--tree-breadth", type=int, default=4, help="Directory breadth at each level")
     parser.add_argument("--tree-files", type=int, default=5, help="Number of files per directory")
-    
+
+    # Crash soak (no mount required; runs the kill-9 harness at soak scale)
+    parser.add_argument("--crash-soak", type=int, default=0, metavar="N",
+                        help="Run the kill-9 remount soak for N rounds (nightly: 500) and exit")
+
     args = parser.parse_args()
-    
-    if not os.path.isdir(args.dir):
+
+    if args.crash_soak > 0:
+        run_crash_soak(args.crash_soak)
+        return
+
+    if not args.dir or not os.path.isdir(args.dir):
         print(f"Error: {args.dir} is not a valid directory.")
         sys.exit(1)
         

@@ -14,6 +14,11 @@
 //! - [`gauge_core`]: the staged-budget saturating gauge — invariant: racing
 //!   charges and credits settle exactly and never wrap below zero (a
 //!   wrapped gauge reads as "staging pool full forever").
+//! - [`cow_core`]: the exclusive-owner CoW active-block cell (get_mut-or-
+//!   copy vs snapshot clone) — invariant: a snapshot's payload never
+//!   changes for the snapshot's lifetime, and uniqueness observed after a
+//!   remote snapshot drop mutates in place (the shared-`Bytes` write-merge
+//!   UB fix, zero-copy write-path design §5.2).
 //!
 //! Models run only under `--cfg loom` (see `tests/run_loom.sh`); a plain
 //! `cargo test` here compiles the cores against std atomics and runs
@@ -21,6 +26,8 @@
 
 #[path = "../../src/meta_backend/alloc_core.rs"]
 pub mod alloc_core;
+#[path = "../../src/cow_core.rs"]
+pub mod cow_core;
 #[path = "../../src/gauge_core.rs"]
 pub mod gauge_core;
 #[path = "../../src/incarnation_core.rs"]
@@ -284,6 +291,103 @@ mod models {
                 a ^ b,
                 "exactly one of two racing releases must observe the terminal 1->0"
             );
+        });
+    }
+
+    /// Payload cell for the CoW models: a `loom::cell::UnsafeCell` stands in
+    /// for the active block's raw memory, so loom's access tracking flags
+    /// any unsynchronized read/write overlap (the exact shared-`Bytes` UB
+    /// the protocol removes) in addition to the value assertions.
+    struct CowPayload {
+        cell: loom::cell::UnsafeCell<u64>,
+    }
+
+    impl CowPayload {
+        fn new(v: u64) -> Self {
+            Self {
+                cell: loom::cell::UnsafeCell::new(v),
+            }
+        }
+
+        fn read(&self) -> u64 {
+            // SAFETY: shared read; loom verifies no concurrent mutable access.
+            self.cell.with(|p| unsafe { *p })
+        }
+
+        fn write(&mut self, v: u64) {
+            // SAFETY: exclusive access — reachable only through
+            // `CowCell::owned_mut`, which proves the owning Arc unique.
+            self.cell.with_mut(|p| unsafe { *p = v });
+        }
+
+        fn duplicate(&self) -> Self {
+            Self::new(self.read())
+        }
+    }
+
+    /// CoW invariant #1 (the P0 fix): a reader's snapshot payload never
+    /// changes between two reads, no matter how its clone interleaves with
+    /// a writer's get_mut-or-copy + mutate + publish. The slot mutex models
+    /// the DashMap-entry/`BLOCK_FLUSH_LOCKS` serialization of *cell* access;
+    /// payload reads run OUTSIDE it, like the read path's zero-copy slice.
+    /// loom's `UnsafeCell` tracking additionally fails the model if any
+    /// interleaving lets the writer mutate memory a reader is reading.
+    #[test]
+    fn cow_snapshot_never_changes_under_racing_writer() {
+        loom::model(|| {
+            let slot = Arc::new(loom::sync::Mutex::new(crate::cow_core::CowCell::new(
+                CowPayload::new(0),
+            )));
+
+            let reader = {
+                let slot = slot.clone();
+                thread::spawn(move || {
+                    let snap = slot.lock().unwrap().share();
+                    let a = snap.read();
+                    let b = snap.read();
+                    (a, b)
+                })
+            };
+
+            {
+                let mut cell = slot.lock().unwrap();
+                let (_copied, payload) = cell.owned_mut(CowPayload::duplicate);
+                payload.write(1);
+            }
+
+            let (a, b) = reader.join().unwrap();
+            assert_eq!(
+                a, b,
+                "snapshot payload changed between two reads (in-place \
+                 mutation of shared memory)"
+            );
+
+            // The writer's publish must always be visible through the cell.
+            let final_v = slot.lock().unwrap().peek().read();
+            assert_eq!(final_v, 1, "writer's published payload lost");
+        });
+    }
+
+    /// CoW invariant #2: uniqueness is *restored* once a remote snapshot
+    /// drops — `Arc::drop`'s Release decrement must synchronize with
+    /// `get_mut`'s Acquire check, so the writer mutates in place (no
+    /// spurious copy) and sees its own write.
+    #[test]
+    fn cow_uniqueness_restored_after_remote_snapshot_drop() {
+        loom::model(|| {
+            let mut cell = crate::cow_core::CowCell::new(CowPayload::new(7));
+            let snap = cell.share();
+            let t = thread::spawn(move || snap.read()); // snap drops there
+            let observed = t.join().unwrap();
+            assert_eq!(observed, 7, "snapshot must read the seeded payload");
+
+            let (copied, payload) = cell.owned_mut(CowPayload::duplicate);
+            assert!(
+                !copied,
+                "get_mut failed to observe a join-synchronized snapshot drop"
+            );
+            payload.write(8);
+            assert_eq!(cell.peek().read(), 8);
         });
     }
 

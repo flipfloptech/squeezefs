@@ -314,6 +314,12 @@ pub struct Metrics {
     pub lease_acquire_fail: Align64<AtomicU64>,
     /// Writeback path: durable flush hard failures (sticky).
     pub writeback_hard_failures: Align64<AtomicU64>,
+    /// Copy-on-write duplications of an active-block accumulation buffer
+    /// forced by a live reader snapshot (zero-copy write-path design §5.2).
+    /// Sequential streams never pay this; spikes mean read/write contention
+    /// on the same dirty block — the price of snapshot immutability, made
+    /// observable.
+    pub active_block_cow_copies: Align64<AtomicU64>,
     /// Meta-volume durability barriers actually issued (real `fdatasync` calls).
     /// A single FUSE fsync should raise this by exactly one (no redundant barrier).
     pub meta_device_syncs: Align64<AtomicU64>,
@@ -485,8 +491,14 @@ pub struct SqueezefsFilesystem {
     pub client_id: std::sync::Arc<std::sync::Mutex<String>>,
     pub mountpoint: std::sync::Arc<std::sync::Mutex<String>>,
     pub max_background_uploads: usize,
-    pub active_block_buffers:
-        std::sync::Arc<dashmap::DashMap<String, bytes::Bytes, ahash::RandomState>>,
+    /// Dirty in-RAM striped block accumulation buffers. Exclusive-owner CoW
+    /// values ([`crate::cache::active_block::ActiveBlockBuf`]): all mutation
+    /// happens under [`BLOCK_FLUSH_LOCKS`]; readers stay lock-free
+    /// (`DashMap::get` + `snapshot()`), and a live snapshot forces the next
+    /// writer to copy (never mutate) that memory.
+    active_block_buffers: std::sync::Arc<
+        dashmap::DashMap<String, crate::cache::active_block::ActiveBlockBuf, ahash::RandomState>,
+    >,
     pub open_virtual_files: dashmap::DashMap<u64, Vec<u8>, ahash::RandomState>,
     pub next_virtual_fh: std::sync::atomic::AtomicU64,
     pub latest_stats_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
@@ -924,6 +936,7 @@ impl SqueezefsFilesystem {
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),
                 "writeback_hard_failures": METRICS.writeback_hard_failures.load(Ordering::Relaxed),
+                "active_block_cow_copies": METRICS.active_block_cow_copies.load(Ordering::Relaxed),
                 "meta_device_syncs": METRICS.meta_device_syncs.load(Ordering::Relaxed),
                 "meta_sync_requests": METRICS.meta_sync_requests.load(Ordering::Relaxed),
                 "bg_admit_available_permits": crate::bg_admit::available_permits(),
@@ -1156,7 +1169,7 @@ impl SqueezefsFilesystem {
                     if let Ok(b) = parts[1].parse::<u32>() {
                         let nvme_clone = self.router.cache.nvme.clone();
                         let key_clone = key.clone();
-                        let staging_copy = block_data.clone();
+                        let staging_copy = block_data.snapshot();
                         let admitted = tokio::task::spawn_blocking(move || {
                             nvme_clone.put_active_block(&key_clone, &staging_copy, fencing_token)
                         })
@@ -1178,7 +1191,7 @@ impl SqueezefsFilesystem {
                             upload_active_block_bytes(
                                 ino,
                                 b,
-                                block_data,
+                                block_data.snapshot(),
                                 fencing_token,
                                 &self.router,
                                 &self.active_inode_locks,
@@ -1251,143 +1264,111 @@ impl SqueezefsFilesystem {
                 METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
                 // 1. Get existing block data (either from memory cache, NVMe staging cache, or read from backend/cache)
-                let block_data = if let Some((_, buf)) =
+                let mut block_data = if let Some((_, buf)) =
                     self.active_block_buffers.remove(&cache_key)
                 {
                     buf
+                } else if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
+                    crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
+                } else if !needs_existing_data {
+                    crate::cache::active_block::ActiveBlockBuf::zeroed(block_size as usize)
                 } else {
-                    let data = if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
-                        bytes::Bytes::from(d)
-                    } else if !needs_existing_data {
-                        let ptr = crate::cache::pool::ALIGNED_BUF_POOL.alloc_raw();
-                        unsafe {
-                            std::ptr::write_bytes(ptr, 0, block_size as usize);
+                    // Try cache first
+                    let mut block_map_id_opt = None;
+                    if let Some(entry) = self.router.metadata_cache.get(&file_path) {
+                        if entry.cached_at.elapsed() < Duration::from_secs(1) {
+                            block_map_id_opt = entry.block_map_id.clone();
                         }
-                        let owner = crate::cache::pool::AlignedBufOwner {
-                            ptr,
-                            len: block_size as usize,
-                        };
-                        bytes::Bytes::from_owner(owner)
-                    } else {
-                        // Try cache first
-                        let mut block_map_id_opt = None;
-                        if let Some(entry) = self.router.metadata_cache.get(&file_path) {
-                            if entry.cached_at.elapsed() < Duration::from_secs(1) {
-                                block_map_id_opt = entry.block_map_id.clone();
-                            }
-                        }
+                    }
 
-                        let mut block_map_id = block_map_id_opt.clone();
-                        let mut block_map = None;
-                        if block_map_id.is_none() {
+                    let mut block_map_id = block_map_id_opt.clone();
+                    let mut block_map = None;
+                    if block_map_id.is_none() {
+                        if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
+                            block_map_id = meta.block_map_id.clone();
+                            block_map = meta.block_map.clone();
+                        }
+                    }
+
+                    let mut existing = bytes::Bytes::new();
+                    // Read the existing block for the read-modify-write whenever the
+                    // file has a block map — whether stored INLINE (`block_map`, the
+                    // common <=32-block case) or via an INDIRECT block (`block_map_id`).
+                    // Gating only on `block_map_id` skipped the existing-block read for
+                    // inline maps, so a partial (non-block-aligned) overwrite of a
+                    // striped file zeroed the un-overwritten bytes of the block.
+                    if block_map_id.is_some() || block_map.is_some() {
+                        let mut old_block_key: Option<String> = None;
+                        if let Some(ref bm) = block_map {
+                            old_block_key = bm.get(&(b as u32)).cloned();
+                        }
+                        if old_block_key.is_none() {
                             if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
-                                block_map_id = meta.block_map_id.clone();
-                                block_map = meta.block_map.clone();
-                            }
-                        }
-
-                        let mut existing = bytes::Bytes::new();
-                        // Read the existing block for the read-modify-write whenever the
-                        // file has a block map — whether stored INLINE (`block_map`, the
-                        // common <=32-block case) or via an INDIRECT block (`block_map_id`).
-                        // Gating only on `block_map_id` skipped the existing-block read for
-                        // inline maps, so a partial (non-block-aligned) overwrite of a
-                        // striped file zeroed the un-overwritten bytes of the block.
-                        if block_map_id.is_some() || block_map.is_some() {
-                            let mut old_block_key: Option<String> = None;
-                            if let Some(ref bm) = block_map {
-                                old_block_key = bm.get(&(b as u32)).cloned();
-                            }
-                            if old_block_key.is_none() {
-                                if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
-                                    if let Some(ref bm) = meta.block_map {
-                                        old_block_key = bm.get(&(b as u32)).cloned();
-                                    }
+                                if let Some(ref bm) = meta.block_map {
+                                    old_block_key = bm.get(&(b as u32)).cloned();
                                 }
                             }
+                        }
 
-                            if let Some(bk) = old_block_key {
-                                existing = if let Some(cached_block) =
-                                    self.router.cache.read_lru.get(&bk)
-                                {
-                                    cached_block
-                                } else if let Some(cached) =
-                                    self.router.cache.nvme.get_cached_read_block(&bk)
-                                {
-                                    let cb = bytes::Bytes::from(cached);
-                                    self.router.cache.read_lru.put(&bk, cb.clone());
-                                    cb
-                                } else {
-                                    // NVMe-oF backend read path
-                                    let get_res = async {
-                                        let raw = self.router.read_nvme_block(&bk).await?;
-                                        let decompressed = self
-                                            .router
-                                            .get_crypto()
-                                            .process_read_async(raw)
-                                            .await?;
-                                        Ok::<bytes::Bytes, SqueezefsError>(decompressed)
-                                    }
-                                    .await;
+                        if let Some(bk) = old_block_key {
+                            existing = if let Some(cached_block) =
+                                self.router.cache.read_lru.get(&bk)
+                            {
+                                cached_block
+                            } else if let Some(cached) =
+                                self.router.cache.nvme.get_cached_read_block(&bk)
+                            {
+                                let cb = bytes::Bytes::from(cached);
+                                self.router.cache.read_lru.put(&bk, cb.clone());
+                                cb
+                            } else {
+                                // NVMe-oF backend read path
+                                let get_res = async {
+                                    let raw = self.router.read_nvme_block(&bk).await?;
+                                    let decompressed =
+                                        self.router.get_crypto().process_read_async(raw).await?;
+                                    Ok::<bytes::Bytes, SqueezefsError>(decompressed)
+                                }
+                                .await;
 
-                                    let decompressed_bytes = get_res?;
-                                    self.router
+                                let decompressed_bytes = get_res?;
+                                self.router
+                                    .cache
+                                    .read_lru
+                                    .put(&bk, decompressed_bytes.clone());
+                                if decompressed_bytes.len() < 64 * 1024 {
+                                    let _ = self
+                                        .router
                                         .cache
-                                        .read_lru
-                                        .put(&bk, decompressed_bytes.clone());
-                                    if decompressed_bytes.len() < 64 * 1024 {
-                                        let _ = self
-                                            .router
-                                            .cache
-                                            .nvme
-                                            .cache_read_block(&bk, decompressed_bytes.clone());
-                                    } else {
-                                        let nvme_clone = self.router.cache.nvme.clone();
-                                        let bk_clone = bk.clone();
-                                        let decompressed_clone = decompressed_bytes.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let _ = nvme_clone
-                                                .cache_read_block(&bk_clone, decompressed_clone);
-                                        });
-                                    }
-                                    decompressed_bytes
-                                };
-                            }
+                                        .nvme
+                                        .cache_read_block(&bk, decompressed_bytes.clone());
+                                } else {
+                                    let nvme_clone = self.router.cache.nvme.clone();
+                                    let bk_clone = bk.clone();
+                                    let decompressed_clone = decompressed_bytes.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let _ = nvme_clone
+                                            .cache_read_block(&bk_clone, decompressed_clone);
+                                    });
+                                }
+                                decompressed_bytes
+                            };
                         }
+                    }
 
-                        let ptr = crate::cache::pool::ALIGNED_BUF_POOL.alloc_raw();
-                        let copy_len = std::cmp::min(existing.len(), block_size as usize);
-                        unsafe {
-                            if copy_len > 0 {
-                                std::ptr::copy_nonoverlapping(existing.as_ptr(), ptr, copy_len);
-                            }
-                            if (block_size as usize) > copy_len {
-                                std::ptr::write_bytes(
-                                    ptr.add(copy_len),
-                                    0,
-                                    (block_size as usize) - copy_len,
-                                );
-                            }
-                        }
-                        let owner = crate::cache::pool::AlignedBufOwner {
-                            ptr,
-                            len: block_size as usize,
-                        };
-                        bytes::Bytes::from_owner(owner)
-                    };
-                    data
+                    crate::cache::active_block::ActiveBlockBuf::seeded(
+                        &existing,
+                        block_size as usize,
+                    )
                 };
 
-                // 2. Perform write range directly in memory
+                // 2. Merge the request slice. `make_mut` mutates only
+                // provably-unique memory: a live reader snapshot forces a
+                // copy-on-write instead of mutating aliased bytes (P0 fix,
+                // zero-copy write-path design §5.2).
                 let rel_start = (write_start - b_start_offset) as usize;
-                let raw_ptr = block_data.as_ptr() as *mut u8;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        file_data_slice.as_ptr(),
-                        raw_ptr.add(rel_start),
-                        slice_len,
-                    );
-                }
+                block_data.make_mut()[rel_start..rel_start + slice_len]
+                    .copy_from_slice(file_data_slice);
 
                 // 3. Write back to staging_nvme_cache if block is complete, or keep in memory
                 let is_block_complete = write_end == b_end_offset;
@@ -1395,11 +1376,11 @@ impl SqueezefsFilesystem {
                     let nvme_clone = self.router.cache.nvme.clone();
                     let cache_key_clone = cache_key.clone();
                     let fencing_token_val = fencing_token;
-                    let block_data_clone = block_data.clone();
+                    let block_snapshot = block_data.snapshot();
                     let admitted = tokio::task::spawn_blocking(move || {
                         nvme_clone.put_active_block(
                             &cache_key_clone,
-                            &block_data_clone,
+                            &block_snapshot,
                             fencing_token_val,
                         )
                     })
@@ -1567,7 +1548,7 @@ impl SqueezefsFilesystem {
     fn insert_active_block_buffer(
         &self,
         cache_key: String,
-        block_data: bytes::Bytes,
+        block_data: crate::cache::active_block::ActiveBlockBuf,
         fencing_token: u64,
     ) {
         while self.active_block_buffers.len() >= MAX_ACTIVE_BLOCK_BUFFERS {
@@ -1578,12 +1559,11 @@ impl SqueezefsFilesystem {
             let spill_key = entry.key().clone();
             drop(entry);
             if let Some((_, data)) = self.active_block_buffers.remove(&spill_key) {
-                if !self
-                    .router
-                    .cache
-                    .nvme
-                    .put_active_block(&spill_key, &data, fencing_token)
-                {
+                if !self.router.cache.nvme.put_active_block(
+                    &spill_key,
+                    data.as_slice(),
+                    fencing_token,
+                ) {
                     // Staging refused (never-lossy backpressure): keep the
                     // buffer in RAM — exceeding the soft cap beats losing
                     // dirty data. fsync drains it durably.
@@ -1618,7 +1598,7 @@ impl SqueezefsFilesystem {
 
                             let nvme_clone = self.router.cache.nvme.clone();
                             let key_clone = key.clone();
-                            let staging_copy = block_data.clone();
+                            let staging_copy = block_data.snapshot();
                             let admitted = match tokio::task::spawn_blocking(move || {
                                 nvme_clone.put_active_block(
                                     &key_clone,
@@ -1642,7 +1622,7 @@ impl SqueezefsFilesystem {
                                 if let Err(e) = upload_active_block_bytes(
                                     ino,
                                     b,
-                                    block_data,
+                                    block_data.snapshot(),
                                     fencing_token,
                                     &self.router,
                                     &self.active_inode_locks,
@@ -2619,7 +2599,13 @@ impl Filesystem for SqueezefsFilesystem {
                 if let Some(buf) = self.active_block_buffers.get(&cache_key) {
                     let block_start = start_block * block_size;
                     let rel_offset = (offset - block_start) as usize;
-                    let data = buf.value().slice(rel_offset..rel_offset + read_len);
+                    // Zero-copy CoW-stable snapshot: immutable for the
+                    // reply's whole lifetime — a later write to this block
+                    // copies instead of mutating these bytes (P0 fix).
+                    let data = buf
+                        .value()
+                        .snapshot()
+                        .slice(rel_offset..rel_offset + read_len);
                     return Ok(ReplyData {
                         data,
                         backing: None,
@@ -2805,22 +2791,31 @@ impl Filesystem for SqueezefsFilesystem {
                         .await
                         .map_err(map_squeezefs_err)?;
                     let cache_key = crate::keys::active_block(ino, 0).to_string();
+                    let block_size = self.router.block_size.load(Ordering::Relaxed) as usize;
                     if file_type == "staged" {
                         if let Some(ref file_id) = meta.file_id {
                             if let Some(staged_data) = self.router.cache.nvme.read_staged(file_id) {
-                                self.active_block_buffers
-                                    .insert(cache_key, bytes::Bytes::from(staged_data));
+                                // Seed a full-block, pool-backed CoW buffer
+                                // (zero-extended): a short shared `Bytes`
+                                // here used to be merged past its length.
+                                self.active_block_buffers.insert(
+                                    cache_key,
+                                    crate::cache::active_block::ActiveBlockBuf::seeded(
+                                        &staged_data,
+                                        block_size,
+                                    ),
+                                );
                             }
                         }
                     } else if file_type == "inline" {
                         if let Some(ref inline_data) = meta.data_key {
-                            let block_size =
-                                self.router.block_size.load(Ordering::Relaxed) as usize;
-                            let mut buf = vec![0u8; block_size];
-                            let copy_len = std::cmp::min(inline_data.len(), block_size);
-                            buf[0..copy_len].copy_from_slice(&inline_data[0..copy_len]);
-                            self.active_block_buffers
-                                .insert(cache_key, bytes::Bytes::from(buf));
+                            self.active_block_buffers.insert(
+                                cache_key,
+                                crate::cache::active_block::ActiveBlockBuf::seeded(
+                                    inline_data,
+                                    block_size,
+                                ),
+                            );
                         }
                     }
 

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Exhaustive loom model-checking of the lock-free protocol cores
 # (inode allocator bitmap, block-key incarnation seqlock, staging budget
-# gauge). See loom-models/src/lib.rs for the invariants.
+# gauge, exclusive-owner CoW active-block cell). See loom-models/src/lib.rs
+# for the invariants.
 #
 # Isolated crate on purpose: a global `--cfg loom` poisons transitive deps
 # of the main crate; loom-models depends only on `loom` and #[path]-includes

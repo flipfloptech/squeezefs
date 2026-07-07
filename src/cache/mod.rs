@@ -1,3 +1,4 @@
+pub mod active_block;
 pub mod gds;
 pub mod lru;
 pub mod nvme;

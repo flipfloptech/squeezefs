@@ -889,7 +889,11 @@ impl MetaLvStorage {
             let zero_header = bytes::Bytes::from(vec![0u8; SECTOR_SIZE]);
             let mut ino = first_survivor;
             while ino < limit {
-                let chunk_end = std::cmp::min(ino + 512, limit);
+                // 128 entries per message: well under the worker ring depth
+                // even with concurrent volume formats sharing a worker (the
+                // reactor also submit-flushes on a full SQ, but bounded
+                // messages keep completion-queue pressure predictable).
+                let chunk_end = std::cmp::min(ino + 128, limit);
                 let ops: Vec<(u64, bytes::Bytes)> = (ino..chunk_end)
                     .map(|i| (block_start + i * block_size, zero_header.clone()))
                     .collect();

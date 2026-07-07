@@ -772,13 +772,21 @@ impl Reactor {
         }
     }
 
-    /// Queue the SQE for slot `i`; on a full SQ, complete the op with an
-    /// error (should not happen under ADMIT_CAP, and must be loud if it does).
+    /// Queue the SQE for slot `i`. A full SQ is normal backpressure (a
+    /// single `WriteAtBatch` may carry more entries than the ring): flush
+    /// the queued SQEs to the kernel with `submit()` — which consumes SQ
+    /// entries immediately, independent of completions — and push again.
+    /// Only a push that fails right after a successful flush is a real
+    /// error (and must be loud).
     fn push_slot(&mut self, i: usize) {
         let sqe = self.sqe_for(i);
         // SAFETY: buffers referenced by the SQE live in `self.slots[i]`, which
         // stays untouched until this SQE's completion is reaped.
-        let res = unsafe { self.ring.submission().push(&sqe) };
+        let mut res = unsafe { self.ring.submission().push(&sqe) };
+        if res.is_err() && self.ring.submit().is_ok() {
+            // SAFETY: same invariant as above.
+            res = unsafe { self.ring.submission().push(&sqe) };
+        }
         if res.is_err() {
             let p = self.release_slot(i);
             let err =

@@ -158,3 +158,44 @@ async fn test_fd_cache_churn_under_load() {
             .expect("churn task panicked");
     }
 }
+
+/// A single logical batch LARGER than the worker's submission-queue ring
+/// (512) must complete: SQ-full during batch admission is normal
+/// backpressure — the reactor flushes the SQ to the kernel and keeps
+/// pushing — never an error surfaced to the caller. Regression: the
+/// quick-format ghost sweep sent 512-entry batches (== ring size); with
+/// any co-resident op on the same worker the push overflowed and format
+/// failed loudly ("uring-fs submission queue overflow").
+#[tokio::test]
+async fn test_write_at_batch_larger_than_ring_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big_batch.bin");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(700 * 4096)
+        .unwrap();
+
+    // 600 sector writes in ONE message: > the 512-deep SQ ring.
+    let ops: Vec<(u64, bytes::Bytes)> = (0..600u64)
+        .map(|i| {
+            let mut sector = vec![0u8; 4096];
+            sector[..8].copy_from_slice(&i.to_le_bytes());
+            (i * 4096, bytes::Bytes::from(sector))
+        })
+        .collect();
+    squeezefs::uring_fs::write_at_batch(&path, ops)
+        .await
+        .expect("a batch larger than the SQ ring must complete via submit-on-full");
+
+    // Byte-exactness spot checks across the range.
+    for i in [0u64, 255, 511, 512, 599] {
+        let got = squeezefs::uring_fs::read_at(&path, i * 4096, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            u64::from_le_bytes(got[..].try_into().unwrap()),
+            i,
+            "entry {i} must have landed"
+        );
+    }
+}

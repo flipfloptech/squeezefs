@@ -4336,6 +4336,21 @@ impl Filesystem for SqueezefsFilesystem {
         self.queue_reclaim_inode(ino);
     }
 
+    /// BATCH_FORGET (kernel mass evictions: memory pressure, drop_caches,
+    /// pre-umount sweeps) must behave exactly like N FORGETs. fuse3's
+    /// default impl is a NO-OP — leaving this unimplemented leaked every
+    /// batch-evicted orphan's inode slot until the next mount's
+    /// reconciliation.
+    async fn batch_forget(&self, _req: Request, inodes: &[u64]) {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE BatchForget: {} inodes", inodes.len());
+        for &ino in inodes {
+            self.attr_cache.invalidate(&ino);
+            self.active_inode_locks.remove(&ino);
+            self.queue_reclaim_inode(ino);
+        }
+    }
+
     async fn getlk(
         &self,
         _req: Request,
@@ -5650,6 +5665,42 @@ async fn flush_single_active_block(
     Ok(())
 }
 
+/// Drain one reclaim batch: after the first ino arrives, hold a short
+/// gather window so a FORGET storm coalesces into a REAL batch. Without the
+/// window, a 1:1 unlink→FORGET storm outruns `try_recv` and every "batch"
+/// degenerates to 1–2 inos — reclaim then interferes op-for-op with the
+/// foreground delete path (measured: ~360 µs/unlink vs ~180 µs with reclaim
+/// quiescent). Reclaim is background by definition; +`window` of slot-reuse
+/// latency is free, and the batch's meta work amortizes ~cap× (§4.5).
+/// Returns `None` when the channel closed with nothing pending.
+async fn drain_reclaim_batch(
+    rx: &mut tokio::sync::mpsc::Receiver<u64>,
+    cap: usize,
+    window: std::time::Duration,
+) -> Option<Vec<u64>> {
+    let first = rx.recv().await?;
+    let mut batch = vec![first];
+    if !window.is_zero() {
+        let deadline = tokio::time::Instant::now() + window;
+        while batch.len() < cap {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(ino)) => batch.push(ino),
+                Ok(None) | Err(_) => break, // closed or window elapsed
+            }
+        }
+    }
+    while batch.len() < cap {
+        match rx.try_recv() {
+            Ok(ino) => batch.push(ino),
+            Err(_) => break,
+        }
+    }
+    // FORGET can enqueue an ino more than once across sessions.
+    batch.sort_unstable();
+    batch.dedup();
+    Some(batch)
+}
+
 async fn run_reclaim_worker_pool(
     mut rx: tokio::sync::mpsc::Receiver<u64>,
     fs: SqueezefsFilesystem,
@@ -5664,19 +5715,15 @@ async fn run_reclaim_worker_pool(
         .and_then(|v| v.parse::<usize>().ok())
         .map(|v| v.clamp(1, 1024))
         .unwrap_or(64);
+    let window_ms = std::env::var("SQUEEZEFS_RECLAIM_BATCH_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.min(1000))
+        .unwrap_or(20);
+    let window = std::time::Duration::from_millis(window_ms);
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let fs_arc = std::sync::Arc::new(fs);
-    while let Some(first) = rx.recv().await {
-        let mut batch = vec![first];
-        while batch.len() < batch_cap {
-            match rx.try_recv() {
-                Ok(ino) => batch.push(ino),
-                Err(_) => break,
-            }
-        }
-        // FORGET can enqueue an ino more than once across sessions.
-        batch.sort_unstable();
-        batch.dedup();
+    while let Some(batch) = drain_reclaim_batch(&mut rx, batch_cap, window).await {
         let fs_clone = fs_arc.clone();
         let sem_clone = semaphore.clone();
         let permit = sem_clone.acquire_owned().await.unwrap();

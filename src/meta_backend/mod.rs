@@ -1103,6 +1103,19 @@ impl MetaLvBackend {
             for &ino in &doomed {
                 let empty = inode::DiskInode::new_zeroed();
                 inode::write_inode_raw(&self.storage, ino, &empty).await?;
+                // Kill the corpse's xattr block header (magic + num_entries)
+                // in the SAME commit: an 8-byte staged patch instead of the
+                // per-corpse `removexattr("layout")` transaction reclaim used
+                // to issue — which doubled meta-commit traffic under delete
+                // storms and collided with foreground unlinks on the shared
+                // inode-table sectors. Also guarantees a reused ino can never
+                // resurrect the corpse's layout xattr. Quarantined inos are
+                // skipped: their block is journal-region territory (§4.4).
+                if !xattr::is_quarantined(ino) {
+                    let block_offset =
+                        xattr::XATTR_BLOCK_START + ino * xattr::XATTR_BLOCK_SIZE as u64;
+                    self.storage.write_blocks(block_offset, &[0u8; 8]).await?;
+                }
             }
             Ok(())
         })

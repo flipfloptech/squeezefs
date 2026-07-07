@@ -3120,7 +3120,6 @@ impl DataRouter {
         file_path: &str,
         _con: &mut crate::dlm::MetaConnection,
     ) -> Result<()> {
-        let ino = parse_inode_from_path(file_path);
         let meta = self.fetch_metadata(file_path).await?;
 
         let mut blocks_to_free: Vec<String> = Vec::new();
@@ -3158,9 +3157,11 @@ impl DataRouter {
             let _ = self.backend_router.free_blocks(&free_refs).await;
         }
 
-        if let Some(backend) = self.inner.meta_backend.get() {
-            let _ = backend.removexattr(ino, "layout").await;
-        }
+        // No per-corpse `removexattr("layout")` transaction here: the sole
+        // caller is inode reclaim, whose batched `destroy_inodes` kills the
+        // whole xattr block inside its own commit (one transaction per batch
+        // instead of one per corpse — the extra commit's sector guards
+        // collided with foreground unlinks under delete storms).
 
         // Targeted O(1) active block removals without full staging listing
         let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);

@@ -322,15 +322,22 @@ impl MetaLvBackend {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
 
-            let mut images: Vec<(u64, Vec<u8>)> = Vec::with_capacity(by_sector.len());
-            for (&sector, patches) in &by_sector {
-                let mut image = vec![0u8; SECTOR_SIZE];
-                self.storage.read_blocks_direct(sector, &mut image).await?;
-                for (off, bytes) in patches {
-                    let start = (off - sector) as usize;
-                    image[start..start + bytes.len()].copy_from_slice(bytes);
+            // RMW reads for all touched sectors in flight together (the
+            // pipelined uring-fs workers service them concurrently).
+            let mut images: Vec<(u64, Vec<u8>)> =
+                futures::future::try_join_all(by_sector.keys().map(|&sector| async move {
+                    let mut image = vec![0u8; SECTOR_SIZE];
+                    self.storage.read_blocks_direct(sector, &mut image).await?;
+                    Ok::<_, crate::error::SqueezefsError>((sector, image))
+                }))
+                .await?;
+            for (sector, image) in images.iter_mut() {
+                if let Some(patches) = by_sector.get(sector) {
+                    for (off, bytes) in patches {
+                        let start = (off - *sector) as usize;
+                        image[start..start + bytes.len()].copy_from_slice(bytes);
+                    }
                 }
-                images.push((sector, image));
             }
 
             let record = bincode::serialize(&images).map_err(|e| {
@@ -343,9 +350,15 @@ impl MetaLvBackend {
                 .write_record(&self.storage, &record, sync)
                 .await?;
 
-            for (sector, image) in &images {
-                self.storage.write_blocks_direct(*sector, image).await?;
-            }
+            // Apply every sector image as one batched uring-fs message.
+            self.storage
+                .write_blocks_direct_batch(
+                    images
+                        .into_iter()
+                        .map(|(sector, image)| (sector, bytes::Bytes::from(image)))
+                        .collect(),
+                )
+                .await?;
 
             // Foreign (non-metadata) files: direct uring writes (unjournaled, as
             // previously). In practice a meta tx never stages these.
@@ -387,6 +400,18 @@ impl MetaLvBackend {
         force: bool,
         pb: Option<indicatif::ProgressBar>,
     ) -> Result<()> {
+        // Fail loud on a volume too small to hold any inode: the table
+        // begins past the xattr region (72 MiB), so a smaller device yields
+        // an allocator with limit 0 and every create fails "Inode table
+        // full" at runtime — far from the actual mistake.
+        if storage.inode_alloc.limit() <= alloc::FIRST_ALLOCATABLE_INO {
+            return Err(crate::error::SqueezefsError::InvalidOperation(
+                "Metadata volume too small: 0 allocatable inodes (the inode \
+                 table starts past the 72 MiB xattr region; use a volume of \
+                 at least ~80 MiB)"
+                    .to_string(),
+            ));
+        }
         // Prevent format only if the volume is mounted by a *live* client. A
         // client heartbeats its `client:{id}` registration; one whose heartbeat is
         // older than CLIENT_STALE_TTL_SECS is stale (the client crashed / was

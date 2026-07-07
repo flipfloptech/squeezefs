@@ -7,7 +7,7 @@ fn bench_metalv_metadata(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
-    let meta_storage = MetaLvStorage::open(&meta_path, 64 * 1024 * 1024).unwrap();
+    let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
     rt.block_on(async { MetaLvBackend::format(&meta_storage).await })
         .unwrap();
     let backend = MetaLvBackend::new(meta_storage);
@@ -19,8 +19,12 @@ fn bench_metalv_metadata(c: &mut Criterion) {
             let name = format!("file_{}", rand::random::<u64>());
             let backend_ref = &backend;
             async move {
-                backend_ref.create(1, &name, 0o644, 0, 0).await.unwrap();
+                let ino = backend_ref.create(1, &name, 0o644, 0, 0).await.unwrap().ino;
                 backend_ref.unlink(1, &name).await.unwrap();
+                // Reclaim the slot: unlink only drops the dentry/nlink, and a
+                // leaked slot per iteration fills the inode table mid-warmup
+                // once iterations get fast enough.
+                backend_ref.destroy_inode(ino).await.unwrap();
             }
         });
     });

@@ -74,27 +74,28 @@ impl Journal {
     }
 }
 
-async fn write_circular(
-    storage: &MetaLvStorage,
-    circular_start: u64,
-    circular_size: u64,
-    pos: u64,
-    data: &[u8],
-) -> Result<()> {
-    let mut written_len = 0;
-    let mut cur_pos = pos % circular_size;
-    while written_len < data.len() {
-        let chunk_len = std::cmp::min(data.len() - written_len, (circular_size - cur_pos) as usize);
-        storage
-            .write_blocks_direct(
-                circular_start + cur_pos,
-                &data[written_len..written_len + chunk_len],
-            )
-            .await?;
-        written_len += chunk_len;
-        cur_pos = (cur_pos + chunk_len as u64) % circular_size;
-    }
-    Ok(())
+/// Encode one WAL record: `len (LE u32) | payload | xxh3_64(payload) LE 8B`,
+/// zero-padded to sector alignment.
+///
+/// The 8-byte trailer is an **error-detection** checksum (torn/corrupt
+/// record detection), not a security boundary — anyone who can forge WAL
+/// records can write the inode table directly. It was SHA-256 truncated to
+/// 8 bytes: all of the cryptographic cost (3.7% of daemon cycles under
+/// delete storms) for none of the cryptographic strength. `xxh3_64` has the
+/// same 64-bit detection power at a fraction of the cost. Records are
+/// currently write-only (replay was deleted as unsound in PR 8; the state
+/// sector persists tail == head), so the trailer bytes are format-neutral —
+/// pinned by `test_encode_record_layout` for any future recovery reader.
+fn encode_record(payload: &[u8]) -> Vec<u8> {
+    let payload_len = payload.len() as u32;
+    let raw_len = 4 + payload.len() + 8;
+    let padded_len = (raw_len + SECTOR_SIZE - 1) & !(SECTOR_SIZE - 1);
+    let mut record_bytes = Vec::with_capacity(padded_len);
+    record_bytes.extend_from_slice(&payload_len.to_le_bytes());
+    record_bytes.extend_from_slice(payload);
+    record_bytes.extend_from_slice(&xxhash_rust::xxh3::xxh3_64(payload).to_le_bytes());
+    record_bytes.resize(padded_len, 0);
+    record_bytes
 }
 
 async fn journal_worker_loop(
@@ -162,38 +163,29 @@ async fn journal_worker_loop(
 
         let mut write_failed = false;
         let mut force_sync = false;
+        // Build every record in the drain into ONE batched uring-fs write:
+        // record boundaries stay sector-aligned (encode_record pads), so the
+        // circular wrap splits are themselves aligned batch entries.
+        let mut batch_ops: Vec<(u64, bytes::Bytes)> = Vec::with_capacity(reqs.len() + 1);
         for req in &reqs {
             if req.sync {
                 force_sync = true;
             }
-            let payload_len = req.record.len() as u32;
-            let mut record_bytes = Vec::with_capacity(4 + req.record.len() + 8);
-            record_bytes.extend_from_slice(&payload_len.to_le_bytes());
-            record_bytes.extend_from_slice(&req.record);
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(&req.record);
-            record_bytes.extend_from_slice(&hash[..8]);
-
-            // Pad record to sector alignment (4096 bytes)
-            let raw_len = record_bytes.len();
-            let padded_len = (raw_len + SECTOR_SIZE - 1) & !(SECTOR_SIZE - 1);
-            record_bytes.resize(padded_len, 0);
-
-            let start_pos = state.head;
-            if write_circular(
-                &storage,
-                circular_start,
-                circular_size,
-                start_pos,
-                &record_bytes,
-            )
-            .await
-            .is_err()
-            {
-                write_failed = true;
-                break;
+            let record_bytes = encode_record(&req.record);
+            let record_len = record_bytes.len() as u64;
+            let record = bytes::Bytes::from(record_bytes);
+            let mut cur = state.head % circular_size;
+            let mut off = 0usize;
+            while off < record.len() {
+                let chunk = std::cmp::min(record.len() - off, (circular_size - cur) as usize);
+                batch_ops.push((circular_start + cur, record.slice(off..off + chunk)));
+                off += chunk;
+                cur = (cur + chunk as u64) % circular_size;
             }
-            state.head = (state.head + padded_len as u64) % circular_size;
+            state.head = (state.head + record_len) % circular_size;
+        }
+        if storage.write_blocks_direct_batch(batch_ops).await.is_err() {
+            write_failed = true;
         }
 
         if !write_failed {
@@ -239,5 +231,44 @@ async fn journal_worker_loop(
             };
             let _ = req.tx.send(res);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the WAL record layout for any future recovery reader:
+    /// `len (LE u32) | payload | xxh3_64(payload) LE 8B | zero pad to 4096`.
+    #[test]
+    fn test_encode_record_layout() {
+        let payload = b"squeezefs wal record payload".as_slice();
+        let rec = encode_record(payload);
+
+        assert_eq!(rec.len() % SECTOR_SIZE, 0, "record must be sector-padded");
+        assert_eq!(
+            u32::from_le_bytes(rec[0..4].try_into().unwrap()) as usize,
+            payload.len(),
+            "length prefix"
+        );
+        assert_eq!(&rec[4..4 + payload.len()], payload, "payload bytes");
+        let trailer_at = 4 + payload.len();
+        assert_eq!(
+            u64::from_le_bytes(rec[trailer_at..trailer_at + 8].try_into().unwrap()),
+            xxhash_rust::xxh3::xxh3_64(payload),
+            "xxh3_64 error-detection trailer"
+        );
+        assert!(
+            rec[trailer_at + 8..].iter().all(|&b| b == 0),
+            "padding must be zeroed"
+        );
+    }
+
+    /// A record whose raw size is exactly sector-aligned gains no extra pad.
+    #[test]
+    fn test_encode_record_exact_sector_fit() {
+        let payload = vec![0x7Fu8; SECTOR_SIZE - 4 - 8];
+        let rec = encode_record(&payload);
+        assert_eq!(rec.len(), SECTOR_SIZE, "exact fit must stay one sector");
     }
 }

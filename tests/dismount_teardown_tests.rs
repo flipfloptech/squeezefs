@@ -57,7 +57,7 @@ async fn make() -> (SqueezefsFilesystem, Request, NamedTempFile, NamedTempFile) 
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 
     let m = NamedTempFile::new().unwrap();
-    let ms = MetaLvStorage::open(m.path(), 64 * 1024 * 1024).unwrap();
+    let ms = MetaLvStorage::open(m.path(), 256 * 1024 * 1024).unwrap();
     MetaLvBackend::format(&ms).await.unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         Arc::new(MetaLvBackend::new(ms)),

@@ -658,6 +658,22 @@ impl MetaLvStorage {
         Ok(())
     }
 
+    /// Direct sector-aligned writes as ONE uring-fs message: the entries fan
+    /// out into parallel SQEs and the call returns when all have landed (any
+    /// failure fails the whole batch). One commit = one queue round-trip
+    /// instead of one per sector image / WAL record.
+    pub async fn write_blocks_direct_batch(&self, ops: Vec<(u64, bytes::Bytes)>) -> Result<()> {
+        for (offset, _) in &ops {
+            if offset % SECTOR_SIZE as u64 != 0 {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "Write offset {} must be sector-aligned",
+                    offset
+                )));
+            }
+        }
+        crate::uring_fs::write_at_batch(&self.path, ops).await
+    }
+
     pub fn device_path(&self) -> &Path {
         &self.path
     }

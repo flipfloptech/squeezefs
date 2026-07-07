@@ -740,6 +740,16 @@ impl NvmeCache {
             return Vec::new();
         }
 
+        // Key-affine: replace an existing copy on its own device — readers
+        // scan devices in order, so a round-robin re-put of a resident key
+        // would leave a divergent stale duplicate that survives remove().
+        for dev in &active_devices {
+            let shard_idx = (xxh3_64(&key) as usize) % dev.shards.len();
+            if dev.shards[shard_idx].has_key(&key) {
+                return dev.shards[shard_idx].put(key, value);
+            }
+        }
+
         let idx = self.write_counter.fetch_add(1, Ordering::Relaxed) % active_devices.len();
         let dev = &active_devices[idx];
         let shard_idx = (xxh3_64(&key) as usize) % dev.shards.len();
@@ -805,15 +815,20 @@ impl NvmeCache {
         false
     }
 
+    /// Remove `key` from EVERY device (pre-affinity rings can hold
+    /// duplicates; a purge must not leave a stale survivor). Returns the
+    /// most recent value found, favoring later devices only after earlier
+    /// ones are cleared.
     pub fn remove(&self, key: &Bytes) -> Option<Bytes> {
         let devices = self.devices.read();
+        let mut removed = None;
         for dev in devices.iter() {
             let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
             if let Some(val) = dev.shards[shard_idx].remove(key) {
-                return Some(val);
+                removed.get_or_insert(val);
             }
         }
-        None
+        removed
     }
 
     pub async fn offline_device(&self, id: usize) -> Vec<(Bytes, Bytes)> {
@@ -1063,17 +1078,20 @@ mod tests {
     fn test_multi_device_reput_and_remove_leave_no_stale_duplicate() {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
-        let cache =
-            NvmeCache::new(&[dir1.path(), dir2.path()], &[4096, 4096], 1).unwrap();
+        // Sub-4096 capacities keep byte-alignment (>=4096 switches the ring
+        // to 4 KiB block alignment and these tiny entries no longer fit).
+        let cache = NvmeCache::new(&[dir1.path(), dir2.path()], &[2048, 2048], 1).unwrap();
 
         let key = Bytes::from("block_dup");
         let v1 = Bytes::from(vec![0x11u8; 64]);
         let v2 = Bytes::from(vec![0x22u8; 64]);
 
         // Interleave with other keys so the round-robin counter points at a
-        // different device for the re-put of the same key.
+        // DIFFERENT device for the re-put of the same key (counter: key->A,
+        // filler_a->B, filler_b->A, re-put key->B without affinity).
         cache.put(key.clone(), v1.clone());
         cache.put(Bytes::from("filler_a"), Bytes::from(vec![0u8; 16]));
+        cache.put(Bytes::from("filler_b"), Bytes::from(vec![0u8; 16]));
         cache.put(key.clone(), v2.clone());
 
         // Whatever device it lives on, the current value must be v2.

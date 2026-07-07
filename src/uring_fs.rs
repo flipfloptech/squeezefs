@@ -267,6 +267,277 @@ fn map_io(e: std::io::Error) -> SqueezefsError {
     SqueezefsError::Io(e)
 }
 
+// ---------------------------------------------------------------------------
+// Fault-injection test support (design-wal-crash-consistency §4.7a).
+//
+// Live, test-exercised statics per the `nvme_dev.rs` precedent
+// (`SIMULATE_CORRUPTION` / `FAIL_NEXT_WRITES`): the crash-contract and
+// kill-9 suites (`tests/crash_contract_tests.rs`, `tests/crash_kill_tests.rs`)
+// arm these to deterministically reproduce "power loss tore sector S
+// mid-apply" and "writes since the last barrier are volatile" without root,
+// KVM, or dm-flakey. Consulted at request admission (both the uring reactors
+// and the blocking fallback): ONE relaxed atomic load when disarmed — the
+// default — so the production hot path pays nothing.
+// ---------------------------------------------------------------------------
+
+pub struct TornWriteFault {
+    /// Absolute file offset the tear triggers on (`u64::MAX` = disarmed).
+    /// The first write whose byte range covers this offset is torn.
+    pub offset: std::sync::atomic::AtomicU64,
+    /// Bytes of the matching write to persist before the "crash" (a
+    /// sub-sector prefix in practice).
+    pub keep: std::sync::atomic::AtomicUsize,
+}
+
+/// After the torn write fires, every subsequent request on the SAME path
+/// fails with `EIO` ("device died mid-commit") until [`clear_faults`].
+pub static TORN_WRITE_FAULT: TornWriteFault = TornWriteFault {
+    offset: std::sync::atomic::AtomicU64::new(u64::MAX),
+    keep: std::sync::atomic::AtomicUsize::new(0),
+};
+
+/// Fast disarmed-path guard: `false` (default) ⇒ the shim is completely
+/// inert and admission does no further fault work.
+static FAULTS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Default)]
+struct FaultState {
+    /// Paths whose "device died": every request fails `EIO`.
+    poisoned: std::collections::HashSet<PathBuf>,
+    /// Power-cut tracking: per path, the (offset, ORIGINAL bytes) of every
+    /// write admitted since the last `fdatasync` — i.e. the volatile cache a
+    /// real power loss would drop. [`power_cut`] reverts them.
+    tracked: std::collections::HashMap<PathBuf, Vec<(u64, Vec<u8>)>>,
+}
+
+static FAULT_STATE: Lazy<std::sync::Mutex<FaultState>> =
+    Lazy::new(|| std::sync::Mutex::new(FaultState::default()));
+
+/// Arm the torn-write fault: the next write covering `offset` persists only
+/// its first `keep` bytes, completes with `EIO`, and poisons its path.
+pub fn arm_torn_write(offset: u64, keep: usize) {
+    TORN_WRITE_FAULT
+        .keep
+        .store(keep, std::sync::atomic::Ordering::Relaxed);
+    TORN_WRITE_FAULT
+        .offset
+        .store(offset, std::sync::atomic::Ordering::Relaxed);
+    FAULTS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Begin volatile-cache tracking on `path`: every subsequent write is
+/// captured (original bytes) until an `fdatasync` on the path marks them
+/// durable. [`power_cut`] then reverts whatever is still volatile.
+pub fn arm_power_cut(path: impl AsRef<Path>) {
+    FAULT_STATE
+        .lock()
+        .unwrap()
+        .tracked
+        .insert(path.as_ref().to_path_buf(), Vec::new());
+    FAULTS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Simulate power loss on `path`: revert (in reverse admission order) every
+/// tracked write not yet covered by an `fdatasync`. Returns how many writes
+/// were reverted. The caller must have quiesced the path (no in-flight I/O),
+/// exactly as a crash point does.
+pub fn power_cut(path: impl AsRef<Path>) -> usize {
+    use std::os::unix::fs::FileExt;
+    let entries = FAULT_STATE
+        .lock()
+        .unwrap()
+        .tracked
+        .insert(path.as_ref().to_path_buf(), Vec::new())
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return 0;
+    }
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path.as_ref())
+        .expect("power_cut: open tracked path");
+    // Reverse order restores pre-write bytes under overlapping writes.
+    let count = entries.len();
+    for (offset, original) in entries.into_iter().rev() {
+        f.write_all_at(&original, offset)
+            .expect("power_cut: revert tracked write");
+    }
+    f.sync_data().expect("power_cut: settle reverted bytes");
+    count
+}
+
+/// Disarm everything: torn fault, poisoned paths, power-cut tracking.
+pub fn clear_faults() {
+    TORN_WRITE_FAULT
+        .offset
+        .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    TORN_WRITE_FAULT
+        .keep
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut st = FAULT_STATE.lock().unwrap();
+    st.poisoned.clear();
+    st.tracked.clear();
+    FAULTS_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fault_eio(what: &str) -> SqueezefsError {
+    SqueezefsError::Io(std::io::Error::other(format!(
+        "uring-fs fault injection: {what}"
+    )))
+}
+
+/// Whether the armed tear offset falls inside `[offset, offset + len)`.
+fn tear_hits(offset: u64, len: usize) -> Option<usize> {
+    let armed = TORN_WRITE_FAULT
+        .offset
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if armed == u64::MAX || armed < offset || armed >= offset + len as u64 {
+        return None;
+    }
+    Some(
+        TORN_WRITE_FAULT
+            .keep
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Synchronously persist `data[..keep]` at `offset` — the genuine prefix of
+/// a torn write (std I/O on purpose: the "device" is failing, determinism
+/// beats the uring hot path here, and this only runs with a fault armed).
+fn tear_pwrite(path: &Path, offset: u64, data: &[u8], keep: usize) {
+    use std::os::unix::fs::FileExt;
+    let keep = keep.min(data.len());
+    if keep == 0 {
+        return;
+    }
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.write_all_at(&data[..keep], offset);
+        let _ = f.sync_data();
+    }
+}
+
+/// Capture the ORIGINAL bytes of `[offset, offset + len)` for power-cut
+/// revert. Short reads (beyond EOF) capture zeros — meta volumes are
+/// preallocated, so writes never extend the file.
+fn capture_original(path: &Path, offset: u64, len: usize) -> (u64, Vec<u8>) {
+    use std::os::unix::fs::FileExt;
+    let mut original = vec![0u8; len];
+    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(path) {
+        let mut filled = 0usize;
+        while filled < len {
+            match f.read_at(&mut original[filled..], offset + filled as u64) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => filled += n,
+            }
+        }
+    }
+    (offset, original)
+}
+
+/// Fault-shim request interception, shared by the uring reactors and the
+/// blocking fallback. Returns `Some(req)` to proceed (possibly after
+/// capturing power-cut originals) or `None` when the request was consumed
+/// (its completion already sent an error).
+fn fault_intercept(req: FsReq) -> Option<FsReq> {
+    let mut st = FAULT_STATE.lock().unwrap();
+
+    // Poisoned path: the device died — EVERY request fails.
+    {
+        let path = match &req {
+            FsReq::WriteAll { path, .. }
+            | FsReq::ReadAll { path, .. }
+            | FsReq::ReadAt { path, .. }
+            | FsReq::WriteAt { path, .. }
+            | FsReq::WriteAtBatch { path, .. }
+            | FsReq::Fdatasync { path, .. } => path,
+        };
+        if st.poisoned.contains(path) {
+            let err = || fault_eio("path poisoned (device died mid-commit)");
+            match req {
+                FsReq::WriteAll { tx, .. }
+                | FsReq::WriteAt { tx, .. }
+                | FsReq::WriteAtBatch { tx, .. }
+                | FsReq::Fdatasync { tx, .. } => {
+                    let _ = tx.send(Err(err()));
+                }
+                FsReq::ReadAll { tx, .. } | FsReq::ReadAt { tx, .. } => {
+                    let _ = tx.send(Err(err()));
+                }
+            }
+            return None;
+        }
+    }
+
+    match req {
+        FsReq::WriteAt {
+            path,
+            offset,
+            data,
+            tx,
+        } => {
+            if let Some(keep) = tear_hits(offset, data.len()) {
+                tear_pwrite(&path, offset, &data, keep);
+                TORN_WRITE_FAULT
+                    .offset
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                st.poisoned.insert(path);
+                let _ = tx.send(Err(fault_eio("write torn mid-sector, device died")));
+                return None;
+            }
+            if let Some(log) = st.tracked.get_mut(&path) {
+                let cap = capture_original(&path, offset, data.len());
+                log.push(cap);
+            }
+            Some(FsReq::WriteAt {
+                path,
+                offset,
+                data,
+                tx,
+            })
+        }
+        FsReq::WriteAtBatch { path, ops, tx } => {
+            let torn_at = ops
+                .iter()
+                .position(|(off, d)| tear_hits(*off, d.len()).is_some());
+            if let Some(k) = torn_at {
+                // Entries admitted before the tear land fully; the matching
+                // entry keeps its prefix; later entries never reach the
+                // device ("died mid-commit").
+                for (off, d) in &ops[..k] {
+                    tear_pwrite(&path, *off, d, d.len());
+                }
+                let (off, d) = &ops[k];
+                let keep = tear_hits(*off, d.len()).unwrap_or(0);
+                tear_pwrite(&path, *off, d, keep);
+                TORN_WRITE_FAULT
+                    .offset
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                st.poisoned.insert(path);
+                let _ = tx.send(Err(fault_eio("batch write torn mid-sector, device died")));
+                return None;
+            }
+            if let Some(log) = st.tracked.get_mut(&path) {
+                for (off, d) in &ops {
+                    let cap = capture_original(&path, *off, d.len());
+                    log.push(cap);
+                }
+            }
+            Some(FsReq::WriteAtBatch { path, ops, tx })
+        }
+        FsReq::Fdatasync { path, tx } => {
+            // The barrier makes everything admitted before it durable. The
+            // caller awaits this completion before relying on durability, and
+            // the serial test harness admits no concurrent writes in the
+            // window, so clearing at admission is exact for its users.
+            if let Some(log) = st.tracked.get_mut(&path) {
+                log.clear();
+            }
+            Some(FsReq::Fdatasync { path, tx })
+        }
+        other => Some(other),
+    }
+}
+
 /// Completion sink: single ops answer their own oneshot; batch entries share
 /// an aggregate that fires once when the last entry lands.
 enum UnitDone {
@@ -495,6 +766,15 @@ impl Reactor {
     /// Admit one request: do the (rare, blocking) opens inline, then queue
     /// its first SQE(s).
     fn admit(&mut self, req: FsReq) {
+        // Fault-injection shim (§4.7a): one relaxed load when disarmed.
+        let req = if FAULTS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            match fault_intercept(req) {
+                Some(r) => r,
+                None => return, // consumed: completion already sent an error
+            }
+        } else {
+            req
+        };
         match req {
             FsReq::WriteAll { path, data, tx } => {
                 let opened = (|| -> Result<Rc<File>> {
@@ -856,6 +1136,15 @@ impl Reactor {
 fn blocking_fallback_loop(rx: crossbeam::channel::Receiver<FsReq>) {
     use std::os::unix::fs::FileExt;
     while let Ok(req) = rx.recv() {
+        // Same fault-injection admission as the uring reactors (§4.7a).
+        let req = if FAULTS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            match fault_intercept(req) {
+                Some(r) => r,
+                None => continue,
+            }
+        } else {
+            req
+        };
         match req {
             FsReq::WriteAll { path, data, tx } => {
                 let res = (|| -> std::io::Result<()> {

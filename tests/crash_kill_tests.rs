@@ -94,7 +94,7 @@ fn crash_child_entry() {
             backend.sync_device().await.unwrap();
             ledger_append(&ledger, &format!("ack setxattr {ino} user.crash v{i}"));
 
-            if i % 3 == 0 {
+            if i.is_multiple_of(3) {
                 ledger_append(&ledger, &format!("start unlink {name}"));
                 backend.unlink(1, &name).await.unwrap();
                 backend.sync_device().await.unwrap();
@@ -329,8 +329,9 @@ async fn test_kill9_remount_soak() {
             .ensure_dentry_index()
             .await
             .expect("dentry index must build after kill-9");
+        // The index is parent-keyed and the churn lives entirely in root.
         let mut dentry_names: HashMap<u64, String> = HashMap::new();
-        storage.dentry_index.scan(|_bucket, chain| {
+        storage.dentry_index.read_sync(&1u64, |_, chain| {
             for (_off, d) in chain {
                 dentry_names.insert(d.child_ino, d.get_name());
             }
@@ -389,8 +390,22 @@ async fn test_kill9_remount_soak() {
         );
 
         // Invariant 1 (D0): acked ops present unless superseded.
+        let expectations = acked_expectations(&m);
+        eprintln!(
+            "[kill9 round {round}] ledger: {} lines, {} started creates, {} started destroys, \
+             {} acked inos, {} un-acked starts; checks: {} valid slots, {} dentries, \
+             {healed} healed bits, {unexplained} unexplained, {} D0 expectations",
+            m.lines.len(),
+            m.started_creates,
+            m.started_destroys,
+            m.acked_inos.len(),
+            m.unacked_starts,
+            valid_inos.len(),
+            dentry_names.len(),
+            expectations.len(),
+        );
         let backend = MetaLvBackend::new(storage);
-        for (name, ino, expect) in acked_expectations(&m) {
+        for (name, ino, expect) in expectations {
             match expect {
                 Expect::Present(xattr) => {
                     let found = backend.lookup(1, &name).await.unwrap_or_else(|e| {

@@ -1002,7 +1002,7 @@ impl SqueezefsFilesystem {
         let start_dlm = std::time::Instant::now();
         let lease = self
             .dlm
-            .acquire_lock_with_retry(&file_path, None, Duration::from_secs(5), 5)
+            .acquire_lock(&file_path, None, Duration::from_secs(5))
             .await?;
         METRICS.dlm_acquire_time.record(start_dlm.elapsed());
         let token = lease.fencing_token();
@@ -1145,8 +1145,7 @@ impl SqueezefsFilesystem {
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
         {
-            let file_path = format!("inode_{}", ino);
-            let current_fencing = self.dlm.get_fencing_token(&file_path);
+            let current_fencing = self.dlm.get_fencing_token_ino(ino);
             if fencing_token < current_fencing {
                 return Err(SqueezefsError::FencingTokenExpired {
                     token: fencing_token,
@@ -1554,8 +1553,7 @@ impl SqueezefsFilesystem {
                         if let (Ok(ino), Ok(b)) =
                             (ino_parts[1].parse::<u64>(), parts[1].parse::<u32>())
                         {
-                            let fencing_token =
-                                self.dlm.get_fencing_token(&format!("inode_{}", ino));
+                            let fencing_token = self.dlm.get_fencing_token_ino(ino);
 
                             let nvme_clone = self.router.cache.nvme.clone();
                             let key_clone = key.clone();
@@ -1677,8 +1675,7 @@ impl SqueezefsFilesystem {
                     .unwrap_or_default();
                 let file_type = meta.file_type.clone();
                 let is_striped = file_type == "striped";
-                let file_path = crate::keys::inode_path(ino);
-                let fencing_token = dlm_clone.get_fencing_token(&file_path);
+                let fencing_token = dlm_clone.get_fencing_token_ino(ino);
                 let old_key = meta.block_map.as_ref().and_then(|bm| bm.get(&b).cloned());
 
                 flush_single_active_block(
@@ -2445,7 +2442,7 @@ impl Filesystem for SqueezefsFilesystem {
         let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
 
         if active_hit {
-            let fencing_token = self.dlm.get_fencing_token(&file_path);
+            let fencing_token = self.dlm.get_fencing_token_ino(ino);
             let _ = self
                 .flush_active_blocks_with_retry(ino, fencing_token)
                 .await;
@@ -2883,8 +2880,7 @@ impl Filesystem for SqueezefsFilesystem {
             };
 
             if let Some(new_size) = size_to_set {
-                let file_path = crate::keys::inode_path(ino);
-                let fencing_token = self.dlm.get_fencing_token(&file_path);
+                let fencing_token = self.dlm.get_fencing_token_ino(ino);
                 self.router
                     .truncate_layout(ino, new_size, fencing_token)
                     .await
@@ -3735,7 +3731,7 @@ impl Filesystem for SqueezefsFilesystem {
             } else {
                 let lease = match self
                     .dlm
-                    .acquire_lock_with_retry(&src_path, None, Duration::from_secs(5), 5)
+                    .acquire_lock(&src_path, None, Duration::from_secs(5))
                     .await
                 {
                     Ok(l) => l,
@@ -3766,7 +3762,7 @@ impl Filesystem for SqueezefsFilesystem {
             } else {
                 let l = match self
                     .dlm
-                    .acquire_lock_with_retry(first_path, None, Duration::from_secs(5), 5)
+                    .acquire_lock(first_path, None, Duration::from_secs(5))
                     .await
                 {
                     Ok(l) => Some(l),
@@ -3788,7 +3784,7 @@ impl Filesystem for SqueezefsFilesystem {
             } else {
                 let l = match self
                     .dlm
-                    .acquire_lock_with_retry(second_path, None, Duration::from_secs(5), 5)
+                    .acquire_lock(second_path, None, Duration::from_secs(5))
                     .await
                 {
                     Ok(l) => Some(l),
@@ -4131,7 +4127,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let file_path = crate::keys::inode_path(ino);
                 if let Ok(mut meta) = self.router.fetch_metadata(&file_path).await {
                     meta.size = target_size;
-                    let fencing_token = self.dlm.get_fencing_token(&file_path);
+                    let fencing_token = self.dlm.get_fencing_token_ino(ino);
                     let _ = self
                         .router
                         .save_metadata_to_backend(ino, &meta, fencing_token)

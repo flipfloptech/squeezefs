@@ -73,6 +73,75 @@ fn bench_high_concurrency(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cluster-DLM (local backend) hot-path costs: lease acquire/release cycles
+/// and fencing-token reads. The typed binary `ObjectKey` (`Ino(u64)` fast
+/// path) must keep these free of `format!`/parse allocations — regressions
+/// show up here as step changes.
+fn bench_cluster_dlm(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("cluster_dlm");
+
+    let dlm = squeezefs::dlm::DlmClient::new("local").unwrap();
+
+    // Uncontended acquire+release on rotating inode keys (the
+    // get_or_acquire_lease shape).
+    group.bench_function("acquire_release_uncontended_ino", |b| {
+        let dlm = dlm.clone();
+        let mut i = 0u64;
+        b.to_async(&rt).iter(|| {
+            i = i.wrapping_add(1);
+            let path = format!("inode_{}", 800_000 + (i % 1024));
+            let dlm = dlm.clone();
+            async move {
+                let lease = dlm
+                    .acquire_lock(&path, None, std::time::Duration::from_secs(1))
+                    .await
+                    .expect("uncontended acquire");
+                lease.release().await.expect("release");
+            }
+        });
+    });
+
+    // Fencing-token read via the path API (prefix parse, zero alloc) — the
+    // per-save_metadata fencing check shape.
+    let seeded = rt.block_on(async {
+        dlm.acquire_lock("inode_800042", None, std::time::Duration::from_secs(1))
+            .await
+            .expect("seed acquire")
+    });
+    group.bench_function("get_fencing_token_path", |b| {
+        b.iter(|| black_box(dlm.get_fencing_token(black_box("inode_800042"))));
+    });
+    group.bench_function("get_fencing_token_ino", |b| {
+        b.iter(|| black_box(dlm.get_fencing_token_ino(black_box(800_042u64))));
+    });
+    drop(seeded);
+
+    // Contended handoff: 8 tasks fight over one key, each holding briefly.
+    group.bench_function("acquire_release_contended_1key_8tasks", |b| {
+        let dlm = dlm.clone();
+        b.to_async(&rt).iter(|| {
+            let dlm = dlm.clone();
+            async move {
+                let futures = (0..8).map(|_| {
+                    let dlm = dlm.clone();
+                    async move {
+                        let lease = dlm
+                            .acquire_lock("inode_800777", None, std::time::Duration::from_secs(5))
+                            .await
+                            .expect("contended acquire");
+                        tokio::task::yield_now().await;
+                        lease.release().await.expect("release");
+                    }
+                });
+                futures::future::join_all(futures).await;
+            }
+        });
+    });
+
+    group.finish();
+}
+
 /// Quantifies the inline small-write zero-copy win: `CachedMetadata` is cloned
 /// ~3x per small write (moka `get`, `meta.clone()`). With `data_key: Bytes` the
 /// inline-payload clone is an O(1) refcount bump; the old `Vec<u8>` layout paid a
@@ -105,5 +174,10 @@ fn bench_metadata_clone(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_high_concurrency, bench_metadata_clone);
+criterion_group!(
+    benches,
+    bench_high_concurrency,
+    bench_cluster_dlm,
+    bench_metadata_clone
+);
 criterion_main!(benches);

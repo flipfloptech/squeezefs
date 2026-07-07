@@ -697,7 +697,7 @@ impl DataRouter {
 
         // Fencing check
         let file_path = crate::keys::inode_path(ino);
-        let current_fencing = self.inner.dlm.get_fencing_token(&file_path);
+        let current_fencing = self.inner.dlm.get_fencing_token_ino(ino);
         if fencing_token < current_fencing {
             return Err(SqueezefsError::FencingTokenExpired {
                 token: fencing_token,
@@ -1456,7 +1456,7 @@ impl DataRouter {
         let ino = parse_inode_from_path(file_path);
         let meta_key = crate::keys::metadata_for_path(file_path);
 
-        let current_fencing = self.dlm.get_fencing_token(file_path);
+        let current_fencing = self.dlm.get_fencing_token_ino(ino);
         if fencing_token < current_fencing {
             return Err(crate::error::SqueezefsError::FencingTokenExpired {
                 token: fencing_token,
@@ -2898,7 +2898,7 @@ impl DataRouter {
         } else {
             _src_lease = self
                 .dlm
-                .acquire_lock_with_retry(src, None, std::time::Duration::from_secs(5), 5)
+                .acquire_lock(src, None, std::time::Duration::from_secs(5))
                 .await?;
             _src_lease.fencing_token()
         };
@@ -2909,7 +2909,7 @@ impl DataRouter {
         } else {
             _dest_lease = self
                 .dlm
-                .acquire_lock_with_retry(dest, None, std::time::Duration::from_secs(5), 5)
+                .acquire_lock(dest, None, std::time::Duration::from_secs(5))
                 .await?;
             _dest_lease.fencing_token()
         };

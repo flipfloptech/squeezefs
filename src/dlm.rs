@@ -1,12 +1,90 @@
 use crate::error::Result;
+use crate::stripe_locks::StripeLocks;
 use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use xxhash_rust::xxh3::xxh3_64;
 
-static LOCK_MAP: Lazy<scc::HashMap<String, String>> = Lazy::new(|| scc::HashMap::new());
-static FENCING_MAP: Lazy<scc::HashMap<String, AtomicU64>> = Lazy::new(|| scc::HashMap::new());
-static LOCK_RELEASED: Lazy<tokio::sync::Notify> = Lazy::new(|| tokio::sync::Notify::new());
+/// Typed lock/fencing object key.
+///
+/// The hot path (`inode_{N}` objects) is pure binary — no `format!`, no
+/// digit parsing on reads, no heap allocation, integer hashing. String
+/// forms exist only at the API boundary (callers pass `&str` paths) and
+/// for the rare non-inode object; a networked DLM backend would render
+/// these to wire bytes at the transport edge, never on the local path.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ObjectKey {
+    /// Whole-file lock on `inode_{0}`.
+    Ino(u64),
+    /// Byte-range lock on `inode_{0}`: `(ino, start, end)`.
+    InoRange(u64, u64, u64),
+    /// Whole-object lock on a non-inode path (rare).
+    Path(Box<str>),
+    /// Byte-range lock on a non-inode path (rare).
+    PathRange(Box<str>, u64, u64),
+}
+
+impl ObjectKey {
+    /// Parse a caller path into its binary form without allocating for the
+    /// `inode_{N}` fast path.
+    fn from_path(file_path: &str, range: Option<(u64, u64)>) -> Self {
+        match (ino_of_path(file_path), range) {
+            (Some(ino), None) => Self::Ino(ino),
+            (Some(ino), Some((s, e))) => Self::InoRange(ino, s, e),
+            (None, None) => Self::Path(file_path.into()),
+            (None, Some((s, e))) => Self::PathRange(file_path.into(), s, e),
+        }
+    }
+
+    /// The fencing generator identity: per *file* object (ranges share the
+    /// file's generator, matching the historical `fencing_generator:{path}`
+    /// keyspace).
+    fn fencing_identity(&self) -> ObjectKey {
+        match self {
+            Self::Ino(i) | Self::InoRange(i, _, _) => Self::Ino(*i),
+            Self::Path(p) | Self::PathRange(p, _, _) => Self::Path(p.clone()),
+        }
+    }
+
+    /// Stripe selector for the waiter-notify array. Collisions are benign
+    /// (spurious wakeups re-check and re-wait); correctness never depends on
+    /// this hash.
+    fn stripe_seed(&self) -> u64 {
+        match self {
+            Self::Ino(i) => *i,
+            Self::InoRange(i, s, e) => i ^ s.rotate_left(16) ^ e.rotate_left(32),
+            Self::Path(p) => xxh3_64(p.as_bytes()),
+            Self::PathRange(p, s, e) => {
+                xxh3_64(p.as_bytes()) ^ s.rotate_left(16) ^ e.rotate_left(32)
+            }
+        }
+    }
+}
+
+/// `inode_{N}` → `N` without allocating. Strict: the entire suffix must be
+/// ASCII digits that parse into a `u64`, otherwise the path is treated as an
+/// opaque string key (never a lossy alias of some inode).
+fn ino_of_path(path: &str) -> Option<u64> {
+    let digits = path.strip_prefix("inode_")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Lock table: object → owner nonce. Owner identity is a process-unique
+/// `u64` (not a cloned `String` per acquisition).
+static LOCK_MAP: Lazy<scc::HashMap<ObjectKey, u64>> = Lazy::new(scc::HashMap::new);
+/// Fencing generators: file object → shared monotonic counter. `Arc` so a
+/// lease caches its generator and later reads are a plain atomic load.
+static FENCING_MAP: Lazy<scc::HashMap<ObjectKey, Arc<AtomicU64>>> = Lazy::new(scc::HashMap::new);
+/// Per-stripe release notifications. A release wakes only its own stripe —
+/// never every waiter in the process (the old single global `Notify` was a
+/// thundering herd and let unrelated churn burn waiters' retry budgets).
+static LOCK_WAITERS: Lazy<StripeLocks<tokio::sync::Notify, 1024>> = Lazy::new(StripeLocks::new);
+
+static CLIENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct BoundConnection {}
@@ -40,15 +118,18 @@ impl MetaClient {
 #[derive(Clone)]
 pub struct DlmClient {
     client_id: String,
+    client_nonce: u64,
     redis_url: String,
     meta_client: Arc<MetaClient>,
 }
 
 impl DlmClient {
     pub fn new(redis_url: &str) -> Result<Self> {
+        let client_nonce = CLIENT_NONCE.fetch_add(1, Ordering::Relaxed);
         let client_id = format!("local_dlm_client_{}", uuid::Uuid::new_v4());
         Ok(Self {
             client_id,
+            client_nonce,
             redis_url: redis_url.to_string(),
             meta_client: Arc::new(MetaClient::Local),
         })
@@ -85,10 +166,24 @@ impl DlmClient {
     pub async fn get_connection_for_key(&self, _key: &str) -> Result<MetaConnection> {
         Ok(MetaConnection {})
     }
+
+    /// Current fencing generation for a path-form object key (zero-alloc for
+    /// `inode_{N}` paths).
     pub fn get_fencing_token(&self, file_path: &str) -> u64 {
-        let gen_key = format!("fencing_generator:{}", file_path);
+        match ino_of_path(file_path) {
+            Some(ino) => self.get_fencing_token_ino(ino),
+            None => FENCING_MAP
+                .read_sync(&ObjectKey::Path(file_path.into()), |_, v| {
+                    v.load(Ordering::Acquire)
+                })
+                .unwrap_or(0),
+        }
+    }
+
+    /// Current fencing generation for an inode object — binary fast path.
+    pub fn get_fencing_token_ino(&self, ino: u64) -> u64 {
         FENCING_MAP
-            .read_sync(&gen_key, |_, v| v.load(Ordering::SeqCst))
+            .read_sync(&ObjectKey::Ino(ino), |_, v| v.load(Ordering::Acquire))
             .unwrap_or(0)
     }
 
@@ -100,66 +195,67 @@ impl DlmClient {
         Ok(())
     }
 
+    /// Acquire an exclusive lease on `file_path` (optionally a byte range),
+    /// waiting up to `ttl` for the current holder to release.
+    ///
+    /// Wait protocol (per attempt):
+    /// 1. `enable()` this key's stripe notification **before** checking the
+    ///    table — a release landing between the check and the wait is then
+    ///    still observed (tokio's documented lost-wakeup discipline).
+    /// 2. Try to claim the vacant entry.
+    /// 3. Otherwise wait for a stripe release or the deadline. Stripe
+    ///    collisions only cause spurious re-checks, never missed wakeups.
+    ///
+    /// The wait budget is **time** (`ttl`), not wakeup counts: unrelated
+    /// churn cannot starve a waiter into a spurious failure, and a quiet
+    /// system fails loudly at the deadline instead of hanging.
     pub async fn acquire_lock(
         &self,
         file_path: &str,
         range: Option<(u64, u64)>,
         ttl: Duration,
     ) -> Result<LockLease> {
-        self.acquire_lock_with_retry(file_path, range, ttl, 3).await
-    }
+        let key = ObjectKey::from_path(file_path, range);
+        let notify = LOCK_WAITERS.get_inode_lock(key.stripe_seed());
+        let deadline = tokio::time::Instant::now() + ttl;
 
-    pub async fn acquire_lock_with_retry(
-        &self,
-        file_path: &str,
-        range: Option<(u64, u64)>,
-        _ttl: Duration,
-        _max_retries: usize,
-    ) -> Result<LockLease> {
-        let lock_key = if let Some((start, end)) = range {
-            format!("lock:{}:range:{}-{}", file_path, start, end)
-        } else {
-            format!("lock:{}", file_path)
-        };
-
-        let mut retries = 0;
         loop {
-            let notified = LOCK_RELEASED.notified();
-            let pinned_notified = std::pin::pin!(notified);
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            // Register interest BEFORE the availability check (lost-wakeup fix).
+            notified.as_mut().enable();
 
-            let acquired = match LOCK_MAP.entry_sync(lock_key.clone()) {
+            let acquired = match LOCK_MAP.entry_sync(key.clone()) {
                 scc::hash_map::Entry::Occupied(_) => false,
                 scc::hash_map::Entry::Vacant(vac) => {
-                    let _ = vac.insert_entry(self.client_id.clone());
+                    let _ = vac.insert_entry(self.client_nonce);
                     true
                 }
             };
 
             if acquired {
-                let gen_key = format!("fencing_generator:{}", file_path);
                 let fencing_token = FENCING_MAP
-                    .entry_sync(gen_key)
-                    .or_insert_with(|| AtomicU64::new(0))
-                    .fetch_add(1, Ordering::SeqCst)
+                    .entry_sync(key.fencing_identity())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                    .get()
+                    .fetch_add(1, Ordering::AcqRel)
                     + 1;
 
                 return Ok(LockLease {
-                    inner: std::sync::Arc::new(LockLeaseInner {
-                        file_path: file_path.to_string(),
-                        client_id: self.client_id.clone(),
+                    inner: Arc::new(LockLeaseInner {
+                        key,
+                        client_nonce: self.client_nonce,
                         fencing_token,
-                        lock_key,
+                        released: AtomicBool::new(false),
                     }),
                 });
             }
 
-            if retries >= _max_retries {
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return Err(crate::error::SqueezefsError::LockFailed {
-                    reason: format!("Lock key {} already held", lock_key),
+                    reason: format!("lock {:?} still held after {:?} wait budget", key, ttl),
                 });
             }
-            retries += 1;
-            pinned_notified.await;
         }
     }
 
@@ -173,68 +269,59 @@ impl DlmClient {
 }
 
 struct LockLeaseInner {
-    file_path: String,
-    client_id: String,
+    key: ObjectKey,
+    client_nonce: u64,
     fencing_token: u64,
-    lock_key: String,
+    released: AtomicBool,
+}
+
+impl LockLeaseInner {
+    /// Single-pass conditional unlock: remove the entry only if this lease's
+    /// client still owns it, then wake this key's stripe. Idempotent across
+    /// explicit `release()` + final-clone `Drop`.
+    fn unlock(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let nonce = self.client_nonce;
+        let removed = LOCK_MAP
+            .remove_if_sync(&self.key, |owner| *owner == nonce)
+            .is_some();
+        if removed {
+            LOCK_WAITERS
+                .get_inode_lock(self.key.stripe_seed())
+                .notify_waiters();
+        }
+    }
 }
 
 impl Drop for LockLeaseInner {
     fn drop(&mut self) {
-        let mut removed = false;
-        let _ = LOCK_MAP.read_sync(&self.lock_key, |_, owner| {
-            if owner == &self.client_id {
-                removed = true;
-            }
-        });
-        if removed {
-            LOCK_MAP.remove_sync(&self.lock_key);
-            LOCK_RELEASED.notify_waiters();
-        }
+        self.unlock();
     }
 }
 
 #[derive(Clone)]
 pub struct LockLease {
-    inner: std::sync::Arc<LockLeaseInner>,
+    inner: Arc<LockLeaseInner>,
 }
 
 impl LockLease {
     pub async fn is_held(&self) -> bool {
         LOCK_MAP
-            .read_sync(&self.inner.lock_key, |_, owner| {
-                owner == &self.inner.client_id
+            .read_sync(&self.inner.key, |_, owner| {
+                *owner == self.inner.client_nonce
             })
             .unwrap_or(false)
     }
 
+    /// The generation this lease was fenced at (snapshot at acquire).
     pub fn fencing_token(&self) -> u64 {
         self.inner.fencing_token
     }
 
-    pub fn lock_key(&self) -> &str {
-        &self.inner.lock_key
-    }
-
-    pub fn file_path(&self) -> &str {
-        &self.inner.file_path
-    }
-
-    pub fn client_id(&self) -> &str {
-        &self.inner.client_id
-    }
-
     pub async fn release(self) -> Result<()> {
-        let mut removed = false;
-        let _ = LOCK_MAP.read_sync(&self.inner.lock_key, |_, owner| {
-            if owner == &self.inner.client_id {
-                removed = true;
-            }
-        });
-        if removed {
-            LOCK_MAP.remove_sync(&self.inner.lock_key);
-            LOCK_RELEASED.notify_waiters();
-        }
+        self.inner.unlock();
         Ok(())
     }
 }

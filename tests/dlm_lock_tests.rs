@@ -39,14 +39,14 @@ async fn test_waiter_survives_unrelated_key_churn() {
     let b = dlm();
 
     let held = a
-        .acquire_lock_with_retry("inode_910001", None, Duration::from_secs(10), 5)
+        .acquire_lock("inode_910001", None, Duration::from_secs(10))
         .await
         .expect("initial acquire");
 
     let waiter = tokio::spawn({
         let b = b.clone();
         async move {
-            b.acquire_lock_with_retry("inode_910001", None, Duration::from_secs(10), 5)
+            b.acquire_lock("inode_910001", None, Duration::from_secs(10))
                 .await
         }
     });
@@ -58,7 +58,7 @@ async fn test_waiter_survives_unrelated_key_churn() {
     // Unrelated-key churn: every release used to wake ALL waiters.
     for _ in 0..25 {
         let l = a
-            .acquire_lock_with_retry("inode_910002", None, Duration::from_secs(10), 5)
+            .acquire_lock("inode_910002", None, Duration::from_secs(10))
             .await
             .expect("churn acquire");
         l.release().await.expect("churn release");
@@ -92,7 +92,7 @@ async fn test_release_racing_waiter_never_loses_wakeup() {
     for round in 0..400u32 {
         let key = format!("inode_92{:04}", round % 7);
         let lease = holder
-            .acquire_lock_with_retry(&key, None, Duration::from_secs(10), 5)
+            .acquire_lock(&key, None, Duration::from_secs(10))
             .await
             .expect("holder acquire");
 
@@ -101,7 +101,7 @@ async fn test_release_racing_waiter_never_loses_wakeup() {
             let key = key.clone();
             async move {
                 contender
-                    .acquire_lock_with_retry(&key, None, Duration::from_secs(10), 5)
+                    .acquire_lock(&key, None, Duration::from_secs(10))
                     .await
             }
         });
@@ -126,7 +126,7 @@ async fn test_fencing_token_monotonic_and_readable() {
     let d = dlm();
 
     let l1 = d
-        .acquire_lock_with_retry("inode_930001", None, Duration::from_secs(5), 3)
+        .acquire_lock("inode_930001", None, Duration::from_secs(5))
         .await
         .expect("acquire 1");
     let t1 = l1.fencing_token();
@@ -138,7 +138,7 @@ async fn test_fencing_token_monotonic_and_readable() {
     l1.release().await.expect("release 1");
 
     let l2 = d
-        .acquire_lock_with_retry("inode_930001", None, Duration::from_secs(5), 3)
+        .acquire_lock("inode_930001", None, Duration::from_secs(5))
         .await
         .expect("acquire 2");
     assert!(
@@ -158,14 +158,14 @@ async fn test_range_and_whole_file_locks_are_distinct() {
     let e = dlm();
 
     let whole = d
-        .acquire_lock_with_retry("inode_940001", None, Duration::from_secs(5), 3)
+        .acquire_lock("inode_940001", None, Duration::from_secs(5))
         .await
         .expect("whole-file acquire");
 
     // A range lock on the same path is a different object: must not block.
     let range = tokio::time::timeout(
         Duration::from_secs(2),
-        e.acquire_lock_with_retry("inode_940001", Some((0, 4096)), Duration::from_secs(5), 3),
+        e.acquire_lock("inode_940001", Some((0, 4096)), Duration::from_secs(5)),
     )
     .await
     .expect("range acquire hung against whole-file lock")
@@ -177,12 +177,7 @@ async fn test_range_and_whole_file_locks_are_distinct() {
     // time (the ttl parameter), not wakeups.
     let same_range = tokio::time::timeout(
         Duration::from_secs(3),
-        e.acquire_lock_with_retry(
-            "inode_940001",
-            Some((0, 4096)),
-            Duration::from_millis(300),
-            2,
-        ),
+        e.acquire_lock("inode_940001", Some((0, 4096)), Duration::from_millis(300)),
     )
     .await;
     match same_range {
@@ -204,7 +199,7 @@ async fn test_release_idempotent_across_clones() {
     let d = dlm();
 
     let l1 = d
-        .acquire_lock_with_retry("inode_950001", None, Duration::from_secs(5), 3)
+        .acquire_lock("inode_950001", None, Duration::from_secs(5))
         .await
         .expect("acquire");
     let l1_clone = l1.clone();
@@ -216,7 +211,7 @@ async fn test_release_idempotent_across_clones() {
     // Key must be immediately reacquirable.
     let l2 = tokio::time::timeout(
         Duration::from_secs(2),
-        d.acquire_lock_with_retry("inode_950001", None, Duration::from_secs(5), 3),
+        d.acquire_lock("inode_950001", None, Duration::from_secs(5)),
     )
     .await
     .expect("reacquire hung after release")
@@ -226,7 +221,7 @@ async fn test_release_idempotent_across_clones() {
     drop(l2);
     let l3 = tokio::time::timeout(
         Duration::from_secs(2),
-        d.acquire_lock_with_retry("inode_950001", None, Duration::from_secs(5), 3),
+        d.acquire_lock("inode_950001", None, Duration::from_secs(5)),
     )
     .await
     .expect("reacquire hung after drop-release")

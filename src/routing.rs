@@ -1690,7 +1690,34 @@ impl DataRouter {
                     .await;
                 }
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
-                    log::warn!("NVMe write staging cache full. Falling back to direct synchronous backend block write for: {}", file_path);
+                    // Spill is the designed degraded mode under sustained
+                    // pressure and can fire thousands of times in a burst:
+                    // one line per second + a suppressed count keeps the
+                    // signal without drowning the log.
+                    {
+                        static LAST_SPILL_WARN: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        static SUPPRESSED: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let last = LAST_SPILL_WARN.load(Ordering::Relaxed);
+                        if now != last
+                            && LAST_SPILL_WARN
+                                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                        {
+                            let suppressed = SUPPRESSED.swap(0, Ordering::Relaxed);
+                            log::warn!(
+                                "NVMe write staging cache full: direct synchronous backend block write for {} ({} similar spills suppressed)",
+                                file_path, suppressed
+                            );
+                        } else {
+                            SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     let processed_data = self
                         .get_crypto()
                         .process_write_async(shared_data.clone())

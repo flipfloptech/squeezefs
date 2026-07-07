@@ -462,7 +462,12 @@ async fn test_block_allocator_recovery() {
 
     // Force flush all staged data to block storage
     fs.flush_all_memory_buffers_to_staging().await.unwrap();
-    fs.flush_all_staged_blocks_to_backend().await.unwrap();
+    let summary = fs.flush_all_staged_blocks_to_backend().await;
+    assert_eq!(
+        summary.failed, 0,
+        "staged flush failures: {:?}",
+        summary.error_samples
+    );
 
     // Verify current block allocator has 5 allocated blocks
     assert_eq!(block_alloc.get_used_blocks(), 5);

@@ -82,22 +82,22 @@ async fn test_destroy_is_idempotent_across_queue_invocations() {
     let (fs, req, _b, _m) = make().await;
 
     // Orphan active block (no inode meta): first destroy attempts + drops it.
-    assert!(fs
-        .router
-        .cache
-        .nvme
-        .put_active_block("active_block:inode_991001:block_0", &[0xAA; 4096], 1));
+    assert!(fs.router.cache.nvme.put_active_block(
+        "active_block:inode_991001:block_0",
+        &[0xAA; 4096],
+        1
+    ));
 
     fs.destroy(req).await;
     assert!(fs.dismount_started(), "first destroy must mark teardown");
 
     // Stage a sentinel AFTER teardown: a second destroy must NOT flush or
     // remove it (it must not re-run the teardown work at all).
-    assert!(fs
-        .router
-        .cache
-        .nvme
-        .put_active_block("active_block:inode_991002:block_0", &[0xBB; 4096], 1));
+    assert!(fs.router.cache.nvme.put_active_block(
+        "active_block:inode_991002:block_0",
+        &[0xBB; 4096],
+        1
+    ));
 
     fs.destroy(req).await;
 

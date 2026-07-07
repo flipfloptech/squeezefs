@@ -376,8 +376,16 @@ pub struct ClientStats {
 #[cold]
 #[inline(never)]
 fn map_squeezefs_err(e: SqueezefsError) -> Errno {
-    error!("Squeezefs operational error: {:?}", e);
-    Errno::from(e.to_errno())
+    let errno = e.to_errno();
+    // ENOENT is the normal grammar of POSIX lookups (negative dentries,
+    // unlink/stat probes): logging it at ERROR buried real faults under
+    // thousands of benign lines per bench/rsync run.
+    if errno == libc::ENOENT {
+        debug!("Squeezefs operational error: {:?}", e);
+    } else {
+        error!("Squeezefs operational error: {:?}", e);
+    }
+    Errno::from(errno)
 }
 
 #[inline]
@@ -424,6 +432,17 @@ pub static WRITEBACK_HARD_FAILURES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, String, ahash::RandomState>,
 > = once_cell::sync::Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
+/// Aggregated result of the dismount active-block force-flush: one report
+/// per unmount, never a log line per block.
+#[derive(Debug, Default)]
+pub struct TeardownFlushSummary {
+    pub attempted: usize,
+    pub flushed: usize,
+    pub failed: usize,
+    /// First few failure reasons (bounded) for the aggregated log line.
+    pub error_samples: Vec<String>,
+}
+
 pub struct SqueezefsFilesystem {
     pub router: DataRouter,
     dlm: DlmClient,
@@ -460,6 +479,9 @@ pub struct SqueezefsFilesystem {
         arc_swap::ArcSwap<Option<std::sync::Arc<fuse3::raw::connection::FuseConnection>>>,
     pub open_inodes: std::sync::Arc<dashmap::DashMap<u64, usize, ahash::RandomState>>,
     pub reclaim_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    /// FUSE-over-io_uring surfaces Destroy once per queue; teardown must
+    /// run exactly once.
+    dismount_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
     reclaim_tx: tokio::sync::mpsc::Sender<u64>,
     reclaim_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<u64>>>>,
     pub open_dir_streams: std::sync::Arc<
@@ -501,6 +523,7 @@ impl Clone for SqueezefsFilesystem {
             session_connection: arc_swap::ArcSwap::new(self.session_connection.load_full()),
             open_inodes: self.open_inodes.clone(),
             reclaim_semaphore: self.reclaim_semaphore.clone(),
+            dismount_once: self.dismount_once.clone(),
             reclaim_tx: self.reclaim_tx.clone(),
             reclaim_rx: self.reclaim_rx.clone(),
             open_dir_streams: self.open_dir_streams.clone(),
@@ -590,6 +613,7 @@ impl SqueezefsFilesystem {
             reclaim_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 reclaim_concurrency,
             )),
+            dismount_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reclaim_tx,
             reclaim_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(reclaim_rx))),
             open_dir_streams: std::sync::Arc::new(dashmap::DashMap::with_hasher(
@@ -1617,7 +1641,7 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
-    pub async fn flush_all_staged_blocks_to_backend(&self) -> Result<(), SqueezefsError> {
+    pub async fn flush_all_staged_blocks_to_backend(&self) -> TeardownFlushSummary {
         info!("FUSE Daemon: Force flushing all staged active blocks to NVMe-oF backend...");
         let keys = self.router.cache.nvme.list_staged_files();
 
@@ -1628,9 +1652,13 @@ impl SqueezefsFilesystem {
             }
         }
 
+        let mut summary = TeardownFlushSummary {
+            attempted: active_keys.len(),
+            ..Default::default()
+        };
         if active_keys.is_empty() {
             info!("FUSE Daemon: No staged active blocks to flush.");
-            return Ok(());
+            return summary;
         }
 
         info!(
@@ -1697,22 +1725,55 @@ impl SqueezefsFilesystem {
         }
 
         use futures::StreamExt;
+        const ERROR_SAMPLES: usize = 3;
         while let Some(res) = tasks.next().await {
-            if let Err(e) = res {
-                error!("Task panicked during dismount active block flush: {:?}", e);
-            } else if let Some(Err(e)) = res.ok() {
-                error!("Error flushing active block during dismount: {:?}", e);
+            match res {
+                Err(join_err) => {
+                    summary.failed += 1;
+                    if summary.error_samples.len() < ERROR_SAMPLES {
+                        summary
+                            .error_samples
+                            .push(format!("task panicked: {join_err:?}"));
+                    }
+                }
+                Ok(Err(e)) => {
+                    summary.failed += 1;
+                    if summary.error_samples.len() < ERROR_SAMPLES {
+                        summary.error_samples.push(format!("{e:?}"));
+                    }
+                }
+                Ok(Ok(())) => summary.flushed += 1,
             }
         }
 
-        info!("FUSE Daemon: Force flush of staged active blocks completed.");
-        Ok(())
+        // One aggregated report, never a line per block: an unmount racing
+        // deleted files or an offline backend produces thousands of
+        // identical failures (orphan active blocks are dropped with the
+        // segment either way).
+        if summary.failed > 0 {
+            warn!(
+                "FUSE Daemon: dismount active-block flush: {} flushed, {} failed of {} (first errors: {:?})",
+                summary.flushed, summary.failed, summary.attempted, summary.error_samples
+            );
+        } else {
+            info!(
+                "FUSE Daemon: Force flush of staged active blocks completed ({} flushed).",
+                summary.flushed
+            );
+        }
+        summary
     }
 
     pub async fn force_flush_all_staged_data(&self) -> Result<(), SqueezefsError> {
         let _ = self.flush_all_memory_buffers_to_staging().await;
         let _ = self.flush_all_staged_blocks_to_backend().await;
         Ok(())
+    }
+
+    /// Whether dismount teardown has begun (destroy runs once per unmount;
+    /// duplicate per-queue invocations are no-ops).
+    pub fn dismount_started(&self) -> bool {
+        self.dismount_once.load(Ordering::Acquire)
     }
 
     fn mode_to_file_type(&self, mode: u32) -> FileType {
@@ -1923,6 +1984,14 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn destroy(&self, _req: Request) {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        // FUSE-over-io_uring: every queue loop observes connection teardown
+        // and calls destroy — only the first runs the teardown (the repeats
+        // used to re-attempt thousands of orphan flushes, starve the uring
+        // worker into failing health probes, and spam ~3k ERROR lines).
+        if self.dismount_once.swap(true, Ordering::SeqCst) {
+            debug!("FUSE Daemon: duplicate destroy (per-queue) ignored");
+            return;
+        }
         info!("FUSE Daemon: Destroying mount. Force flushing all staged and memory data...");
 
         // Phase 1 & 2: Force flush memory buffers to staging, then staged blocks to NVMe-oF backend
@@ -4949,9 +5018,12 @@ pub async fn start_mount<P: AsRef<Path>>(
                         } else if choice == "w" || choice == "wait" {
                             println!("Waiting for staged writes to drain. Press Ctrl+C again to force exit.");
                             tokio::select! {
-                                res = fs.flush_all_staged_blocks_to_backend() => {
-                                    if let Err(e) = res {
-                                        error!("Error flushing staged blocks to backend: {:?}", e);
+                                summary = fs.flush_all_staged_blocks_to_backend() => {
+                                    if summary.failed > 0 {
+                                        error!(
+                                            "Staged-block drain: {} flushed, {} failed (first errors: {:?})",
+                                            summary.flushed, summary.failed, summary.error_samples
+                                        );
                                     } else {
                                         println!("\nAll staged files and active writes drained cleanly!");
                                     }

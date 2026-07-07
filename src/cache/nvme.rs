@@ -1,5 +1,4 @@
 use crate::error::{Result, SqueezefsError};
-use crate::meta_backend::Metadata;
 use bytes::Bytes;
 use log::{error, info};
 use std::fs;
@@ -139,13 +138,22 @@ pub struct NvmeStaging {
     pub backend_router:
         std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
     redis_client: std::sync::Arc<crate::dlm::MetaClient>,
-    pub meta_backend: std::sync::Arc<
-        once_cell::sync::OnceCell<std::sync::Arc<crate::meta_backend::RoutedMetaBackend>>,
-    >,
     /// Bounded merge-queue sender (P1-1). Full → StorageFull / backpressure.
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
     pub current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Budget ledger: staged `file_id` → (bytes counted in
+    /// `current_staged_write_bytes`, stage generation). Every add to the
+    /// gauge records its cost here; every ring-entry removal credits the
+    /// gauge through here — the gauge can never ratchet. The generation
+    /// lets the merge worker skip crediting an entry that a racing
+    /// re-stage has already replaced (the newer stage owns the budget).
+    staged_ledger: std::sync::Arc<scc::HashMap<String, (u64, u64)>>,
+    /// Router hook for the merge worker: promotion must commit layout through
+    /// `DataRouter` (RAM metadata cache + backend coherently, under the
+    /// per-inode metadata lock). Weak — the router owns this cache.
+    data_router:
+        std::sync::Arc<std::sync::OnceLock<std::sync::Weak<crate::routing::DataRouterInner>>>,
     pub space_freed_notify: std::sync::Arc<tokio::sync::Notify>,
     pub staged_writes_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub staged_drained_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -272,7 +280,26 @@ impl NvmeStaging {
             read_nvme_cache.recover_index();
         }
 
-        let initial_write_bytes = staging_nvme_cache.current_bytes() as u64;
+        // Seed the staged-write budget from recovered *staged* entries only.
+        // Orphan active blocks (crash leftovers; uploaded+removed by later
+        // flushes or unlink) must not consume the staged budget, or a mount
+        // over a dirty segment starts with the admission gate already pinned.
+        let staged_ledger: std::sync::Arc<scc::HashMap<String, (u64, u64)>> =
+            std::sync::Arc::new(scc::HashMap::new());
+        let mut initial_write_bytes = 0u64;
+        for key in staging_nvme_cache.list_keys() {
+            if key.starts_with(b"active_block:") {
+                continue;
+            }
+            let Ok(file_id) = std::str::from_utf8(&key) else {
+                continue;
+            };
+            if let Some(guard) = staging_nvme_cache.get(&key) {
+                let cost = guard.len as u64;
+                initial_write_bytes += cost;
+                let _ = staged_ledger.insert_sync(file_id.to_string(), (cost, 0));
+            }
+        }
 
         // P1-1: bound the merge worker queue to avoid unbounded RAM growth under write storms.
         const STAGING_MERGE_QUEUE_CAP: usize = 1024;
@@ -288,12 +315,13 @@ impl NvmeStaging {
             nvme_writer: nvme_writer.clone(),
             backend_router,
             redis_client: redis_client.clone(),
-            meta_backend: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
             write_tx,
             p2p_addr: std::sync::Arc::new(std::sync::OnceLock::new()),
             current_staged_write_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 initial_write_bytes,
             )),
+            staged_ledger,
+            data_router: std::sync::Arc::new(std::sync::OnceLock::new()),
             space_freed_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             staged_writes_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                 staging_nvme_cache.list_keys().len(),
@@ -313,6 +341,11 @@ impl NvmeStaging {
 
     pub fn set_backend_router(&self, router: std::sync::Arc<crate::routing::BackendRouter>) {
         let _ = self.backend_router.set(router);
+    }
+
+    /// Late-bind the owning `DataRouter` (weak) for merge-worker promotion.
+    pub(crate) fn set_data_router(&self, router: std::sync::Weak<crate::routing::DataRouterInner>) {
+        let _ = self.data_router.set(router);
     }
 
     pub fn redis_client(&self) -> &std::sync::Arc<crate::dlm::MetaClient> {
@@ -356,25 +389,46 @@ impl NvmeStaging {
             )));
         }
 
+        // Re-staging the same file_id replaces its ring entry: the gate must
+        // charge the *delta*, not the sum of every intermediate payload.
+        let prior_cost = self
+            .staged_ledger
+            .read_sync(file_id, |_, (cost, _)| *cost)
+            .unwrap_or(0);
+
+        let over_cap =
+            |cur: u64| cur.saturating_sub(prior_cost) + padded_size > self.max_write_bytes;
+
         let mut total_staged_bytes = self
             .current_staged_write_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        if total_staged_bytes + padded_size > self.max_write_bytes {
-            let mut attempts = 0;
-            while total_staged_bytes + padded_size > self.max_write_bytes && attempts < 4 {
+        if over_cap(total_staged_bytes) {
+            // Capacity pressure: promote resident staged entries to durable
+            // backend blocks so the pool drains, then wait (bounded) for the
+            // merge worker to credit freed space. Never a fixed futile stall.
+            self.kick_promotion(file_id, 64);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+            loop {
                 let notified = self.space_freed_notify.notified();
                 tokio::pin!(notified);
-                let wait_timeout = tokio::time::timeout(Duration::from_millis(500), notified);
-                let _ = wait_timeout.await;
-                attempts += 1;
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    break;
+                }
                 total_staged_bytes = self
                     .current_staged_write_bytes
                     .load(std::sync::atomic::Ordering::Relaxed);
+                if !over_cap(total_staged_bytes) {
+                    break;
+                }
+                self.kick_promotion(file_id, 64);
             }
+            total_staged_bytes = self
+                .current_staged_write_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
         }
 
-        if total_staged_bytes + padded_size > self.max_write_bytes {
+        if over_cap(total_staged_bytes) {
             return Err(SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 format!(
@@ -386,18 +440,38 @@ impl NvmeStaging {
 
         let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
 
-        let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
-        // Memory-mapped copy directly (lock-free, zero disk syscall wait)
-        let _evicted = self.staging_nvme_cache.reserve_and_write(
-            key_bytes.clone(),
-            meta_len,
-            &meta_bytes,
-            data,
-            None,
-        );
-
+        // Ring write + ledger charge under this file_id's ledger entry lock:
+        // a concurrent promotion/unlink of the same id either completes fully
+        // before (and sees the old generation) or after (and sees the bumped
+        // generation) — it can never remove the ring entry we just wrote.
+        let (evicted, replaced_cost, is_new) = {
+            let mut entry = self
+                .staged_ledger
+                .entry_sync(file_id.to_string())
+                .or_insert((0, 0));
+            let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
+            // Memory-mapped copy directly (lock-free, zero disk syscall wait)
+            let evicted = self.staging_nvme_cache.reserve_and_write(
+                key_bytes.clone(),
+                meta_len,
+                &meta_bytes,
+                data,
+                None,
+            );
+            let (cost, gen) = *entry.get();
+            *entry.get_mut() = (padded_size, gen.wrapping_add(1));
+            (evicted, cost, is_new)
+        };
         self.current_staged_write_bytes
             .fetch_add(padded_size, std::sync::atomic::Ordering::Relaxed);
+        if replaced_cost > 0 {
+            Self::sub_saturating(&self.current_staged_write_bytes, replaced_cost);
+            self.space_freed_notify.notify_waiters();
+        }
+        // Ring wrap-around may have evicted *other* staged entries: return
+        // their budget (their data is gone from the ring). Our own key is
+        // excluded — its replacement was already settled through the ledger.
+        self.credit_evicted_excluding(&evicted, Some(&key_bytes));
 
         if is_new {
             self.staged_writes_in_flight
@@ -411,13 +485,132 @@ impl NvmeStaging {
             data.len()
         );
 
-        // Do not enqueue the merge/promote worker on the write hot path.
-        // Promoting every small stage to NVMe-oF was competing with create/fsync
-        // and inflated small-write latency. Data remains in the mmap segment;
-        // merge is triggered under capacity pressure or explicit drain/fsync paths
-        // that call try_enqueue_staged_merge.
-        let _ = (fencing_token, padded_size);
+        // Keep the hot path enqueue-free (promoting every small stage to the
+        // backend competed with create/fsync), but arm the drain *before* the
+        // pool hard-fills: past the high-water mark, ask the merge worker to
+        // promote this entry in the background.
+        let high_water = self.max_write_bytes - self.max_write_bytes / 4;
+        if self
+            .current_staged_write_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > high_water
+        {
+            self.try_enqueue_staged_merge(file_path, file_id, fencing_token, padded_size);
+        }
         Ok(())
+    }
+
+    /// Saturating subtract on the staged-budget gauge.
+    fn sub_saturating(gauge: &std::sync::atomic::AtomicU64, amount: u64) {
+        let mut val = gauge.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let new_val = val.saturating_sub(amount);
+            match gauge.compare_exchange_weak(
+                val,
+                new_val,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => val = actual,
+            }
+        }
+    }
+
+    /// Credit the budget for staged entries the ring evicted on wrap-around,
+    /// skipping `exclude` (a same-key replacement settled via the ledger).
+    fn credit_evicted_excluding(&self, evicted: &[(Bytes, Bytes)], exclude: Option<&Bytes>) {
+        for (key, _) in evicted {
+            if key.starts_with(b"active_block:") || Some(key) == exclude {
+                continue;
+            }
+            if let Ok(file_id) = std::str::from_utf8(key) {
+                if let Some((_, (cost, _))) = self.staged_ledger.remove_sync(file_id) {
+                    Self::sub_saturating(&self.current_staged_write_bytes, cost);
+                    self.space_freed_notify.notify_waiters();
+                }
+            }
+        }
+    }
+
+    /// Ask the merge worker to promote up to `max_items` resident staged
+    /// entries (excluding `exclude_file_id`, whose newest payload is the one
+    /// being staged right now). Best-effort: a full queue means promotion is
+    /// already in flight.
+    fn kick_promotion(&self, exclude_file_id: &str, max_items: usize) {
+        let mut pending: Vec<(String, u64)> = Vec::new();
+        self.staged_ledger.iter_sync(|file_id, (cost, _)| {
+            if file_id != exclude_file_id {
+                pending.push((file_id.clone(), *cost));
+            }
+            pending.len() < max_items
+        });
+        for (file_id, cost) in pending {
+            let Some(meta) = self.staged_meta_of(&file_id) else {
+                continue;
+            };
+            let item = PendingStagedWrite {
+                file_path: meta.file_path,
+                file_id,
+                fencing_token: meta.fencing_token,
+                padded_size: cost,
+            };
+            if self.write_tx.try_send(item).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Read the staged header for `file_id` from the ring (no payload copy).
+    fn staged_meta_of(&self, file_id: &str) -> Option<StagedMetadata> {
+        let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
+        let guard = self.staging_nvme_cache.get(&key_bytes)?;
+        let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+        if bytes.len() < 8 {
+            return None;
+        }
+        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().ok()?) as usize;
+        if bytes.len() < 8 + meta_len {
+            return None;
+        }
+        StagedMetadata::deserialize(&bytes[8..8 + meta_len])
+    }
+
+    /// Current stage generation of `file_id`, if it is budget-counted.
+    pub fn staged_generation(&self, file_id: &str) -> Option<u64> {
+        self.staged_ledger.read_sync(file_id, |_, (_, gen)| *gen)
+    }
+
+    /// Remove `file_id`'s ring entry and return its budget **iff** its stage
+    /// generation still equals `gen`. A racing re-stage bumps the generation
+    /// first (under the same ledger entry lock), so its fresh ring entry and
+    /// budget are never destroyed by a promotion that raced it.
+    pub fn remove_staged_if_generation(&self, file_id: &str, gen: u64) -> bool {
+        let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
+        let removed_cost = {
+            let scc::hash_map::Entry::Occupied(entry) =
+                self.staged_ledger.entry_sync(file_id.to_string())
+            else {
+                return false;
+            };
+            let (cost, cur_gen) = *entry.get();
+            if cur_gen != gen {
+                return false;
+            }
+            if self.staging_nvme_cache.remove(&key_bytes).is_some() {
+                let prev = self
+                    .staged_writes_in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if prev == 1 {
+                    self.staged_drained_notify.notify_waiters();
+                }
+            }
+            let _ = entry.remove();
+            cost
+        };
+        Self::sub_saturating(&self.current_staged_write_bytes, removed_cost);
+        self.space_freed_notify.notify_waiters();
+        true
     }
 
     /// Ask the background merge worker to promote a staged file_id (best-effort).
@@ -450,13 +643,16 @@ impl NvmeStaging {
         let key_bytes = Bytes::copy_from_slice(key.as_bytes());
 
         let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
-        let _evicted = self.staging_nvme_cache.reserve_and_write(
+        let evicted = self.staging_nvme_cache.reserve_and_write(
             key_bytes,
             meta_len,
             &meta_bytes,
             data,
             Some(4096),
         );
+        // Active blocks share the ring with staged files: wrap-around here
+        // can evict staged entries, whose budget must be returned.
+        self.credit_evicted_excluding(&evicted, None);
         if is_new {
             self.staged_writes_in_flight
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -474,6 +670,12 @@ impl NvmeStaging {
             if prev == 1 {
                 self.staged_drained_notify.notify_waiters();
             }
+        }
+        // Return the budget of a counted staged entry (unlink, spill purge,
+        // layout transition). Active-block keys are never in the ledger.
+        if let Some((_, (cost, _))) = self.staged_ledger.remove_sync(key) {
+            Self::sub_saturating(&self.current_staged_write_bytes, cost);
+            self.space_freed_notify.notify_waiters();
         }
         val
     }
@@ -553,16 +755,7 @@ impl NvmeStaging {
     }
 
     fn start_merge_worker(&self, mut write_rx: mpsc::Receiver<PendingStagedWrite>) {
-        let block_allocator = self.block_allocator.clone();
-        let nvme_writer = self.nvme_writer.clone();
-        let backend_router = self.backend_router.clone();
-        let meta_backend = self.meta_backend.clone();
-        let staged_bytes = self.current_staged_write_bytes.clone();
-        let space_freed_notify = self.space_freed_notify.clone();
-        let staging_nvme_cache = self.staging_nvme_cache.clone();
-        let staged_writes_in_flight = self.staged_writes_in_flight.clone();
-        let staged_drained_notify = self.staged_drained_notify.clone();
-        let crypto = self.crypto.clone();
+        let data_router = self.data_router.clone();
 
         tokio::spawn(async move {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
@@ -582,18 +775,14 @@ impl NvmeStaging {
                                 batch.push(pending);
 
                                 if current_bytes >= max_batch_bytes {
-                                    info!("NVMe Staging: Batch size threshold reached ({} bytes). Flushing merged block.", current_bytes);
-                                    if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify, &crypto).await {
-                                        error!("Failed to flush NVMe staging batch: {:?}", e);
-                                    }
+                                    Self::promote_batch(&data_router, &mut batch).await;
+                                    current_bytes = 0;
                                 }
                             }
                             None => {
                                 if !batch.is_empty() {
-                                    info!("NVMe Staging: Channel closed. Flushing remaining {} pending writes.", batch.len());
-                                    if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify, &crypto).await {
-                                        error!("Failed to flush NVMe staging batch on channel close: {:?}", e);
-                                    }
+                                    info!("NVMe Staging: Channel closed. Promoting remaining {} staged writes.", batch.len());
+                                    Self::promote_batch(&data_router, &mut batch).await;
                                 }
                                 break;
                             }
@@ -601,10 +790,8 @@ impl NvmeStaging {
                     }
                     _ = &mut sleep => {
                         if !batch.is_empty() {
-                            info!("NVMe Staging: Timeout reached. Flushing merged block with {} pending writes.", batch.len());
-                            if let Err(e) = Self::flush_batch(&staging_nvme_cache, &meta_backend, &mut batch, &mut current_bytes, &staged_bytes, &space_freed_notify, &backend_router, &block_allocator, &nvme_writer, &staged_writes_in_flight, &staged_drained_notify, &crypto).await {
-                                error!("Failed to flush NVMe staging batch on timeout: {:?}", e);
-                            }
+                            Self::promote_batch(&data_router, &mut batch).await;
+                            current_bytes = 0;
                         }
                     }
                 }
@@ -612,211 +799,42 @@ impl NvmeStaging {
         });
     }
 
-    async fn flush_batch(
-        staging_nvme_cache: &crate::tiering::nvme::NvmeCache,
-        meta_backend: &std::sync::Arc<
-            once_cell::sync::OnceCell<std::sync::Arc<crate::meta_backend::RoutedMetaBackend>>,
-        >,
+    /// Promote every distinct pending staged file to a durable backend block
+    /// through the owning router (coherent RAM + backend layout commit).
+    /// Conservative on any miss: the entry stays resident and budget-counted.
+    async fn promote_batch(
+        data_router: &std::sync::OnceLock<std::sync::Weak<crate::routing::DataRouterInner>>,
         batch: &mut Vec<PendingStagedWrite>,
-        current_bytes: &mut u64,
-        staged_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
-        space_freed_notify: &tokio::sync::Notify,
-        backend_router: &std::sync::Arc<
-            once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>,
-        >,
-        default_allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
-        default_writer: &std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
-        staged_writes_in_flight: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        staged_drained_notify: &tokio::sync::Notify,
-        crypto: &std::sync::Arc<std::sync::OnceLock<crate::crypto_compress::CryptoCompressState>>,
-    ) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        crate::coz_progress!("nvme_flush_batch");
-
-        let default_crypto = crate::crypto_compress::CryptoCompressState::new(
-            "none".to_string(),
-            "none".to_string(),
-            None,
-        );
-        let crypto_state = crypto.get().unwrap_or(&default_crypto);
-
-        let (_be_id, block_allocator, nvme_writer) = if let Some(router) = backend_router.get() {
-            router.get_active_backend()?
-        } else {
-            (
-                "backend_0".to_string(),
-                default_allocator.clone(),
-                default_writer.clone(),
-            )
+    ) {
+        let Some(router) = data_router.get().and_then(std::sync::Weak::upgrade) else {
+            // Router not wired (shutdown or partially constructed cache):
+            // drop the notices, entries stay resident + counted.
+            batch.clear();
+            return;
         };
+        let router = crate::routing::DataRouter::from_inner(router);
 
-        let offset = block_allocator.allocate_block().await?;
-        let packed_key = offset.to_string();
-        let max_block_size = block_allocator.chunk_size();
-
-        let mut packed_payload = Vec::new();
-        let mut mappings = Vec::new();
-        let mut highest_fencing_token = 0u64;
-
-        let mut processed_count = 0;
-
-        for item in batch.iter() {
-            let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
-            let data_res = if let Some(guard) = staging_nvme_cache.get(&key_bytes) {
-                let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
-                if bytes.len() >= 8 {
-                    let meta_len =
-                        u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
-                    if bytes.len() >= 8 + meta_len {
-                        if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
-                            let data_start = 8 + meta_len;
-                            let data_end = data_start + meta.original_size as usize;
-                            if bytes.len() >= data_end {
-                                Some(bytes[data_start..data_end].to_vec())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(data) = data_res {
-                let processed_data = crypto_state.process_write(bytes::Bytes::from(data))?;
-                let size = processed_data.len() as u64;
-                if packed_payload.len() as u64 + size > max_block_size {
-                    break;
-                }
-                let offset = packed_payload.len() as u64;
-                packed_payload.extend_from_slice(&processed_data);
-
-                mappings.push((item.file_id.clone(), offset, size));
-                if item.fencing_token > highest_fencing_token {
-                    highest_fencing_token = item.fencing_token;
-                }
+        let mut seen = std::collections::HashSet::new();
+        for item in batch.drain(..) {
+            if !seen.insert(item.file_id.clone()) {
+                continue;
             }
-            processed_count += 1;
-        }
-
-        if processed_count == 0 && !batch.is_empty() {
-            let item = &batch[0];
-            let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
-            if let Some(guard) = staging_nvme_cache.get(&key_bytes) {
-                let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
-                let meta_len =
-                    u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
-                let data_start = 8 + meta_len;
-                let data = bytes[data_start..data_start + guard.len - data_start].to_vec();
-                let processed_data = crypto_state.process_write(bytes::Bytes::from(data))?;
-                let size = processed_data.len() as u64;
-                packed_payload.extend_from_slice(&processed_data);
-                mappings.push((item.file_id.clone(), 0, size));
-                if item.fencing_token > highest_fencing_token {
-                    highest_fencing_token = item.fencing_token;
-                }
-            }
-            processed_count = 1;
-        }
-
-        let processed_items: Vec<PendingStagedWrite> = batch.drain(0..processed_count).collect();
-
-        let packed_payload_len = packed_payload.len();
-        info!("NVMe Staging: Writing packed block {} (size {} bytes) to NVMe-oF backend volume with fencing token {}.", packed_key, packed_payload_len, highest_fencing_token);
-        if let Err(e) = nvme_writer
-            .write_block(offset, bytes::Bytes::from(packed_payload))
-            .await
-        {
-            let _ = block_allocator.free_block(offset).await;
-            return Err(e);
-        }
-        block_allocator.publish_block(offset);
-
-        if let Some(backend) = meta_backend.get() {
-            let mut mapped_count = 0;
-            for (item, (_file_id, sub_offset, sub_size)) in
-                processed_items.iter().zip(mappings.iter())
+            crate::coz_progress!("nvme_staged_promotion");
+            match router
+                .promote_staged_file(&item.file_path, &item.file_id, item.fencing_token)
+                .await
             {
-                let file_path = &item.file_path;
-                let ino = crate::routing::parse_inode_from_path(file_path);
-
-                let layout_bytes = backend.getxattr(ino, "layout").await.unwrap_or(None);
-                let layout_opt = if let Some(ref bytes) = layout_bytes {
-                    if bytes.starts_with(b"{") {
-                        serde_json::from_slice::<crate::routing::LayoutMetadata>(bytes).ok()
-                    } else {
-                        bincode::deserialize::<crate::routing::LayoutMetadata>(bytes).ok()
-                    }
-                } else {
-                    None
-                };
-                let mut meta = layout_opt.unwrap_or_default();
-
-                if meta.file_id.as_deref() == Some(&item.file_id) {
-                    let mut block_map = meta.block_map.unwrap_or_default();
-                    let val_str = format!("{}:{}:{}", packed_key, sub_offset, sub_size);
-                    block_map.insert(0, val_str);
-                    meta.block_map = Some(block_map);
-                    meta.file_id = None;
-
-                    if let Ok(serialized) = bincode::serialize(&meta) {
-                        if backend.setxattr(ino, "layout", &serialized).await.is_ok() {
-                            mapped_count += 1;
-                            if mapped_count > 1 {
-                                block_allocator.increment_refcount(offset);
-                            }
-                        }
-                    }
-                } else {
-                    info!(
-                        "NVMe Staging: Skip merge worker update for {} because file_id changed or promoted",
-                        file_path
-                    );
-                }
-            }
-            if mapped_count == 0 {
-                let _ = block_allocator.free_block(offset).await;
+                Ok(true) => info!(
+                    "NVMe Staging: promoted staged file {} (ID: {}) to durable block",
+                    item.file_path, item.file_id
+                ),
+                Ok(false) => {}
+                Err(e) => error!(
+                    "NVMe Staging: promotion failed for {} (ID: {}): {:?} — entry stays resident",
+                    item.file_path, item.file_id, e
+                ),
             }
         }
-
-        for item in processed_items.iter() {
-            let key_bytes = Bytes::copy_from_slice(item.file_id.as_bytes());
-            if staging_nvme_cache.remove(&key_bytes).is_some() {
-                let prev =
-                    staged_writes_in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                if prev == 1 {
-                    staged_drained_notify.notify_waiters();
-                }
-            }
-            let mut val = staged_bytes.load(std::sync::atomic::Ordering::Relaxed);
-            loop {
-                let new_val = val.saturating_sub(item.padded_size);
-                match staged_bytes.compare_exchange_weak(
-                    val,
-                    new_val,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => val = actual,
-                }
-            }
-        }
-
-        *current_bytes = batch.iter().map(|item| item.padded_size).sum();
-        space_freed_notify.notify_waiters();
-
-        Ok(())
     }
 
     pub fn staging_dirs(&self) -> &[PathBuf] {

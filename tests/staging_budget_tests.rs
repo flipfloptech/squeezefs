@@ -187,6 +187,8 @@ async fn test_restage_same_file_does_not_leak_staging_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_unlink_returns_staging_budget() {
     let h = make_with_write_cap("64MB").await;
+    // Storage reclaim runs on the background pool started by FUSE init.
+    h.fs.init(h.req).await.expect("fuse init failed");
     let ino = create(&h, "gone.bin").await;
     write_at(&h, ino, 0, &vec![0xBBu8; STAGED_LEN]).await;
 
@@ -199,12 +201,18 @@ async fn test_unlink_returns_staging_budget() {
     h.fs.unlink(h.req, 1, OsStr::new("gone.bin"))
         .await
         .expect("unlink failed");
-    let _ = ino;
+    // Storage reclaim is deferred to FORGET (open-unlinked semantics); mirror
+    // the kernel's sequence — close the create() handle, then FORGET — and
+    // wait (bounded) for the queued reclaim.
+    h.fs.release(h.req, ino, 0, 0, 0, true)
+        .await
+        .expect("release failed");
+    h.fs.forget(h.req, ino, 1).await;
 
-    let after = budget(&h);
+    let after = wait_budget_below(&h, SLACK + 1, 15).await;
     assert!(
         after <= SLACK,
-        "unlink did not return staging budget: {before} -> {after}"
+        "unlink+forget did not return staging budget: {before} -> {after}"
     );
 }
 

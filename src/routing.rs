@@ -832,7 +832,7 @@ impl DataRouter {
         let stripe_write_semaphore =
             std::sync::Arc::new(tokio::sync::Semaphore::new(stripe_permits));
 
-        Self {
+        let router = Self {
             inner: std::sync::Arc::new(DataRouterInner {
                 dlm,
                 meta_backend: once_cell::sync::OnceCell::new(),
@@ -858,7 +858,19 @@ impl DataRouter {
                 prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
                 stripe_write_semaphore,
             }),
-        }
+        };
+        // Merge-worker promotion commits layout through the router (weak:
+        // the router owns the cache, never the reverse).
+        router
+            .cache
+            .nvme
+            .set_data_router(std::sync::Arc::downgrade(&router.inner));
+        router
+    }
+
+    /// Rehydrate a `DataRouter` from its inner Arc (merge-worker hook).
+    pub(crate) fn from_inner(inner: std::sync::Arc<DataRouterInner>) -> Self {
+        Self { inner }
     }
 
     pub fn set_crypto(&self, crypto: crate::crypto_compress::CryptoCompressState) {
@@ -1065,18 +1077,24 @@ impl DataRouter {
     }
 
     /// Persist layout/size if the hot cache marked it dirty (writeback path).
+    ///
+    /// Runs under the per-inode metadata lock: a concurrent staged-promotion
+    /// commit mutates the same RAM entry + backend layout, and an unlocked
+    /// persist could clobber the promoted mapping with a pre-promotion
+    /// snapshot (stranding the staged data once its ring entry is released).
     pub async fn persist_dirty_layout_if_needed(
         &self,
         file_path: &str,
         fencing_token: u64,
     ) -> Result<()> {
+        let ino = parse_inode_from_path(file_path);
+        let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
         let Some(meta) = self.metadata_cache.get(file_path) else {
             return Ok(());
         };
         if !meta.layout_dirty {
             return Ok(());
         }
-        let ino = parse_inode_from_path(file_path);
         let mut clean = meta.clone();
         clean.layout_dirty = false;
         clean.cached_at = std::time::Instant::now();
@@ -1084,6 +1102,160 @@ impl DataRouter {
             .await?;
         self.metadata_cache.insert(file_path.to_string(), clean);
         Ok(())
+    }
+
+    /// Promote a resident staged file to a durable backend block and release
+    /// its staging-ring entry + budget (merge-worker path, capacity pressure).
+    ///
+    /// Returns `Ok(true)` when the entry was promoted and released. Any
+    /// identity/generation mismatch is a benign skip (`Ok(false)`): the entry
+    /// either no longer exists or a racing re-stage/layout-transition now
+    /// owns it. Ordering:
+    ///
+    /// 1. Block data I/O first (io_uring, no locks held).
+    /// 2. Layout commit (backend + RAM cache together) under the per-inode
+    ///    metadata lock, with staged identity + stage-generation re-checked
+    ///    under that lock.
+    /// 3. Ring entry + budget release only if the stage generation is still
+    ///    the one we promoted (`remove_staged_if_generation`).
+    pub(crate) async fn promote_staged_file(
+        &self,
+        file_path: &str,
+        file_id: &str,
+        fencing_token: u64,
+    ) -> Result<bool> {
+        let nvme = &self.cache.nvme;
+        let Some(gen) = nvme.staged_generation(file_id) else {
+            return Ok(false);
+        };
+        let Some(raw) = nvme.read_staged(file_id) else {
+            // Counted but not resident (should not happen): reconcile so the
+            // budget cannot leak.
+            nvme.remove_staged_if_generation(file_id, gen);
+            return Ok(false);
+        };
+
+        let processed = self
+            .get_crypto()
+            .process_write_async(bytes::Bytes::from(raw))
+            .await?;
+        let (_be_id, allocator, writer) = self.backend_router.get_active_backend()?;
+        if processed.len() as u64 > allocator.chunk_size() {
+            // Incompressible expansion past the block size: stays resident.
+            return Ok(false);
+        }
+        let offset = allocator.allocate_block().await?;
+        let block_key = offset.to_string();
+        if let Err(e) = writer.write_block(offset, processed).await {
+            let _ = allocator.free_block(offset).await;
+            return Err(e);
+        }
+        allocator.publish_block(offset);
+
+        let ino = parse_inode_from_path(file_path);
+        let commit = async {
+            let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+            // Authoritative meta: RAM cache first (post-write truth), then
+            // backend. NOTE: `fetch_metadata` would retake this lock.
+            let current = match self.metadata_cache.get(file_path) {
+                Some(m) => Some(m),
+                None => self.fetch_metadata_from_backend(ino).await?,
+            };
+            let Some(current) = current else {
+                return Ok::<bool, SqueezefsError>(false);
+            };
+            if current.file_type != "staged"
+                || current.file_id.as_deref() != Some(file_id)
+                || nvme.staged_generation(file_id) != Some(gen)
+            {
+                return Ok(false);
+            }
+            let mut updated = current.clone();
+            let mut block_map = updated.block_map.take().unwrap_or_default();
+            let displaced = block_map.insert(0, block_key.clone());
+            updated.block_map = Some(block_map);
+            updated.layout_dirty = false;
+            updated.cached_at = std::time::Instant::now();
+            self.save_metadata_to_backend(ino, &updated, fencing_token)
+                .await?;
+            self.metadata_cache.insert(file_path.to_string(), updated);
+            if let Some(prev) = displaced {
+                if prev != block_key {
+                    // Re-promotion over an older durable copy: purge + free it.
+                    self.cache.read_lru.remove(&prev);
+                    self.cache.nvme.remove_cached_read_block(&prev);
+                    let _ = self.backend_router.free_block(&prev).await;
+                }
+            }
+            Ok(true)
+        }
+        .await;
+
+        match commit {
+            Ok(true) => {
+                nvme.remove_staged_if_generation(file_id, gen);
+                Ok(true)
+            }
+            Ok(false) => {
+                let _ = allocator.free_block(offset).await;
+                Ok(false)
+            }
+            Err(e) => {
+                let _ = allocator.free_block(offset).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Resolve the durable mapping (`block_map[0]`) of a staged file whose
+    /// ring entry is gone. The caller's `meta` snapshot can predate a
+    /// concurrent promotion/spill commit, so fall back to the freshest cached
+    /// entry and finally the authoritative backend before declaring the
+    /// payload unreachable.
+    async fn staged_block_mapping(&self, file_path: &str, meta: &CachedMetadata) -> Option<String> {
+        let map0 = |m: &CachedMetadata| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned());
+        if let Some(mapping) = map0(meta) {
+            return Some(mapping);
+        }
+        if let Some(mapping) = self.metadata_cache.get(file_path).as_ref().and_then(map0) {
+            return Some(mapping);
+        }
+        let ino = parse_inode_from_path(file_path);
+        self.fetch_metadata_from_backend(ino)
+            .await
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(map0)
+    }
+
+    /// Release the artifacts of a superseded staged layout *after* the new
+    /// layout is published (backend as applicable + RAM cache): the staging
+    /// ring entry (returns its budget) and any promoted/spilled durable
+    /// copies the new layout no longer references. Callers hold the
+    /// per-inode metadata lock; `old_maps` are the pre-publish snapshots
+    /// (write-entry meta + last cached meta) so a promotion that landed
+    /// between them cannot leak its block.
+    async fn release_superseded_staged(
+        &self,
+        old_ring_id: Option<&str>,
+        old_maps: [Option<&std::collections::HashMap<u32, String>>; 2],
+        keep_block_key: Option<&str>,
+    ) {
+        if let Some(fid) = old_ring_id {
+            self.cache.nvme.remove_staged(fid);
+        }
+        let mut freed = std::collections::HashSet::new();
+        for map in old_maps.into_iter().flatten() {
+            for bk in map.values() {
+                if keep_block_key == Some(bk.as_str()) || !freed.insert(bk.clone()) {
+                    continue;
+                }
+                self.cache.read_lru.remove(bk);
+                self.cache.nvme.remove_cached_read_block(bk);
+                let _ = self.backend_router.free_block(bk).await;
+            }
+        }
     }
 
     pub async fn update_metadata_cache_size(&self, file_path: &str, size: u64) {
@@ -1388,7 +1560,9 @@ impl DataRouter {
         };
 
         if end_offset > stripe_threshold || new_size > stripe_threshold {
-            // Transition layout → striped.
+            // Transition layout → striped. Block data I/O runs unlocked; only
+            // the layout commit is serialized against concurrent staged
+            // promotion (see INODE_META_LOCKS).
             let (block_mappings, _sizes, _block_count) =
                 self.durable_write_stripe_payload(payload_bytes).await?;
 
@@ -1399,19 +1573,34 @@ impl DataRouter {
                 }
             }
 
-            let mut updated_meta = meta.clone();
-            updated_meta.file_type = "striped".to_string();
-            updated_meta.size = new_size as u64;
-            updated_meta.block_map = Some(block_map);
-            updated_meta.file_id = None;
-            self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
-                .await?;
+            {
+                let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+                let fresh = self.metadata_cache.get(file_path);
+                let mut updated_meta = meta.clone();
+                updated_meta.file_type = "striped".to_string();
+                updated_meta.size = new_size as u64;
+                updated_meta.block_map = Some(block_map);
+                updated_meta.file_id = None;
+                self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
+                    .await?;
 
-            self.cache.write_lru.remove(file_path);
-            self.cache.read_lru.remove(file_path);
+                self.cache.write_lru.remove(file_path);
+                self.cache.read_lru.remove(file_path);
 
-            self.metadata_cache
-                .insert(file_path.to_string(), updated_meta);
+                self.metadata_cache
+                    .insert(file_path.to_string(), updated_meta);
+                // The staged form is superseded: release its ring entry
+                // (budget) and any promoted/spilled durable copy.
+                self.release_superseded_staged(
+                    meta.file_id.as_deref(),
+                    [
+                        meta.block_map.as_ref(),
+                        fresh.as_ref().and_then(|f| f.block_map.as_ref()),
+                    ],
+                    None,
+                )
+                .await;
+            }
             crate::fuse_client::METRICS
                 .layout_striped_writes
                 .fetch_add(1, Ordering::Relaxed);
@@ -1425,6 +1614,8 @@ impl DataRouter {
                 .fetch_add(1, Ordering::Relaxed);
             let shared_data = payload_bytes;
 
+            let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+            let fresh = self.metadata_cache.get(file_path);
             let mut updated_meta = meta.clone();
             updated_meta.file_type = "inline".to_string();
             updated_meta.size = new_size as u64;
@@ -1440,6 +1631,17 @@ impl DataRouter {
             self.cache.read_lru.put(file_path, shared_data);
             self.metadata_cache
                 .insert(file_path.to_string(), updated_meta);
+            // A truncated-then-rewritten staged/spilled file leaves a ring
+            // entry and/or a durable copy behind: release them.
+            self.release_superseded_staged(
+                meta.file_id.as_deref(),
+                [
+                    meta.block_map.as_ref(),
+                    fresh.as_ref().and_then(|f| f.block_map.as_ref()),
+                ],
+                None,
+            )
+            .await;
         } else if !self.cache.nvme.staging_dirs().is_empty()
             && (new_size as u64) <= self.block_size.load(Ordering::Acquire)
         {
@@ -1462,6 +1664,8 @@ impl DataRouter {
 
             match stage_res {
                 Ok(_) => {
+                    let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+                    let fresh = self.metadata_cache.get(file_path);
                     let mut updated_meta = meta.clone();
                     updated_meta.file_type = "staged".to_string();
                     updated_meta.size = new_size as u64;
@@ -1472,6 +1676,18 @@ impl DataRouter {
                     updated_meta.cached_at = std::time::Instant::now();
                     self.metadata_cache
                         .insert(file_path.to_string(), updated_meta);
+                    // The fresh stage supersedes any promoted/spilled durable
+                    // copy of older content. The ring entry itself is the
+                    // fresh data (replaced in-place by stage_write) — keep it.
+                    self.release_superseded_staged(
+                        None,
+                        [
+                            meta.block_map.as_ref(),
+                            fresh.as_ref().and_then(|f| f.block_map.as_ref()),
+                        ],
+                        None,
+                    )
+                    .await;
                 }
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
                     log::warn!("NVMe write staging cache full. Falling back to direct synchronous backend block write for: {}", file_path);
@@ -1489,12 +1705,21 @@ impl DataRouter {
                     block_allocator.publish_block(be_offset);
 
                     let mut block_map = std::collections::HashMap::new();
-                    block_map.insert(0, stored_block_key);
+                    block_map.insert(0, stored_block_key.clone());
 
+                    // Spill takes a *fresh* file_id: the stale ring entry
+                    // under the old id must never shadow this newer durable
+                    // payload on reads, and an in-flight promotion of the old
+                    // id must never pass its identity check and clobber this
+                    // layout with pre-spill content.
+                    let spill_file_id = Uuid::new_v4().to_string();
+
+                    let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+                    let fresh = self.metadata_cache.get(file_path);
                     let mut updated_meta = meta.clone();
                     updated_meta.file_type = "staged".to_string();
                     updated_meta.size = new_size as u64;
-                    updated_meta.file_id = Some(new_file_id);
+                    updated_meta.file_id = Some(spill_file_id);
                     updated_meta.data_key = None;
                     updated_meta.block_map = Some(block_map);
                     // Durable backend write already happened — commit layout now.
@@ -1503,6 +1728,17 @@ impl DataRouter {
                         .await?;
                     self.metadata_cache
                         .insert(file_path.to_string(), updated_meta);
+                    // Release the superseded stale ring entry (returns its
+                    // budget) and any older durable copy it had.
+                    self.release_superseded_staged(
+                        meta.file_id.as_deref(),
+                        [
+                            meta.block_map.as_ref(),
+                            fresh.as_ref().and_then(|f| f.block_map.as_ref()),
+                        ],
+                        Some(&stored_block_key),
+                    )
+                    .await;
                 }
                 Err(e) => return Err(e),
             }
@@ -1932,7 +2168,7 @@ impl DataRouter {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     staged_data
                 } else {
-                    let mapping_opt = meta.block_map.as_ref().and_then(|bm| bm.get(&0).cloned());
+                    let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
                     if let Some(mapping_str) = mapping_opt {
                         let (offset_u64, off, sz) = self.parse_block_mapping(&mapping_str)?;
                         let packed_bytes =
@@ -2040,17 +2276,17 @@ impl DataRouter {
                 Ok(decompressed[start..end].to_vec())
             }
             "staged" => {
-                let file_id = meta.file_id.ok_or_else(|| {
+                let file_id = meta.file_id.as_deref().ok_or_else(|| {
                     SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
                 })?;
 
-                if let Some(staged_data) = self.cache.nvme.read_staged(&file_id) {
+                if let Some(staged_data) = self.cache.nvme.read_staged(file_id) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     let start = std::cmp::min(offset as usize, staged_data.len());
                     let end = std::cmp::min((offset + size as u64) as usize, staged_data.len());
                     Ok(staged_data[start..end].to_vec())
                 } else {
-                    let mapping_opt = meta.block_map.as_ref().and_then(|bm| bm.get(&0).cloned());
+                    let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
                     if let Some(mapping_str) = mapping_opt {
                         let (offset_u64, off, sz) = self.parse_block_mapping(&mapping_str)?;
                         let packed_bytes =
@@ -2287,7 +2523,7 @@ impl DataRouter {
                     };
                     Ok((data, backing))
                 } else {
-                    let mapping_opt = meta.block_map.as_ref().and_then(|bm| bm.get(&0).cloned());
+                    let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
                     if let Some(bk) = mapping_opt {
                         let offset_u64 = self.backend_router.parse_block_offset(&bk)?;
                         let sz = self.block_size.load(Ordering::Acquire) as usize;

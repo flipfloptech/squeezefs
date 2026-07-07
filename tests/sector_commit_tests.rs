@@ -1024,23 +1024,24 @@ async fn test_metrics_inode_alloc_reconciled_counts_healed_bits() {
     );
 }
 
-/// Every journal-worker iteration records its batch fill.
+/// Every commit records its apply-batch sector count (`meta_commit_sectors`,
+/// the same-payload replacement for the deleted `meta_wal_batch_size` —
+/// design §Observability). Synchronous: the commit itself records it, no
+/// worker to wait on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_metrics_wal_batch_size_recorded() {
+async fn test_metrics_commit_sectors_recorded() {
     use squeezefs::fuse_client::METRICS;
     let (_t, backend) = open_backend().await;
 
-    let before = hist_count(&METRICS.meta_wal_batch_size.buckets);
+    let before = hist_count(&METRICS.meta_commit_sectors.buckets);
     backend
-        .create(1, "walbatch", libc::S_IFREG | 0o644, 0, 0)
+        .create(1, "commitsectors", libc::S_IFREG | 0o644, 0, 0)
         .await
         .unwrap();
-    // The journal worker is async; give it a beat to drain the request.
-    for _ in 0..50 {
-        if hist_count(&METRICS.meta_wal_batch_size.buckets) > before {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("journal worker never recorded a WAL batch size");
+    let after = hist_count(&METRICS.meta_commit_sectors.buckets);
+    assert!(
+        after > before,
+        "the commit apply must record its sector-batch fill synchronously (delta {})",
+        after - before
+    );
 }

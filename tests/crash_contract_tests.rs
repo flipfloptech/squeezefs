@@ -276,11 +276,10 @@ async fn test_acked_fsync_survives_power_cut() {
 }
 
 /// Strict mode (`…_FLUSH_INTERVAL_MS=0`, "sync-on-commit"): a returned
-/// commit implies the APPLY bytes are durable. RED today (§2.5): the
-/// interval-0 barrier fires on the WAL record BEFORE the apply is issued,
-/// so the apply bytes are still volatile when the commit returns.
+/// commit implies the APPLY bytes are durable. Was RED before PR 4 (§2.5):
+/// the interval-0 barrier fired on the WAL record BEFORE the apply was
+/// issued; PR 4 moved the strict-mode barrier post-apply — enforced since.
 #[tokio::test]
-#[ignore = "RED until PR 4: today's interval-0 barrier covers the WAL record, not the apply (design §2.5). PR 4 moves the strict-mode barrier post-apply and flips this test to enforced."]
 async fn test_strict_mode_flushes_apply() {
     let _env = StrictModeEnv::set();
     let (tmp, storage) = fresh_volume().await;
@@ -305,18 +304,85 @@ async fn test_strict_mode_flushes_apply() {
         .expect("interval-0 commit returned ⇒ the op must survive a power cut");
 }
 
+/// Deferred mode (the default): commits set the flush flag and the
+/// per-volume flusher barriers the device within the interval — an op is
+/// power-cut durable once `meta_flush_deferred` shows the timer fired
+/// (§4.2). Bounded poll on the metric, no sleep-for-sync.
+#[tokio::test]
+async fn test_deferred_flush_window_barriers_applies() {
+    use std::sync::atomic::Ordering;
+
+    struct DeferredEnv;
+    impl DeferredEnv {
+        fn set() -> Self {
+            std::env::set_var("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS", "20");
+            std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "20");
+            DeferredEnv
+        }
+    }
+    impl Drop for DeferredEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS");
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+
+    let _env = DeferredEnv::set();
+    let (tmp, storage) = fresh_volume().await;
+    let _g = FaultGuard;
+
+    uring_fs::arm_power_cut(storage.device_path());
+    let backend = MetaLvBackend::new(storage);
+    let before = squeezefs::fuse_client::METRICS
+        .meta_flush_deferred
+        .load(Ordering::Relaxed);
+    backend
+        .create(1, "deferred", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+
+    // Wait (bounded) for the flusher's barrier, observable via the metric.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while squeezefs::fuse_client::METRICS
+        .meta_flush_deferred
+        .load(Ordering::Relaxed)
+        == before
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "deferred flusher never barriered within the window"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    let reverted = uring_fs::power_cut(backend.storage.device_path());
+    assert_eq!(
+        reverted, 0,
+        "after the deferred barrier fires, the commit's writes must be durable"
+    );
+    drop(backend);
+    uring_fs::clear_faults();
+
+    let storage = MetaLvStorage::open(tmp.path(), VOL_SIZE).unwrap();
+    let backend = MetaLvBackend::new(storage);
+    backend
+        .lookup(1, "deferred")
+        .await
+        .expect("deferred-mode op must survive a power cut after the flush window");
+}
+
 // ---------------------------------------------------------------------------
 // Journal-region hygiene.
 // ---------------------------------------------------------------------------
 
 /// A full mutation session (create / setxattr / unlink / destroy) leaves the
-/// journal region [104 MiB, 108 MiB) byte-identical. RED today by
-/// definition: the WAL worker writes a record for every mutation.
+/// journal region [104 MiB, 108 MiB) byte-identical. Was RED before PR 4
+/// (the WAL worker wrote a record for every mutation); the write path is
+/// deleted — the region stays declared/reserved on disk (§4.2, R1).
 /// Strengthens `test_reconciliation_does_not_touch_journal`
 /// (meta_lv_tests.rs) from "reconciliation reads don't write" to "NO code
 /// path writes" (§4.2).
 #[tokio::test]
-#[ignore = "RED until PR 4: the WAL worker journals every mutation today. PR 4 deletes the write path and flips this test to enforced."]
 async fn test_journal_region_never_written() {
     let (_t, storage) = fresh_volume().await;
 

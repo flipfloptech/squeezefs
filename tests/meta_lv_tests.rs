@@ -1129,3 +1129,101 @@ async fn test_quarantined_metric_counts_legacy_occupants() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Quick-format xattr ghosts (design-wal-crash-consistency resolved Open
+// Question 3, queued follow-up): `wipe(quick)` zeroes only the first
+// 108 MiB, but xattr blocks extend to `72 MiB + limit×32 KiB` — on a
+// 256 MiB volume that is the whole device. A quick-reformatted volume
+// could therefore resurrect prior-life xattr blocks (still-valid magic
+// 0x58415452) for any ino ≥ 1152, serving a dead filesystem's xattrs —
+// or worse, a dead symlink's target bytes — as the new volume's state.
+// ---------------------------------------------------------------------------
+
+/// After a quick re-format, no prior-life xattr block may survive: reads
+/// on same-numbered new inos degrade to empty, and the on-disk block
+/// headers (magic sectors) beyond the 108 MiB wipe window are zeroed.
+#[tokio::test]
+async fn test_quick_format_leaves_no_xattr_ghosts() {
+    use squeezefs::meta_backend::inode::{write_inode, DiskInode};
+    use squeezefs::meta_backend::xattr;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    // Prior life: a high-ino file with an xattr, and a symlink with
+    // content — both blocks land beyond the 108 MiB quick-wipe window.
+    let ghost_ino = 2000u64;
+    let link_ino = 2100u64;
+    assert!(
+        1024 * 1024 * 72 + ghost_ino * 32768 > 108 * 1024 * 1024,
+        "test premise: the ghost block lies beyond the quick-wipe window"
+    );
+    write_inode(
+        &storage,
+        ghost_ino,
+        &DiskInode::new(ghost_ino, libc::S_IFREG | 0o644, 0, 0),
+    )
+    .await
+    .unwrap();
+    xattr::set_xattr(&storage, ghost_ino, "user.ghost", b"from-a-dead-fs")
+        .await
+        .unwrap();
+    let mut link = DiskInode::new(link_ino, libc::S_IFLNK | 0o777, 0, 0);
+    link.size = 0; // content written via system.symlink below
+    write_inode(&storage, link_ino, &link).await.unwrap();
+    xattr::set_xattr(&storage, link_ino, "system.symlink", b"/dead/target")
+        .await
+        .unwrap();
+
+    // Sanity: the prior life is readable before the re-format.
+    assert!(xattr::get_xattr(&storage, ghost_ino, "user.ghost")
+        .await
+        .unwrap()
+        .is_some());
+
+    // Quick re-format (the default `format` path is quick + force).
+    MetaLvBackend::format(&storage).await.unwrap();
+
+    // New life at the same ino numbers, no xattrs ever set.
+    write_inode(
+        &storage,
+        ghost_ino,
+        &DiskInode::new(ghost_ino, libc::S_IFREG | 0o644, 0, 0),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        xattr::get_xattr(&storage, ghost_ino, "user.ghost")
+            .await
+            .expect("read on the fresh volume"),
+        None,
+        "a quick-reformatted volume must not resurrect prior-life xattrs"
+    );
+    assert!(
+        xattr::list_xattrs(&storage, ghost_ino)
+            .await
+            .expect("list on the fresh volume")
+            .is_empty(),
+        "no ghost keys may survive the re-format"
+    );
+
+    // The definitive on-disk property: every xattr-block header sector
+    // beyond the wipe window is zeroed (magic killed), symlink blocks
+    // included — their content bytes have no magic guard of their own.
+    for ino in [ghost_ino, link_ino] {
+        let offset = 1024 * 1024 * 72 + ino * 32768;
+        let mut header = [0u8; 4096];
+        storage
+            .read_blocks_direct(offset, &mut header)
+            .await
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(header[0..4].try_into().unwrap()),
+            0,
+            "ino {ino}: xattr block magic must be zeroed by the quick format"
+        );
+    }
+}

@@ -25,6 +25,8 @@ pub mod alloc_core;
 pub mod gauge_core;
 #[path = "../../src/incarnation_core.rs"]
 pub mod incarnation_core;
+#[path = "../../src/refcount_core.rs"]
+pub mod refcount_core;
 
 #[cfg(all(test, loom))]
 mod models {
@@ -173,6 +175,60 @@ mod models {
                 }
             }
             writer.join().unwrap();
+        });
+    }
+
+    /// Refcount invariant #1: an acquire racing the terminal release either
+    /// takes a reference (and the releaser does NOT free) or observes zero
+    /// (and must not use the block) — never both, never a resurrected count.
+    #[test]
+    fn refcount_acquire_never_resurrects_freed_block() {
+        use loom::sync::atomic::AtomicU32;
+        loom::model(|| {
+            let cell = Arc::new(AtomicU32::new(1)); // one live owner
+
+            let cloner = {
+                let cell = cell.clone();
+                thread::spawn(move || crate::refcount_core::try_acquire(&cell))
+            };
+            let freed = crate::refcount_core::release(&cell); // owner drops
+            let acquired = cloner.join().unwrap();
+
+            assert!(
+                !(freed && acquired),
+                "block freed while a clone simultaneously took a reference \
+                 (resurrection: the clone now aliases a reallocatable offset)"
+            );
+            assert!(
+                freed || acquired,
+                "reference neither freed nor transferred — leaked"
+            );
+            if acquired {
+                // The clone holds the only remaining reference; its release
+                // must be the terminal one.
+                assert!(crate::refcount_core::release(&cell), "clone's release must free");
+            }
+            assert!(!crate::refcount_core::release(&cell), "double free");
+        });
+    }
+
+    /// Refcount invariant #2: two concurrent releases of a doubly-referenced
+    /// block produce exactly one terminal transition.
+    #[test]
+    fn refcount_exactly_one_terminal_release() {
+        use loom::sync::atomic::AtomicU32;
+        loom::model(|| {
+            let cell = Arc::new(AtomicU32::new(2));
+            let t = {
+                let cell = cell.clone();
+                thread::spawn(move || crate::refcount_core::release(&cell))
+            };
+            let a = crate::refcount_core::release(&cell);
+            let b = t.join().unwrap();
+            assert!(
+                a ^ b,
+                "exactly one of two racing releases must observe the terminal 1->0"
+            );
         });
     }
 

@@ -96,11 +96,23 @@ impl BlockAllocator {
 
     pub fn increment_refcount(&self, offset: u64) {
         match self.refcounts.entry_sync(offset) {
-            scc::hash_map::Entry::Occupied(mut occ) => {
-                occ.get_mut().fetch_add(1, Ordering::SeqCst);
+            scc::hash_map::Entry::Occupied(occ) => {
+                // Acquire-from-nonzero (loom-modeled, crate::refcount_core):
+                // a plain fetch_add could resurrect a count a concurrent
+                // free_block just took to zero, leaving this clone holding a
+                // freed (reallocatable) offset.
+                if !crate::refcount_core::try_acquire(occ.get()) {
+                    log::warn!(
+                        "increment_refcount raced a free for offset {offset}: reference not taken"
+                    );
+                }
             }
-            scc::hash_map::Entry::Vacant(vac) => {
-                let _ = vac.insert_entry(AtomicU32::new(2));
+            scc::hash_map::Entry::Vacant(_) => {
+                // Unknown offset: it was never allocated by this process or
+                // its count already hit zero and was removed. Fabricating a
+                // fresh count for a possibly free-listed offset would alias
+                // a future allocation — refuse loudly instead.
+                log::warn!("increment_refcount on untracked offset {offset}: reference not taken");
             }
         }
     }
@@ -137,11 +149,11 @@ impl BlockAllocator {
     }
 
     pub async fn free_block(&self, offset: u64) -> Result<()> {
-        let should_free = if let Some(cell) = self
+        let should_free = if let Some(terminal) = self
             .refcounts
-            .read_sync(&offset, |_, v| v.fetch_sub(1, Ordering::SeqCst) == 1)
+            .read_sync(&offset, |_, v| crate::refcount_core::release(v))
         {
-            if cell {
+            if terminal {
                 self.refcounts.remove_sync(&offset);
                 true
             } else {

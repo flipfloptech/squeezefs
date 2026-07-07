@@ -19,6 +19,7 @@ pub mod meta_backend;
 pub mod nvmeof;
 pub mod p2p;
 pub mod recovery;
+pub(crate) mod refcount_core;
 pub mod routing;
 
 #[macro_export]

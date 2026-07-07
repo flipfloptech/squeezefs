@@ -100,3 +100,19 @@ use-cases the tokio path already supports) — its own design; the remaining
 per-round-trip tax (eventfd wake + re-arm submit per reply,
 `fuse_over_uring.rs:510-540`, `:961-967`) is a second, independent
 transport optimization candidate.
+
+## Addendum 2: substrate invariance (operator cross-check)
+
+Same machine, same day, full `squeezefs bench` on two substrates:
+
+| Row | NVMe-oF (SPDK loopback) | Direct file-backed | Δ |
+|---|---|---|---|
+| Metadata Stat | 42,513 | 87,325 | +105% |
+| Metadata Mkdir | 7,717 | 16,764 | +117% |
+| Metadata Rmdir | 21,549 | 30,321 | +41% |
+| **Metadata Delete** | **2,776** | **2,815** | **+1.4%** |
+
+Removing the fabric RTT roughly doubles every metadata row EXCEPT Delete,
+which is flat across substrates — independent confirmation that the Delete
+row is bounded by kernel-side inline page-cache eviction (per the
+attribution above), not by the metadata commit path or device latency.

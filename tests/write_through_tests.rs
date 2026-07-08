@@ -82,8 +82,8 @@ struct H {
     _s: TempDir,
 }
 
-async fn make_with(test_id: &str, write_disk: &str) -> H {
-    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
+async fn make_with(test_id: &str, write_disk: &str, block_size: &str) -> H {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", block_size);
     let dlm = DlmClient::new("local").unwrap();
 
     let b = NamedTempFile::new().unwrap();
@@ -137,7 +137,7 @@ async fn make_with(test_id: &str, write_disk: &str) -> H {
 }
 
 async fn make(test_id: &str) -> H {
-    make_with(test_id, "64MB").await
+    make_with(test_id, "64MB", "4096").await
 }
 
 async fn create(h: &H, name: &str) -> u64 {
@@ -985,8 +985,8 @@ async fn test_merge_primitive_truncate_from_removes_and_returns_keys() {
     let meta = backend_meta(&h, ino).await;
     assert_eq!(meta.size, 2 * BS, "TruncateFrom sets the size exactly");
     let bm = meta.block_map.clone().unwrap();
-    assert!(bm.get(&2).is_none() && bm.get(&3).is_none());
-    assert!(bm.get(&0).is_some() && bm.get(&1).is_some());
+    assert!(!bm.contains_key(&2) && !bm.contains_key(&3));
+    assert!(bm.contains_key(&0) && bm.contains_key(&1));
 }
 
 /// The degenerate size-only save (`Merge(&[])`) re-reads the CURRENT map
@@ -1080,11 +1080,11 @@ async fn test_interleave_write_through_vs_fallback_writeback() {
         let meta = backend_meta(&h, ino).await;
         let bm = meta.block_map.clone().unwrap_or_default();
         assert!(
-            bm.get(&2).is_some(),
+            bm.contains_key(&2),
             "iter {iter}: fallback block 2 mapping lost (torn merge): {bm:?}"
         );
         assert!(
-            bm.get(&4).is_some(),
+            bm.contains_key(&4),
             "iter {iter}: write-through block 4 mapping lost (torn merge): {bm:?}"
         );
         assert_eq!(
@@ -1104,7 +1104,7 @@ async fn test_interleave_write_through_vs_fallback_writeback() {
 async fn test_interleave_write_through_vs_staging_refusal_escalation() {
     let _g = serial().await;
     // Tiny write-staging budget so `put_active_block` refuses.
-    let h = make_with("wt_il_refusal", "1MB").await;
+    let h = make_with("wt_il_refusal", "1MB", "4096").await;
 
     // Fill the staging segment with junk entries that stay live.
     let mut filled = 0u64;
@@ -1145,11 +1145,11 @@ async fn test_interleave_write_through_vs_staging_refusal_escalation() {
         let meta = backend_meta(&h, ino).await;
         let bm = meta.block_map.clone().unwrap_or_default();
         assert!(
-            bm.get(&2).is_some(),
+            bm.contains_key(&2),
             "iter {iter}: escalated block 2 mapping lost: {bm:?}"
         );
         assert!(
-            bm.get(&4).is_some(),
+            bm.contains_key(&4),
             "iter {iter}: write-through block 4 mapping lost: {bm:?}"
         );
         assert_eq!(read_at(&h, ino, 2 * BS, 1000).await, pa);
@@ -1195,7 +1195,7 @@ async fn test_interleave_write_through_vs_truncate_shrink() {
         // Both orders are POSIX-legal; torn merges are not:
         if meta.size <= 2 * BS {
             assert!(
-                bm.get(&3).is_none(),
+                !bm.contains_key(&3),
                 "iter {iter}: truncate won (size {}), block 3 mapping resurrected: {bm:?}",
                 meta.size
             );
@@ -1206,7 +1206,7 @@ async fn test_interleave_write_through_vs_truncate_shrink() {
                 meta.size
             );
             assert!(
-                bm.get(&3).is_some(),
+                bm.contains_key(&3),
                 "iter {iter}: write won (size {}) but block 3 mapping lost: {bm:?}",
                 meta.size
             );
@@ -1217,7 +1217,7 @@ async fn test_interleave_write_through_vs_truncate_shrink() {
         }
         // Blocks 0/1 are below every cut and must survive in all orders.
         assert!(
-            bm.get(&0).is_some() && bm.get(&1).is_some(),
+            bm.contains_key(&0) && bm.contains_key(&1),
             "iter {iter}: pre-existing mappings lost: {bm:?}"
         );
     }
@@ -1262,7 +1262,7 @@ async fn test_interleave_write_through_vs_truncate_grow() {
             meta.size
         );
         assert!(
-            bm.get(&3).is_some(),
+            bm.contains_key(&3),
             "iter {iter}: write-through mapping dropped by the grow save: {bm:?}"
         );
         assert_eq!(
@@ -1300,7 +1300,7 @@ async fn test_interleave_write_through_vs_fallocate_extend() {
             meta.size
         );
         assert!(
-            bm.get(&3).is_some(),
+            bm.contains_key(&3),
             "iter {iter}: write-through mapping dropped by the fallocate save: {bm:?}"
         );
         assert_eq!(
@@ -1318,16 +1318,19 @@ async fn test_interleave_write_through_vs_fallocate_extend() {
 /// staged file releases its ring entry exactly once, and a later fsync-path
 /// flush (KeepStagedIdentity) neither strands nor double-releases it — the
 /// staging budget gauge settles at 0 and the layout keeps a clean identity.
+///
+/// Uses a 64 KiB block size: the staged window is (MAX_INLINE_SIZE,
+/// block_size], which is EMPTY at this suite's default 4 KiB shape.
 #[tokio::test]
 async fn test_staged_identity_promotion_fsync_ring_entry_exact() {
     let _g = serial().await;
-    let h = make("wt_staged_id").await;
+    let h = make_with("wt_staged_id", "64MB", "65536").await;
     let ino = create(&h, "staged_id.bin").await;
 
-    // Staged layout first (fits under block_size with staging dirs present).
+    // Staged layout first (> inline, <= 64 KiB block, staging dirs present).
     // Read the RAM entry directly: a staged layout is RAM-only until fsync
     // (layout_dirty) — evicting it here would orphan the staged identity.
-    let p0 = pattern(3000, 41);
+    let p0 = pattern(8000, 41);
     write_at(&h, ino, 0, &p0).await;
     let path = squeezefs::keys::inode_path(ino);
     let ram =
@@ -1343,8 +1346,8 @@ async fn test_staged_identity_promotion_fsync_ring_entry_exact() {
     );
 
     // Grow past block_size → striped transition releases the ring entry.
-    let p1 = pattern(2000, 43);
-    write_at(&h, ino, 3000, &p1).await;
+    let p1 = pattern(60000, 43);
+    write_at(&h, ino, 8000, &p1).await;
     assert!(
         h.fs.router.cache.nvme.read_staged(&file_id).is_none(),
         "transition must release the superseded ring entry"
@@ -1353,7 +1356,7 @@ async fn test_staged_identity_promotion_fsync_ring_entry_exact() {
     // fsync-path flush of post-transition active blocks must keep the
     // staged-identity fields untouched (no resurrected file_id) and the
     // budget exact.
-    write_at(&h, ino, 5000, &pattern(500, 45)).await; // partial active block
+    write_at(&h, ino, 68000, &pattern(500, 45)).await; // partial active block
     h.fs.fsync(h.req, ino, 0, false).await.unwrap();
     h.fs.force_flush_all_staged_data().await.unwrap();
 

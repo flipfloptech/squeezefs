@@ -32,13 +32,20 @@ fn pooled_layout(size: usize) -> std::alloc::Layout {
         .expect("pooled buffer layout (size, 4 KiB align)")
 }
 
-/// Allocate `size` uninitialized bytes at [`POOLED_BUF_ALIGN`]. Callers
-/// expose only bytes they have initialized (see `PooledBuf::len`).
+/// Allocate `size` **zeroed** bytes at [`POOLED_BUF_ALIGN`].
+///
+/// Zeroed at birth (one-time cost per OS allocation, amortized to nothing
+/// across recycling) so every pooled byte is always initialized memory:
+/// the memset-elided `ActiveBlockBuf::fresh` path (zero-copy write-path
+/// design §5.3) forms `&[u8]` views over not-yet-written pool bytes, which
+/// is only sound when the backing is initialized. Recycled buffers keep
+/// whatever prior content safe writes left — the §5.3 covered-interval
+/// contract is what keeps those bytes from ever *escaping*.
 fn alloc_pooled(size: usize) -> *mut u8 {
     // SAFETY: `pooled_layout` never has zero size for pool buffers
     // (`BufferPool::new` / `AlignedBufPool::new` take non-zero sizes and
     // grow targets are > 0).
-    let ptr = unsafe { std::alloc::alloc(pooled_layout(size)) };
+    let ptr = unsafe { std::alloc::alloc_zeroed(pooled_layout(size)) };
     assert!(!ptr.is_null(), "pooled buffer allocation failed");
     debug_assert_eq!(
         ptr as usize % POOLED_BUF_ALIGN,

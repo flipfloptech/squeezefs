@@ -180,7 +180,8 @@ async fn test_pooled_write_sources_take_aligned_dma_branch() {
     );
 
     // (b) ActiveBlockBuf snapshot source (active-block flush/upload shape).
-    let mut abb = ActiveBlockBuf::zeroed(block);
+    let mut abb = ActiveBlockBuf::fresh(block);
+    abb.record_write(0, block); // one-shot full coverage (PR 4 memset elision)
     for (i, b) in abb.make_mut().iter_mut().enumerate() {
         *b = (i % 239) as u8;
     }

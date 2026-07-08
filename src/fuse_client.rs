@@ -328,6 +328,23 @@ pub struct Metrics {
     /// on the same dirty block — the price of snapshot immutability, made
     /// observable.
     pub active_block_cow_copies: Align64<AtomicU64>,
+    /// Content-complete blocks uploaded directly (crypto → allocate → DMA →
+    /// block-map merge), bypassing the staging mmap + writeback round-trip
+    /// (zero-copy write-path design §5.3, PR 4). Should ≈ the striped
+    /// sequential write volume on healthy mounts.
+    pub write_through_blocks: Align64<AtomicU64>,
+    /// Bytes moved by write-through uploads (`write_through_blocks` ×
+    /// block_size for the default shape).
+    pub write_through_bytes: Align64<AtomicU64>,
+    /// Write-throughs that degraded into the never-lossy staging fallback
+    /// (device write failure / allocator failure / uring backpressure).
+    /// ~0 on healthy mounts; sustained growth = device backpressure.
+    pub write_through_fallbacks: Align64<AtomicU64>,
+    /// Seed-time memset bytes elided by §5.3 coverage tracking: for every
+    /// Fresh accumulation buffer reaching content-validity, the block size
+    /// minus the complement bytes actually zeroed. Sequential fills elide
+    /// the whole block.
+    pub active_block_memset_elided_bytes: Align64<AtomicU64>,
     /// Meta-volume durability barriers actually issued (real `fdatasync` calls).
     /// A single FUSE fsync should raise this by exactly one (no redundant barrier).
     pub meta_device_syncs: Align64<AtomicU64>,
@@ -946,6 +963,10 @@ impl SqueezefsFilesystem {
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),
                 "writeback_hard_failures": METRICS.writeback_hard_failures.load(Ordering::Relaxed),
                 "active_block_cow_copies": METRICS.active_block_cow_copies.load(Ordering::Relaxed),
+                "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
+                "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
+                "write_through_fallbacks": METRICS.write_through_fallbacks.load(Ordering::Relaxed),
+                "active_block_memset_elided_bytes": METRICS.active_block_memset_elided_bytes.load(Ordering::Relaxed),
                 "meta_device_syncs": METRICS.meta_device_syncs.load(Ordering::Relaxed),
                 "meta_sync_requests": METRICS.meta_sync_requests.load(Ordering::Relaxed),
                 "bg_admit_available_permits": crate::bg_admit::available_permits(),
@@ -1172,43 +1193,54 @@ impl SqueezefsFilesystem {
         }
 
         for key in keys_to_flush {
-            if let Some((_, block_data)) = self.active_block_buffers.remove(&key) {
-                let parts: Vec<&str> = key.split(":block_").collect();
-                if parts.len() == 2 {
-                    if let Ok(b) = parts[1].parse::<u32>() {
-                        let nvme_clone = self.router.cache.nvme.clone();
-                        let key_clone = key.clone();
-                        let staging_copy = block_data.snapshot();
-                        let admitted = tokio::task::spawn_blocking(move || {
-                            nvme_clone.put_active_block(&key_clone, &staging_copy, fencing_token)
-                        })
-                        .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let Some((_, b)) = Self::parse_active_block_key(&key) else {
+                continue;
+            };
+            // Stage/upload exit under the victim's block lock (§5.3 exit 2;
+            // normal await — this path holds no other block locks):
+            // zero-complete Fresh buffers so recycled pool bytes never
+            // reach staging or the device, and serialize against a
+            // concurrent write's checkout of the same block.
+            let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
+            let block_guard = block_lock.lock().await;
+            let Some((_, mut block_data)) = self.active_block_buffers.remove(&key) else {
+                drop(block_guard);
+                continue;
+            };
+            block_data.zero_complete();
+            let nvme_clone = self.router.cache.nvme.clone();
+            let key_clone = key.clone();
+            let staging_copy = block_data.snapshot();
+            let admitted = tokio::task::spawn_blocking(move || {
+                nvme_clone.put_active_block(&key_clone, &staging_copy, fencing_token)
+            })
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-                        if admitted {
-                            let req = WritebackRequest {
-                                ino,
-                                block_idx: b,
-                                fencing_token,
-                                attempts: 0,
-                            };
-                            self.enqueue_writeback(req).await?;
-                        } else {
-                            // Staging refused (never-lossy backpressure):
-                            // this is the fsync path, so make the block
-                            // durable right now.
-                            upload_active_block_bytes(
-                                ino,
-                                b,
-                                block_data.snapshot(),
-                                fencing_token,
-                                &self.router,
-                                &self.active_inode_locks,
-                            )
-                            .await?;
-                        }
-                    }
-                }
+            if admitted {
+                drop(block_guard);
+                let req = WritebackRequest {
+                    ino,
+                    block_idx: b,
+                    fencing_token,
+                    attempts: 0,
+                };
+                self.enqueue_writeback(req).await?;
+            } else {
+                // Staging refused (never-lossy backpressure): this is the
+                // fsync path, so make the block durable right now. The
+                // escalation merges via the shared primitive
+                // (INODE_META_LOCKS — after BLOCK_FLUSH_LOCKS in the P1-9
+                // extended order), so holding the block guard is legal.
+                upload_active_block_bytes(
+                    ino,
+                    b,
+                    block_data.snapshot(),
+                    fencing_token,
+                    &self.router,
+                )
+                .await?;
+                drop(block_guard);
             }
         }
         Ok(())
@@ -1280,7 +1312,12 @@ impl SqueezefsFilesystem {
                 } else if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
                     crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
                 } else if !needs_existing_data {
-                    crate::cache::active_block::ActiveBlockBuf::zeroed(block_size as usize)
+                    // Fresh entry: no existing data for this block, so the
+                    // seed-time zero-fill is elided (§5.3) — the `covered`
+                    // interval below keeps recycled pool bytes private, and
+                    // the complement is zeroed lazily at the trigger or at
+                    // any stage/upload exit.
+                    crate::cache::active_block::ActiveBlockBuf::fresh(block_size as usize)
                 } else {
                     // Try cache first
                     let mut block_map_id_opt = None;
@@ -1374,48 +1411,88 @@ impl SqueezefsFilesystem {
                 // 2. Merge the request slice. `make_mut` mutates only
                 // provably-unique memory: a live reader snapshot forces a
                 // copy-on-write instead of mutating aliased bytes (P0 fix,
-                // zero-copy write-path design §5.2).
+                // zero-copy write-path design §5.2). Coverage bookkeeping
+                // first (§5.3): a gap write zeroes the complement before
+                // the merge lands.
                 let rel_start = (write_start - b_start_offset) as usize;
+                block_data.record_write(rel_start, rel_start + slice_len);
                 block_data.make_mut()[rel_start..rel_start + slice_len]
                     .copy_from_slice(file_data_slice);
 
-                // 3. Write back to staging_nvme_cache if block is complete, or keep in memory
+                // 3. Write-through when the block is content-complete
+                // (normative trigger — byte-identical to the old staging
+                // point: write_end == b_end_offset for every entry kind and
+                // fill order), else keep in memory. §5.3: content-validity
+                // is established AT the trigger (zero the uncovered
+                // complement of a Fresh entry), never required before it.
                 let is_block_complete = write_end == b_end_offset;
                 if is_block_complete {
-                    let nvme_clone = self.router.cache.nvme.clone();
-                    let cache_key_clone = cache_key.clone();
-                    let fencing_token_val = fencing_token;
-                    let block_snapshot = block_data.snapshot();
-                    let admitted = tokio::task::spawn_blocking(move || {
-                        nvme_clone.put_active_block(
-                            &cache_key_clone,
-                            &block_snapshot,
-                            fencing_token_val,
-                        )
-                    })
-                    .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    block_data.zero_complete();
+                    match self
+                        .upload_full_block(ino, b as u32, block_data.snapshot(), fencing_token)
+                        .await
+                    {
+                        Ok(()) => {
+                            METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
+                            METRICS
+                                .write_through_bytes
+                                .fetch_add(block_size, Ordering::Relaxed);
+                            std::mem::drop(block_guard);
+                        }
+                        Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                            // A fenced-out writer must not publish anywhere —
+                            // not even to staging. Propagate; the caller
+                            // invalidates the local lease.
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            // Never-lossy fallback (uring backpressure /
+                            // allocator / device failure): degrade into
+                            // today's staging + writeback path.
+                            METRICS
+                                .write_through_fallbacks
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "write-through failed for ino {} block {} ({:?}); \
+                                 falling back to staging",
+                                ino, b, e
+                            );
+                            let nvme_clone = self.router.cache.nvme.clone();
+                            let cache_key_clone = cache_key.clone();
+                            let fencing_token_val = fencing_token;
+                            let block_snapshot = block_data.snapshot();
+                            let admitted = tokio::task::spawn_blocking(move || {
+                                nvme_clone.put_active_block(
+                                    &cache_key_clone,
+                                    &block_snapshot,
+                                    fencing_token_val,
+                                )
+                            })
+                            .await
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-                    std::mem::drop(block_guard);
+                            std::mem::drop(block_guard);
 
-                    if admitted {
-                        let req = WritebackRequest {
-                            ino,
-                            block_idx: b as u32,
-                            fencing_token,
-                            attempts: 0,
-                        };
-                        self.enqueue_writeback(req).await?;
-                    } else {
-                        // Staging refused (never-lossy backpressure): keep
-                        // the block in RAM like a partial block; fsync's
-                        // buffer flush re-attempts staging or uploads it
-                        // durably.
-                        self.insert_active_block_buffer(
-                            cache_key.clone(),
-                            block_data,
-                            fencing_token,
-                        );
+                            if admitted {
+                                let req = WritebackRequest {
+                                    ino,
+                                    block_idx: b as u32,
+                                    fencing_token,
+                                    attempts: 0,
+                                };
+                                self.enqueue_writeback(req).await?;
+                            } else {
+                                // Staging refused too (never-lossy
+                                // backpressure): keep the block in RAM like
+                                // a partial block; fsync's buffer flush
+                                // re-attempts staging or uploads it durably.
+                                self.insert_active_block_buffer(
+                                    cache_key.clone(),
+                                    block_data,
+                                    fencing_token,
+                                );
+                            }
+                        }
                     }
                 } else {
                     self.insert_active_block_buffer(cache_key.clone(), block_data, fencing_token);
@@ -1428,6 +1505,97 @@ impl SqueezefsFilesystem {
 
         futures::future::try_join_all(futures).await?;
 
+        Ok(())
+    }
+
+    /// Upload a content-complete block directly: crypto → allocate → DMA →
+    /// block-map merge (zero-copy write-path design §5.3, PR 4). Caller
+    /// holds `BLOCK_FLUSH_LOCKS(ino, b)`; MUST NOT hold the inode write
+    /// guard (striped scope is MetaPrepOnly, guard already dropped — P1-8)
+    /// nor any pooled meta connection (P1-10: the meta connection opens
+    /// after the DMA completed and closes before returning). Returns `Err`
+    /// to request the caller's never-lossy staging fallback.
+    ///
+    /// `plaintext` MUST be lease-free (§5.4 severance boundary): always an
+    /// `ActiveBlockBuf::snapshot()` — zero-completed, block-sized,
+    /// 4096-aligned (guaranteed `WriteData::Aligned` zero-copy submit) —
+    /// never a transport-payload `Bytes`.
+    async fn upload_full_block(
+        &self,
+        ino: u64,
+        b: u32,
+        plaintext: bytes::Bytes,
+        fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        // Passthrough returns the same `Bytes` (0 copy); non-passthrough
+        // transforms into a fresh buffer (§5.7).
+        let processed = self
+            .router
+            .get_crypto()
+            .process_write_async(plaintext)
+            .await?;
+        let (_be_id, block_allocator, nvme_writer) =
+            self.router.backend_router.get_active_backend()?;
+        // Marks the key's incarnation unstable: racing validated cache fills
+        // of a reused key fail their seqlock check instead of caching
+        // pre-DMA bytes.
+        let offset = block_allocator.allocate_block().await?;
+        if let Err(e) = nvme_writer.write_block(offset, processed).await {
+            let _ = block_allocator.free_block(offset).await;
+            return Err(e);
+        }
+        // Publish after the device write (incarnation ordering). No
+        // `read_lru.put` for the striped hot path — deliberately mirroring
+        // `flush_single_active_block`'s `!is_striped` gate: a 10 GiB stream
+        // would otherwise evict genuinely hot read data with 2,560 plaintext
+        // blocks.
+        block_allocator.publish_block(offset);
+        let new_key = offset.to_string();
+
+        // Block-map merge via the shared primitive (§5.3 one merge
+        // discipline) under INODE_META_LOCKS: current-map RMW, fencing
+        // revalidation, RAM cache republish, displaced-key tier purge. The
+        // completed write ends exactly at the block end, so the file is at
+        // least that large.
+        let min_size = (b as u64 + 1) * self.router.block_size.load(Ordering::Relaxed);
+        let entries = [(b, new_key)];
+        let displaced = match self
+            .router
+            .merge_block_mappings(
+                ino,
+                crate::routing::BlockMapOp::Merge(&entries),
+                min_size,
+                crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
+                fencing_token,
+            )
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                // The DMA'd block is unreachable (never published to the
+                // map): free it before surfacing the error.
+                let _ = block_allocator.free_block(offset).await;
+                return Err(e);
+            }
+        };
+        // Free displaced keys only after the new map is published (durable +
+        // cached), so no reader can resolve a block to a key we are freeing.
+        for bk in displaced {
+            let _ = self.router.backend_router.free_block(&bk).await;
+        }
+
+        // Invalidate AFTER the meta publish: a read racing between DMA and
+        // publish still hits the RAM snapshot (correct); after removal it
+        // resolves via the published block map. Any stale queued
+        // WritebackRequest for this key becomes a no-op (its staged source
+        // is gone). A stale whole-file RAM snapshot would serve pre-write
+        // bytes — drop it, as the routing striped merge does.
+        let cache_key = crate::keys::active_block(ino, b as u64).to_string();
+        self.active_block_buffers.remove(&cache_key);
+        self.router.cache.nvme.remove_active_block(&cache_key);
+        let file_path = crate::keys::inode_path(ino);
+        self.router.cache.write_lru.remove(&file_path);
+        self.router.cache.read_lru.remove(&file_path);
         Ok(())
     }
 
@@ -1554,20 +1722,54 @@ impl SqueezefsFilesystem {
         }
     }
 
+    /// `(ino, block)` of an `active_block:inode_{ino}:block_{b}` key.
+    fn parse_active_block_key(key: &str) -> Option<(u64, u32)> {
+        let rest = key.strip_prefix("active_block:inode_")?;
+        let (ino_str, block_str) = rest.split_once(":block_")?;
+        Some((ino_str.parse().ok()?, block_str.parse().ok()?))
+    }
+
     fn insert_active_block_buffer(
         &self,
         cache_key: String,
         block_data: crate::cache::active_block::ActiveBlockBuf,
         fencing_token: u64,
     ) {
-        while self.active_block_buffers.len() >= MAX_ACTIVE_BLOCK_BUFFERS {
-            // Spill an arbitrary partial buffer to local NVMe staging to free RAM.
-            let Some(entry) = self.active_block_buffers.iter().next() else {
+        'spill: while self.active_block_buffers.len() >= MAX_ACTIVE_BLOCK_BUFFERS {
+            // Spill a partial buffer to local NVMe staging to free RAM —
+            // under the victim's block lock via try_lock, MANDATORY (§5.3):
+            // the caller already holds the lock of the block being inserted,
+            // and two stripe keys can collide on one shard, so a blocking
+            // acquire here can self-deadlock. On contention pick a different
+            // victim or stop — the cap is soft; keeping one extra buffer
+            // beats deadlock. Candidate keys are snapshotted first so the
+            // map is never mutated under a live iterator guard.
+            let candidates: Vec<String> = self
+                .active_block_buffers
+                .iter()
+                .take(16)
+                .map(|r| r.key().clone())
+                .collect();
+            if candidates.is_empty() {
                 break;
-            };
-            let spill_key = entry.key().clone();
-            drop(entry);
-            if let Some((_, data)) = self.active_block_buffers.remove(&spill_key) {
+            }
+            let mut spilled = false;
+            for spill_key in candidates {
+                let Some((v_ino, v_b)) = Self::parse_active_block_key(&spill_key) else {
+                    continue;
+                };
+                let victim_lock = BLOCK_FLUSH_LOCKS.get_lock(v_ino, v_b);
+                let Ok(_victim_guard) = victim_lock.try_lock() else {
+                    // Contended (possibly by this very caller's shard): a
+                    // writer/flusher owns this block right now — skip it.
+                    continue;
+                };
+                let Some((_, mut data)) = self.active_block_buffers.remove(&spill_key) else {
+                    continue; // checked out by a racing writer meanwhile
+                };
+                // Zero-complete Fresh victims under their lock: recycled
+                // pool bytes must never reach staging (§5.3 exit 2).
+                data.zero_complete();
                 if !self.router.cache.nvme.put_active_block(
                     &spill_key,
                     data.as_slice(),
@@ -1577,9 +1779,13 @@ impl SqueezefsFilesystem {
                     // buffer in RAM — exceeding the soft cap beats losing
                     // dirty data. fsync drains it durably.
                     self.active_block_buffers.insert(spill_key, data);
-                    break;
+                    break 'spill;
                 }
-            } else {
+                spilled = true;
+                break;
+            }
+            if !spilled {
+                // Every candidate was contended or vanished: soft cap.
                 break;
             }
         }
@@ -1595,72 +1801,73 @@ impl SqueezefsFilesystem {
             .collect();
 
         for key in keys_to_flush {
-            if let Some((_, block_data)) = self.active_block_buffers.remove(&key) {
-                let parts: Vec<&str> = key.split(":block_").collect();
-                if parts.len() == 2 {
-                    let ino_parts: Vec<&str> = parts[0].split("inode_").collect();
-                    if ino_parts.len() == 2 {
-                        if let (Ok(ino), Ok(b)) =
-                            (ino_parts[1].parse::<u64>(), parts[1].parse::<u32>())
-                        {
-                            let fencing_token = self.dlm.get_fencing_token_ino(ino);
+            let Some((ino, b)) = Self::parse_active_block_key(&key) else {
+                continue;
+            };
+            // Stage/upload exit under the victim's block lock (§5.3 exit 2;
+            // normal await — teardown holds no other block locks):
+            // zero-complete Fresh buffers before they leave RAM.
+            let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
+            let block_guard = block_lock.lock().await;
+            let Some((_, mut block_data)) = self.active_block_buffers.remove(&key) else {
+                drop(block_guard);
+                continue;
+            };
+            block_data.zero_complete();
+            let fencing_token = self.dlm.get_fencing_token_ino(ino);
 
-                            let nvme_clone = self.router.cache.nvme.clone();
-                            let key_clone = key.clone();
-                            let staging_copy = block_data.snapshot();
-                            let admitted = match tokio::task::spawn_blocking(move || {
-                                nvme_clone.put_active_block(
-                                    &key_clone,
-                                    &staging_copy,
-                                    fencing_token,
-                                )
-                            })
-                            .await
-                            {
-                                Ok(admitted) => admitted,
-                                Err(e) => {
-                                    error!("Failed to write active block to NVMe staging during dismount: {:?}", e);
-                                    continue;
-                                }
-                            };
-
-                            if !admitted {
-                                // Staging refused (never-lossy backpressure):
-                                // dismount must not strand dirty RAM — upload
-                                // the block durably right now.
-                                if let Err(e) = upload_active_block_bytes(
-                                    ino,
-                                    b,
-                                    block_data.snapshot(),
-                                    fencing_token,
-                                    &self.router,
-                                    &self.active_inode_locks,
-                                )
-                                .await
-                                {
-                                    error!(
-                                        "Dismount durable upload failed for ino {} block {}: {:?}",
-                                        ino, b, e
-                                    );
-                                }
-                                continue;
-                            }
-
-                            let req = WritebackRequest {
-                                ino,
-                                block_idx: b,
-                                fencing_token,
-                                attempts: 0,
-                            };
-                            if let Err(e) = self.enqueue_writeback(req).await {
-                                error!(
-                                    "Failed to enqueue writeback during dismount for ino {}: {:?}",
-                                    ino, e
-                                );
-                            }
-                        }
-                    }
+            let nvme_clone = self.router.cache.nvme.clone();
+            let key_clone = key.clone();
+            let staging_copy = block_data.snapshot();
+            let admitted = match tokio::task::spawn_blocking(move || {
+                nvme_clone.put_active_block(&key_clone, &staging_copy, fencing_token)
+            })
+            .await
+            {
+                Ok(admitted) => admitted,
+                Err(e) => {
+                    error!(
+                        "Failed to write active block to NVMe staging during dismount: {:?}",
+                        e
+                    );
+                    continue;
                 }
+            };
+
+            if !admitted {
+                // Staging refused (never-lossy backpressure): dismount must
+                // not strand dirty RAM — upload the block durably right now
+                // (the escalation merges via the shared primitive, legal
+                // under the block guard per the P1-9 extended order).
+                if let Err(e) = upload_active_block_bytes(
+                    ino,
+                    b,
+                    block_data.snapshot(),
+                    fencing_token,
+                    &self.router,
+                )
+                .await
+                {
+                    error!(
+                        "Dismount durable upload failed for ino {} block {}: {:?}",
+                        ino, b, e
+                    );
+                }
+                continue;
+            }
+            drop(block_guard);
+
+            let req = WritebackRequest {
+                ino,
+                block_idx: b,
+                fencing_token,
+                attempts: 0,
+            };
+            if let Err(e) = self.enqueue_writeback(req).await {
+                error!(
+                    "Failed to enqueue writeback during dismount for ino {}: {:?}",
+                    ino, e
+                );
             }
         }
         info!("FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.");
@@ -1727,10 +1934,8 @@ impl SqueezefsFilesystem {
                     .fetch_metadata_from_backend(ino)
                     .await?
                     .unwrap_or_default();
-                let file_type = meta.file_type.clone();
-                let is_striped = file_type == "striped";
+                let is_striped = meta.file_type == "striped";
                 let fencing_token = dlm_clone.get_fencing_token_ino(ino);
-                let old_key = meta.block_map.as_ref().and_then(|bm| bm.get(&b).cloned());
 
                 flush_single_active_block(
                     ino,
@@ -1740,8 +1945,6 @@ impl SqueezefsFilesystem {
                     &dlm_clone,
                     &locks_clone,
                     is_striped,
-                    "",
-                    old_key,
                     false,
                 )
                 .await?;
@@ -2608,13 +2811,36 @@ impl Filesystem for SqueezefsFilesystem {
                 if let Some(buf) = self.active_block_buffers.get(&cache_key) {
                     let block_start = start_block * block_size;
                     let rel_offset = (offset - block_start) as usize;
+                    let rel_end = rel_offset + read_len;
                     // Zero-copy CoW-stable snapshot: immutable for the
                     // reply's whole lifetime — a later write to this block
                     // copies instead of mutating these bytes (P0 fix).
-                    let data = buf
-                        .value()
-                        .snapshot()
-                        .slice(rel_offset..rel_offset + read_len);
+                    // Coverage-aware (§5.3): snapshot + covered interval are
+                    // read from the same entry, so the pair is consistent;
+                    // memset elision means the uncovered range of a Fresh
+                    // buffer holds recycled pool bytes that must NEVER be
+                    // served through the kernel.
+                    let (snapshot, covered) = buf.value().covered_snapshot();
+                    let data = if covered.0 as usize <= rel_offset && rel_end <= covered.1 as usize
+                    {
+                        // Common case (every Seeded/content-valid entry and
+                        // every sequential read): zero-copy slice.
+                        snapshot.slice(rel_offset..rel_end)
+                    } else {
+                        // Rare sparse read overlapping uncovered bytes:
+                        // build the reply in a fresh buffer — zeros plus
+                        // covered ∩ range — WITHOUT mutating the shared
+                        // buffer (zeroing in place here would be a mutation
+                        // outside BLOCK_FLUSH_LOCKS).
+                        let mut out = vec![0u8; read_len];
+                        let is = (covered.0 as usize).max(rel_offset);
+                        let ie = (covered.1 as usize).min(rel_end);
+                        if is < ie {
+                            out[is - rel_offset..ie - rel_offset]
+                                .copy_from_slice(&snapshot[is..ie]);
+                        }
+                        bytes::Bytes::from(out)
+                    };
                     return Ok(ReplyData {
                         data,
                         backing: None,
@@ -4317,15 +4543,35 @@ impl Filesystem for SqueezefsFilesystem {
                     .await
                     .map_err(map_squeezefs_err)?;
 
-                // Update layout size
+                // Update layout size. Striped files go through the §5.3
+                // degenerate size-only merge: the old whole-meta save of a
+                // stale snapshot under NO lock could rewrite the block map
+                // "without mutating it", dropping mappings a concurrent
+                // write-through just published. Inline/staged files keep
+                // the whole-meta save — their RAM meta (dirty inline
+                // payload / staged identity) is the truth a backend re-read
+                // cannot carry, and they have no striped map to lose.
                 let file_path = crate::keys::inode_path(ino);
                 if let Ok(mut meta) = self.router.fetch_metadata(&file_path).await {
-                    meta.size = target_size;
                     let fencing_token = self.dlm.get_fencing_token_ino(ino);
-                    let _ = self
-                        .router
-                        .save_metadata_to_backend(ino, &meta, fencing_token)
-                        .await;
+                    if meta.file_type == "striped" {
+                        let _ = self
+                            .router
+                            .merge_block_mappings(
+                                ino,
+                                crate::routing::BlockMapOp::Merge(&[]),
+                                target_size,
+                                crate::routing::LayoutFlip::KeepLayout,
+                                fencing_token,
+                            )
+                            .await;
+                    } else {
+                        meta.size = target_size;
+                        let _ = self
+                            .router
+                            .save_metadata_to_backend(ino, &meta, fencing_token)
+                            .await;
+                    }
                 }
 
                 // Update cache
@@ -5294,15 +5540,6 @@ async fn run_constant_writeback_worker(
             };
 
             let is_striped = meta.file_type == "striped";
-            let mut block_map_id = meta.block_map_id.clone().unwrap_or_default();
-            if block_map_id.is_empty() {
-                block_map_id = format!("block_map_{}", req.ino);
-            }
-
-            let mut old_key = None;
-            if let Some(ref bm) = meta.block_map {
-                old_key = bm.get(&req.block_idx).cloned();
-            }
 
             match flush_single_active_block(
                 req.ino,
@@ -5312,8 +5549,6 @@ async fn run_constant_writeback_worker(
                 &dlm_clone,
                 &locks_clone,
                 is_striped,
-                &block_map_id,
-                old_key,
                 false,
             )
             .await
@@ -5377,9 +5612,8 @@ async fn upload_single_active_block_data(
     ino: u64,
     b: u32,
     router: &DataRouter,
-    old_block_key: Option<String>,
     cache_promotion_copy: bool,
-) -> Result<(u32, u64, Option<String>), SqueezefsError> {
+) -> Result<(u32, u64), SqueezefsError> {
     let cache_key = crate::keys::active_block(ino, b as u64).to_string();
 
     let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
@@ -5427,12 +5661,12 @@ async fn upload_single_active_block_data(
 
     // Post-DMA, post-publish, pre-merge — the same put point as the routing
     // striped path (`routing.rs` per-block task): the key stays unreferenced
-    // until the block-map save below publishes it.
+    // until the block-map merge below publishes it.
     if let Some(copy) = lru_copy {
         router.cache.read_lru.put(&offset.to_string(), copy);
     }
 
-    Ok((b, offset, old_block_key))
+    Ok((b, offset))
 }
 
 async fn flush_due_active_blocks_for_inode(
@@ -5449,35 +5683,18 @@ async fn flush_due_active_blocks_for_inode(
     let meta = router.fetch_metadata(&file_path).await?;
 
     let is_striped = meta.file_type == "striped";
-    let block_map = meta.block_map.clone().unwrap_or_default();
-    let old_block_keys: Vec<Option<String>> = block_indices
-        .iter()
-        .map(|&b| block_map.get(&b).cloned())
-        .collect();
-
     let router_clone = router.clone();
-    let old_block_keys_clone = old_block_keys.clone();
     // Promotion LRU seeding happens inside the per-block future with a
     // detached copy (§5.5): the batch results carry keys/sizes only, never
     // guard-backed bytes.
     let cache_promotion_copy = !is_striped;
 
-    let mut flushes = stream::iter(block_indices.into_iter().enumerate().map(
-        move |(idx, block_idx)| {
-            let router = router_clone.clone();
-            let old_key = old_block_keys_clone[idx].clone();
-            async move {
-                upload_single_active_block_data(
-                    ino,
-                    block_idx,
-                    &router,
-                    old_key,
-                    cache_promotion_copy,
-                )
-                .await
-            }
-        },
-    ))
+    let mut flushes = stream::iter(block_indices.into_iter().map(move |block_idx| {
+        let router = router_clone.clone();
+        async move {
+            upload_single_active_block_data(ino, block_idx, &router, cache_promotion_copy).await
+        }
+    }))
     .buffer_unordered(8);
 
     let mut results = Vec::new();
@@ -5493,37 +5710,33 @@ async fn flush_due_active_blocks_for_inode(
         return Ok(());
     }
 
-    // Acquire exclusive write lock to serialize metadata RMW cycle once!
+    // fsync-vs-write serialization (lock order position 1, left as-is); the
+    // map RMW itself goes through the shared merge primitive below.
     let write_lock = active_inode_locks.get_inode_lock(ino);
     let _write_guard = write_lock.write().await;
 
-    let mut meta = router
-        .fetch_metadata_from_backend(ino)
-        .await?
-        .unwrap_or_default();
-    if let Some(cached) = router.metadata_cache.get(&file_path) {
-        if cached.size > meta.size {
-            meta.size = cached.size;
-        }
-    }
-    let mut block_map = meta.block_map.clone().unwrap_or_default();
-
-    for &(b, offset, _) in &results {
-        block_map.insert(b, offset.to_string());
-    }
-    meta.block_map = Some(block_map);
-    meta.file_type = "striped".to_string();
-
-    router
-        .save_metadata_to_backend(ino, &meta, fencing_token)
+    // One merge for the whole batch via the §5.3 primitive: current-map
+    // RMW under INODE_META_LOCKS, freeing only the displaced-from-current
+    // keys it returns (the old start-of-call snapshot frees could free a
+    // block a concurrent writer just published).
+    let entries: Vec<(u32, String)> = results
+        .iter()
+        .map(|&(b, offset)| (b, offset.to_string()))
+        .collect();
+    let displaced = router
+        .merge_block_mappings(
+            ino,
+            crate::routing::BlockMapOp::Merge(&entries),
+            0,
+            crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
+            fencing_token,
+        )
         .await?;
+    for bk in displaced {
+        let _ = router.backend_router.free_block(&bk).await;
+    }
 
-    for &(b, _, ref old_key) in &results {
-        if let Some(ref bk) = old_key {
-            router.cache.read_lru.remove(bk);
-            let _ = router.backend_router.free_block(bk).await;
-        }
-
+    for &(b, _) in &results {
         let cache_key = crate::keys::active_block(ino, b as u64).to_string();
         let current_token = router.cache.nvme.get_staged_fencing_token(&cache_key);
         if let Some(tok) = current_token {
@@ -5542,13 +5755,20 @@ async fn flush_due_active_blocks_for_inode(
 /// (never-lossy backpressure): upload the RAM copy straight to a backend
 /// block and commit it into the inode's block map. Loud and slower than
 /// staging, but the data is durable the moment this returns.
+///
+/// The map RMW goes through the §5.3 merge primitive (INODE_META_LOCKS) —
+/// the old `active_inode_locks` write-guard merge was the second
+/// serialization discipline whose coexistence with write-through would
+/// have opened a lost-update window exactly under the staging-refusal
+/// backpressure regime in which both fire concurrently. Callers may hold
+/// the victim's `BLOCK_FLUSH_LOCKS` (P1-9 extended order: block locks →
+/// INODE_META_LOCKS).
 async fn upload_active_block_bytes(
     ino: u64,
     b: u32,
     block_bytes: bytes::Bytes,
     fencing_token: u64,
     router: &DataRouter,
-    active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
 ) -> Result<(), SqueezefsError> {
     let processed_block = router
         .get_crypto()
@@ -5563,30 +5783,18 @@ async fn upload_active_block_bytes(
     block_allocator.publish_block(offset);
     let stored_block_key = offset.to_string();
 
-    let _write_guard = active_inode_locks.get_inode_lock(ino).write().await;
-    let file_path = crate::keys::inode_path(ino);
-    let mut meta = router
-        .fetch_metadata_from_backend(ino)
-        .await?
-        .unwrap_or_default();
-    if let Some(cached) = router.metadata_cache.get(&file_path) {
-        if cached.size > meta.size {
-            meta.size = cached.size;
-        }
-    }
-    let mut block_map = meta.block_map.clone().unwrap_or_default();
-    let old_key = block_map.insert(b, stored_block_key.clone());
-    meta.block_map = Some(block_map);
-    meta.file_type = "striped".to_string();
-    router
-        .save_metadata_to_backend(ino, &meta, fencing_token)
+    let entries = [(b, stored_block_key)];
+    let displaced = router
+        .merge_block_mappings(
+            ino,
+            crate::routing::BlockMapOp::Merge(&entries),
+            0,
+            crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
+            fencing_token,
+        )
         .await?;
-    if let Some(bk) = old_key {
-        if bk != stored_block_key {
-            router.cache.read_lru.remove(&bk);
-            router.cache.nvme.remove_cached_read_block(&bk);
-            let _ = router.backend_router.free_block(&bk).await;
-        }
+    for bk in displaced {
+        let _ = router.backend_router.free_block(&bk).await;
     }
     Ok(())
 }
@@ -5599,8 +5807,6 @@ async fn flush_single_active_block(
     _dlm: &DlmClient,
     active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
     is_striped: bool,
-    _block_map_id: &str,
-    old_block_key: Option<String>,
     locked: bool,
 ) -> Result<(), SqueezefsError> {
     let cache_key = crate::keys::active_block(ino, b as u64).to_string();
@@ -5660,30 +5866,28 @@ async fn flush_single_active_block(
     std::mem::drop(block_guard);
     std::mem::drop(_inode_guard);
 
-    // Acquire exclusive write lock to serialize metadata RMW cycle
+    // fsync-vs-write serialization (lock order position 1, left as-is); the
+    // map RMW itself goes through the shared merge primitive below.
     let write_lock = active_inode_locks.get_inode_lock(ino);
     let mut _write_guard = None;
     if !locked {
         _write_guard = Some(write_lock.write().await);
     }
 
-    let file_path = crate::keys::inode_path(ino);
-    // Update metadata offline in block_map
-    let mut meta = router
-        .fetch_metadata_from_backend(ino)
-        .await?
-        .unwrap_or_default();
-    if let Some(cached) = router.metadata_cache.get(&file_path) {
-        if cached.size > meta.size {
-            meta.size = cached.size;
-        }
-    }
-    let mut block_map = meta.block_map.clone().unwrap_or_default();
-    block_map.insert(b, stored_block_key.clone());
-    meta.block_map = Some(block_map);
-    meta.file_type = "striped".to_string();
-    router
-        .save_metadata_to_backend(ino, &meta, fencing_token)
+    // §5.3 one merge discipline: current-map RMW under INODE_META_LOCKS.
+    // Free only the displaced-from-current keys the primitive returns —
+    // the old start-of-call `old_block_key` free was exactly the
+    // stale-snapshot anti-pattern the routing merge comment forbids
+    // (freeing it could free a block a concurrent writer just published).
+    let entries = [(b, stored_block_key.clone())];
+    let displaced = router
+        .merge_block_mappings(
+            ino,
+            crate::routing::BlockMapOp::Merge(&entries),
+            0,
+            crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
+            fencing_token,
+        )
         .await?;
 
     // Cache in RAM (bypass entirely if file is striped layout). Promotion
@@ -5692,8 +5896,7 @@ async fn flush_single_active_block(
         router.cache.read_lru.put(&stored_block_key, copy);
     }
 
-    if let Some(bk) = old_block_key {
-        router.cache.read_lru.remove(&bk);
+    for bk in displaced {
         let _ = router.backend_router.free_block(&bk).await;
     }
 

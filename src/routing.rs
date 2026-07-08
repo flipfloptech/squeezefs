@@ -86,6 +86,53 @@ impl Default for CachedMetadata {
     }
 }
 
+/// The mutation shapes of [`DataRouter::merge_block_mappings`] (§5.3 "One
+/// merge discipline") — inserts, removals, AND size-only snapshot-saves —
+/// so truncate/fallocate share the serialization domain instead of racing
+/// it.
+pub enum BlockMapOp<'a> {
+    /// Insert/overwrite entries: write-through, flush paths, defrag
+    /// `BlockMove`, routing striped merge. `(block_idx, new_block_key)`
+    /// pairs.
+    ///
+    /// `Merge(&[])` is the DEGENERATE, size-only case: no entries change,
+    /// but the primitive still re-reads the CURRENT meta under
+    /// `INODE_META_LOCKS` and saves size/map from that — which is exactly
+    /// what makes the stale-snapshot whole-meta saves (truncate-grow,
+    /// fallocate-extend) safe: they can no longer rewrite the block map
+    /// "without mutating it".
+    Merge(&'a [(u32, String)]),
+    /// Remove every block whose start offset ≥ `new_size`
+    /// (truncate-shrink): the old `retain`-and-save re-expressed as a
+    /// removal set on the same primitive; removed keys come back as the
+    /// free list.
+    TruncateFrom { new_size: u64 },
+}
+
+/// Layout-field policy for [`DataRouter::merge_block_mappings`] — an
+/// EXPLICIT parameter, because the converted writers disagree today and a
+/// silent "extracted-body default" would change the flush paths'
+/// side-effects.
+pub enum LayoutFlip {
+    /// Flush-path merges (`flush_single_active_block`, `flush_due_…`,
+    /// `upload_active_block_bytes`, write-through): force
+    /// `file_type = "striped"` but PRESERVE `file_id` / `data_key` —
+    /// today's exact field writes. Behavior-preserving by construction.
+    ToStripedKeepStagedIdentity,
+    /// Layout transitions (routing striped merge): `file_type = "striped"`
+    /// AND clear `file_id` / `data_key`. Staged-identity release
+    /// bookkeeping (`release_superseded_staged` — ring-entry/budget
+    /// release) stays with the CALLER: the primitive never releases staged
+    /// identity itself, so a clear is never paired with zero or two
+    /// releases.
+    ToStripedClearStagedIdentity,
+    /// Truncate / fallocate / defrag mutations: leave `file_type`,
+    /// `file_id`, `data_key` untouched (truncate's inline/staged handling
+    /// stays in its caller — the primitive only owns the striped map +
+    /// size).
+    KeepLayout,
+}
+
 pub struct StorageBackend {
     pub device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
@@ -1273,6 +1320,107 @@ impl DataRouter {
         }
     }
 
+    /// The ONLY way to mutate a striped block map (zero-copy write-path
+    /// design §5.3 "One merge discipline"). Serializes under
+    /// `INODE_META_LOCKS.get_inode_lock(ino)`; fetches the CURRENT meta
+    /// (authoritative backend, falling back to the freshest RAM entry and
+    /// finally a default for never-persisted layouts); applies `op`; bumps
+    /// size to at least `min_size` (or truncates to `new_size` exactly for
+    /// [`BlockMapOp::TruncateFrom`]); applies `layout_flip`; saves with
+    /// fencing revalidation (which also republishes the RAM cache entry
+    /// coherently); returns the keys actually displaced/removed from the
+    /// current map — the caller frees them AFTER this returns (never a
+    /// start-of-call snapshot key) — having already purged them from every
+    /// RAM/NVMe read tier.
+    ///
+    /// Lock order: callers may hold `active_inode_locks` (1) and/or
+    /// `BLOCK_FLUSH_LOCKS` (3); this primitive MUST NOT acquire either —
+    /// `INODE_META_LOCKS` sits strictly after them (P1-9 extended order,
+    /// see `stripe_locks.rs`). NOTE: never call `fetch_metadata` from under
+    /// this lock — it retakes it on refill and self-deadlocks.
+    pub async fn merge_block_mappings(
+        &self,
+        ino: u64,
+        op: BlockMapOp<'_>,
+        min_size: u64,
+        layout_flip: LayoutFlip,
+        fencing_token: u64,
+    ) -> Result<Vec<String>> {
+        let file_path = crate::keys::inode_path(ino);
+        let _map_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+
+        let mut current = match self.fetch_metadata_from_backend(ino).await? {
+            Some(m) => m,
+            // Never-persisted layout: the freshest RAM entry (post-write
+            // truth for dirty layouts) beats an empty default.
+            None => self.metadata_cache.get(&file_path).unwrap_or_default(),
+        };
+
+        let mut block_map = current.block_map.take().unwrap_or_default();
+        let mut displaced: Vec<String> = Vec::new();
+        let purge = |bk: &str| {
+            // Purge every cache tier for a displaced/removed key: its offset
+            // will be reallocated under the SAME key string once freed, and
+            // a stale tier hit would serve the dead incarnation's bytes.
+            self.cache.read_lru.remove(bk);
+            self.cache.nvme.remove_cached_read_block(bk);
+        };
+        match op {
+            BlockMapOp::Merge(entries) => {
+                for (b, new_key) in entries {
+                    if let Some(prev) = block_map.insert(*b, new_key.clone()) {
+                        if prev != *new_key {
+                            purge(&prev);
+                            displaced.push(prev);
+                        }
+                    }
+                }
+                // Size floor: never below the caller's bound nor the freshest
+                // RAM size (writes publish size to the RAM cache ahead of the
+                // deferred layout commit — a merge must not regress it).
+                current.size = std::cmp::max(current.size, min_size);
+                if let Some(cached) = self.metadata_cache.get(&file_path) {
+                    if cached.size > current.size {
+                        current.size = cached.size;
+                    }
+                }
+            }
+            BlockMapOp::TruncateFrom { new_size } => {
+                let block_size = self.block_size.load(Ordering::Relaxed);
+                block_map.retain(|&b, bk| {
+                    if (b as u64) * block_size >= new_size {
+                        purge(bk);
+                        displaced.push(bk.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                current.size = new_size;
+            }
+        }
+        current.block_map = Some(block_map);
+
+        match layout_flip {
+            LayoutFlip::ToStripedKeepStagedIdentity => {
+                current.file_type = "striped".to_string();
+            }
+            LayoutFlip::ToStripedClearStagedIdentity => {
+                current.file_type = "striped".to_string();
+                current.file_id = None;
+                current.data_key = None;
+            }
+            LayoutFlip::KeepLayout => {}
+        }
+
+        // Fencing revalidation happens inside; the save also republishes the
+        // RAM metadata_cache entry, keeping RAM + backend coherent under the
+        // same guard.
+        self.save_metadata_to_backend(ino, &current, fencing_token)
+            .await?;
+        Ok(displaced)
+    }
+
     pub async fn update_metadata_cache_size(&self, file_path: &str, size: u64) {
         if let Some(mut entry) = self.metadata_cache.get(file_path) {
             if size > entry.size {
@@ -1799,21 +1947,30 @@ impl DataRouter {
                 }
             }
 
-            let mut updated_meta = meta.clone();
-            updated_meta.file_type = "striped".to_string();
-            updated_meta.size = new_size as u64;
-            updated_meta.block_map = Some(block_map);
-            self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
-                .await?;
+            {
+                // First-time striped commit under INODE_META_LOCKS, for
+                // uniformity with its transition siblings above (§5.3
+                // census): without the guard, two concurrent first-writers
+                // on a brand-new file could interleave their create-time
+                // saves (the conditional block-0 guard at the top of
+                // `write_file` does not cover a default/empty `file_type`).
+                let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+                let mut updated_meta = meta.clone();
+                updated_meta.file_type = "striped".to_string();
+                updated_meta.size = new_size as u64;
+                updated_meta.block_map = Some(block_map);
+                self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
+                    .await?;
 
-            self.cache.write_lru.remove(file_path);
-            self.cache.read_lru.remove(file_path);
+                self.cache.write_lru.remove(file_path);
+                self.cache.read_lru.remove(file_path);
 
+                self.metadata_cache
+                    .insert(file_path.to_string(), updated_meta);
+            }
             crate::fuse_client::METRICS
                 .layout_striped_writes
                 .fetch_add(1, Ordering::Relaxed);
-            self.metadata_cache
-                .insert(file_path.to_string(), updated_meta);
         }
 
         Ok(())
@@ -2064,9 +2221,7 @@ impl DataRouter {
 
                 let block_bytes = block_data.into_bytes();
 
-                let logical_size = block_bytes.len();
                 let processed_block = crypto.process_write_async(block_bytes.clone()).await?;
-                let physical_size = processed_block.len();
                 nvme_writer.write_block(offset, processed_block).await?;
 
                 // Cache + publish only after the device write: a racing
@@ -2076,13 +2231,7 @@ impl DataRouter {
                 read_lru.put(&stored_new_block_key, block_bytes);
                 block_allocator.publish_block(offset);
 
-                Ok::<_, SqueezefsError>((
-                    b,
-                    old_block_key,
-                    stored_new_block_key,
-                    logical_size,
-                    physical_size,
-                ))
+                Ok::<_, SqueezefsError>((b, stored_new_block_key))
             }));
         }
 
@@ -2105,61 +2254,30 @@ impl DataRouter {
             }
         }
         if let Some(e) = first_err {
-            for (_b, _old, new_key, _logical, _physical) in &results {
+            for (_b, new_key) in &results {
                 let _ = self.backend_router.free_block(new_key).await;
             }
             return Err(e);
         }
 
-        // Atomic per-inode layout merge (see INODE_META_LOCKS). The block data
-        // I/O above ran concurrently (COW to fresh keys); only this short
-        // read→merge→save is serialized. Merge into the *current* map read from
-        // the authoritative backend under the lock — never into our
-        // start-of-call snapshot, which drops concurrent writers' entries and
-        // reverts blocks to freed keys (whose physical blocks the allocator
-        // then reuses: the block reads as zeros or as another block's data).
-        // NOTE: never call `fetch_metadata` here — it takes this same lock on
-        // refill and would self-deadlock.
-        let _map_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
-
-        let current = match self.fetch_metadata_from_backend(ino).await? {
-            Some(m) => m,
-            None => meta.clone(),
-        };
-        let mut updated_block_map = current.block_map.clone().unwrap_or_default();
-        let mut displaced_keys = Vec::new();
-        for res in &results {
-            let (b, _old_snapshot_key, new_block_key) = (res.0, res.1.clone(), res.2.clone());
-            // COW: point block `b` at the freshly written key. Free only the key
-            // this merge actually displaces from the *current* map (never the
-            // possibly-stale snapshot key — freeing that could free a block a
-            // concurrent writer just published).
-            if let Some(prev) = updated_block_map.insert(b, new_block_key.clone()) {
-                if prev != new_block_key {
-                    // Purge every cache tier for the displaced key: its offset
-                    // will be reallocated under the SAME key string, and a stale
-                    // tier hit would serve this dead incarnation's bytes.
-                    self.cache.read_lru.remove(&prev);
-                    self.cache.nvme.remove_cached_read_block(&prev);
-                    displaced_keys.push(prev);
-                }
-            }
-        }
-
-        let new_size = std::cmp::max(current.size, end_pos);
-        let mut updated_meta = current.clone();
-        updated_meta.file_type = "striped".to_string();
-        updated_meta.file_id = None;
-        updated_meta.data_key = None;
-        updated_meta.size = new_size;
-        updated_meta.block_map = Some(updated_block_map);
-        self.save_metadata_to_backend(ino, &updated_meta, _fencing_token)
+        // Atomic per-inode layout merge through the shared primitive (§5.3
+        // one merge discipline): read→merge→save serialized under
+        // INODE_META_LOCKS against every other striped-map writer, merging
+        // into the *current* map — never into our start-of-call snapshot,
+        // which would drop concurrent writers' entries and revert blocks to
+        // freed keys. The block data I/O above ran concurrently (COW to
+        // fresh keys); displaced-from-current keys are freed only after the
+        // new map is published (durable + cached), so no reader can resolve
+        // a block to a key we are freeing.
+        let displaced_keys = self
+            .merge_block_mappings(
+                ino,
+                BlockMapOp::Merge(&results),
+                end_pos,
+                LayoutFlip::ToStripedClearStagedIdentity,
+                _fencing_token,
+            )
             .await?;
-        self.metadata_cache
-            .insert(file_path.to_string(), updated_meta);
-
-        // Free displaced keys only after the new map is published (durable +
-        // cached), so no reader can resolve a block to a key we are freeing.
         for bk in displaced_keys {
             let _ = self.backend_router.free_block(&bk).await;
         }
@@ -3045,6 +3163,61 @@ impl DataRouter {
         let file_path = crate::keys::inode_path(ino);
         let mut meta = self.fetch_metadata(&file_path).await?;
         let old_size = meta.size;
+
+        // Striped files: every save that carries an existing striped block
+        // map goes through the merge primitive (§5.3 one merge discipline).
+        // Both legs were stale-snapshot saves racing the data-path merges:
+        // grow rewrote the whole map "without mutating it" (a live
+        // lost-update once write-through publishes continuously), shrink's
+        // retain-and-save was serialized only by setattr's inode write lock.
+        // Inline/staged files keep the whole-meta save below — their RAM
+        // meta (dirty inline payload / staged identity) is the truth a
+        // backend re-read cannot carry, and they have no striped map to
+        // lose.
+        if meta.file_type == "striped" {
+            if new_size >= old_size {
+                // Growing: degenerate size-only merge — the CURRENT map is
+                // re-read and saved under INODE_META_LOCKS.
+                self.merge_block_mappings(
+                    ino,
+                    BlockMapOp::Merge(&[]),
+                    new_size,
+                    LayoutFlip::KeepLayout,
+                    fencing_token,
+                )
+                .await?;
+                return Ok(());
+            }
+            // Shrinking: removal-RMW on the same primitive; removed keys
+            // come back as the free list (post-publish free discipline).
+            let removed = self
+                .merge_block_mappings(
+                    ino,
+                    BlockMapOp::TruncateFrom { new_size },
+                    new_size,
+                    LayoutFlip::KeepLayout,
+                    fencing_token,
+                )
+                .await?;
+            let blocks_to_free: Vec<String> = removed
+                .iter()
+                .map(|bk| {
+                    if let Some(pos) = bk.find("://") {
+                        let proto = &bk[..pos];
+                        let rest = &bk[pos + 3..];
+                        let offset = rest.split(':').next().unwrap_or(rest);
+                        format!("{}://{}", proto, offset)
+                    } else {
+                        bk.split(':').next().unwrap_or(bk).to_string()
+                    }
+                })
+                .collect();
+            if !blocks_to_free.is_empty() {
+                let free_refs: Vec<&str> = blocks_to_free.iter().map(|s| s.as_str()).collect();
+                let _ = self.backend_router.free_blocks(&free_refs).await;
+            }
+            return Ok(());
+        }
 
         if new_size >= old_size {
             // Growing the file: update size

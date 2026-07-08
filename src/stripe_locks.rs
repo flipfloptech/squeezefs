@@ -12,12 +12,24 @@
 /// 1. `active_inode_locks` (per-inode `RwLock`, striped) — FUSE op serialization
 /// 2. `lease_locks` (per-inode `Mutex`) — only while acquiring/refreshing a DLM lease
 /// 3. `BLOCK_FLUSH_LOCKS` (per block) — active-block flush mutual exclusion
+/// 3.5. `INODE_META_LOCKS` (routing, per-inode `Mutex`) — the striped
+///    block-map merge domain (`DataRouter::merge_block_mappings`, §5.3 one
+///    merge discipline)
 /// 4. MetaLV metadata-transaction locks, acquired in this sub-order:
 ///    - a. DLM `I{ino}` / `D{parent:name}` (per-object; MetaLV `DlmLockManager`)
 ///    - b. dentry bucket lock (`dentry_bucket_locks`) — in-RAM dentry-chain integrity
 ///    - c. sector locks (`sector_locks`) — commit-time RMW+apply, acquired in
 ///      **ascending sector-offset order** (total order ⇒ deadlock-free) and only
 ///      at commit, never taken while holding a DLM lock across the tx closure
+///
+/// The extended order `active_inode_locks (1) → BLOCK_FLUSH_LOCKS (3) →
+/// INODE_META_LOCKS → meta backend (4)` is established: `write_file_staged`'s
+/// per-block future calls `fetch_metadata` under the block guard, which takes
+/// `INODE_META_LOCKS` on refill, and `upload_full_block` holds the block lock
+/// across `merge_block_mappings`. No existing or new path acquires
+/// `BLOCK_FLUSH_LOCKS` or `active_inode_locks` while holding
+/// `INODE_META_LOCKS` (`merge_block_mappings` is forbidden from doing so by
+/// contract), so the extended order is acyclic.
 ///
 /// Do not hold (1) write-guard across long backend I/O when a finer lock suffices
 /// (see [`crate::fuse_client::InodeWriteLockScope`] / P1-8). Do not acquire (1)

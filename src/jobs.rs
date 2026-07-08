@@ -1,5 +1,4 @@
 use crate::error::{Result, SqueezefsError};
-use crate::meta_backend::Metadata;
 use crate::routing::DataRouter;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -123,7 +122,7 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                 let start = std::time::Instant::now();
                 match task_wrapper.task_type {
                     TaskType::BlockMove {
-                        ino: _,
+                        ino,
                         map_id,
                         idx_str,
                         src_offset,
@@ -133,32 +132,43 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                         if let Ok(data) = router.nvme_writer.read_block(src_offset, len).await {
                             match router.nvme_writer.write_block(dest_offset, data).await {
                                 Ok(_) => {
-                                    if let Some(backend) = router.meta_backend.get() {
-                                        if let Ok(Some(bytes)) = backend
-                                            .getxattr(map_id.parse().unwrap_or(0), "layout")
-                                            .await
+                                    // Layout RMW via the §5.3 merge primitive
+                                    // (INODE_META_LOCKS). The old raw-xattr
+                                    // read-modify-setxattr ran under NO lock,
+                                    // skipped fencing revalidation, and left
+                                    // every RAM/NVMe tier stale — conversion
+                                    // fixes all three. The displaced source
+                                    // mapping is purged from the read tiers
+                                    // by the primitive but deliberately NOT
+                                    // freed here: the move reuses the
+                                    // allocation and the defrag driver owns
+                                    // source-slot reclamation (design open
+                                    // question 6).
+                                    let target_ino: u64 = map_id.parse().unwrap_or(ino);
+                                    let idx: u32 = idx_str.parse().unwrap_or(0);
+                                    let fencing_token =
+                                        router.dlm.get_fencing_token_ino(target_ino);
+                                    let entries = [(idx, dest_offset.to_string())];
+                                    if let Err(e) = router
+                                        .merge_block_mappings(
+                                            target_ino,
+                                            crate::routing::BlockMapOp::Merge(&entries),
+                                            0,
+                                            crate::routing::LayoutFlip::KeepLayout,
+                                            fencing_token,
+                                        )
+                                        .await
+                                    {
+                                        log::error!(
+                                            "Job worker: BlockMove merge failed: {:?}. Pausing job.",
+                                            e
+                                        );
+                                        let mut state = IN_MEMORY_JOBS.lock();
+                                        state.paused_jobs.insert(task_wrapper.job_id.clone());
+                                        if let Some(n) =
+                                            state.job_notifiers.get(&task_wrapper.job_id)
                                         {
-                                            if let Ok(mut layout) = serde_json::from_slice::<
-                                                crate::routing::LayoutMetadata,
-                                            >(
-                                                bytes.as_slice()
-                                            ) {
-                                                if let Some(ref mut bm) = layout.block_map {
-                                                    let idx: u32 = idx_str.parse().unwrap_or(0);
-                                                    bm.insert(idx, dest_offset.to_string());
-                                                    if let Ok(updated_bytes) =
-                                                        serde_json::to_vec(&layout)
-                                                    {
-                                                        let _ = backend
-                                                            .setxattr(
-                                                                map_id.parse().unwrap_or(0),
-                                                                "layout",
-                                                                &updated_bytes,
-                                                            )
-                                                            .await;
-                                                    }
-                                                }
-                                            }
+                                            n.notify_waiters();
                                         }
                                     }
                                 }

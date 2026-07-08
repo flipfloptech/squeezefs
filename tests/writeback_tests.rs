@@ -740,15 +740,20 @@ async fn test_striped_flush_dma_zero_copy_aligned_no_lru_retention() {
     let p0: Vec<u8> = (0..8193u32).map(|i| (i % 199) as u8).collect();
     harness_write(&h, ino, 0, &p0).await;
 
-    // The production staged shape: a non-block-multiple write on a striped
-    // file goes through write_file_staged — block 0 becomes content-complete
-    // (staging put + writeback enqueue), block 1 stays partial in RAM.
+    // The staged shape post-PR 4: content-complete blocks write through and
+    // bypass staging, so the staged flush leg is reached via the never-lossy
+    // fallback — inject one device-write failure so block 0's write-through
+    // degrades into the staging put (+ writeback enqueue); block 1 stays
+    // partial in RAM. (FAIL_NEXT_WRITES fires before any aligned-branch
+    // accounting, so the counter window below stays clean.)
     let p1: Vec<u8> = (0..4097u32).map(|i| ((i % 97) + 60) as u8).collect();
+    squeezefs::nvme_dev::set_fail_next_writes(1);
     harness_write(&h, ino, 0, &p1).await;
+    squeezefs::nvme_dev::clear_fail_next_writes();
     let cache_key0 = squeezefs::keys::active_block(ino, 0).to_string();
     assert!(
         h.fs.router.cache.nvme.read_staged(&cache_key0).is_some(),
-        "premise: block 0 must be staged by the striped write_file_staged path"
+        "premise: block 0 must be staged by the write-through fallback path"
     );
 
     // Flush window under measurement: spill the partial tail to staging,
@@ -941,12 +946,15 @@ async fn test_flush_write_verification_readback_runs_within_guard_hold() {
         .attr
         .ino;
 
-    // Striped file with a staged complete block 0 + partial RAM block 1
-    // (same production shape as the striped-flush test).
+    // Striped file with a staged complete block 0 (via the write-through
+    // fallback, post-PR 4) + partial RAM block 1 (same staged shape as the
+    // striped-flush test).
     let p0: Vec<u8> = (0..8193u32).map(|i| (i % 223) as u8).collect();
     harness_write(&h, ino, 0, &p0).await;
     let p1: Vec<u8> = (0..4097u32).map(|i| ((i % 113) + 5) as u8).collect();
+    squeezefs::nvme_dev::set_fail_next_writes(1);
     harness_write(&h, ino, 0, &p1).await;
+    squeezefs::nvme_dev::clear_fail_next_writes();
 
     // Every flush write from here runs the sampled read-back verify against
     // the caller's (guard-backed) payload.

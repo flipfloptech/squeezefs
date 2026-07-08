@@ -427,15 +427,21 @@ pub fn volume_delete(pool_name: &str, vol_name: &str, force_yes: bool) -> Result
     Ok(())
 }
 
+/// Validate a data backing device path.
+///
+/// Policy: a backing device is any existing, **nonzero-sized** **regular
+/// file** or **block device** (raw NVMe namespace, partition, dm/LVM
+/// volume, loop device). Nothing else — no LVM/VG/NQN interrogation, no
+/// path allow-lists. Non-I/O-capable node types (directories, character
+/// devices, FIFOs, sockets), zero-sized backing, and missing paths are
+/// rejected with specific errors.
 pub fn validate_backing_device(path: &str) -> Result<()> {
     use std::fs;
+    use std::os::unix::fs::FileTypeExt;
     use std::path::Path;
 
     let path_buf = Path::new(path);
     if !path_buf.exists() {
-        if path.starts_with("/dev/shm/") || path.starts_with("/tmp/") {
-            return Ok(());
-        }
         return Err(SqueezefsError::InvalidOperation(format!(
             "Backing device path '{}' does not exist.",
             path
@@ -445,98 +451,52 @@ pub fn validate_backing_device(path: &str) -> Result<()> {
     let real_path = fs::canonicalize(path_buf).map_err(|e| {
         SqueezefsError::InvalidOperation(format!("Failed to resolve path '{}': {}", path, e))
     })?;
-    let real_path_str = real_path.to_string_lossy();
 
-    let is_squeeze_pv = |pv: &str| -> bool {
-        let pv_clean = pv.trim();
-        if pv_clean.starts_with("/dev/loop") {
-            return true;
-        }
-        if pv_clean.starts_with("/dev/nvme") {
-            let parts: Vec<&str> = pv_clean.split('/').collect();
-            if let Some(dev_name) = parts.last() {
-                if dev_name.starts_with("nvme") {
-                    if let Some(end_idx) = dev_name.rfind('n') {
-                        let ctrl = &dev_name[..end_idx];
-                        let nqn_path = format!("/sys/class/nvme/{}/subsysnqn", ctrl);
-                        if let Ok(nqn) = fs::read_to_string(nqn_path) {
-                            return nqn.trim().starts_with("nqn.2026-06.io.squeezefs:");
-                        }
-                    }
-                }
-            }
-        }
-        false
-    };
+    let meta = fs::metadata(&real_path).map_err(|e| {
+        SqueezefsError::InvalidOperation(format!("Failed to stat '{}': {}", path, e))
+    })?;
+    let file_type = meta.file_type();
 
-    if real_path_str.starts_with("/dev/nvme") {
+    if file_type.is_file() {
+        if meta.len() == 0 {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "Backing file '{}' has zero size — create/extend it first (e.g. truncate -s <size>).",
+                path
+            )));
+        }
+        return Ok(());
+    }
+
+    if file_type.is_block_device() {
+        // stat's size is 0 for device nodes; capacity lives in sysfs
+        // (512-byte sectors). An absent sysfs entry is tolerated — the
+        // device open will fail loudly later if the node is truly unusable.
+        let sectors: Option<u64> = real_path.file_name().and_then(|name| {
+            fs::read_to_string(format!("/sys/class/block/{}/size", name.to_string_lossy()))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        });
+        if sectors == Some(0) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "Backing block device '{}' has zero capacity (e.g. an unattached loop device).",
+                path
+            )));
+        }
+        return Ok(());
+    }
+
+    if file_type.is_char_device() {
         return Err(SqueezefsError::InvalidOperation(format!(
-            "Direct writes to raw NVMe device '{}' are not supported. Backing device must be a SqueezeFS LVM Logical Volume.",
+            "Backing device '{}' is a character device, not a block device. For NVMe, pass \
+             the namespace block node (e.g. /dev/nvme0n1), not the controller (e.g. /dev/nvme0).",
             path
         )));
     }
 
-    if real_path_str.starts_with("/dev/loop")
-        || real_path_str.starts_with("/dev/shm/")
-        || real_path_str.starts_with("/tmp/")
-        || real_path_str.starts_with("/home/")
-    {
-        return Ok(());
-    }
-
-    let mut lvs_target = real_path_str.to_string();
-    if real_path_str.starts_with("/dev/dm-") {
-        if let Some(dev_name) = real_path.file_name() {
-            let dm_name_path = format!("/sys/block/{}/dm/name", dev_name.to_string_lossy());
-            if let Ok(name) = fs::read_to_string(dm_name_path) {
-                lvs_target = format!("/dev/mapper/{}", name.trim());
-            }
-        }
-    }
-
-    let output = std::process::Command::new("lvs")
-        .args(["-o", "vg_name", "--noheadings", &lvs_target])
-        .output();
-    if let Ok(out) = output {
-        if out.status.success() {
-            let vg_name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !vg_name.is_empty() {
-                let pvs_output = std::process::Command::new("pvs")
-                    .args([
-                        "-o",
-                        "pv_name",
-                        "-S",
-                        &format!("vg_name={}", vg_name),
-                        "--noheadings",
-                    ])
-                    .output();
-                if let Ok(pvs_out) = pvs_output {
-                    if pvs_out.status.success() {
-                        let pvs_str = String::from_utf8_lossy(&pvs_out.stdout);
-                        let mut pvs_checked = 0;
-                        for pv in pvs_str.lines() {
-                            let pv_trim = pv.trim();
-                            if !pv_trim.is_empty() {
-                                pvs_checked += 1;
-                                if !is_squeeze_pv(pv_trim) {
-                                    return Err(SqueezefsError::InvalidOperation(format!(
-                                        "LVM Volume '{}' is built on Physical Volume '{}' which is not a SqueezeFS disk.",
-                                        path, pv_trim
-                                    )));
-                                }
-                            }
-                        }
-                        if pvs_checked > 0 {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     Err(SqueezefsError::InvalidOperation(format!(
-        "Backing device '{}' is not a valid SqueezeFS LVM Volume or NVMe-oF disk.",
+        "Backing device '{}' is not a block device or regular file.",
         path
     )))
 }

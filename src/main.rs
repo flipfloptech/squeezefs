@@ -1531,6 +1531,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             let _ctrl_c_guard = spawn_ctrl_c_handler("formatting");
 
+            // Type-check every data volume up front so a bogus path (char
+            // device, directory, empty file, missing path) fails with a
+            // precise error instead of a downstream capacity complaint.
+            for path in &data_lvs {
+                squeezefs::storage::validate_backing_device(path)
+                    .map_err(|e| format!("data volume '{}' failed validation: {}", path, e))?;
+            }
+
             let mut physical_total = 0;
             for path in &data_lvs {
                 if let Ok(size) = get_backing_device_size(path) {
@@ -1576,6 +1584,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 upload_delay: Some(upload_delay.clone()),
                 fuse_io_uring_sqpoll_idle_ms,
             };
+
+            // Pre-flight EVERY meta volume before ANY destructive step
+            // (staging-dir wipes, data zeroing, meta wipes): a refused format
+            // must leave all volumes and caches intact.
+            for path in &meta_lvs {
+                let storage =
+                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 128 * 1024 * 1024)
+                        .map_err(|e| format!("Failed to open metadata volume '{}': {}", path, e))?;
+                squeezefs::meta_backend::MetaLvBackend::format_preflight(&storage, force)
+                    .await
+                    .map_err(|e| format!("metadata volume '{}': {}", path, e))?;
+            }
 
             if let Some(ref paths) = disk_cache_paths {
                 for dir in paths {
@@ -1981,8 +2001,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("Error: no data volumes specified or configured".into());
             }
 
+            // Every data volume must be a usable backing device, not just the
+            // first one — a typo'd second volume should fail here, not at
+            // first I/O.
+            for path in &resolved_data_lvs {
+                squeezefs::storage::validate_backing_device(path)?;
+            }
             let first_data_path = &resolved_data_lvs[0];
-            squeezefs::storage::validate_backing_device(first_data_path)?;
 
             let dlm = DlmClient::new("local")?;
 

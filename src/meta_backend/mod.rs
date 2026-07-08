@@ -482,6 +482,70 @@ impl MetaLvBackend {
         Self::format_with_options(storage, true, true, None).await
     }
 
+    /// No-side-effect format gate (also run standalone by the CLI across ALL
+    /// volumes before ANY volume is wiped, so a refused multi-volume format
+    /// leaves everything intact — the only mutation is reaping provably stale
+    /// client registrations).
+    ///
+    /// Policy:
+    /// - blank / foreign volume (no valid superblock): formatting allowed;
+    /// - already-formatted volume: refused without `force` — even idle — so a
+    ///   fat-fingered format cannot silently destroy a filesystem;
+    /// - **live** client registrations (fresh heartbeat) refuse format even
+    ///   WITH `force`: reformatting under an active mount is never safe;
+    /// - stale registrations (heartbeat older than
+    ///   [`crate::fuse_client::CLIENT_STALE_TTL_SECS`], i.e. crashed clients)
+    ///   never block and are reaped.
+    pub async fn format_preflight(storage: &storage::MetaLvStorage, force: bool) -> Result<()> {
+        if storage.read_superblock().await.is_err() {
+            // Never formatted (or unrecognizable): nothing to protect.
+            return Ok(());
+        }
+
+        if let Ok(attrs) = crate::meta_backend::xattr::list_xattrs(storage, 1).await {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let ttl = crate::fuse_client::CLIENT_STALE_TTL_SECS;
+            let mut live = Vec::new();
+            let mut stale = Vec::new();
+            for k in attrs.iter().filter(|k| k.starts_with("client:")) {
+                let fresh = match crate::meta_backend::xattr::get_xattr(storage, 1, k).await {
+                    Ok(Some(val)) => parse_client_registration_ts(&val)
+                        .map(|ts| now.saturating_sub(ts) <= ttl)
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if fresh {
+                    live.push(k.clone());
+                } else {
+                    stale.push(k.clone());
+                }
+            }
+            // Best-effort reap of crashed-client registrations so a crashed
+            // mount never wedges the volume permanently.
+            for k in &stale {
+                let _ = crate::meta_backend::xattr::remove_xattr(storage, 1, k).await;
+            }
+            if !live.is_empty() {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "Cannot format: metadata volume is actively mounted by clients: {:?}",
+                    live
+                )));
+            }
+        }
+
+        if !force {
+            return Err(crate::error::SqueezefsError::InvalidOperation(
+                "Metadata volume is already formatted as SqueezeFS; refusing to destroy it. \
+                 Pass --force to reformat."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn format_with_options(
         storage: &storage::MetaLvStorage,
         quick: bool,
@@ -500,45 +564,7 @@ impl MetaLvBackend {
                     .to_string(),
             ));
         }
-        // Prevent format only if the volume is mounted by a *live* client. A
-        // client heartbeats its `client:{id}` registration; one whose heartbeat is
-        // older than CLIENT_STALE_TTL_SECS is stale (the client crashed / was
-        // kill -9'd without unregistering) and must not block format. Reap stale
-        // entries so a crashed mount never wedges the volume permanently.
-        if !force && storage.read_superblock().await.is_ok() {
-            if let Ok(attrs) = crate::meta_backend::xattr::list_xattrs(storage, 1).await {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let ttl = crate::fuse_client::CLIENT_STALE_TTL_SECS;
-                let mut live = Vec::new();
-                let mut stale = Vec::new();
-                for k in attrs.iter().filter(|k| k.starts_with("client:")) {
-                    let fresh = match crate::meta_backend::xattr::get_xattr(storage, 1, k).await {
-                        Ok(Some(val)) => parse_client_registration_ts(&val)
-                            .map(|ts| now.saturating_sub(ts) <= ttl)
-                            .unwrap_or(false),
-                        _ => false,
-                    };
-                    if fresh {
-                        live.push(k.clone());
-                    } else {
-                        stale.push(k.clone());
-                    }
-                }
-                // Best-effort reap of crashed-client registrations.
-                for k in &stale {
-                    let _ = crate::meta_backend::xattr::remove_xattr(storage, 1, k).await;
-                }
-                if !live.is_empty() {
-                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                        "Cannot format: metadata volume is actively mounted by clients: {:?}",
-                        live
-                    )));
-                }
-            }
-        }
+        Self::format_preflight(storage, force).await?;
 
         // Zero-wipe the entire metadata volume first to prevent stale garbage issues
         storage.wipe(quick, pb).await?;

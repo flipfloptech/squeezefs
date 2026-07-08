@@ -1452,6 +1452,202 @@ async fn test_defrag_block_move_merges_through_primitive() {
     assert_eq!(read_at(&h, ino, 0, BS as u32).await, &p0[..BS as usize]);
 }
 
+/// Design OQ 6 resolved — defrag `BlockMove` source-slot free discipline:
+/// the source mapping the merge displaces is FREED by the worker, but only
+/// AFTER `merge_block_mappings` has published the new map (durable +
+/// RAM-coherent, tiers purged), through `BackendRouter::free_block`'s
+/// `begin_free` → punch-on-terminal → `finish_free` split — so the offset
+/// returns to the allocator's free list (the leak this pins RED: today the
+/// worker frees nothing) and the destructive punch strictly happens-before
+/// any new owner's DMA at the reused offset.
+#[tokio::test]
+async fn test_defrag_block_move_frees_displaced_source_after_merge() {
+    let _g = serial().await;
+    let h = make("wt_defrag_free").await;
+    let ino = create(&h, "defrag_free.bin").await;
+    let p0 = make_striped(&h, ino, 2 * BS as usize, 53).await;
+
+    let meta = backend_meta(&h, ino).await;
+    let bm = meta.block_map.clone().unwrap();
+    let src_key = bm.get(&0).unwrap().clone();
+    let src_offset: u64 = src_key.parse().expect("plain offset key");
+
+    let (_be, allocator, _writer) = h.fs.router.backend_router.get_active_backend().unwrap();
+    let src_idx = src_offset / allocator.chunk_size();
+    assert!(
+        !allocator
+            .get_free_blocks()
+            .await
+            .unwrap()
+            .contains(&src_idx),
+        "test precondition: source offset is live (not free-listed)"
+    );
+    let dest_offset = allocator.allocate_block().await.unwrap();
+    allocator.publish_block(dest_offset);
+
+    squeezefs::jobs::start_job_worker(Arc::new(h.fs.router.clone()), "t".into(), 100);
+    squeezefs::jobs::submit_and_wait_for_job(
+        "local",
+        "t",
+        vec![squeezefs::jobs::TaskType::BlockMove {
+            ino,
+            map_id: ino.to_string(),
+            idx_str: "0".to_string(),
+            src_offset,
+            dest_offset,
+            len: BS as usize,
+        }],
+    )
+    .await
+    .unwrap();
+
+    // `submit_and_wait_for_job` acks at dequeue; poll (bounded) for the
+    // worker's merge AND the displaced source's return to the free list.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let meta = backend_meta(&h, ino).await;
+        let merged =
+            meta.block_map.as_ref().and_then(|m| m.get(&0)) == Some(&dest_offset.to_string());
+        let freed = allocator
+            .get_free_blocks()
+            .await
+            .unwrap()
+            .contains(&src_idx);
+        if merged && freed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "BlockMove never freed the displaced source slot (merged: {merged}, \
+             source free-listed: {freed}) — the source must follow the \
+             displaced-key free discipline after the merge publishes"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Content still served from the destination after the source is gone.
+    h.fs.router.cache.read_lru.remove(&src_key);
+    h.fs.router.cache.read_lru.remove(&dest_offset.to_string());
+    assert_eq!(read_at(&h, ino, 0, BS as u32).await, &p0[..BS as usize]);
+}
+
+/// Design OQ 6, clone-sharing half: a BlockMove whose displaced source is
+/// still referenced by another holder (clone-shared refcount) must release
+/// its reference WITHOUT punching the device bytes or free-listing the
+/// offset — `begin_free`'s non-terminal contract (f0ca977). The surviving
+/// referent's bytes stay intact on the device.
+#[tokio::test]
+async fn test_defrag_block_move_clone_shared_source_not_freed() {
+    let _g = serial().await;
+    let h = make("wt_defrag_clone").await;
+    let ino = create(&h, "defrag_clone.bin").await;
+    let p0 = make_striped(&h, ino, 2 * BS as usize, 59).await;
+
+    let meta = backend_meta(&h, ino).await;
+    let bm = meta.block_map.clone().unwrap();
+    let src0_key = bm.get(&0).unwrap().clone();
+    let src0_offset: u64 = src0_key.parse().expect("plain offset key");
+    let src1_key = bm.get(&1).unwrap().clone();
+    let src1_offset: u64 = src1_key.parse().expect("plain offset key");
+
+    let (_be, allocator, writer) = h.fs.router.backend_router.get_active_backend().unwrap();
+    let src0_idx = src0_offset / allocator.chunk_size();
+    let src1_idx = src1_offset / allocator.chunk_size();
+
+    // Ground truth for the punch check: the raw device bytes at the shared
+    // source, captured before the move (cache-independent).
+    let src0_device_before = writer.read_block(src0_offset, BS as usize).await.unwrap();
+
+    // Simulate clone sharing: a second live reference on block 0's source.
+    assert!(
+        h.fs.router.backend_router.increment_refcount(&src0_key),
+        "test precondition: clone reference taken on the source block"
+    );
+
+    let dest0 = allocator.allocate_block().await.unwrap();
+    allocator.publish_block(dest0);
+    let dest1 = allocator.allocate_block().await.unwrap();
+    allocator.publish_block(dest1);
+
+    // Two serialized moves: when the SECOND task's (sole-referent) source
+    // hits the free list, the first task's free discipline has provably
+    // completed — the worker is serial.
+    squeezefs::jobs::start_job_worker(Arc::new(h.fs.router.clone()), "t".into(), 100);
+    squeezefs::jobs::submit_and_wait_for_job(
+        "local",
+        "t",
+        vec![
+            squeezefs::jobs::TaskType::BlockMove {
+                ino,
+                map_id: ino.to_string(),
+                idx_str: "0".to_string(),
+                src_offset: src0_offset,
+                dest_offset: dest0,
+                len: BS as usize,
+            },
+            squeezefs::jobs::TaskType::BlockMove {
+                ino,
+                map_id: ino.to_string(),
+                idx_str: "1".to_string(),
+                src_offset: src1_offset,
+                dest_offset: dest1,
+                len: BS as usize,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if allocator
+            .get_free_blocks()
+            .await
+            .unwrap()
+            .contains(&src1_idx)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second BlockMove never freed its sole-referent source — the \
+             displaced-source free discipline did not run"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The clone-shared source was released but NOT reclaimed: not on the
+    // free list (its offset must never be handed to a new owner while the
+    // clone lives) …
+    assert!(
+        !allocator
+            .get_free_blocks()
+            .await
+            .unwrap()
+            .contains(&src0_idx),
+        "clone-shared source was free-listed on a NON-terminal release — \
+         a new owner's allocation would alias the surviving clone's block"
+    );
+    // … and NOT punched: the surviving referent's device bytes are intact.
+    let src0_device_after = writer.read_block(src0_offset, BS as usize).await.unwrap();
+    assert_eq!(
+        &src0_device_after[..],
+        &src0_device_before[..],
+        "clone-shared source bytes changed on the device — a non-terminal \
+         free must never punch a still-referenced block"
+    );
+
+    // Both mappings live on the destinations; content byte-exact.
+    let meta = backend_meta(&h, ino).await;
+    let bm = meta.block_map.clone().unwrap();
+    assert_eq!(bm.get(&0), Some(&dest0.to_string()), "block 0 moved");
+    assert_eq!(bm.get(&1), Some(&dest1.to_string()), "block 1 moved");
+    for k in [&src0_key, &src1_key, &dest0.to_string(), &dest1.to_string()] {
+        h.fs.router.cache.read_lru.remove(k);
+    }
+    assert_eq!(read_at(&h, ino, 0, 2 * BS as u32).await, p0);
+}
+
 /// Read-your-own-writes at ack: after a completing (write-through) request
 /// returns, an immediate read observes the new bytes across the whole block.
 #[tokio::test]

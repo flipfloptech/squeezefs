@@ -19,6 +19,12 @@
 //!   changes for the snapshot's lifetime, and uniqueness observed after a
 //!   remote snapshot drop mutates in place (the shared-`Bytes` write-merge
 //!   UB fix, zero-copy write-path design §5.2).
+//! - [`lease_core`]: the FUSE-over-io_uring payload-lease re-arm protocol
+//!   (refs/parked publish-then-recheck word protocol, zero-copy write-path
+//!   design §5.4, PR 5) — invariants: the COMMIT_AND_FETCH for an ent
+//!   executes exactly once and never while a payload lease is live
+//!   (including the shutdown header-only drain), and a parked commit is
+//!   never lost to a missed eventfd wake.
 //!
 //! Models run only under `--cfg loom` (see `tests/run_loom.sh`); a plain
 //! `cargo test` here compiles the cores against std atomics and runs
@@ -32,13 +38,15 @@ pub mod cow_core;
 pub mod gauge_core;
 #[path = "../../src/incarnation_core.rs"]
 pub mod incarnation_core;
+#[path = "../../third_party/fuse3/src/raw/connection/lease_core.rs"]
+pub mod lease_core;
 #[path = "../../src/refcount_core.rs"]
 pub mod refcount_core;
 
 #[cfg(all(test, loom))]
 mod models {
-    use crate::{alloc_core, gauge_core, incarnation_core};
-    use loom::sync::atomic::{AtomicU64, Ordering};
+    use crate::{alloc_core, gauge_core, incarnation_core, lease_core};
+    use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
     use loom::thread;
 
@@ -416,6 +424,112 @@ mod models {
             // huge value here.
             let end = g.load(Ordering::Relaxed);
             assert_eq!(end, 0, "gauge wrapped or leaked: {end}");
+        });
+    }
+
+    /// Transport payload-lease invariant #1 (zero-copy write-path design
+    /// §5.4, PR 5): thread A = lease drop (refs 1→0, parked check + wake),
+    /// thread B = queue worker (refs load, park, publish-then-recheck).
+    /// The COMMIT_AND_FETCH executes exactly once and never while a payload
+    /// lease is live, and a parked commit is never lost to a missed wake —
+    /// if the worker parks, the lease drop MUST observe `parked` and fire
+    /// the eventfd (a silent park at `Q_DEPTH = 4` is a deterministic mount
+    /// hang, not a slowdown).
+    #[test]
+    fn ent_lease_commit_exactly_once_never_while_leased() {
+        loom::model(|| {
+            let st = Arc::new(lease_core::EntLeaseState::new());
+            // Delivery (queue worker, before any reply exists): the single
+            // payload lease for this ent.
+            assert_eq!(st.acquire(), 0, "fresh ent must be lease-free");
+
+            let wake = Arc::new(AtomicBool::new(false));
+
+            // Thread A: the handler's last payload `Bytes` clone drops.
+            let dropper = {
+                let st = Arc::clone(&st);
+                let wake = Arc::clone(&wake);
+                thread::spawn(move || {
+                    if st.release() {
+                        wake.store(true, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            // Thread B (queue worker): the reply's CommitMsg arrives.
+            let mut commits = 0u32;
+            let parked = match st.try_commit() {
+                lease_core::CommitGate::Ready => {
+                    assert!(
+                        !st.leased(),
+                        "commit fired while the payload lease was live"
+                    );
+                    commits += 1;
+                    false
+                }
+                lease_core::CommitGate::Parked => true,
+            };
+
+            dropper.join().unwrap();
+
+            if parked {
+                // Liveness: the lease has fully dropped by now, so the wake
+                // MUST have fired — otherwise the parked commit sleeps until
+                // an eventfd write that never comes (missed-wake deadlock).
+                assert!(
+                    wake.load(Ordering::SeqCst),
+                    "missed wake: commit parked but the lease drop saw parked == false"
+                );
+                assert!(
+                    st.try_unpark(),
+                    "parked commit not releasable after the lease dropped"
+                );
+                assert!(!st.leased(), "unparked commit with a live lease");
+                commits += 1;
+            }
+            assert_eq!(commits, 1, "the commit must execute exactly once");
+        });
+    }
+
+    /// Transport payload-lease invariant #2 — the §5.4 shutdown third
+    /// interleaving: final drain vs a late lease drop. The
+    /// no-write-while-leased rule stays unconditional at shutdown: the
+    /// drain may send the payload-writing reply only when the probe proves
+    /// the lease is gone; otherwise it degrades to a header-only reply that
+    /// never touches the payload region. Once the probe observes refs == 0
+    /// no new lease can appear (delivery requires a prior commit), so the
+    /// payload write cannot race a resurrection.
+    #[test]
+    fn ent_lease_shutdown_header_only_never_writes_leased_payload() {
+        loom::model(|| {
+            let st = Arc::new(lease_core::EntLeaseState::new());
+            assert_eq!(st.acquire(), 0);
+            // The commit parked before shutdown (worker owns the message).
+            assert!(matches!(st.try_commit(), lease_core::CommitGate::Parked));
+
+            // Thread A: late lease drop racing the shutdown drain.
+            let dropper = {
+                let st = Arc::clone(&st);
+                thread::spawn(move || {
+                    // The wake goes to a worker that is already draining;
+                    // it is at worst spurious, never required here.
+                    let _ = st.release();
+                })
+            };
+
+            // Shutdown drain (bounded wait modeled as a single probe).
+            if st.try_unpark() {
+                // Full payload-writing reply: legal ONLY with the lease gone.
+                assert!(
+                    !st.leased(),
+                    "shutdown drain wrote a payload while a lease was live"
+                );
+            }
+            // else: header-only reply — payload region untouched, so a live
+            // lease is fine; nothing to assert.
+
+            dropper.join().unwrap();
+            assert!(!st.leased(), "lease outlived its drop");
         });
     }
 }

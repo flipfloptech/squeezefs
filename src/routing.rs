@@ -2192,6 +2192,18 @@ impl DataRouter {
                     && (overlap_start > block_start_file_offset || overlap_end < existing_block_end)
             };
 
+            // §5.6 (PR 6) full-coverage slice reuse (kills audit #12 here):
+            // when the overlap covers the whole block there is no existing
+            // data to RMW-seed (`needs_existing` is provably false) — the
+            // payload slice IS the block, so it flows to crypto/DMA and into
+            // the read LRU directly instead of being copied into a
+            // `PooledBuf` first. Lease-safe by construction: the §5.4
+            // severance boundary guarantees no transport lease ever reaches
+            // `DataRouter::write_file`, so retaining `data_slice` retains a
+            // private copy. The RMW-seed copy below (partial coverage,
+            // audit #13) is untouched by design.
+            let full_coverage = rel_start == 0 && rel_end == block_size as usize;
+
             let sem_clone = sem.clone();
             tasks.push(tokio::spawn(async move {
                 let _permit = sem_clone.acquire().await.map_err(|e| {
@@ -2201,54 +2213,58 @@ impl DataRouter {
                     )))
                 })?;
 
-                let mut block_data = if needs_existing {
-                    if let Some(resolved) = pre_resolved {
-                        match resolved {
-                            crate::cache::pool::ReadBlockValue::Pooled(p) => p,
-                            crate::cache::pool::ReadBlockValue::Bytes(b) => {
-                                let mut pooled = BUFFER_POOL.alloc();
-                                pooled.resize(b.len(), 0);
-                                pooled.copy_from_slice(&b);
-                                pooled
+                let block_bytes = if full_coverage {
+                    data_slice
+                } else {
+                    let mut block_data = if needs_existing {
+                        if let Some(resolved) = pre_resolved {
+                            match resolved {
+                                crate::cache::pool::ReadBlockValue::Pooled(p) => p,
+                                crate::cache::pool::ReadBlockValue::Bytes(b) => {
+                                    let mut pooled = BUFFER_POOL.alloc();
+                                    pooled.resize(b.len(), 0);
+                                    pooled.copy_from_slice(&b);
+                                    pooled
+                                }
                             }
-                        }
-                    } else if let Some(ref bk) = old_block_key {
-                        match router_clone.get_cached_or_fetch_block(bk).await? {
-                            crate::cache::pool::ReadBlockValue::Pooled(p) => p,
-                            crate::cache::pool::ReadBlockValue::Bytes(b) => {
-                                let mut pooled = BUFFER_POOL.alloc();
-                                pooled.resize(b.len(), 0);
-                                pooled.copy_from_slice(&b);
-                                pooled
+                        } else if let Some(ref bk) = old_block_key {
+                            match router_clone.get_cached_or_fetch_block(bk).await? {
+                                crate::cache::pool::ReadBlockValue::Pooled(p) => p,
+                                crate::cache::pool::ReadBlockValue::Bytes(b) => {
+                                    let mut pooled = BUFFER_POOL.alloc();
+                                    pooled.resize(b.len(), 0);
+                                    pooled.copy_from_slice(&b);
+                                    pooled
+                                }
                             }
+                        } else {
+                            let mut pooled = BUFFER_POOL.alloc();
+                            pooled.resize(rel_end, 0);
+                            pooled
                         }
                     } else {
                         let mut pooled = BUFFER_POOL.alloc();
                         pooled.resize(rel_end, 0);
                         pooled
+                    };
+
+                    if block_data.len() < rel_end {
+                        block_data.resize(rel_end, 0);
                     }
-                } else {
-                    let mut pooled = BUFFER_POOL.alloc();
-                    pooled.resize(rel_end, 0);
-                    pooled
+
+                    unsafe {
+                        block_data
+                            .get_unchecked_mut(rel_start..rel_end)
+                            .copy_from_slice(&data_slice);
+                    }
+
+                    block_data.into_bytes()
                 };
-
-                if block_data.len() < rel_end {
-                    block_data.resize(rel_end, 0);
-                }
-
-                unsafe {
-                    block_data
-                        .get_unchecked_mut(rel_start..rel_end)
-                        .copy_from_slice(&data_slice);
-                }
 
                 let (_be_id, block_allocator, nvme_writer) =
                     router_clone.backend_router.get_active_backend()?;
                 let offset = block_allocator.allocate_block().await?;
                 let stored_new_block_key = offset.to_string();
-
-                let block_bytes = block_data.into_bytes();
 
                 let processed_block = crypto.process_write_async(block_bytes.clone()).await?;
                 nvme_writer.write_block(offset, processed_block).await?;

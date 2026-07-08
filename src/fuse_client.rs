@@ -101,12 +101,14 @@ pub fn inode_write_lock_scope(fits_inline: bool, is_striped: bool) -> InodeWrite
 /// registered FUSE-over-io_uring payload buffer; the ring ent is not
 /// re-armed (COMMIT_AND_FETCH) until the lease drops. A lease that escapes
 /// the write handler into a long-lived sink (`data_key`, the LRUs) parks
-/// that ent forever — at `Q_DEPTH = 4`, a deterministic mount hang. Routes
-/// that hand the payload to `DataRouter::write_file` therefore materialize
-/// it lease-free first with one unconditional copy (the same bytes the
-/// transport used to copy *twice* before PR 5, now paid only by the
-/// small/staged routes — the hot striped route consumes the lease via the
-/// accumulation merge and never severs). Unconditional rather than
+/// that ent forever — at `Q_DEPTH = 4`, a deterministic mount hang. The one
+/// route that hands the payload to `DataRouter::write_file` — the
+/// `use_router_write` branch top; PR 6 deleted the transitional
+/// `is_aligned` second sever point together with its branch — therefore
+/// materializes it lease-free first with one unconditional copy (the same
+/// bytes the transport used to copy *twice* before PR 5, now paid only by
+/// the small/staged routes — the hot striped route consumes the lease via
+/// the accumulation merge and never severs). Unconditional rather than
 /// lease-detecting: `bytes::Bytes` cannot cheaply introspect its owner, and
 /// a copy on the cold routes beats a reachability argument every reviewer
 /// must re-verify. Invariant, checkable in one place: a transport lease
@@ -3040,15 +3042,16 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             if use_router_write {
-                // §5.4 lease-severance boundary, route (i): the router's
-                // inline/staged commits retain the payload `Bytes`
-                // unboundedly (`data_key`, `write_lru`, `read_lru`) and its
-                // internal promotions slice it across device writes — a
-                // transport payload lease here would park the ring ent's
-                // COMMIT_AND_FETCH for as long as the cache holds it
-                // (deterministic mount hang at Q_DEPTH=4). Materialize a
-                // private copy before anything reaches
-                // `DataRouter::write_file`.
+                // §5.4 lease-severance boundary — the single sever route:
+                // the router's inline/staged commits retain the payload
+                // `Bytes` unboundedly (`data_key`, `write_lru`, `read_lru`)
+                // and its internal promotions/striped section slice it
+                // across device writes (and, post-PR 6, retain full-coverage
+                // slices in the read LRU) — a transport payload lease here
+                // would park the ring ent's COMMIT_AND_FETCH for as long as
+                // the cache holds it (deterministic mount hang at
+                // Q_DEPTH=4). Materialize a private copy before anything
+                // reaches `DataRouter::write_file`.
                 let data_bytes = sever_payload(&data);
                 if lock_scope == InodeWriteLockScope::MetaPrepOnly {
                     drop(guard);
@@ -3076,113 +3079,35 @@ impl Filesystem for SqueezefsFilesystem {
                     drop(guard);
                 }
             } else {
-                if file_type == "inline" || file_type == "staged" {
-                    // Promote to striped: need full layout for block-0 seed.
-                    let meta = self
-                        .router
-                        .fetch_metadata(&file_path)
-                        .await
-                        .map_err(map_squeezefs_err)?;
-                    let cache_key = crate::keys::active_block(ino, 0).to_string();
-                    let block_size = self.router.block_size.load(Ordering::Relaxed) as usize;
-                    if file_type == "staged" {
-                        if let Some(ref file_id) = meta.file_id {
-                            if let Some(staged_data) = self.router.cache.nvme.read_staged(file_id) {
-                                // Seed a full-block, pool-backed CoW buffer
-                                // (zero-extended): a short shared `Bytes`
-                                // here used to be merged past its length.
-                                self.active_block_buffers.insert(
-                                    cache_key,
-                                    crate::cache::active_block::ActiveBlockBuf::seeded(
-                                        &staged_data,
-                                        block_size,
-                                    ),
-                                );
-                            }
-                        }
-                    } else if file_type == "inline" {
-                        if let Some(ref inline_data) = meta.data_key {
-                            self.active_block_buffers.insert(
-                                cache_key,
-                                crate::cache::active_block::ActiveBlockBuf::seeded(
-                                    inline_data,
-                                    block_size,
-                                ),
-                            );
-                        }
-                    }
-
-                    let mut updated_meta = meta.clone();
-                    updated_meta.file_type = "striped".to_string();
-                    updated_meta.size = expected_new_size;
-                    if let Err(e) = self
-                        .router
-                        .save_metadata_to_backend(ino, &updated_meta, fencing_token)
-                        .await
-                    {
-                        return Err(map_squeezefs_err(e));
-                    }
-                } else if expected_new_size > old_size {
+                // `use_router_write` is unconditionally true for
+                // `file_type == "inline" || "staged"` (the condition names
+                // those values verbatim), so this branch only ever sees
+                // striped files — inline/staged→striped promotions resolve
+                // inside `DataRouter::write_file` on the severed route
+                // above. Every striped shape (aligned or not, complete
+                // blocks or partial) funnels through `write_file_staged`,
+                // whose per-block write-through (§5.3) uploads
+                // content-complete blocks directly: the one striped write
+                // path. PR 6 deleted the in-handler promotion block (dead:
+                // its `file_type` guard could never hold here) and the
+                // subsumed `is_aligned` direct leg.
+                if expected_new_size > old_size {
                     self.router
                         .update_metadata_cache_size(&file_path, expected_new_size)
                         .await;
                 }
-                if lock_scope == InodeWriteLockScope::MetaPrepOnly {
-                    // Striped: drop inode write lock before long active-block I/O.
-                    drop(guard);
-
-                    let block_size = self.router.block_size.load(Ordering::Relaxed);
-                    let is_aligned = is_striped
-                        && (offset % block_size == 0)
-                        && (data.len() as u64 % block_size == 0);
-
-                    if is_aligned {
-                        // §5.4 lease-severance boundary, route (ii): the
-                        // transitional `is_aligned` direct leg (dead for the
-                        // default shape, live for small-block configs) holds
-                        // payload slices across allocate + DMA inside the
-                        // router's striped section. One line of scaffolding
-                        // that PR 6 deletes together with the branch.
-                        let data_bytes = sever_payload(&data);
-                        if let Err(e) = self
-                            .router
-                            .write_file(&file_path, offset, data_bytes, fencing_token)
-                            .await
-                        {
-                            if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
-                                self.invalidate_local_lease(ino);
-                            }
-                            return Err(map_squeezefs_err(e));
-                        }
-                        let start_block = offset / block_size;
-                        let end_block = (offset + data.len() as u64 - 1) / block_size;
-                        for b in start_block..=end_block {
-                            let cache_key = crate::keys::active_block(ino, b).to_string();
-                            self.active_block_buffers.remove(&cache_key);
-                            self.router.cache.nvme.remove_active_block(&cache_key);
-                        }
-                    } else {
-                        if let Err(e) = self
-                            .write_file_staged(ino, offset, data.clone(), old_size, fencing_token)
-                            .await
-                        {
-                            if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
-                                self.invalidate_local_lease(ino);
-                            }
-                            return Err(map_squeezefs_err(e));
-                        }
+                // Striped: drop inode write lock before long active-block
+                // I/O (P1-8); per-block BLOCK_FLUSH_LOCKS serialize the
+                // data path.
+                drop(guard);
+                if let Err(e) = self
+                    .write_file_staged(ino, offset, data.clone(), old_size, fencing_token)
+                    .await
+                {
+                    if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
+                        self.invalidate_local_lease(ino);
                     }
-                } else {
-                    drop(guard);
-                    if let Err(e) = self
-                        .write_file_staged(ino, offset, data.clone(), old_size, fencing_token)
-                        .await
-                    {
-                        if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
-                            self.invalidate_local_lease(ino);
-                        }
-                        return Err(map_squeezefs_err(e));
-                    }
+                    return Err(map_squeezefs_err(e));
                 }
             }
 

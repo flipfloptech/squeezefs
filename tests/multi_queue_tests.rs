@@ -230,27 +230,30 @@ async fn test_staged_route_severs_payload() {
     );
 }
 
-/// Sinks row: the transitional `is_aligned` direct leg (dead for the default
-/// shape, live for small-block configs until PR 6 deletes the branch). Its
-/// per-block tasks hold payload slices across allocate + DMA; the sever
-/// inside the branch bounds that to a private copy. Also pins that the
-/// payload does not leak into the router's read-LRU as a live handle.
+/// Sinks row (updated by PR 6): the transitional `is_aligned` direct leg is
+/// deleted — aligned striped writes on small-block configs now funnel
+/// through `write_file_staged`, whose complete-block write-through consumes
+/// the payload via the one-shot severing copy (§5.3 upload-helper
+/// contract). The pin is unchanged: an aligned striped overwrite must still
+/// provably drop the payload before the handler returns, and must not leak
+/// it into any cache as a live handle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_striped_aligned_route_severs_payload() {
     let h = make_fs("pr5_sever_aligned", "65536").await;
     let ino = create_file(&h, "aligned.bin").await;
 
     // First write grows past block_size ⇒ router resolves the striped
-    // promotion internally (route (i) — also severed).
+    // promotion internally (the severed router route).
     let promote: Vec<u8> = (0..131072u32).map(|b| (b % 247) as u8).collect();
     let dropped = write_canary(&h, ino, 0, &promote).await;
     assert_severed(&dropped, "striped-promotion router");
 
     // Now striped: an aligned overwrite (offset % bs == 0, len % bs == 0)
-    // takes the `is_aligned` direct leg.
+    // funnels through write_file_staged; the complete block write-through
+    // uploads from a pooled snapshot, never from the payload.
     let aligned: Vec<u8> = (0..65536u32).map(|b| (b % 241) as u8).collect();
     let dropped = write_canary(&h, ino, 0, &aligned).await;
-    assert_severed(&dropped, "is_aligned direct");
+    assert_severed(&dropped, "aligned striped write-through");
 
     let mut expected = promote.clone();
     expected[..65536].copy_from_slice(&aligned);

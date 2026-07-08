@@ -27,17 +27,18 @@ async fn formatted_storage() -> (NamedTempFile, MetaLvStorage) {
 }
 
 /// A fresh (recently heartbeated) registration blocks format; a stale one does
-/// not and is reaped.
+/// not and is reaped. (Reformatting a formatted volume requires `force`; the
+/// heartbeat semantics under test are orthogonal to that flag.)
 #[tokio::test]
 async fn test_stale_registration_does_not_block_format() {
     let (_meta, storage) = formatted_storage().await;
     let now = now_secs();
 
-    // Fresh registration -> format must be refused.
+    // Fresh registration -> format must be refused even when forced.
     xattr::set_xattr(&storage, 1, "client:live", &reg_value(now))
         .await
         .unwrap();
-    let blocked = MetaLvBackend::format_with_options(&storage, true, false, None).await;
+    let blocked = MetaLvBackend::format_with_options(&storage, true, true, None).await;
     assert!(
         blocked.is_err(),
         "a live (freshly-heartbeated) client must block format"
@@ -52,7 +53,7 @@ async fn test_stale_registration_does_not_block_format() {
         .await
         .unwrap();
 
-    let allowed = MetaLvBackend::format_with_options(&storage, true, false, None).await;
+    let allowed = MetaLvBackend::format_with_options(&storage, true, true, None).await;
     assert!(
         allowed.is_ok(),
         "a stale (crashed) client registration must not block format: {allowed:?}"
@@ -69,7 +70,7 @@ async fn test_legacy_registration_value_treated_as_stale() {
         .await
         .unwrap();
 
-    let allowed = MetaLvBackend::format_with_options(&storage, true, false, None).await;
+    let allowed = MetaLvBackend::format_with_options(&storage, true, true, None).await;
     assert!(
         allowed.is_ok(),
         "legacy timestamp-less registration must not block format: {allowed:?}"

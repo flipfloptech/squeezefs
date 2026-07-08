@@ -699,4 +699,74 @@ mod storm {
         // Clean unmount (kernel FORGET storm + DESTROY ride the same queues).
         mount.unmount();
     }
+
+    /// Kernel contract (fs/fuse/dev_uring.c, v6.14 through v7.1): even with
+    /// FUSE-over-io_uring armed, `fuse_io_uring_ops` keeps
+    /// `.send_forget = fuse_dev_queue_forget` and
+    /// `.send_interrupt = fuse_dev_queue_interrupt` — FORGET/BATCH_FORGET and
+    /// INTERRUPT ride the CLASSICAL `/dev/fuse` queue forever — and
+    /// `fuse_resend` splices resent requests straight onto the classical
+    /// `fiq->pending`. Regular requests can also land classically in the
+    /// unlocked `WRITE_ONCE(fiq->ops, …)` switchover window (`fuse_send_one`
+    /// reads `fiq->ops` without `fiq->lock`).
+    ///
+    /// A daemon that stops servicing `/dev/fuse` after arm therefore strands
+    /// them: `fusectl waiting` sticks at ≥ 1, syncfs blocks, plain umount
+    /// returns EBUSY forever — the PR 5/6/7 storm-teardown wedge
+    /// (live-confirmed on a 23-hour mount: a stranded `GETATTR unique=4`
+    /// held `waiting == 1` the whole time, next to a 3030-entry
+    /// BATCH_FORGET pile-up, all on the classical queue; kernel
+    /// 7.1.3-1-cachyos).
+    ///
+    /// Pin: after an unlink storm (the kernel-driven FORGET generator), the
+    /// armed session MUST have serviced classical sideband traffic —
+    /// `transport_classical_sideband` > 0 — and the unmount MUST be clean.
+    /// RED on dev: the metric does not exist (the transport never reads
+    /// `/dev/fuse` after arm), so forgets pile up unserviced.
+    #[test]
+    fn test_classical_sideband_serviced_and_unmount_clean() {
+        if !super::storm::transport_supported() {
+            return;
+        }
+        let mut mount = mount_fs("sideband");
+
+        // Generate kernel FORGETs: create + read (nlookup > 0), then unlink.
+        // Eviction on the last iput queues a forget via `fiq->ops->send_forget`
+        // — classical by kernel design even with the ring armed.
+        let n_files = 400usize;
+        for i in 0..n_files {
+            let p = mount.mnt.join(format!("forget_{i}.txt"));
+            std::fs::write(&p, format!("payload {i}")).expect("create forget file");
+            assert_eq!(
+                std::fs::read_to_string(&p).expect("read back"),
+                format!("payload {i}")
+            );
+        }
+        for i in 0..n_files {
+            let p = mount.mnt.join(format!("forget_{i}.txt"));
+            std::fs::remove_file(&p).expect("unlink forget file");
+        }
+
+        // The forgets must actually be serviced (not stranded on the classical
+        // queue): the sideband counter has to move within a bounded window.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let sideband = loop {
+            let stats = mount.stats();
+            let sideband = mount.metric(&stats, "transport_classical_sideband");
+            if sideband > 0 || Instant::now() > deadline {
+                break sideband;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        assert!(
+            sideband > 0,
+            "no classical sideband requests serviced after an unlink storm — \
+             kernel-mandated classical traffic (FORGET/INTERRUPT/resend + \
+             fiq->ops switchover stragglers) is being stranded on /dev/fuse; \
+             this is the stuck-request unmount wedge class"
+        );
+
+        // Teardown must be clean: no stranded request may hold `waiting` up.
+        mount.unmount();
+    }
 }

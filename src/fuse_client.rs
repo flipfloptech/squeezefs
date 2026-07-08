@@ -1352,108 +1352,82 @@ impl SqueezefsFilesystem {
                 METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
                 // 1. Get existing block data (either from memory cache, NVMe staging cache, or read from backend/cache)
-                let mut block_data = if let Some((_, buf)) =
-                    self.active_block_buffers.remove(&cache_key)
-                {
-                    buf
-                } else if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
-                    crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
-                } else if !needs_existing_data {
-                    // Fresh entry: no existing data for this block, so the
-                    // seed-time zero-fill is elided (§5.3) — the `covered`
-                    // interval below keeps recycled pool bytes private, and
-                    // the complement is zeroed lazily at the trigger or at
-                    // any stage/upload exit.
-                    crate::cache::active_block::ActiveBlockBuf::fresh(block_size as usize)
-                } else {
-                    // Try cache first
-                    let mut block_map_id_opt = None;
-                    if let Some(entry) = self.router.metadata_cache.get(&file_path) {
-                        if entry.cached_at.elapsed() < Duration::from_secs(1) {
-                            block_map_id_opt = entry.block_map_id.clone();
-                        }
-                    }
-
-                    let mut block_map_id = block_map_id_opt.clone();
-                    let mut block_map = None;
-                    if block_map_id.is_none() {
-                        if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
-                            block_map_id = meta.block_map_id.clone();
-                            block_map = meta.block_map.clone();
-                        }
-                    }
-
-                    let mut existing = bytes::Bytes::new();
-                    // Read the existing block for the read-modify-write whenever the
-                    // file has a block map — whether stored INLINE (`block_map`, the
-                    // common <=32-block case) or via an INDIRECT block (`block_map_id`).
-                    // Gating only on `block_map_id` skipped the existing-block read for
-                    // inline maps, so a partial (non-block-aligned) overwrite of a
-                    // striped file zeroed the un-overwritten bytes of the block.
-                    if block_map_id.is_some() || block_map.is_some() {
-                        let mut old_block_key: Option<String> = None;
-                        if let Some(ref bm) = block_map {
-                            old_block_key = bm.get(&(b as u32)).cloned();
-                        }
-                        if old_block_key.is_none() {
-                            if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
-                                if let Some(ref bm) = meta.block_map {
-                                    old_block_key = bm.get(&(b as u32)).cloned();
-                                }
+                let mut block_data =
+                    if let Some((_, buf)) = self.active_block_buffers.remove(&cache_key) {
+                        buf
+                    } else if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
+                        crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
+                    } else if !needs_existing_data {
+                        // Fresh entry: no existing data for this block, so the
+                        // seed-time zero-fill is elided (§5.3) — the `covered`
+                        // interval below keeps recycled pool bytes private, and
+                        // the complement is zeroed lazily at the trigger or at
+                        // any stage/upload exit.
+                        crate::cache::active_block::ActiveBlockBuf::fresh(block_size as usize)
+                    } else {
+                        // Try cache first
+                        let mut block_map_id_opt = None;
+                        if let Some(entry) = self.router.metadata_cache.get(&file_path) {
+                            if entry.cached_at.elapsed() < Duration::from_secs(1) {
+                                block_map_id_opt = entry.block_map_id.clone();
                             }
                         }
 
-                        if let Some(bk) = old_block_key {
-                            existing = if let Some(cached_block) =
-                                self.router.cache.read_lru.get(&bk)
-                            {
-                                cached_block
-                            } else if let Some(cached) =
-                                self.router.cache.nvme.get_cached_read_block(&bk)
-                            {
-                                let cb = bytes::Bytes::from(cached);
-                                self.router.cache.read_lru.put(&bk, cb.clone());
-                                cb
-                            } else {
-                                // NVMe-oF backend read path
-                                let get_res = async {
-                                    let raw = self.router.read_nvme_block(&bk).await?;
-                                    let decompressed =
-                                        self.router.get_crypto().process_read_async(raw).await?;
-                                    Ok::<bytes::Bytes, SqueezefsError>(decompressed)
-                                }
-                                .await;
-
-                                let decompressed_bytes = get_res?;
-                                self.router
-                                    .cache
-                                    .read_lru
-                                    .put(&bk, decompressed_bytes.clone());
-                                if decompressed_bytes.len() < 64 * 1024 {
-                                    let _ = self
-                                        .router
-                                        .cache
-                                        .nvme
-                                        .cache_read_block(&bk, decompressed_bytes.clone());
-                                } else {
-                                    let nvme_clone = self.router.cache.nvme.clone();
-                                    let bk_clone = bk.clone();
-                                    let decompressed_clone = decompressed_bytes.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        let _ = nvme_clone
-                                            .cache_read_block(&bk_clone, decompressed_clone);
-                                    });
-                                }
-                                decompressed_bytes
-                            };
+                        let mut block_map_id = block_map_id_opt.clone();
+                        let mut block_map = None;
+                        if block_map_id.is_none() {
+                            if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
+                                block_map_id = meta.block_map_id.clone();
+                                block_map = meta.block_map.clone();
+                            }
                         }
-                    }
 
-                    crate::cache::active_block::ActiveBlockBuf::seeded(
-                        &existing,
-                        block_size as usize,
-                    )
-                };
+                        let mut existing: Option<crate::cache::pool::ReadBlockValue> = None;
+                        // Read the existing block for the read-modify-write whenever the
+                        // file has a block map — whether stored INLINE (`block_map`, the
+                        // common <=32-block case) or via an INDIRECT block (`block_map_id`).
+                        // Gating only on `block_map_id` skipped the existing-block read for
+                        // inline maps, so a partial (non-block-aligned) overwrite of a
+                        // striped file zeroed the un-overwritten bytes of the block.
+                        if block_map_id.is_some() || block_map.is_some() {
+                            let mut old_block_key: Option<String> = None;
+                            if let Some(ref bm) = block_map {
+                                old_block_key = bm.get(&(b as u32)).cloned();
+                            }
+                            if old_block_key.is_none() {
+                                if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
+                                    if let Some(ref bm) = meta.block_map {
+                                        old_block_key = bm.get(&(b as u32)).cloned();
+                                    }
+                                }
+                            }
+
+                            if let Some(bk) = old_block_key {
+                                // The seed is a cache FILL like any other: `bk`
+                                // can be displaced, freed, and reallocated under
+                                // the SAME key string while (or right after) we
+                                // read it — including by THIS call, when the
+                                // merged block completes and write-through
+                                // displaces + frees `bk` before a detached tier
+                                // publish of its old bytes lands. Route through
+                                // the shared single-flight validated fill:
+                                // read_lru → NVMe tier (served without the
+                                // unprovable-provenance RAM re-promote) → device
+                                // read under the incarnation seqlock (snapshot →
+                                // read → publish → REvalidate → undo; the
+                                // detached NVMe-tier publish re-checks before
+                                // and after its put). The previous hand-rolled
+                                // read published both tiers with no validation —
+                                // the stale-fill follow-up filed in 8e3995e.
+                                existing = Some(self.router.get_cached_or_fetch_block(&bk).await?);
+                            }
+                        }
+
+                        crate::cache::active_block::ActiveBlockBuf::seeded(
+                            existing.as_deref().unwrap_or(&[]),
+                            block_size as usize,
+                        )
+                    };
 
                 // 2. Merge the request slice. `make_mut` mutates only
                 // provably-unique memory: a live reader snapshot forces a

@@ -13,7 +13,9 @@ pub use request::Request;
 #[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 pub use session::{MountHandle, Session, tpc_spawn, tpc_thread_count};
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
-pub use connection::fuse_over_uring::{over_uring_sessions_active, over_uring_stats};
+pub use connection::fuse_over_uring::{
+    over_uring_sessions_active, over_uring_stats, transport_lease_stats,
+};
 
 pub(crate) type FuseData = Either<Vec<u8>, (Vec<u8>, Bytes, Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>)>;
 

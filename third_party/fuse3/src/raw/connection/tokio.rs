@@ -144,6 +144,8 @@ use tracing::warn;
 use super::CompleteIoResult;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use crate::find_fusermount3;
+#[cfg(target_os = "linux")]
+use crate::raw::abi::FUSE_WRITE_IN_SIZE;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use crate::MountOptions;
 
@@ -460,6 +462,24 @@ impl FuseConnection {
                 let body_need = total_len.saturating_sub(40);
                 let op_in = &inbound.header_and_op[40..];
                 let payload = &inbound.payload;
+                // FUSE_WRITE (§5.4 transport zero-copy): the body already
+                // rides `payload` — as a zero-copy lease over the registered
+                // uring buffer — and `handle_write` consumes exactly that
+                // `Bytes`. Copying the body into the session buffer here
+                // would spend a second 1 MiB memcpy per request (audit #2)
+                // for bytes nothing reads. Copy only the fuse_write_in arg
+                // from op_in; every other opcode keeps the reconstruction
+                // below verbatim.
+                let opcode =
+                    u32::from_le_bytes(inbound.header_and_op[4..8].try_into().unwrap());
+                if opcode == crate::raw::abi::fuse_opcode::FUSE_WRITE as u32
+                    && body_need >= FUSE_WRITE_IN_SIZE
+                    && !payload.is_empty()
+                {
+                    let n = FUSE_WRITE_IN_SIZE.min(op_in.len()).min(data_buf.len());
+                    data_buf[..n].copy_from_slice(&op_in[..n]);
+                    return ((header_buf, data_buf, Some(inbound.payload)), Ok(40 + n));
+                }
                 // Bytes of body that live in op_in (first in_arg); remainder in payload.
                 // NOTE: We keep payload as Bytes for zero-copy writes!
                 let from_op = body_need.saturating_sub(payload.len()).min(op_in.len());

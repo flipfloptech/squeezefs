@@ -2458,17 +2458,42 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         data = &data[FUSE_WRITE_IN_SIZE..];
 
-        if write_in.size as usize != data.len() {
-            error!("fuse_write_in body len is invalid");
-
-            reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
-
-            return;
-        }
-
         let payload = match uring_payload {
-            Some(p) => p,
-            None => Bytes::copy_from_slice(data),
+            // FUSE-over-io_uring delivery: the body was NOT copied into the
+            // session buffer (transport zero-copy, §5.4) — it rides `p`,
+            // possibly as a payload lease over the registered uring buffer.
+            // Validate the header's size against the payload itself (the
+            // kernel fills payload_sz from the same request).
+            Some(p) => {
+                if write_in.size as usize != p.len() {
+                    error!(
+                        "fuse_write_in size {} != uring payload len {}",
+                        write_in.size,
+                        p.len()
+                    );
+
+                    reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender)
+                        .await;
+
+                    return;
+                }
+
+                p
+            }
+            // Classical delivery (FUSE_INIT window handoff only after arm):
+            // the body is in the session buffer, exactly as before.
+            None => {
+                if write_in.size as usize != data.len() {
+                    error!("fuse_write_in body len is invalid");
+
+                    reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender)
+                        .await;
+
+                    return;
+                }
+
+                Bytes::copy_from_slice(data)
+            }
         };
 
         let mut resp_sender = self.response_sender.clone();

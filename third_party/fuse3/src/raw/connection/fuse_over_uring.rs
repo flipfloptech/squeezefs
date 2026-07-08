@@ -30,12 +30,20 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use io_uring::squeue::Entry128;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use tracing::{debug, error, info, warn};
+
+/// Payload-lease re-arm protocol core (refs/parked publish-then-recheck).
+/// `#[path]`-included so `loom-models` can model-check the exact shipped
+/// code (SqueezeFS zero-copy write-path design §5.4, house extracted-core
+/// convention).
+#[path = "lease_core.rs"]
+mod lease_core;
+use lease_core::{CommitGate, EntLeaseState};
 
 /// `FUSE_OVER_IO_URING` (1ULL<<41) → `flags2` bit 9.
 pub const FUSE_OVER_IO_URING_FLAGS2: u32 = 1u32 << 9;
@@ -46,6 +54,8 @@ pub const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
 const FUSE_IO_URING_CMD_REGISTER: u32 = 1;
 const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
 const FUSE_IN_HEADER_SIZE: usize = 40;
+/// `linux/fuse.h` opcode 16 — the only opcode whose payload rides a lease.
+const FUSE_WRITE_OPCODE: u32 = crate::raw::abi::fuse_opcode::FUSE_WRITE as u32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -110,8 +120,134 @@ struct QueueHandle {
     wake_fd: RawFd,
     /// Keep OwnedFd alive.
     _wake: OwnedFd,
-    payload_buffers: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    /// The queue's payload arena, set once by the worker at startup. Held
+    /// here so payload pointers handed out via `get_payload_buffer` stay
+    /// valid for the pool's whole life, even after the worker exited.
+    arena: std::sync::Mutex<Option<Arc<PayloadArena>>>,
 }
+
+/// Owns every registered payload buffer of one queue plus a dup of the
+/// queue eventfd (§5.4). Payload allocations live here — not in the
+/// worker-local `Ent` — so a payload lease outliving the worker (shutdown
+/// with a pathological handler) keeps pointing at valid memory, and the
+/// wake fd a late lease drop writes can never be closed/reused underneath
+/// it. A leaked lease degrades to a leaked buffer, never a dangling
+/// pointer.
+struct PayloadArena {
+    /// `*mut u8` stored as `usize` (one stable allocation per ring ent;
+    /// never reallocated for the arena's life).
+    bufs: Vec<usize>,
+    layout: std::alloc::Layout,
+    /// dup(2) of the queue eventfd: lease drops wake the worker through the
+    /// arena so the fd is alive exactly as long as any lease can write it.
+    wake: OwnedFd,
+}
+
+impl PayloadArena {
+    fn new(depth: usize, payload_sz: usize, wake_fd: RawFd) -> io::Result<Arc<Self>> {
+        let dup = unsafe { libc::dup(wake_fd) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `dup` just returned a fresh owned descriptor.
+        let wake = unsafe { OwnedFd::from_raw_fd(dup) };
+        let layout = std::alloc::Layout::from_size_align(payload_sz, 4096)
+            .map_err(io::Error::other)?;
+        let mut bufs = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            // SAFETY: `layout` has non-zero size (payload_sz ≥ 8192).
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            if ptr.is_null() {
+                for &p in &bufs {
+                    // SAFETY: allocated above with the same layout.
+                    unsafe { std::alloc::dealloc(p as *mut u8, layout) };
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "payload arena allocation failed",
+                ));
+            }
+            bufs.push(ptr as usize);
+        }
+        Ok(Arc::new(Self { bufs, layout, wake }))
+    }
+
+    fn buf(&self, idx: usize) -> Option<*mut u8> {
+        self.bufs.get(idx).map(|&p| p as *mut u8)
+    }
+}
+
+impl Drop for PayloadArena {
+    fn drop(&mut self) {
+        for &p in &self.bufs {
+            // SAFETY: allocated in `new` with `self.layout`; dropped once.
+            unsafe { std::alloc::dealloc(p as *mut u8, self.layout) };
+        }
+    }
+}
+
+// SAFETY: the raw buffer pointers reference kernel-shared payload memory
+// whose access is serialized by the §5.4 lease protocol (the worker and the
+// kernel write only when the ent's lease refs == 0; leases read only while
+// refs > 0). `OwnedFd` writes are thread-safe.
+unsafe impl Send for PayloadArena {}
+unsafe impl Sync for PayloadArena {}
+
+/// Owner behind `Bytes::from_owner` for a FUSE_WRITE payload delivered
+/// zero-copy (§5.4). Holds the arena (memory + wake fd) alive and drives
+/// the refs/parked re-arm protocol on drop.
+struct EntPayloadLease {
+    arena: Arc<PayloadArena>,
+    state: Arc<EntLeaseState>,
+    ptr: *const u8,
+    len: usize,
+    born: Instant,
+}
+
+impl AsRef<[u8]> for EntPayloadLease {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: `ptr..ptr+len` lies inside one arena buffer (kept alive by
+        // `self.arena`); the lease protocol guarantees no writer (worker or
+        // kernel re-arm) touches it while this lease (refs > 0) exists.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for EntPayloadLease {
+    fn drop(&mut self) {
+        let age_ms = self.born.elapsed().as_millis() as u64;
+        TRANSPORT_LEASE_MAX_AGE_MS.fetch_max(age_ms, Ordering::Relaxed);
+        TRANSPORT_LEASES_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+        // §5.4 severance-boundary enforcement, armed in debug/test builds:
+        // a lease's lifetime is bounded by ONE handler invocation; anything
+        // second-scale means a payload escaped toward a long-lived cache
+        // and would park this ent's COMMIT_AND_FETCH indefinitely.
+        debug_assert!(
+            age_ms < 1000,
+            "transport payload lease held {age_ms} ms (≥ 1 s) — a FUSE_WRITE \
+             payload escaped its handler (lease-severance violation, §5.4)"
+        );
+        if self.state.release() {
+            // Last lease gone with a commit parked: wake the queue worker.
+            let one: u64 = 1;
+            // SAFETY: writing 8 bytes to an eventfd we keep alive via
+            // `self.arena.wake`.
+            unsafe {
+                libc::write(
+                    self.arena.wake.as_raw_fd(),
+                    &one as *const u64 as *const _,
+                    8,
+                )
+            };
+        }
+    }
+}
+
+// SAFETY: the payload memory is owned by the arena (held alive by the Arc);
+// reads are immutable while the lease lives (protocol above); drops can run
+// on any thread (tokio workers) and only touch atomics + an eventfd write.
+unsafe impl Send for EntPayloadLease {}
+unsafe impl Sync for EntPayloadLease {}
 
 /// Shared work queue for all session workers (primary + multi-queue clones).
 struct InboundQueue {
@@ -177,6 +313,11 @@ static STATS_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static STATS_REPLIES: AtomicU64 = AtomicU64::new(0);
 static STATS_CQE_ERR: AtomicU64 = AtomicU64::new(0);
 static STATS_REGISTER: AtomicU64 = AtomicU64::new(0);
+// §5.4 transport payload-lease observability (SqueezeFS stats inode).
+static TRANSPORT_PAYLOAD_LEASES: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_PARKED_COMMITS: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_LEASES_OUTSTANDING: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_LEASE_MAX_AGE_MS: AtomicU64 = AtomicU64::new(0);
 
 pub fn over_uring_sessions_active() -> u64 {
     ACTIVE_SESSIONS.load(Ordering::Relaxed)
@@ -189,6 +330,22 @@ pub fn over_uring_stats() -> (u64, u64, u64, u64) {
         STATS_REPLIES.load(Ordering::Relaxed),
         STATS_CQE_ERR.load(Ordering::Relaxed),
         STATS_REGISTER.load(Ordering::Relaxed),
+    )
+}
+
+/// Transport payload-lease counters (§5.4): `(payload_leases,
+/// parked_commits, leases_outstanding, lease_max_age_ms)`.
+/// `payload_leases` proves adoption (FUSE_WRITE rides leases, not copies);
+/// `parked_commits` ≫ 0 means handlers hold payloads past their reply or
+/// Q_DEPTH is too small; `leases_outstanding` returns to 0 at quiesce;
+/// `lease_max_age_ms` is the severance-boundary high-water mark (bounded by
+/// one handler invocation, hard-asserted in debug builds).
+pub fn transport_lease_stats() -> (u64, u64, u64, u64) {
+    (
+        TRANSPORT_PAYLOAD_LEASES.load(Ordering::Relaxed),
+        TRANSPORT_PARKED_COMMITS.load(Ordering::Relaxed),
+        TRANSPORT_LEASES_OUTSTANDING.load(Ordering::Relaxed),
+        TRANSPORT_LEASE_MAX_AGE_MS.load(Ordering::Relaxed),
     )
 }
 
@@ -289,12 +446,11 @@ impl FuseOverUring {
             let wake = unsafe { OwnedFd::from_raw_fd(efd) };
             let wake_fd = wake.as_raw_fd();
             wake_fds.push(wake_fd);
-            let payload_buffers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             queue_handles.push(QueueHandle {
                 commit_tx,
                 wake_fd,
                 _wake: wake,
-                payload_buffers,
+                arena: std::sync::Mutex::new(None),
             });
             commit_rxs.push(commit_rx);
         }
@@ -545,8 +701,8 @@ impl FuseOverUring {
             pending_guard.get(&unique).cloned()?
         };
         let q = self.queues.get(qid as usize)?;
-        let buffers = q.payload_buffers.lock().unwrap();
-        let ptr = buffers.get(ent_idx as usize).cloned()?;
+        let arena = q.arena.lock().unwrap().clone()?;
+        let ptr = arena.buf(ent_idx as usize)?;
         Some((ptr as u64, self.payload_sz))
     }
 
@@ -608,8 +764,31 @@ type Ring = IoUring<squeue::Entry128, cqueue::Entry>;
 
 struct Ent {
     header: Box<FuseUringReqHeader>,
-    payload: Vec<u8>,
+    /// Registered payload buffer — owned by the queue's [`PayloadArena`]
+    /// (kept alive past worker exit by lease/pool Arcs).
+    payload_ptr: *mut u8,
+    payload_len: usize,
     iov: [libc::iovec; 2],
+}
+
+impl Ent {
+    /// Immutable payload view (delivery-time copy for non-leased opcodes).
+    fn payload(&self) -> &[u8] {
+        // SAFETY: `payload_ptr..+payload_len` is one arena buffer, alive for
+        // the worker's life; the kernel only writes it between re-arm and
+        // the delivery CQE, and this view is taken after the CQE.
+        unsafe { std::slice::from_raw_parts(self.payload_ptr, self.payload_len) }
+    }
+
+    /// Mutable payload view for reply application. Caller must hold the
+    /// §5.4 gate proof: the ent's lease refs == 0 (CommitGate::Ready /
+    /// try_unpark). Writing while a lease lives is the mutation-under-alias
+    /// UB class the protocol exists to eliminate.
+    fn payload_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, plus the caller-supplied refs == 0 proof that no
+        // live `&[u8]` (lease) aliases the region.
+        unsafe { std::slice::from_raw_parts_mut(self.payload_ptr, self.payload_len) }
+    }
 }
 
 /// Poll `/dev/fuse` until the connection is aborted/closed or the pool shuts down.
@@ -674,14 +853,23 @@ fn queue_worker(
             ))
         })?;
 
+    // Payload memory lives in an Arc'd arena (not the worker-local Ent) so
+    // FUSE_WRITE leases and `get_payload_buffer` pointers stay valid past
+    // worker exit (§5.4).
+    let arena = PayloadArena::new(depth, payload_sz, wake_fd)?;
+    // One lease state per ring ent + the worker-local parked commit slots.
+    let lease_states: Vec<Arc<EntLeaseState>> =
+        (0..depth).map(|_| Arc::new(EntLeaseState::new())).collect();
+    let mut parked_msgs: Vec<Option<CommitMsg>> = (0..depth).map(|_| None).collect();
+
     let mut ents: Vec<Ent> = (0..depth)
-        .map(|_| {
+        .map(|idx| {
             let mut header = Box::new(FuseUringReqHeader::default());
-            let payload = vec![0u8; payload_sz];
             header.ring_ent_in_out.payload_sz = payload_sz as u32;
             Ent {
                 header,
-                payload,
+                payload_ptr: arena.buf(idx).expect("arena sized to depth"),
+                payload_len: payload_sz,
                 iov: [
                     libc::iovec {
                         iov_base: std::ptr::null_mut(),
@@ -702,15 +890,12 @@ fn queue_worker(
             iov_len: std::mem::size_of::<FuseUringReqHeader>(),
         };
         ent.iov[1] = libc::iovec {
-            iov_base: ent.payload.as_mut_ptr().cast(),
-            iov_len: ent.payload.len(),
+            iov_base: ent.payload_ptr.cast(),
+            iov_len: ent.payload_len,
         };
     }
 
-    {
-        let mut buffers = pool.queues[qid as usize].payload_buffers.lock().unwrap();
-        *buffers = ents.iter_mut().map(|ent| ent.payload.as_mut_ptr() as usize).collect();
-    }
+    *pool.queues[qid as usize].arena.lock().unwrap() = Some(arena.clone());
 
     for (idx, ent) in ents.iter().enumerate() {
         push_cmd(
@@ -740,19 +925,39 @@ fn queue_worker(
     pool.queues_registered.fetch_add(1, Ordering::AcqRel);
 
     while pool.active.load(Ordering::Relaxed) {
-        // Drain commits for this queue only (no demux)
+        // Drain commits for this queue only (no demux). §5.4 re-arm gate: a
+        // COMMIT_AND_FETCH both writes the reply into the ent payload and
+        // re-arms the registered buffers for the kernel — never legal while
+        // a payload lease is live. Gate every commit; park the message when
+        // leased and rely on the lease drop's eventfd wake.
         while let Ok(msg) = commit_rx.try_recv() {
-            let ent = &mut ents[msg.ent_idx as usize];
-            apply_reply(ent, &msg.header, &msg.reply_body);
-            push_cmd(
-                &mut ring,
-                FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
-                qid,
-                msg.commit_id,
-                None,
-                msg.ent_idx as u64,
-            )?;
-            ring.submit()?;
+            let idx = msg.ent_idx as usize;
+            if idx >= ents.len() {
+                warn!("fuse-over-uring qid={qid}: commit for bad ent {idx}");
+                continue;
+            }
+            match lease_states[idx].try_commit() {
+                CommitGate::Ready => {
+                    apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
+                    push_cmd(
+                        &mut ring,
+                        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                        qid,
+                        msg.commit_id,
+                        None,
+                        idx as u64,
+                    )?;
+                    ring.submit()?;
+                }
+                CommitGate::Parked => {
+                    debug_assert!(
+                        parked_msgs[idx].is_none(),
+                        "two commits parked for one ring ent"
+                    );
+                    TRANSPORT_PARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
+                    parked_msgs[idx] = Some(msg);
+                }
+            }
         }
         // Drain eventfd
         let mut buf = [0u8; 8];
@@ -770,6 +975,27 @@ fn queue_worker(
             }
             if n == 0 {
                 break;
+            }
+        }
+
+        // Parked scan (runs on every wake path — lease-drop eventfd, new
+        // CQEs, commit sends — and always before the worker can sleep in
+        // submit_and_wait): un-park and commit every ent whose lease is
+        // gone. try_unpark re-proves refs == 0, so the payload write below
+        // cannot alias a live lease.
+        for idx in 0..ents.len() {
+            if parked_msgs[idx].is_some() && lease_states[idx].try_unpark() {
+                let msg = parked_msgs[idx].take().expect("checked is_some");
+                apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
+                push_cmd(
+                    &mut ring,
+                    FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                    qid,
+                    msg.commit_id,
+                    None,
+                    idx as u64,
+                )?;
+                ring.submit()?;
             }
         }
 
@@ -864,6 +1090,9 @@ fn queue_worker(
                     warn!(
                         "fuse-over-uring qid={qid} ent={ent_idx}: unique=0 commit_id={cid}; force EIO COMMIT"
                     );
+                    // Delivery on this ent implies its previous commit passed
+                    // the refs == 0 gate; header-only reply, payload untouched.
+                    debug_assert!(!lease_states[ent_idx].leased());
                     let mut out = [0u8; 16];
                     out[0..4].copy_from_slice(&16u32.to_le_bytes());
                     out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
@@ -893,9 +1122,31 @@ fn queue_worker(
                 Vec::with_capacity(FUSE_IN_HEADER_SIZE + FUSE_URING_OP_IN_OUT_SZ);
             header_and_op.extend_from_slice(&ents[ent_idx].header.in_out[..FUSE_IN_HEADER_SIZE]);
             header_and_op.extend_from_slice(&ents[ent_idx].header.op_in);
-            let payload = Bytes::copy_from_slice(
-                &ents[ent_idx].payload[..payload_sz.min(ents[ent_idx].payload.len())],
-            );
+            let capped_sz = payload_sz.min(ents[ent_idx].payload_len);
+            // §5.4: FUSE_WRITE payloads ride a zero-copy lease over the
+            // registered buffer (kills the 1 MiB copy + alloc per write
+            // request, audit #1); the commit gate above defers the ent's
+            // re-arm until the lease drops. FORGET/BATCH_FORGET are
+            // auto-committed below *before* the session consumes the payload
+            // — leasing them would hand the session a buffer the kernel is
+            // already refilling — and non-write opcodes carry small payloads
+            // (names, xattrs): both keep the copy.
+            let payload = if opcode == FUSE_WRITE_OPCODE && capped_sz > 0 {
+                let state = Arc::clone(&lease_states[ent_idx]);
+                let prev = state.acquire();
+                debug_assert_eq!(prev, 0, "delivery on a still-leased ent");
+                TRANSPORT_PAYLOAD_LEASES.fetch_add(1, Ordering::Relaxed);
+                TRANSPORT_LEASES_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
+                Bytes::from_owner(EntPayloadLease {
+                    arena: Arc::clone(&arena),
+                    state,
+                    ptr: ents[ent_idx].payload_ptr as *const u8,
+                    len: capped_sz,
+                    born: Instant::now(),
+                })
+            } else {
+                Bytes::copy_from_slice(&ents[ent_idx].payload()[..capped_sz])
+            };
 
             pool.stats_requests.fetch_add(1, Ordering::Relaxed);
             STATS_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -917,6 +1168,10 @@ fn queue_worker(
                     payload,
                     unique,
                 });
+                // FORGET payloads are copies (never leased) and this ent's
+                // previous commit passed the refs == 0 gate: the immediate
+                // auto-commit below cannot alias a live lease.
+                debug_assert!(!lease_states[ent_idx].leased());
                 let mut out = [0u8; 16];
                 out[0..4].copy_from_slice(&16u32.to_le_bytes());
                 // error = 0
@@ -981,18 +1236,60 @@ fn queue_worker(
             let _ = ring.submit();
         }
     }
-    // Final drain of any pending commits (including FUSE_DESTROY reply) before exiting
-    let mut final_commits = 0;
+    // Final drain of parked messages plus any pending commits (including the
+    // FUSE_DESTROY reply) before exiting. §5.4: the no-write-while-leased
+    // rule stays unconditional — it is not waived at shutdown. A still-leased
+    // ent gets a short bounded wait for the lease to drop; if it survives,
+    // the worker sends a header-only error reply (16-byte fuse_out_header,
+    // payload_sz = 0 — the exact shape of the unique=0 recovery path), never
+    // writing the leased payload region. The arena Arc keeps the leased
+    // memory valid, so a pathological handler holding a payload past
+    // shutdown degrades to a leaked buffer and a dropped reply body — never
+    // a dangling pointer, and never a write into memory a live &[u8]
+    // aliases.
+    let mut final_msgs: Vec<CommitMsg> = parked_msgs.iter_mut().filter_map(|s| s.take()).collect();
     while let Ok(msg) = commit_rx.try_recv() {
-        let ent = &mut ents[msg.ent_idx as usize];
-        apply_reply(ent, &msg.header, &msg.reply_body);
+        final_msgs.push(msg);
+    }
+    let mut final_commits = 0;
+    for msg in final_msgs {
+        let idx = msg.ent_idx as usize;
+        if idx >= ents.len() {
+            continue;
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut free = lease_states[idx].try_unpark();
+        while !free && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            free = lease_states[idx].try_unpark();
+        }
+        if free {
+            apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
+        } else {
+            warn!(
+                "fuse-over-uring qid={qid} ent={idx}: payload lease still live at \
+                 shutdown; committing header-only error reply"
+            );
+            let unique = if msg.header.len() >= 16 {
+                u64::from_le_bytes(msg.header[8..16].try_into().unwrap())
+            } else {
+                0
+            };
+            let mut out = [0u8; 16];
+            out[0..4].copy_from_slice(&16u32.to_le_bytes());
+            out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
+            out[8..16].copy_from_slice(&unique.to_le_bytes());
+            // Header-only: apply_reply never touches the payload region when
+            // the reply has no body beyond the 16-byte fuse_out_header.
+            apply_reply(&mut ents[idx], &out, &Bytes::new());
+        }
         let _ = push_cmd(
             &mut ring,
             FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
             qid,
             msg.commit_id,
             None,
-            msg.ent_idx as u64,
+            idx as u64,
         );
         final_commits += 1;
     }
@@ -1005,6 +1302,13 @@ fn queue_worker(
 
 /// Place a classical fuse reply (`fuse_out_header` || body) into the ring entry
 /// the way libfuse/`send_reply_uring` does: header in `in_out`, body in payload.
+///
+/// §5.4 aliasing contract: any call that can write the payload region
+/// (header > 16 bytes or a non-empty body) requires the ent's lease
+/// refs == 0, proven by the caller via `CommitGate::Ready` / `try_unpark`.
+/// A 16-byte header-only reply touches only the (separately allocated)
+/// header struct and is safe even while a lease lives — the shutdown drain
+/// relies on exactly that.
 fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
     const OUT_HDR: usize = 16; // sizeof(fuse_out_header)
     // Clear header region so stale request bytes cannot leak into the reply.
@@ -1021,14 +1325,14 @@ fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
     let mut payload_len = 0;
     if header.len() > OUT_HDR {
         let extra = &header[OUT_HDR..];
-        let n = extra.len().min(ent.payload.len());
-        ent.payload[..n].copy_from_slice(&extra[..n]);
+        let n = extra.len().min(ent.payload_len);
+        ent.payload_mut()[..n].copy_from_slice(&extra[..n]);
         payload_len = n;
     }
 
-    let body_len = body.len().min(ent.payload.len() - payload_len);
-    if body_len > 0 && body.as_ptr() != unsafe { ent.payload.as_ptr().add(payload_len) } {
-        ent.payload[payload_len..payload_len + body_len].copy_from_slice(&body[..body_len]);
+    let body_len = body.len().min(ent.payload_len - payload_len);
+    if body_len > 0 && body.as_ptr() != unsafe { ent.payload_ptr.add(payload_len) as *const u8 } {
+        ent.payload_mut()[payload_len..payload_len + body_len].copy_from_slice(&body[..body_len]);
     }
     payload_len += body_len;
 
@@ -1094,5 +1398,84 @@ mod tests {
     fn test_header_sizes() {
         assert_eq!(std::mem::size_of::<FuseUringReqHeader>(), 128 + 128 + 32);
         assert_eq!(std::mem::size_of::<FuseUringCmdReq>(), 24);
+    }
+
+    #[test]
+    fn test_write_opcode_matches_abi() {
+        assert_eq!(FUSE_WRITE_OPCODE, 16, "linux/fuse.h FUSE_WRITE");
+    }
+
+    /// Arena buffers: one stable, 4096-aligned, zeroed allocation per ring
+    /// ent; out-of-range indexes refused; the dup'ed wake fd is distinct
+    /// from (but signals) the original eventfd.
+    #[test]
+    fn test_payload_arena_buffers() {
+        let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(efd >= 0);
+        let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
+        let arena = PayloadArena::new(4, 8192, efd_owned.as_raw_fd()).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for idx in 0..4 {
+            let p = arena.buf(idx).expect("in-range ent");
+            assert_eq!(p as usize % 4096, 0, "payload buffers must be page-aligned");
+            assert!(seen.insert(p as usize), "ent buffers must not alias");
+            // Born zeroed (fresh arena; the kernel owns content afterwards).
+            let s = unsafe { std::slice::from_raw_parts(p, 8192) };
+            assert!(s.iter().all(|&b| b == 0));
+        }
+        assert!(arena.buf(4).is_none(), "out-of-range ent must be refused");
+
+        // The arena wake fd is a dup: writing it must signal the original.
+        let one: u64 = 1;
+        let w = unsafe {
+            libc::write(
+                arena.wake.as_raw_fd(),
+                &one as *const u64 as *const _,
+                8,
+            )
+        };
+        assert_eq!(w, 8);
+        let mut buf = [0u8; 8];
+        let r = unsafe { libc::read(efd_owned.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
+        assert_eq!(r, 8, "dup'ed wake fd must signal the queue eventfd");
+    }
+
+    /// A dropped payload lease releases its ref, records the outstanding
+    /// gauge, and fires the queue eventfd when (and only when) a commit is
+    /// parked.
+    #[test]
+    fn test_lease_drop_wakes_parked_worker() {
+        let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(efd >= 0);
+        let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
+        let arena = PayloadArena::new(1, 8192, efd_owned.as_raw_fd()).unwrap();
+        let state = Arc::new(EntLeaseState::new());
+
+        assert_eq!(state.acquire(), 0);
+        TRANSPORT_LEASES_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
+        let lease = EntPayloadLease {
+            arena: Arc::clone(&arena),
+            state: Arc::clone(&state),
+            ptr: arena.buf(0).unwrap() as *const u8,
+            len: 16,
+            born: Instant::now(),
+        };
+        let bytes = Bytes::from_owner(lease);
+        assert_eq!(bytes.len(), 16);
+        let clone = bytes.clone();
+        drop(bytes);
+        // A clone keeps the single owner (and its ref) alive.
+        assert!(state.leased(), "clone dropped the owner early");
+
+        // Reply while leased: gate parks.
+        assert_eq!(state.try_commit(), CommitGate::Parked);
+        drop(clone);
+        assert!(!state.leased());
+        // The drop must have fired the wake (parked was set).
+        let mut buf = [0u8; 8];
+        let r = unsafe { libc::read(efd_owned.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
+        assert_eq!(r, 8, "lease drop with a parked commit must fire the eventfd");
+        assert!(state.try_unpark(), "commit releasable after the drop");
     }
 }

@@ -95,6 +95,29 @@ pub fn inode_write_lock_scope(fits_inline: bool, is_striped: bool) -> InodeWrite
     }
 }
 
+/// §5.4 lease-severance boundary (zero-copy write-path design, PR 5).
+///
+/// FUSE_WRITE payloads arrive as zero-copy transport leases over the
+/// registered FUSE-over-io_uring payload buffer; the ring ent is not
+/// re-armed (COMMIT_AND_FETCH) until the lease drops. A lease that escapes
+/// the write handler into a long-lived sink (`data_key`, the LRUs) parks
+/// that ent forever — at `Q_DEPTH = 4`, a deterministic mount hang. Routes
+/// that hand the payload to `DataRouter::write_file` therefore materialize
+/// it lease-free first with one unconditional copy (the same bytes the
+/// transport used to copy *twice* before PR 5, now paid only by the
+/// small/staged routes — the hot striped route consumes the lease via the
+/// accumulation merge and never severs). Unconditional rather than
+/// lease-detecting: `bytes::Bytes` cannot cheaply introspect its owner, and
+/// a copy on the cold routes beats a reachability argument every reviewer
+/// must re-verify. Invariant, checkable in one place: a transport lease
+/// never escapes the write handler's call graph — consumed by the
+/// accumulation merge, the one-shot severing copy, or `sever_payload`,
+/// all before the handler returns.
+#[inline]
+fn sever_payload(data: &bytes::Bytes) -> bytes::Bytes {
+    bytes::Bytes::copy_from_slice(data)
+}
+
 struct ThreadLocalState {
     count: u64,
     target: *const AtomicU64,
@@ -934,6 +957,14 @@ impl SqueezefsFilesystem {
         let (fou_req, fou_rep, fou_err, fou_reg) = fuse3::over_uring_stats();
         #[cfg(not(target_os = "linux"))]
         let (fou_req, fou_rep, fou_err, fou_reg) = (0u64, 0u64, 0u64, 0u64);
+        // §5.4 transport payload-lease signals: adoption, parked-ent
+        // pressure, and the severance-boundary enforcement pair
+        // (outstanding hovers at in-flight write count and returns to 0 at
+        // quiesce; max age is bounded by one handler invocation).
+        #[cfg(target_os = "linux")]
+        let (t_leases, t_parked, t_outstanding, t_max_age) = fuse3::transport_lease_stats();
+        #[cfg(not(target_os = "linux"))]
+        let (t_leases, t_parked, t_outstanding, t_max_age) = (0u64, 0u64, 0u64, 0u64);
 
         let stats_obj = serde_json::json!({
             "read_lru_keys": read_lru_keys,
@@ -977,6 +1008,10 @@ impl SqueezefsFilesystem {
                 "fuse_over_uring_replies": fou_rep,
                 "fuse_over_uring_cqe_errors": fou_err,
                 "fuse_over_uring_registers": fou_reg,
+                "transport_payload_leases": t_leases,
+                "transport_parked_commits": t_parked,
+                "transport_leases_outstanding": t_outstanding,
+                "transport_lease_max_age_ms": t_max_age,
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
@@ -2991,7 +3026,16 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             if use_router_write {
-                let data_bytes = data.clone();
+                // §5.4 lease-severance boundary, route (i): the router's
+                // inline/staged commits retain the payload `Bytes`
+                // unboundedly (`data_key`, `write_lru`, `read_lru`) and its
+                // internal promotions slice it across device writes — a
+                // transport payload lease here would park the ring ent's
+                // COMMIT_AND_FETCH for as long as the cache holds it
+                // (deterministic mount hang at Q_DEPTH=4). Materialize a
+                // private copy before anything reaches
+                // `DataRouter::write_file`.
+                let data_bytes = sever_payload(&data);
                 if lock_scope == InodeWriteLockScope::MetaPrepOnly {
                     drop(guard);
                     if let Err(e) = self
@@ -3079,7 +3123,13 @@ impl Filesystem for SqueezefsFilesystem {
                         && (data.len() as u64 % block_size == 0);
 
                     if is_aligned {
-                        let data_bytes = data.clone();
+                        // §5.4 lease-severance boundary, route (ii): the
+                        // transitional `is_aligned` direct leg (dead for the
+                        // default shape, live for small-block configs) holds
+                        // payload slices across allocate + DMA inside the
+                        // router's striped section. One line of scaffolding
+                        // that PR 6 deletes together with the branch.
+                        let data_bytes = sever_payload(&data);
                         if let Err(e) = self
                             .router
                             .write_file(&file_path, offset, data_bytes, fencing_token)

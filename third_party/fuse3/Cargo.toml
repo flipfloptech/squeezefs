@@ -121,6 +121,10 @@ features = [
     "net",
     "macros",
     "process",
+    # The crate itself uses tokio::time (over-uring inbound timeout, session
+    # retry sleeps); without this the standalone `cargo test` of the vendored
+    # crate only compiled via downstream feature unification.
+    "time",
 ]
 optional = true
 
@@ -164,3 +168,9 @@ unprivileged = [
 version = "0.29.0"
 features = ["user", "ioctl"]
 default-features = false
+
+# `lease_core.rs` (FUSE-over-io_uring payload-lease protocol core) is
+# `#[path]`-included by the SqueezeFS loom-models crate and switches its
+# atomics on `cfg(loom)`; the main build never sets it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

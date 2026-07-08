@@ -3,6 +3,21 @@ set -euo pipefail
 
 # Squeezefs integration script for fstests (xfstests).
 # MUST be run as root.
+#
+# Harness contract this script has to satisfy (xfstests common/rc + check):
+#  - Tests unmount/remount TEST_DEV and SCRATCH_DEV between (and inside) tests
+#    via `mount -t fuse.squeezefs $DEV $MNT` / `umount $DEV`. The mount helper
+#    must be SILENT on success (its stdout leaks into golden output diffs) and
+#    must not return until the mount is actually usable.
+#  - `umount` returns before the squeezefs daemon finishes draining staged
+#    writes. The next mount of the same device must wait for the previous
+#    daemon to exit, or two daemons race on the same meta volume (fencing
+#    discards -> phantom data loss) and a dead ENOTCONN mountpoint corrupts
+#    $TEST_DIR inside common/config ("mount: bad usage" cascade).
+#  - xfstests never re-mkfs a FUSE scratch fs (common/rc _scratch_mkfs just
+#    rm -rf's it), so volumes must be big enough for a full `-g auto` run:
+#    meta sized for the 20000-inode allocator cap (see
+#    src/meta_backend/storage.rs: usable inodes = (size - 72 MiB) / 32 KiB).
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: This script must run as root (sudo $0)." >&2
@@ -11,12 +26,38 @@ fi
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUNUSER="${SUDO_USER:-root}"
-# Ensure mount points are clean from any previous runs
-umount -l /mnt/squeezefs_test /mnt/squeezefs_scratch &>/dev/null || true
-rm -rf /mnt/squeezefs_test/.* /mnt/squeezefs_test/* /mnt/squeezefs_scratch/.* /mnt/squeezefs_scratch/* &>/dev/null || true
+
+TEST_DIR="${TEST_DIR:-/mnt/squeezefs_test}"
+SCRATCH_MNT="${SCRATCH_MNT:-/mnt/squeezefs_scratch}"
+TEST_DEV="${TEST_DEV:-/dev/shm/squeezefs_fstests_test_meta}"
+SCRATCH_DEV="${SCRATCH_DEV:-/dev/shm/squeezefs_fstests_scratch_meta}"
+
+# Sizes: meta >= 72 MiB + 20000 * 32 KiB (~697 MiB) reaches the inode
+# allocator cap; below that "Inode table full" aborts long runs. Backing
+# files are sparse on tmpfs.
+META_SIZE="${SQUEEZEFS_FSTESTS_META_SIZE:-1G}"
+DATA_SIZE="${SQUEEZEFS_FSTESTS_DATA_SIZE:-8G}"
 
 echo "=== Squeezefs fstests Integration ==="
 echo "Repo: $REPO_DIR"
+
+# 0. Clean state from any previous runs: unmount, wait out old daemons,
+#    wipe stale backing volumes / staging dirs / mountpoint underlay junk.
+echo "Cleaning up state from previous runs..."
+umount -l "$TEST_DIR" "$SCRATCH_MNT" &>/dev/null || true
+pkill -f "squeezefs mount sqmeta://${TEST_DEV}" &>/dev/null || true
+pkill -f "squeezefs mount sqmeta://${SCRATCH_DEV}" &>/dev/null || true
+for _ in $(seq 1 100); do
+    pgrep -f "squeezefs mount sqmeta://(${TEST_DEV}|${SCRATCH_DEV})" >/dev/null || break
+    sleep 0.1
+done
+pkill -9 -f "squeezefs mount sqmeta://(${TEST_DEV}|${SCRATCH_DEV})" &>/dev/null || true
+rm -f "$TEST_DEV" "${TEST_DEV/_meta/_data}" "$SCRATCH_DEV" "${SCRATCH_DEV/_meta/_data}"
+rm -rf /tmp/squeezefs_fstests_staging_* /tmp/squeezefs_fstests_*.log
+# Leaked files on the underlying mountpoint dirs make the daemon refuse to
+# mount ("mount point is not empty"); recreate them empty.
+rm -rf "$TEST_DIR" "$SCRATCH_MNT"
+mkdir -p "$TEST_DIR" "$SCRATCH_MNT"
 
 # 1. Install prerequisites
 echo "Installing prerequisites..."
@@ -62,8 +103,15 @@ fi
 # 4. Install mount and mkfs helpers
 echo "Installing FUSE helpers in /sbin..."
 
-cat << 'EOF' > /sbin/mount.fuse.squeezefs
+cat << EOF > /sbin/mount.fuse.squeezefs
 #!/bin/bash
+# mount(8) helper for -t fuse.squeezefs. Contract: silent on success (stdout
+# leaks into xfstests golden output), non-zero + stderr on failure, and the
+# mount is usable when we return.
+set -u
+SQUEEZEFS_BIN="$SQUEEZEFS_BIN"
+EOF
+cat << 'EOF' >> /sbin/mount.fuse.squeezefs
 DEV="$1"
 MNT="$2"
 shift 2
@@ -83,17 +131,36 @@ if [ -n "$OPTS" ]; then
     ALL_OPTS="$ALL_OPTS,$OPTS"
 fi
 
-SQUEEZEFS_BIN="/home/justin/Source/squeezefs/target/release/squeezefs"
-
-if [[ "$MNT" == *"test"* ]]; then
-    STAGING_DIR="/tmp/squeezefs_fstests_staging_test"
-else
-    STAGING_DIR="/tmp/squeezefs_fstests_staging_scratch"
-fi
+TAG="$(basename "$MNT")"
+LOG="/tmp/squeezefs_fstests_${TAG}.log"
+STAGING_DIR="/tmp/squeezefs_fstests_staging_${TAG}"
 mkdir -p "$STAGING_DIR"
 
-# Run mount daemon
-exec "$SQUEEZEFS_BIN" mount \
+# xfstests' `umount` returns while the previous daemon is still draining
+# staged writes to this same meta volume + staging dir. Mounting a second
+# daemon on top of that races fencing/recovery and corrupts the volume, and a
+# daemon dying mid-teardown leaves the mountpoint ENOTCONN. Serialize: wait
+# (up to 60s) for any prior daemon on this device to exit before mounting.
+for _ in $(seq 1 600); do
+    pgrep -f "squeezefs mount sqmeta://$DEV " >/dev/null 2>&1 || break
+    sleep 0.1
+done
+if pgrep -f "squeezefs mount sqmeta://$DEV " >/dev/null 2>&1; then
+    echo "mount.fuse.squeezefs: previous daemon for $DEV still running after 60s" >&2
+    exit 32
+fi
+
+# Clear stale mountpoint state: detach a dead FUSE attachment (stat fails
+# with ENOTCONN), then remove any files leaked onto the underlying directory
+# — the daemon refuses non-empty mountpoints.
+if ! stat "$MNT" >/dev/null 2>&1; then
+    umount -l "$MNT" 2>/dev/null
+fi
+if ! mountpoint -q "$MNT" 2>/dev/null; then
+    find "$MNT" -mindepth 1 -delete 2>/dev/null
+fi
+
+"$SQUEEZEFS_BIN" mount \
     "sqmeta://$DEV" \
     "$MNT" \
     --daemon \
@@ -101,21 +168,33 @@ exec "$SQUEEZEFS_BIN" mount \
     --disk-cache-size 500MB \
     --allow-other \
     -o "$ALL_OPTS" \
-    --log-file "/tmp/squeezefs_fstests_$(basename "$MNT").log"
+    --log-file "$LOG" >> "$LOG" 2>&1
+rc=$?
+if [ $rc -ne 0 ]; then
+    echo "mount.fuse.squeezefs: squeezefs mount $DEV -> $MNT failed (rc=$rc); see $LOG" >&2
+    exit 32
+fi
+exit 0
 EOF
 chmod +x /sbin/mount.fuse.squeezefs
 
-cat << 'EOF' > /sbin/mkfs.fuse.squeezefs
+cat << EOF > /sbin/mkfs.fuse.squeezefs
 #!/bin/bash
+set -u
+SQUEEZEFS_BIN="$SQUEEZEFS_BIN"
+META_SIZE="$META_SIZE"
+DATA_SIZE="$DATA_SIZE"
+EOF
+cat << 'EOF' >> /sbin/mkfs.fuse.squeezefs
 DEV="$1"
 DATA_DEV="${DEV/_meta/_data}"
 
 if [ ! -b "$DEV" ]; then
-    truncate -s 128M "$DEV"
-    truncate -s 1G "$DATA_DEV"
+    # Recreate sparse backing files so a re-format drops old allocations.
+    rm -f "$DEV" "$DATA_DEV"
+    truncate -s "$META_SIZE" "$DEV"
+    truncate -s "$DATA_SIZE" "$DATA_DEV"
 fi
-
-SQUEEZEFS_BIN="/home/justin/Source/squeezefs/target/release/squeezefs"
 
 # Format
 exec "$SQUEEZEFS_BIN" format \
@@ -125,25 +204,58 @@ exec "$SQUEEZEFS_BIN" format \
 EOF
 chmod +x /sbin/mkfs.fuse.squeezefs
 
+# UMOUNT_PROG wrapper: a freshly armed FUSE-over-io_uring mount holds a
+# kernel-side reference for up to ~100ms after mount(8) returns, so the
+# zero-dwell umount xfstests issues in cycle-mount paths fails EBUSY with no
+# userspace holder (deterministic in e.g. generic/003). Retry briefly; a real
+# leak still fails after the 5s budget. Silent on eventual success so no
+# noise reaches golden output.
+UMOUNT_REAL="$(type -P umount)"
+cat << EOF > /sbin/umount.squeezefs-fstests
+#!/bin/bash
+UMOUNT_REAL="$UMOUNT_REAL"
+EOF
+cat << 'EOF' >> /sbin/umount.squeezefs-fstests
+rc=0
+for _ in $(seq 1 100); do
+    ERR=$("$UMOUNT_REAL" "$@" 2>&1)
+    rc=$?
+    [ $rc -eq 0 ] && exit 0
+    case "$ERR" in
+    *"target is busy"*)
+        sleep 0.05
+        ;;
+    *)
+        break
+        ;;
+    esac
+done
+[ -n "$ERR" ] && echo "$ERR" >&2
+exit $rc
+EOF
+chmod +x /sbin/umount.squeezefs-fstests
+
 # 5. Create local.config
 echo "Configuring xfstests local.config..."
 cat << EOF > "$XFSTESTS_DIR/local.config"
 export FSTYP=fuse
 export FUSE_SUBTYP=.squeezefs
 
-export TEST_DIR=${TEST_DIR:-/mnt/squeezefs_test}
-export SCRATCH_MNT=${SCRATCH_MNT:-/mnt/squeezefs_scratch}
+export TEST_DIR=$TEST_DIR
+export SCRATCH_MNT=$SCRATCH_MNT
 
-export TEST_DEV=${TEST_DEV:-/dev/shm/squeezefs_fstests_test_meta}
-export SCRATCH_DEV=${SCRATCH_DEV:-/dev/shm/squeezefs_fstests_scratch_meta}
+export TEST_DEV=$TEST_DEV
+export SCRATCH_DEV=$SCRATCH_DEV
+
+# common/config sets UMOUNT_PROG before sourcing this file; override it so
+# every harness unmount rides the EBUSY-retry wrapper installed by
+# tests/run_fstests.sh.
+export UMOUNT_PROG=/sbin/umount.squeezefs-fstests
 EOF
 
-# Ensure mount points exist
-mkdir -p "${TEST_DIR:-/mnt/squeezefs_test}" "${SCRATCH_MNT:-/mnt/squeezefs_scratch}"
-
 # Pre-format TEST_DEV and SCRATCH_DEV once since xfstests doesn't mkfs them for FUSE
-/sbin/mkfs.fuse.squeezefs "${TEST_DEV:-/dev/shm/squeezefs_fstests_test_meta}"
-/sbin/mkfs.fuse.squeezefs "${SCRATCH_DEV:-/dev/shm/squeezefs_fstests_scratch_meta}"
+/sbin/mkfs.fuse.squeezefs "$TEST_DEV"
+/sbin/mkfs.fuse.squeezefs "$SCRATCH_DEV"
 
 # 6. Run fstests
 if [ $# -eq 0 ]; then
@@ -160,11 +272,14 @@ set +e
 EXIT_CODE=$?
 set -e
 
-# 7. Cleanup
+# 7. Cleanup: unmount and wait for the daemons to finish draining so a
+#    back-to-back invocation starts from a quiet state.
 echo "Cleaning up..."
-umount /mnt/squeezefs_test /mnt/squeezefs_scratch &>/dev/null || true
-# rm -f /sbin/mount.fuse.squeezefs /sbin/mkfs.fuse.squeezefs
-# rm -f /dev/shm/squeezefs_fstests_*
+umount "$TEST_DIR" "$SCRATCH_MNT" &>/dev/null || true
+for _ in $(seq 1 300); do
+    pgrep -f "squeezefs mount sqmeta://(${TEST_DEV}|${SCRATCH_DEV})" >/dev/null || break
+    sleep 0.1
+done
 
 echo "=== fstests Completed (exit=$EXIT_CODE) ==="
 exit $EXIT_CODE

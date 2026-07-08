@@ -5368,12 +5368,18 @@ async fn requeue_or_hard_fail(
     }
 }
 
+/// Upload one staged active block via the §5.5 write-only guard-backed DMA
+/// source (zero staging copy). Resolves carrying keys/sizes only — the
+/// staging guard is provably dead inside [`cache::nvme::write_block_from_staging`]
+/// before this future completes, so the batch stage never carries guards in
+/// its `results`.
 async fn upload_single_active_block_data(
     ino: u64,
     b: u32,
     router: &DataRouter,
     old_block_key: Option<String>,
-) -> Result<(u32, u64, Option<String>, bytes::Bytes), SqueezefsError> {
+    cache_promotion_copy: bool,
+) -> Result<(u32, u64, Option<String>), SqueezefsError> {
     let cache_key = crate::keys::active_block(ino, b as u64).to_string();
 
     let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
@@ -5381,8 +5387,8 @@ async fn upload_single_active_block_data(
     let block_guard = block_lock.lock().await;
     METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
-    let block_data_guard = match router.cache.nvme.read_staged_zero_copy(&cache_key) {
-        Some(g) => g,
+    let block_data_source = match router.cache.nvme.staged_dma_source(&cache_key) {
+        Some(s) => s,
         None => {
             return Err(SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -5390,20 +5396,26 @@ async fn upload_single_active_block_data(
             )))
         }
     };
-
-    let block_bytes = bytes::Bytes::copy_from_slice(&block_data_guard);
-    drop(block_data_guard);
+    // §5.5: guard-backed bytes never enter any cache — the promotion LRU
+    // seed (not-yet-striped files only, cold path) is a bounded real copy
+    // taken while the source is alive.
+    let lru_copy = cache_promotion_copy.then(|| block_data_source.detached_copy());
     drop(block_guard);
-
-    let processed_block = router
-        .get_crypto()
-        .process_write_async(block_bytes.clone())
-        .await?;
 
     let (_be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
     let offset = block_allocator.allocate_block().await?;
 
-    if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
+    // Consumes the source (crypto transform severs the guard pre-DMA;
+    // passthrough DMAs straight off the staging mmap and drops the guard on
+    // completion — normative §5.5 sequencing).
+    if let Err(e) = crate::cache::nvme::write_block_from_staging(
+        router.get_crypto(),
+        &nvme_writer,
+        offset,
+        block_data_source,
+    )
+    .await
+    {
         error!(
             "upload_single_active_block_data: Failed to upload block {} of inode {} to NVMe: {:?}",
             b, ino, e
@@ -5413,7 +5425,14 @@ async fn upload_single_active_block_data(
     }
     block_allocator.publish_block(offset);
 
-    Ok((b, offset, old_block_key, block_bytes))
+    // Post-DMA, post-publish, pre-merge — the same put point as the routing
+    // striped path (`routing.rs` per-block task): the key stays unreferenced
+    // until the block-map save below publishes it.
+    if let Some(copy) = lru_copy {
+        router.cache.read_lru.put(&offset.to_string(), copy);
+    }
+
+    Ok((b, offset, old_block_key))
 }
 
 async fn flush_due_active_blocks_for_inode(
@@ -5438,12 +5457,25 @@ async fn flush_due_active_blocks_for_inode(
 
     let router_clone = router.clone();
     let old_block_keys_clone = old_block_keys.clone();
+    // Promotion LRU seeding happens inside the per-block future with a
+    // detached copy (§5.5): the batch results carry keys/sizes only, never
+    // guard-backed bytes.
+    let cache_promotion_copy = !is_striped;
 
     let mut flushes = stream::iter(block_indices.into_iter().enumerate().map(
         move |(idx, block_idx)| {
             let router = router_clone.clone();
             let old_key = old_block_keys_clone[idx].clone();
-            async move { upload_single_active_block_data(ino, block_idx, &router, old_key).await }
+            async move {
+                upload_single_active_block_data(
+                    ino,
+                    block_idx,
+                    &router,
+                    old_key,
+                    cache_promotion_copy,
+                )
+                .await
+            }
         },
     ))
     .buffer_unordered(8);
@@ -5476,7 +5508,7 @@ async fn flush_due_active_blocks_for_inode(
     }
     let mut block_map = meta.block_map.clone().unwrap_or_default();
 
-    for &(b, offset, _, _) in &results {
+    for &(b, offset, _) in &results {
         block_map.insert(b, offset.to_string());
     }
     meta.block_map = Some(block_map);
@@ -5486,14 +5518,7 @@ async fn flush_due_active_blocks_for_inode(
         .save_metadata_to_backend(ino, &meta, fencing_token)
         .await?;
 
-    for &(b, offset, ref old_key, ref block_bytes) in &results {
-        let stored_block_key = offset.to_string();
-        if !is_striped {
-            router
-                .cache
-                .read_lru
-                .put(&stored_block_key, block_bytes.clone());
-        }
+    for &(b, _, ref old_key) in &results {
         if let Some(ref bk) = old_key {
             router.cache.read_lru.remove(bk);
             let _ = router.backend_router.free_block(bk).await;
@@ -5596,23 +5621,31 @@ async fn flush_single_active_block(
     let block_guard = block_lock.lock().await;
     METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
-    let block_data_guard = match router.cache.nvme.read_staged_zero_copy(&cache_key) {
-        Some(g) => g,
+    let block_data_source = match router.cache.nvme.staged_dma_source(&cache_key) {
+        Some(s) => s,
         None => return Ok(()),
     };
 
-    let block_bytes = bytes::Bytes::copy_from_slice(&block_data_guard);
-    drop(block_data_guard);
-
-    let processed_block = router
-        .get_crypto()
-        .process_write_async(block_bytes.clone())
-        .await?;
+    // §5.5: guard-backed bytes never enter any cache — the promotion LRU
+    // seed (not-yet-striped files only, cold path) is a bounded real copy
+    // taken while the source is alive; striped flushes never put.
+    let lru_copy = (!is_striped).then(|| block_data_source.detached_copy());
 
     let (_be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
     let offset = block_allocator.allocate_block().await?;
 
-    if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
+    // Consumes the source (crypto transform severs the guard pre-DMA;
+    // passthrough DMAs straight off the staging mmap). The guard is provably
+    // dead when this returns — the meta merge and `remove_active_block`
+    // below take same-shard write locks (normative §5.5 sequencing).
+    if let Err(e) = crate::cache::nvme::write_block_from_staging(
+        router.get_crypto(),
+        &nvme_writer,
+        offset,
+        block_data_source,
+    )
+    .await
+    {
         error!(
             "flush_single_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
             b, ino, e
@@ -5653,12 +5686,10 @@ async fn flush_single_active_block(
         .save_metadata_to_backend(ino, &meta, fencing_token)
         .await?;
 
-    // Cache in RAM (bypass entirely if file is striped layout)
-    if !is_striped {
-        router
-            .cache
-            .read_lru
-            .put(&stored_block_key, block_bytes.clone());
+    // Cache in RAM (bypass entirely if file is striped layout). Promotion
+    // puts a detached copy — never the guard-backed staging bytes (§5.5).
+    if let Some(copy) = lru_copy {
+        router.cache.read_lru.put(&stored_block_key, copy);
     }
 
     if let Some(bk) = old_block_key {

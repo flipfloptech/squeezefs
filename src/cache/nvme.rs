@@ -128,6 +128,120 @@ pub fn parse_staged_blob(bytes: &[u8], is_active_block: bool) -> Option<(StagedM
     Some((meta, bytes[data_start..data_end].to_vec()))
 }
 
+/// §5.5 write-only, guard-backed DMA source over one staged payload
+/// (zero-copy write-path design, PR 3).
+///
+/// Wraps the staging shard's read guard so a flush can DMA the payload
+/// straight off the staging mmap (`bytes::Bytes::from_owner`, no copy).
+/// Active-block values are packed at a 4 KiB boundary with whole-block
+/// length, so the source qualifies for `nvme_dev::write_block`'s zero-copy
+/// `WriteData::Aligned` branch by construction (PR 2 contract).
+///
+/// Two §5.5 rules are enforced structurally:
+///
+/// - **Consumed by value, deliberately non-`Clone`**: the only sink is
+///   [`write_block_from_staging`], which guarantees the guard is dead when
+///   it returns — retention past the DMA (and therefore holding the shard
+///   read lock into a same-shard write-lock op such as
+///   `NvmeStaging::remove_active_block`, a parking_lot read→write
+///   self-deadlock) is a compile error, not a review item.
+///
+/// ```compile_fail
+/// # fn keep_a_copy(source: squeezefs::cache::nvme::StagedDmaSource) {
+/// // §5.5: the source is deliberately non-Clone — a second guard-backed
+/// // handle could outlive the DMA and reach a cache.
+/// let _second: squeezefs::cache::nvme::StagedDmaSource = source.clone();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # async fn retain_past_dma(
+/// #     crypto: &squeezefs::crypto_compress::CryptoCompressState,
+/// #     dev: &squeezefs::nvme_dev::NvmeBlockDev,
+/// #     source: squeezefs::cache::nvme::StagedDmaSource,
+/// # ) {
+/// squeezefs::cache::nvme::write_block_from_staging(crypto, dev, 0, source)
+///     .await
+///     .unwrap();
+/// // §5.5: retention past the DMA is a compile error (moved value).
+/// let _still_alive = source.len();
+/// # }
+/// ```
+///
+/// - **A guard-backed `Bytes` never enters any cache**: an LRU entry has
+///   unbounded lifetime and would hold the shard read-locked until
+///   eviction. Cache-bound consumers (the not-yet-striped promotion put)
+///   must use [`StagedDmaSource::detached_copy`] — a bounded real copy on a
+///   cold path.
+pub struct StagedDmaSource {
+    guard: crate::tiering::nvme::NvmeCacheReadGuard,
+}
+
+impl StagedDmaSource {
+    /// Payload length (the staged entry's `original_size`).
+    pub fn len(&self) -> usize {
+        self.guard.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.guard.len == 0
+    }
+
+    /// Bounded REAL copy, detached from the guard — the only sanctioned way
+    /// for staged bytes to outlive the source (§5.5: read-LRU promotion
+    /// seeds; never the guard-backed memory itself).
+    pub fn detached_copy(&self) -> Bytes {
+        Bytes::copy_from_slice(&self.guard)
+    }
+
+    /// Convert into the guard-backed `Bytes` for the DMA submit. Private to
+    /// this module on purpose: only [`write_block_from_staging`] may
+    /// materialize a clonable guard-backed handle, and it provably drops it
+    /// before returning.
+    fn into_bytes(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+}
+
+impl AsRef<[u8]> for StagedDmaSource {
+    fn as_ref(&self) -> &[u8] {
+        &self.guard
+    }
+}
+
+/// Process (crypto/compress) and DMA one staged payload to `offset` on the
+/// block backend, consuming the write-only `source` by value (§5.5).
+///
+/// Normative sequencing, encoded here once so every flush caller inherits
+/// it:
+///
+/// - **Passthrough** (default): the DMA reads straight off the staging mmap
+///   — the guard-backed `Bytes` moves into `write_block`, which keeps it
+///   alive through completion *and* the sampled `--write-verification`
+///   read-back, then drops it before returning. (The uring worker's
+///   keep-alive clone is released on its own thread at CQE handling,
+///   independent of any shard lock, so it can only delay — never deadlock —
+///   a subsequent shard writer.)
+/// - **Non-passthrough**: `process_write_async` consumes the guard-backed
+///   `Bytes` and returns a fresh transform buffer — the guard is dead
+///   *before* the DMA is submitted.
+///
+/// Either way the staging-shard read guard is provably dead when this
+/// returns: callers may then merge metadata and take same-shard write locks
+/// (`remove_active_block`) without self-deadlock, and no guard-backed
+/// `Bytes` can leak into a cache. The shard read lock is therefore held
+/// across exactly one transform-or-DMA (plus the sampled read-back verify
+/// on `--write-verification` mounts) — the §5.5 hold bound.
+pub async fn write_block_from_staging(
+    crypto: &crate::crypto_compress::CryptoCompressState,
+    writer: &crate::nvme_dev::NvmeBlockDev,
+    offset: u64,
+    source: StagedDmaSource,
+) -> Result<()> {
+    let processed = crypto.process_write_async(source.into_bytes()).await?;
+    writer.write_block(offset, processed).await
+}
+
 #[derive(Clone)]
 pub struct NvmeStaging {
     staging_dirs: Vec<PathBuf>,
@@ -714,6 +828,15 @@ impl NvmeStaging {
             }
         }
         None
+    }
+
+    /// Take the §5.5 write-only DMA source for a staged entry: a guard-backed,
+    /// zero-copy view of the payload for [`write_block_from_staging`].
+    /// Holding it pins the entry's shard against writers/evictors, so take it
+    /// immediately before the upload and let the helper consume it.
+    pub fn staged_dma_source(&self, key: &str) -> Option<StagedDmaSource> {
+        self.read_staged_zero_copy(key)
+            .map(|guard| StagedDmaSource { guard })
     }
 
     /// Read staged data zero-copy directly from staging_nvme_cache memory-mapped segments.

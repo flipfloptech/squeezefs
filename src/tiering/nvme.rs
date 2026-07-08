@@ -91,6 +91,30 @@ pub struct NvmeReadGuard<'a> {
     pub len: usize,
 }
 
+/// Owned (`'static`) read guard over one shard's mmap value slice, backed by
+/// a cloned `Arc<NvmeDevice>` keep-alive.
+///
+/// **Hold discipline (zero-copy write-path design §5.5, risk R3).** While a
+/// guard lives, its shard's write lock is unacquirable: every same-shard
+/// writer/evictor (`put` / `reserve_and_write` / `remove`) waits, and a task
+/// that takes a same-shard write lock while *itself* holding the guard
+/// self-deadlocks (parking_lot read→write upgrade). Two sanctioned holders,
+/// both bounded:
+///
+/// - **Read replies**: the guard rides as the reply backing across one FUSE
+///   reply (the read-path precedent).
+/// - **Write-only staged flush** (`cache::nvme::StagedDmaSource`, consumed
+///   by value by `cache::nvme::write_block_from_staging`): held across
+///   exactly one crypto transform or one DMA — plus the sampled read-back
+///   verify on `--write-verification` mounts — and provably dead before any
+///   same-shard mutation (`remove_active_block`). A guard-backed `Bytes`
+///   must never enter a cache: LRU entries have unbounded lifetime and
+///   would pin the shard until eviction.
+///
+/// **Pre-agreed fallback** (§5.5): if the bounded hold ever shows up in
+/// staging eviction-wait gauges, replace the shard read lock held across the
+/// DMA with a per-entry pin count (`AtomicU32` in `BlockMeta`; evictors skip
+/// pinned entries) — same externally visible bound, finer blocking scope.
 pub struct NvmeCacheReadGuard {
     pub _device: Arc<NvmeDevice>,
     pub guard: RwLockReadGuard<'static, NvmeShardInner>,

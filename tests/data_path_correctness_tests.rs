@@ -1066,3 +1066,150 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
          no-put write-through owner must purge the key's read tiers"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `write_file_staged` RMW-seed fill discipline (the follow-up filed in
+// 8e3995e): the partial-overwrite seed of an existing striped block is a
+// cache FILL like any other — it resolves a block key that a concurrent (or
+// even the SAME call's block-completing write-through) displace+free can
+// retire and reallocate under the identical key string. Its publishes must
+// therefore obey the same validated-fill discipline as
+// `get_cached_or_fetch_block`: NVMe-tier hits never re-promote into the RAM
+// LRU (entry provenance is unprovable from the incarnation word), and
+// device-read fills publish only under a stable, unchanged incarnation
+// (publish → revalidate → undo; detached tier publishes re-check).
+// ---------------------------------------------------------------------------
+
+/// The RMW seed's NVMe read-tier hit must serve the merge WITHOUT
+/// re-promoting the entry into the RAM block LRU — the same unprovable-
+/// provenance publish `get_cached_or_fetch_block` deleted (8e3995e): a tier
+/// entry may hold a dying incarnation's bytes while an undo/purge is still
+/// in flight, and a re-promote launders that transient poison into a sticky
+/// RAM entry under a reusable key string.
+#[tokio::test]
+async fn test_rmw_seed_nvme_tier_hit_does_not_repromote_into_ram_lru() {
+    let h = make().await;
+    let block = 65536usize;
+    let ino = create(&h, "seed_norepromote").await;
+    let path = format!("inode_{ino}");
+
+    // Striped file, 2 blocks.
+    let base = pattern(2 * block);
+    write_at(&h, ino, 0, &base).await;
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    let k1 = meta
+        .block_map
+        .as_ref()
+        .and_then(|bm| bm.get(&1).cloned())
+        .expect("block 1 mapped");
+
+    // Shape the tiers: block 1 lives ONLY in the NVMe read tier.
+    h.fs.router.cache.read_lru.remove(&k1);
+    h.fs.router
+        .cache
+        .nvme
+        .cache_read_block(&k1, bytes::Bytes::copy_from_slice(&base[block..2 * block]))
+        .expect("seed NVMe read tier");
+    assert!(
+        h.fs.router.cache.read_lru.get(&k1).is_none(),
+        "test precondition: RAM LRU cold for block 1"
+    );
+
+    // Partial overwrite INSIDE block 1 (never reaches the block end, so no
+    // write-through fires): the seed takes the NVMe-tier hit leg.
+    let patch: Vec<u8> = (0..100).map(|i| ((i % 89) as u8) ^ 0x5a).collect();
+    write_at(&h, ino, (block + 100) as u64, &patch).await;
+
+    assert!(
+        h.fs.router.cache.read_lru.get(&k1).is_none(),
+        "RMW seed re-promoted an NVMe-tier entry into the RAM LRU — an \
+         unprovable-provenance publish that can stick a dead incarnation's \
+         bytes under a reused key"
+    );
+
+    // The seed still served the merge: read-your-write across the block.
+    let mut expected = base[block..2 * block].to_vec();
+    expected[100..200].copy_from_slice(&patch);
+    let got = read_at(&h, ino, block as u64, block as u32).await;
+    assert_eq!(got, expected, "seeded merge content mismatch");
+}
+
+/// A device-read RMW seed whose block key's incarnation is NOT stable at
+/// fill time must hand the bytes to the merge UNCACHED — publishing them
+/// would poison the shared read tiers for the key's (new) owner. This is
+/// the same seqlock gate `get_cached_or_fetch_block` enforces
+/// (fill_incarnation → None ⇒ no publish); the hand-rolled seed read
+/// published both tiers with no validation at all.
+#[tokio::test]
+async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
+    let h = make().await;
+    let block = 65536usize;
+    let ino = create(&h, "seed_unstable").await;
+    let path = format!("inode_{ino}");
+
+    // Striped file, 2 blocks.
+    let base = pattern(2 * block);
+    write_at(&h, ino, 0, &base).await;
+
+    // Re-map block 1 to a fresh allocation whose device bytes exist but
+    // whose incarnation was never published (an in-flight owner, exactly
+    // what a seed racing an owner's allocate→DMA window observes).
+    let (_be, allocator, writer) =
+        h.fs.router
+            .backend_router
+            .get_active_backend()
+            .expect("backend");
+    let dest = allocator.allocate_block().await.expect("allocate");
+    let seeded: Vec<u8> = (0..block).map(|i| ((i % 227) as u8) ^ 0x17).collect();
+    writer
+        .write_block(dest, bytes::Bytes::copy_from_slice(&seeded))
+        .await
+        .expect("raw device write");
+    // Deliberately NO publish_block(dest): the word stays unstable.
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+    let entries = [(1u32, dest.to_string())];
+    h.fs.router
+        .merge_block_mappings(
+            ino,
+            squeezefs::routing::BlockMapOp::Merge(&entries),
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("merge block 1 → in-flight key");
+
+    let dk = dest.to_string();
+    h.fs.router.cache.read_lru.remove(&dk);
+    h.fs.router.cache.nvme.remove_cached_read_block(&dk);
+
+    // Partial overwrite INSIDE block 1: the seed misses every cache and
+    // device-reads the in-flight key.
+    let patch: Vec<u8> = (0..100).map(|i| ((i % 97) as u8) ^ 0x33).collect();
+    write_at(&h, ino, (block + 10) as u64, &patch).await;
+
+    assert!(
+        h.fs.router.cache.read_lru.get(&dk).is_none(),
+        "RMW seed published a device read of an UNSTABLE incarnation into \
+         the RAM LRU — an unvalidated fill that poisons the key's owner"
+    );
+    assert!(
+        h.fs.router.cache.nvme.get_cached_read_block(&dk).is_none(),
+        "RMW seed published a device read of an UNSTABLE incarnation into \
+         the NVMe read tier — an unvalidated fill that poisons the key's owner"
+    );
+
+    // Sanity: the write path merged over OUR in-flight mapping (the seed
+    // really resolved `dk`), and uncached ≠ unserved — the merge seeded
+    // from the device bytes.
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(
+        meta.block_map.as_ref().and_then(|bm| bm.get(&1)),
+        Some(&dk),
+        "test premise: block 1 must still resolve to the in-flight key"
+    );
+    let mut expected = seeded.clone();
+    expected[10..110].copy_from_slice(&patch);
+    let got = read_at(&h, ino, block as u64, block as u32).await;
+    assert_eq!(got, expected, "unstable-incarnation seed content mismatch");
+}

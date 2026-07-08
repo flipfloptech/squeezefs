@@ -547,10 +547,17 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
-            let nqueues = fuse_connection.num_uring_queues().unwrap_or(1);
-            if nqueues > 1 {
-                debug!("Multi-Queue FUSE: Spawning {} worker connections", nqueues - 1);
-                for qid in 1..nqueues {
+            // FUSE-over-io_uring armed: one worker session per uring queue
+            // (including qid 0), while THIS primary session becomes the
+            // classical sideband servicer. The kernel keeps FORGET/INTERRUPT/
+            // resends and `fiq->ops` switchover stragglers on the classical
+            // `/dev/fuse` queue even with the ring armed — a daemon that stops
+            // reading it strands them forever (`fusectl waiting ≥ 1`, syncfs
+            // blocks, umount EBUSY). The sideband read still rides io_uring
+            // (`Readv` on `/dev/fuse`).
+            if let Some(nqueues) = fuse_connection.num_uring_queues() {
+                debug!("Multi-Queue FUSE: Spawning {} worker connections", nqueues);
+                for qid in 0..nqueues {
                     let mut worker_session = self.clone();
                     let (tx, rx) = unbounded();
                     worker_session.response_sender = tx;
@@ -567,6 +574,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         }
                     });
                 }
+                fuse_connection.set_classical_sideband();
+                eprintln!(
+                    "FUSE-over-io_uring: classical sideband servicer armed \
+                     (primary session; FORGET/INTERRUPT/resend + switchover stragglers)"
+                );
             }
         }
 
@@ -901,16 +913,23 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                     fs.destroy(request).await;
 
-                    // COMMIT the ring entry synchronously before pool shutdown so we
-                    // do not race the async reply task (pending map would be cleared).
+                    // Reply inline (synchronously, not via the async reply task) and
+                    // only then shut the pool down: shutdown clears the pending map,
+                    // so a reply routed after it would be dropped and the kernel
+                    // would wait on DESTROY forever. `write_vectored` routes by
+                    // delivery channel — COMMIT_AND_FETCH for uring-delivered
+                    // DESTROYs (the shutdown drain flushes it), classical write for
+                    // classically-delivered ones (sideband/switchover-race case).
                     #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
                     {
+                        let mut hdr = vec![0u8; FUSE_OUT_HEADER_SIZE];
+                        hdr[0..4].copy_from_slice(&(FUSE_OUT_HEADER_SIZE as u32).to_le_bytes());
+                        hdr[8..16].copy_from_slice(&request.unique.to_le_bytes());
+                        let _ = fuse_connection
+                            .write_vectored::<_, Vec<u8>>(hdr, None)
+                            .await
+                            .1;
                         if let Some(pool) = fuse_connection.over_uring.lock().unwrap().take() {
-                            let mut hdr = vec![0u8; FUSE_OUT_HEADER_SIZE];
-                            hdr[0..4]
-                                .copy_from_slice(&(FUSE_OUT_HEADER_SIZE as u32).to_le_bytes());
-                            hdr[8..16].copy_from_slice(&request.unique.to_le_bytes());
-                            let _ = pool.submit_reply(request.unique, hdr, bytes::Bytes::new());
                             pool.shutdown();
                         }
                     }
@@ -1402,22 +1421,16 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             return Err(err);
         }
 
-        // 2) REGISTER all CPU queues (blocks until kernel fiq→uring switch), arm
-        //    session uring path, then non-blocking-drain any classical requests that
-        //    arrived during INIT→REGISTER (parent metadata, FORGET, …).
+        // 2) REGISTER all CPU queues (blocks until kernel fiq→uring switch) and
+        //    arm the session uring path. Classical requests that arrived during
+        //    INIT→REGISTER — and the kernel's permanent classical traffic
+        //    (FORGET/INTERRUPT/resends) — are serviced by the classical
+        //    sideband session `inner_mount` keeps on the primary connection.
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
-            use std::os::fd::AsRawFd;
             fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
             if let Some(pool) = fuse_connection.over_uring.lock().unwrap().clone() {
                 pool.mark_ready();
-                let fd = fuse_connection.as_fd().as_raw_fd();
-                tokio::spawn(async move {
-                    for _ in 0..150 {
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                        crate::raw::connection::fuse_over_uring::FuseOverUring::drain_classical_stranded(fd);
-                    }
-                });
             }
             eprintln!("FUSE-over-io_uring transport armed for this session");
             tracing::info!("FUSE-over-io_uring transport armed for this session");

@@ -159,12 +159,24 @@ pub struct FuseConnection {
     pub(crate) over_uring: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<super::fuse_over_uring::FuseOverUring>>>,
     >,
-    /// Uniques delivered via classical `/dev/fuse` (INIT + REGISTER handoff). Replies
-    /// for these must use classical write even after the uring pool is armed.
+    /// Uniques delivered via classical `/dev/fuse` (INIT, the REGISTER handoff,
+    /// and the post-arm classical sideband). Replies for these must use
+    /// classical write even after the uring pool is armed.
     #[cfg(target_os = "linux")]
     classical_inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
     #[cfg(target_os = "linux")]
     pub(crate) assigned_qid: Option<u16>,
+    /// Post-arm classical sideband servicer (primary session only). The kernel
+    /// keeps FORGET/BATCH_FORGET and INTERRUPT on the classical `/dev/fuse`
+    /// queue even with FUSE-over-io_uring armed (`fuse_io_uring_ops` in
+    /// fs/fuse/dev_uring.c), `fuse_resend` splices resends onto the classical
+    /// `fiq->pending`, and regular requests can land classically in the
+    /// unlocked `fiq->ops` switchover window. When set, this connection reads
+    /// the classical device (io_uring `Readv`) instead of the uring inbound
+    /// queues so that traffic is serviced, not stranded (stuck-request
+    /// unmount wedge).
+    #[cfg(target_os = "linux")]
+    classical_sideband: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for FuseConnection {
@@ -203,6 +215,7 @@ impl FuseConnection {
                     std::collections::HashSet::new(),
                 )),
                 assigned_qid: None,
+                classical_sideband: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -260,6 +273,7 @@ impl FuseConnection {
                 std::collections::HashSet::new(),
             )),
             assigned_qid: None,
+            classical_sideband: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -293,6 +307,7 @@ impl FuseConnection {
                     over_uring: self.over_uring.clone(),
                     classical_inflight: self.classical_inflight.clone(),
                     assigned_qid: None,
+                    classical_sideband: std::sync::atomic::AtomicBool::new(false),
                 })
             }
             #[cfg(feature = "unprivileged")]
@@ -375,6 +390,7 @@ impl FuseConnection {
                     over_uring: self.over_uring.clone(),
                     classical_inflight: self.classical_inflight.clone(),
                     assigned_qid: None,
+                    classical_sideband: std::sync::atomic::AtomicBool::new(false),
                 })
             }
             #[cfg(not(feature = "unprivileged"))]
@@ -383,6 +399,19 @@ impl FuseConnection {
                 "Cloning non-blocking connections is not supported",
             )),
         }
+    }
+
+    /// Turn this (primary) connection into the post-arm classical sideband
+    /// servicer: its session keeps reading the classical `/dev/fuse` device
+    /// (io_uring `Readv`) after FUSE-over-io_uring is armed, because the
+    /// kernel still routes FORGET/BATCH_FORGET, INTERRUPT, NOTIFY_RESEND
+    /// resends, and `fiq->ops` switchover-window stragglers there. Without a
+    /// reader those strand forever (`fusectl waiting >= 1`, syncfs blocks,
+    /// umount EBUSY).
+    #[cfg(target_os = "linux")]
+    pub fn set_classical_sideband(&self) {
+        self.classical_sideband
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
@@ -404,12 +433,24 @@ impl FuseConnection {
         mut header_buf: Vec<u8>,
         mut data_buf: T,
     ) -> ((Vec<u8>, T, Option<Bytes>), io::Result<usize>) {
-        // After arm, the request path is FUSE-over-io_uring only — never classical.
-        // Pre-arm (during INIT only) still uses /dev/fuse because the kernel rejects
-        // REGISTER until fch->initialized.
+        // After arm, the request hot path is FUSE-over-io_uring. The classical
+        // device is still read pre-arm (INIT — the kernel rejects REGISTER until
+        // fch->initialized) and, post-arm, by the dedicated classical sideband
+        // session (`classical_sideband`): the kernel keeps FORGET/INTERRUPT/
+        // resends and `fiq->ops` switchover stragglers on the classical queue
+        // even when the ring is armed. Both classical reads ride io_uring
+        // (`Readv` on `/dev/fuse` below).
         #[cfg(target_os = "linux")]
         {
-            let pool = self.over_uring.lock().unwrap().clone();
+            let pool = if self
+                .classical_sideband
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                // Sideband servicer: never drain the uring inbound queues.
+                None
+            } else {
+                self.over_uring.lock().unwrap().clone()
+            };
             // After arm: uring-only. Before arm / when inactive: fall through.
             // - ready → drain uring inbound
             // - shut down (!active) → disconnect error
@@ -534,12 +575,25 @@ impl FuseConnection {
                 connection.read_vectored(header_buf, data_buf).await
             }
         };
-        // Track unique so a reply that races mark_ready still uses classical write.
+        // Track unique so the reply uses classical write (both the mark_ready
+        // race window and the post-arm sideband). FORGET/BATCH_FORGET carry a
+        // unique but are never replied to — tracking them would leak the set.
         #[cfg(target_os = "linux")]
         if let ((ref hdr, _), Ok(n)) = &result {
             if *n >= 16 {
                 let unique = u64::from_le_bytes(hdr[8..16].try_into().unwrap_or([0; 8]));
-                if unique != 0 {
+                let op = u32::from_le_bytes(hdr[4..8].try_into().unwrap_or([0; 4]));
+                if self
+                    .classical_sideband
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    super::fuse_over_uring::note_classical_sideband();
+                }
+                if super::fuse_over_uring::transport_debug() {
+                    eprintln!("[XPORT] classical-deliver unique={unique} op={op}");
+                }
+                // FUSE_FORGET = 2, FUSE_BATCH_FORGET = 42: no reply exists.
+                if unique != 0 && !matches!(op, 2 | 42) {
                     self.classical_inflight.lock().unwrap().insert(unique);
                 }
             }
@@ -586,6 +640,9 @@ impl FuseConnection {
                     .unwrap()
                     .remove(&unique);
                 if is_classical {
+                    if super::fuse_over_uring::transport_debug() {
+                        eprintln!("[XPORT] classical-reply unique={unique}");
+                    }
                     // Fall through to classical write below.
                 } else {
                     let body_bytes = if let Some(ref ext) = body_extend_data {
@@ -616,6 +673,9 @@ impl FuseConnection {
                                 unique,
                                 "fuse-over-uring COMMIT miss; drop (no classical fallback)"
                             );
+                            if super::fuse_over_uring::transport_debug() {
+                                eprintln!("[XPORT] reply-dropped-notfound unique={unique}");
+                            }
                             return ((data, body_extend_data), Ok(len));
                         }
                         Err(e) => return ((data, body_extend_data), Err(e)),

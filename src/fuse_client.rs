@@ -967,6 +967,15 @@ impl SqueezefsFilesystem {
         let (t_leases, t_parked, t_outstanding, t_max_age) = fuse3::transport_lease_stats();
         #[cfg(not(target_os = "linux"))]
         let (t_leases, t_parked, t_outstanding, t_max_age) = (0u64, 0u64, 0u64, 0u64);
+        // Post-arm classical sideband deliveries (kernel-mandated FORGET/
+        // INTERRUPT/resend traffic + fiq->ops switchover stragglers). Must
+        // move under unlink storms; a permanent zero here while forgets flow
+        // means the sideband is stranded — the stuck-request unmount wedge
+        // class.
+        #[cfg(target_os = "linux")]
+        let t_classical_sideband = fuse3::over_uring_classical_sideband();
+        #[cfg(not(target_os = "linux"))]
+        let t_classical_sideband = 0u64;
 
         let stats_obj = serde_json::json!({
             "read_lru_keys": read_lru_keys,
@@ -1014,6 +1023,7 @@ impl SqueezefsFilesystem {
                 "transport_parked_commits": t_parked,
                 "transport_leases_outstanding": t_outstanding,
                 "transport_lease_max_age_ms": t_max_age,
+                "transport_classical_sideband": t_classical_sideband,
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),

@@ -137,19 +137,13 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                                     // read-modify-setxattr ran under NO lock,
                                     // skipped fencing revalidation, and left
                                     // every RAM/NVMe tier stale — conversion
-                                    // fixes all three. The displaced source
-                                    // mapping is purged from the read tiers
-                                    // by the primitive but deliberately NOT
-                                    // freed here: the move reuses the
-                                    // allocation and the defrag driver owns
-                                    // source-slot reclamation (design open
-                                    // question 6).
+                                    // fixes all three.
                                     let target_ino: u64 = map_id.parse().unwrap_or(ino);
                                     let idx: u32 = idx_str.parse().unwrap_or(0);
                                     let fencing_token =
                                         router.dlm.get_fencing_token_ino(target_ino);
                                     let entries = [(idx, dest_offset.to_string())];
-                                    if let Err(e) = router
+                                    match router
                                         .merge_block_mappings(
                                             target_ino,
                                             crate::routing::BlockMapOp::Merge(&entries),
@@ -159,16 +153,41 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                                         )
                                         .await
                                     {
-                                        log::error!(
-                                            "Job worker: BlockMove merge failed: {:?}. Pausing job.",
-                                            e
-                                        );
-                                        let mut state = IN_MEMORY_JOBS.lock();
-                                        state.paused_jobs.insert(task_wrapper.job_id.clone());
-                                        if let Some(n) =
-                                            state.job_notifiers.get(&task_wrapper.job_id)
-                                        {
-                                            n.notify_waiters();
+                                        Ok(displaced) => {
+                                            // Design OQ 6 resolved: the source
+                                            // slot the move vacates follows the
+                                            // same displaced-key free
+                                            // discipline as every other merge
+                                            // caller — freed only AFTER the
+                                            // new map is published (durable +
+                                            // RAM-coherent, read tiers purged
+                                            // by the primitive), so no reader
+                                            // can resolve a block to a key
+                                            // being freed. free_block's
+                                            // begin_free → punch-on-terminal →
+                                            // finish_free split (f0ca977)
+                                            // honors clone sharing: a source
+                                            // still referenced by a clone is
+                                            // released but never punched or
+                                            // free-listed; a terminal source
+                                            // is punched strictly before its
+                                            // offset becomes reallocatable.
+                                            for bk in displaced {
+                                                let _ = router.backend_router.free_block(&bk).await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "Job worker: BlockMove merge failed: {:?}. Pausing job.",
+                                                e
+                                            );
+                                            let mut state = IN_MEMORY_JOBS.lock();
+                                            state.paused_jobs.insert(task_wrapper.job_id.clone());
+                                            if let Some(n) =
+                                                state.job_notifiers.get(&task_wrapper.job_id)
+                                            {
+                                                n.notify_waiters();
+                                            }
                                         }
                                     }
                                 }

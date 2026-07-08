@@ -160,7 +160,19 @@ if ! mountpoint -q "$MNT" 2>/dev/null; then
     find "$MNT" -mindepth 1 -delete 2>/dev/null
 fi
 
-"$SQUEEZEFS_BIN" mount \
+# xfstests' check runs every test inside a transient systemd scope and stops
+# that scope when the test exits ("kill all subprocesses of the test").
+# A daemon mounted from inside a test inherits the test's cgroup and gets
+# SIGTERM/SIGKILL from systemd at test end while still mounted — aborting the
+# FUSE connection (ENOTCONN mountpoint, fencing races). Launch the daemon in
+# its own scope so it only ever exits via unmount.
+LAUNCH=()
+if [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
+    LAUNCH=(systemd-run --quiet --collect --scope \
+        --unit "squeezefs-fstests-${TAG}-$$-$(date +%s%N)")
+fi
+
+"${LAUNCH[@]}" "$SQUEEZEFS_BIN" mount \
     "sqmeta://$DEV" \
     "$MNT" \
     --daemon \

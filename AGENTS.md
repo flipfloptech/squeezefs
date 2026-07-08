@@ -15,7 +15,7 @@ Squeezefs is a high-performance distributed POSIX FUSE filesystem (Rust + tokio 
 | Path                              | Expectation |
 |-----------------------------------|-------------|
 | **FUSE request hot path**         | **FUSE-over-io_uring only** after arm (`REGISTER` / `COMMIT_AND_FETCH`). No userspace opt-out. Mount fails if setup fails. |
-| **FUSE_INIT only**                | Classical `/dev/fuse` once — kernel requires `fch->initialized` before REGISTER. Then over-uring. |
+| **FUSE_INIT + classical sideband** | Classical `/dev/fuse` for `FUSE_INIT` (kernel requires `fch->initialized` before REGISTER), then the **kernel-mandated classical sideband** only: the kernel keeps FORGET/BATCH_FORGET + INTERRUPT + `fuse_resend` resends + `fiq->ops` switchover stragglers on the classical queue even when armed (fs/fuse/dev_uring.c). A dedicated sideband session services them — **via io_uring `Readv`** — or they strand forever (`waiting ≥ 1`, umount EBUSY). All other requests stay over-uring. |
 | **NVMe / block data**             | `NvmeBlockDev` io_uring workers (fixed files when available). |
 | **Ad-hoc local files**            | `crate::uring_fs` (not std file APIs) where practical. |
 | **Not uring**                     | TLS peers, network TCP/TLS stacks. Staging **mmap** segments stay mmap by design. |
@@ -41,7 +41,7 @@ Mount always enables FUSE-over-io_uring after INIT (required). Expects: "FUSE-ov
 | Primary block device R/W | `NvmeBlockDev` worker + fixed-file registration when supported |
 | Ad-hoc file R/W / fdatasync | `crate::uring_fs` process worker |
 | Mmap page hint | `IoUringPrefetcher` (`MADV_WILLNEED`) |
-| FUSE transport (default) | `fuse3` `BlockFuseConnection` (classical rings during INIT); **FUSE-over-io_uring** (`IORING_OP_URING_CMD` + REGISTER/COMMIT_AND_FETCH) after arm |
+| FUSE transport (default) | `fuse3` `BlockFuseConnection` (classical rings during INIT); **FUSE-over-io_uring** (`IORING_OP_URING_CMD` + REGISTER/COMMIT_AND_FETCH) after arm; post-arm **classical sideband session** (io_uring `Readv` on `/dev/fuse`) for kernel-mandated FORGET/INTERRUPT/resend traffic + switchover stragglers |
 | FUSE_WRITE payload delivery | Zero-copy **payload lease** (`Bytes::from_owner` over the registered uring payload buffer) with deferred COMMIT_AND_FETCH re-arm; the lease-severance boundary bounds every lease to one handler invocation — `docs/design-zero-copy-write-path.md` §5.4 |
 | Staging / read-segment hot path | **mmap** (by design — zero syscall) |
 | TLS peers | Not uring (network) |
@@ -182,7 +182,7 @@ This repo is Linux + **io_uring**-first. When planning or implementing:
 
 - **Default to io_uring** for FUSE request traffic (FUSE-over-io_uring after arm), NVMe/block I/O (`NvmeBlockDev`), and local file I/O (`crate::uring_fs`) whenever the kernel can support it.
 - **Do not** introduce or re-enable classical `/dev/fuse` or POSIX file I/O fallbacks to “make it work.” That is an anti-pattern here. Fix the uring path or fail loud.
-- The **only** intentional classical FUSE use is the one-shot **`FUSE_INIT`** exchange (kernel requires it before REGISTER). After arm, requests/replies are over-uring only.
+- The intentional classical FUSE uses are the one-shot **`FUSE_INIT`** exchange (kernel requires it before REGISTER) and the post-arm **classical sideband session** for the traffic the kernel refuses to put on the ring (FORGET/INTERRUPT/resends + `fiq->ops` switchover stragglers) — serviced via io_uring `Readv`, never as a hot-path fallback. All other requests/replies are over-uring only after arm.
 - If a failing test tempts you to disable over-uring or switch to blocking `read`/`write`, stop — write a failing test that encodes correct uring behavior, then fix uring.
 
 #### No dead code

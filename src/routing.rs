@@ -982,7 +982,18 @@ impl DataRouter {
             if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                 let bytes = bytes::Bytes::from(cached_block);
-                self.cache.read_lru.put(block_key, bytes.clone());
+                // NO RAM re-promote: this NVMe→RAM copy would be a cache
+                // publish under a possibly-reused key, and the incarnation
+                // word cannot prove ENTRY provenance — a tier entry from a
+                // key's dying incarnation (undo/purge still in flight, see
+                // the fill below) would validate against the NEW owner's
+                // stable word and stick its bytes in the RAM LRU until
+                // remount (all-zero block reads; surfaced by PR 6 routing
+                // aligned striped writes through the no-LRU-put
+                // write-through path). The RAM LRU is filled only by
+                // device-validated fills (below) and legitimate owners;
+                // NVMe-tier hits stay NVMe-tier hits — the bytes still
+                // serve this caller.
                 return Ok(crate::cache::pool::ReadBlockValue::Bytes(bytes));
             }
 
@@ -1046,11 +1057,11 @@ impl DataRouter {
                         }
                     };
                     let downloaded_bytes = downloaded;
-                    let publishable = matches!(
-                        incarnation,
-                        Some(before) if self.backend_router.fill_incarnation_still(block_key, before)
-                    );
-                    if publishable {
+                    let publishable = incarnation.filter(|&before| {
+                        self.backend_router
+                            .fill_incarnation_still(block_key, before)
+                    });
+                    if let Some(before) = publishable {
                         if downloaded_bytes.len() < 64 * 1024 {
                             let _ = self
                                 .cache
@@ -1058,16 +1069,48 @@ impl DataRouter {
                                 .cache_read_block(block_key, downloaded_bytes.clone());
                         } else {
                             let nvme_clone = self.cache.nvme.clone();
+                            let backend_router = self.backend_router.clone();
                             let bk_clone = block_key.to_string();
                             let dl_clone = downloaded_bytes.clone();
                             tokio::task::spawn_blocking(move || {
+                                // Detached publish: it can run arbitrarily
+                                // late, past a free + reallocation of this
+                                // key. Re-check before AND after the put —
+                                // the residual exposure is then a put→check
+                                // instruction window that a whole
+                                // free→allocate→DMA→publish cycle cannot
+                                // fit inside.
+                                if !backend_router.fill_incarnation_still(&bk_clone, before) {
+                                    return;
+                                }
                                 let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
+                                if !backend_router.fill_incarnation_still(&bk_clone, before) {
+                                    nvme_clone.remove_cached_read_block(&bk_clone);
+                                }
                             });
                         }
                         // Avoid flooding RAM LRU with full 4 MiB blocks under
                         // multi-GB sequential reads. Small blocks still cache.
                         if downloaded_bytes.len() <= 256 * 1024 {
                             self.cache.read_lru.put(block_key, downloaded_bytes.clone());
+                        }
+                        // Seqlock completion (publish-then-revalidate): the
+                        // pre-publish check alone is check-then-act — this
+                        // task can be preempted between it and the puts, and
+                        // a put landing after a new owner's
+                        // allocate→DMA→publish→purge sequence would stick
+                        // the dead incarnation's bytes under the reused key
+                        // (all-zero block reads until remount; surfaced by
+                        // PR 6 routing aligned writes through the no-put
+                        // write-through path). Undo on any movement: a
+                        // poisoned entry is at worst transient — removed by
+                        // the very task that published it — never sticky.
+                        if !self
+                            .backend_router
+                            .fill_incarnation_still(block_key, before)
+                        {
+                            self.cache.read_lru.remove(block_key);
+                            self.cache.nvme.remove_cached_read_block(block_key);
                         }
                     }
                     return Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes));
@@ -2105,9 +2148,12 @@ impl DataRouter {
                     if let Some(cached_block) = self.cache.read_lru.get(bk) {
                         resolved = Some(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
                     } else if let Some(cached_block) = self.cache.nvme.read_cached_block(bk) {
-                        let bytes = bytes::Bytes::from(cached_block);
-                        self.cache.read_lru.put(bk, bytes.clone());
-                        resolved = Some(crate::cache::pool::ReadBlockValue::Bytes(bytes));
+                        // NVMe hit consumed directly — no RAM re-promote
+                        // (unprovable entry provenance under key reuse; see
+                        // get_cached_or_fetch_block).
+                        resolved = Some(crate::cache::pool::ReadBlockValue::Bytes(
+                            bytes::Bytes::from(cached_block),
+                        ));
                     }
                 }
             }

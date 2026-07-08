@@ -1586,6 +1586,20 @@ impl SqueezefsFilesystem {
         // blocks.
         block_allocator.publish_block(offset);
         let new_key = offset.to_string();
+        // A no-put owner must PURGE the reused key's read tiers instead
+        // (PR 6 equivalence with the deleted `write_striped` direct route,
+        // whose unconditional fresh-plaintext put overwrote any stale
+        // entry): block keys are offset strings, and a validated fill of
+        // the key's DYING incarnation may legally publish its bytes in the
+        // window between the previous owner's merge-purge and
+        // `free_block`'s retire (the word is still stable there). Such a
+        // poison publish strictly precedes our `allocate_block` above
+        // (which bumped the incarnation word — later fill re-checks fail),
+        // so purging here, after the DMA and before the map names the key,
+        // leaves no interleaving that can serve the dead incarnation's
+        // bytes for this block.
+        self.router.cache.read_lru.remove(&new_key);
+        self.router.cache.nvme.remove_cached_read_block(&new_key);
 
         // Block-map merge via the shared primitive (§5.3 one merge
         // discipline) under INODE_META_LOCKS: current-map RMW, fencing
@@ -5712,8 +5726,15 @@ async fn upload_single_active_block_data(
     // Post-DMA, post-publish, pre-merge — the same put point as the routing
     // striped path (`routing.rs` per-block task): the key stays unreferenced
     // until the block-map merge below publishes it.
-    if let Some(copy) = lru_copy {
-        router.cache.read_lru.put(&offset.to_string(), copy);
+    match lru_copy {
+        Some(copy) => router.cache.read_lru.put(&offset.to_string(), copy),
+        None => {
+            // No-put owner of a possibly-reused key: purge instead (same
+            // dead-incarnation shielding as `upload_full_block`, PR 6).
+            let new_key = offset.to_string();
+            router.cache.read_lru.remove(&new_key);
+            router.cache.nvme.remove_cached_read_block(&new_key);
+        }
     }
 
     Ok((b, offset))
@@ -5942,8 +5963,17 @@ async fn flush_single_active_block(
 
     // Cache in RAM (bypass entirely if file is striped layout). Promotion
     // puts a detached copy — never the guard-backed staging bytes (§5.5).
-    if let Some(copy) = lru_copy {
-        router.cache.read_lru.put(&stored_block_key, copy);
+    match lru_copy {
+        Some(copy) => router.cache.read_lru.put(&stored_block_key, copy),
+        None => {
+            // No-put owner of a possibly-reused key: purge instead (same
+            // dead-incarnation shielding as `upload_full_block`, PR 6).
+            router.cache.read_lru.remove(&stored_block_key);
+            router
+                .cache
+                .nvme
+                .remove_cached_read_block(&stored_block_key);
+        }
     }
 
     for bk in displaced {

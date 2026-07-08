@@ -166,6 +166,14 @@ fi
 # SIGTERM/SIGKILL from systemd at test end while still mounted — aborting the
 # FUSE connection (ENOTCONN mountpoint, fencing races). Launch the daemon in
 # its own scope so it only ever exits via unmount.
+#
+# check also bumps each test's oom_score_adj to 250 so the OOM killer
+# sacrifices tests, not the framework; a daemon mounted from inside a test
+# inherits that bias and becomes the preferred OOM victim while mounted,
+# which kills the mount under the whole remaining run. Reset to neutral —
+# a genuinely leaking daemon still gets picked on its own RSS.
+echo 0 > /proc/self/oom_score_adj 2>/dev/null || true
+
 LAUNCH=()
 if [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
     LAUNCH=(systemd-run --quiet --collect --scope \

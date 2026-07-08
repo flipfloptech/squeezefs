@@ -239,13 +239,25 @@ observable — the perf work paid for itself in correctness.
    `8e3995e`): the seed path at `fuse_client.rs:1396-1438` still
    publishes without post-publish revalidation — unreachable for
    full-block writes and predates this design; left as-is, filed for the
-   same follow-up as the fill-discipline work.
+   same follow-up as the fill-discipline work. **CLOSED (`1e347b1`,
+   tests `846fe9b`)**: reachable after all — every partial-overwrite
+   seed of an uncached striped block ≥ 64 KiB queued a *detached*
+   unvalidated NVMe-tier publish that can land after the same call's
+   write-through displaces + frees the key (plus the NVMe→RAM
+   re-promote 8e3995e deleted elsewhere). The seed now routes through
+   `get_cached_or_fetch_block` — the shared single-flight validated
+   fill — so one fill discipline exists, not two.
 5. **Defrag source-slot free (design OQ 6)**: `BlockMove` now merges
    through the primitive (serialization + fencing revalidation + tier
    coherency fixed in PR 4), but the displaced source mapping is
    tier-purged and **not** freed — the move reuses the allocation;
    source-slot reclamation stays with the defrag driver. Disposition
    recorded in the PR 4 census; revisit with the defrag ledger work.
+   **CLOSED (`6229a07`, tests `1fd07e1`)**: the worker frees the
+   merge-returned displaced source keys after the merge publishes, via
+   `free_block`'s `begin_free` → punch-on-terminal → `finish_free`
+   split — clone-shared sources are released but never punched or
+   free-listed. OQ 6 marked resolved in the design doc.
 6. **OQ 4 health-endpoint warning** — filed with the
    `write_through_fallbacks` stat instead: `health.rs` is probe
    hysteresis, not a stats surface (recorded in the PR 4 commit).

@@ -188,3 +188,101 @@ async fn test_clone_retries_via_authoritative_map() {
         "clone did not actually pin the block (source drop was terminal)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Hole-punch discipline on block free (surfaced by PR 6 of
+// docs/design-zero-copy-write-path.md, pre-existing on dev): a freed block's
+// hole punch is destructive device I/O and must obey two contracts. Both
+// were violated by `BackendRouter::free_block` punching unconditionally
+// AFTER the allocator made the offset reallocatable — demonstrated as an
+// acked-write-then-device-zeros lost update under free→realloc churn with
+// concurrent readers (the pinned striped concurrency test), invisible
+// while `write_striped`'s read-LRU put shielded reads from the device.
+// ---------------------------------------------------------------------------
+
+/// Contract A: a NON-terminal free (refcount still > 0 — e.g. a clone's
+/// shared block) must NOT punch the block's data. Punching a live shared
+/// block destroys the surviving clone's bytes on the device.
+#[tokio::test]
+async fn test_nonterminal_free_must_not_punch_shared_block() {
+    let (router, ba, _routed, backing, _m, _s) = make_router().await;
+
+    let offset = ba.allocate_block().await.expect("alloc");
+    let key = offset.to_string();
+    assert!(
+        router.backend_router.increment_refcount(&key),
+        "second reference (clone) must pin"
+    );
+
+    let pattern: Vec<u8> = (0..8192usize).map(|i| (i % 251) as u8).collect();
+    router
+        .nvme_writer
+        .write_block(offset, bytes::Bytes::from(pattern.clone()))
+        .await
+        .expect("write");
+    ba.publish_block(offset);
+
+    // Drop ONE of the two references through the router (the path that
+    // punches). The block is still referenced by the clone.
+    router
+        .backend_router
+        .free_block(&key)
+        .await
+        .expect("non-terminal free");
+
+    // The surviving reference's data must still be on the device — read the
+    // backing file directly so no cache can mask a punch.
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(backing.path()).expect("open backing");
+    let mut buf = vec![0u8; 8192];
+    f.read_exact_at(&mut buf, offset).expect("pread");
+    assert_eq!(
+        buf, pattern,
+        "non-terminal free punched a still-referenced block's data \
+         (clone data destroyed on device)"
+    );
+}
+
+/// Contract B: a TERMINAL free must punch strictly BEFORE the offset
+/// becomes reallocatable. `begin_free` (terminal) retires the offset but
+/// must not put it on the free list yet — `allocate_block` cannot return
+/// it until `finish_free`. This is the ordering that makes the punch's
+/// destructive zeroing race-free against a new owner's DMA: today the
+/// offset is handed out first and the freer's late punch zeroes the new
+/// owner's acked write (the durable lost-update class).
+#[tokio::test]
+async fn test_terminal_free_punches_before_offset_is_reallocatable() {
+    let (_router, ba, _routed, _b, _m, _s) = make_router().await;
+
+    // Drain any implicit free list first: allocate twice, keep both.
+    let a = ba.allocate_block().await.expect("alloc a");
+    let b = ba.allocate_block().await.expect("alloc b");
+    assert_ne!(a, b);
+
+    // Terminal begin_free retires `a` but must NOT make it reallocatable.
+    assert!(
+        ba.begin_free(a),
+        "single-reference free must report terminal"
+    );
+    let c = ba.allocate_block().await.expect("alloc c");
+    assert_ne!(
+        c, a,
+        "offset became reallocatable between begin_free and finish_free \
+         (a concurrent owner's DMA would race the freer's hole punch)"
+    );
+
+    // finish_free publishes it for reuse.
+    ba.finish_free(a);
+    let d = ba.allocate_block().await.expect("alloc d");
+    assert_eq!(d, a, "finish_free must return the offset to the free list");
+
+    // A non-terminal begin_free reports false and releases nothing.
+    assert!(
+        ba.increment_refcount(b),
+        "pin b to two references (count 2)"
+    );
+    assert!(
+        !ba.begin_free(b),
+        "non-terminal release must not report terminal"
+    );
+}

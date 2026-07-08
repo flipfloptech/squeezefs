@@ -1,9 +1,22 @@
+use crate::cache::pool::{BufferPool, POOLED_BUF_ALIGN};
 use crate::error::SqueezefsError;
 use ring::aead::{LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use ring::rand::{SecureRandom, SystemRandom};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::RsaPrivateKey;
 use std::sync::Arc;
+
+/// On-disk AEAD header prefix: `[2B wrapped_key_len][1B nonce_len]`.
+const ENCRYPT_HEADER_PREFIX_LEN: usize = 3;
+
+/// AEAD nonce length emitted by every writer (4-byte salt + 8-byte counter).
+const NONCE_LEN: usize = 12;
+
+/// §5.7: conservative wrapped-key bound for scratch sizing when no
+/// prewrapped session-key blob exists at pool-init time — an RSA-4096 OAEP
+/// wrap (a 256 B RSA-2048 assumption would silently push 4096-bit-key
+/// configs onto the overflow bounce the pool exists to avoid).
+const WRAPPED_KEY_LEN_FALLBACK: usize = 512;
 
 /// Resolved compression mode (P2-3) — avoids string matching on every block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +85,12 @@ pub struct CryptoCompressState {
     pub aead_tag_len: usize,
     pub nonce_counter: Arc<std::sync::atomic::AtomicU64>,
     pub salt: [u8; 4],
+    /// §5.7 CRYPTO_SCRATCH_POOL: worst-case-sized transform scratch for the
+    /// non-passthrough write path, shared across clones (one pool per
+    /// mount's crypto state). `None` until [`Self::init_scratch_pool`] runs
+    /// (`DataRouter::set_crypto` initializes it from the configured block
+    /// size); uninitialized states stay on the heap `Vec` path.
+    scratch_pool: Arc<once_cell::sync::OnceCell<Arc<BufferPool>>>,
 }
 
 impl CryptoCompressState {
@@ -142,7 +161,75 @@ impl CryptoCompressState {
             aead_tag_len,
             nonce_counter,
             salt,
+            scratch_pool: Arc::new(once_cell::sync::OnceCell::new()),
         }
+    }
+
+    /// §5.7 worst-case compressed size for `input_len` bytes, independent of
+    /// the configured mode (the pool must hold either compressor's worst
+    /// case). The lz4 term carries the 4-byte size-prefix framing
+    /// `compress_prepend_size` emits.
+    fn scratch_compress_term(input_len: usize) -> usize {
+        std::cmp::max(
+            4 + lz4_flex::block::get_maximum_output_size(input_len),
+            zstd::zstd_safe::compress_bound(input_len),
+        )
+    }
+
+    /// §5.7 on-disk AEAD overhead: `[2B wrapped_key_len][1B nonce_len]`
+    /// header + the ACTUAL prewrapped session-key blob (512 B RSA-4096
+    /// fallback when none exists at pool-init time) + nonce + tag.
+    fn scratch_encrypt_overhead(&self) -> usize {
+        if self.encrypt_mode == EncryptMode::None {
+            return 0;
+        }
+        let wrapped_len = self
+            .prewrapped_key
+            .as_ref()
+            .map(|(w, _)| w.len())
+            .unwrap_or(WRAPPED_KEY_LEN_FALLBACK);
+        ENCRYPT_HEADER_PREFIX_LEN + wrapped_len + NONCE_LEN + self.aead_tag_len
+    }
+
+    /// Worst-case transform output for `input_len` bytes (§5.7) — the
+    /// pooled path's fit check against the pool's buffer size.
+    fn worst_case_scratch_len(&self, input_len: usize) -> usize {
+        Self::scratch_compress_term(input_len) + self.scratch_encrypt_overhead()
+    }
+
+    /// Initialize the §5.7 CRYPTO_SCRATCH_POOL for `block_size`-byte writes:
+    /// buffers are `worst_case(block_size)` rounded up to the next 4 KiB
+    /// (≈ `block_size` + 128 KiB for 4 MiB blocks — deliberately not
+    /// `ALIGNED_BUF_POOL`, whose exactly-`block_size` buffers cannot hold
+    /// worst-case transform output). Idempotent (first init wins); no-op for
+    /// passthrough states, which never transform.
+    pub fn init_scratch_pool(&self, block_size: usize) {
+        if self.is_passthrough() {
+            return;
+        }
+        self.scratch_pool.get_or_init(|| {
+            let buf_size = self
+                .worst_case_scratch_len(block_size)
+                .next_multiple_of(POOLED_BUF_ALIGN);
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            // Small on purpose: the queue is FIFO, so a capacity far above
+            // the concurrent-transform count rotates every handout through a
+            // cache-cold worst-case buffer (measured +4..10% on the 4 MiB
+            // lz4/aes micro-benches at cores*4 buffers). Pool-empty handouts
+            // fall back to a fresh aligned allocation — exactly today's
+            // per-transform cost, paid only by burst excess over this
+            // steady-state hot set.
+            let capacity = (cores / 4).clamp(4, 16);
+            Arc::new(BufferPool::new(capacity, buf_size))
+        });
+    }
+
+    /// §5.7 observability: buffer size of the initialized scratch pool
+    /// (`None` = heap-path state).
+    pub fn scratch_pool_buf_len(&self) -> Option<usize> {
+        self.scratch_pool.get().map(|p| p.buf_size())
     }
 
     /// True when neither compression nor encryption is configured (zero-copy path).
@@ -191,15 +278,12 @@ impl CryptoCompressState {
         }
     }
 
-    pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, SqueezefsError> {
-        if self.encrypt_mode == EncryptMode::None {
-            return Err(SqueezefsError::InvalidOperation(
-                "encrypt() called with encrypt mode none".to_string(),
-            ));
-        }
-
-        // Session key path (P2-3): reuse RSA-wrapped blob + precomputed LessSafeKey.
-        let (wrapped_key, less_safe_key) = if let Some(ref key) = self.precomputed_encrypt_key {
+    /// Resolve the RSA-wrapped data-key blob + AEAD key for a write —
+    /// session-key fast path (P2-3: reuse RSA-wrapped blob + precomputed
+    /// `LessSafeKey`) or the per-write wrap fallback. Shared by the heap
+    /// `encrypt` and the §5.7 pooled scratch path.
+    fn resolve_encrypt_key(&self) -> Result<(Arc<[u8]>, Arc<LessSafeKey>), SqueezefsError> {
+        if let Some(ref key) = self.precomputed_encrypt_key {
             let wrapped = self
                 .prewrapped_key
                 .as_ref()
@@ -209,54 +293,67 @@ impl CryptoCompressState {
                         "precomputed encrypt key without prewrapped blob".to_string(),
                     )
                 })?;
-            (wrapped, key.clone())
+            return Ok((wrapped, key.clone()));
+        }
+
+        let (wrapped_key, key_bytes) = if let Some((ref wrapped, key)) = self.prewrapped_key {
+            (wrapped.clone(), key)
         } else {
-            let (wrapped_key, key_bytes) = if let Some((ref wrapped, key)) = self.prewrapped_key {
-                (wrapped.clone(), key)
-            } else {
-                let mut key_bytes = [0u8; 32];
-                SystemRandom::new().fill(&mut key_bytes).map_err(|_| {
-                    SqueezefsError::InvalidOperation(
-                        "Failed to generate random data key".to_string(),
-                    )
-                })?;
-
-                let private_key = self.private_key.as_ref().ok_or_else(|| {
-                    SqueezefsError::InvalidOperation(
-                        "RSA Private Key is required for encryption but not configured".to_string(),
-                    )
-                })?;
-                let public_key = private_key.to_public_key();
-
-                let mut rng = rand::thread_rng();
-                let wrapped_key = public_key
-                    .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes)
-                    .map_err(|e| {
-                        SqueezefsError::InvalidOperation(format!("RSA key wrap failed: {:?}", e))
-                    })?;
-                (Arc::from(wrapped_key.into_boxed_slice()), key_bytes)
-            };
-
-            let algorithm = self.encrypt_mode.algorithm().ok_or_else(|| {
-                SqueezefsError::InvalidOperation(format!(
-                    "Unsupported encryption algo: {}",
-                    self.encrypt_algo
-                ))
+            let mut key_bytes = [0u8; 32];
+            SystemRandom::new().fill(&mut key_bytes).map_err(|_| {
+                SqueezefsError::InvalidOperation("Failed to generate random data key".to_string())
             })?;
 
-            let unbound_key = UnboundKey::new(algorithm, &key_bytes).map_err(|_| {
-                SqueezefsError::InvalidOperation("Failed to create unbound key".to_string())
+            let private_key = self.private_key.as_ref().ok_or_else(|| {
+                SqueezefsError::InvalidOperation(
+                    "RSA Private Key is required for encryption but not configured".to_string(),
+                )
             })?;
-            (wrapped_key, Arc::new(LessSafeKey::new(unbound_key)))
+            let public_key = private_key.to_public_key();
+
+            let mut rng = rand::thread_rng();
+            let wrapped_key = public_key
+                .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes)
+                .map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!("RSA key wrap failed: {:?}", e))
+                })?;
+            (Arc::from(wrapped_key.into_boxed_slice()), key_bytes)
         };
 
+        let algorithm = self.encrypt_mode.algorithm().ok_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "Unsupported encryption algo: {}",
+                self.encrypt_algo
+            ))
+        })?;
+
+        let unbound_key = UnboundKey::new(algorithm, &key_bytes).map_err(|_| {
+            SqueezefsError::InvalidOperation("Failed to create unbound key".to_string())
+        })?;
+        Ok((wrapped_key, Arc::new(LessSafeKey::new(unbound_key))))
+    }
+
+    /// Next unique AEAD nonce: 4-byte process salt + 8-byte big-endian
+    /// sequence (the construction every writer has always emitted).
+    fn next_nonce_bytes(&self) -> [u8; NONCE_LEN] {
         let seq = self
             .nonce_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut nonce_bytes = [0u8; 12];
+        let mut nonce_bytes = [0u8; NONCE_LEN];
         nonce_bytes[0..4].copy_from_slice(&self.salt);
         nonce_bytes[4..12].copy_from_slice(&seq.to_be_bytes());
+        nonce_bytes
+    }
 
+    pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, SqueezefsError> {
+        if self.encrypt_mode == EncryptMode::None {
+            return Err(SqueezefsError::InvalidOperation(
+                "encrypt() called with encrypt mode none".to_string(),
+            ));
+        }
+
+        let (wrapped_key, less_safe_key) = self.resolve_encrypt_key()?;
+        let nonce_bytes = self.next_nonce_bytes();
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| {
             SqueezefsError::InvalidOperation("Failed to construct nonce".to_string())
         })?;
@@ -347,10 +444,107 @@ impl CryptoCompressState {
         Ok(in_out)
     }
 
+    /// Compress (or copy, mode `None`) `data` into the head of `out`,
+    /// returning the bytes written. The lz4 image reproduces
+    /// `compress_prepend_size`'s 4-byte little-endian size prefix — raw
+    /// `compress_into` emits no framing and the contractually untouched
+    /// read path (`decompress_size_prepended`) requires it (§5.7 on-disk
+    /// compatibility). `out` must hold [`Self::scratch_compress_term`] of
+    /// `data.len()` bytes; the pooled caller's fit check guarantees it.
+    fn compress_into_scratch(&self, data: &[u8], out: &mut [u8]) -> Result<usize, SqueezefsError> {
+        match self.compression_mode {
+            CompressionMode::Lz4 => {
+                out[..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                let n = lz4_flex::block::compress_into(data, &mut out[4..]).map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "LZ4 compression into scratch failed: {:?}",
+                        e
+                    ))
+                })?;
+                Ok(4 + n)
+            }
+            CompressionMode::Zstd => zstd::bulk::Compressor::new(3)
+                .and_then(|mut c| c.compress_to_buffer(data, out))
+                .map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "ZSTD compression into scratch failed: {:?}",
+                        e
+                    ))
+                }),
+            CompressionMode::None => {
+                out[..data.len()].copy_from_slice(data);
+                Ok(data.len())
+            }
+        }
+    }
+
+    /// §5.7 pooled transform: compress into the scratch at the sealed-payload
+    /// offset, then encrypt **in place within the scratch** — header first,
+    /// `seal_in_place_separate_tag` at the offset (a raw fixed scratch has no
+    /// `Extend`, so `seal_in_place_append_tag` cannot apply), tag written
+    /// after the ciphertext. Exactly one pooled transform buffer total,
+    /// returned as `Bytes` over the 4096-aligned backing (recycles when the
+    /// last handle drops; the DMA takes `WriteData::Aligned` whenever the
+    /// ciphertext lands on a 4 KiB multiple). The input is never mutated.
+    fn process_write_pooled(
+        &self,
+        pool: &Arc<BufferPool>,
+        data: &[u8],
+    ) -> Result<bytes::Bytes, SqueezefsError> {
+        let mut scratch = pool.alloc();
+        let total = if self.encrypt_mode != EncryptMode::None {
+            let (wrapped_key, less_safe_key) = self.resolve_encrypt_key()?;
+            let wrapped_len = wrapped_key.len();
+            let header_len = ENCRYPT_HEADER_PREFIX_LEN + wrapped_len + NONCE_LEN;
+            let out = scratch.backing_mut();
+
+            let plain_len = self.compress_into_scratch(data, &mut out[header_len..])?;
+
+            // The exact on-disk header `encrypt` emits:
+            // [2B wrapped_key_len][1B nonce_len][wrapped_key][nonce].
+            out[0] = (wrapped_len >> 8) as u8;
+            out[1] = (wrapped_len & 0xFF) as u8;
+            out[2] = NONCE_LEN as u8;
+            out[ENCRYPT_HEADER_PREFIX_LEN..ENCRYPT_HEADER_PREFIX_LEN + wrapped_len]
+                .copy_from_slice(&wrapped_key);
+            let nonce_bytes = self.next_nonce_bytes();
+            out[ENCRYPT_HEADER_PREFIX_LEN + wrapped_len..header_len].copy_from_slice(&nonce_bytes);
+            let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| {
+                SqueezefsError::InvalidOperation("Failed to construct nonce".to_string())
+            })?;
+
+            let tag = less_safe_key
+                .seal_in_place_separate_tag(
+                    nonce,
+                    ring::aead::Aad::empty(),
+                    &mut out[header_len..header_len + plain_len],
+                )
+                .map_err(|_| SqueezefsError::InvalidOperation("AEAD seal failed".to_string()))?;
+            let tag_bytes = tag.as_ref();
+            out[header_len + plain_len..header_len + plain_len + tag_bytes.len()]
+                .copy_from_slice(tag_bytes);
+            header_len + plain_len + tag_bytes.len()
+        } else {
+            self.compress_into_scratch(data, scratch.backing_mut())?
+        };
+        scratch.set_written_len(total);
+        Ok(scratch.into_bytes())
+    }
+
     pub fn process_write(&self, data: bytes::Bytes) -> Result<bytes::Bytes, SqueezefsError> {
         // P2-3: enum-mode fast path — no string trim/match per block.
         if self.is_passthrough() {
             return Ok(data);
+        }
+        // §5.7 CRYPTO_SCRATCH_POOL: one pooled worst-case transform buffer
+        // when the mount initialized the pool and the input fits its sizing
+        // basis. Everything else — uninitialized ad-hoc states, or overflow
+        // past the pooled worst case — bounces to the heap `Vec` path below
+        // (byte-compatible; pinned by the read-back parity tests).
+        if let Some(pool) = self.scratch_pool.get() {
+            if self.worst_case_scratch_len(data.len()) <= pool.buf_size() {
+                return self.process_write_pooled(pool, &data);
+            }
         }
         let compressed = self.compress(&data)?;
         if self.encrypt_mode != EncryptMode::None {

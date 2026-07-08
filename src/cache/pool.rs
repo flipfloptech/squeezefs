@@ -130,6 +130,13 @@ impl BufferPool {
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+
+    /// Capacity (bytes) of every pooled backing this pool hands out —
+    /// callers' fit check before drawing scratch (crypto scratch §5.7
+    /// bounces to the heap when a worst case exceeds it).
+    pub fn buf_size(&self) -> usize {
+        self.buf_size
+    }
 }
 
 impl Drop for BufferPool {
@@ -185,6 +192,35 @@ impl PooledBuf {
             // invariant.
             unsafe { std::ptr::write_bytes(self.ptr.add(self.len), value, new_len - self.len) };
         }
+        self.len = new_len;
+    }
+
+    /// Full-capacity mutable view over the backing for **write-only
+    /// scratch** use (crypto scratch, zero-copy write-path design §5.7).
+    ///
+    /// Every byte is initialized memory (zeroed at birth, recycled bytes
+    /// hold prior safe writes), so this is sound — but bytes beyond the
+    /// logical length may be another user's recycled content. Callers must
+    /// only *write* through this view and must pair it with
+    /// [`Self::set_written_len`] covering exactly the bytes they wrote, so
+    /// stale content can never escape (the same hygiene contract
+    /// [`Self::resize`] enforces by filling).
+    pub(crate) fn backing_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` is a live, uniquely-owned `cap`-byte allocation
+        // (struct invariant) whose every byte is initialized (zeroed at
+        // birth; only safe writes since); `&mut self` guarantees
+        // exclusivity.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
+    }
+
+    /// Set the logical length after writing `[0, new_len)` through
+    /// [`Self::backing_mut`]. Never fills: the caller asserts it wrote every
+    /// byte it exposes (see the `backing_mut` contract).
+    pub(crate) fn set_written_len(&mut self, new_len: usize) {
+        assert!(
+            new_len <= self.cap,
+            "set_written_len past the backing capacity"
+        );
         self.len = new_len;
     }
 

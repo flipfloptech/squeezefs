@@ -919,6 +919,12 @@ impl DataRouter {
     }
 
     pub fn set_crypto(&self, crypto: crate::crypto_compress::CryptoCompressState) {
+        // §5.7 CRYPTO_SCRATCH_POOL: size the transform scratch off the
+        // CONFIGURED block size (FUSE init calls `set_block_size` before
+        // installing crypto). Passthrough states skip pool allocation; the
+        // clone below shares the same pool (Arc-held).
+        crypto
+            .init_scratch_pool(self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize);
         let _ = self.crypto.set(crypto.clone());
         let _ = self.cache.nvme.crypto.set(crypto);
     }

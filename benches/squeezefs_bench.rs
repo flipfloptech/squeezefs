@@ -32,6 +32,26 @@ fn bench_crypto_compress(c: &mut Criterion) {
     let state_combined =
         CryptoCompressState::new("lz4".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
 
+    // §5.7 CRYPTO_SCRATCH_POOL: production mounts initialize the scratch
+    // pool from the configured block size (`DataRouter::set_crypto`);
+    // mirror that so the named benches measure the shipping pooled path.
+    let block_size = 4 * 1024 * 1024;
+    for state in [
+        &state_lz4,
+        &state_zstd,
+        &state_aes,
+        &state_chacha,
+        &state_combined,
+    ] {
+        state.init_scratch_pool(block_size);
+    }
+
+    // Heap-path comparison pair (§5.7): identical config, pool never
+    // initialized — quantifies pooled scratch vs per-transform heap `Vec`s
+    // on the same workload.
+    let state_combined_unpooled =
+        CryptoCompressState::new("lz4".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
+
     for &size in &sizes {
         let input_data = bytes::Bytes::from(vec![0xAAu8; size]);
 
@@ -107,6 +127,19 @@ fn bench_crypto_compress(c: &mut Criterion) {
             |b, data| {
                 b.to_async(&rt).iter(|| {
                     let state = &state_combined;
+                    let data = data.clone();
+                    async move { state.process_write_async(data).await.unwrap() }
+                });
+            },
+        );
+
+        // LZ4 + AES combined, heap path (§5.7 pooled-vs-heap comparison)
+        group.bench_with_input(
+            BenchmarkId::new("lz4_aes_combined_write_unpooled", size),
+            &input_data,
+            |b, data| {
+                b.to_async(&rt).iter(|| {
+                    let state = &state_combined_unpooled;
                     let data = data.clone();
                     async move { state.process_write_async(data).await.unwrap() }
                 });

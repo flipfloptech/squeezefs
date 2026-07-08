@@ -1,5 +1,7 @@
 # Design Doc: MetaLV Metadata Durability — Retiring the Write-Only WAL and Making the Sector-Commit Crash Contract Explicit
 
+> **Superseded on v3 volumes** by `docs/design-cow-kv-metadata.md` (CoW KV metadata: checksummed journal + root-flip checkpoints; §7.2 there answers this document's WAL-deletion findings point-by-point). The D0/D1/D2 contract described here remains the authoritative v2-volume story.
+
 | | |
 |---|---|
 | **Title** | SqueezeFS metadata WAL role & crash consistency: durability story for the MetaLV sector-commit path |

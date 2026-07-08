@@ -1,5 +1,7 @@
 # Design Doc: Sector-Sharded Metadata Commit — Removing the Global `transaction_lock`
 
+> **Superseded on v3 volumes** by `docs/design-cow-kv-metadata.md` (CoW KV btree commit pipeline). The sector-commit protocol described here remains the authoritative v2-volume path.
+
 | | |
 |---|---|
 | **Title** | Uncapping small-file / metadata write throughput by replacing the global `transaction_lock` with sector-sharded commit locking |

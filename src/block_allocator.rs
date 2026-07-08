@@ -156,7 +156,14 @@ impl BlockAllocator {
         Ok(offset)
     }
 
-    pub async fn free_block(&self, offset: u64) -> Result<()> {
+    /// Release one reference. On the TERMINAL release (count hit zero, or
+    /// the offset was untracked) the offset's incarnation is retired and
+    /// `true` is returned — but the offset is **not yet reallocatable**:
+    /// the freer owns it until [`Self::finish_free`], which is what makes
+    /// destructive post-free device work (the router's hole punch) safe to
+    /// run in between — it strictly happens-before any new owner's DMA.
+    /// Non-terminal releases return `false` and release nothing else.
+    pub fn begin_free(&self, offset: u64) -> bool {
         let should_free = if let Some(terminal) = self
             .refcounts
             .read_sync(&offset, |_, v| crate::refcount_core::release(v))
@@ -176,19 +183,25 @@ impl BlockAllocator {
             // any in-flight cache fill that resolved a stale map to this key
             // fails its seqlock validation instead of poisoning the next owner.
             self.mark_incarnation_unstable(offset);
-            let block_idx = offset / self.chunk_size;
-            self.free_blocks.insert(block_idx);
-            crate::fuse_client::METRICS
-                .del_obj
-                .fetch_add(1, Ordering::Relaxed);
         }
-
-        Ok(())
+        should_free
     }
 
-    pub async fn free_blocks(&self, offsets: &[u64]) -> Result<()> {
-        for &offset in offsets {
-            let _ = self.free_block(offset).await;
+    /// Publish a [`Self::begin_free`]-retired offset for reuse. Only after
+    /// this can `allocate_block` hand the offset to a new owner.
+    pub fn finish_free(&self, offset: u64) {
+        let block_idx = offset / self.chunk_size;
+        self.free_blocks.insert(block_idx);
+        crate::fuse_client::METRICS
+            .del_obj
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Release one reference and, when terminal, immediately publish the
+    /// offset for reuse (begin + finish with no destructive work between).
+    pub async fn free_block(&self, offset: u64) -> Result<()> {
+        if self.begin_free(offset) {
+            self.finish_free(offset);
         }
         Ok(())
     }

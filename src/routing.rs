@@ -447,55 +447,38 @@ impl BackendRouter {
         }
     }
 
+    /// Free one reference on a block key. The hole punch is destructive
+    /// device I/O and runs ONLY on the terminal release (a non-terminal
+    /// free must never zero a clone's still-referenced bytes), and runs in
+    /// the `begin_free` → punch → `finish_free` window — the offset is not
+    /// reallocatable until after the punch, so the punch can never race a
+    /// new owner's DMA at the reused offset (the acked-write lost-update
+    /// class surfaced by PR 6's pinned striped concurrency test).
     pub async fn free_block(&self, block_key: &str) -> Result<()> {
         let (be_id, offset) = self.parse_block_key(block_key)?;
 
-        let device_path = if be_id == "backend_0" {
-            let _ = self.default_allocator.free_block(offset).await;
-            Some(self.default_device.device_path.clone())
+        let (allocator, device_path) = if be_id == "backend_0" {
+            (
+                self.default_allocator.clone(),
+                self.default_device.device_path.clone(),
+            )
         } else if let Some(be) = self.backends.get(&be_id) {
-            let _ = be.block_allocator.free_block(offset).await;
-            Some(be.device.device_path.clone())
+            (be.block_allocator.clone(), be.device.device_path.clone())
         } else {
-            None
+            return Ok(());
         };
 
-        if let Some(path) = device_path {
+        if allocator.begin_free(offset) {
             let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
-            Self::punch_hole_sync(&path, offset, block_size);
+            Self::punch_hole_sync(&device_path, offset, block_size);
+            allocator.finish_free(offset);
         }
         Ok(())
     }
 
     pub async fn free_blocks(&self, block_keys: &[&str]) -> Result<()> {
-        if block_keys.is_empty() {
-            return Ok(());
-        }
-        let mut backend_groups: std::collections::HashMap<String, Vec<u64>> =
-            std::collections::HashMap::new();
         for &block_key in block_keys {
-            if let Ok((be_id, offset)) = self.parse_block_key(block_key) {
-                backend_groups.entry(be_id).or_default().push(offset);
-            }
-        }
-
-        let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
-        for (be_id, offsets) in backend_groups {
-            let device_path = if be_id == "backend_0" {
-                let _ = self.default_allocator.free_blocks(&offsets).await;
-                Some(self.default_device.device_path.clone())
-            } else if let Some(be) = self.backends.get(&be_id) {
-                let _ = be.block_allocator.free_blocks(&offsets).await;
-                Some(be.device.device_path.clone())
-            } else {
-                None
-            };
-
-            if let Some(path) = device_path {
-                for offset in offsets {
-                    Self::punch_hole_sync(&path, offset, block_size);
-                }
-            }
+            let _ = self.free_block(block_key).await;
         }
         Ok(())
     }

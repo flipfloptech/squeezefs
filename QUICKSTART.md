@@ -68,6 +68,8 @@ Run SqueezeFS parallel benchmarks to stress metadata and raw data operations:
 ./target/release/squeezefs bench /mnt/squeezefs --threads 4 --large-size 64
 ```
 
+Committed reference numbers for this bench (large-seq writes ~1.8 GB/s on the reference box via the zero-copy write path) live in `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`; compare your rows against that table when validating a setup.
+
 ### Step 6: Unmount Safely
 Use SqueezeFS unmount to drain staging writes and cleanly shut down:
 ```bash

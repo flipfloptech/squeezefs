@@ -42,6 +42,7 @@ Mount always enables FUSE-over-io_uring after INIT (required). Expects: "FUSE-ov
 | Ad-hoc file R/W / fdatasync | `crate::uring_fs` process worker |
 | Mmap page hint | `IoUringPrefetcher` (`MADV_WILLNEED`) |
 | FUSE transport (default) | `fuse3` `BlockFuseConnection` (classical rings during INIT); **FUSE-over-io_uring** (`IORING_OP_URING_CMD` + REGISTER/COMMIT_AND_FETCH) after arm |
+| FUSE_WRITE payload delivery | Zero-copy **payload lease** (`Bytes::from_owner` over the registered uring payload buffer) with deferred COMMIT_AND_FETCH re-arm; the lease-severance boundary bounds every lease to one handler invocation — `docs/design-zero-copy-write-path.md` §5.4 |
 | Staging / read-segment hot path | **mmap** (by design — zero syscall) |
 | TLS peers | Not uring (network) |
 
@@ -63,6 +64,7 @@ Hardening: pool not marked ready until all queues submit REGISTER; per-qid commi
 - **Zero-Copy Hot Path:** Hot staged files are mapped directly using memory mapping (`mmap`). Buffer segments must be returned or updated in-place via pointer/slice references. Avoid allocating new buffers or cloning vectors during standard read/write execution.
 - **Latch-Free/Lock-Free Caching & Indexes:** Hot metadata tables, directory entry indices, and block routing tables must use lock-free or latch-free data structures (e.g., `scc::HashMap`, sharded atomic clock rings, atomic reference counts). Traditional read/write synchronization locks are only permitted for FUSE operations and metadata/lease transactions (see Lock Order constraints).
 - **Zero-Copy GPU Direct (GDS):** When `gds` feature is active, bypass host RAM completely. Copy block data directly between NVMe/NVMe-oF and GPU memory via RDMA.
+- **Zero-copy write path (normative design):** the large-write hot path is **1 userspace copy + 1 DMA** — transport payload leases (no per-request copy/alloc), one merge copy into the exclusive-owner `ActiveBlockBuf`, complete-block write-through past staging, guard-backed DMA for residual staged flushes. Design + acceptance evidence: `docs/design-zero-copy-write-path.md` and `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`. Do not reintroduce copies or staging detours on this path.
 
 ---
 

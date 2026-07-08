@@ -4,12 +4,25 @@
 |---|---|
 | **Title** | Zero-copy write path: complete-block write-through, exclusive-owner active blocks, and FUSE-over-io_uring payload leasing |
 | **Author** | _(placeholder — assign on review)_ |
-| **Date** | 2026-07-07 |
-| **Status** | **Draft** |
+| **Date** | 2026-07-07 (implemented 2026-07-08) |
+| **Status** | **Implemented** — all seven PRs landed on `dev`; the ≥ 3× acceptance gate is met (closing re-run ~1827 MiB/s = 3.57×–4.25× vs the 430–512 MiB/s attribution baseline; see the landed table below and `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`) |
 | **Repo** | `/home/justin/Source/squeezefs`, branch `dev` |
 | **Intended home** | `docs/design-zero-copy-write-path.md` |
 | **Reviewers** | FUSE / data-path owners |
 | **Related** | `.benchmarks/2026-07-07-write-path-attribution.md` (perf attribution), `.benchmarks/2026-07-07-write-copy-audit.md` (13-site copy inventory — the evidence base for every claim below), `.benchmarks/2026-07-07-pre-wal-removal-mount-bench.md` (no-regression baseline), `.benchmarks/2026-07-07-pr5-delete-gate-analysis.md` Addendum 2 (substrate cross-check), `docs/design-wal-crash-consistency.md` §3 (D0/D1/D2 contract), `AGENTS.md` (zero-copy / latch-free / io_uring-first non-negotiables, lock order P1-9) |
+
+## Landed (per-PR SHAs on `dev`)
+
+| PR | Landed as (tests-first + implementation) | Gate evidence |
+|---|---|---|
+| PR 0 — design | `1a3927e` (attribution `6a73303`, copy audit `f031bdb`) | — |
+| PR 1 — `fix(fuse)` exclusive-owner CoW active blocks (P0) | `ac92350` + `7f783ff` | perf-neutral; loom green |
+| PR 2 — `perf(cache)` contractual 4 KiB pooled alignment | `25db4ae` + `ec304cf` | fallback counter 0 on aligned workloads |
+| PR 3 — `perf(fuse)` guard-backed zero-copy staged flush | `fa26dab` + `b7a2973` | aligned-branch deltas 0; sequencing pins |
+| PR 4 — `perf(fuse)` complete-block write-through | `a678890` + `ffc5fe0` | ~921 → ~1679 MiB/s (**1.82×**), `.benchmarks/2026-07-07-pr4-write-through-gate.md` |
+| PR 5 — `perf(fuse3)` transport payload leases | `3a64858` + `2580006` | ~1660.9 MiB/s sustained; **cumulative ≥ 3× gate MET**, `.benchmarks/2026-07-07-pr5-transport-lease-gate.md` |
+| PR 6 — `refactor(routing)` slice reuse; delete subsumed routes | `2e5b3c1` + `80b0569` (+ surfaced pre-existing fixes: hole-punch `1a0ea16`+`f0ca977`, stale-fill `2974416`+`8e3995e`; design row retire `2c99e85`) | no-regression; equivalence + promotion pins |
+| PR 7 — `docs(bench)` closing report, baselines, doc updates | this change | `.benchmarks/2026-07-08-zero-copy-write-path-closing.md` (closing re-run ~1827 MiB/s, full reference table, follow-up dispositions) |
 
 ---
 
@@ -616,7 +629,7 @@ Ordered, each independently reviewable/mergeable off `dev` (`--ff-only`), tests-
 - **Gate**: no-regression on all rows; small-block-config correctness suite green; promotion round-trip tests green.
 
 **PR 7 — `docs(bench): zero-copy write path closing report, baselines, and doc updates`**
-- **Files**: `.benchmarks/2026-XX-XX-zero-copy-write-path-results.md` (final attribution rerun: bench rows, perf memcpy share, staging-write volume, alloc-rate), `AGENTS.md` (io_uring coverage table: payload-lease row; zero-copy section pointer), `README.md`/`QUICKSTART.md` perf note, criterion `--save-baseline` refresh.
+- **Files**: `.benchmarks/2026-07-08-zero-copy-write-path-closing.md` (landed name; final attribution rerun: bench rows, perf memcpy share, staging-write volume, alloc-rate), `AGENTS.md` (io_uring coverage table: payload-lease row; zero-copy section pointer), `README.md`/`QUICKSTART.md` perf note, criterion `--save-baseline zero_copy_write_path` refresh.
 - **Deps**: PRs 1–6.
 - **Changes**: verifies and records the **≥ 3× / ≥ ~1.3 GB/s** acceptance gate and the full no-regression table vs both committed baselines; files follow-ups for anything deferred (Alt C/D levers, open questions 4–6).
 - **Gate**: the acceptance gate itself; all suites green at the closing commit.

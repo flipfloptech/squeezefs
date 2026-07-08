@@ -42,6 +42,7 @@ Translates POSIX FUSE locks to cluster-wide leases on the metadata backend, prot
 - **Tier 1 (GPU Direct Storage - GDS):** Routes RDMA transfers directly from NVMe to VRAM, bypassing the host CPU/RAM.
 - **Tier 2 (Unified System RAM):** Clock/LRU caches dynamically sizing to system memory limits.
 - **Tier 3 (Local NVMe Staging):** Staging directory (`.staging`) for async writes and local caching of read blocks to avoid RTT latency.
+- **Zero-copy write path:** large sequential writes travel kernel → transport payload lease → one merge copy → io_uring DMA. Content-complete blocks upload directly (**write-through**), skipping the staging round-trip entirely; FUSE_WRITE payloads ride zero-copy leases over the registered FUSE-over-io_uring buffers. Measured on the committed reference profile: large-seq writes went from 430–512 MiB/s to ~1.8 GB/s (**≥ 3.5×**) with small-write, read, and metadata rows at-or-better — see `docs/design-zero-copy-write-path.md` and `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`.
 
 ### 5. Multi-NIC (Multi-Rail) Network Load Balancing & HA
 Binds outbound client connections to multiple configured physical interfaces (source IPs). Distributes traffic round-robin across NICs and automatically fails over on interface drops. Fully compatible with user-space storage engines like SPDK (Storage Performance Development Kit).

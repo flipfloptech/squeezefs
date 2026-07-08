@@ -939,3 +939,130 @@ async fn test_staged_to_striped_promotion_roundtrip() {
         "staged→striped promotion mismatch after cache invalidation"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stale-fill hardening under block-key reuse (surfaced by PR 6, pre-existing
+// class): block keys are device-offset strings, so a displaced-key free +
+// reallocation reuses the SAME key string for a NEW incarnation. Cache
+// publishes that cannot prove which incarnation their bytes belong to must
+// not stick — otherwise a reader that raced the free serves the dead
+// incarnation's bytes (observed as all-zero blocks) until remount.
+// ---------------------------------------------------------------------------
+
+/// An NVMe read-tier hit must serve the caller WITHOUT re-promoting the
+/// entry into the RAM block LRU: tier-entry provenance under key reuse is
+/// unprovable from the incarnation word (the entry may predate a
+/// free+realloc whose undo/purge is still in flight), and a stale
+/// re-promote is exactly the sticky poison the seqlock exists to prevent.
+/// The RAM LRU is filled only by device-validated fills and owners.
+#[tokio::test]
+async fn test_nvme_tier_hit_does_not_repromote_into_ram_lru() {
+    let h = make().await;
+    // A key with NO live incarnation bookkeeping (never allocated in this
+    // process) — the shape where provenance is least provable.
+    let key = "31391744".to_string();
+    let payload: Vec<u8> = (0..4096u32).map(|b| (b % 197) as u8).collect();
+    h.fs.router
+        .cache
+        .nvme
+        .cache_read_block(&key, bytes::Bytes::copy_from_slice(&payload))
+        .expect("seed NVMe read tier");
+    assert!(
+        h.fs.router.cache.read_lru.get(&key).is_none(),
+        "test precondition: RAM LRU cold"
+    );
+
+    let served =
+        h.fs.router
+            .get_cached_or_fetch_block(&key)
+            .await
+            .expect("NVMe tier hit");
+    assert_eq!(&served[..], &payload[..], "tier hit must serve the bytes");
+
+    assert!(
+        h.fs.router.cache.read_lru.get(&key).is_none(),
+        "NVMe tier hit re-promoted into the RAM LRU — an unprovable-provenance \
+         publish that can stick a dead incarnation's bytes under a reused key"
+    );
+}
+
+/// A no-LRU-put owner (complete-block write-through) taking ownership of a
+/// REUSED block key must purge the key's read tiers: a reader fill of the
+/// key's dying incarnation can legally publish between the displaced-key
+/// purge and the free (the incarnation word is still stable there), and
+/// with no owner put to overwrite it, that entry would shadow the new
+/// owner's device bytes forever.
+#[tokio::test]
+async fn test_write_through_reused_key_purges_stale_read_tiers() {
+    let h = make().await;
+    let block = 65536usize;
+    let ino = create(&h, "reuse_purge").await;
+    let path = format!("inode_{ino}");
+
+    // Striped file, 4 blocks.
+    let base = pattern(4 * block);
+    write_at(&h, ino, 0, &base).await;
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    let k1_old = meta
+        .block_map
+        .as_ref()
+        .and_then(|bm| bm.get(&1).cloned())
+        .expect("block 1 mapped");
+
+    // Full overwrite of block 1 only: displaces and frees block 1's old key
+    // — the ONLY free-listed offset now (its replacement key is allocated
+    // before the displaced free, so it never comes from the free list).
+    let over1: Vec<u8> = (0..block).map(|i| ((i % 239) as u8) ^ 0x21).collect();
+    write_at(&h, ino, block as u64, &over1).await;
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    let k1_new = meta
+        .block_map
+        .as_ref()
+        .and_then(|bm| bm.get(&1).cloned())
+        .expect("block 1 mapped");
+    assert_ne!(k1_old, k1_new, "overwrite must publish a fresh key");
+
+    // Simulate the raced reader: the dying incarnation's bytes land in both
+    // read tiers under the now-freed key.
+    let poison = vec![0u8; block];
+    h.fs.router
+        .cache
+        .read_lru
+        .put(&k1_old, bytes::Bytes::copy_from_slice(&poison));
+    let _ =
+        h.fs.router
+            .cache
+            .nvme
+            .cache_read_block(&k1_old, bytes::Bytes::copy_from_slice(&poison));
+
+    // A block-end-reaching partial write RMW-seeds block 2 and fires the
+    // complete-block write-through, whose allocation takes the freed offset
+    // — the poisoned key string — as block 2's new key.
+    let tail2: Vec<u8> = (0..block / 2).map(|i| ((i % 233) as u8) ^ 0x42).collect();
+    write_at(&h, ino, (2 * block + block / 2) as u64, &tail2).await;
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    let k2_new = meta
+        .block_map
+        .as_ref()
+        .and_then(|bm| bm.get(&2).cloned())
+        .expect("block 2 mapped");
+    assert_eq!(
+        k2_new, k1_old,
+        "test precondition: the allocator must reuse the freed offset \
+         (single-entry free list)"
+    );
+
+    // The new owner's block must read back as written — not as the dead
+    // incarnation's poison shadowing the reused key.
+    let mut expected = base.clone();
+    expected[block..2 * block].copy_from_slice(&over1);
+    let s2 = 2 * block + block / 2;
+    expected[s2..s2 + tail2.len()].copy_from_slice(&tail2);
+    let got = read_at(&h, ino, (2 * block) as u64, block as u32).await;
+    assert_eq!(
+        got,
+        &expected[2 * block..3 * block],
+        "reused block key served the dead incarnation's cached bytes — the \
+         no-put write-through owner must purge the key's read tiers"
+    );
+}

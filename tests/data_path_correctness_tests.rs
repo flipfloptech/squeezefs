@@ -681,3 +681,261 @@ async fn test_active_block_snapshots_stable_under_concurrent_writers(
         "final read must observe the last write"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR 6 of docs/design-zero-copy-write-path.md (§5.6): full-coverage slice
+// reuse in the router's striped per-block task (kills audit #12), plus the
+// no-dead-code removal of the subsumed `is_aligned` fast path and the
+// provably-unreachable in-handler promotion block. This harness runs
+// `block_size = 64 KiB` — the small-block config where the `is_aligned`
+// branch IS reachable today — so these tests pin behavior equivalence
+// before/after the deletion, and the promotion round-trips pin that
+// inline→striped and staged→striped growth stays byte-exact.
+// ---------------------------------------------------------------------------
+
+/// RED until PR 6 lands — the slice-reuse contract itself: when a striped
+/// write through `DataRouter::write_file` fully covers a block
+/// (`rel_start == 0 && rel_end == block_size`), the per-block task must use
+/// the payload slice directly as the block bytes instead of copying it into
+/// a `PooledBuf` (routing copy, audit #12). Observable without new API: the
+/// plaintext block the task caches in the read LRU under the new block key
+/// is then a zero-copy slice of the caller's payload allocation — pointer
+/// containment proves the copy is gone. Lease-safe by construction: the
+/// §5.4 severance boundary guarantees no transport lease ever reaches
+/// `DataRouter::write_file`, so retaining the slice retains a private copy.
+#[tokio::test]
+async fn test_striped_full_coverage_write_reuses_payload_slice() {
+    let h = make().await;
+    let block = 65536usize;
+    let ino = create(&h, "slice_reuse").await;
+    let path = format!("inode_{ino}");
+
+    // Stripe the file (4 blocks: 3 full + tail) through the FUSE handler.
+    write_at(&h, ino, 0, &pattern(200_000)).await;
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(meta.file_type, "striped", "seed file must be striped");
+
+    // One payload covering blocks 0 and 1 completely, written through the
+    // router route the design keeps live (promotions / copy_file_range /
+    // stale-cache striped dispatch).
+    let payload_vec: Vec<u8> = (0..2 * block).map(|i| ((i % 239) as u8) ^ 0x5A).collect();
+    let payload = bytes::Bytes::from(payload_vec);
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+    h.fs.router
+        .write_file(&path, 0, payload.clone(), token)
+        .await
+        .expect("router striped write");
+
+    let payload_base = payload.as_ptr() as usize;
+    let payload_range = payload_base..payload_base + payload.len();
+
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    let block_map = meta.block_map.as_ref().expect("striped block map");
+    for b in [0u32, 1u32] {
+        let key = block_map
+            .get(&b)
+            .unwrap_or_else(|| panic!("block {b} missing from block map"));
+        let cached =
+            h.fs.router
+                .cache
+                .read_lru
+                .get(key)
+                .unwrap_or_else(|| panic!("block {b} (key {key}) not in read LRU after write"));
+        assert_eq!(
+            &cached[..],
+            &payload[b as usize * block..(b as usize + 1) * block],
+            "block {b}: cached plaintext differs from the payload slice"
+        );
+        let ptr = cached.as_ptr() as usize;
+        assert!(
+            payload_range.contains(&ptr),
+            "block {b}: full-coverage striped write still copies the payload \
+             into a pooled buffer (cached block at {ptr:#x} is outside the \
+             payload allocation {payload_range:?}) — §5.6 slice reuse must \
+             hand data_slice through as block_bytes"
+        );
+    }
+
+    // The reuse must not change what readers observe.
+    let mut expected = pattern(200_000);
+    expected[..2 * block].copy_from_slice(&payload);
+    let got = read_at(&h, ino, 0, 200_000).await;
+    assert_eq!(got, expected, "content mismatch after slice-reuse write");
+}
+
+/// Equivalence pin for the `is_aligned` direct-leg deletion: block-aligned
+/// overwrites of a striped file (single-block, multi-block, and a
+/// block-boundary append) must produce byte-identical results before and
+/// after the branch is removed — post-PR 4, `write_file_staged` handles
+/// complete blocks equivalently (write-through) for every config, which is
+/// the design's justification for deleting the duplicate striped route.
+#[tokio::test]
+async fn test_aligned_striped_overwrite_equivalence_64k_blocks() {
+    let h = make().await;
+    let block = 65536usize;
+    let size = 4 * block; // exactly 4 blocks — aligned append lands on EOF
+    let ino = create(&h, "aligned_eq").await;
+
+    let mut expected = pattern(size);
+    write_at(&h, ino, 0, &expected).await;
+
+    // Single-block aligned overwrite (block 1).
+    let one: Vec<u8> = (0..block).map(|i| ((i % 241) as u8) ^ 0xA5).collect();
+    write_at(&h, ino, block as u64, &one).await;
+    expected[block..2 * block].copy_from_slice(&one);
+    assert_eq!(
+        read_at(&h, ino, 0, size as u32).await,
+        expected,
+        "single-block aligned overwrite mismatch"
+    );
+
+    // Multi-block aligned overwrite (blocks 2..4).
+    let two: Vec<u8> = (0..2 * block).map(|i| ((i % 243) as u8) ^ 0x3C).collect();
+    write_at(&h, ino, 2 * block as u64, &two).await;
+    expected[2 * block..4 * block].copy_from_slice(&two);
+    assert_eq!(
+        read_at(&h, ino, 0, size as u32).await,
+        expected,
+        "multi-block aligned overwrite mismatch"
+    );
+
+    // Aligned append at EOF (grows the file by one whole block).
+    let grow: Vec<u8> = (0..block).map(|i| ((i % 245) as u8) ^ 0x69).collect();
+    write_at(&h, ino, size as u64, &grow).await;
+    expected.extend_from_slice(&grow);
+    let got = read_at(&h, ino, 0, (size + block) as u32).await;
+    assert_eq!(got.len(), size + block, "aligned append: short read");
+    assert_eq!(got, expected, "aligned append mismatch");
+
+    // Durable view: drop the hot meta/attr caches and read again.
+    h.fs.router
+        .metadata_cache
+        .invalidate(&format!("inode_{ino}"));
+    h.fs.attr_cache.invalidate(&ino);
+    assert_eq!(
+        read_at(&h, ino, 0, (size + block) as u32).await,
+        expected,
+        "aligned overwrite/append mismatch after cache invalidation"
+    );
+}
+
+/// Equivalence pin for the deleted branch's buffer-invalidation duty: an
+/// aligned full-block overwrite of a block that holds a DIRTY in-RAM
+/// active-block buffer (left by a prior partial write) must supersede that
+/// buffer — a later read must see the overwrite, not the stale merge state.
+#[tokio::test]
+async fn test_aligned_overwrite_supersedes_dirty_active_block() {
+    let h = make().await;
+    let block = 65536usize;
+    let size = 4 * block;
+    let ino = create(&h, "aligned_dirty").await;
+
+    let mut expected = pattern(size);
+    write_at(&h, ino, 0, &expected).await;
+
+    // Partial write inside block 2 → dirty active-block buffer (no trigger).
+    let patch = vec![0xEEu8; 1024];
+    write_at(&h, ino, (2 * block + 100) as u64, &patch).await;
+    expected[2 * block + 100..2 * block + 100 + patch.len()].copy_from_slice(&patch);
+    assert_eq!(
+        read_at(&h, ino, 0, size as u32).await,
+        expected,
+        "partial write not observed"
+    );
+
+    // Aligned overwrite of the same (dirty) block.
+    let full: Vec<u8> = (0..block).map(|i| ((i % 233) as u8) ^ 0x11).collect();
+    write_at(&h, ino, 2 * block as u64, &full).await;
+    expected[2 * block..3 * block].copy_from_slice(&full);
+    assert_eq!(
+        read_at(&h, ino, 0, size as u32).await,
+        expected,
+        "aligned overwrite of a dirty active block must supersede the buffer"
+    );
+}
+
+/// Promotion round-trip pin (design PR 6 gate): inline→striped growth must
+/// stay byte-exact across the deletion of the in-handler promotion block —
+/// which is provably unreachable (`use_router_write` is unconditionally true
+/// for `file_type == "inline"`), so promotions resolve inside
+/// `DataRouter::write_file` via §5.4 route (i), before and after.
+#[tokio::test]
+async fn test_inline_to_striped_promotion_roundtrip() {
+    let h = make().await;
+    let ino = create(&h, "promo_inline").await;
+    let path = format!("inode_{ino}");
+
+    // Inline seed (≤ 4096).
+    let seed = pattern(3000);
+    write_at(&h, ino, 0, &seed).await;
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(meta.file_type, "inline", "3000-byte file must be inline");
+
+    // Growth write past block_size (64 KiB) → promotes inline → striped.
+    let grow: Vec<u8> = (0..150_000).map(|i| ((i % 251) as u8) ^ 0x77).collect();
+    write_at(&h, ino, 3000, &grow).await;
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(
+        meta.file_type, "striped",
+        "growth past block_size must promote inline → striped"
+    );
+
+    let mut expected = seed.clone();
+    expected.extend_from_slice(&grow);
+    assert_eq!(
+        read_at(&h, ino, 0, expected.len() as u32).await,
+        expected,
+        "inline→striped promotion round-trip mismatch"
+    );
+
+    // Durable view (cold meta/attr caches).
+    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.attr_cache.invalidate(&ino);
+    assert_eq!(
+        read_at(&h, ino, 0, expected.len() as u32).await,
+        expected,
+        "inline→striped promotion mismatch after cache invalidation"
+    );
+}
+
+/// Promotion round-trip pin (design PR 6 gate): staged→striped growth must
+/// stay byte-exact across the deletion, same unreachability argument
+/// (`use_router_write` is unconditionally true for `file_type == "staged"`).
+#[tokio::test]
+async fn test_staged_to_striped_promotion_roundtrip() {
+    let h = make().await;
+    let ino = create(&h, "promo_staged").await;
+    let path = format!("inode_{ino}");
+
+    // Staged seed (> 4096 inline cap, ≤ 64 KiB block size).
+    let seed = pattern(30_000);
+    write_at(&h, ino, 0, &seed).await;
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(meta.file_type, "staged", "30 KB file must be staged");
+
+    // Growth write past block_size → promotes staged → striped.
+    let grow: Vec<u8> = (0..200_000).map(|i| ((i % 249) as u8) ^ 0x88).collect();
+    write_at(&h, ino, 30_000, &grow).await;
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(
+        meta.file_type, "striped",
+        "growth past block_size must promote staged → striped"
+    );
+
+    let mut expected = seed.clone();
+    expected.extend_from_slice(&grow);
+    assert_eq!(
+        read_at(&h, ino, 0, expected.len() as u32).await,
+        expected,
+        "staged→striped promotion round-trip mismatch"
+    );
+
+    // Durable view (cold meta/attr caches).
+    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.attr_cache.invalidate(&ino);
+    assert_eq!(
+        read_at(&h, ino, 0, expected.len() as u32).await,
+        expected,
+        "staged→striped promotion mismatch after cache invalidation"
+    );
+}

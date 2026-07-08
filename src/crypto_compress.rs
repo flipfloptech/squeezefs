@@ -521,4 +521,485 @@ mod tests {
         let read = state.process_read(&written).unwrap();
         assert_eq!(&*read, payload.as_ref());
     }
+
+    // -----------------------------------------------------------------
+    // §5.7 CRYPTO_SCRATCH_POOL (zero-copy write-path design, severable
+    // sub-commit): worst-case-sized pooled transform scratch for the
+    // non-passthrough write path. Contract pinned here:
+    //
+    //  - pool buffers are sized at init as worst_case(block_size) =
+    //    on-disk header ([2B wrapped_key_len][1B nonce_len][wrapped_key]
+    //    [nonce]) with the ACTUAL prewrapped key blob length (512 B
+    //    RSA-4096 fallback when none exists at pool-init time) + nonce
+    //    (12 B) + max(4-byte-prefixed lz4 maximum output, zstd compress
+    //    bound) + AEAD tag, rounded up to the next 4 KiB;
+    //  - pooled lz4 output is BYTE-IDENTICAL to `compress_prepend_size`
+    //    (the 4-byte little-endian size-prefix framing the untouched
+    //    `decompress_size_prepended` read path requires — the on-disk
+    //    compatibility pin);
+    //  - blocks written by the pre-scratch writer primitives decode
+    //    through the (contractually untouched) read path, and pooled
+    //    blocks decode through that same read path (read-back parity);
+    //  - exactly one pooled buffer per transform, checked out for the
+    //    output's lifetime, recycled on drop, 4096-aligned backing;
+    //  - inputs whose worst case exceeds the pool's buffer size bounce
+    //    to today's heap `Vec`s; states never initialized stay on the
+    //    heap path (and keep emitting pre-scratch bytes);
+    //  - `process_write` never mutates its input snapshot (the same
+    //    plaintext backs read-LRU / RYW reads).
+    // -----------------------------------------------------------------
+
+    use rstest::rstest;
+
+    /// One RSA-2048 keypair for every scratch-pool test (keygen is the
+    /// slow part; the tests pin transform behavior, not keygen).
+    static TEST_PEM: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+        let mut rng = rand::thread_rng();
+        RsaPrivateKey::new(&mut rng, 2048)
+            .unwrap()
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .unwrap()
+            .to_string()
+    });
+
+    /// Deterministic high-entropy filler (no rand dependency on content).
+    fn lcg_bytes(len: usize, mut seed: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(len);
+        for _ in 0..len {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            v.push((seed >> 33) as u8);
+        }
+        v
+    }
+
+    /// Compressible-run + entropy-tail payload (exercises literal and
+    /// match paths of both compressors).
+    fn mixed_payload(len: usize) -> Vec<u8> {
+        let mut v = vec![0x5Au8; len];
+        let tail = len / 4;
+        v[len - tail..].copy_from_slice(&lcg_bytes(tail, 0x5EED));
+        v
+    }
+
+    fn pool_len(state: &CryptoCompressState) -> usize {
+        state
+            .scratch_pool
+            .get()
+            .expect("CRYPTO_SCRATCH_POOL must be initialized")
+            .len()
+    }
+
+    /// §5.7 sizing formula, recomputed independently from the dependency
+    /// bounds (the lz4 term carries the 4-byte size-prefix framing).
+    fn expected_scratch_buf_len(state: &CryptoCompressState, block_size: usize) -> usize {
+        let compress_term = std::cmp::max(
+            4 + lz4_flex::block::get_maximum_output_size(block_size),
+            zstd::zstd_safe::compress_bound(block_size),
+        );
+        let encrypt_overhead = if state.encrypt_mode != EncryptMode::None {
+            let wrapped = state
+                .prewrapped_key
+                .as_ref()
+                .map(|(w, _)| w.len())
+                .unwrap_or(512);
+            3 + wrapped + 12 + state.aead_tag_len
+        } else {
+            0
+        };
+        (compress_term + encrypt_overhead).next_multiple_of(4096)
+    }
+
+    #[test]
+    fn test_scratch_pool_sizing_uses_actual_prewrapped_key_blob() {
+        let bs = 256 * 1024;
+        let state = CryptoCompressState::new(
+            "lz4".to_string(),
+            "aes256gcm-rsa".to_string(),
+            Some(&TEST_PEM),
+        );
+        let wrapped_len = state
+            .prewrapped_key
+            .as_ref()
+            .expect("session key must prewrap with a private key configured")
+            .0
+            .len();
+        assert_eq!(wrapped_len, 256, "RSA-2048 wrap must be 256 bytes");
+
+        state.init_scratch_pool(bs);
+        let buf_len = state
+            .scratch_pool_buf_len()
+            .expect("pool must initialize for non-passthrough state");
+        assert_eq!(
+            buf_len,
+            expected_scratch_buf_len(&state, bs),
+            "pool buffer must be the §5.7 worst case for the ACTUAL wrapped key blob"
+        );
+        assert_eq!(buf_len % 4096, 0, "worst case must round to 4 KiB");
+        // Tight rounding: next multiple, not an overshoot.
+        assert!(
+            buf_len - expected_scratch_buf_len(&state, bs) < 4096,
+            "rounded to the NEXT 4 KiB, not beyond"
+        );
+        // ≈ block_size + 128 KiB for the design's shape.
+        assert!(buf_len > bs && buf_len <= bs + 128 * 1024);
+    }
+
+    #[test]
+    fn test_scratch_pool_sizing_falls_back_to_512b_rsa4096_wrap() {
+        // Encryption configured but no private key at pool-init time: no
+        // prewrapped blob exists, so sizing must assume a 512 B RSA-4096
+        // wrap (a 256 B RSA-2048 assumption would silently push
+        // 4096-bit-key configs onto the overflow bounce).
+        let bs = 256 * 1024;
+        let state = CryptoCompressState::new("lz4".to_string(), "aes256gcm-rsa".to_string(), None);
+        assert!(state.prewrapped_key.is_none());
+        state.init_scratch_pool(bs);
+        let compress_term = std::cmp::max(
+            4 + lz4_flex::block::get_maximum_output_size(bs),
+            zstd::zstd_safe::compress_bound(bs),
+        );
+        let expected = (compress_term + 3 + 512 + 12 + state.aead_tag_len).next_multiple_of(4096);
+        assert_eq!(state.scratch_pool_buf_len(), Some(expected));
+    }
+
+    #[test]
+    fn test_scratch_pool_init_idempotent_and_passthrough_noop() {
+        // Passthrough never transforms: a scratch pool would be dead weight.
+        let passthrough = CryptoCompressState::new("none".to_string(), "none".to_string(), None);
+        passthrough.init_scratch_pool(4 * 1024 * 1024);
+        assert_eq!(
+            passthrough.scratch_pool_buf_len(),
+            None,
+            "passthrough state must not allocate a scratch pool"
+        );
+
+        // First init wins; re-init with a different block size is a no-op.
+        let state = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+        state.init_scratch_pool(64 * 1024);
+        let first = state.scratch_pool_buf_len().unwrap();
+        state.init_scratch_pool(4 * 1024 * 1024);
+        assert_eq!(state.scratch_pool_buf_len(), Some(first));
+    }
+
+    #[test]
+    fn test_lz4_scratch_framing_byte_identical_to_prepend_size() {
+        // On-disk compatibility pin: raw `compress_into` emits no framing,
+        // so the pooled writer must reproduce the exact
+        // `compress_prepend_size` image (4-byte LE uncompressed size +
+        // block stream) that `decompress_size_prepended` requires.
+        let bs = 256 * 1024;
+        let state = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+        state.init_scratch_pool(bs);
+        let cap0 = pool_len(&state);
+        assert!(cap0 > 0, "pool must preallocate");
+
+        // Deep write first: leaves long stale content in a recycled buffer.
+        let deep = lcg_bytes(bs, 0xD1CE);
+        let deep_out = state
+            .process_write(bytes::Bytes::from(deep.clone()))
+            .unwrap();
+        assert_eq!(pool_len(&state), cap0 - 1, "deep write must be pooled");
+        assert_eq!(
+            deep_out.as_ref(),
+            lz4_flex::compress_prepend_size(&deep).as_slice()
+        );
+        drop(deep_out);
+        assert_eq!(pool_len(&state), cap0);
+
+        // Then cycle short writes through every pooled buffer: stale bytes
+        // from the deep write must never leak past the written length.
+        let short = mixed_payload(32 * 1024);
+        let expected = lz4_flex::compress_prepend_size(&short);
+        for _ in 0..cap0 {
+            let out = state
+                .process_write(bytes::Bytes::from(short.clone()))
+                .unwrap();
+            assert_eq!(pool_len(&state), cap0 - 1, "short write must be pooled");
+            assert_eq!(
+                out.as_ref(),
+                expected.as_slice(),
+                "pooled lz4 image must be byte-identical to compress_prepend_size"
+            );
+            assert_eq!(state.process_read(&out).unwrap().as_ref(), short.as_slice());
+        }
+
+        // Empty payload keeps the framing too ([0,0,0,0] prefix).
+        let empty_out = state.process_write(bytes::Bytes::new()).unwrap();
+        assert_eq!(
+            empty_out.as_ref(),
+            lz4_flex::compress_prepend_size(&[]).as_slice()
+        );
+        assert!(state.process_read(&empty_out).unwrap().is_empty());
+    }
+
+    #[rstest]
+    #[case::lz4("lz4", "none")]
+    #[case::zstd("zstd", "none")]
+    #[case::aes("none", "aes256gcm-rsa")]
+    #[case::chacha("none", "chacha20-rsa")]
+    #[case::lz4_aes("lz4", "aes256gcm-rsa")]
+    #[case::zstd_chacha("zstd", "chacha20-rsa")]
+    fn test_pre_scratch_volume_read_back_parity(#[case] comp: &str, #[case] enc: &str) {
+        // A volume written before the scratch sub-commit holds blocks
+        // produced by `compress_prepend_size` / `encode_all` / heap
+        // `encrypt`. Both directions must hold through the untouched read
+        // path: pre-scratch blocks decode on a pool-enabled state, and
+        // pooled blocks decode exactly like pre-scratch ones.
+        let bs = 128 * 1024;
+        let pem = if enc == "none" {
+            None
+        } else {
+            Some(TEST_PEM.as_str())
+        };
+        let state = CryptoCompressState::new(comp.to_string(), enc.to_string(), pem);
+        state.init_scratch_pool(bs);
+        let payload = mixed_payload(96 * 1024);
+
+        // Pre-scratch writer image (the exact primitives the old
+        // `process_write` used).
+        let compressed: Vec<u8> = match comp {
+            "lz4" => lz4_flex::compress_prepend_size(&payload),
+            "zstd" => zstd::encode_all(std::io::Cursor::new(&payload[..]), 3).unwrap(),
+            _ => payload.clone(),
+        };
+        let old_blob: Vec<u8> = if enc != "none" {
+            state.encrypt(&compressed).unwrap()
+        } else {
+            compressed
+        };
+        assert_eq!(
+            state.process_read(&old_blob).unwrap().as_ref(),
+            payload.as_slice(),
+            "pre-scratch volume block must decode through the untouched read path"
+        );
+
+        // Pooled writer image, decoded by the same untouched read path.
+        let cap0 = pool_len(&state);
+        let new_blob = state
+            .process_write(bytes::Bytes::from(payload.clone()))
+            .unwrap();
+        assert_eq!(pool_len(&state), cap0 - 1, "transform must be pooled");
+        assert_eq!(
+            state.process_read(&new_blob).unwrap().as_ref(),
+            payload.as_slice(),
+            "pooled block must decode through the untouched read path"
+        );
+        if enc == "none" && comp == "lz4" {
+            assert_eq!(new_blob.as_ref(), old_blob.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_scratch_pool_checkout_recycle_and_alignment() {
+        let bs = 256 * 1024;
+        let state = CryptoCompressState::new(
+            "lz4".to_string(),
+            "aes256gcm-rsa".to_string(),
+            Some(&TEST_PEM),
+        );
+        state.init_scratch_pool(bs);
+        let cap0 = pool_len(&state);
+        assert!(cap0 > 0);
+
+        let payload = bytes::Bytes::from(mixed_payload(bs));
+        let out = state.process_write(payload.clone()).unwrap();
+        // Exactly ONE pooled transform buffer, checked out for the
+        // output's lifetime (compress-into-scratch + seal-in-place —
+        // no second transform buffer).
+        assert_eq!(pool_len(&state), cap0 - 1);
+        // 4096-aligned backing: the DMA takes `WriteData::Aligned` whenever
+        // the ciphertext lands on a 4 KiB multiple.
+        assert_eq!(out.as_ptr() as usize % 4096, 0);
+        assert_eq!(state.process_read(&out).unwrap().as_ref(), payload.as_ref());
+        drop(out);
+        assert_eq!(pool_len(&state), cap0, "backing must recycle on drop");
+
+        // Recycled buffers serve subsequent transforms.
+        let out2 = state.process_write(payload.clone()).unwrap();
+        assert_eq!(pool_len(&state), cap0 - 1);
+        assert_eq!(
+            state.process_read(&out2).unwrap().as_ref(),
+            payload.as_ref()
+        );
+        drop(out2);
+        assert_eq!(pool_len(&state), cap0);
+    }
+
+    #[test]
+    fn test_incompressible_input_within_bound_stays_pooled() {
+        // Incompressible data expands (prefix + literal framing) but stays
+        // within the worst-case bound — it must NOT bounce to the heap.
+        let bs = 128 * 1024;
+        let state = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+        state.init_scratch_pool(bs);
+        let cap0 = pool_len(&state);
+
+        let payload = lcg_bytes(bs, 0xBAD5EED);
+        let out = state
+            .process_write(bytes::Bytes::from(payload.clone()))
+            .unwrap();
+        assert!(
+            out.len() > payload.len(),
+            "entropy payload must expand under lz4"
+        );
+        assert_eq!(
+            pool_len(&state),
+            cap0 - 1,
+            "expansion within bound stays pooled"
+        );
+        assert_eq!(
+            state.process_read(&out).unwrap().as_ref(),
+            payload.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_scratch_overflow_bounces_to_heap() {
+        // Inputs past the pool's sizing basis (worst case > buffer size)
+        // must bounce to today's heap `Vec` path — and only those.
+        let bs = 64 * 1024;
+        let state = CryptoCompressState::new(
+            "lz4".to_string(),
+            "aes256gcm-rsa".to_string(),
+            Some(&TEST_PEM),
+        );
+        state.init_scratch_pool(bs);
+        let cap0 = pool_len(&state);
+
+        let oversized = bytes::Bytes::from(mixed_payload(2 * bs));
+        let out = state.process_write(oversized.clone()).unwrap();
+        assert_eq!(
+            pool_len(&state),
+            cap0,
+            "overflow bounce must not touch the pool"
+        );
+        assert_eq!(
+            state.process_read(&out).unwrap().as_ref(),
+            oversized.as_ref()
+        );
+    }
+
+    #[test]
+    fn test_uninitialized_state_stays_on_pre_scratch_heap_path() {
+        // No `init_scratch_pool` (e.g. ad-hoc states): the heap path stays,
+        // and its bytes are exactly the pre-scratch writer's bytes.
+        let state = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+        assert_eq!(state.scratch_pool_buf_len(), None);
+        let payload = mixed_payload(96 * 1024);
+        let out = state
+            .process_write(bytes::Bytes::from(payload.clone()))
+            .unwrap();
+        assert_eq!(
+            out.as_ref(),
+            lz4_flex::compress_prepend_size(&payload).as_slice()
+        );
+        assert_eq!(
+            state.process_read(&out).unwrap().as_ref(),
+            payload.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_process_write_never_mutates_input() {
+        // Input immutability (§5.7): the same plaintext snapshot backs
+        // read-LRU and RYW reads; an in-place-over-input "optimization" is
+        // explicitly rejected.
+        let bs = 128 * 1024;
+        let state = CryptoCompressState::new(
+            "zstd".to_string(),
+            "chacha20-rsa".to_string(),
+            Some(&TEST_PEM),
+        );
+        state.init_scratch_pool(bs);
+        let pristine = mixed_payload(bs);
+        let input = bytes::Bytes::from(pristine.clone());
+        let input_ptr = input.as_ptr();
+        let out = state.process_write(input.clone()).unwrap();
+        assert_ne!(out.as_ptr(), input_ptr, "output must be a fresh buffer");
+        assert_eq!(
+            input.as_ref(),
+            pristine.as_slice(),
+            "input snapshot must stay immutable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_scratch_pool_shared_across_clones_async() {
+        // `process_write_async` clones the state into `spawn_blocking` for
+        // ≥ 64 KiB payloads: the clone must share the SAME pool (recycle
+        // returns the buffer to the mount's pool, not a per-clone orphan).
+        let bs = 256 * 1024;
+        let state = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+        state.init_scratch_pool(bs);
+        let cap0 = pool_len(&state);
+
+        let payload = bytes::Bytes::from(mixed_payload(bs));
+        let out = state.process_write_async(payload.clone()).await.unwrap();
+        assert_eq!(
+            pool_len(&state),
+            cap0 - 1,
+            "clone must draw from the shared pool"
+        );
+        assert_eq!(out.as_ptr() as usize % 4096, 0);
+        assert_eq!(state.process_read(&out).unwrap().as_ref(), payload.as_ref());
+        drop(out);
+        assert_eq!(
+            pool_len(&state),
+            cap0,
+            "clone must recycle into the shared pool"
+        );
+    }
+
+    #[test]
+    fn test_encrypted_scratch_header_parity() {
+        // The pooled writer emits the exact on-disk header `encrypt` emits:
+        // [2B wrapped_key_len][1B nonce_len][wrapped_key][nonce] — no mode
+        // byte — sealing at the header offset with a separate tag.
+        let bs = 128 * 1024;
+        let state = CryptoCompressState::new(
+            "lz4".to_string(),
+            "aes256gcm-rsa".to_string(),
+            Some(&TEST_PEM),
+        );
+        state.init_scratch_pool(bs);
+        let payload = mixed_payload(64 * 1024);
+
+        let pooled = state
+            .process_write(bytes::Bytes::from(payload.clone()))
+            .unwrap();
+        let compressed = state.compress(&payload).unwrap();
+        let heap = state.encrypt(&compressed).unwrap();
+
+        // Identical header framing and (session) wrapped-key bytes.
+        let wkl = ((pooled[0] as usize) << 8) + (pooled[1] as usize);
+        assert_eq!(&pooled[..2], &heap[..2]);
+        assert_eq!(pooled[2], 12, "nonce_len byte");
+        assert_eq!(heap[2], 12);
+        assert_eq!(&pooled[3..3 + wkl], &heap[3..3 + wkl]);
+        assert_eq!(
+            &pooled[3..3 + wkl],
+            state.prewrapped_key.as_ref().unwrap().0.as_ref()
+        );
+
+        // AEAD length arithmetic: header + compressed + tag.
+        let compressed_len = compressed.len();
+        assert_eq!(
+            pooled.len(),
+            3 + wkl + 12 + compressed_len + state.aead_tag_len
+        );
+
+        // The sealed body opens to the compressed image; the full read
+        // path recovers the plaintext for both writers.
+        assert_eq!(state.decrypt(&pooled).unwrap().as_slice(), &*compressed);
+        assert_eq!(
+            state.process_read(&pooled).unwrap().as_ref(),
+            payload.as_slice()
+        );
+        assert_eq!(
+            state.process_read(&heap).unwrap().as_ref(),
+            payload.as_slice()
+        );
+    }
 }

@@ -1203,8 +1203,26 @@ impl VolumeBackend {
     /// superblocks, versions above 3, and unknown incompat feature bits
     /// fail loud from the gate itself.
     pub async fn open_for_mount(path: &str) -> Result<Self> {
-        let _ = path;
-        todo!("PR K6a implementation commit")
+        match kv::superblock::classify_volume(std::path::Path::new(path)).await? {
+            kv::superblock::VolumeFormat::Blank => {
+                Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "Metadata volume {path} is not formatted (zeroed superblock) — run \
+                     `squeezefs format` first"
+                )))
+            }
+            kv::superblock::VolumeFormat::V2(_) => {
+                // The unchanged v2 path, byte-identical policy: open (the
+                // v2 size floor included) + full superblock validation.
+                let storage = storage::MetaLvStorage::open(path, 128 * 1024 * 1024)?;
+                storage.validate_superblock().await?;
+                Ok(VolumeBackend::V2(std::sync::Arc::new(MetaLvBackend::new(
+                    storage,
+                ))))
+            }
+            kv::superblock::VolumeFormat::V3(_) => Ok(VolumeBackend::V3(std::sync::Arc::new(
+                kv::backend::KvMetaBackend::open(std::path::Path::new(path)).await?,
+            ))),
+        }
     }
 
     /// The volume's on-disk format version (the `meta_format_version`

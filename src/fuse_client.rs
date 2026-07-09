@@ -1041,7 +1041,29 @@ impl SqueezefsFilesystem {
                 "meta_reclaim_batch_size": METRICS.meta_reclaim_batch_size.to_json(),
                 // §4.6: per-volume mount-probe classification (design
                 // §Observability — live signals over ad-hoc logging).
+                // Resolved OQ 2 (design-cow-kv-metadata §4.10): TWO fields
+                // per volume — `meta_volume_atomicity` is the contract
+                // class (for v2 volumes that IS the probed class; v3
+                // volumes report "cow-checksummed" by construction when
+                // K6b lets them serve FUSE) and
+                // `meta_volume_atomicity_physical` is the hardware probe,
+                // kept alongside for operator visibility.
                 "meta_volume_atomicity": self
+                    .meta_backend
+                    .as_ref()
+                    .map(|mb| {
+                        mb.volumes
+                            .iter()
+                            .map(|v| {
+                                v.atomicity_class
+                                    .get()
+                                    .map(|c| c.as_str())
+                                    .unwrap_or("unprobed")
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "meta_volume_atomicity_physical": self
                     .meta_backend
                     .as_ref()
                     .map(|mb| {

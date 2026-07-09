@@ -39,9 +39,29 @@
 //! per-tree roots. The [`crate::meta_backend::kv::builder`] writes the
 //! initial ledger record naming the fresh (empty or bulk-built) tree roots.
 
+use super::alloc_ext::{bitmap_region_len, compaction_reserve_extents};
+use super::checkpoint::ROOT_LEDGER_LEN;
+use super::journal::{JOURNAL_PAGE_LEN, MAX_ENTRY_LEN};
+use super::node::{record_value_cap, NodeLayout, NODE_PAGE};
 use super::KvError;
-use crate::meta_backend::storage::{Superblock, SECTOR_SIZE};
+use crate::meta_backend::storage::{Superblock, MAGIC_VALUE, SECTOR_SIZE};
 use std::path::Path;
+use zerocopy::IntoBytes;
+
+/// Byte offsets of the sector-0 wire layout (module docs). `magic` and
+/// `version` sit at the v2 offsets by design — the downgrade gate.
+const OFF_MAGIC: usize = 0;
+const OFF_VERSION: usize = 8;
+const OFF_NODE_SIZE: usize = 12;
+const OFF_FEAT_INCOMPAT: usize = 16;
+const OFF_FEAT_RO: usize = 24;
+const OFF_ROOT_LEDGER: usize = 32;
+const OFF_JOURNAL: usize = 48;
+const OFF_ALLOC_BITMAP: usize = 64;
+const OFF_HEAP: usize = 80;
+const OFF_UUID: usize = 96;
+const OFF_HASH_SEED: usize = 112;
+const OFF_CHECKSUM: usize = 120;
 
 /// Format version this module writes and mounts.
 pub const SUPERBLOCK_V3_VERSION: u32 = 3;
@@ -122,37 +142,126 @@ impl SuperblockV3 {
         uuid: [u8; 16],
         hash_seed: u64,
     ) -> Result<Self, KvError> {
-        let _ = (volume_len, node_size, journal_len_override, uuid, hash_seed);
-        todo!("PR K6a implementation commit")
+        let layout = NodeLayout::new(node_size)?;
+        let node_size = layout.node_size() as u64;
+
+        let root_ledger = ExtentRef {
+            start: SECTOR_SIZE as u64,
+            len: ROOT_LEDGER_LEN,
+        };
+
+        let journal_len = match journal_len_override {
+            Some(len) => {
+                // Ring floor: the reserve carve-out (max(256 KiB, ring/64))
+                // plus one max-size entry must always be admissible, or a
+                // legal transaction could never commit (§4.4 pt 5).
+                let floor = 256 * 1024 + MAX_ENTRY_LEN;
+                if len % JOURNAL_PAGE_LEN != 0 || len < floor {
+                    return Err(KvError::Corrupt(format!(
+                        "journal ring override {len} bytes is invalid: must be a 4 KiB \
+                         multiple of at least {floor} bytes (reserve + one max entry)"
+                    )));
+                }
+                len
+            }
+            None => journal_ring_len(volume_len),
+        };
+        let journal = ExtentRef {
+            start: root_ledger.end(),
+            len: journal_len,
+        };
+
+        // Bitmap region sized for the extent-count upper bound (the heap
+        // cannot exceed volume/node_size extents); the actual count is
+        // recomputed below once the heap start is fixed. Over-reserving a
+        // page pair or two is deliberate — it breaks the mutual
+        // dependency between bitmap size and heap size.
+        let upper_extents = volume_len / node_size;
+        let alloc_bitmap = ExtentRef {
+            start: journal.end(),
+            len: bitmap_region_len(upper_extents),
+        };
+
+        let heap_start = alloc_bitmap.end().div_ceil(node_size) * node_size;
+        let total_extents = volume_len.saturating_sub(heap_start) / node_size;
+        // A usable volume must hold the §4.7 compaction reserve plus room
+        // for the three tree roots and growth.
+        let min_extents = compaction_reserve_extents(total_extents) + 4;
+        if total_extents < min_extents {
+            return Err(KvError::Corrupt(format!(
+                "metadata volume too small for format v3: {volume_len} bytes leaves \
+                 {total_extents} heap extents of {node_size} bytes after the fixed structures \
+                 (superblock + ledger + {journal_len}-byte journal + bitmap end at \
+                 {heap_start}); at least {min_extents} extents are required — grow the volume \
+                 or pass a smaller --meta-journal-mb / --meta-node-kib"
+            )));
+        }
+        let heap = ExtentRef {
+            start: heap_start,
+            len: total_extents * node_size,
+        };
+
+        Ok(Self {
+            node_size: node_size as u32,
+            features_incompat: FEATURE_INCOMPAT_KV_V3,
+            features_ro: 0,
+            root_ledger,
+            journal,
+            alloc_bitmap,
+            heap,
+            uuid,
+            hash_seed,
+        })
     }
 
     /// Heap extent count (`heap.len / node_size`).
     pub fn total_extents(&self) -> u64 {
-        todo!("PR K6a implementation commit")
+        self.heap.len / u64::from(self.node_size)
     }
 
     /// Journal ring page count (`journal.len / 4096`).
     pub fn journal_pages(&self) -> u64 {
-        todo!("PR K6a implementation commit")
+        self.journal.len / JOURNAL_PAGE_LEN
     }
 
     /// Incompat feature bits set on disk that this binary does not
     /// understand (nonzero ⇒ the mount was refused by
     /// [`classify_sector0`]; kept for error surfaces and tests).
     pub fn unknown_incompat(&self) -> u64 {
-        todo!("PR K6a implementation commit")
+        self.features_incompat & !FEATURES_INCOMPAT_KNOWN
     }
 
     /// Read-only feature bits set on disk that this binary does not
     /// understand (nonzero ⇒ mount read-only once K6b has a write path
     /// to withhold; K6a's read side logs it).
     pub fn unknown_ro(&self) -> u64 {
-        todo!("PR K6a implementation commit")
+        self.features_ro & !FEATURES_RO_KNOWN
     }
 
     /// Encode into a checksummed whole-sector image.
     pub fn encode_sector(&self) -> Result<Vec<u8>, KvError> {
-        todo!("PR K6a implementation commit")
+        self.validate_geometry()?;
+        let mut img = vec![0u8; SUPERBLOCK_V3_LEN];
+        img[OFF_MAGIC..OFF_MAGIC + 8].copy_from_slice(MAGIC_VALUE);
+        img[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&SUPERBLOCK_V3_VERSION.to_le_bytes());
+        img[OFF_NODE_SIZE..OFF_NODE_SIZE + 4].copy_from_slice(&self.node_size.to_le_bytes());
+        img[OFF_FEAT_INCOMPAT..OFF_FEAT_INCOMPAT + 8]
+            .copy_from_slice(&self.features_incompat.to_le_bytes());
+        img[OFF_FEAT_RO..OFF_FEAT_RO + 8].copy_from_slice(&self.features_ro.to_le_bytes());
+        for (off, ext) in [
+            (OFF_ROOT_LEDGER, &self.root_ledger),
+            (OFF_JOURNAL, &self.journal),
+            (OFF_ALLOC_BITMAP, &self.alloc_bitmap),
+            (OFF_HEAP, &self.heap),
+        ] {
+            img[off..off + 8].copy_from_slice(&ext.start.to_le_bytes());
+            img[off + 8..off + 16].copy_from_slice(&ext.len.to_le_bytes());
+        }
+        img[OFF_UUID..OFF_UUID + 16].copy_from_slice(&self.uuid);
+        img[OFF_HASH_SEED..OFF_HASH_SEED + 8].copy_from_slice(&self.hash_seed.to_le_bytes());
+        let sum = sector_checksum(&img);
+        img[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
+        Ok(img)
     }
 
     /// Decode + verify a sector-0 image already known to carry version 3:
@@ -161,25 +270,193 @@ impl SuperblockV3 {
     /// (unknown incompat bits refuse loud, naming the bits). Torn or
     /// tampered superblocks fail loud — the §4.10 torn-SB crash case.
     pub fn decode_sector(buf: &[u8]) -> Result<Self, KvError> {
-        let _ = buf;
-        todo!("PR K6a implementation commit")
+        if buf.len() != SUPERBLOCK_V3_LEN {
+            return Err(KvError::Corrupt(format!(
+                "v3 superblock sector must be {SUPERBLOCK_V3_LEN} bytes, got {}",
+                buf.len()
+            )));
+        }
+        if &buf[OFF_MAGIC..OFF_MAGIC + 8] != MAGIC_VALUE {
+            return Err(KvError::Corrupt(
+                "bad v3 superblock magic (corrupted or foreign volume)".to_string(),
+            ));
+        }
+        let version = u32::from_le_bytes(buf[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap());
+        if version != SUPERBLOCK_V3_VERSION {
+            return Err(KvError::Corrupt(format!(
+                "v3 decoder handed superblock version {version} (classification bug)"
+            )));
+        }
+        let stored = u64::from_le_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 8].try_into().unwrap());
+        let computed = sector_checksum(buf);
+        if stored != computed {
+            // Not the bare ChecksumMismatch variant: its display names
+            // bsets, and a torn superblock deserves its own words (the
+            // storage.rs v2 message shape).
+            return Err(KvError::Corrupt(format!(
+                "superblock checksum mismatch: stored {stored:#018x}, computed {computed:#018x} \
+                 — corrupted superblock"
+            )));
+        }
+        let ext_at = |off: usize| ExtentRef {
+            start: u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()),
+            len: u64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap()),
+        };
+        let sb = Self {
+            node_size: u32::from_le_bytes(
+                buf[OFF_NODE_SIZE..OFF_NODE_SIZE + 4].try_into().unwrap(),
+            ),
+            features_incompat: u64::from_le_bytes(
+                buf[OFF_FEAT_INCOMPAT..OFF_FEAT_INCOMPAT + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
+            features_ro: u64::from_le_bytes(buf[OFF_FEAT_RO..OFF_FEAT_RO + 8].try_into().unwrap()),
+            root_ledger: ext_at(OFF_ROOT_LEDGER),
+            journal: ext_at(OFF_JOURNAL),
+            alloc_bitmap: ext_at(OFF_ALLOC_BITMAP),
+            heap: ext_at(OFF_HEAP),
+            uuid: buf[OFF_UUID..OFF_UUID + 16].try_into().unwrap(),
+            hash_seed: u64::from_le_bytes(
+                buf[OFF_HASH_SEED..OFF_HASH_SEED + 8].try_into().unwrap(),
+            ),
+        };
+        // Feature gate (§6.1): the KV_V3 bit must be present; unknown
+        // incompat bits refuse the mount naming the bits. Unknown ro bits
+        // pass — their read-only semantics belong to callers with a write
+        // path (§4.11).
+        if sb.features_incompat & FEATURE_INCOMPAT_KV_V3 == 0 {
+            return Err(KvError::Corrupt(
+                "v3 superblock without the KV_V3 incompat bit (corrupt feature field)".to_string(),
+            ));
+        }
+        let unknown = sb.unknown_incompat();
+        if unknown != 0 {
+            let bits: Vec<String> = (0..64)
+                .filter(|b| unknown & (1u64 << b) != 0)
+                .map(|b| format!("bit {b}"))
+                .collect();
+            return Err(KvError::Corrupt(format!(
+                "unknown incompatible feature bits on v3 superblock: {} \
+                 ({unknown:#x}) — upgrade squeezefs to mount this volume",
+                bits.join(", ")
+            )));
+        }
+        sb.validate_geometry()?;
+        Ok(sb)
+    }
+
+    /// §9 bounds discipline: every geometry field validated before any
+    /// caller dereferences it. Regions must ascend without overlap
+    /// (SB | ledger | journal | bitmap | heap), lengths must match their
+    /// consumers' fixed shapes, and the heap must hold whole aligned
+    /// extents covering the bitmap's bit range.
+    fn validate_geometry(&self) -> Result<(), KvError> {
+        let layout = NodeLayout::new(self.node_size as usize)?;
+        let node_size = layout.node_size() as u64;
+        let corrupt = |msg: String| Err(KvError::Corrupt(format!("v3 superblock geometry: {msg}")));
+
+        if self.root_ledger.start < SECTOR_SIZE as u64 {
+            return corrupt(format!(
+                "root ledger at {} overlaps sector 0",
+                self.root_ledger.start
+            ));
+        }
+        if self.root_ledger.len != ROOT_LEDGER_LEN {
+            return corrupt(format!(
+                "root ledger length {} != the fixed {ROOT_LEDGER_LEN}",
+                self.root_ledger.len
+            ));
+        }
+        if self.journal.start < self.root_ledger.end()
+            || self.journal.len == 0
+            || self.journal.len % JOURNAL_PAGE_LEN != 0
+        {
+            return corrupt(format!(
+                "journal [{}, +{}) must follow the ledger in whole 4 KiB pages",
+                self.journal.start, self.journal.len
+            ));
+        }
+        if self.alloc_bitmap.start < self.journal.end() {
+            return corrupt(format!(
+                "alloc bitmap at {} overlaps the journal",
+                self.alloc_bitmap.start
+            ));
+        }
+        if self.heap.start < self.alloc_bitmap.end()
+            || self.heap.start % NODE_PAGE as u64 != 0
+            || self.heap.len < node_size
+            || self.heap.len % node_size != 0
+        {
+            return corrupt(format!(
+                "heap [{}, +{}) must follow the bitmap in whole {node_size}-byte extents",
+                self.heap.start, self.heap.len
+            ));
+        }
+        if self.alloc_bitmap.len < bitmap_region_len(self.total_extents()) {
+            return corrupt(format!(
+                "alloc bitmap length {} cannot cover {} extents",
+                self.alloc_bitmap.len,
+                self.total_extents()
+            ));
+        }
+        // The heap must clear the §4.7 compaction reserve with headroom —
+        // the same floor `plan` enforces. Without this, a crafted (still
+        // checksummed) superblock could hand the allocator a reserve ≥
+        // total and turn a mount into a construction assert.
+        let total = self.total_extents();
+        let min_extents = compaction_reserve_extents(total) + 4;
+        if total < min_extents {
+            return corrupt(format!(
+                "heap of {total} extents cannot hold the compaction reserve \
+                 (≥ {min_extents} required)"
+            ));
+        }
+        Ok(())
     }
 }
 
+/// xxh3 over the whole sector image with the checksum field zeroed.
+fn sector_checksum(img: &[u8]) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(&img[..OFF_CHECKSUM]);
+    h.update(&[0u8; 8]);
+    h.update(&img[OFF_CHECKSUM + 8..]);
+    h.digest()
+}
+
 /// The resolved OQ 1 ring default: `clamp(volume_len / 64, 8 MiB, 32 MiB)`,
-/// rounded down to whole 4 KiB pages (the clamp bounds already are).
+/// rounded down to whole 4 KiB pages (the clamp bounds already are, so the
+/// alignment can never dip below the floor).
 pub fn journal_ring_len(volume_len: u64) -> u64 {
-    let _ = volume_len;
-    todo!("PR K6a implementation commit")
+    let clamped = (volume_len / 64).clamp(JOURNAL_RING_MIN, JOURNAL_RING_MAX);
+    clamped / JOURNAL_PAGE_LEN * JOURNAL_PAGE_LEN
 }
 
 /// Validate the `--meta-node-kib` knob (§5.1): allowed values
 /// 64/128/256/512/1024; sub-256 KiB settings return `Ok` with a warning
 /// string naming the reduced per-volume record-value cap `node_size/4`
-/// (§4.2) for the CLI to print. Anything else is a typed refusal.
+/// (§4.2) for the CLI to print. Anything else is a typed refusal —
+/// including everything below the 64 KiB floor.
 pub fn validate_node_kib(kib: u32) -> Result<(usize, Option<String>), KvError> {
-    let _ = kib;
-    todo!("PR K6a implementation commit")
+    if ![64, 128, 256, 512, 1024].contains(&kib) {
+        return Err(KvError::Corrupt(format!(
+            "--meta-node-kib {kib} is not supported: allowed values are 64|128|256|512|1024 \
+             (64 KiB floor, 1 MiB ceiling — design §5.1)"
+        )));
+    }
+    let bytes = kib as usize * 1024;
+    let warning = if kib < 256 {
+        Some(format!(
+            "--meta-node-kib {kib} trades xattr/layout headroom for cold-read latency: the \
+             per-volume record-value cap becomes {} bytes (node_size/4, design §4.2) — values \
+             above it are rejected and layout maps spill to the indirect mechanism sooner",
+            record_value_cap(bytes)
+        ))
+    } else {
+        None
+    };
+    Ok((bytes, warning))
 }
 
 /// Sector-0 classification for the dual-format mount dispatch (§6.1) —
@@ -204,8 +481,52 @@ pub enum VolumeFormat {
 /// arms — an unknown version must be reported as such, never as a
 /// checksum mismatch (the storage.rs discipline).
 pub fn classify_sector0(sector: &[u8]) -> Result<VolumeFormat, KvError> {
-    let _ = sector;
-    todo!("PR K6a implementation commit")
+    if sector.len() != SUPERBLOCK_V3_LEN {
+        return Err(KvError::Corrupt(format!(
+            "sector-0 image must be {SUPERBLOCK_V3_LEN} bytes, got {}",
+            sector.len()
+        )));
+    }
+    let magic = &sector[OFF_MAGIC..OFF_MAGIC + 8];
+    if magic == [0u8; 8] {
+        return Ok(VolumeFormat::Blank);
+    }
+    if magic != MAGIC_VALUE {
+        return Err(KvError::Corrupt(format!(
+            "invalid superblock magic {magic:?} (expected {MAGIC_VALUE:?}) — corrupted or \
+             foreign volume"
+        )));
+    }
+    // The version check precedes checksum verification on both arms: a
+    // future format may change checksum semantics, so an unknown version
+    // must be reported as such (the storage.rs discipline).
+    let version = u32::from_le_bytes(sector[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap());
+    match version {
+        v if v <= 2 => {
+            // Byte-identical v2 policy (`storage.rs::validate_superblock`):
+            // verify the struct checksum iff nonzero (legacy volumes wrote
+            // 0, which skips the check).
+            let mut sb = Superblock::new_zeroed();
+            let sb_len = sb.as_bytes().len();
+            sb.as_mut_bytes().copy_from_slice(&sector[..sb_len]);
+            if sb.checksum != 0 {
+                let computed = sb.compute_checksum();
+                if computed != sb.checksum {
+                    return Err(KvError::Corrupt(format!(
+                        "superblock checksum mismatch: stored {:#018x}, computed \
+                         {computed:#018x} — corrupted superblock",
+                        sb.checksum
+                    )));
+                }
+            }
+            Ok(VolumeFormat::V2(sb))
+        }
+        SUPERBLOCK_V3_VERSION => Ok(VolumeFormat::V3(SuperblockV3::decode_sector(sector)?)),
+        v => Err(KvError::Corrupt(format!(
+            "unsupported metadata format version {v} (this binary supports <= \
+             {SUPERBLOCK_V3_VERSION}) — upgrade squeezefs"
+        ))),
+    }
 }
 
 /// Read sector 0 of `path` via `crate::uring_fs` (io_uring-only,
@@ -213,14 +534,30 @@ pub fn classify_sector0(sector: &[u8]) -> Result<VolumeFormat, KvError> {
 /// volume (unlike `MetaLvStorage::open`, which `set_len`s small files —
 /// a v3 volume must not be touched by v2 plumbing).
 pub async fn classify_volume(path: &Path) -> Result<VolumeFormat, KvError> {
-    let _ = path;
-    todo!("PR K6a implementation commit")
+    let got = crate::uring_fs::read_at(path, 0, SUPERBLOCK_V3_LEN).await?;
+    // A short read (file smaller than one sector) zero-extends: zeros
+    // classify as Blank, exactly what a never-formatted stub file is.
+    let sector: std::borrow::Cow<'_, [u8]> = if got.len() == SUPERBLOCK_V3_LEN {
+        std::borrow::Cow::Borrowed(&got)
+    } else {
+        let mut full = vec![0u8; SUPERBLOCK_V3_LEN];
+        full[..got.len().min(SUPERBLOCK_V3_LEN)]
+            .copy_from_slice(&got[..got.len().min(SUPERBLOCK_V3_LEN)]);
+        std::borrow::Cow::Owned(full)
+    };
+    classify_sector0(&sector).map_err(|e| match e {
+        // Prefix classification failures with the volume path — these are
+        // operator-facing mount/format refusals.
+        KvError::Corrupt(msg) => KvError::Corrupt(format!("{}: {msg}", path.display())),
+        other => other,
+    })
 }
 
 /// Write `sb` to sector 0 of `path` (one checksummed whole-sector
 /// `uring_fs::write_at` — the same single-sector commit-point class as
 /// every v2 superblock write).
 pub async fn write_superblock_v3(path: &Path, sb: &SuperblockV3) -> Result<(), KvError> {
-    let _ = (path, sb);
-    todo!("PR K6a implementation commit")
+    let img = sb.encode_sector()?;
+    crate::uring_fs::write_at(path, 0, img).await?;
+    Ok(())
 }

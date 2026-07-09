@@ -1683,13 +1683,19 @@ async fn test_kv_v3_torn_superblock_fails_mount_loud() {
     let f = k6a_built_volume().await;
     let _g = FaultGuard;
 
-    // Grab the valid superblock, then re-write it torn: 100 bytes survive
-    // (magic + version + node_size + features land; geometry + checksum
-    // are lost to the tear).
-    let sb = match classify_volume(f.path()).await.unwrap() {
+    // Grab the valid superblock, then re-write a CHANGED one torn (a
+    // re-format with a fresh identity racing power loss): 100 bytes of
+    // the new image survive — magic/version plus the new uuid's first
+    // bytes land, while the new checksum (offset 120) is lost — so the
+    // sector holds a hybrid no checksum can bless. (A tear whose
+    // persisted prefix is byte-identical to what it replaced is
+    // indistinguishable from a complete write by construction — the K3
+    // ledger case states the same.)
+    let mut sb = match classify_volume(f.path()).await.unwrap() {
         squeezefs::meta_backend::kv::superblock::VolumeFormat::V3(sb) => sb,
         other => panic!("expected a v3 volume, got {other:?}"),
     };
+    sb.uuid = *b"reformat-newuuid";
     uring_fs::arm_torn_write(0, 100);
     let err = write_superblock_v3(f.path(), &sb)
         .await

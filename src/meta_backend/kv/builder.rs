@@ -16,11 +16,12 @@
 //! images**: inos are assigned monotonically per §4.8, record seqs are 0
 //! (checkpoint-covered by construction: `journal_tail_seq` = 0 and every
 //! bset horizon = 0), node seqs count up in a fixed tree-id-then-level
-//! order, extents are claimed lowest-first, collision `coll_seq`s are
-//! assigned in sorted-name order within a `(parent, hash)` group, and
-//! builder timestamps default to 0 unless set. Determinism is what lets
-//! the §8 mount-time gates measure real images and lets K9's migrate
-//! dry-run diff a digest walk before flipping the superblock.
+//! order, extents are claimed lowest-first (the K4 core's hint scan),
+//! collision `coll_seq`s are assigned in sorted-name order within a
+//! `(parent, hash)` group, and builder timestamps default to 0 unless
+//! set. Determinism is what lets the §8 mount-time gates measure real
+//! images and lets K9's migrate dry-run diff a digest walk before
+//! flipping the superblock.
 //!
 //! ## Fresh-volume hygiene
 //!
@@ -30,17 +31,40 @@
 //! into a fresh volume's mount-time recovery. Heap extents need no wipe:
 //! unreferenced extents are unreachable through the FS API (§9), and a
 //! reused extent's ghost bset frames carry foreign `node_seq` stamps the
-//! K2 loader refuses as not-same-incarnation.
+//! K2 loader refuses as not-same-incarnation. The superblock is stamped
+//! **last**, after an `fdatasync` barrier over everything it references —
+//! the §6.2 single-sector flip discipline applied to format.
 
+use super::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
 use super::backend::KvMetaBackend;
-use super::superblock::SuperblockV3;
-use super::tree::KvTree;
+use super::checkpoint::{write_ledger_slot, LedgerRecord, TreeRoot};
+use super::node::{key_successor, write_node, NodeLayout, NodeWriteParams, NODE_PAGE};
+use super::record::{
+    dentry_key, dentry_name_hash54, inode_key, xattr_key, xattr_name_hash56, DentryValue,
+    InodeValue, Record, XattrValue, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+};
+use super::superblock::{write_superblock_v3, SuperblockV3};
+use super::tree::{encode_interior_value, KvTree, KEY_SPACE_MAX};
 use super::KvError;
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 /// The root directory's fixed ino (§4.8: ino 0 reserved, 1 = root,
 /// `next_ino` starts above the built population).
 pub const ROOT_INO: u64 = 1;
+
+/// The root-ino xattr recording the volume-set format configuration; the
+/// mount bootstrap reads it back through the dispatch (`main.rs`). On v2
+/// volumes the same name lives in the fixed xattr region.
+pub const FORMAT_CONFIG_XATTR: &str = "user.squeezefs.format_config";
+
+/// Pending-free FIFO capacity for builder-internal allocators (never
+/// exercised — the builder only claims).
+const BUILDER_PENDING_CAP: usize = 64;
+
+/// Wipe/zero chunk size.
+const ZERO_CHUNK: usize = 1024 * 1024;
 
 /// Format-time identity + geometry knobs for one built image.
 #[derive(Debug, Clone)]
@@ -61,9 +85,20 @@ impl BuilderConfig {
     /// Production defaults: random `hash_seed`/`uuid` (the §9
     /// hash-flooding posture requires an unpredictable seed).
     pub fn new(node_size: usize) -> Self {
-        let _ = node_size;
-        todo!("PR K6a implementation commit")
+        Self {
+            node_size,
+            journal_len_override: None,
+            hash_seed: rand::random::<u64>(),
+            uuid: *uuid::Uuid::new_v4().as_bytes(),
+        }
     }
+}
+
+/// One described inode: the packed record value (times default 0 — the
+/// determinism contract) plus nothing else; names live in the dentry map.
+#[derive(Debug, Clone)]
+struct InodeSpec {
+    value: InodeValue,
 }
 
 /// The in-memory volume description. Population methods reject duplicate
@@ -71,15 +106,84 @@ impl BuilderConfig {
 /// values (> the §4.2 per-volume cap) with typed [`KvError`]s — a builder
 /// input error must surface before any byte is written.
 pub struct ImageBuilder {
-    _private: (),
+    cfg: BuilderConfig,
+    layout: NodeLayout,
+    inodes: BTreeMap<u64, InodeSpec>,
+    /// Per-directory `name → (child_ino, file_type)`; BTreeMap keeps
+    /// name-sorted iteration (the coll_seq determinism rule).
+    dentries: BTreeMap<u64, BTreeMap<Vec<u8>, (u64, u8)>>,
+    /// `(ino, name) → value`, name-sorted per ino.
+    xattrs: BTreeMap<(u64, Vec<u8>), Vec<u8>>,
+    next_ino: u64,
 }
 
 impl ImageBuilder {
     /// A description holding only the root directory (ino 1,
     /// `S_IFDIR | 0o755`, uid/gid 0, times 0).
     pub fn new(cfg: BuilderConfig) -> Result<Self, KvError> {
-        let _ = cfg;
-        todo!("PR K6a implementation commit")
+        let layout = NodeLayout::new(cfg.node_size)?;
+        let mut inodes = BTreeMap::new();
+        inodes.insert(
+            ROOT_INO,
+            InodeSpec {
+                value: InodeValue {
+                    mode: libc::S_IFDIR | 0o755,
+                    nlink: 1,
+                    ..Default::default()
+                },
+            },
+        );
+        let mut dentries = BTreeMap::new();
+        dentries.insert(ROOT_INO, BTreeMap::new());
+        Ok(Self {
+            cfg,
+            layout,
+            inodes,
+            dentries,
+            xattrs: BTreeMap::new(),
+            next_ino: ROOT_INO + 1,
+        })
+    }
+
+    fn check_name(name: &str) -> Result<(), KvError> {
+        if name.is_empty() {
+            return Err(KvError::Corrupt("empty entry name".to_string()));
+        }
+        if name.len() > 255 {
+            return Err(KvError::NameTooLong { len: name.len() });
+        }
+        Ok(())
+    }
+
+    /// Bind `name` under `parent` to `(child, file_type)`, with the
+    /// duplicate/parent checks shared by every population method.
+    fn bind(&mut self, parent: u64, name: &str, child: u64, dt: u8) -> Result<(), KvError> {
+        Self::check_name(name)?;
+        let parent_spec = self.inodes.get(&parent).ok_or_else(|| {
+            KvError::Corrupt(format!(
+                "parent ino {parent} does not exist in the description"
+            ))
+        })?;
+        if parent_spec.value.mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(KvError::Corrupt(format!(
+                "parent ino {parent} is not a directory"
+            )));
+        }
+        let dir = self.dentries.entry(parent).or_default();
+        if dir.contains_key(name.as_bytes()) {
+            return Err(KvError::Corrupt(format!(
+                "duplicate name {name:?} under ino {parent}"
+            )));
+        }
+        dir.insert(name.as_bytes().to_vec(), (child, dt));
+        Ok(())
+    }
+
+    fn add_inode(&mut self, value: InodeValue) -> u64 {
+        let ino = self.next_ino;
+        self.next_ino += 1;
+        self.inodes.insert(ino, InodeSpec { value });
+        ino
     }
 
     /// Add a directory under `parent`; returns its ino.
@@ -91,8 +195,21 @@ impl ImageBuilder {
         uid: u32,
         gid: u32,
     ) -> Result<u64, KvError> {
-        let _ = (parent, name, perm, uid, gid);
-        todo!("PR K6a implementation commit")
+        let mode = libc::S_IFDIR | (perm & 0o7777);
+        // Validate against the parent before allocating the ino, so a
+        // refused add leaves the description untouched.
+        Self::check_name(name)?;
+        let ino = self.next_ino; // provisional — bound below
+        self.bind(parent, name, ino, dt_of(mode))?;
+        let ino = self.add_inode(InodeValue {
+            mode,
+            uid,
+            gid,
+            nlink: 1,
+            ..Default::default()
+        });
+        self.dentries.entry(ino).or_default();
+        Ok(ino)
     }
 
     /// Add a regular file under `parent`; returns its ino.
@@ -105,23 +222,64 @@ impl ImageBuilder {
         gid: u32,
         size: u64,
     ) -> Result<u64, KvError> {
-        let _ = (parent, name, perm, uid, gid, size);
-        todo!("PR K6a implementation commit")
+        let mode = libc::S_IFREG | (perm & 0o7777);
+        Self::check_name(name)?;
+        let ino = self.next_ino; // provisional — bound below
+        self.bind(parent, name, ino, dt_of(mode))?;
+        let ino = self.add_inode(InodeValue {
+            mode,
+            uid,
+            gid,
+            nlink: 1,
+            size,
+            ..Default::default()
+        });
+        Ok(ino)
     }
 
     /// Add a hard link: one more name for an existing non-directory ino
     /// (`nlink` maintained).
     pub fn add_link(&mut self, ino: u64, parent: u64, name: &str) -> Result<(), KvError> {
-        let _ = (ino, parent, name);
-        todo!("PR K6a implementation commit")
+        let target = self
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| KvError::Corrupt(format!("link target ino {ino} does not exist")))?;
+        let mode = target.value.mode;
+        if mode & libc::S_IFMT == libc::S_IFDIR {
+            return Err(KvError::Corrupt(format!(
+                "hard links to directories are not allowed (ino {ino})"
+            )));
+        }
+        self.bind(parent, name, ino, dt_of(mode))?;
+        let spec = self.inodes.get_mut(&ino).expect("checked above");
+        spec.value.nlink += 1;
+        Ok(())
     }
 
     /// Set (or replace) one xattr on `ino`. The `"layout"` xattr — the
     /// data path's `LayoutMetadata` bytes (§5.3) — travels through here
     /// like any other value.
     pub fn set_xattr(&mut self, ino: u64, name: &str, value: &[u8]) -> Result<(), KvError> {
-        let _ = (ino, name, value);
-        todo!("PR K6a implementation commit")
+        Self::check_name(name)?;
+        if !self.inodes.contains_key(&ino) {
+            return Err(KvError::Corrupt(format!(
+                "xattr target ino {ino} does not exist"
+            )));
+        }
+        // The record value is the encoded XattrValue; enforce the §4.2
+        // per-volume cap at description time so the error carries the
+        // caller's context, not a mid-build failure.
+        let encoded_len = 1 + name.len() + value.len();
+        let cap = self.layout.record_value_cap();
+        if encoded_len > cap {
+            return Err(KvError::ValueTooLarge {
+                len: encoded_len,
+                cap,
+            });
+        }
+        self.xattrs
+            .insert((ino, name.as_bytes().to_vec()), value.to_vec());
+        Ok(())
     }
 
     /// Override an ino's timestamps (ns). Builder defaults are 0 — see
@@ -133,25 +291,325 @@ impl ImageBuilder {
         mtime: u64,
         ctime: u64,
     ) -> Result<(), KvError> {
-        let _ = (ino, atime, mtime, ctime);
-        todo!("PR K6a implementation commit")
+        let spec = self
+            .inodes
+            .get_mut(&ino)
+            .ok_or_else(|| KvError::Corrupt(format!("ino {ino} does not exist")))?;
+        spec.value.atime = atime;
+        spec.value.mtime = mtime;
+        spec.value.ctime = ctime;
+        Ok(())
     }
 
     /// Inodes described so far (root included).
     pub fn inode_count(&self) -> u64 {
-        todo!("PR K6a implementation commit")
+        self.inodes.len() as u64
     }
+
+    // -----------------------------------------------------------------
+    // Record assembly (key-sorted, seq 0, checkpoint-covered).
+    // -----------------------------------------------------------------
+
+    fn inode_records(&self) -> Vec<Record> {
+        // BTreeMap iteration is ino order == big-endian key order.
+        self.inodes
+            .iter()
+            .map(|(ino, spec)| Record::put(inode_key(*ino).to_vec(), 0, spec.value.encode()))
+            .collect()
+    }
+
+    fn dentry_records(&self) -> Result<Vec<Record>, KvError> {
+        let mut out: BTreeMap<Vec<u8>, Record> = BTreeMap::new();
+        for (parent, dir) in &self.dentries {
+            // Group same-hash names; name-sorted outer iteration makes
+            // coll_seq assignment deterministic (module docs).
+            let mut groups: BTreeMap<u64, u16> = BTreeMap::new();
+            for (name, (child, dt)) in dir {
+                let hash = dentry_name_hash54(name, self.cfg.hash_seed);
+                let coll = groups.entry(hash).or_insert(0);
+                if *coll > u16::from(u8::MAX) {
+                    super::META_KV_DENTRY_COLLISION_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+                    return Err(KvError::DentryChainOverflow);
+                }
+                let key = dentry_key(*parent, hash, *coll as u8).to_vec();
+                *coll += 1;
+                let value = DentryValue {
+                    child_ino: *child,
+                    file_type: *dt,
+                    name: name.clone(),
+                }
+                .encode()?;
+                out.insert(key, Record::put(Vec::new(), 0, value));
+            }
+        }
+        // Keys were assembled out of memcmp order (parent-major but
+        // hash-shuffled within a directory); the BTreeMap re-sorts.
+        Ok(out
+            .into_iter()
+            .map(|(key, mut rec)| {
+                rec.key = key;
+                rec
+            })
+            .collect())
+    }
+
+    fn xattr_records(&self) -> Result<Vec<Record>, KvError> {
+        let mut out: BTreeMap<Vec<u8>, Record> = BTreeMap::new();
+        let mut groups: BTreeMap<(u64, u64), u16> = BTreeMap::new();
+        for ((ino, name), value) in &self.xattrs {
+            let hash = xattr_name_hash56(name, self.cfg.hash_seed);
+            let coll = groups.entry((*ino, hash)).or_insert(0);
+            if *coll > u16::from(u8::MAX) {
+                return Err(KvError::Corrupt(format!(
+                    "xattr hash-collision chain full on ino {ino} (coll_seq 0..=255 occupied)"
+                )));
+            }
+            let key = xattr_key(*ino, hash, *coll as u8).to_vec();
+            *coll += 1;
+            let enc = XattrValue {
+                name: name.clone(),
+                value: value.clone(),
+            }
+            .encode()?;
+            out.insert(key, Record::put(Vec::new(), 0, enc));
+        }
+        Ok(out
+            .into_iter()
+            .map(|(key, mut rec)| {
+                rec.key = key;
+                rec
+            })
+            .collect())
+    }
+
+    // -----------------------------------------------------------------
+    // Image assembly.
+    // -----------------------------------------------------------------
 
     /// Build the image into `path` (a file or block device of
     /// `volume_len` usable bytes): plan geometry, zero the fixed
     /// structures, pack leaves bottom-up per tree, write interior levels,
     /// persist the bitmap, write the bootstrap ledger record, and stamp
-    /// the superblock **last** (nothing references a half-built image —
-    /// the §6.2 flip discipline applied to format).
+    /// the superblock **last** behind an `fdatasync` barrier (nothing
+    /// references a half-built image — the §6.2 flip discipline applied
+    /// to format).
     pub async fn build(&self, path: &Path, volume_len: u64) -> Result<BuiltImage, KvError> {
-        let _ = (path, volume_len);
-        todo!("PR K6a implementation commit")
+        let sb = SuperblockV3::plan(
+            volume_len,
+            self.cfg.node_size,
+            self.cfg.journal_len_override,
+            self.cfg.uuid,
+            self.cfg.hash_seed,
+        )?;
+
+        // §9 quick-format hygiene: zero SB + ledger + ring + bitmap.
+        zero_range(path, 0, sb.heap.start).await?;
+
+        let total_extents = sb.total_extents();
+        let alloc = ExtentAllocator::format(
+            total_extents,
+            compaction_reserve_extents(total_extents),
+            BUILDER_PENDING_CAP,
+        );
+
+        let mut writer = TreeWriter {
+            path,
+            layout: &self.layout,
+            heap_base: sb.heap.start,
+            alloc: &alloc,
+            next_node_seq: 0,
+            nodes_written: 0,
+        };
+        let mut tree_roots = Vec::with_capacity(3);
+        for (tree_id, records) in [
+            (TREE_INODES, self.inode_records()),
+            (TREE_DENTRIES, self.dentry_records()?),
+            (TREE_XATTRS, self.xattr_records()?),
+        ] {
+            let (addr, seq) = writer.write_tree(tree_id, records).await?;
+            tree_roots.push(TreeRoot {
+                tree_id,
+                node_addr: addr,
+                node_seq: seq,
+            });
+        }
+        let nodes_written = writer.nodes_written;
+
+        // Persist the allocator's claimed-extent bitmap (A slots,
+        // generation 1 — the ledger names it).
+        alloc
+            .write_dirty_pages(path, sb.alloc_bitmap.start, 1)
+            .await?;
+
+        // The bootstrap checkpoint record: fresh ring (tail 0), the §4.8
+        // watermark, generation 1 bitmap.
+        let ledger = LedgerRecord {
+            seq: 1,
+            tree_roots,
+            journal_tail_seq: 0,
+            next_ino: self.next_ino,
+            alloc_bitmap_generation: 1,
+        };
+        write_ledger_slot(path, sb.root_ledger.start, &ledger).await?;
+
+        // Barrier, then the single-sector commit point, then make IT
+        // durable too.
+        crate::uring_fs::fdatasync(path.to_path_buf()).await?;
+        write_superblock_v3(path, &sb).await?;
+        crate::uring_fs::fdatasync(path.to_path_buf()).await?;
+
+        Ok(BuiltImage {
+            superblock: sb,
+            ledger_seq: ledger.seq,
+            next_ino: self.next_ino,
+            nodes_written,
+            extents_allocated: nodes_written,
+        })
     }
+}
+
+/// `d_type`-style byte for a mode's `S_IFMT` bits (`DentryValue`'s u8
+/// field); the read side reconstructs the v2 `file_type = mode & S_IFMT`
+/// convention by shifting back.
+fn dt_of(mode: u32) -> u8 {
+    ((mode & libc::S_IFMT) >> 12) as u8
+}
+
+/// Zero `[start, start + len)` in bounded chunks via `uring_fs`.
+async fn zero_range(path: &Path, start: u64, len: u64) -> Result<(), KvError> {
+    let zeros = bytes::Bytes::from(vec![0u8; ZERO_CHUNK]);
+    let mut off = start;
+    let end = start + len;
+    while off < end {
+        let n = usize::try_from((end - off).min(ZERO_CHUNK as u64)).expect("chunk fits usize");
+        crate::uring_fs::write_at(path, off, zeros.slice(..n)).await?;
+        off += n as u64;
+    }
+    Ok(())
+}
+
+/// Bottom-up tree writer: leaves greedily packed to ~3/4 of a node's
+/// usable bytes (append headroom — the K5 split-fill convention), then
+/// interior levels of `(child max_key → (addr, seq))` separators until a
+/// single root remains. Extents claim lowest-first; node seqs count up in
+/// write order — both deterministic.
+struct TreeWriter<'a> {
+    path: &'a Path,
+    layout: &'a NodeLayout,
+    heap_base: u64,
+    alloc: &'a ExtentAllocator,
+    next_node_seq: u64,
+    nodes_written: u64,
+}
+
+impl TreeWriter<'_> {
+    fn usable_budget(&self) -> usize {
+        let usable = self.layout.node_size()
+            - NODE_PAGE
+            - super::node::BSET_FRAME_LEN
+            - super::bset::BSET_HEADER_LEN;
+        usable * 3 / 4
+    }
+
+    async fn write_tree(
+        &mut self,
+        tree_id: u8,
+        records: Vec<Record>,
+    ) -> Result<(u64, u64), KvError> {
+        // Level 0.
+        let mut level: u8 = 0;
+        let mut nodes = self.write_level(tree_id, level, &records).await?;
+        // Interior levels until one root spans the key space.
+        while nodes.len() > 1 {
+            level = level
+                .checked_add(1)
+                .ok_or_else(|| KvError::Corrupt("tree deeper than 255 levels".to_string()))?;
+            let separators: Vec<Record> = nodes
+                .iter()
+                .map(|(addr, seq, max_key)| {
+                    Record::put(max_key.clone(), 0, encode_interior_value(*addr, *seq))
+                })
+                .collect();
+            nodes = self.write_level(tree_id, level, &separators).await?;
+        }
+        let (addr, seq, _) = nodes.pop().expect("write_level yields at least one node");
+        Ok((addr, seq))
+    }
+
+    /// Write one whole level: `records` chunked by the byte budget, each
+    /// chunk one node, sibling bounds partitioning the key space gap-free
+    /// (`next.min = successor(prev.max)`; first min = `""`, last max =
+    /// [`KEY_SPACE_MAX`] — the K2/K5 rule). Returns
+    /// `(addr, node_seq, max_key)` per node, left to right.
+    async fn write_level(
+        &mut self,
+        tree_id: u8,
+        level: u8,
+        records: &[Record],
+    ) -> Result<Vec<(u64, u64, Vec<u8>)>, KvError> {
+        let budget = self.usable_budget();
+        let chunks: Vec<&[Record]> = if records.is_empty() {
+            vec![&records[..]]
+        } else {
+            chunk_by_encoded_len(records, budget)
+        };
+        let mut out = Vec::with_capacity(chunks.len());
+        let mut min_key: Vec<u8> = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let max_key: Vec<u8> = if i + 1 == chunks.len() {
+                KEY_SPACE_MAX.to_vec()
+            } else {
+                chunk
+                    .last()
+                    .expect("non-final chunks are non-empty")
+                    .key
+                    .clone()
+            };
+            let extent = self.alloc.claim_internal()?;
+            let addr = self.heap_base + extent * self.layout.node_size() as u64;
+            self.next_node_seq += 1;
+            let node_seq = self.next_node_seq;
+            write_node(
+                self.path,
+                self.layout,
+                &NodeWriteParams {
+                    node_addr: addr,
+                    node_seq,
+                    tree_id,
+                    level,
+                    min_key: &min_key,
+                    max_key: &max_key,
+                },
+                chunk,
+                0,
+            )
+            .await?;
+            self.nodes_written += 1;
+            min_key = key_successor(&max_key);
+            out.push((addr, node_seq, max_key));
+        }
+        Ok(out)
+    }
+}
+
+/// Greedy chunking of key-ascending records into runs of ≤ `budget`
+/// encoded bytes (every run non-empty; a single record never exceeds the
+/// budget — the §4.2 value cap guarantees it at every node size).
+fn chunk_by_encoded_len(records: &[Record], budget: usize) -> Vec<&[Record]> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0usize;
+    for (i, r) in records.iter().enumerate() {
+        let len = r.record_ref().encoded_len();
+        if acc + len > budget && i > start {
+            chunks.push(&records[start..i]);
+            start = i;
+            acc = 0;
+        }
+        acc += len;
+    }
+    chunks.push(&records[start..]);
+    chunks
 }
 
 /// Summary of one built image (assertions + mount logs).
@@ -175,14 +633,31 @@ pub struct BuiltImage {
 /// determinism tests, the torn-ledger fallback crash case, and (in K9)
 /// migrate's dry-run diff.
 pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
-    let _ = trees;
-    todo!("PR K6a implementation commit")
+    const WALK_PAGE: usize = 1024;
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    for tree in trees {
+        h.update(&[tree.tree_id()]);
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            let page = tree.range(&cursor, &KEY_SPACE_MAX, WALK_PAGE).await?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            cursor = key_successor(last_key);
+            for (k, v) in &page {
+                h.update(&(k.len() as u64).to_le_bytes());
+                h.update(k);
+                h.update(&(v.len() as u64).to_le_bytes());
+                h.update(v);
+            }
+        }
+    }
+    Ok(h.digest())
 }
 
 /// Convenience: [`digest_walk`] over a mounted backend's three trees.
 pub async fn digest_backend(backend: &KvMetaBackend) -> Result<u64, KvError> {
-    let _ = backend;
-    todo!("PR K6a implementation commit")
+    digest_walk(&backend.trees()).await
 }
 
 /// `squeezefs format` options for one metadata volume (the CLI arm's
@@ -207,13 +682,45 @@ pub struct FormatV3Options {
 /// the v2 formatter is test-surface-only — §6.2, resolved OQ 4): runs the
 /// same preflight policy as v2 (`format_preflight` — already-formatted
 /// volumes refused without `force`, live clients refuse even with it),
-/// then builds an empty (plus optional config xattr) image via
-/// [`ImageBuilder`].
+/// grows regular files to `volume_len` (the v2 open parity), optionally
+/// full-wipes, then builds an empty (plus optional config xattr) image
+/// via [`ImageBuilder`].
 pub async fn format_v3(
     path: &Path,
     volume_len: u64,
     opts: &FormatV3Options,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    let _ = (path, volume_len, opts);
-    todo!("PR K6a implementation commit")
+    // The shared guard policy (pinned by format_guard_tests /
+    // mount_registration_tests on the v2 surface): a valid superblock —
+    // v2 OR v3, both carry the magic — refuses without force; live client
+    // registrations refuse even with it. size_limit 0 ⇒ the v2 plumbing
+    // never grows the file here.
+    let storage = crate::meta_backend::storage::MetaLvStorage::open(path, 0)?;
+    crate::meta_backend::MetaLvBackend::format_preflight(&storage, opts.force).await?;
+
+    // Regular files grow to the requested volume length (control-path
+    // one-shot; ftruncate has no uring opcode).
+    let meta = std::fs::metadata(path).map_err(crate::error::SqueezefsError::Io)?;
+    if meta.is_file() && meta.len() < volume_len {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(crate::error::SqueezefsError::Io)?;
+        f.set_len(volume_len)
+            .map_err(crate::error::SqueezefsError::Io)?;
+    }
+
+    if opts.full_wipe {
+        zero_range(path, 0, volume_len).await?;
+    }
+
+    let mut builder = ImageBuilder::new(BuilderConfig {
+        node_size: opts.node_size,
+        journal_len_override: opts.journal_len_override,
+        ..BuilderConfig::new(opts.node_size)
+    })?;
+    if let Some(cfg) = &opts.format_config_xattr {
+        builder.set_xattr(ROOT_INO, FORMAT_CONFIG_XATTR, cfg)?;
+    }
+    Ok(builder.build(path, volume_len).await?)
 }

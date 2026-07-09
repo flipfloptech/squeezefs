@@ -113,6 +113,15 @@ enum Commands {
         /// Shared default /dev/fuse io_uring SQPOLL idle timeout in milliseconds. Use 0 to disable the shared default.
         #[arg(long, env = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS")]
         fuse_io_uring_sqpoll_idle_ms: Option<u32>,
+        /// Metadata (v3) btree node size in KiB: 64|128|256|512|1024.
+        /// Values below 256 warn: the per-volume record-value cap becomes
+        /// node_size/4 (xattr/layout headroom traded for cold-read latency).
+        #[arg(long, default_value = "256")]
+        meta_node_kib: u32,
+        /// Metadata (v3) journal ring size in MiB, overriding the default
+        /// clamp(volume/64, 8 MiB, 32 MiB).
+        #[arg(long)]
+        meta_journal_mb: Option<u64>,
     },
     /// Show filesystem status
     Status {
@@ -1070,34 +1079,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let first_meta_path = &meta_lvs[0];
-        let storage = match squeezefs::meta_backend::storage::MetaLvStorage::open(
-            first_meta_path,
-            128 * 1024 * 1024,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "Error: Failed to open metadata volume {}: {}",
-                    first_meta_path, e
-                );
-                std::process::exit(1);
-            }
-        };
-
         let temp_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        // Dual-format bootstrap (PR K6a): the format config is read
+        // through the version-gated dispatch — v2 volumes via the fixed
+        // xattr region, v3 volumes via the KV xattr tree. Blank, foreign,
+        // torn, future-version, and unknown-feature superblocks all fail
+        // loud here, before any daemonization.
         let val_opt = temp_rt.block_on(async {
-            squeezefs::meta_backend::xattr::get_xattr(&storage, 1, "user.squeezefs.format_config")
+            let vol =
+                squeezefs::meta_backend::VolumeBackend::open_for_mount(first_meta_path).await?;
+            vol.getxattr(1, squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
                 .await
         });
         let val_opt = match val_opt {
             Ok(v) => v,
             Err(e) => {
                 eprintln!(
-                    "Error: Failed to read format config from metadata volume: {}",
-                    e
+                    "Error: Failed to read format config from metadata volume {}: {}",
+                    first_meta_path, e
                 );
                 std::process::exit(1);
             }
@@ -1492,6 +1494,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             dismount_wait,
             upload_delay,
             fuse_io_uring_sqpoll_idle_ms,
+            meta_node_kib,
+            meta_journal_mb,
         } => {
             let mut meta_lvs = Vec::new();
             let mut data_lvs = Vec::new();
@@ -1563,6 +1567,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            // v3 metadata-format knobs (design-cow-kv-metadata §5.1): the
+            // node-size allowed set with the sub-256 KiB record-cap
+            // warning, and the --meta-journal-mb override of the resolved
+            // OQ 1 ring clamp.
+            let (meta_node_size, node_kib_warning) =
+                squeezefs::meta_backend::kv::superblock::validate_node_kib(meta_node_kib)
+                    .map_err(squeezefs::error::SqueezefsError::from)?;
+            if let Some(warning) = node_kib_warning {
+                eprintln!("\x1b[93mWARNING\x1b[0m: {warning}");
+            }
+            let meta_journal_override = meta_journal_mb.map(|mb| mb * 1024 * 1024);
+
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let config = FormatConfig {
                 name: "squeezefs".to_string(),
@@ -1617,38 +1633,42 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let mut join_handles = Vec::new();
 
-            // 1. Concurrent Metadata Volumes Tasks
+            // 1. Concurrent Metadata Volumes Tasks — format v3 (design
+            // §5.1: the CLI produces only v3 from PR K6a on; v2 formatting
+            // is test-surface-only, §6.2/resolved OQ 4). The volume-set
+            // format config is recorded in the FIRST volume's v3 xattr
+            // tree (the mount bootstrap reads it back through the
+            // dual-format dispatch).
+            let config_bytes = serde_json::to_vec(&config)?;
+            let first_meta = meta_lvs[0].clone();
             for path in meta_lvs.clone() {
                 let sem = semaphore.clone();
-                let mp_c = mp.clone();
-                let path_basename = Path::new(&path)
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("meta"))
-                    .to_string_lossy()
-                    .to_string();
-
+                let config_xattr = if path == first_meta {
+                    Some(config_bytes.clone())
+                } else {
+                    None
+                };
                 let handle = tokio::task::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
-                        &path,
-                        128 * 1024 * 1024,
-                    )
-                    .map_err(|e| format!("Failed to open metadata volume '{}': {}", path, e))?;
-                    let pb = if !quick {
-                        let pb = mp_c.add(indicatif::ProgressBar::new(0));
-                        pb.set_style(
-                            indicatif::ProgressStyle::default_bar()
-                                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) - {msg}")
-                                .unwrap()
-                                .progress_chars("#>-")
-                        );
-                        pb.set_message(format!("Meta: {}", path_basename));
-                        Some(pb)
-                    } else {
-                        None
+                    // Volume length: block devices use their physical
+                    // size; regular files grow to the v2-era 128 MiB
+                    // floor (format_v3 set_lens them).
+                    let physical = get_backing_device_size(&path).unwrap_or(0);
+                    let volume_len = std::cmp::max(physical, 128 * 1024 * 1024);
+                    if !quick {
+                        println!("Full-wiping metadata volume {path} ({volume_len} bytes)...");
+                    }
+                    let opts = squeezefs::meta_backend::kv::builder::FormatV3Options {
+                        node_size: meta_node_size,
+                        journal_len_override: meta_journal_override,
+                        force,
+                        full_wipe: !quick,
+                        format_config_xattr: config_xattr,
                     };
-                    squeezefs::meta_backend::MetaLvBackend::format_v2_for_tests(
-                        &storage, quick, force, pb,
+                    squeezefs::meta_backend::kv::builder::format_v3(
+                        Path::new(&path),
+                        volume_len,
+                        &opts,
                     )
                     .await
                     .map_err(|e| format!("Failed to format metadata volume '{}': {}", path, e))?;
@@ -1726,20 +1746,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 handle.await.map_err(|e| e.to_string())??;
             }
 
-            let first_meta_path = &meta_lvs[0];
-            let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
-                first_meta_path,
-                128 * 1024 * 1024,
-            )?;
-            let config_bytes = serde_json::to_vec(&config)?;
-            squeezefs::meta_backend::xattr::set_xattr(
-                &storage,
-                1,
-                "user.squeezefs.format_config",
-                &config_bytes,
-            )
-            .await?;
-            log::info!("Successfully formatted and recorded config on metadata volume.");
+            log::info!("Successfully formatted (v3) and recorded config on metadata volume.");
             let resolved_mem = mem_cache_size.as_deref().unwrap_or("1GB");
             let resolved_disk = disk_cache_size.as_deref().unwrap_or("10GB");
             let resolved_paths = disk_cache_paths
@@ -1854,22 +1861,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 (m_lvs, m_point)
             };
 
+            // Dual-format bootstrap (PR K6a): root-inode presence and the
+            // format config are read through the version-gated dispatch —
+            // v2 volumes via the fixed tables, v3 volumes via the KV trees.
             let first_meta_path = &meta_lvs[0];
-            let storage = squeezefs::meta_backend::storage::MetaLvStorage::open(
-                first_meta_path,
-                128 * 1024 * 1024,
-            )?;
-            let _disk_inode = squeezefs::meta_backend::inode::read_inode(&storage, 1).await?;
-            let val_opt = squeezefs::meta_backend::xattr::get_xattr(
-                &storage,
-                1,
-                "user.squeezefs.format_config",
-            )
-            .await?;
+            let boot_vol =
+                squeezefs::meta_backend::VolumeBackend::open_for_mount(first_meta_path).await?;
+            let _root_inode = boot_vol.getattr(1).await?;
+            let val_opt = boot_vol
+                .getxattr(1, squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+                .await?;
             let val = val_opt.ok_or(
                 "Format configuration xattr not found on root inode. Is this volume formatted?",
             )?;
             let format_config: FormatConfig = serde_json::from_slice(&val)?;
+            drop(boot_vol);
 
             let resolved_mem_cache_size = mem_cache_size.unwrap_or_else(|| {
                 format_config
@@ -2085,31 +2091,74 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let strict_atomicity = strict_meta_atomicity
                 || squeezefs::config_ops::load_or_create_config().strict_meta_atomicity;
 
+            // Dual-format mount dispatch (design-cow-kv-metadata §6.1, PR
+            // K6a): every volume is routed by its superblock version
+            // through the same gate the bootstrap used. Mixed sets are
+            // legal by design (§4.9); serving FUSE from v3 volumes needs
+            // the K6b commit pipeline, so v3 volumes mount their read side
+            // (SB → ledger → bitmap → replay), log the §10 structured
+            // line, and then refuse loud.
             let mut meta_backends = Vec::new();
+            let mut v3_volumes: Vec<String> = Vec::new();
             for path in &meta_lvs {
-                let storage =
-                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 128 * 1024 * 1024)?;
-                // Mount-time format validation (design-wal-crash-consistency
-                // PR 1): magic + version + checksum-iff-nonzero, hard error
-                // BEFORE any backend/worker is constructed or reconciliation
-                // runs. A blank auto-created path fails loud ("run `squeezefs
-                // format` first") instead of limping along with no root inode.
-                storage.validate_superblock().await?;
-                // Sector-atomicity probe (design §4.6): classify the volume,
-                // enforce the strict gate if requested, publish to the stats
-                // surface via the backend.
-                let atomicity_class = squeezefs::meta_backend::atomicity::probe_meta_volume(
-                    std::path::Path::new(path),
-                );
-                if strict_atomicity {
-                    squeezefs::meta_backend::atomicity::enforce_strict(
-                        atomicity_class,
-                        std::path::Path::new(path),
-                    )?;
+                match squeezefs::meta_backend::VolumeBackend::open_for_mount(path).await? {
+                    squeezefs::meta_backend::VolumeBackend::V2(be) => {
+                        // The unchanged v2 path: superblock validated by
+                        // the gate (magic + version + checksum-iff-nonzero,
+                        // hard error before any worker/reconciliation).
+                        // Sector-atomicity probe (design §4.6): classify,
+                        // enforce the strict gate if requested — the gate
+                        // retains meaning on v2 volumes ONLY (resolved
+                        // OQ 2; v3's contract class holds by construction)
+                        // — and publish to the stats surface.
+                        let atomicity_class = squeezefs::meta_backend::atomicity::probe_meta_volume(
+                            std::path::Path::new(path),
+                        );
+                        if strict_atomicity {
+                            squeezefs::meta_backend::atomicity::enforce_strict(
+                                atomicity_class,
+                                std::path::Path::new(path),
+                            )?;
+                        }
+                        let _ = be.atomicity_class.set(atomicity_class);
+                        meta_backends.push(be);
+                    }
+                    squeezefs::meta_backend::VolumeBackend::V3(be) => {
+                        // §10 mount log: format version, ledger seq chosen,
+                        // replay entries/dropped/ms, free extents — plus
+                        // BOTH resolved-OQ-2 atomicity fields (the contract
+                        // class and the physical probe).
+                        let physical = squeezefs::meta_backend::atomicity::probe_meta_volume(
+                            std::path::Path::new(path),
+                        );
+                        let stats = be.replay_stats();
+                        log::info!(
+                            "meta volume {}: format=3 ledger_seq={} replay_entries={} \
+                             replay_dropped_torn={} replay_ms={} free_extents={} next_ino={} \
+                             meta_volume_atomicity={} meta_volume_atomicity_physical={}",
+                            path,
+                            be.mounted_ledger().seq,
+                            stats.entries,
+                            stats.dropped_torn,
+                            stats.replay_ms,
+                            be.free_extents(),
+                            be.next_ino(),
+                            be.atomicity_contract(),
+                            physical,
+                        );
+                        v3_volumes.push(path.clone());
+                    }
                 }
-                let be = std::sync::Arc::new(squeezefs::meta_backend::MetaLvBackend::new(storage));
-                let _ = be.atomicity_class.set(atomicity_class);
-                meta_backends.push(be);
+            }
+            if !v3_volumes.is_empty() {
+                return Err(format!(
+                    "metadata volume(s) {:?} carry format v3: the KV read side mounted and \
+                     verified them (superblock → ledger → bitmap → journal replay), but \
+                     read-write FUSE serving requires the v3 commit pipeline (PR K6b). \
+                     Until it lands, mount v2 volumes only.",
+                    v3_volumes
+                )
+                .into());
             }
 
             let routed_meta_backend = std::sync::Arc::new(

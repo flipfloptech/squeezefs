@@ -374,13 +374,30 @@ impl KvTree {
         kind: RecordKind,
         value: Bytes,
     ) -> Result<ApplyOutcome, KvError> {
+        self.apply_at_seq(leaf, key, kind, value, None).await
+    }
+
+    /// The shared lock-window protocol behind [`Self::apply_at`] (fresh
+    /// seq assigned inside the window) and [`Self::apply_replayed`] (the
+    /// record's journal seq reproduced — mount replay, PR K6a).
+    async fn apply_at_seq(
+        &self,
+        leaf: &Arc<CachedNode>,
+        key: &[u8],
+        kind: RecordKind,
+        value: Bytes,
+        replay_seq: Option<u64>,
+    ) -> Result<ApplyOutcome, KvError> {
         let mut guard = leaf.lock().write().await;
         if leaf.state().is_superseded() || key < leaf.min_key() || key > leaf.max_key() {
             drop(guard);
             super::META_KV_COMMIT_SMO_RETRIES.fetch_add(1, Ordering::Relaxed);
             return Ok(ApplyOutcome::Stale);
         }
-        let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let seq = match replay_seq {
+            Some(seq) => seq,
+            None => self.seq.fetch_add(1, Ordering::AcqRel) + 1,
+        };
         leaf.apply_locked(
             &mut guard,
             vec![OwnedRec {
@@ -396,6 +413,38 @@ impl KvTree {
             self.maintenance.push(leaf.addr());
         }
         Ok(ApplyOutcome::Applied)
+    }
+
+    /// Mount-time replay apply (PR K6a; design §4.2 "Replay fold" / §4.5
+    /// "read-only replay into the cache"): resolve → lock → revalidate →
+    /// apply, exactly the commit path, except the record carries **its
+    /// journal seq** — per-key LWW by seq must reproduce the pre-crash RAM
+    /// history, so replay never mints fresh seqs. The tree's shared seq
+    /// counter is floored above the replayed seq so post-replay
+    /// assignments (K6b commits; K5-style test mutations) stay newer.
+    pub async fn apply_replayed(
+        &self,
+        key: &[u8],
+        seq: u64,
+        kind: RecordKind,
+        value: Bytes,
+    ) -> Result<(), KvError> {
+        self.check_key(key)?;
+        self.seq.fetch_max(seq, Ordering::AcqRel);
+        for _ in 0..RETRY_BUDGET {
+            let leaf = self.resolve_leaf(key).await?;
+            match self
+                .apply_at_seq(&leaf, key, kind, value.clone(), Some(seq))
+                .await?
+            {
+                ApplyOutcome::Applied => return Ok(()),
+                ApplyOutcome::Stale => continue,
+            }
+        }
+        Err(KvError::Corrupt(
+            "replay retry budget exhausted (revalidation never passed — SMO protocol bug)"
+                .to_string(),
+        ))
     }
 
     fn check_key(&self, key: &[u8]) -> Result<(), KvError> {

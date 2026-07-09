@@ -141,6 +141,10 @@ async fn populate_v2(file: &NamedTempFile) -> HashMap<&'static str, u64> {
     inos
 }
 
+/// Timestamps stamped on readme.txt by [`describe_v3`] (ns) — builder
+/// times default to 0 (the determinism contract) and are settable.
+const README_TIMES: (u64, u64, u64) = (11_111, 22_222, 33_333);
+
 fn describe_v3() -> (ImageBuilder, HashMap<&'static str, u64>) {
     let mut b = ImageBuilder::new(v3_builder_config()).unwrap();
     let mut inos = HashMap::new();
@@ -150,6 +154,8 @@ fn describe_v3() -> (ImageBuilder, HashMap<&'static str, u64>) {
         .add_file(docs, "readme.txt", 0o644, 1000, 1000, 4096)
         .unwrap();
     inos.insert("readme.txt", readme);
+    b.set_times(readme, README_TIMES.0, README_TIMES.1, README_TIMES.2)
+        .unwrap();
     b.set_xattr(readme, "user.color", b"blue").unwrap();
     b.set_xattr(readme, "user.big", &big_xattr()).unwrap();
     let hello = b.add_file(ROOT_INO, "hello.bin", 0o600, 0, 0, 0).unwrap();
@@ -157,6 +163,7 @@ fn describe_v3() -> (ImageBuilder, HashMap<&'static str, u64>) {
     let empty = b.add_dir(ROOT_INO, "empty", 0o755, 0, 0).unwrap();
     inos.insert("empty", empty);
     b.add_link(hello, ROOT_INO, "hard.lnk").unwrap();
+    assert_eq!(b.inode_count(), 5, "root + docs + readme + hello + empty");
     (b, inos)
 }
 
@@ -1053,7 +1060,7 @@ async fn v3_format_guards_match_the_preflight_contract() {
 async fn v3_mount_surfaces_ledger_and_allocator_state() {
     let file = NamedTempFile::new().unwrap();
     file.as_file().set_len(V3_VOL_LEN).unwrap();
-    let (b, _) = describe_v3();
+    let (b, inos) = describe_v3();
     let img = b.build(file.path(), V3_VOL_LEN).await.unwrap();
 
     let be = KvMetaBackend::open(file.path()).await.unwrap();
@@ -1070,4 +1077,19 @@ async fn v3_mount_surfaces_ledger_and_allocator_state() {
         "free extents = total − built nodes"
     );
     assert_eq!(be.trees().len(), 3);
+
+    // Builder-set timestamps round-trip; unset ones stay at the
+    // deterministic 0 default.
+    let readme = be.getattr(inos["readme.txt"]).await.unwrap();
+    assert_eq!(
+        (readme.atime, readme.mtime, readme.ctime),
+        README_TIMES,
+        "set_times must round-trip through the built image"
+    );
+    let hello = be.getattr(inos["hello.bin"]).await.unwrap();
+    assert_eq!(
+        (hello.atime, hello.mtime, hello.ctime),
+        (0, 0, 0),
+        "unset builder times default to 0 (the determinism contract)"
+    );
 }

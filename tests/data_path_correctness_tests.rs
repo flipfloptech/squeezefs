@@ -450,6 +450,7 @@ async fn test_stats_json_exposes_sector_commit_metrics() {
         "meta_flush_deferred",
         "meta_reclaim_batch_size",
         "meta_volume_atomicity",
+        "meta_volume_atomicity_physical",
     ] {
         assert!(!metrics[key].is_null(), "stats JSON missing metrics.{key}");
     }
@@ -472,6 +473,14 @@ async fn test_stats_json_exposes_sector_commit_metrics() {
     assert_eq!(
         v["metrics"]["meta_volume_atomicity"][0], "file-backed",
         "the probed classification must surface on the stats inode"
+    );
+    // Resolved OQ 2 (design-cow-kv-metadata §4.10): the physical probe is
+    // its own field alongside the contract class. On a v2 volume the two
+    // coincide by definition; v3 volumes report "cow-checksummed" in the
+    // contract field once K6b lets them serve FUSE.
+    assert_eq!(
+        v["metrics"]["meta_volume_atomicity_physical"][0], "file-backed",
+        "the physical probe must surface alongside the contract class"
     );
 }
 

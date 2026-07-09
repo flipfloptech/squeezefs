@@ -540,6 +540,45 @@ mod storm {
             String::from_utf8_lossy(&fmt.stderr)
         );
 
+        // The CLI `format` produces v3 from PR K6a on (design §6.2 —
+        // resolved OQ 4: v2 formatting is test-surface-only), but FUSE
+        // serving of v3 volumes arrives with the K6b commit pipeline.
+        // This suite pins the FUSE-over-io_uring TRANSPORT contract, which
+        // keeps running against the v2 backend until then: rebuild the
+        // meta volume as v2 with the §6.2 test-scoped formatter, carrying
+        // over the format config the CLI recorded in the v3 xattr tree.
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let cfg = squeezefs::meta_backend::kv::backend::KvMetaBackend::open(&meta)
+                    .await
+                    .expect("open the CLI-formatted v3 meta volume")
+                    .getxattr(1, squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+                    .await
+                    .expect("read the recorded format config")
+                    .expect("format must record the config xattr");
+                let storage =
+                    squeezefs::meta_backend::storage::MetaLvStorage::open(&meta, 256 * 1024 * 1024)
+                        .expect("reopen meta volume");
+                squeezefs::meta_backend::MetaLvBackend::format_v2_for_tests(
+                    &storage, true, true, None,
+                )
+                .await
+                .expect("v2 reformat for the transport suite");
+                squeezefs::meta_backend::xattr::set_xattr(
+                    &storage,
+                    1,
+                    squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+                    &cfg,
+                )
+                .await
+                .expect("carry the format config onto the v2 volume");
+            });
+        }
+
         let logf = std::fs::File::create(&log).unwrap();
         let child = Command::new(bin)
             .arg("mount")

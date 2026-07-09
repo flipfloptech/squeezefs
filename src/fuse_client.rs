@@ -20,6 +20,25 @@ use tokio::runtime::Builder;
 pub const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 pub const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
+/// §4.5 dir-entry-cache policy (PR K7): only directories with at most
+/// this many entries are snapshotted into `dir_entry_cache` — an
+/// `Arc<[…]>` of a 1 M-entry listing is ~60 MB, and moka's capacity
+/// accounting here counts *directories*, not entries. Larger directories
+/// stream through `readdir(dir, offset, max)` instead.
+pub const DIR_ENTRY_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// Readdir cookie of the root's virtual `.config` entry on v3 volumes
+/// (design §5.1, PR K7): real-entry cookies occupy
+/// `[3, 3 + ((2^54−1)·2^8 + 255)] = [3, 2^62 + 2]`, so the virtual entries
+/// ride strictly above the whole real space — still sign-bit-clear for
+/// the `i64` FUSE surface. v2 volumes keep positional offsets (virtuals
+/// first), untouched.
+pub const READDIR_VIRTUAL_CONFIG_COOKIE: u64 = (1 << 62) + 3;
+
+/// Readdir cookie of the root's virtual `.stats` entry on v3 volumes
+/// (see [`READDIR_VIRTUAL_CONFIG_COOKIE`]).
+pub const READDIR_VIRTUAL_STATS_COOKIE: u64 = (1 << 62) + 4;
+
 /// How often a mounted client refreshes its `client:{id}` registration on the
 /// metadata volume (heartbeat), so peers can distinguish a live mount from a
 /// crashed one.

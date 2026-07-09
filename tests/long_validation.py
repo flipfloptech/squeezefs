@@ -280,6 +280,42 @@ def run_crash_soak(rounds):
     print("[crash-soak] PASSED")
 
 
+# Nightly builder-built mount-time cases (design-cow-kv-metadata §8 row 5,
+# PR K7): 10M- and 100M-ino kv::builder images, cold-mounted (fdatasync'd
+# then fadvise(DONTNEED)) with the §3 bound asserted in the Rust test
+# (≤ 2 s hard; ≤ ~300 ms typical target for 100M). The 1M-ino case runs in
+# the serial cargo gate; these two are nightly because the 100M build
+# writes a ~25 GiB image and holds a multi-GB description in RAM.
+#
+# Standalone invocation (what this wrapper runs for you):
+#   cargo test --release --test kv_scale_tests -- --ignored \
+#       --exact nightly_mount_time_10m_ino --test-threads=1 --nocapture
+#   cargo test --release --test kv_scale_tests -- --ignored \
+#       --exact nightly_mount_time_100m_ino --test-threads=1 --nocapture
+MOUNT_SCALE_TESTS = {
+    "10m": ["nightly_mount_time_10m_ino"],
+    "100m": ["nightly_mount_time_100m_ino"],
+    "both": ["nightly_mount_time_10m_ino", "nightly_mount_time_100m_ino"],
+}
+
+
+def run_mount_scale(which):
+    """Run the 10M / 100M-ino nightly mount-time cases (PR K7 §8 row 5)."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for test in MOUNT_SCALE_TESTS[which]:
+        print(f"[mount-scale] {test} (builder image + cold mount; "
+              f"images land in target/tmp and are removed afterwards)")
+        result = subprocess.run(
+            ["cargo", "test", "--release", "--test", "kv_scale_tests", "--",
+             "--ignored", "--exact", test, "--test-threads=1", "--nocapture"],
+            cwd=repo_root,
+        )
+        if result.returncode != 0:
+            print(f"[mount-scale] {test} FAILED")
+            sys.exit(result.returncode)
+        print(f"[mount-scale] {test} PASSED")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Long running validation test for squeezefs mounts.")
     parser.add_argument("--dir", help="Target directory (usually the squeezefs mount point)")
@@ -304,10 +340,20 @@ def main():
     parser.add_argument("--crash-soak", type=int, default=0, metavar="N",
                         help="Run the kill-9 remount soak for N rounds (nightly: 500) and exit")
 
+    # Builder-built mount-time scale cases (no mount required; PR K7 §8
+    # row 5 nightly halves — the 1M case lives in the serial cargo gate)
+    parser.add_argument("--mount-scale", choices=sorted(MOUNT_SCALE_TESTS),
+                        help="Run the 10M/100M-ino builder-built cold-mount "
+                             "cases (nightly) and exit")
+
     args = parser.parse_args()
 
     if args.crash_soak > 0:
         run_crash_soak(args.crash_soak)
+        return
+
+    if args.mount_scale:
+        run_mount_scale(args.mount_scale)
         return
 
     if not args.dir or not os.path.isdir(args.dir):

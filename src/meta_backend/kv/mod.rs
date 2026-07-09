@@ -114,6 +114,34 @@ pub static META_KV_NODE_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
 /// `meta_kv_commit_smo_retries` in K6a/K7.
 pub static META_KV_COMMIT_SMO_RETRIES: AtomicU64 = AtomicU64::new(0);
 
+/// Journal entry bytes physically written to ring pages (`res.len` per
+/// committed entry — headers included). One half of the §8 row 7
+/// write-amplification accounting; surfaced as `meta_kv_journal_bytes`
+/// (design §10) on the stats inode in PR K7.
+pub static META_KV_JOURNAL_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Journal entries written (one whole transaction each, §4.1). Surfaced
+/// as `meta_kv_journal_entries` (design §10) in PR K7.
+pub static META_KV_JOURNAL_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Bset frames appended to node tails by writeback (§4.6 pt 1). Surfaced
+/// as `meta_kv_node_appends` (design §10) in PR K7.
+pub static META_KV_NODE_APPENDS: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of those appended frames (4 KiB-padded) — the second half of the
+/// §8 row 7 "node writeback counters" accounting. Surfaced as
+/// `meta_kv_node_append_bytes` in PR K7.
+pub static META_KV_NODE_APPEND_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of whole-node CoW rewrites (compaction / split successors —
+/// header page + base bset; §4.6). Completes the §8 row 7 device-byte
+/// accounting. Surfaced as `meta_kv_node_rewrite_bytes` in PR K7.
+pub static META_KV_NODE_REWRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// §4.6 pt 2 checkpoint cycles completed (ledger records written).
+/// Surfaced as `meta_kv_checkpoints` in PR K7.
+pub static META_KV_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
+
 /// Errors from the pure KV encoding / fold layer.
 ///
 /// Kept separate from [`crate::error::SqueezefsError`] so the contracts stay

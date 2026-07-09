@@ -463,8 +463,10 @@ async fn test_stats_json_exposes_sector_commit_metrics() {
         .expect("meta_volume_atomicity must be an array (one entry per volume)");
     assert_eq!(atomicity.len(), 1, "harness mounts exactly one meta volume");
     assert_eq!(atomicity[0], "unprobed");
-    let vols = &h.fs.meta_backend.as_ref().unwrap().volumes;
-    vols[0]
+    h.fs.meta_backend
+        .as_ref()
+        .unwrap()
+        .v2_volume(0)
         .atomicity_class
         .set(squeezefs::meta_backend::atomicity::AtomicityClass::FileBacked)
         .expect("probe result set once");

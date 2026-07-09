@@ -358,6 +358,22 @@ impl NodeSnapshot {
         None
     }
 
+    /// The newest record seq present for `key` across the overlay and
+    /// every serialized source, or `None` when the key has no records —
+    /// the §4.4 pt 4 rollback's seq-conditional probe ("rollback restores
+    /// a key only if its newest dirty record still bears this tx's seq").
+    pub fn newest_record_seq(&self, key: &[u8]) -> Option<u64> {
+        let og = self.overlay_group(key);
+        let overlay_newest = og.clone().next_back().map(|i| self.overlay[i].seq);
+        let bg = self.base.group_bounds(key);
+        // Base groups are (seq desc): the first entry is the newest.
+        let base_newest = (!bg.is_empty()).then(|| self.base.entries[bg.start].seq);
+        match (overlay_newest, base_newest) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).max(b.unwrap_or(0))),
+        }
+    }
+
     /// The next **live** `(key, value)` with key ≥ `from` (fold-walked:
     /// tombstoned/orphaned keys are skipped) — the range-scan / interior
     /// routing primitive. Zero-copy on both key and value.
@@ -492,6 +508,12 @@ pub struct CachedNode {
     ref_bit: AtomicBool,
     /// Interior nodes and tree roots never evict (§4.5).
     pinned: AtomicBool,
+    /// §4.6 pt 2 `oldest_dirty_seq`: the smallest record seq applied to
+    /// this node that is not yet in a **durable-covered** bset
+    /// (`u64::MAX` = none). Maintained by [`Self::apply_locked`]; the
+    /// checkpoint task swaps it out per flush pass and restores it if the
+    /// pass fails — the tail rule takes the min over these floors.
+    dirty_floor: AtomicU64,
 }
 
 impl std::fmt::Debug for CachedNode {
@@ -537,6 +559,7 @@ impl CachedNode {
             }),
             ref_bit: AtomicBool::new(true),
             pinned: AtomicBool::new(pinned),
+            dirty_floor: AtomicU64::new(u64::MAX),
         }))
     }
 
@@ -618,6 +641,9 @@ impl CachedNode {
             )));
         }
         for rec in records {
+            // §4.6 pt 2: every applied record lowers the not-yet-durable
+            // floor; the checkpoint's tail rule reads it back.
+            self.dirty_floor.fetch_min(rec.seq, Ordering::AcqRel);
             let pos = guard
                 .overlay
                 .partition_point(|r| (&r.key[..], r.seq) <= (&rec.key[..], rec.seq));
@@ -630,6 +656,62 @@ impl CachedNode {
             overlay: Arc::new(guard.overlay.clone()),
         }));
         Ok(())
+    }
+
+    /// Current §4.6 pt 2 dirty floor (`u64::MAX` = clean of un-durable
+    /// records).
+    pub fn dirty_floor(&self) -> u64 {
+        self.dirty_floor.load(Ordering::Acquire)
+    }
+
+    /// Checkpoint flush pass: take the floor (leaving `u64::MAX`) —
+    /// records applied after this call re-lower it and belong to the
+    /// next cycle. Call under the node write lock, in the same window as
+    /// the freeze, so no applied record can slip between freeze and take.
+    pub fn take_dirty_floor(&self) -> u64 {
+        self.dirty_floor.swap(u64::MAX, Ordering::AcqRel)
+    }
+
+    /// Restore a floor after a failed flush (I/O error before the
+    /// barrier): the records are still not durable-covered, so the tail
+    /// must keep respecting them.
+    pub fn restore_dirty_floor(&self, floor: u64) {
+        self.dirty_floor.fetch_min(floor, Ordering::AcqRel);
+    }
+
+    /// §4.4 pt 4 seq-conditional rollback, removal half: under the held
+    /// write lock, remove every open-overlay record of `key` whose seq is
+    /// inside the failing tx's reserved range `[lo, hi)` and swap a fresh
+    /// snapshot. Records that already left the overlay (a freeze raced
+    /// the failed write) are the caller's compensation problem — detected
+    /// via [`NodeSnapshot::newest_record_seq`]. Returns how many records
+    /// were removed.
+    pub fn remove_overlay_records_locked(
+        &self,
+        guard: &mut NodeDirty,
+        key: &[u8],
+        lo: u64,
+        hi: u64,
+    ) -> usize {
+        let before = guard.overlay.len();
+        guard.overlay.retain(|r| {
+            let mine = r.key[..] == *key && r.seq >= lo && r.seq < hi;
+            !mine
+        });
+        let removed = before - guard.overlay.len();
+        if removed > 0 {
+            guard.overlay_bytes = guard
+                .overlay
+                .iter()
+                .map(|r| r.record_ref().encoded_len())
+                .sum();
+            let cur = self.snapshot.load();
+            self.snapshot.store(Arc::new(NodeSnapshot {
+                base: cur.base.clone(),
+                overlay: Arc::new(guard.overlay.clone()),
+            }));
+        }
+        removed
     }
 
     /// The §4.6 pt 1 freeze-swap, **under the held write lock**: move the

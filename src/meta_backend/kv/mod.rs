@@ -198,6 +198,18 @@ pub enum KvError {
     )]
     NoSpace { free: u64, reserve: u64 },
 
+    /// The checkpoint-task ring reserve could not admit an SMO's records
+    /// right now (§4.4 pt 5): the caller (the per-volume checkpoint task
+    /// — the only SMO driver) must run a **minimal drain** (barrier +
+    /// ledger + `reusable_upto` advance, zero ring bytes — the §4.4 pt 5
+    /// progress theorem) and retry. Never a panic, never a park: parking
+    /// the one task that frees ring space is the R10 self-deadlock.
+    #[error(
+        "journal reserve exhausted: {needed} bytes of SMO records refused admission; \
+         run a minimal checkpoint drain and retry"
+    )]
+    JournalReserveExhausted { needed: u64 },
+
     /// The pending-free list hit its cap (design §4.7 "capped"): the
     /// caller must force a checkpoint (whose durable barrier drains the
     /// list via `advance_durable`) — never reuse an extent whose retiring

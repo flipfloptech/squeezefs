@@ -2091,17 +2091,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let strict_atomicity = strict_meta_atomicity
                 || squeezefs::config_ops::load_or_create_config().strict_meta_atomicity;
 
-            // Dual-format mount dispatch (design-cow-kv-metadata §6.1, PR
-            // K6a): every volume is routed by its superblock version
-            // through the same gate the bootstrap used. Mixed sets are
-            // legal by design (§4.9); serving FUSE from v3 volumes needs
-            // the K6b commit pipeline, so v3 volumes mount their read side
-            // (SB → ledger → bitmap → replay), log the §10 structured
-            // line, and then refuse loud.
+            // Dual-format mount dispatch (design-cow-kv-metadata §6.1):
+            // every volume is routed by its superblock version through
+            // the same gate the bootstrap used. Mixed sets are legal by
+            // design (§4.9). Since PR K6b v3 volumes serve READ-WRITE:
+            // the §4.4 commit pipeline + §4.6 checkpoint task are live.
             let mut meta_backends = Vec::new();
-            let mut v3_volumes: Vec<String> = Vec::new();
             for path in &meta_lvs {
-                match squeezefs::meta_backend::VolumeBackend::open_for_mount(path).await? {
+                let vol = squeezefs::meta_backend::VolumeBackend::open_for_mount(path).await?;
+                match &vol {
                     squeezefs::meta_backend::VolumeBackend::V2(be) => {
                         // The unchanged v2 path: superblock validated by
                         // the gate (magic + version + checksum-iff-nonzero,
@@ -2121,7 +2119,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             )?;
                         }
                         let _ = be.atomicity_class.set(atomicity_class);
-                        meta_backends.push(be);
                     }
                     squeezefs::meta_backend::VolumeBackend::V3(be) => {
                         // §10 mount log: format version, ledger seq chosen,
@@ -2131,6 +2128,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let physical = squeezefs::meta_backend::atomicity::probe_meta_volume(
                             std::path::Path::new(path),
                         );
+                        be.set_atomicity_physical(physical);
                         let stats = be.replay_stats();
                         log::info!(
                             "meta volume {}: format=3 ledger_seq={} replay_entries={} \
@@ -2146,23 +2144,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             be.atomicity_contract(),
                             physical,
                         );
-                        v3_volumes.push(path.clone());
                     }
                 }
-            }
-            if !v3_volumes.is_empty() {
-                return Err(format!(
-                    "metadata volume(s) {:?} carry format v3: the KV read side mounted and \
-                     verified them (superblock → ledger → bitmap → journal replay), but \
-                     read-write FUSE serving requires the v3 commit pipeline (PR K6b). \
-                     Until it lands, mount v2 volumes only.",
-                    v3_volumes
-                )
-                .into());
+                meta_backends.push(vol);
             }
 
             let routed_meta_backend = std::sync::Arc::new(
-                squeezefs::meta_backend::RoutedMetaBackend::new(meta_backends),
+                squeezefs::meta_backend::RoutedMetaBackend::new_dispatch(meta_backends),
             );
 
             let resolved_uid = uid.unwrap_or_else(|| {
@@ -2190,42 +2178,68 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // volume. WAL replay was deleted in PR 8 (unsound as the WAL stood —
             // review Issue 15); crash recovery = in-place apply + fdatasync.
             // Then run block-allocator recovery.
-            for meta_be in &routed_meta_backend.volumes {
-                let quarantined_before = squeezefs::fuse_client::METRICS
-                    .meta_quarantined_inodes
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if let Err(e) = meta_be.storage.seed_inode_alloc_from_table().await {
-                    log::warn!("Inode allocator seed failed on mount: {:?}", e);
-                }
-                if let Err(e) = meta_be.storage.refresh_bitmap_from_table().await {
-                    log::warn!("Inode bitmap reconciliation failed on mount: {:?}", e);
-                }
-                // One structured line per volume (design §4.6/§Observability):
-                // atomicity classification + legacy quarantine victims +
-                // journal-region status (reserved; write path deleted, PR 4).
-                let quarantined = squeezefs::fuse_client::METRICS
-                    .meta_quarantined_inodes
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    - quarantined_before;
-                log::info!(
-                    "meta volume {}: atomicity={} quarantined_legacy_inos={} journal_region=reserved(never written)",
-                    meta_be.storage.device_path().display(),
-                    meta_be
-                        .atomicity_class
-                        .get()
-                        .map(|c| c.as_str())
-                        .unwrap_or("unprobed"),
-                    quarantined,
-                );
-                for entry in fs_engine.router.backend_router.backends.iter() {
-                    let backend = entry.value();
-                    log::info!("Running block allocator recovery for data volume...");
-                    if let Err(e) = backend
-                        .block_allocator
-                        .recover_active_blocks(&meta_be.storage, &fs_engine.router.backend_router)
-                        .await
-                    {
-                        log::error!("Failed to recover block allocator: {:?}", e);
+            for meta_vol in &routed_meta_backend.volumes {
+                match meta_vol {
+                    squeezefs::meta_backend::VolumeBackend::V2(meta_be) => {
+                        let quarantined_before = squeezefs::fuse_client::METRICS
+                            .meta_quarantined_inodes
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if let Err(e) = meta_be.storage.seed_inode_alloc_from_table().await {
+                            log::warn!("Inode allocator seed failed on mount: {:?}", e);
+                        }
+                        if let Err(e) = meta_be.storage.refresh_bitmap_from_table().await {
+                            log::warn!("Inode bitmap reconciliation failed on mount: {:?}", e);
+                        }
+                        // One structured line per volume (design §4.6/§Observability):
+                        // atomicity classification + legacy quarantine victims +
+                        // journal-region status (reserved; write path deleted, PR 4).
+                        let quarantined = squeezefs::fuse_client::METRICS
+                            .meta_quarantined_inodes
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            - quarantined_before;
+                        log::info!(
+                            "meta volume {}: atomicity={} quarantined_legacy_inos={} journal_region=reserved(never written)",
+                            meta_be.storage.device_path().display(),
+                            meta_be
+                                .atomicity_class
+                                .get()
+                                .map(|c| c.as_str())
+                                .unwrap_or("unprobed"),
+                            quarantined,
+                        );
+                        for entry in fs_engine.router.backend_router.backends.iter() {
+                            let backend = entry.value();
+                            log::info!("Running block allocator recovery for data volume...");
+                            if let Err(e) = backend
+                                .block_allocator
+                                .recover_active_blocks(
+                                    &meta_be.storage,
+                                    &fs_engine.router.backend_router,
+                                )
+                                .await
+                            {
+                                log::error!("Failed to recover block allocator: {:?}", e);
+                            }
+                        }
+                    }
+                    squeezefs::meta_backend::VolumeBackend::V3(kv) => {
+                        // v3 needs no allocator seed / bitmap reconcile
+                        // (monotonic inos, §4.8; A/B bitmap loaded at
+                        // open). Block-allocator refcount recovery walks
+                        // the live inode tree instead of the fixed table.
+                        for entry in fs_engine.router.backend_router.backends.iter() {
+                            let backend = entry.value();
+                            log::info!(
+                                "Running block allocator recovery (v3 walk) for data volume..."
+                            );
+                            if let Err(e) = backend
+                                .block_allocator
+                                .recover_active_blocks_v3(kv, &fs_engine.router.backend_router)
+                                .await
+                            {
+                                log::error!("Failed to recover block allocator: {:?}", e);
+                            }
+                        }
                     }
                 }
             }

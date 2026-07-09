@@ -47,8 +47,9 @@
 //! split rule), so revalidation admits exactly the keys the separators
 //! route.
 
-use super::alloc_ext::ExtentAllocator;
+use super::alloc_ext::{alloc_record, free_record, ExtentAllocator};
 use super::bset::{compact, BsetView};
+use super::journal::{entry_len_for, tag_for, JournalRing};
 use super::node::{
     key_successor, load_node, split_node, write_node, NodeWriteParams, SplitDest, BSET_FRAME_LEN,
     NODE_PAGE,
@@ -100,6 +101,40 @@ pub struct RootPtr {
     pub seq: u64,
 }
 
+/// The journal side of production SMOs (PR K6b; design §4.6): every
+/// structure modification reserves its interior-pointer and alloc/free
+/// records from the **checkpoint-task ring reserve** (§4.4 pt 5) inside
+/// the lock window and writes the entry bytes after release — the same
+/// split as every commit. Successor node images are made durable
+/// (coalesced barrier) *before* the swap window, so a replayed pointer
+/// record can never route to a torn successor.
+pub struct SmoJournal {
+    /// The volume's journal ring (admission from the checkpoint reserve).
+    pub ring: Arc<JournalRing>,
+    /// §4.7 pending-free tag source: the checkpoint seq that will stop
+    /// referencing extents freed *now* — i.e. the NEXT ledger record's
+    /// seq. The checkpoint task keeps it at `last_written_seq + 1`.
+    pub retire_seq: Arc<AtomicU64>,
+    /// The volume's group-commit barrier (successor durability).
+    pub sync: Arc<crate::meta_backend::sync_coalescer::SyncCoalescer>,
+    /// The volume device (barrier target).
+    pub path: std::path::PathBuf,
+}
+
+impl SmoJournal {
+    /// One coalesced fdatasync on the volume device.
+    async fn barrier(&self) -> Result<(), KvError> {
+        let path = self.path.clone();
+        self.sync
+            .barrier(|| {
+                let path = path.clone();
+                async move { crate::uring_fs::fdatasync(path).await }
+            })
+            .await
+            .map_err(KvError::Io)
+    }
+}
+
 /// The serialized SMO execution context (§4.6): **one per volume**, owned
 /// by whatever drives structure modifications — the tests in K5, the
 /// checkpoint/writeback task in K6b. Passing it `&mut` into every SMO
@@ -108,11 +143,27 @@ pub struct RootPtr {
 /// the enforcer.
 pub struct SmoContext {
     alloc: Arc<ExtentAllocator>,
+    /// `None` = the K5 test shape (counter seqs, no journaling, no
+    /// barrier); `Some` = the K6b production shape.
+    journal: Option<SmoJournal>,
 }
 
 impl SmoContext {
     pub fn new(alloc: Arc<ExtentAllocator>) -> Self {
-        Self { alloc }
+        Self {
+            alloc,
+            journal: None,
+        }
+    }
+
+    /// The K6b production context: SMOs journal their records through the
+    /// checkpoint-task reserve and barrier successor images before the
+    /// swap (§4.6).
+    pub fn with_journal(alloc: Arc<ExtentAllocator>, journal: SmoJournal) -> Self {
+        Self {
+            alloc,
+            journal: Some(journal),
+        }
     }
 
     /// The extent allocator behind this volume's SMOs (§4.7).
@@ -447,6 +498,56 @@ impl KvTree {
         ))
     }
 
+    /// Mount-time replay of an SMO's **interior-pointer record** (K6b;
+    /// §4.6 "replay applies the pointer record first"): route to the
+    /// level-`level` node covering `key` and apply with the record's
+    /// journal seq. Returns `false` — dropped, never loud — when the
+    /// mounted structure cannot route it: the selected (older) ledger may
+    /// predate a root growth, in which case the mounted tree is shorter
+    /// than the crashed one and the pointer's target parent does not
+    /// exist. That drop is sound: content records replay **by key**
+    /// through the old routing, so the folded state is consistent; the
+    /// successor extents the pointer named stay allocated-but-unreferenced
+    /// (a bounded crash-window leak, reclaimed by a future fsck — not
+    /// corruption). Mount replay is single-threaded and the checkpoint
+    /// task is not yet running, so touching interior locks here cannot
+    /// collide with the §4.6 SMO-only lock population.
+    pub async fn apply_replayed_interior(
+        &self,
+        key: &[u8],
+        level: u8,
+        seq: u64,
+        kind: RecordKind,
+        value: Bytes,
+    ) -> Result<bool, KvError> {
+        self.check_key(key)?;
+        self.seq.fetch_max(seq, Ordering::AcqRel);
+        if self.root_level().await? < level {
+            return Ok(false); // shorter mounted structure: unroutable
+        }
+        for _ in 0..RETRY_BUDGET {
+            let target = self.descend(key, level).await?;
+            match self
+                .apply_at_seq(&target, key, kind, value.clone(), Some(seq))
+                .await?
+            {
+                ApplyOutcome::Applied => return Ok(true),
+                ApplyOutcome::Stale => continue,
+            }
+        }
+        Err(KvError::Corrupt(
+            "interior replay retry budget exhausted (no SMO can be running at mount)".to_string(),
+        ))
+    }
+
+    /// Enqueue a node for the next maintenance pass (the K6b commit
+    /// pipeline applies records through the backend's multi-leaf lock
+    /// window rather than [`Self::apply_at`], so it reports writeback
+    /// pressure here; duplicates are benign).
+    pub(crate) fn enqueue_maintenance(&self, addr: u64) {
+        self.maintenance.push(addr);
+    }
+
     fn check_key(&self, key: &[u8]) -> Result<(), KvError> {
         if key.is_empty() || key >= &KEY_SPACE_MAX[..] {
             return Err(KvError::Corrupt(format!(
@@ -583,6 +684,51 @@ impl KvTree {
         ))
     }
 
+    /// The checkpoint's per-node flush step (§4.6 pts 1–2): freeze the
+    /// open delta and **take the dirty floor in the same lock window**
+    /// (no applied record can slip between them), then append outside the
+    /// lock — full logs compact/split through the SMO path. On failure
+    /// the floor is restored, so the tail rule keeps respecting the
+    /// records this pass could not make durable.
+    pub(crate) async fn checkpoint_flush_node(
+        &self,
+        ctx: &mut SmoContext,
+        addr: u64,
+    ) -> Result<(), KvError> {
+        let Some(node) = self.cache.try_get(addr) else {
+            return Ok(()); // evicted/retired since the dirty walk
+        };
+        if node.state().is_superseded() || node.tree_id() != self.tree_id {
+            return Ok(());
+        }
+        let (frozen, floor) = {
+            let mut guard = node.lock().write().await;
+            let frozen = node.freeze_locked(&mut guard, &self.cache.config().layout)?;
+            let floor = node.take_dirty_floor();
+            (frozen, floor)
+        };
+        if frozen.is_none() {
+            // Nothing to write: either clean, or its bytes were already
+            // appended by threshold maintenance — the caller's barrier
+            // covers those appends, so the cleared floor is exact.
+            return Ok(());
+        }
+        let out = async {
+            if self.cache.append_frozen(&node).await? {
+                return Ok(());
+            }
+            // Log area full ⇒ compact / split (§4.6 pt 1; smo_replace
+            // owns the SMO counters).
+            let mut o = MaintenanceOutcome::default();
+            self.smo_replace(ctx, &node, &mut o).await
+        }
+        .await;
+        if out.is_err() {
+            node.restore_dirty_floor(floor);
+        }
+        out
+    }
+
     fn cache_map_dirty_addrs(&self, out: &mut Vec<u64>) {
         self.cache.for_each_node(|node| {
             if node.tree_id() == self.tree_id
@@ -636,6 +782,17 @@ impl KvTree {
     /// The §4.6 three-step node replacement. `node` is frozen (its
     /// unappended delta rides `extra_records`) and stays mapped until the
     /// swap below.
+    ///
+    /// Production journaling (K6b, `SmoContext::with_journal`): successor
+    /// images are barriered durable **before** the swap window (a
+    /// replayed pointer record must never route to a torn successor);
+    /// ring admission for the SMO's records (interior pointers +
+    /// alloc/free) is drawn from the checkpoint-task reserve **before**
+    /// any lock (§4.4 pt 5 / §4.9 4b — never wait on ring space under a
+    /// node lock; on refusal the caller runs a minimal drain and
+    /// retries); the reservation happens **inside** the parent-then-child
+    /// lock window and the entry bytes are written after release — the
+    /// same split as every commit (§4.4 pt 2).
     async fn smo_replace(
         &self,
         ctx: &mut SmoContext,
@@ -684,8 +841,11 @@ impl KvTree {
 
         // Claim fresh extents (internal class, §4.7) + write images.
         let mut written: Vec<(u64, u64)> = Vec::new(); // (addr, node_seq)
-        let claim = |ctx: &SmoContext, cache: &NodeCache| -> Result<u64, KvError> {
-            Ok(cache.extent_addr(ctx.alloc.claim_internal()?))
+        let mut claimed_extents: Vec<u64> = Vec::new();
+        let mut claim = |ctx: &SmoContext, cache: &NodeCache| -> Result<u64, KvError> {
+            let extent = ctx.alloc.claim_internal()?;
+            claimed_extents.push(extent);
+            Ok(cache.extent_addr(extent))
         };
         if parts.len() == 1 {
             let dst = claim(ctx, &self.cache)?;
@@ -791,20 +951,80 @@ impl KvTree {
             None
         };
 
+        // ---- K6b production journaling (before any lock): make the
+        // successor images durable, then admit the SMO's records from the
+        // checkpoint-task reserve. Admission refusal aborts cleanly — the
+        // built images were never published, the claims are released, and
+        // the caller (the checkpoint task) drains and retries.
+        let is_root_swap = self.is_root(node);
+        let old_extent = self.cache.addr_extent(node.addr());
+        let smo_prep = if let Some(j) = &ctx.journal {
+            // Successors (and a new root, if any) durable BEFORE any
+            // pointer record to them can exist in the ring: a replayed
+            // pointer must never route to a torn image (§4.10).
+            j.barrier().await?;
+            let mut recs: Vec<(u8, Record)> = Vec::new();
+            if !is_root_swap {
+                for s in &successors {
+                    recs.push((
+                        tag_for(self.tree_id, node.level() + 1),
+                        Record::put(
+                            s.max_key().to_vec(),
+                            0, // stamped from the reservation inside the window
+                            encode_interior_value(s.addr(), s.node_seq()),
+                        ),
+                    ));
+                }
+            }
+            for e in &claimed_extents {
+                recs.push(alloc_record(*e, 0));
+            }
+            let retire_tag = j.retire_seq.load(Ordering::Acquire);
+            recs.push(free_record(old_extent, retire_tag, 0));
+            let len = entry_len_for(&recs)?;
+            match j
+                .ring
+                .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
+            {
+                Some(adm) => Some((adm, recs, retire_tag)),
+                None => {
+                    for e in &claimed_extents {
+                        ctx.alloc.release_unpublished(*e);
+                    }
+                    return Err(KvError::JournalReserveExhausted { needed: len });
+                }
+            }
+        } else {
+            None
+        };
+
         // ---- Step 2: parent-then-child locks; move the accumulated
         // delta; swap the mapping; assign pointer-record seqs INSIDE the
         // window; release. (§4.6 three-step replacement.)
-        let parent = if self.is_root(node) {
+        let parent = if is_root_swap {
             None
         } else {
             Some(self.resolve_parent(node).await?)
         };
-        {
+        let smo_entry = {
             let mut parent_guard = match &parent {
                 Some(p) => Some(p.lock().write().await),
                 None => None,
             };
             let mut child_guard = node.lock().write().await;
+
+            // §4.4 pt 2 / §4.6: the reservation happens INSIDE the lock
+            // window — any commit that lands on a successor after the
+            // swap reserves after this and carries higher seqs, so
+            // replay applies the pointer record first.
+            let smo_entry = smo_prep.map(|(adm, mut recs, retire_tag)| {
+                let j = ctx.journal.as_ref().expect("prep implies hooks");
+                let res = j.ring.reserve_registered(adm);
+                for (i, (_tag, r)) in recs.iter_mut().enumerate() {
+                    r.seq = res.start + i as u64;
+                }
+                (res, recs, retire_tag)
+            });
 
             // The bounded second merge: partition the delta that
             // accumulated during the build into the successors.
@@ -853,14 +1073,24 @@ impl KvTree {
                 }
                 (Some(parent), Some(pg)) => {
                     // Interior pointer records — the §4.4 pt 2 discipline:
-                    // seqs assigned inside the lock window (K6b swaps in
-                    // the real journal reservation), bytes written by the
-                    // parent's own later writeback, outside these locks.
+                    // seqs assigned inside the lock window (from the real
+                    // journal reservation under the K6b hooks, from the
+                    // K5 counter stand-in otherwise), bytes written after
+                    // release (the journal entry below; the parent's node
+                    // image catches up on its own later writeback).
                     let recs: Vec<OwnedRec> = successors
                         .iter()
-                        .map(|s| OwnedRec {
+                        .enumerate()
+                        .map(|(i, s)| OwnedRec {
                             key: Bytes::copy_from_slice(s.max_key()),
-                            seq: self.next_seq(),
+                            seq: match &smo_entry {
+                                // The first `successors.len()` journal
+                                // records ARE the pointer records, in
+                                // successor order — RAM apply and replay
+                                // must carry identical seqs.
+                                Some((_, recs, _)) => recs[i].1.seq,
+                                None => self.next_seq(),
+                            },
                             kind: RecordKind::Put,
                             value: Bytes::from(encode_interior_value(s.addr(), s.node_seq())),
                         })
@@ -871,14 +1101,36 @@ impl KvTree {
             }
             drop(child_guard);
             // parent_guard drops here.
-        }
+            smo_entry
+        };
         node.state().end_freeze();
 
-        // ---- Step 3: after release — old extent to pending-free (§4.7:
-        // reusable only once the retiring seq is durable), parent
-        // maintenance if its delta crossed the threshold.
+        // ---- Step 3: after release — the SMO's entry bytes (§4.6:
+        // reserve-in-window / write-after-release), then the old extent
+        // to pending-free (§4.7: reusable only once the retiring seq is
+        // durable), then parent maintenance if its delta crossed the
+        // threshold.
+        let retire_tag = match smo_entry {
+            Some((res, recs, retire_tag)) => {
+                let j = ctx.journal.as_ref().expect("entry implies hooks");
+                if let Err(e) = j.ring.commit_entry(&res, &recs).await {
+                    // The swap already happened and RAM is authoritative;
+                    // an unwritten reserved range is exactly the §4.4
+                    // pt 4 crash-equivalent hole — replay folds to the
+                    // pre-SMO state plus the by-key window, which is
+                    // consistent (§4.6). Loud in the log, never fatal.
+                    log::warn!(
+                        "SMO journal entry write failed on {:?} (crash-equivalent hole; \
+                         state stays RAM-consistent): {e}",
+                        j.path
+                    );
+                }
+                retire_tag
+            }
+            None => self.next_seq(),
+        };
         ctx.alloc
-            .free_pending(self.cache.addr_extent(node.addr()), self.next_seq())?;
+            .free_pending(self.cache.addr_extent(node.addr()), retire_tag)?;
         if let Some(parent) = &parent {
             let pg = parent.lock().read().await;
             let re = pg.overlay_bytes() >= cfg.writeback_delta_bytes;

@@ -86,7 +86,7 @@ async fn test_concurrent_create_distinct_inodes_no_collision() {
     }
     // get_allocated_inode_count must reflect the in-RAM allocator:
     // n_tasks parent dirs + n_tasks*m files (root ino 1 is not counted).
-    let count = backend.volumes[0].get_allocated_inode_count().await;
+    let count = backend.v2_volume(0).get_allocated_inode_count().await;
     assert_eq!(count, n_tasks + n_tasks * m, "allocated count mismatch");
 }
 
@@ -325,7 +325,8 @@ async fn test_concurrent_same_bucket_dentry_ops() {
         .await
         .unwrap();
     let pino = parent.ino;
-    let baseline = backend.volumes[0]
+    let baseline = backend
+        .v2_volume(0)
         .storage
         .dentry_occupied_offsets
         .lock()
@@ -405,7 +406,8 @@ async fn test_concurrent_same_bucket_dentry_ops() {
         0,
         "dentries remain after unlink-all"
     );
-    let after = backend.volumes[0]
+    let after = backend
+        .v2_volume(0)
         .storage
         .dentry_occupied_offsets
         .lock()

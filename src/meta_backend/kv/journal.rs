@@ -79,10 +79,12 @@
 //! which is exactly what makes "nonzero after a clean unmount" the
 //! corruption alert (§10) instead of a tear census.
 
-use super::journal_core::{CoreGeometry, JournalCore, Reservation};
+use super::journal_core::{AdmissionClass, CoreGeometry, JournalCore, Reservation};
 use super::record::{Record, RecordRef, TREE_BACKPTR_RESERVED, TREE_INODES};
 use super::KvError;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Physical page length (§4.1: 4 KiB pages).
 pub const JOURNAL_PAGE_LEN: u64 = 4096;
@@ -142,23 +144,45 @@ pub fn encode_entry_payload(records: &[(u8, Record)]) -> Vec<u8> {
     out
 }
 
-/// Decode an entry payload back into `(tree_id, Record)` pairs. Every
-/// length is bounds-checked against the container (§9); unknown tree ids
-/// are structural corruption (the checksum already verified, so this is
-/// defense in depth against writer bugs).
+/// Encode a record tag byte: the low nibble is the §4.2 `tree_id`
+/// (1..=5), the high nibble the node **level** the record targets — 0 for
+/// ordinary leaf records (byte == tree_id, the K3 wire encoding
+/// unchanged), > 0 for the SMO task's journaled interior-pointer records
+/// (§4.6: "interior mutations are journaled records"). Replay routes a
+/// level-`L` record to the level-`L` node covering its key.
+pub fn tag_for(tree_id: u8, level: u8) -> u8 {
+    debug_assert!((TREE_INODES..=TREE_BACKPTR_RESERVED).contains(&tree_id));
+    debug_assert!(
+        level <= 0x0F,
+        "interior level {level} exceeds the tag nibble"
+    );
+    tree_id | (level << 4)
+}
+
+/// Split a record tag byte into `(tree_id, level)` (see [`tag_for`]).
+pub fn untag(tag: u8) -> (u8, u8) {
+    (tag & 0x0F, tag >> 4)
+}
+
+/// Decode an entry payload back into `(tag, Record)` pairs (`tag` =
+/// [`tag_for`]'s tree/level byte). Every length is bounds-checked against
+/// the container (§9); unknown tree ids are structural corruption (the
+/// checksum already verified, so this is defense in depth against writer
+/// bugs).
 pub fn decode_entry_payload(buf: &[u8]) -> Result<Vec<(u8, Record)>, KvError> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos < buf.len() {
-        let tree_id = buf[pos];
+        let tag = buf[pos];
         pos += 1;
+        let (tree_id, _level) = untag(tag);
         if !(TREE_INODES..=TREE_BACKPTR_RESERVED).contains(&tree_id) {
             return Err(KvError::Corrupt(format!(
                 "journal record carries tree id {tree_id} outside the §4.2 table"
             )));
         }
         let (r, used) = RecordRef::decode(&buf[pos..])?;
-        out.push((tree_id, r.to_record()));
+        out.push((tag, r.to_record()));
         pos += used;
     }
     Ok(out)
@@ -209,10 +233,44 @@ fn parse_page_header(page: &[u8]) -> Option<(u32, u16)> {
 /// One journal ring over a file extent: `pages` × 4 KiB starting at byte
 /// `base` of `path`. Owns the lock-free [`JournalCore`]; all device I/O
 /// goes through `crate::uring_fs` (io_uring — non-negotiable).
+///
+/// PR K6b adds the **in-flight reservation registry** around the core:
+///
+/// - `min_inflight_start()` feeds the §4.6 pt 2 tail rule (a tx between
+///   its in-lock reservation and its RAM apply/entry write must hold the
+///   tail back — the registry is the only witness of that window);
+/// - `completed_upto()` is the **contiguous completed-prefix watermark**
+///   behind the K3 fsync-barrier observation: an acked entry starting
+///   mid-page is chain-reachable only through its predecessors, so a tx
+///   returns (and a barrier acks) only once every reservation below it
+///   has completed its write — or explicitly abandoned it (a rollback's
+///   reserved-but-unwritten hole still *completes* for watermark
+///   purposes, it just never writes bytes).
+///
+/// The registry is a `std::sync::Mutex` over a `BTreeMap` — held for O(1)
+/// map ops, never across `.await`, entered at most twice per transaction
+/// (reserve + complete). It is *around* the loom-modeled lock-free core,
+/// not inside it; the commit hot path's reads stay latch-free.
 pub struct JournalRing {
     path: PathBuf,
     base: u64,
     core: JournalCore,
+    inflight: Mutex<Inflight>,
+    /// Wakes admission parkers (§4.4 pt 5) when `reusable_upto` advances
+    /// — and on shutdown, so parked committers can observe the flag.
+    space_notify: tokio::sync::Notify,
+    /// Wakes `wait_completed_upto` waiters when the watermark advances.
+    completion_notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct Inflight {
+    /// Reservations issued but not yet completed: start → end.
+    open: BTreeMap<u64, u64>,
+    /// Every position below this has a completed (or abandoned)
+    /// reservation covering it. Reservations partition `[0, head)`
+    /// contiguously, so this is `min(open) `or the head when none open.
+    completed_upto: u64,
 }
 
 /// One replayed transaction: the entry seq and its staged records in
@@ -261,6 +319,9 @@ impl JournalRing {
                 0,
                 0,
             ),
+            inflight: Mutex::new(Inflight::default()),
+            space_notify: tokio::sync::Notify::new(),
+            completion_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -299,6 +360,12 @@ impl JournalRing {
             path: path.to_path_buf(),
             base,
             core: JournalCore::new(geo, recovery.head_pos, tail_seq),
+            inflight: Mutex::new(Inflight {
+                open: BTreeMap::new(),
+                completed_upto: recovery.head_pos,
+            }),
+            space_notify: tokio::sync::Notify::new(),
+            completion_notify: tokio::sync::Notify::new(),
         };
         Ok((ring, recovery))
     }
@@ -309,6 +376,111 @@ impl JournalRing {
     /// three phases.
     pub fn core(&self) -> &JournalCore {
         &self.core
+    }
+
+    /// Non-parking admission (the checkpoint task's own records, §4.4
+    /// pt 5: the task must never wait on ring space it is itself
+    /// responsible for freeing — on `None` it runs a minimal drain and
+    /// retries).
+    pub fn try_admit(
+        &self,
+        len: u64,
+        class: AdmissionClass,
+    ) -> Option<super::journal_core::Admission> {
+        self.core.try_admit(len, class)
+    }
+
+    /// Transfer admitted budget to the head **and register the
+    /// reservation in-flight** — one mutex section so the completed-prefix
+    /// watermark can never observe a head past an unregistered
+    /// reservation. Called inside the node-lock window (§4.4 pt 2); the
+    /// mutex is held for two map operations, never across `.await`.
+    pub fn reserve_registered(&self, adm: super::journal_core::Admission) -> Reservation {
+        let mut g = self.inflight.lock().unwrap();
+        let res = self.core.reserve(adm);
+        g.open.insert(res.start, res.end());
+        res
+    }
+
+    /// Mark a reservation's write complete — or abandoned (a failed
+    /// writer's reserved range stays unwritten but still completes for
+    /// watermark purposes, §4.4 pt 4: "the reserved ring range stays
+    /// unwritten — replay's checksum walk drops it").
+    pub fn complete(&self, res: &Reservation) {
+        let mut g = self.inflight.lock().unwrap();
+        let removed = g.open.remove(&res.start);
+        debug_assert!(removed.is_some(), "double-complete of a reservation");
+        g.completed_upto = match g.open.first_key_value() {
+            Some((start, _)) => *start,
+            None => self.core.head(),
+        };
+        drop(g);
+        self.completion_notify.notify_waiters();
+    }
+
+    /// The contiguous completed-prefix watermark (module docs).
+    pub fn completed_upto(&self) -> u64 {
+        self.inflight.lock().unwrap().completed_upto
+    }
+
+    /// The oldest in-flight reservation's start, or `u64::MAX` when none
+    /// — the §4.6 pt 2 tail rule's third input (a tx between reservation
+    /// and RAM apply must hold the tail back).
+    pub fn min_inflight_start(&self) -> u64 {
+        self.inflight
+            .lock()
+            .unwrap()
+            .open
+            .first_key_value()
+            .map(|(s, _)| *s)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Wait until every reservation below `pos` has completed — the D0
+    /// chain-reachability rule (module docs): a tx returns only once its
+    /// predecessors' bytes are in page cache; a barrier acks only writes
+    /// that completed before it started.
+    pub async fn wait_completed_upto(&self, pos: u64) {
+        loop {
+            if self.completed_upto() >= pos {
+                return;
+            }
+            let notified = self.completion_notify.notified();
+            if self.completed_upto() >= pos {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Advance the §4.6 pt 3 reclamation watermark **and wake admission
+    /// parkers** — the checkpoint task calls this only after the ledger
+    /// record that retired the range is known durable.
+    pub fn advance_reusable_upto(&self, pos: u64) {
+        self.core.advance_reusable_upto(pos);
+        self.space_notify.notify_waiters();
+    }
+
+    /// Wake every admission parker without advancing anything (shutdown:
+    /// parked committers re-check the volume state and bail out).
+    pub fn wake_parked(&self) {
+        self.space_notify.notify_waiters();
+    }
+
+    /// A registered waiter on the space notify (the caller's
+    /// register-recheck-await admission loop; §4.4 pt 5).
+    pub fn space_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.space_notify.notified()
+    }
+
+    /// Physical file offset of logical ring position `pos` (the crash
+    /// harness arms write faults at exact entry offsets).
+    pub fn physical_offset_of(&self, pos: u64) -> u64 {
+        let geo = self.core.geometry();
+        self.base
+            + geo.page_index(pos) * JOURNAL_PAGE_LEN
+            + JOURNAL_PAGE_HDR_LEN
+            + geo.in_page_off(pos)
     }
 
     /// Write one entry's bytes into its reserved range: the committer's own
@@ -382,6 +554,20 @@ impl JournalRing {
             crate::uring_fs::write_at_batch(&self.path, ops).await?;
         }
         Ok(())
+    }
+
+    /// [`Self::write_entry`] + guaranteed [`Self::complete`] on **both**
+    /// outcomes — the commit pipeline's write step. A reservation that
+    /// never completes would wedge the completed-prefix watermark (and
+    /// with it every later committer), so completion is not optional.
+    pub async fn commit_entry(
+        &self,
+        res: &Reservation,
+        records: &[(u8, Record)],
+    ) -> Result<(), KvError> {
+        let out = self.write_entry(res, records).await;
+        self.complete(res);
+        out
     }
 }
 

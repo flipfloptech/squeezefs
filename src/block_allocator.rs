@@ -306,6 +306,86 @@ impl BlockAllocator {
                             "ino: {}, mode: {}, nlink: {}, layout: {:?}",
                             ino, inode.mode, inode.nlink, layout_opt
                         );
+                        self.recover_from_layout(backend_router, layout_opt).await;
+                    }
+                }
+            }
+        }
+        println!(
+            "Recovery scan summary: checked={}, valid_inodes={}, layouts_found={}",
+            checked, valid_inodes, layouts_found
+        );
+        Ok(())
+    }
+
+    /// PR K6b: the same refcount recovery over a format-v3 metadata
+    /// volume — walk the live inode tree (paged range scans; no fixed
+    /// geometry to iterate) and feed each live ino's `"layout"` xattr
+    /// through the shared per-layout recovery body.
+    pub async fn recover_active_blocks_v3(
+        &self,
+        kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+        backend_router: &crate::routing::BackendRouter,
+    ) -> Result<()> {
+        use crate::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
+        let inodes = kv.trees()[0];
+        let mut checked = 0u64;
+        let mut valid_inodes = 0u64;
+        let mut layouts_found = 0u64;
+        let mut cursor: Vec<u8> = inode_key(1).to_vec();
+        let end = inode_key(u64::MAX - 1);
+        loop {
+            let page = inodes.range(&cursor, &end, 512).await.map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "v3 recovery inode walk failed: {e}"
+                ))
+            })?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            cursor = crate::meta_backend::kv::node::key_successor(last_key);
+            for (k, v) in &page {
+                let Ok(ino) = decode_inode_key(k) else {
+                    continue;
+                };
+                let Ok(val) = InodeValue::decode(v) else {
+                    continue;
+                };
+                checked += 1;
+                if val.nlink == 0 {
+                    continue;
+                }
+                valid_inodes += 1;
+                if let Ok(Some(bytes)) = kv.getxattr(ino, "layout").await {
+                    layouts_found += 1;
+                    let layout_opt: Option<crate::routing::LayoutMetadata> =
+                        if bytes.starts_with(b"{") {
+                            serde_json::from_slice(&bytes).ok()
+                        } else {
+                            bincode::deserialize(&bytes).ok()
+                        };
+                    self.recover_from_layout(backend_router, layout_opt).await;
+                }
+            }
+        }
+        println!(
+            "Recovery scan summary (v3): checked={}, valid_inodes={}, layouts_found={}",
+            checked, valid_inodes, layouts_found
+        );
+        Ok(())
+    }
+
+    /// The shared per-layout refcount recovery body (extracted verbatim
+    /// from the v2 scan; both format walks feed it).
+    async fn recover_from_layout(
+        &self,
+        backend_router: &crate::routing::BackendRouter,
+        layout_opt: Option<crate::routing::LayoutMetadata>,
+    ) {
+        {
+            {
+                {
+                    {
                         if let Some(layout) = layout_opt {
                             if layout.file_type == "striped" {
                                 // 1. Check for indirect block map
@@ -403,10 +483,5 @@ impl BlockAllocator {
                 }
             }
         }
-        println!(
-            "Recovery scan summary: checked={}, valid_inodes={}, layouts_found={}",
-            checked, valid_inodes, layouts_found
-        );
-        Ok(())
     }
 }

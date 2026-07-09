@@ -185,7 +185,7 @@ async fn test_reclaim_batch_bisect_poisoned_sector_wedges_only_victim() {
     // Doomed inos 2..=15 share the first table sector (8192); the victim
     // (ino 18) sits in sector 12288 with only LIVE siblings, so the armed
     // sector error wedges exactly one admitted ino.
-    let backend = &routed.volumes[0];
+    let backend = routed.v2_volume(0);
     let mut doomed = Vec::new();
     for i in 0..14 {
         let f = backend
@@ -513,7 +513,7 @@ async fn test_batch_forget_queues_reclaim_like_forget() {
     fs.reclaim_orphaned_batch(inos.clone()).await;
     for &ino in &inos {
         assert!(
-            read_inode(&routed.volumes[0].storage, ino).await.is_err(),
+            read_inode(&routed.v2_volume(0).storage, ino).await.is_err(),
             "batch-forgotten orphan {ino} must be reclaimable (slot zeroed)"
         );
     }

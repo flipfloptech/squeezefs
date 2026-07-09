@@ -301,6 +301,18 @@ impl ImageBuilder {
         Ok(())
     }
 
+    /// Override an inode's owner (the `format_v3` root-stamping surface —
+    /// v2 format parity; deterministic images keep the 0:0 default).
+    pub fn set_owner(&mut self, ino: u64, uid: u32, gid: u32) -> Result<(), KvError> {
+        let spec = self
+            .inodes
+            .get_mut(&ino)
+            .ok_or_else(|| KvError::Corrupt(format!("ino {ino} does not exist")))?;
+        spec.value.uid = uid;
+        spec.value.gid = gid;
+        Ok(())
+    }
+
     /// Inodes described so far (root included).
     pub fn inode_count(&self) -> u64 {
         self.inodes.len() as u64
@@ -719,6 +731,14 @@ pub async fn format_v3(
         journal_len_override: opts.journal_len_override,
         ..BuilderConfig::new(opts.node_size)
     })?;
+    // The v2 format parity (`format_with_options` root stamping): the
+    // root directory belongs to the formatting user, or an unprivileged
+    // mount cannot create anything under it. The BUILDER default stays
+    // 0:0 (its determinism contract); the public formatter is the
+    // user-facing surface and mirrors v2.
+    let root_uid = unsafe { libc::getuid() };
+    let root_gid = unsafe { libc::getgid() };
+    builder.set_owner(ROOT_INO, root_uid, root_gid)?;
     if let Some(cfg) = &opts.format_config_xattr {
         builder.set_xattr(ROOT_INO, FORMAT_CONFIG_XATTR, cfg)?;
     }

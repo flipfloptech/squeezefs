@@ -105,7 +105,7 @@ pub struct MetaLvBackend {
 /// alias second, default 50 ms (§4.2 — a `JOURNAL_`-named knob controlling a
 /// flusher with no journal is a permanent naming wart; the alias keeps old
 /// operator scripts working).
-fn resolve_flush_interval_ms() -> u64 {
+pub(crate) fn resolve_flush_interval_ms() -> u64 {
     let parse = |name: &str| {
         std::env::var(name)
             .ok()
@@ -1176,11 +1176,13 @@ impl MetaLvBackend {
 /// dual-backend conformance suite consume. PR K6b extends the dispatch to
 /// the full mutating `Metadata` surface and folds it into
 /// `RoutedMetaBackend`.
+#[derive(Clone)]
 pub enum VolumeBackend {
     /// Format version 2: the fixed-geometry `MetaLvBackend` (frozen
     /// behavior; its whole test suite pins it).
     V2(std::sync::Arc<MetaLvBackend>),
-    /// Format version 3: the CoW KV node layer (read side in K6a).
+    /// Format version 3: the CoW KV node layer (read side since K6a,
+    /// read-write since K6b).
     V3(std::sync::Arc<kv::backend::KvMetaBackend>),
 }
 
@@ -1231,6 +1233,41 @@ impl VolumeBackend {
         match self {
             VolumeBackend::V2(_) => 2,
             VolumeBackend::V3(_) => 3,
+        }
+    }
+
+    /// The volume's backing device path (stats surface, sync targets).
+    pub fn device_path(&self) -> &std::path::Path {
+        match self {
+            VolumeBackend::V2(be) => be.storage.device_path(),
+            VolumeBackend::V3(be) => be.device_path(),
+        }
+    }
+
+    /// `meta_volume_atomicity` (design §10 / resolved OQ 2): the probed
+    /// class on v2 (that IS the contract there); the constant
+    /// `cow-checksummed` contract class on v3 (§4.10, by construction).
+    pub fn atomicity_contract(&self) -> &'static str {
+        match self {
+            VolumeBackend::V2(be) => be
+                .atomicity_class
+                .get()
+                .map(|c| c.as_str())
+                .unwrap_or("unprobed"),
+            VolumeBackend::V3(be) => be.atomicity_contract(),
+        }
+    }
+
+    /// `meta_volume_atomicity_physical` (resolved OQ 2's second field):
+    /// the hardware probe on both formats.
+    pub fn atomicity_physical(&self) -> &'static str {
+        match self {
+            VolumeBackend::V2(be) => be
+                .atomicity_class
+                .get()
+                .map(|c| c.as_str())
+                .unwrap_or("unprobed"),
+            VolumeBackend::V3(be) => be.atomicity_physical(),
         }
     }
 
@@ -1445,15 +1482,27 @@ impl VolumeBackend {
     }
 }
 
-#[derive(Clone)]
+/// PR K6b (design §4.9 "Volume routing"): the routed backend holds the
+/// dual-format dispatch — `volumes` is a `Vec<VolumeBackend>` and every
+/// op routes per arm. `Arc`-shared (not `Clone`): the `VolumeBackend`
+/// arms own live backends (checkpoint tasks, caches) that must not fork.
 pub struct RoutedMetaBackend {
-    pub volumes: Vec<std::sync::Arc<MetaLvBackend>>,
+    pub volumes: Vec<VolumeBackend>,
     pub disabled_volumes: std::sync::Arc<dashmap::DashMap<usize, bool, ahash::RandomState>>,
     pub redirections: std::sync::Arc<dashmap::DashMap<usize, usize, ahash::RandomState>>,
 }
 
 impl RoutedMetaBackend {
+    /// The all-v2 convenience constructor (the pre-K6b signature; the v2
+    /// fixtures and tests keep using it).
     pub fn new(volumes: Vec<std::sync::Arc<MetaLvBackend>>) -> Self {
+        Self::new_dispatch(volumes.into_iter().map(VolumeBackend::V2).collect())
+    }
+
+    /// PR K6b: construct over the dual-format dispatch — the volume set
+    /// may mix v2 and v3 arms (design §4.9: mixed-version sets are legal;
+    /// migrate one volume at a time).
+    pub fn new_dispatch(volumes: Vec<VolumeBackend>) -> Self {
         Self {
             volumes,
             disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
@@ -1465,19 +1514,190 @@ impl RoutedMetaBackend {
         }
     }
 
-    /// PR K6b: construct over the dual-format dispatch — the volume set
-    /// may mix v2 and v3 arms (design §4.9: mixed-version sets are legal;
-    /// migrate one volume at a time). The plain [`Self::new`] remains the
-    /// all-v2 convenience the existing fixtures use.
-    pub fn new_dispatch(volumes: Vec<VolumeBackend>) -> Self {
-        let _ = volumes;
-        todo!("PR K6b: fold VolumeBackend into RoutedMetaBackend")
+    /// The v2 arm of volume `idx` — the v2-only surfaces (recovery scans,
+    /// bitmap reconciliation, the v2 test fixtures). Panics on a v3 arm:
+    /// callers are v2-specific by construction.
+    pub fn v2_volume(&self, idx: usize) -> &std::sync::Arc<MetaLvBackend> {
+        match &self.volumes[idx] {
+            VolumeBackend::V2(be) => be,
+            VolumeBackend::V3(_) => {
+                panic!("volume {idx} is format v3; this surface is v2-only")
+            }
+        }
+    }
+
+    /// Format-generic routed dentry read: `(stored child ino (global),
+    /// S_IFMT bits)`.
+    async fn find_dentry_routed(
+        &self,
+        idx: usize,
+        local_parent: Ino,
+        name: &str,
+    ) -> Result<Option<(Ino, u32)>> {
+        match &self.volumes[idx] {
+            VolumeBackend::V2(be) => Ok(dentry::find_dentry(&be.storage, local_parent, name)
+                .await?
+                .map(|d| (d.child_ino, d.file_type))),
+            VolumeBackend::V3(be) => be.routed_find_dentry(local_parent, name).await,
+        }
+    }
+
+    /// §4.4 pt 4 escalation mirror: after any v3 mutation error, latch
+    /// the volume into `disabled_volumes` iff its backend has fail-
+    /// stopped (repeated journal write failures) — the existing
+    /// mechanism `check_volume_enabled` consults.
+    fn mirror_v3_failure(&self, idx: usize) {
+        if let VolumeBackend::V3(be) = &self.volumes[idx] {
+            if be.is_failed() {
+                self.disabled_volumes.insert(idx, true);
+            }
+        }
+    }
+
+    /// Rename fragment: pure dentry removal on one volume (the caller
+    /// holds the D-guard).
+    async fn remove_dentry_routed(&self, idx: usize, local_parent: Ino, name: &str) -> Result<()> {
+        match &self.volumes[idx] {
+            VolumeBackend::V2(be) => dentry::remove_dentry(&be.storage, local_parent, name).await,
+            VolumeBackend::V3(be) => {
+                let out = be
+                    .routed_remove_dentry(local_parent, name, kv::backend::RoutedParentUpdate::None)
+                    .await;
+                if out.is_err() {
+                    self.mirror_v3_failure(idx);
+                }
+                out
+            }
+        }
+    }
+
+    /// Rename fragment: pure dentry insertion on one volume (`ft_bits` =
+    /// `mode & S_IFMT`).
+    async fn insert_dentry_routed(
+        &self,
+        idx: usize,
+        local_parent: Ino,
+        global_child: Ino,
+        name: &str,
+        ft_bits: u32,
+    ) -> Result<()> {
+        match &self.volumes[idx] {
+            VolumeBackend::V2(be) => {
+                dentry::insert_dentry(&be.storage, local_parent, global_child, name, ft_bits).await
+            }
+            VolumeBackend::V3(be) => {
+                let out = be
+                    .routed_add_dentry(
+                        local_parent,
+                        name,
+                        global_child,
+                        ft_bits,
+                        kv::backend::RoutedParentUpdate::None,
+                    )
+                    .await;
+                if out.is_err() {
+                    self.mirror_v3_failure(idx);
+                }
+                out
+            }
+        }
+    }
+
+    /// Rename fragment: directory-move parent nlink shift, best-effort
+    /// (the v2 `if let Ok` shape).
+    async fn parent_nlink_delta_routed(
+        &self,
+        idx: usize,
+        local_parent: Ino,
+        delta: i64,
+    ) -> Result<()> {
+        match &self.volumes[idx] {
+            VolumeBackend::V2(be) => {
+                if let Ok(mut p) = inode::read_inode(&be.storage, local_parent).await {
+                    if delta > 0 {
+                        p.nlink += delta as u32;
+                    } else if p.nlink > 2 {
+                        p.nlink -= (-delta) as u32;
+                    }
+                    let _ = inode::write_inode(&be.storage, local_parent, &p).await;
+                }
+                Ok(())
+            }
+            VolumeBackend::V3(be) => {
+                let out = be.routed_parent_nlink_delta(local_parent, delta).await;
+                if out.is_err() {
+                    self.mirror_v3_failure(idx);
+                }
+                out
+            }
+        }
+    }
+
+    /// Rename fragment: destination-inode replacement accounting —
+    /// ENOTEMPTY probe for directories, nlink dec + ctime (the v2 shape,
+    /// best-effort on a missing inode).
+    async fn dest_replace_routed(&self, idx: usize, local_dest: Ino) -> Result<()> {
+        match &self.volumes[idx] {
+            VolumeBackend::V2(be) => {
+                if let Ok(mut dest_inode) = inode::read_inode(&be.storage, local_dest).await {
+                    // Check if destination is a directory and is not empty
+                    if (dest_inode.mode & libc::S_IFMT) == libc::S_IFDIR {
+                        let dentries = dentry::list_dentries(&be.storage, local_dest).await?;
+                        if !dentries.is_empty() {
+                            return Err(crate::error::SqueezefsError::Io(
+                                std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
+                            ));
+                        }
+                    }
+                    if dest_inode.nlink > 0 {
+                        dest_inode.nlink -= 1;
+                    }
+                    dest_inode.ctime = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    let _ = inode::write_inode(&be.storage, local_dest, &dest_inode).await;
+                }
+                Ok(())
+            }
+            VolumeBackend::V3(be) => {
+                let out = be.routed_dest_replace(local_dest).await;
+                if out.is_err() {
+                    self.mirror_v3_failure(idx);
+                }
+                out
+            }
+        }
+    }
+
+    /// Format-generic LOCK-FREE inode read (no DLM acquisition — safe
+    /// under held routed I-guards, where a re-entrant stripe read can
+    /// deadlock against a queued writer).
+    async fn read_inode_routed(&self, idx: usize, local_ino: Ino) -> Result<Inode> {
+        match &self.volumes[idx] {
+            VolumeBackend::V2(be) => {
+                let di = inode::read_inode(&be.storage, local_ino).await?;
+                Ok(Inode {
+                    ino: local_ino,
+                    mode: di.mode,
+                    uid: di.uid,
+                    gid: di.gid,
+                    size: di.size,
+                    nlink: di.nlink,
+                    atime: di.atime,
+                    mtime: di.mtime,
+                    ctime: di.ctime,
+                    flags: di.flags,
+                })
+            }
+            VolumeBackend::V3(be) => be.getattr(local_ino).await,
+        }
     }
 
     /// The per-volume metadata lock manager (tests force stripe collisions
     /// through its public stripe accessors).
     pub fn volume_dlm(&self, idx: usize) -> &dlm::DlmLockManager {
-        &self.volumes[idx].dlm
+        self.volumes[idx].dlm()
     }
 
     pub fn check_volume_enabled(&self, idx: usize) -> Result<()> {
@@ -1506,14 +1726,28 @@ impl RoutedMetaBackend {
                 return v.0;
             }
         }
-        let vol = &self.volumes[idx];
-        let allocated = vol.get_allocated_inode_count().await;
-        let max_inodes = 20000;
-
-        let free_factor = if max_inodes > allocated {
-            (max_inodes - allocated) as f64 / max_inodes as f64
-        } else {
-            0.0
+        // Resolved OQ 5 (design §4.9): normalize by estimated
+        // remaining-capacity FRACTION — free inos / limit on v2
+        // (unchanged formula), free extents / total on v3 — the one unit
+        // both formats honestly report, so mixed sets compare.
+        let free_factor = match &self.volumes[idx] {
+            VolumeBackend::V2(vol) => {
+                let allocated = vol.get_allocated_inode_count().await;
+                let max_inodes = 20000;
+                if max_inodes > allocated {
+                    (max_inodes - allocated) as f64 / max_inodes as f64
+                } else {
+                    0.0
+                }
+            }
+            VolumeBackend::V3(be) => {
+                let total = be.superblock().total_extents();
+                if total > 0 {
+                    be.free_extents() as f64 / total as f64
+                } else {
+                    0.0
+                }
+            }
         };
 
         let score = (free_factor * 1000.0) as u32;
@@ -1581,11 +1815,11 @@ impl Metadata for RoutedMetaBackend {
         // see MetaLvBackend::lookup).
         let child_ino = {
             let _guard = self.volumes[v_idx]
-                .dlm
+                .dlm()
                 .lock_dentry_shared(local_parent, name)
                 .await;
-            match dentry::find_dentry(&self.volumes[v_idx].storage, local_parent, name).await? {
-                Some(dentry) => dentry.child_ino,
+            match self.find_dentry_routed(v_idx, local_parent, name).await? {
+                Some((child_ino, _ft)) => child_ino,
                 None => {
                     return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
@@ -1647,22 +1881,36 @@ impl Metadata for RoutedMetaBackend {
         // field patch from racing a full-slot parent write (design §3.8).
         let _parent_guard = if is_dir {
             self.volumes[parent_v_idx]
-                .dlm
+                .dlm()
                 .lock_inode_exclusive(local_parent)
                 .await
         } else {
             self.volumes[parent_v_idx]
-                .dlm
+                .dlm()
                 .lock_inode_shared(local_parent)
                 .await
         };
         let _dentry_guard = self.volumes[parent_v_idx]
-            .dlm
+            .dlm()
             .lock_dentry_exclusive(local_parent, name)
             .await;
 
         if parent_v_idx == target_v_idx {
-            let backend = &self.volumes[target_v_idx];
+            // v3 arm: ONE whole-tx journal entry with the routed
+            // semantics (§4.4; the v2 arm below is byte-identical
+            // pre-K6b behavior).
+            if let VolumeBackend::V3(be) = &self.volumes[target_v_idx] {
+                let out = be
+                    .routed_create_local(local_parent, name, mode, uid, gid, |local| {
+                        self.make_global_ino(local, target_v_idx)
+                    })
+                    .await;
+                if out.is_err() {
+                    self.mirror_v3_failure(target_v_idx);
+                }
+                return out;
+            }
+            let backend = self.v2_volume(target_v_idx);
             let is_dir_flag = is_dir;
 
             let inode = backend
@@ -1753,16 +2001,18 @@ impl Metadata for RoutedMetaBackend {
             // concurrent run_transaction applies on the same volume (stale sector
             // snapshots wipe sibling slots → magic 0 / ESTALE). Mutate each volume
             // only inside that volume's run_transaction (holds transaction_lock).
-            if let Some(_) =
-                dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name).await?
+            // Each side dispatches per format (mixed sets are legal, §4.9).
+            if self
+                .find_dentry_routed(parent_v_idx, local_parent, name)
+                .await?
+                .is_some()
             {
                 return Err(crate::error::SqueezefsError::InvalidOperation(
                     "File already exists".to_string(),
                 ));
             }
 
-            let parent_inode =
-                inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent).await?;
+            let parent_inode = self.read_inode_routed(parent_v_idx, local_parent).await?;
             let mut final_gid = gid;
             let mut final_mode = mode;
             if (parent_inode.mode & libc::S_ISGID) != 0 {
@@ -1772,74 +2022,141 @@ impl Metadata for RoutedMetaBackend {
                 }
             }
 
-            let target = self.volumes[target_v_idx].clone();
             let is_dir_flag = is_dir;
-            let (new_local_ino, disk_inode) = target
-                .run_transaction(|| async {
-                    let new_local_ino = {
-                        let ino = target.storage.inode_alloc.alloc()?;
-                        target.storage.tx_record_alloc(ino);
-                        ino
-                    };
-                    let mut disk_inode =
-                        inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
-                    if is_dir_flag {
-                        disk_inode.nlink = 2;
+            // Target side: mint the child inode record.
+            let (new_local_ino, child_inode) = match &self.volumes[target_v_idx] {
+                VolumeBackend::V2(target) => {
+                    let target = target.clone();
+                    target
+                        .run_transaction(|| async {
+                            let new_local_ino = {
+                                let ino = target.storage.inode_alloc.alloc()?;
+                                target.storage.tx_record_alloc(ino);
+                                ino
+                            };
+                            let mut disk_inode =
+                                inode::DiskInode::new(new_local_ino, final_mode, uid, final_gid);
+                            if is_dir_flag {
+                                disk_inode.nlink = 2;
+                            }
+                            inode::write_inode_raw(&target.storage, new_local_ino, &disk_inode)
+                                .await?;
+                            Ok((
+                                new_local_ino,
+                                Inode {
+                                    ino: new_local_ino,
+                                    mode: disk_inode.mode,
+                                    uid: disk_inode.uid,
+                                    gid: disk_inode.gid,
+                                    size: disk_inode.size,
+                                    nlink: disk_inode.nlink,
+                                    atime: disk_inode.atime,
+                                    mtime: disk_inode.mtime,
+                                    ctime: disk_inode.ctime,
+                                    flags: disk_inode.flags,
+                                },
+                            ))
+                        })
+                        .await?
+                }
+                VolumeBackend::V3(be) => {
+                    let local = be.allocate_ino();
+                    let out = be
+                        .routed_mint_inode(local, final_mode, uid, final_gid)
+                        .await;
+                    if out.is_err() {
+                        self.mirror_v3_failure(target_v_idx);
                     }
-                    inode::write_inode_raw(&target.storage, new_local_ino, &disk_inode).await?;
-                    Ok((new_local_ino, disk_inode))
-                })
-                .await?;
+                    let v = out?;
+                    (
+                        local,
+                        Inode {
+                            ino: local,
+                            mode: v.mode,
+                            uid: v.uid,
+                            gid: v.gid,
+                            size: v.size,
+                            nlink: v.nlink,
+                            atime: v.atime,
+                            mtime: v.mtime,
+                            ctime: v.ctime,
+                            flags: v.flags,
+                        },
+                    )
+                }
+            };
 
             let global_child_ino = self.make_global_ino(new_local_ino, target_v_idx);
 
-            let parent_be = self.volumes[parent_v_idx].clone();
-            let name_owned = name.to_string();
-            parent_be
-                .run_transaction(|| async {
-                    dentry::insert_dentry(
-                        &parent_be.storage,
-                        local_parent,
-                        global_child_ino,
-                        &name_owned,
-                        final_mode & libc::S_IFMT,
-                    )
-                    .await?;
-
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    if is_dir_flag {
-                        // Directory (exclusive I{parent}): full-slot RMW (nlink + times).
-                        let mut parent_inode =
-                            inode::read_inode(&parent_be.storage, local_parent).await?;
-                        parent_inode.mtime = now;
-                        parent_inode.ctime = now;
-                        parent_inode.nlink += 1;
-                        inode::write_inode(&parent_be.storage, local_parent, &parent_inode).await?;
-                    } else {
-                        // Regular file (shared I{parent}): 16-byte mtime/ctime
-                        // field patch, consistent with the same-volume path
-                        // (design §3.8, PR 5).
-                        inode::stage_parent_time_patch(&parent_be.storage, local_parent, now)
+            // Parent side: the dentry (global child ino) + parent update.
+            match &self.volumes[parent_v_idx] {
+                VolumeBackend::V2(parent_be) => {
+                    let parent_be = parent_be.clone();
+                    let name_owned = name.to_string();
+                    parent_be
+                        .run_transaction(|| async {
+                            dentry::insert_dentry(
+                                &parent_be.storage,
+                                local_parent,
+                                global_child_ino,
+                                &name_owned,
+                                final_mode & libc::S_IFMT,
+                            )
                             .await?;
+
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as u64;
+                            if is_dir_flag {
+                                // Directory (exclusive I{parent}): full-slot RMW (nlink + times).
+                                let mut parent_inode =
+                                    inode::read_inode(&parent_be.storage, local_parent).await?;
+                                parent_inode.mtime = now;
+                                parent_inode.ctime = now;
+                                parent_inode.nlink += 1;
+                                inode::write_inode(&parent_be.storage, local_parent, &parent_inode)
+                                    .await?;
+                            } else {
+                                // Regular file (shared I{parent}): 16-byte mtime/ctime
+                                // field patch, consistent with the same-volume path
+                                // (design §3.8, PR 5).
+                                inode::stage_parent_time_patch(
+                                    &parent_be.storage,
+                                    local_parent,
+                                    now,
+                                )
+                                .await?;
+                            }
+                            Ok(())
+                        })
+                        .await?;
+                }
+                VolumeBackend::V3(be) => {
+                    let update = if is_dir_flag {
+                        kv::backend::RoutedParentUpdate::ExclusiveTimesBump
+                    } else {
+                        kv::backend::RoutedParentUpdate::SharedTimes
+                    };
+                    let out = be
+                        .routed_add_dentry(
+                            local_parent,
+                            name,
+                            global_child_ino,
+                            final_mode & libc::S_IFMT,
+                            update,
+                        )
+                        .await;
+                    if out.is_err() {
+                        self.mirror_v3_failure(parent_v_idx);
                     }
-                    Ok(())
-                })
-                .await?;
+                    out?;
+                }
+            }
 
             Ok(Inode {
                 ino: global_child_ino,
-                mode: disk_inode.mode,
-                uid: disk_inode.uid,
-                gid: disk_inode.gid,
-                size: disk_inode.size,
-                nlink: disk_inode.nlink,
-                atime: disk_inode.atime,
-                mtime: disk_inode.mtime,
-                ctime: disk_inode.ctime,
-                flags: disk_inode.flags,
+                ..child_inode
             })
         }
     }
@@ -1858,30 +2175,29 @@ impl Metadata for RoutedMetaBackend {
         // unlink patches only the parent's mtime/ctime — SHARED parent, so
         // same-directory delete storms overlap. Directory removal mutates
         // parent nlink (full-slot RMW) — EXCLUSIVE.
-        let (dentry, global_child_ino, child_v_idx, local_child, parent_shared, _guards) = loop {
+        let (file_type, global_child_ino, child_v_idx, local_child, parent_shared, _guards) = loop {
             let phase1 = self.volumes[parent_v_idx]
-                .dlm
+                .dlm()
                 .lock_many(
                     &[(local_parent, dlm::LockMode::Shared)],
                     &[(local_parent, name, dlm::LockMode::Exclusive)],
                 )
                 .await;
-            let Some(dentry) =
-                dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)
-                    .await?
+            let Some((global_child_ino, file_type)) = self
+                .find_dentry_routed(parent_v_idx, local_parent, name)
+                .await?
             else {
                 return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "Dentry not found",
                 )));
             };
-            let global_child_ino = dentry.child_ino;
             let (child_v_idx, local_child) = self.route_ino(global_child_ino);
             self.check_volume_enabled(child_v_idx)?;
 
             // Self-references and directories take the exclusive-parent
             // path; a regular file can never be its own parent.
-            let parent_shared = dentry.file_type != libc::S_IFDIR && parent != global_child_ino;
+            let parent_shared = file_type != libc::S_IFDIR && parent != global_child_ino;
             let parent_mode = if parent_shared {
                 dlm::LockMode::Shared
             } else {
@@ -1893,7 +2209,7 @@ impl Metadata for RoutedMetaBackend {
             if parent == global_child_ino {
                 guards.extend(
                     self.volumes[parent_v_idx]
-                        .dlm
+                        .dlm()
                         .lock_many(
                             &[(local_parent, dlm::LockMode::Exclusive)],
                             &[(local_parent, name, dlm::LockMode::Exclusive)],
@@ -1903,7 +2219,7 @@ impl Metadata for RoutedMetaBackend {
             } else if child_v_idx == parent_v_idx {
                 guards.extend(
                     self.volumes[parent_v_idx]
-                        .dlm
+                        .dlm()
                         .lock_many(
                             &[
                                 (local_parent, parent_mode),
@@ -1916,13 +2232,13 @@ impl Metadata for RoutedMetaBackend {
             } else if child_v_idx < parent_v_idx {
                 guards.extend(
                     self.volumes[child_v_idx]
-                        .dlm
+                        .dlm()
                         .lock_many(&[(local_child, dlm::LockMode::Exclusive)], &[])
                         .await,
                 );
                 guards.extend(
                     self.volumes[parent_v_idx]
-                        .dlm
+                        .dlm()
                         .lock_many(
                             &[(local_parent, parent_mode)],
                             &[(local_parent, name, dlm::LockMode::Exclusive)],
@@ -1932,7 +2248,7 @@ impl Metadata for RoutedMetaBackend {
             } else {
                 guards.extend(
                     self.volumes[parent_v_idx]
-                        .dlm
+                        .dlm()
                         .lock_many(
                             &[(local_parent, parent_mode)],
                             &[(local_parent, name, dlm::LockMode::Exclusive)],
@@ -1941,18 +2257,19 @@ impl Metadata for RoutedMetaBackend {
                 );
                 guards.extend(
                     self.volumes[child_v_idx]
-                        .dlm
+                        .dlm()
                         .lock_many(&[(local_child, dlm::LockMode::Exclusive)], &[])
                         .await,
                 );
             }
 
-            match dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)
+            match self
+                .find_dentry_routed(parent_v_idx, local_parent, name)
                 .await?
             {
-                Some(cur) if cur.child_ino == global_child_ino => {
+                Some((cur_child, _)) if cur_child == global_child_ino => {
                     break (
-                        dentry,
+                        file_type,
                         global_child_ino,
                         child_v_idx,
                         local_child,
@@ -1966,12 +2283,22 @@ impl Metadata for RoutedMetaBackend {
 
         {
             if parent_v_idx == child_v_idx {
-                let backend = &self.volumes[parent_v_idx];
+                let is_dir = file_type == libc::S_IFDIR;
+                // v3 arm: ONE whole-tx entry with the routed semantics.
+                if let VolumeBackend::V3(be) = &self.volumes[parent_v_idx] {
+                    let out = be
+                        .routed_unlink_local(local_parent, name, local_child, is_dir, parent_shared)
+                        .await;
+                    if out.is_err() {
+                        self.mirror_v3_failure(parent_v_idx);
+                    }
+                    out?;
+                    return Ok(global_child_ino);
+                }
+                let backend = self.v2_volume(parent_v_idx);
                 backend
                     .run_transaction(|| async {
                         dentry::remove_dentry(&backend.storage, local_parent, name).await?;
-
-                        let is_dir = dentry.file_type == libc::S_IFDIR;
 
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -2024,64 +2351,80 @@ impl Metadata for RoutedMetaBackend {
                     })
                     .await
             } else {
-                dentry::remove_dentry(&self.volumes[parent_v_idx].storage, local_parent, name)
-                    .await?;
-
-                let is_dir = dentry.file_type == libc::S_IFDIR;
-
+                let is_dir = file_type == libc::S_IFDIR;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64;
-                if parent_shared {
-                    // Regular file (shared I{parent}): field patch (§3.8).
-                    inode::stage_parent_time_patch(
-                        &self.volumes[parent_v_idx].storage,
-                        local_parent,
-                        now,
-                    )
-                    .await?;
-                } else {
-                    // Directory (exclusive I{parent}): full-slot RMW.
-                    let mut parent_inode =
-                        inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent)
-                            .await?;
-                    parent_inode.mtime = now;
-                    parent_inode.ctime = now;
-                    if is_dir && parent_inode.nlink > 2 {
-                        parent_inode.nlink -= 1;
+
+                // Parent side: dentry removal + parent update.
+                match &self.volumes[parent_v_idx] {
+                    VolumeBackend::V2(be) => {
+                        dentry::remove_dentry(&be.storage, local_parent, name).await?;
+                        if parent_shared {
+                            // Regular file (shared I{parent}): field patch (§3.8).
+                            inode::stage_parent_time_patch(&be.storage, local_parent, now).await?;
+                        } else {
+                            // Directory (exclusive I{parent}): full-slot RMW.
+                            let mut parent_inode =
+                                inode::read_inode(&be.storage, local_parent).await?;
+                            parent_inode.mtime = now;
+                            parent_inode.ctime = now;
+                            if is_dir && parent_inode.nlink > 2 {
+                                parent_inode.nlink -= 1;
+                            }
+                            inode::write_inode(&be.storage, local_parent, &parent_inode).await?;
+                        }
                     }
-                    inode::write_inode(
-                        &self.volumes[parent_v_idx].storage,
-                        local_parent,
-                        &parent_inode,
-                    )
-                    .await?;
+                    VolumeBackend::V3(be) => {
+                        let update = if parent_shared {
+                            kv::backend::RoutedParentUpdate::SharedTimes
+                        } else if is_dir {
+                            kv::backend::RoutedParentUpdate::ExclusiveTimesBump
+                        } else {
+                            kv::backend::RoutedParentUpdate::ExclusiveTimes
+                        };
+                        let out = be.routed_remove_dentry(local_parent, name, update).await;
+                        if out.is_err() {
+                            self.mirror_v3_failure(parent_v_idx);
+                        }
+                        out?;
+                    }
                 }
 
-                let mut disk_inode =
-                    inode::read_inode(&self.volumes[child_v_idx].storage, local_child).await?;
-                log::debug!(
-                    "meta_backend unlink: local_child = {}, nlink = {}",
-                    local_child,
-                    disk_inode.nlink
-                );
-                if is_dir {
-                    disk_inode.nlink = 0;
-                } else if disk_inode.nlink > 0 {
-                    disk_inode.nlink -= 1;
+                // Child side: nlink discipline (dir ⇒ 0) + ctime.
+                match &self.volumes[child_v_idx] {
+                    VolumeBackend::V2(be) => {
+                        let mut disk_inode = inode::read_inode(&be.storage, local_child).await?;
+                        log::debug!(
+                            "meta_backend unlink: local_child = {}, nlink = {}",
+                            local_child,
+                            disk_inode.nlink
+                        );
+                        if is_dir {
+                            disk_inode.nlink = 0;
+                        } else if disk_inode.nlink > 0 {
+                            disk_inode.nlink -= 1;
+                        }
+                        disk_inode.ctime = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        log::debug!(
+                            "meta_backend unlink: local_child = {}, writing nlink = {}",
+                            local_child,
+                            disk_inode.nlink
+                        );
+                        inode::write_inode(&be.storage, local_child, &disk_inode).await?;
+                    }
+                    VolumeBackend::V3(be) => {
+                        let out = be.routed_nlink_adjust(local_child, -1, is_dir).await;
+                        if out.is_err() {
+                            self.mirror_v3_failure(child_v_idx);
+                        }
+                        out?;
+                    }
                 }
-                disk_inode.ctime = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                log::debug!(
-                    "meta_backend unlink: local_child = {}, writing nlink = {}",
-                    local_child,
-                    disk_inode.nlink
-                );
-                inode::write_inode(&self.volumes[child_v_idx].storage, local_child, &disk_inode)
-                    .await?;
                 Ok(global_child_ino)
             }
         }
@@ -2101,7 +2444,7 @@ impl Metadata for RoutedMetaBackend {
         if child_v_idx == parent_v_idx {
             _guards.extend(
                 self.volumes[parent_v_idx]
-                    .dlm
+                    .dlm()
                     .lock_many(
                         &[
                             (local_parent, dlm::LockMode::Exclusive),
@@ -2114,13 +2457,13 @@ impl Metadata for RoutedMetaBackend {
         } else if child_v_idx < parent_v_idx {
             _guards.extend(
                 self.volumes[child_v_idx]
-                    .dlm
+                    .dlm()
                     .lock_many(&[(local_child, dlm::LockMode::Exclusive)], &[])
                     .await,
             );
             _guards.extend(
                 self.volumes[parent_v_idx]
-                    .dlm
+                    .dlm()
                     .lock_many(
                         &[(local_parent, dlm::LockMode::Exclusive)],
                         &[(local_parent, new_name, dlm::LockMode::Exclusive)],
@@ -2130,7 +2473,7 @@ impl Metadata for RoutedMetaBackend {
         } else {
             _guards.extend(
                 self.volumes[parent_v_idx]
-                    .dlm
+                    .dlm()
                     .lock_many(
                         &[(local_parent, dlm::LockMode::Exclusive)],
                         &[(local_parent, new_name, dlm::LockMode::Exclusive)],
@@ -2139,14 +2482,16 @@ impl Metadata for RoutedMetaBackend {
             );
             _guards.extend(
                 self.volumes[child_v_idx]
-                    .dlm
+                    .dlm()
                     .lock_many(&[(local_child, dlm::LockMode::Exclusive)], &[])
                     .await,
             );
         }
 
-        if let Some(_) =
-            dentry::find_dentry(&self.volumes[parent_v_idx].storage, local_parent, new_name).await?
+        if self
+            .find_dentry_routed(parent_v_idx, local_parent, new_name)
+            .await?
+            .is_some()
         {
             return Err(crate::error::SqueezefsError::InvalidOperation(
                 "File already exists".to_string(),
@@ -2154,7 +2499,17 @@ impl Metadata for RoutedMetaBackend {
         }
 
         if parent_v_idx == child_v_idx {
-            let backend = &self.volumes[parent_v_idx];
+            // v3 arm: ONE whole-tx entry (nlink+1 + dentry + parent times).
+            if let VolumeBackend::V3(be) = &self.volumes[parent_v_idx] {
+                let out = be
+                    .routed_link_local(local_parent, new_name, local_child, ino)
+                    .await;
+                if out.is_err() {
+                    self.mirror_v3_failure(parent_v_idx);
+                }
+                return out;
+            }
+            let backend = self.v2_volume(parent_v_idx);
             backend
                 .run_transaction(|| async {
                     let mut disk_inode = inode::read_inode(&backend.storage, local_child).await?;
@@ -2218,70 +2573,105 @@ impl Metadata for RoutedMetaBackend {
                 })
                 .await
         } else {
-            let mut disk_inode =
-                inode::read_inode(&self.volumes[child_v_idx].storage, local_child).await?;
-            if disk_inode.nlink >= 65000 {
-                return Err(crate::error::SqueezefsError::InvalidOperation(
-                    "Too many links".to_string(),
-                ));
+            // Child side: nlink+1 + ctime (per format).
+            let child_inode = match &self.volumes[child_v_idx] {
+                VolumeBackend::V2(be) => {
+                    let mut disk_inode = inode::read_inode(&be.storage, local_child).await?;
+                    if disk_inode.nlink >= 65000 {
+                        return Err(crate::error::SqueezefsError::InvalidOperation(
+                            "Too many links".to_string(),
+                        ));
+                    }
+                    log::debug!(
+                        "meta_backend link: local_child = {}, nlink before = {}",
+                        local_child,
+                        disk_inode.nlink
+                    );
+                    disk_inode.nlink += 1;
+                    disk_inode.ctime = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    log::debug!(
+                        "meta_backend link: local_child = {}, nlink after = {}",
+                        local_child,
+                        disk_inode.nlink
+                    );
+                    inode::write_inode(&be.storage, local_child, &disk_inode).await?;
+                    Inode {
+                        ino,
+                        mode: disk_inode.mode,
+                        uid: disk_inode.uid,
+                        gid: disk_inode.gid,
+                        size: disk_inode.size,
+                        nlink: disk_inode.nlink,
+                        atime: disk_inode.atime,
+                        mtime: disk_inode.mtime,
+                        ctime: disk_inode.ctime,
+                        flags: disk_inode.flags,
+                    }
+                }
+                VolumeBackend::V3(be) => {
+                    let out = be.routed_nlink_adjust(local_child, 1, false).await;
+                    if out.is_err() {
+                        self.mirror_v3_failure(child_v_idx);
+                    }
+                    let v = out?;
+                    Inode {
+                        ino,
+                        mode: v.mode,
+                        uid: v.uid,
+                        gid: v.gid,
+                        size: v.size,
+                        nlink: v.nlink,
+                        atime: v.atime,
+                        mtime: v.mtime,
+                        ctime: v.ctime,
+                        flags: v.flags,
+                    }
+                }
+            };
+
+            // Parent side: dentry + best-effort parent times.
+            match &self.volumes[parent_v_idx] {
+                VolumeBackend::V2(be) => {
+                    dentry::insert_dentry(
+                        &be.storage,
+                        local_parent,
+                        ino,
+                        new_name,
+                        child_inode.mode & libc::S_IFMT,
+                    )
+                    .await?;
+                    if let Ok(mut parent_inode) = inode::read_inode(&be.storage, local_parent).await
+                    {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        parent_inode.mtime = now;
+                        parent_inode.ctime = now;
+                        let _ = inode::write_inode(&be.storage, local_parent, &parent_inode).await;
+                    }
+                }
+                VolumeBackend::V3(be) => {
+                    let out = be
+                        .routed_add_dentry(
+                            local_parent,
+                            new_name,
+                            ino,
+                            child_inode.mode & libc::S_IFMT,
+                            kv::backend::RoutedParentUpdate::ExclusiveTimes,
+                        )
+                        .await;
+                    if out.is_err() {
+                        self.mirror_v3_failure(parent_v_idx);
+                    }
+                    out?;
+                }
             }
-            log::debug!(
-                "meta_backend link: local_child = {}, nlink before = {}",
-                local_child,
-                disk_inode.nlink
-            );
-            disk_inode.nlink += 1;
-            disk_inode.ctime = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            log::debug!(
-                "meta_backend link: local_child = {}, nlink after = {}",
-                local_child,
-                disk_inode.nlink
-            );
-            inode::write_inode(&self.volumes[child_v_idx].storage, local_child, &disk_inode)
-                .await?;
 
-            dentry::insert_dentry(
-                &self.volumes[parent_v_idx].storage,
-                local_parent,
-                ino,
-                new_name,
-                disk_inode.mode & libc::S_IFMT,
-            )
-            .await?;
-
-            // Update parent directory times
-            if let Ok(mut parent_inode) =
-                inode::read_inode(&self.volumes[parent_v_idx].storage, local_parent).await
-            {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                parent_inode.mtime = now;
-                parent_inode.ctime = now;
-                let _ = inode::write_inode(
-                    &self.volumes[parent_v_idx].storage,
-                    local_parent,
-                    &parent_inode,
-                )
-                .await;
-            }
-
-            Ok(Inode {
-                ino,
-                mode: disk_inode.mode,
-                uid: disk_inode.uid,
-                gid: disk_inode.gid,
-                size: disk_inode.size,
-                nlink: disk_inode.nlink,
-                atime: disk_inode.atime,
-                mtime: disk_inode.mtime,
-                ctime: disk_inode.ctime,
-                flags: disk_inode.flags,
-            })
+            Ok(child_inode)
         }
     }
 
@@ -2315,7 +2705,7 @@ impl Metadata for RoutedMetaBackend {
         if old_parent_v_idx == new_parent_v_idx {
             _guards.extend(
                 self.volumes[old_parent_v_idx]
-                    .dlm
+                    .dlm()
                     .lock_many(
                         &[
                             (local_old_parent, dlm::LockMode::Exclusive),
@@ -2337,7 +2727,7 @@ impl Metadata for RoutedMetaBackend {
             for (v_idx, local_p, name) in sets {
                 _guards.extend(
                     self.volumes[v_idx]
-                        .dlm
+                        .dlm()
                         .lock_many(
                             &[(local_p, dlm::LockMode::Exclusive)],
                             &[(local_p, name, dlm::LockMode::Exclusive)],
@@ -2347,22 +2737,52 @@ impl Metadata for RoutedMetaBackend {
             }
         }
 
-        let old_dentry_opt = dentry::find_dentry(
-            &self.volumes[old_parent_v_idx].storage,
-            local_old_parent,
-            old_name,
-        )
-        .await?;
-
-        let new_dentry_opt = dentry::find_dentry(
-            &self.volumes[new_parent_v_idx].storage,
-            local_new_parent,
-            new_name,
-        )
-        .await?;
+        let old_dentry_opt = self
+            .find_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
+            .await?;
+        let new_dentry_opt = self
+            .find_dentry_routed(new_parent_v_idx, local_new_parent, new_name)
+            .await?;
 
         if old_parent_v_idx == new_parent_v_idx {
-            let backend = &self.volumes[old_parent_v_idx];
+            // v3 arm: dentry surgery + dir-move nlink shifts + local-dest
+            // accounting as ONE whole-tx entry; a remote destination
+            // inode is settled first (ENOTEMPTY aborts before any
+            // surgery), matching the v2 arm's check-then-mutate order.
+            if let VolumeBackend::V3(be) = &self.volumes[old_parent_v_idx] {
+                let mut dest_local = None;
+                if flags & libc::RENAME_EXCHANGE == 0 {
+                    if let Some((dest_global, _ft)) = new_dentry_opt {
+                        if flags & libc::RENAME_NOREPLACE != 0 {
+                            return Err(crate::error::SqueezefsError::Io(
+                                std::io::Error::from_raw_os_error(libc::EEXIST),
+                            ));
+                        }
+                        let (dest_v_idx, local_dest) = self.route_ino(dest_global);
+                        if dest_v_idx == old_parent_v_idx {
+                            dest_local = Some(local_dest);
+                        } else {
+                            self.dest_replace_routed(dest_v_idx, local_dest).await?;
+                        }
+                    }
+                }
+                let out = be
+                    .routed_rename_local(
+                        local_old_parent,
+                        old_name,
+                        local_new_parent,
+                        new_name,
+                        flags,
+                        dest_local,
+                    )
+                    .await;
+                if out.is_err() {
+                    self.mirror_v3_failure(old_parent_v_idx);
+                }
+                return out;
+            }
+
+            let backend = self.v2_volume(old_parent_v_idx);
             backend
                 .run_transaction(|| async {
                     // Pre-acquire both dentry buckets in ascending order so a
@@ -2373,12 +2793,12 @@ impl Metadata for RoutedMetaBackend {
                     )
                     .await?;
                     if flags & libc::RENAME_EXCHANGE != 0 {
-                        let old_dentry = old_dentry_opt.ok_or_else(|| {
+                        let (old_child, old_ft) = old_dentry_opt.ok_or_else(|| {
                             crate::error::SqueezefsError::Io(std::io::Error::from_raw_os_error(
                                 libc::ENOENT,
                             ))
                         })?;
-                        let new_dentry = new_dentry_opt.ok_or_else(|| {
+                        let (new_child, new_ft) = new_dentry_opt.ok_or_else(|| {
                             crate::error::SqueezefsError::Io(std::io::Error::from_raw_os_error(
                                 libc::ENOENT,
                             ))
@@ -2392,18 +2812,18 @@ impl Metadata for RoutedMetaBackend {
                         dentry::insert_dentry(
                             &backend.storage,
                             local_new_parent,
-                            old_dentry.child_ino,
+                            old_child,
                             new_name,
-                            old_dentry.file_type,
+                            old_ft,
                         )
                         .await?;
 
                         dentry::insert_dentry(
                             &backend.storage,
                             local_old_parent,
-                            new_dentry.child_ino,
+                            new_child,
                             old_name,
-                            new_dentry.file_type,
+                            new_ft,
                         )
                         .await?;
 
@@ -2415,8 +2835,8 @@ impl Metadata for RoutedMetaBackend {
                             ));
                         }
 
-                        if let Some(dentry) = old_dentry_opt {
-                            let is_dir = dentry.file_type == libc::S_IFDIR;
+                        if let Some((old_child, old_ft)) = old_dentry_opt {
+                            let is_dir = old_ft == libc::S_IFDIR;
                             let cross_dir = old_parent_v_idx != new_parent_v_idx
                                 || local_old_parent != local_new_parent;
 
@@ -2450,42 +2870,9 @@ impl Metadata for RoutedMetaBackend {
                             }
 
                             // Check if destination already exists to decrement its link count
-                            if let Some(dest_dentry) = new_dentry_opt {
-                                let dest_ino = dest_dentry.child_ino;
+                            if let Some((dest_ino, _dest_ft)) = new_dentry_opt {
                                 let (dest_v_idx, local_dest) = self.route_ino(dest_ino);
-                                if let Ok(mut dest_inode) =
-                                    inode::read_inode(&self.volumes[dest_v_idx].storage, local_dest)
-                                        .await
-                                {
-                                    // Check if destination is a directory and is not empty
-                                    if (dest_inode.mode & libc::S_IFMT) == libc::S_IFDIR {
-                                        let dentries = dentry::list_dentries(
-                                            &self.volumes[dest_v_idx].storage,
-                                            local_dest,
-                                        )
-                                        .await?;
-                                        if !dentries.is_empty() {
-                                            return Err(crate::error::SqueezefsError::Io(
-                                                std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
-                                            ));
-                                        }
-                                    }
-
-                                    if dest_inode.nlink > 0 {
-                                        dest_inode.nlink -= 1;
-                                    }
-                                    dest_inode.ctime = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_nanos()
-                                        as u64;
-                                    let _ = inode::write_inode(
-                                        &self.volumes[dest_v_idx].storage,
-                                        local_dest,
-                                        &dest_inode,
-                                    )
-                                    .await;
-                                }
+                                self.dest_replace_routed(dest_v_idx, local_dest).await?;
                                 // Remove the destination dentry so it gets replaced cleanly
                                 dentry::remove_dentry(&backend.storage, local_new_parent, new_name)
                                     .await?;
@@ -2496,9 +2883,9 @@ impl Metadata for RoutedMetaBackend {
                             dentry::insert_dentry(
                                 &backend.storage,
                                 local_new_parent,
-                                dentry.child_ino,
+                                old_child,
                                 new_name,
-                                dentry.file_type,
+                                old_ft,
                             )
                             .await?;
                             Ok(())
@@ -2513,47 +2900,38 @@ impl Metadata for RoutedMetaBackend {
                 .await
         } else {
             if flags & libc::RENAME_EXCHANGE != 0 {
-                let old_dentry = old_dentry_opt.ok_or_else(|| {
+                let (old_child, old_ft) = old_dentry_opt.ok_or_else(|| {
                     crate::error::SqueezefsError::Io(std::io::Error::from_raw_os_error(
                         libc::ENOENT,
                     ))
                 })?;
-                let new_dentry = new_dentry_opt.ok_or_else(|| {
+                let (new_child, new_ft) = new_dentry_opt.ok_or_else(|| {
                     crate::error::SqueezefsError::Io(std::io::Error::from_raw_os_error(
                         libc::ENOENT,
                     ))
                 })?;
 
-                // Remove both
-                dentry::remove_dentry(
-                    &self.volumes[old_parent_v_idx].storage,
-                    local_old_parent,
-                    old_name,
-                )
-                .await?;
-                dentry::remove_dentry(
-                    &self.volumes[new_parent_v_idx].storage,
+                // Remove both, insert swapped — per-volume fragments, each
+                // dispatched by format (the v2 cross arms were already
+                // non-transactional across volumes).
+                self.remove_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
+                    .await?;
+                self.remove_dentry_routed(new_parent_v_idx, local_new_parent, new_name)
+                    .await?;
+                self.insert_dentry_routed(
+                    new_parent_v_idx,
                     local_new_parent,
+                    old_child,
                     new_name,
+                    old_ft,
                 )
                 .await?;
-
-                // Insert swapped
-                dentry::insert_dentry(
-                    &self.volumes[new_parent_v_idx].storage,
-                    local_new_parent,
-                    old_dentry.child_ino,
-                    new_name,
-                    old_dentry.file_type,
-                )
-                .await?;
-
-                dentry::insert_dentry(
-                    &self.volumes[old_parent_v_idx].storage,
+                self.insert_dentry_routed(
+                    old_parent_v_idx,
                     local_old_parent,
-                    new_dentry.child_ino,
+                    new_child,
                     old_name,
-                    new_dentry.file_type,
+                    new_ft,
                 )
                 .await?;
 
@@ -2565,102 +2943,35 @@ impl Metadata for RoutedMetaBackend {
                     ));
                 }
 
-                if let Some(dentry) = old_dentry_opt {
-                    let is_dir = dentry.file_type == libc::S_IFDIR;
-                    let cross_dir = old_parent_v_idx != new_parent_v_idx
-                        || local_old_parent != local_new_parent;
+                if let Some((old_child, old_ft)) = old_dentry_opt {
+                    let is_dir = old_ft == libc::S_IFDIR;
 
-                    if is_dir && cross_dir {
-                        // Decrement old parent link count
-                        if let Ok(mut old_p_inode) = inode::read_inode(
-                            &self.volumes[old_parent_v_idx].storage,
-                            local_old_parent,
-                        )
-                        .await
-                        {
-                            if old_p_inode.nlink > 2 {
-                                old_p_inode.nlink -= 1;
-                            }
-                            let _ = inode::write_inode(
-                                &self.volumes[old_parent_v_idx].storage,
-                                local_old_parent,
-                                &old_p_inode,
-                            )
-                            .await;
-                        }
-                        // Increment new parent link count
-                        if let Ok(mut new_p_inode) = inode::read_inode(
-                            &self.volumes[new_parent_v_idx].storage,
-                            local_new_parent,
-                        )
-                        .await
-                        {
-                            new_p_inode.nlink += 1;
-                            let _ = inode::write_inode(
-                                &self.volumes[new_parent_v_idx].storage,
-                                local_new_parent,
-                                &new_p_inode,
-                            )
-                            .await;
-                        }
+                    if is_dir {
+                        // Directory move across parents: nlink shift on
+                        // each side (best-effort, the v2 shape).
+                        self.parent_nlink_delta_routed(old_parent_v_idx, local_old_parent, -1)
+                            .await?;
+                        self.parent_nlink_delta_routed(new_parent_v_idx, local_new_parent, 1)
+                            .await?;
                     }
 
-                    // Check if destination already exists to decrement its link count
-                    if let Some(dest_dentry) = new_dentry_opt {
-                        let dest_ino = dest_dentry.child_ino;
+                    // Destination replacement: settle its inode, then
+                    // remove its dentry.
+                    if let Some((dest_ino, _dest_ft)) = new_dentry_opt {
                         let (dest_v_idx, local_dest) = self.route_ino(dest_ino);
-                        if let Ok(mut dest_inode) =
-                            inode::read_inode(&self.volumes[dest_v_idx].storage, local_dest).await
-                        {
-                            // Check if destination is a directory and is not empty
-                            if (dest_inode.mode & libc::S_IFMT) == libc::S_IFDIR {
-                                let dentries = dentry::list_dentries(
-                                    &self.volumes[dest_v_idx].storage,
-                                    local_dest,
-                                )
-                                .await?;
-                                if !dentries.is_empty() {
-                                    return Err(crate::error::SqueezefsError::Io(
-                                        std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
-                                    ));
-                                }
-                            }
-
-                            if dest_inode.nlink > 0 {
-                                dest_inode.nlink -= 1;
-                            }
-                            dest_inode.ctime = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos() as u64;
-                            let _ = inode::write_inode(
-                                &self.volumes[dest_v_idx].storage,
-                                local_dest,
-                                &dest_inode,
-                            )
-                            .await;
-                        }
-                        // Remove the destination dentry so it gets replaced cleanly
-                        dentry::remove_dentry(
-                            &self.volumes[new_parent_v_idx].storage,
-                            local_new_parent,
-                            new_name,
-                        )
-                        .await?;
+                        self.dest_replace_routed(dest_v_idx, local_dest).await?;
+                        self.remove_dentry_routed(new_parent_v_idx, local_new_parent, new_name)
+                            .await?;
                     }
 
-                    dentry::remove_dentry(
-                        &self.volumes[old_parent_v_idx].storage,
-                        local_old_parent,
-                        old_name,
-                    )
-                    .await?;
-                    dentry::insert_dentry(
-                        &self.volumes[new_parent_v_idx].storage,
+                    self.remove_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
+                        .await?;
+                    self.insert_dentry_routed(
+                        new_parent_v_idx,
                         local_new_parent,
-                        dentry.child_ino,
+                        old_child,
                         new_name,
-                        dentry.file_type,
+                        old_ft,
                     )
                     .await?;
                     Ok(())
@@ -2677,36 +2988,34 @@ impl Metadata for RoutedMetaBackend {
     async fn readdir(&self, dir: Ino, _offset: u64, _max: usize) -> Result<Vec<DirEntry>> {
         let (v_idx, local_dir) = self.route_ino(dir);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx].dlm.lock_inode_shared(local_dir).await;
-        let dentries = dentry::list_dentries(&self.volumes[v_idx].storage, local_dir).await?;
-        let mut list = Vec::new();
-        for d in dentries {
-            list.push(DirEntry {
-                ino: d.child_ino,
-                name: d.get_name(),
-                file_type: d.file_type,
-            });
+        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_dir).await;
+        match &self.volumes[v_idx] {
+            VolumeBackend::V2(be) => {
+                let dentries = dentry::list_dentries(&be.storage, local_dir).await?;
+                let mut list = Vec::new();
+                for d in dentries {
+                    list.push(DirEntry {
+                        ino: d.child_ino,
+                        name: d.get_name(),
+                        file_type: d.file_type,
+                    });
+                }
+                Ok(list)
+            }
+            // The routed surface returns the whole listing on both
+            // formats until PR K7 wires the FUSE cookie contract — the
+            // FUSE layer owns offset slicing today.
+            VolumeBackend::V3(be) => be.readdir(local_dir, 0, usize::MAX).await,
         }
-        Ok(list)
     }
 
     async fn getattr(&self, ino: Ino) -> Result<Inode> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx].dlm.lock_inode_shared(local_ino).await;
-        let disk_inode = inode::read_inode(&self.volumes[v_idx].storage, local_ino).await?;
-        Ok(Inode {
-            ino: ino,
-            mode: disk_inode.mode,
-            uid: disk_inode.uid,
-            gid: disk_inode.gid,
-            size: disk_inode.size,
-            nlink: disk_inode.nlink,
-            atime: disk_inode.atime,
-            mtime: disk_inode.mtime,
-            ctime: disk_inode.ctime,
-            flags: disk_inode.flags,
-        })
+        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
+        let mut inode = self.read_inode_routed(v_idx, local_ino).await?;
+        inode.ino = ino;
+        Ok(inode)
     }
 
     async fn setattr(
@@ -2723,10 +3032,23 @@ impl Metadata for RoutedMetaBackend {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
-            .dlm
+            .dlm()
             .lock_inode_exclusive(local_ino)
             .await;
-        let mut disk_inode = inode::read_inode(&self.volumes[v_idx].storage, local_ino).await?;
+        if let VolumeBackend::V3(be) = &self.volumes[v_idx] {
+            let out = be
+                .setattr_locked(local_ino, mode, uid, gid, size, atime, mtime, ctime)
+                .await;
+            if out.is_err() {
+                self.mirror_v3_failure(v_idx);
+            }
+            return out.map(|mut i| {
+                i.ino = ino;
+                i
+            });
+        }
+        let be = self.v2_volume(v_idx);
+        let mut disk_inode = inode::read_inode(&be.storage, local_ino).await?;
         let mut ctime_updated = false;
         if let Some(m) = mode {
             disk_inode.mode = m;
@@ -2758,7 +3080,7 @@ impl Metadata for RoutedMetaBackend {
                 .unwrap_or_default()
                 .as_nanos() as u64;
         }
-        inode::write_inode(&self.volumes[v_idx].storage, local_ino, &disk_inode).await?;
+        inode::write_inode(&be.storage, local_ino, &disk_inode).await?;
         Ok(Inode {
             ino: ino,
             mode: disk_inode.mode,
@@ -2776,35 +3098,59 @@ impl Metadata for RoutedMetaBackend {
     async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx].dlm.lock_inode_shared(local_ino).await;
-        xattr::get_xattr(&self.volumes[v_idx].storage, local_ino, name).await
+        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
+        match &self.volumes[v_idx] {
+            VolumeBackend::V2(be) => xattr::get_xattr(&be.storage, local_ino, name).await,
+            VolumeBackend::V3(be) => be.getxattr(local_ino, name).await,
+        }
     }
 
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
-            .dlm
+            .dlm()
             .lock_inode_exclusive(local_ino)
             .await;
-        xattr::set_xattr(&self.volumes[v_idx].storage, local_ino, name, value).await
+        match &self.volumes[v_idx] {
+            VolumeBackend::V2(be) => xattr::set_xattr(&be.storage, local_ino, name, value).await,
+            VolumeBackend::V3(be) => {
+                let out = be.setxattr_locked(local_ino, name, value).await;
+                if out.is_err() {
+                    self.mirror_v3_failure(v_idx);
+                }
+                out
+            }
+        }
     }
 
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
-            .dlm
+            .dlm()
             .lock_inode_exclusive(local_ino)
             .await;
-        xattr::remove_xattr(&self.volumes[v_idx].storage, local_ino, name).await
+        match &self.volumes[v_idx] {
+            VolumeBackend::V2(be) => xattr::remove_xattr(&be.storage, local_ino, name).await,
+            VolumeBackend::V3(be) => {
+                let out = be.removexattr_locked(local_ino, name).await;
+                if out.is_err() {
+                    self.mirror_v3_failure(v_idx);
+                }
+                out
+            }
+        }
     }
 
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx].dlm.lock_inode_shared(local_ino).await;
-        xattr::list_xattrs(&self.volumes[v_idx].storage, local_ino).await
+        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
+        match &self.volumes[v_idx] {
+            VolumeBackend::V2(be) => xattr::list_xattrs(&be.storage, local_ino).await,
+            VolumeBackend::V3(be) => be.listxattr(local_ino).await,
+        }
     }
 
     async fn destroy_inode(&self, ino: Ino) -> Result<()> {
@@ -2817,7 +3163,14 @@ impl Metadata for RoutedMetaBackend {
 impl RoutedMetaBackend {
     pub async fn sync_all_devices(&self) -> Result<()> {
         for vol in &self.volumes {
-            crate::uring_fs::fdatasync(vol.storage.device_path()).await?;
+            match vol {
+                VolumeBackend::V2(be) => {
+                    crate::uring_fs::fdatasync(be.storage.device_path()).await?
+                }
+                // v3: the coalesced barrier ALSO drains the §4.6 pt 3
+                // pending-reclaim bookkeeping.
+                VolumeBackend::V3(be) => be.sync_device().await?,
+            }
         }
         Ok(())
     }
@@ -2837,17 +3190,28 @@ impl RoutedMetaBackend {
     pub async fn set_layout_and_size(&self, ino: Ino, layout: &[u8], size: u64) -> Result<()> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let be = &self.volumes[v_idx];
-        let _guard = be.dlm.lock_inode_exclusive(local_ino).await;
-        xattr::set_xattr(&be.storage, local_ino, "layout", layout).await?;
-        let mut disk_inode = inode::read_inode(&be.storage, local_ino).await?;
-        disk_inode.size = size;
-        disk_inode.ctime = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        inode::write_inode(&be.storage, local_ino, &disk_inode).await?;
-        Ok(())
+        match &self.volumes[v_idx] {
+            VolumeBackend::V2(be) => {
+                let _guard = be.dlm.lock_inode_exclusive(local_ino).await;
+                xattr::set_xattr(&be.storage, local_ino, "layout", layout).await?;
+                let mut disk_inode = inode::read_inode(&be.storage, local_ino).await?;
+                disk_inode.size = size;
+                disk_inode.ctime = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                inode::write_inode(&be.storage, local_ino, &disk_inode).await?;
+                Ok(())
+            }
+            // §5.3: ONE two-record transaction on v3 (its own I-guard).
+            VolumeBackend::V3(be) => {
+                let out = be.set_layout_and_size(local_ino, layout, size).await;
+                if out.is_err() {
+                    self.mirror_v3_failure(v_idx);
+                }
+                out
+            }
+        }
     }
 }
 

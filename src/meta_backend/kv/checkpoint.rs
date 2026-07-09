@@ -1,10 +1,62 @@
-//! Root-ledger records: the checksummed A/B-style slot array checkpoints
-//! flip tree roots through (design §4.1 "Root ledger", §4.6 pt 2).
+//! Root-ledger records (PR K3) **and the per-volume checkpoint/writeback
+//! task (PR K6b)** — design §4.1 "Root ledger", §4.6.
 //!
-//! **PR K3 lands the ledger *record* part only** — slot encode/decode,
-//! round-robin slot placement, durable write, and newest-valid-wins
-//! selection with torn-slot fallback. Checkpoint *scheduling* (writeback
-//! cadence, the tail rule, `reusable_upto` advancement wiring) is PR K6b.
+//! ## The K6b checkpoint task (§4.6)
+//!
+//! One background task per mounted v3 volume, riding the **existing
+//! flusher cadence** (`SQUEEZEFS_META_FLUSH_INTERVAL_MS`; the v2 deferred
+//! flusher's knob, reused as-is per §5.1). Each tick it:
+//!
+//! 1. drains the trees' maintenance queues (threshold writebacks +
+//!    SMOs — all structure modifications run here, serialized on this
+//!    task's `SmoContext`, §4.6);
+//! 2. issues the deferred-mode flush barrier when a commit flagged one
+//!    (the v2 `needs_flush` discipline, via the volume's `SyncCoalescer`);
+//! 3. runs a **checkpoint cycle** when due — every ≤ 1 s, or journal
+//!    distance > ring/2, or dirty-node count >
+//!    `SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES` (default 4096, the §3
+//!    mount-replay bound), or on shutdown.
+//!
+//! ## One checkpoint cycle (§4.6 pt 2, pinned order)
+//!
+//! `H = head` → flush every dirty node once (freeze under the node lock,
+//! take its `oldest_dirty_seq` floor, append **outside** the lock; full
+//! logs compact/split through the SMO path) → write dirty bitmap pages
+//! (generation = this checkpoint's seq) → **barrier** (everything above +
+//! every completed journal write + any previously-written ledger record
+//! is now durable — the §4.6 pt 3 pending-reclaim drains here) → compute
+//! **`tail = min(H, min in-flight reservation start, min dirty floor)`**
+//! → write the ledger slot naming the synced roots + that tail → the
+//! record's own durability rides the next barrier (or an immediate one
+//! under ring pressure / shutdown), after which `reusable_upto` advances
+//! to its tail and admission parkers wake.
+//!
+//! Why the three-way tail min is exact: a reservation `r < H` was taken
+//! inside its node-lock window, so the flush pass (which takes the same
+//! write locks) either blocked until its records were applied — flushing
+//! them — or the tx is still in-window and `min_inflight_start ≤ r` holds
+//! the tail back; records applied after the pass visited their node carry
+//! reservations ≥ H by the same argument, and their floors re-lower the
+//! min. The tail is always an entry boundary (H is the next reservation
+//! start; floors and inflight starts are entry starts).
+//!
+//! ## R10: the drain always makes progress
+//!
+//! The cycle consumes **zero ring bytes** for everything except SMO
+//! records, which draw from the checkpoint-task reserve
+//! ([`super::journal::checkpoint_reserve_bytes`]) and **never park**: an
+//! exhausted reserve surfaces as
+//! [`KvError::JournalReserveExhausted`], the cycle skips that node for
+//! this pass (restoring its floor — the tail keeps respecting it),
+//! finishes, advances `reusable_upto`, and retries next tick with freed
+//! budget. No task ever blocks on ring space while holding a node lock;
+//! parked user commits hold nothing the drain needs (§4.4 pt 5).
+//!
+//! ---
+//!
+//! **PR K3's half** — slot encode/decode, round-robin slot placement,
+//! durable write, and newest-valid-wins selection with torn-slot
+//! fallback:
 //!
 //! ## Layout
 //!
@@ -34,8 +86,12 @@
 //! slots are written as full zero-padded 4 KiB images so a shorter record
 //! can never leave stale bytes of a longer predecessor parseable.
 
+use super::backend::KvMetaBackend;
+use super::tree::SmoContext;
 use super::KvError;
 use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// Number of round-robin ledger slots (§4.1).
 pub const ROOT_LEDGER_SLOTS: u64 = 32;
@@ -236,4 +292,257 @@ pub async fn read_newest_ledger(
         }
     }
     Ok(newest)
+}
+
+// ---------------------------------------------------------------------------
+// PR K6b: the checkpoint/writeback task (module docs above).
+// ---------------------------------------------------------------------------
+
+/// `SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES` (§5.1; default 4096 — the
+/// §3 mount-replay working-set bound).
+pub const CHECKPOINT_MAX_DIRTY_NODES_ENV: &str = "SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES";
+
+fn max_dirty_nodes() -> u64 {
+    std::env::var(CHECKPOINT_MAX_DIRTY_NODES_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(4096)
+}
+
+/// Checkpoint cadence ceiling: a cycle runs at least this often even when
+/// no other trigger fires (§4.6 pt 2 "every ≤ 1 s").
+const CHECKPOINT_MAX_AGE_MS: u128 = 1000;
+
+/// Spawn the per-volume checkpoint/writeback task (called by
+/// `KvMetaBackend::open`). The task holds a `Weak` backend reference —
+/// dropping the backend without `shutdown` reaps it on its next tick (the
+/// v2 flusher's sentinel discipline; pinned by
+/// `tests/dismount_teardown_tests.rs`) — plus an owned liveness token the
+/// teardown tests probe through `checkpoint_alive_probe`.
+pub(super) fn spawn_checkpoint_task(be: &Arc<KvMetaBackend>) {
+    let weak = Arc::downgrade(be);
+    let alive = Arc::new(());
+    let probe = Arc::downgrade(&alive);
+    let wake = be.checkpoint_wake();
+    // The EXISTING flusher cadence (§4.6): strict mode (interval 0) still
+    // needs the background cycle for ring reclamation and SMO service —
+    // it ticks at 100 ms; commits barrier themselves.
+    let interval = match crate::meta_backend::resolve_flush_interval_ms() {
+        0 => 100,
+        ms => ms,
+    };
+    let handle = tokio::spawn(checkpoint_task(weak, alive, wake, interval));
+    be.install_checkpoint_task(handle, probe);
+}
+
+async fn checkpoint_task(
+    weak: std::sync::Weak<KvMetaBackend>,
+    alive: Arc<()>,
+    wake: Arc<tokio::sync::Notify>,
+    interval_ms: u64,
+) {
+    // Owned for the task's lifetime: `checkpoint_alive_probe` upgrades
+    // iff this task is still running.
+    let _alive = alive;
+    let mut last_checkpoint = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(interval_ms)) => {}
+            _ = wake.notified() => {}
+        }
+        let Some(be) = weak.upgrade() else {
+            return; // backend dropped without shutdown: exit, leak nothing
+        };
+        let shutting_down = be.is_shutting_down();
+        if let Err(e) = tick(&be, &mut last_checkpoint, shutting_down).await {
+            log::warn!(
+                "kv checkpoint tick failed on {:?}: {e} (state stays RAM-consistent; \
+                 retrying next tick)",
+                be.device_path()
+            );
+        }
+        if shutting_down {
+            return; // final checkpoint ran inside the tick
+        }
+    }
+}
+
+/// One task tick: maintenance → deferred flush barrier → checkpoint when
+/// due. `final_cycle` (shutdown) drains in-flight commits first and
+/// forces a full cycle with an immediate post-ledger barrier, leaving
+/// `tail == head` — an empty replay window for the next mount.
+async fn tick(
+    be: &Arc<KvMetaBackend>,
+    last_checkpoint: &mut std::time::Instant,
+    final_cycle: bool,
+) -> Result<(), KvError> {
+    let mut smo = be.smo.lock().await;
+
+    if final_cycle {
+        // New mutations are already refused (`write_gate`); wait out the
+        // in-flight ones so the final flush pass sees every applied
+        // record and the tail lands exactly on the head.
+        let head = be.journal_ring().core().head();
+        be.journal_ring().wait_completed_upto(head).await;
+    }
+
+    // 1. Threshold maintenance (appends + SMOs, serialized here — §4.6).
+    //    Reserve exhaustion runs a drain cycle and retries.
+    for tree in be.trees() {
+        loop {
+            match tree.run_maintenance(&mut smo).await {
+                Ok(_) => break,
+                Err(KvError::JournalReserveExhausted { .. }) => {
+                    be.checkpoint_cycle(&mut smo, true).await?;
+                    *last_checkpoint = std::time::Instant::now();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    // 2. The deferred-mode flush barrier (the v2 flusher tick). Also
+    //    drains the §4.6 pt 3 pending-reclaim for previously-written
+    //    ledger records.
+    if be.take_needs_flush() {
+        crate::fuse_client::METRICS
+            .meta_flush_deferred
+            .fetch_add(1, Ordering::Relaxed);
+        be.sync_device().await.map_err(KvError::Io)?;
+    }
+
+    // 3. Checkpoint decision (§4.6 pt 2): cadence, journal distance,
+    //    dirty-node cap, shutdown.
+    let core = be.journal_ring().core();
+    let distance = core.head().saturating_sub(core.reusable_upto());
+    let ring_pressure = distance > core.geometry().logical_len() / 2;
+    let mut dirty_nodes = 0u64;
+    be.node_cache().for_each_node(|n| {
+        if n.dirty_floor() != u64::MAX {
+            dirty_nodes += 1;
+        }
+    });
+    let due = final_cycle
+        || ring_pressure
+        || dirty_nodes > max_dirty_nodes()
+        || last_checkpoint.elapsed().as_millis() >= CHECKPOINT_MAX_AGE_MS;
+    if due && (final_cycle || dirty_nodes > 0 || distance > 0) {
+        // Immediate post-ledger barrier under pressure or at shutdown:
+        // reclamation must not lag a cycle when parkers wait on it.
+        be.checkpoint_cycle(&mut smo, ring_pressure || final_cycle)
+            .await?;
+        *last_checkpoint = std::time::Instant::now();
+    }
+    Ok(())
+}
+
+impl KvMetaBackend {
+    /// One §4.6 pt 2 checkpoint cycle (module docs pin the order).
+    /// Serialized by the SMO mutex the caller holds. `barrier_now` makes
+    /// the freshly-written ledger record durable inside this cycle
+    /// (shutdown / ring pressure); otherwise its durability rides the
+    /// next barrier and reclamation lags one cycle (§4.6 pt 2's "rides
+    /// the next barrier" default).
+    pub(super) async fn checkpoint_cycle(
+        &self,
+        smo: &mut SmoContext,
+        barrier_now: bool,
+    ) -> Result<(), KvError> {
+        let h = self.journal_ring().core().head();
+
+        // ---- Flush pass: every dirty node once, snapshot-then-write.
+        // SMO-reserve exhaustion skips the node (floor restored — the
+        // tail keeps respecting it) and retries next cycle with the
+        // budget this cycle frees.
+        let mut dirty: Vec<(u8, u64)> = Vec::new();
+        self.node_cache().for_each_node(|n| {
+            if n.dirty_floor() != u64::MAX && !n.state().is_superseded() {
+                dirty.push((n.tree_id(), n.addr()));
+            }
+        });
+        for (tree_id, addr) in dirty {
+            let tree = self
+                .trees()
+                .into_iter()
+                .find(|t| t.tree_id() == tree_id)
+                .expect("dirty node belongs to a mounted tree");
+            match tree.checkpoint_flush_node(smo, addr).await {
+                Ok(()) => {}
+                Err(KvError::JournalReserveExhausted { needed }) => {
+                    log::debug!(
+                        "checkpoint: SMO reserve exhausted ({needed} B) at node {addr:#x}; \
+                         deferred to the next cycle"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // ---- Dirty bitmap pages, stamped with this checkpoint's seq
+        // (§4.7: the generation the ledger record names).
+        let ckpt_seq = self.checkpoint_seq.load(Ordering::Acquire) + 1;
+        self.allocator()
+            .write_dirty_pages(
+                self.device_path(),
+                self.superblock().alloc_bitmap.start,
+                ckpt_seq,
+            )
+            .await?;
+
+        // ---- Barrier #1: node appends + bitmap pages + every completed
+        // journal write + any previously-written ledger record become
+        // durable (the §4.6 pt 3 pending-reclaim drains inside).
+        self.sync_device().await.map_err(KvError::Io)?;
+
+        // ---- The tail rule (module docs; §4.6 pt 2).
+        let mut tail = h.min(self.journal_ring().min_inflight_start());
+        self.node_cache().for_each_node(|n| {
+            tail = tail.min(n.dirty_floor());
+        });
+
+        // ---- The ledger record naming the synced roots + that tail.
+        let [inodes, dentries, xattrs] = self.trees();
+        let tree_roots = vec![
+            TreeRoot {
+                tree_id: inodes.tree_id(),
+                node_addr: inodes.root().addr,
+                node_seq: inodes.root().seq,
+            },
+            TreeRoot {
+                tree_id: dentries.tree_id(),
+                node_addr: dentries.root().addr,
+                node_seq: dentries.root().seq,
+            },
+            TreeRoot {
+                tree_id: xattrs.tree_id(),
+                node_addr: xattrs.root().addr,
+                node_seq: xattrs.root().seq,
+            },
+        ];
+        let rec = LedgerRecord {
+            seq: ckpt_seq,
+            tree_roots,
+            journal_tail_seq: tail,
+            next_ino: self.next_ino(),
+            alloc_bitmap_generation: ckpt_seq,
+        };
+        write_ledger_slot(
+            self.device_path(),
+            self.superblock().root_ledger.start,
+            &rec,
+        )
+        .await?;
+        self.checkpoint_seq.store(ckpt_seq, Ordering::Release);
+        // SMO frees from here on are retired by the NEXT record.
+        self.retire_seq.store(ckpt_seq + 1, Ordering::Release);
+        self.pending_reclaim.lock().unwrap().push((ckpt_seq, tail));
+
+        if barrier_now {
+            // Make THIS record durable now: reclamation (reusable_upto,
+            // pending-free, cache durable tail) advances before we
+            // return — the R10 drain shape and the shutdown guarantee.
+            self.sync_device().await.map_err(KvError::Io)?;
+        }
+        Ok(())
+    }
 }

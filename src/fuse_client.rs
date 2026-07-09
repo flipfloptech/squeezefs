@@ -865,7 +865,7 @@ impl SqueezefsFilesystem {
         if let Some(ref meta) = self.meta_backend {
             for (idx, vol) in meta.volumes.iter().enumerate() {
                 let name = format!("meta_volume_{}", idx);
-                let path_str = vol.storage.device_path().to_string_lossy().to_string();
+                let path_str = vol.device_path().to_string_lossy().to_string();
                 let is_disabled = meta.disabled_volumes.contains_key(&idx);
                 let status = if is_disabled { "disabled" } else { "enabled" };
                 let health = meta.get_volume_health(idx).await;
@@ -1054,12 +1054,7 @@ impl SqueezefsFilesystem {
                     .map(|mb| {
                         mb.volumes
                             .iter()
-                            .map(|v| {
-                                v.atomicity_class
-                                    .get()
-                                    .map(|c| c.as_str())
-                                    .unwrap_or("unprobed")
-                            })
+                            .map(|v| v.atomicity_contract())
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default(),
@@ -1069,12 +1064,17 @@ impl SqueezefsFilesystem {
                     .map(|mb| {
                         mb.volumes
                             .iter()
-                            .map(|v| {
-                                v.atomicity_class
-                                    .get()
-                                    .map(|c| c.as_str())
-                                    .unwrap_or("unprobed")
-                            })
+                            .map(|v| v.atomicity_physical())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "meta_format_version": self
+                    .meta_backend
+                    .as_ref()
+                    .map(|mb| {
+                        mb.volumes
+                            .iter()
+                            .map(|v| v.format_version().to_string())
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default(),
@@ -2410,13 +2410,15 @@ impl Filesystem for SqueezefsFilesystem {
             }
         }
 
-        // Reconcile the on-disk inode bitmap from the authoritative inode table on
-        // clean unmount, so a subsequent mount by a pre-PR-8 binary
-        // reads a correct bitmap (design PR 2b / review Issue 18).
+        // Clean-unmount teardown per format (K6b): v2 reconciles the
+        // on-disk inode bitmap from the authoritative table (design PR 2b
+        // / review Issue 18); v3 runs a final checkpoint and JOINS its
+        // checkpoint task (tail == head ⇒ empty replay window; no leaked
+        // tasks — design §4.6 / tests/dismount_teardown_tests.rs).
         if let Some(ref backend) = self.meta_backend {
             for vol in &backend.volumes {
-                if let Err(e) = vol.storage.refresh_bitmap_from_table().await {
-                    warn!("Inode bitmap reconciliation on unmount failed: {:?}", e);
+                if let Err(e) = vol.shutdown_for_unmount().await {
+                    warn!("Meta volume unmount teardown failed: {:?}", e);
                 }
             }
         }

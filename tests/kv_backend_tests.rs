@@ -1356,16 +1356,16 @@ async fn mutating_rename_conformance(#[case] kind: Kind) {
         other => panic!("NOREPLACE must be an Io(EEXIST) error, got {other:?}"),
     }
 
-    // Replacing rename (no flags): destination unlinked, source moves in.
+    // Replacing rename (no flags): the destination dentry is replaced,
+    // the source moves in. (At this single-volume trait level rename is
+    // pure dentry surgery — the v2 contract; destination-inode nlink
+    // accounting is the routed layer's job.)
     b.rename(d2.ino, "moved", d2.ino, "blocker", 0)
         .await
         .expect("replacing rename");
     assert_eq!(b.lookup(d2.ino, "blocker").await.unwrap().ino, f.ino);
     assert!(b.lookup(d2.ino, "moved").await.is_err());
-    let replaced = b.getattr(blocker.ino).await;
-    if let Ok(i) = replaced {
-        assert_eq!(i.nlink, 0, "replaced destination's nlink must drop to 0");
-    }
+    let _ = blocker;
 
     // EXCHANGE swaps the two names' inos.
     let g = b

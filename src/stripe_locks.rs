@@ -17,10 +17,25 @@
 ///    merge discipline)
 /// 4. MetaLV metadata-transaction locks, acquired in this sub-order:
 ///    - a. DLM `I{ino}` / `D{parent:name}` (per-object; MetaLV `DlmLockManager`)
-///    - b. dentry bucket lock (`dentry_bucket_locks`) — in-RAM dentry-chain integrity
-///    - c. sector locks (`sector_locks`) — commit-time RMW+apply, acquired in
-///      **ascending sector-offset order** (total order ⇒ deadlock-free) and only
-///      at commit, never taken while holding a DLM lock across the tx closure
+///    - b. **format v2**: dentry bucket lock (`dentry_bucket_locks`) — in-RAM
+///      dentry-chain integrity. **Format v3** (design-cow-kv-metadata §4.9 4b):
+///      per-node write locks — the commit path takes **leaf locks only**, in
+///      ascending NodeId order, deduped, lock-then-revalidate-then-retry
+///      against SMOs; interior-node locks belong exclusively to the
+///      serialized per-volume checkpoint/SMO task (parent-then-child), which
+///      is what keeps the two lock populations acyclic. Node locks are
+///      **never held across device I/O** (commit apply is RAM-only; the
+///      journal entry write happens after unlock; writeback freezes under
+///      the lock and appends outside it; SMOs reserve in-window and write
+///      after release) **and never held while waiting on ring space**
+///      (ring admission happens before any node lock — §4.4 pt 5; the
+///      checkpoint task's own admissions never park, they drain-and-retry).
+///    - c. **format v2**: sector locks (`sector_locks`) — commit-time
+///      RMW+apply, acquired in **ascending sector-offset order** (total order
+///      ⇒ deadlock-free) and only at commit, never taken while holding a DLM
+///      lock across the tx closure. **Format v3**: the journal reservation —
+///      a wait-free atomic, not a lock; ordered inside 4b by protocol, it
+///      imposes no ordering edges (§4.9 4c)
 ///
 /// The extended order `active_inode_locks (1) → BLOCK_FLUSH_LOCKS (3) →
 /// INODE_META_LOCKS → meta backend (4)` is established: `write_file_staged`'s

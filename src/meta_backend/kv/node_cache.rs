@@ -377,7 +377,21 @@ impl NodeSnapshot {
     /// The next **live** `(key, value)` with key ≥ `from` (fold-walked:
     /// tombstoned/orphaned keys are skipped) — the range-scan / interior
     /// routing primitive. Zero-copy on both key and value.
-    pub fn next_live(&self, from: &[u8]) -> Result<Option<(Bytes, Bytes)>, KvError> {
+    ///
+    /// `end_inclusive` bounds the walk: a candidate key beyond it returns
+    /// `None` **before** any fold. Without the bound a narrow window scan
+    /// (the ≤ 256-key dentry/xattr chain probes behind every
+    /// lookup/create/unlink) would fold-walk the whole tombstone desert a
+    /// create/unlink storm leaves in the leaf until compaction — the
+    /// ~1000× post-storm lookup cliff the K7 §8 micro gate caught
+    /// (`tests/kv_scale_tests.rs::lookup_p50_immune_to_tombstone_desert`).
+    /// `None` leaves the walk unbounded (interior routing wants the next
+    /// live separator wherever it is).
+    pub fn next_live(
+        &self,
+        from: &[u8],
+        end_inclusive: Option<&[u8]>,
+    ) -> Result<Option<(Bytes, Bytes)>, KvError> {
         let mut cursor: Vec<u8> = from.to_vec();
         loop {
             let bi = self.base.first_at_or_after(&cursor);
@@ -397,6 +411,11 @@ impl NodeSnapshot {
                     }
                 }
             };
+            if let Some(end) = end_inclusive {
+                if key > end {
+                    return Ok(None);
+                }
+            }
             let key_owned; // key borrow ends at lookup; keep bytes for return
             let key_bytes = if bk == Some(key) {
                 key_owned = self.base.key_bytes(bi);

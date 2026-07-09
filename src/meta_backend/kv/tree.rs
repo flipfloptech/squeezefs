@@ -361,7 +361,7 @@ impl KvTree {
                     continue 'restart;
                 }
                 let snap = cur.snapshot();
-                let Some((_, ptr)) = snap.next_live(key)? else {
+                let Some((_, ptr)) = snap.next_live(key, None)? else {
                     // Routing hole: a stale snapshot raced an SMO — restart.
                     continue 'restart;
                 };
@@ -620,12 +620,15 @@ impl KvTree {
             let snap = leaf.snapshot();
             let mut pos: Vec<u8> = cursor.clone();
             while out.len() < max {
-                match snap.next_live(&pos)? {
-                    Some((k, v)) if &k[..] <= end => {
+                // Bounded by `end`: the walk must never fold tombstones
+                // beyond the requested window (the chain probes' desert
+                // cliff — see `next_live`'s doc).
+                match snap.next_live(&pos, Some(end))? {
+                    Some((k, v)) => {
                         pos = key_successor(&k);
                         out.push((k, v));
                     }
-                    _ => break,
+                    None => break,
                 }
             }
             if out.len() >= max || leaf.max_key() >= end {

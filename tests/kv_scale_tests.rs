@@ -1425,6 +1425,64 @@ async fn lookup_p50_immune_to_tombstone_desert() {
     be.shutdown().await.unwrap();
 }
 
+/// §4.6 pt 1 names TWO writeback triggers: "every flush tick, **or when a
+/// node's dirty delta exceeds a bset worth**". The threshold half must
+/// drain without waiting out the cadence — commits enqueue maintenance
+/// when a leaf's open delta crosses `DEFAULT_WRITEBACK_DELTA_BYTES`, and
+/// the checkpoint task must wake and append promptly (RAM-apply cost per
+/// commit is O(open delta): letting it balloon for a whole tick is the
+/// +18 % create-row cliff the K7 §8 criterion run caught). A
+/// maintenance-only wake must NOT barrier or checkpoint — those stay on
+/// the cadence (the deferred-durability contract is untouched).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn threshold_writeback_drains_without_cadence() {
+    // Park the cadence out of reach so only the threshold path can act.
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+
+    let (be, _f) = v3_volume_with_seed(TEST_SEED, 128 * 1024 * 1024).await;
+    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
+        be.clone(),
+    )]));
+
+    let appends0 = META_KV_NODE_APPENDS.load(Ordering::Relaxed);
+    let checkpoints0 = squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed);
+    // ~500 creates ⇒ tens of KiB of dentry+inode+Δtime records — far past
+    // one 4 KiB bset worth on both hot leaves.
+    for i in 0..500u32 {
+        routed
+            .create(ROOT_INO, &format!("thr{i:04}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+    }
+    // The threshold trigger must land appends without a cadence tick
+    // (parked at 60 s). Bounded poll — event-driven in the product, the
+    // poll is only the observer.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut appends_now = META_KV_NODE_APPENDS.load(Ordering::Relaxed);
+    while appends_now == appends0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        appends_now = META_KV_NODE_APPENDS.load(Ordering::Relaxed);
+    }
+    assert!(
+        appends_now > appends0,
+        "threshold-crossed dirty deltas must be appended without waiting out the \
+         60 s cadence (§4.6 pt 1's second trigger) — appends stayed {appends0}"
+    );
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed),
+        checkpoints0,
+        "a maintenance-only wake must not checkpoint (barriers/ledger stay on cadence)"
+    );
+    be.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // §8 paired-run tooling: rebuild a CLI-formatted meta volume as v2.
 // ---------------------------------------------------------------------------

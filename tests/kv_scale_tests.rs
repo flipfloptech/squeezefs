@@ -643,27 +643,60 @@ async fn fuse_readdir_v3_emits_key_cookies_and_streams() {
     );
     assert_eq!(READDIR_VIRTUAL_STATS_COOKIE & (1 << 63), 0);
 
-    // v3 must not populate the FUSE-layer whole-dir caches (streaming).
+    // §4.5: SMALL v3 directories (≤ the cache policy) ARE cached after a
+    // listing start — with their cookies, so the cache-served path keeps
+    // the §5.1 contract bit-for-bit. (Big dirs bypass — pinned by
+    // fuse_readdir_v3_big_dir_streams_exactly_once.)
+    h.fs.dir_entry_cache_v3.run_pending_tasks();
+    assert!(
+        h.fs.dir_entry_cache_v3.get(&1).is_some(),
+        "a small v3 directory must be cached (with cookies) after a listing start — §4.5"
+    );
     h.fs.dir_entry_cache.run_pending_tasks();
     assert!(
         h.fs.dir_entry_cache.get(&1).is_none(),
-        "v3 readdir must not populate dir_entry_cache"
+        "v3 listings must never enter the positional v2 cache"
+    );
+    let walked_again = walk_fuse_readdir(&h.fs, 1, 0, 7).await;
+    assert_eq!(
+        walked, walked_again,
+        "the cache-served walk must be identical — names, inos, AND §5.1 cookie offsets"
+    );
+    // Mutation through the FUSE surface invalidates (the production
+    // shape — trait-path mutations bypass FUSE caches on v2 exactly the
+    // same way and ride the TTL): the next walk sees the new entry at
+    // its own key cookie.
+    use std::ffi::OsStr;
+    h.fs.create(req(), 1, OsStr::new("late-entry"), libc::S_IFREG | 0o644, 0)
+        .await
+        .expect("fuse create");
+    h.fs.dir_entry_cache_v3.run_pending_tasks();
+    let walked_after = walk_fuse_readdir(&h.fs, 1, 0, usize::MAX).await;
+    let late = walked_after
+        .iter()
+        .find(|(n, _, _)| n == "late-entry")
+        .expect("post-invalidation walk must see the new entry");
+    let late_hash = dentry_name_hash54(b"late-entry", TEST_SEED);
+    assert_eq!(
+        late.2 as u64,
+        READDIR_COOKIE_BIAS + dentry_key_suffix(late_hash, 0),
+        "cache refresh must keep §5.1 cookies"
     );
 
-    // opendir on v3 must not materialize a whole-dir snapshot either.
+    // opendir on v3 must not materialize a whole-dir snapshot.
     let opened = h.fs.opendir(req(), 1, 0).await.expect("opendir");
     assert!(
         h.fs.open_dir_streams.get(&opened.fh).is_none(),
         "v3 opendir must not snapshot the directory into open_dir_streams"
     );
-    // ... and readdir through that fh still streams correctly.
+    // ... and readdir through that fh serves the same listing.
     let walked_fh = walk_fuse_readdir(&h.fs, 1, opened.fh, 1000).await;
     assert_eq!(
         walked_fh
             .iter()
             .map(|(n, _, _)| n.clone())
             .collect::<HashSet<_>>(),
-        walked
+        walked_after
             .iter()
             .map(|(n, _, _)| n.clone())
             .collect::<HashSet<_>>(),
@@ -898,9 +931,14 @@ async fn fuse_readdir_v3_big_dir_streams_exactly_once() {
         "every entry of a {total}-entry v3 dir must stream through FUSE exactly once"
     );
     h.fs.dir_entry_cache.run_pending_tasks();
+    h.fs.dir_entry_cache_v3.run_pending_tasks();
     assert!(
         h.fs.dir_entry_cache.get(&dir.ino).is_none(),
         "big v3 directories must never enter dir_entry_cache"
+    );
+    assert!(
+        h.fs.dir_entry_cache_v3.get(&dir.ino).is_none(),
+        "big v3 directories must never enter dir_entry_cache_v3 (≤ 10 K policy)"
     );
 
     // Mid-directory cookie resume: pick the walked entry at the 60th

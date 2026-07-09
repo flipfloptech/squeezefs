@@ -560,6 +560,13 @@ pub struct SqueezefsFilesystem {
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
     pub attr_cache: moka::sync::Cache<u64, (FileAttr, std::time::Instant)>,
     pub dir_entry_cache: moka::sync::Cache<u64, std::sync::Arc<[(std::boxed::Box<str>, u64)]>>,
+    /// §4.5 (PR K7): the v3 twin of `dir_entry_cache` — snapshots of
+    /// directories ≤ [`DIR_ENTRY_CACHE_MAX_ENTRIES`], cookie-ascending
+    /// `(name, ino, §5.1 cookie, file_type)` so cache-served pages keep
+    /// the resume contract bit-for-bit. Larger directories stream and
+    /// never enter it; every v2-cache invalidation site invalidates both.
+    pub dir_entry_cache_v3:
+        moka::sync::Cache<u64, std::sync::Arc<[(std::boxed::Box<str>, u64, u64, u32)]>>,
     pub dismount_wait: u64,
     /// Bounded writeback queue (P1-2). Full → synchronous flush of that block.
     writeback_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
@@ -612,6 +619,7 @@ impl Clone for SqueezefsFilesystem {
             active_inode_locks: self.active_inode_locks.clone(),
             attr_cache: self.attr_cache.clone(),
             dir_entry_cache: self.dir_entry_cache.clone(),
+            dir_entry_cache_v3: self.dir_entry_cache_v3.clone(),
             dismount_wait: self.dismount_wait,
             writeback_tx: self.writeback_tx.clone(),
             writeback_rx: self.writeback_rx.clone(),
@@ -668,6 +676,10 @@ impl SqueezefsFilesystem {
             .max_capacity(dir_entry_capacity)
             .time_to_live(Duration::from_secs(300))
             .build();
+        let dir_entry_cache_v3 = moka::sync::Cache::builder()
+            .max_capacity(dir_entry_capacity)
+            .time_to_live(Duration::from_secs(300))
+            .build();
         // P1-4: bound attr cache growth (was unbounded DashMap).
         let attr_capacity = std::cmp::max(10_000, total_memory / 100_000);
         let attr_cache = moka::sync::Cache::builder()
@@ -693,6 +705,7 @@ impl SqueezefsFilesystem {
             active_inode_locks: std::sync::Arc::new(StripeLocks::new()),
             attr_cache,
             dir_entry_cache,
+            dir_entry_cache_v3,
             dismount_wait: 10,
             writeback_tx,
             writeback_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(writeback_rx))),
@@ -2313,6 +2326,84 @@ impl SqueezefsFilesystem {
         backend.readdir_stream(parent, offset, max).await
     }
 
+    /// [`Self::readdir_v3_page`] behind the §4.5 small-directory cache:
+    /// directories ≤ [`DIR_ENTRY_CACHE_MAX_ENTRIES`] are snapshotted
+    /// cookie-ascending on a listing start and pages are served as cache
+    /// slices (the repeat-`readdir` hot shape); larger directories bypass
+    /// and stream page-by-page — never OOMing the cache. Cache-served
+    /// pages carry the stored §5.1 cookies, so the resume contract is
+    /// identical on both paths.
+    async fn v3_listing_page(
+        &self,
+        parent: u64,
+        offset: u64,
+        max: usize,
+    ) -> Result<Option<Vec<(u64, crate::meta_backend::DirEntry)>>, SqueezefsError> {
+        let slice_page = |cached: &std::sync::Arc<[(std::boxed::Box<str>, u64, u64, u32)]>|
+         -> Vec<(u64, crate::meta_backend::DirEntry)> {
+            // §5.1 resume rule: offsets 0/1/2 ⇒ the start; c ≥ 3 ⇒
+            // strictly after cookie c (entries are cookie-ascending).
+            let start = if offset < 3 {
+                0
+            } else {
+                cached.partition_point(|e| e.2 <= offset)
+            };
+            cached[start..]
+                .iter()
+                .take(max)
+                .map(|(name, ino, cookie, ft)| {
+                    (
+                        *cookie,
+                        crate::meta_backend::DirEntry {
+                            ino: *ino,
+                            name: name.to_string(),
+                            file_type: *ft,
+                        },
+                    )
+                })
+                .collect()
+        };
+        if let Some(cached) = self.dir_entry_cache_v3.get(&parent) {
+            return Ok(Some(slice_page(&cached)));
+        }
+        // Listing start on an uncached directory: probe up to the cache
+        // cap + 1; small directories snapshot (with cookies), larger ones
+        // hand back the streamed prefix and stay stream-only.
+        if offset < 3 {
+            let mut all: Vec<(u64, crate::meta_backend::DirEntry)> = Vec::new();
+            let mut cursor = 0u64;
+            loop {
+                let Some(page) = self
+                    .readdir_v3_page(parent, cursor, V3_READDIR_PAGE)
+                    .await?
+                else {
+                    return Ok(None); // v2-routed parent: legacy path
+                };
+                let short = page.len() < V3_READDIR_PAGE;
+                if let Some((c, _)) = page.last() {
+                    cursor = *c;
+                }
+                all.extend(page);
+                if short || all.len() > DIR_ENTRY_CACHE_MAX_ENTRIES {
+                    break;
+                }
+            }
+            if all.len() <= DIR_ENTRY_CACHE_MAX_ENTRIES {
+                let snapshot: std::sync::Arc<[(std::boxed::Box<str>, u64, u64, u32)]> = all
+                    .iter()
+                    .map(|(cookie, d)| {
+                        (d.name.clone().into_boxed_str(), d.ino, *cookie, d.file_type)
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                self.dir_entry_cache_v3.insert(parent, snapshot);
+            }
+            all.truncate(max);
+            return Ok(Some(all));
+        }
+        self.readdir_v3_page(parent, offset, max).await
+    }
+
     async fn get_attr_internal(&self, ino: u64) -> Result<FileAttr, SqueezefsError> {
         let mut attr = match self.attr_cache.get(&ino) {
             Some((attr, cached_at)) if cached_at.elapsed() < Duration::from_secs(1) => attr,
@@ -2802,6 +2893,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.dir_entry_cache.invalidate(&parent);
+            self.dir_entry_cache_v3.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
@@ -2869,6 +2961,7 @@ impl Filesystem for SqueezefsFilesystem {
                 },
             );
             self.dir_entry_cache.invalidate(&parent);
+            self.dir_entry_cache_v3.invalidate(&parent);
             // Keep parent attr in cache; only dir_entry listing is stale.
             self.add_open(inode.ino);
             Ok(ReplyCreated {
@@ -3397,6 +3490,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.dir_entry_cache.invalidate(&parent);
+            self.dir_entry_cache_v3.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
@@ -3450,7 +3544,9 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
             self.dir_entry_cache.invalidate(&parent);
+            self.dir_entry_cache_v3.invalidate(&parent);
             self.dir_entry_cache.invalidate(&current_inode.ino);
+            self.dir_entry_cache_v3.invalidate(&current_inode.ino);
             self.attr_cache.invalidate(&parent);
             self.attr_cache.invalidate(&current_inode.ino);
             // Reclaim only after FUSE forget (or last release if unlinked-open).
@@ -3628,6 +3724,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.dir_entry_cache.invalidate(&parent);
+            self.dir_entry_cache_v3.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
@@ -3707,6 +3804,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .insert(ino, (attr, std::time::Instant::now()));
             self.attr_cache.invalidate(&new_parent);
             self.dir_entry_cache.invalidate(&new_parent);
+            self.dir_entry_cache_v3.invalidate(&new_parent);
             return Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
                 attr,
@@ -3748,6 +3846,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
             self.dir_entry_cache.invalidate(&parent);
+            self.dir_entry_cache_v3.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
             self.attr_cache.invalidate(&child_ino);
             // Defer destroy_inode until forget/release (see rmdir comment).
@@ -3805,7 +3904,9 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
             self.dir_entry_cache.invalidate(&parent);
+            self.dir_entry_cache_v3.invalidate(&parent);
             self.dir_entry_cache.invalidate(&new_parent);
+            self.dir_entry_cache_v3.invalidate(&new_parent);
             self.attr_cache.invalidate(&parent);
             self.attr_cache.invalidate(&new_parent);
             if let Some(d_ino) = dest_ino {
@@ -3875,7 +3976,9 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
 
             self.dir_entry_cache.invalidate(&parent);
+            self.dir_entry_cache_v3.invalidate(&parent);
             self.dir_entry_cache.invalidate(&new_parent);
+            self.dir_entry_cache_v3.invalidate(&new_parent);
             self.attr_cache.invalidate(&parent);
             self.attr_cache.invalidate(&new_parent);
             if let Some(s_ino) = src_ino {
@@ -3918,7 +4021,7 @@ impl Filesystem for SqueezefsFilesystem {
             // ---- PR K7 (§5.1): v3 volumes stream by key cookies. ----
             let off_u = offset.max(0) as u64;
             if let Some(page) = self
-                .readdir_v3_page(parent, off_u, V3_READDIR_PAGE)
+                .v3_listing_page(parent, off_u, V3_READDIR_PAGE)
                 .await
                 .map_err(map_squeezefs_err)?
             {
@@ -4183,7 +4286,7 @@ impl Filesystem for SqueezefsFilesystem {
         let readdirplus_future = async {
             // ---- PR K7 (§5.1): v3 volumes stream by key cookies. ----
             if let Some(page) = self
-                .readdir_v3_page(parent, offset, V3_READDIRPLUS_PAGE)
+                .v3_listing_page(parent, offset, V3_READDIRPLUS_PAGE)
                 .await
                 .map_err(map_squeezefs_err)?
             {

@@ -139,3 +139,107 @@ async fn test_teardown_flush_aggregates_failures() {
         summary.error_samples.len()
     );
 }
+
+// ===========================================================================
+// PR K6b — checkpoint-task lifecycle (design §4.6): the per-volume
+// checkpoint/writeback task drains cleanly on unmount and never leaks when
+// a backend is dropped without one.
+// ===========================================================================
+
+use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
+use squeezefs::meta_backend::Metadata;
+
+async fn v3_volume() -> (std::sync::Arc<KvMetaBackend>, NamedTempFile) {
+    let f = NamedTempFile::new().unwrap();
+    f.as_file().set_len(64 * 1024 * 1024).unwrap();
+    format_v3(
+        f.path(),
+        64 * 1024 * 1024,
+        &FormatV3Options {
+            node_size: 64 * 1024,
+            journal_len_override: Some(1024 * 1024),
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .unwrap();
+    let be = KvMetaBackend::open(f.path()).await.unwrap();
+    (be, f)
+}
+
+/// Contract 3 (K6b): `shutdown` runs a final checkpoint and JOINS the
+/// checkpoint task — after it returns, the task is gone (the liveness
+/// probe fails to upgrade) and a remount replays an EMPTY window. A
+/// second `shutdown` is a no-op, and mutations after shutdown are
+/// refused rather than silently un-checkpointed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_v3_shutdown_drains_checkpoint_task() {
+    let (be, f) = v3_volume().await;
+    for i in 0..10 {
+        Metadata::create(
+            be.as_ref(),
+            1,
+            &format!("t{i}"),
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    }
+    let probe = be.checkpoint_alive_probe();
+    assert!(
+        probe.upgrade().is_some(),
+        "the checkpoint task must be alive while the backend serves"
+    );
+
+    be.shutdown().await.expect("clean shutdown");
+    assert!(
+        probe.upgrade().is_none(),
+        "shutdown must JOIN the checkpoint task — an alive probe means a leaked task"
+    );
+    be.shutdown().await.expect("shutdown is idempotent");
+    assert!(
+        Metadata::create(be.as_ref(), 1, "late", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .is_err(),
+        "mutations after shutdown must be refused (they could never be checkpointed)"
+    );
+    drop(be);
+
+    let re = KvMetaBackend::open(f.path()).await.unwrap();
+    assert_eq!(
+        re.replay_stats().entries,
+        0,
+        "the final checkpoint must drain the whole window (tail == head)"
+    );
+    for i in 0..10 {
+        assert!(re.lookup(1, &format!("t{i}")).await.is_ok());
+    }
+    re.shutdown().await.unwrap();
+}
+
+/// Contract 4 (K6b): dropping a backend WITHOUT shutdown must not leak
+/// the checkpoint task — it observes the dead backend on its next tick
+/// and exits (the v2 flusher's Arc-sentinel discipline).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_v3_dropped_backend_reaps_checkpoint_task() {
+    let (be, _f) = v3_volume().await;
+    Metadata::create(be.as_ref(), 1, "orphan", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let probe = be.checkpoint_alive_probe();
+    drop(be);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while probe.upgrade().is_some() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        probe.upgrade().is_none(),
+        "the checkpoint task must exit once its backend is dropped (no leaked tasks)"
+    );
+}

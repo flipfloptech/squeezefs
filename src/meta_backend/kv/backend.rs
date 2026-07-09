@@ -52,7 +52,7 @@ use super::tree::{KvTree, RootPtr};
 use super::KvError;
 use crate::error::Result;
 use crate::meta_backend::atomicity::META_VOLUME_ATOMICITY_COW;
-use crate::meta_backend::{DirEntry, Ino, Inode};
+use crate::meta_backend::{DirEntry, Ino, Inode, Metadata};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,7 +127,15 @@ impl KvMetaBackend {
     /// superblock, unknown incompat feature bits, no valid ledger slot,
     /// stale/corrupt tree roots, real device I/O errors. Journal-window
     /// tears recover and are counted, never loud (§4.1).
-    pub async fn open(path: &Path) -> std::result::Result<Self, KvError> {
+    ///
+    /// Returns `Arc<Self>` (PR K6b): the per-volume checkpoint/writeback
+    /// task holds a `Weak` back-reference to the backend, so construction
+    /// and task spawn are one step.
+    pub async fn open(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
+        Ok(Arc::new(Self::open_inner(path).await?))
+    }
+
+    async fn open_inner(path: &Path) -> std::result::Result<Self, KvError> {
         let t0 = std::time::Instant::now();
 
         // 1. Superblock (the version gate is the loud unit).
@@ -494,5 +502,180 @@ impl KvMetaBackend {
             }
         }
         Ok(out)
+    }
+
+    // -----------------------------------------------------------------
+    // PR K6b — the §4.4 commit pipeline + §4.6 checkpoint surface.
+    // Tests-first commit: signatures only (`todo!()` bodies); the feat
+    // commit fills them in.
+    // -----------------------------------------------------------------
+
+    /// The per-volume metadata lock manager (design §4.9 4a): the same
+    /// `DlmLockManager` discipline the v2 backend embeds — I/D stripes
+    /// acquired *before* any node lock (level 4b).
+    pub fn dlm(&self) -> &crate::meta_backend::dlm::DlmLockManager {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    /// The mounted journal ring (K6a dropped it after replay; K6b stores
+    /// it — the §4.4 admission/reservation core and the checkpoint task's
+    /// `reusable_upto` watermark live here). Public for the crash harness,
+    /// which computes physical entry offsets to arm write faults.
+    pub fn journal_ring(&self) -> &super::journal::JournalRing {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    /// §4.8 monotonic ino allocation: one `fetch_add`, no reuse, no
+    /// free-on-failure (a failed create burns the ino; crash-skipped
+    /// ranges waste nothing that matters).
+    pub fn allocate_ino(&self) -> Ino {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    /// §4.4 pt 4 escalation state: repeated journal-write failures latch
+    /// the volume failed — every subsequent mutation returns `EIO` until
+    /// remount (the `errors=remount-ro` analog). The routed layer mirrors
+    /// this into `disabled_volumes`.
+    pub fn is_failed(&self) -> bool {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    /// Ring-admission parks so far (§4.4 pt 5 `meta_kv_journal_full_stalls`
+    /// — counted **before** any node lock is taken).
+    pub fn journal_full_stalls(&self) -> u64 {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    /// Coalesced durability barrier for this volume (the v2
+    /// `MetaLvBackend::sync_device` shape, riding the same
+    /// `SyncCoalescer` group-commit discipline — §4.6 pt 4).
+    pub async fn sync_device(&self) -> Result<()> {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    /// Force one full checkpoint cycle now (§4.6 pt 2): flush dirty
+    /// nodes (snapshot-then-write), barrier, compute the tail, write the
+    /// ledger slot, advance `reusable_upto` once durable. The background
+    /// task calls this on cadence; tests and `shutdown` call it directly.
+    pub async fn checkpoint_now(&self) -> std::result::Result<(), KvError> {
+        todo!("PR K6b: checkpoint/writeback")
+    }
+
+    /// Clean unmount: final checkpoint (tail == head ⇒ an empty replay
+    /// window on the next mount) + checkpoint-task drain (no leaked
+    /// tasks — `tests/dismount_teardown_tests.rs`). Idempotent.
+    pub async fn shutdown(&self) -> std::result::Result<(), KvError> {
+        todo!("PR K6b: checkpoint/writeback")
+    }
+
+    /// Whether the background checkpoint task is still alive (a `Weak`
+    /// probe for the teardown tests: `upgrade()` fails once the task has
+    /// exited and dropped its liveness token).
+    pub fn checkpoint_alive_probe(&self) -> std::sync::Weak<()> {
+        todo!("PR K6b: checkpoint/writeback")
+    }
+
+    /// §4.8 batched destroy: one journal entry per batch carrying the
+    /// inode `Delete`s plus each ino's enumerated xattr `Delete`s.
+    pub async fn destroy_inodes(&self, inos: &[Ino]) -> Result<()> {
+        let _ = inos;
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    /// §5.3: layout xattr + size as ONE two-record transaction (v2's
+    /// non-transactional two-write path, made atomic on v3).
+    pub async fn set_layout_and_size(&self, ino: Ino, layout: &[u8], size: u64) -> Result<()> {
+        let _ = (ino, layout, size);
+        todo!("PR K6b: kv commit pipeline")
+    }
+}
+
+/// The full mutating `Metadata` surface on v3 (PR K6b): every op the v2
+/// backend serves, staged as a `KvTx` (records + read-your-own-writes
+/// overlay) and committed through the §4.4 pipeline — pre-lock ring
+/// admission, ascending-NodeId leaf locks with revalidate/retry, in-lock
+/// reservation, out-of-lock entry write, seq-conditional rollback.
+///
+/// Error shapes and semantics mirror `MetaLvBackend`'s trait impl (the
+/// dual-format conformance suite runs the same assertions against both).
+#[async_trait::async_trait]
+impl Metadata for KvMetaBackend {
+    async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
+        // The read side is live since K6a.
+        KvMetaBackend::lookup(self, parent, name).await
+    }
+
+    async fn create(
+        &self,
+        _parent: Ino,
+        _name: &str,
+        _mode: u32,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<Inode> {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    async fn unlink(&self, _parent: Ino, _name: &str) -> Result<Ino> {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    async fn link(&self, _ino: Ino, _new_parent: Ino, _new_name: &str) -> Result<Inode> {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    async fn rename(
+        &self,
+        _old_parent: Ino,
+        _old_name: &str,
+        _new_parent: Ino,
+        _new_name: &str,
+        _flags: u32,
+    ) -> Result<()> {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    async fn readdir(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>> {
+        KvMetaBackend::readdir(self, dir, offset, max).await
+    }
+
+    async fn getattr(&self, ino: Ino) -> Result<Inode> {
+        KvMetaBackend::getattr(self, ino).await
+    }
+
+    #[allow(clippy::too_many_arguments)] // the trait's signature
+    async fn setattr(
+        &self,
+        _ino: Ino,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _atime: Option<u64>,
+        _mtime: Option<u64>,
+        _ctime: Option<u64>,
+    ) -> Result<Inode> {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        KvMetaBackend::getxattr(self, ino, name).await
+    }
+
+    async fn setxattr(&self, _ino: Ino, _name: &str, _value: &[u8]) -> Result<()> {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    async fn removexattr(&self, _ino: Ino, _name: &str) -> Result<()> {
+        todo!("PR K6b: kv commit pipeline")
+    }
+
+    async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
+        KvMetaBackend::listxattr(self, ino).await
+    }
+
+    async fn destroy_inode(&self, ino: Ino) -> Result<()> {
+        // Single destroy == a size-1 batch: one code path (the v2 shape).
+        self.destroy_inodes(std::slice::from_ref(&ino)).await
     }
 }

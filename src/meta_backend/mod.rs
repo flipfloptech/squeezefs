@@ -1219,9 +1219,9 @@ impl VolumeBackend {
                     storage,
                 ))))
             }
-            kv::superblock::VolumeFormat::V3(_) => Ok(VolumeBackend::V3(std::sync::Arc::new(
+            kv::superblock::VolumeFormat::V3(_) => Ok(VolumeBackend::V3(
                 kv::backend::KvMetaBackend::open(std::path::Path::new(path)).await?,
-            ))),
+            )),
         }
     }
 
@@ -1274,6 +1274,175 @@ impl VolumeBackend {
             VolumeBackend::V3(be) => be.listxattr(ino).await,
         }
     }
+
+    // -----------------------------------------------------------------
+    // PR K6b: the mutating dispatch — every op the v2 backend serves,
+    // routed by format (design §4.9 "Volume routing"; the dual-format
+    // conformance suite runs the same assertions against both arms).
+    // -----------------------------------------------------------------
+
+    /// The per-volume metadata lock manager (level 4a of P1-9) — the
+    /// routed layer's lock phases are format-agnostic.
+    pub fn dlm(&self) -> &dlm::DlmLockManager {
+        match self {
+            VolumeBackend::V2(be) => &be.dlm,
+            VolumeBackend::V3(be) => be.dlm(),
+        }
+    }
+
+    /// Mutating dispatch: `Metadata::create` shape.
+    pub async fn create(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
+        match self {
+            VolumeBackend::V2(be) => be.create(parent, name, mode, uid, gid).await,
+            VolumeBackend::V3(be) => be.create(parent, name, mode, uid, gid).await,
+        }
+    }
+
+    /// Mutating dispatch: `Metadata::unlink` shape.
+    pub async fn unlink(&self, parent: Ino, name: &str) -> Result<Ino> {
+        match self {
+            VolumeBackend::V2(be) => be.unlink(parent, name).await,
+            VolumeBackend::V3(be) => Metadata::unlink(be.as_ref(), parent, name).await,
+        }
+    }
+
+    /// Mutating dispatch: `Metadata::link` shape.
+    pub async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode> {
+        match self {
+            VolumeBackend::V2(be) => be.link(ino, new_parent, new_name).await,
+            VolumeBackend::V3(be) => Metadata::link(be.as_ref(), ino, new_parent, new_name).await,
+        }
+    }
+
+    /// Mutating dispatch: `Metadata::rename` shape.
+    pub async fn rename(
+        &self,
+        old_parent: Ino,
+        old_name: &str,
+        new_parent: Ino,
+        new_name: &str,
+        flags: u32,
+    ) -> Result<()> {
+        match self {
+            VolumeBackend::V2(be) => {
+                be.rename(old_parent, old_name, new_parent, new_name, flags)
+                    .await
+            }
+            VolumeBackend::V3(be) => {
+                Metadata::rename(
+                    be.as_ref(),
+                    old_parent,
+                    old_name,
+                    new_parent,
+                    new_name,
+                    flags,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Mutating dispatch: `Metadata::setattr` shape.
+    #[allow(clippy::too_many_arguments)] // the trait's signature
+    pub async fn setattr(
+        &self,
+        ino: Ino,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+        ctime: Option<u64>,
+    ) -> Result<Inode> {
+        match self {
+            VolumeBackend::V2(be) => {
+                be.setattr(ino, mode, uid, gid, size, atime, mtime, ctime)
+                    .await
+            }
+            VolumeBackend::V3(be) => {
+                Metadata::setattr(be.as_ref(), ino, mode, uid, gid, size, atime, mtime, ctime).await
+            }
+        }
+    }
+
+    /// Mutating dispatch: `Metadata::setxattr` shape.
+    pub async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        match self {
+            VolumeBackend::V2(be) => be.setxattr(ino, name, value).await,
+            VolumeBackend::V3(be) => Metadata::setxattr(be.as_ref(), ino, name, value).await,
+        }
+    }
+
+    /// Mutating dispatch: `Metadata::removexattr` shape.
+    pub async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
+        match self {
+            VolumeBackend::V2(be) => be.removexattr(ino, name).await,
+            VolumeBackend::V3(be) => Metadata::removexattr(be.as_ref(), ino, name).await,
+        }
+    }
+
+    /// Mutating dispatch: `Metadata::destroy_inode` shape.
+    pub async fn destroy_inode(&self, ino: Ino) -> Result<()> {
+        match self {
+            VolumeBackend::V2(be) => be.destroy_inode(ino).await,
+            VolumeBackend::V3(be) => Metadata::destroy_inode(be.as_ref(), ino).await,
+        }
+    }
+
+    /// Batched destroy (the reclaim group-commit surface).
+    pub async fn destroy_inodes(&self, inos: &[Ino]) -> Result<()> {
+        match self {
+            VolumeBackend::V2(be) => be.destroy_inodes(inos).await,
+            VolumeBackend::V3(be) => be.destroy_inodes(inos).await,
+        }
+    }
+
+    /// Coalesced durability barrier for this volume's device.
+    pub async fn sync_device(&self) -> Result<()> {
+        match self {
+            VolumeBackend::V2(be) => be.sync_device().await,
+            VolumeBackend::V3(be) => be.sync_device().await,
+        }
+    }
+
+    /// Layout xattr + size persist (the fsync/release writeback path).
+    /// On v3 this is ONE two-record transaction (§5.3).
+    pub async fn set_layout_and_size(&self, ino: Ino, layout: &[u8], size: u64) -> Result<()> {
+        match self {
+            VolumeBackend::V2(be) => {
+                let _guard = be.dlm.lock_inode_exclusive(ino).await;
+                xattr::set_xattr(&be.storage, ino, "layout", layout).await?;
+                let mut disk_inode = inode::read_inode(&be.storage, ino).await?;
+                disk_inode.size = size;
+                disk_inode.ctime = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                inode::write_inode(&be.storage, ino, &disk_inode).await?;
+                Ok(())
+            }
+            VolumeBackend::V3(be) => be.set_layout_and_size(ino, layout, size).await,
+        }
+    }
+
+    /// Clean-unmount teardown: v3 volumes run a final checkpoint and
+    /// drain the checkpoint task; v2 volumes reconcile the on-disk inode
+    /// bitmap (the pre-existing unmount behavior, moved behind the
+    /// dispatch).
+    pub async fn shutdown_for_unmount(&self) -> Result<()> {
+        match self {
+            VolumeBackend::V2(be) => be.storage.refresh_bitmap_from_table().await,
+            VolumeBackend::V3(be) => Ok(be.shutdown().await?),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1294,6 +1463,15 @@ impl RoutedMetaBackend {
                 ahash::RandomState::new(),
             )),
         }
+    }
+
+    /// PR K6b: construct over the dual-format dispatch — the volume set
+    /// may mix v2 and v3 arms (design §4.9: mixed-version sets are legal;
+    /// migrate one volume at a time). The plain [`Self::new`] remains the
+    /// all-v2 convenience the existing fixtures use.
+    pub fn new_dispatch(volumes: Vec<VolumeBackend>) -> Self {
+        let _ = volumes;
+        todo!("PR K6b: fold VolumeBackend into RoutedMetaBackend")
     }
 
     /// The per-volume metadata lock manager (tests force stripe collisions

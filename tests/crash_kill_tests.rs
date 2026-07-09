@@ -28,8 +28,10 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use squeezefs::meta_backend::inode::read_inode;
+use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3, FormatV3Options};
 use squeezefs::meta_backend::storage::MetaLvStorage;
-use squeezefs::meta_backend::{MetaLvBackend, Metadata};
+use squeezefs::meta_backend::{MetaLvBackend, Metadata, RoutedMetaBackend, VolumeBackend};
 
 /// 130 MiB: covers the full journal region (108 MiB) and the quarantine
 /// range (limit = (130−72) MiB / 32 KiB = 1856 inos > 1152) while keeping
@@ -444,4 +446,460 @@ async fn test_kill9_remount_soak() {
             }
         }
     }
+}
+
+// ===========================================================================
+// PR K6b — the dual-format half of the soak (design Rollout 4: "the kill-9
+// soak runs against BOTH formats from PR K6b on"), the §4.4 pt 4
+// rollback-race case, and the `disabled_volumes` fail-stop escalation.
+// ===========================================================================
+
+/// v3 soak volume: 64 MiB file-backed, small nodes, a small ring so the
+/// kill window crosses checkpoint boundaries.
+const V3_VOL_SIZE: u64 = 64 * 1024 * 1024;
+
+fn v3_format_opts() -> FormatV3Options {
+    FormatV3Options {
+        node_size: 64 * 1024,
+        journal_len_override: Some(1024 * 1024),
+        force: false,
+        full_wipe: false,
+        format_config_xattr: None,
+    }
+}
+
+/// Child branch for the v3 rounds: the same churn protocol as the v2
+/// child (start line → op → `sync_device` barrier → ack line), through
+/// the `KvMetaBackend` `Metadata` surface.
+#[test]
+fn crash_child_entry_v3() {
+    if std::env::var("SQUEEZEFS_CRASH_CHILD_V3").is_err() {
+        return;
+    }
+    let vol = std::path::PathBuf::from(std::env::var("SQUEEZEFS_CRASH_VOL").unwrap());
+    let ledger = std::path::PathBuf::from(std::env::var("SQUEEZEFS_CRASH_LEDGER").unwrap());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let backend = KvMetaBackend::open(&vol).await.unwrap();
+
+        let mut i: u64 = 0;
+        loop {
+            let name = format!("f{i}");
+
+            ledger_append(&ledger, &format!("start create {name}"));
+            let ino =
+                match Metadata::create(backend.as_ref(), 1, &name, libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                {
+                    Ok(f) => f.ino,
+                    Err(_) => break, // volume full mid-kill window — stop quietly
+                };
+            backend.sync_device().await.unwrap();
+            ledger_append(&ledger, &format!("ack create {name} {ino}"));
+
+            ledger_append(&ledger, &format!("start setxattr {ino} user.crash v{i}"));
+            Metadata::setxattr(
+                backend.as_ref(),
+                ino,
+                "user.crash",
+                format!("v{i}").as_bytes(),
+            )
+            .await
+            .unwrap();
+            backend.sync_device().await.unwrap();
+            ledger_append(&ledger, &format!("ack setxattr {ino} user.crash v{i}"));
+
+            if i.is_multiple_of(3) {
+                ledger_append(&ledger, &format!("start unlink {name}"));
+                Metadata::unlink(backend.as_ref(), 1, &name).await.unwrap();
+                backend.sync_device().await.unwrap();
+                ledger_append(&ledger, &format!("ack unlink {name} {ino}"));
+
+                ledger_append(&ledger, &format!("start destroy {ino}"));
+                Metadata::destroy_inode(backend.as_ref(), ino)
+                    .await
+                    .unwrap();
+                backend.sync_device().await.unwrap();
+                ledger_append(&ledger, &format!("ack destroy {ino}"));
+            }
+            i += 1;
+        }
+        std::future::pending::<()>().await
+    });
+}
+
+/// The v3 kill-9 soak (design §4.10 "kill-9 soak runs unchanged against
+/// v3 volumes with two strengthened assertions"): every ledger-acked op
+/// present **and whole** (a create's dentry+inode ride ONE journal entry,
+/// so a dangling dentry is the torn shape the assertion catches), and
+/// replay idempotence via the post-fold digest walk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kill9_remount_soak_v3() {
+    let rounds: u32 = std::env::var("SQUEEZEFS_CRASH_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let exe = std::env::current_exe().expect("test binary path");
+
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = dir.path().join("crash.v3.meta");
+        let ledger = dir.path().join("ledger.log");
+
+        // Parent formats; the child mounts + churns.
+        {
+            let f = std::fs::File::create(&vol).unwrap();
+            f.set_len(V3_VOL_SIZE).unwrap();
+            format_v3(&vol, V3_VOL_SIZE, &v3_format_opts())
+                .await
+                .unwrap();
+        }
+
+        let mut child = Command::new(&exe)
+            .args([
+                "--exact",
+                "crash_child_entry_v3",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("SQUEEZEFS_CRASH_CHILD_V3", "1")
+            .env("SQUEEZEFS_CRASH_VOL", &vol)
+            .env("SQUEEZEFS_CRASH_LEDGER", &ledger)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn v3 crash child");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ledger.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            ledger.exists(),
+            "round {round}: v3 child never started churning"
+        );
+        let jitter: u64 = {
+            use rand::Rng;
+            rand::thread_rng().gen_range(5..=50)
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+        child.kill().expect("SIGKILL v3 child");
+        let _ = child.wait();
+
+        // ---- Remount + the v3 invariants -------------------------------
+        let m = parse_ledger(&ledger);
+        assert!(
+            m.lines.iter().any(|l| l.starts_with("ack ")),
+            "round {round}: the v3 child never acked a single op — commit pipeline dead"
+        );
+
+        // Mount #1: superblock → ledger → bitmap → replay. NEVER loud for
+        // ring/window contents after a kill (§4.1).
+        let m1 = KvMetaBackend::open(&vol)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: v3 remount failed loud: {e}"));
+
+        // Whole-tx atomicity: every dentry in the volume resolves to a
+        // live inode that agrees on the ino — a create is one entry, so a
+        // dangling dentry or missing inode is a torn-transaction artifact.
+        let listing = m1.readdir(1, 0, usize::MAX).await.unwrap();
+        for d in &listing {
+            let got = m1.getattr(d.ino).await.unwrap_or_else(|e| {
+                panic!(
+                    "round {round}: dentry '{}' names ino {} with no inode record \
+                     (partial transaction visible): {e}",
+                    d.name, d.ino
+                )
+            });
+            assert_eq!(got.ino, d.ino);
+        }
+
+        // D0: acked ops present (unless superseded), acked xattr values
+        // intact, acked unlinks stay unlinked.
+        let expectations = acked_expectations(&m);
+        eprintln!(
+            "[kill9-v3 round {round}] ledger: {} lines, {} acked inos, {} un-acked starts; \
+             {} live root dentries; replay: {} entries, {} dropped",
+            m.lines.len(),
+            m.acked_inos.len(),
+            m.unacked_starts,
+            listing.len(),
+            m1.replay_stats().entries,
+            m1.replay_stats().dropped_torn,
+        );
+        for (name, ino, expect) in expectations {
+            match expect {
+                Expect::Present(xattr) => {
+                    let found = m1.lookup(1, &name).await.unwrap_or_else(|e| {
+                        panic!("round {round}: acked create '{name}' lost after kill-9: {e}")
+                    });
+                    assert_eq!(found.ino, ino, "round {round}: '{name}' resolved wrong ino");
+                    if let Some(val) = xattr {
+                        let stored = m1
+                            .getxattr(ino, "user.crash")
+                            .await
+                            .expect("xattr read")
+                            .unwrap_or_else(|| {
+                                panic!("round {round}: acked xattr on ino {ino} lost")
+                            });
+                        assert_eq!(
+                            stored,
+                            val.as_bytes(),
+                            "round {round}: acked xattr value mismatch on ino {ino}"
+                        );
+                    }
+                }
+                Expect::Absent => {
+                    assert!(
+                        m1.lookup(1, &name).await.is_err(),
+                        "round {round}: acked unlink '{name}' resurrected after kill-9"
+                    );
+                }
+                Expect::Unknown => {}
+            }
+        }
+
+        // §4.8: the recovered watermark clears every acked ino.
+        if let Some(max_acked) = m.acked_inos.iter().max() {
+            assert!(
+                m1.next_ino() > *max_acked,
+                "round {round}: next_ino {} does not clear acked ino {max_acked}",
+                m1.next_ino()
+            );
+        }
+
+        // Replay idempotence (§4.10): digest, clean-shutdown, remount —
+        // the post-fold digest walk must be identical, and the second
+        // mount's window empty (the shutdown checkpointed it away).
+        let d1 = digest_backend(&m1).await.unwrap();
+        m1.shutdown()
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: post-crash shutdown failed: {e}"));
+        drop(m1);
+        let m2 = KvMetaBackend::open(&vol)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: second v3 remount failed: {e}"));
+        assert_eq!(
+            m2.replay_stats().entries,
+            0,
+            "round {round}: a clean shutdown must leave an empty replay window"
+        );
+        let d2 = digest_backend(&m2).await.unwrap();
+        assert_eq!(
+            d1, d2,
+            "round {round}: replay-twice digests diverge — replay is not idempotent"
+        );
+    }
+}
+
+/// Physical file offset of the FIRST byte a reservation starting at
+/// logical ring position `pos` would write (the §4.4 fault-arming helper:
+/// entry headers start at the reservation's first logical byte).
+fn journal_physical_offset(be: &KvMetaBackend, pos: u64) -> u64 {
+    let geo = *be.journal_ring().core().geometry();
+    be.superblock().journal.start + geo.page_index(pos) * 4096 + 24 + geo.in_page_off(pos)
+}
+
+/// **The §4.4 pt 4 rollback-race case**: two shared-parent-lock creates
+/// race; a persistent write error at the ring head fails exactly the
+/// first reservation's entry write. The failed writer's seq-conditional
+/// rollback must (a) roll its OWN records back, (b) leave the concurrent
+/// committed Δtime (and every other committed record) standing, and (c)
+/// leave RAM == replay — asserted via the post-fold digest against a
+/// fresh mount of the same bytes, every round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rollback_race_seq_conditional() {
+    // Park the checkpoint cadence: the per-round digest check mounts a
+    // second (read-only-in-spirit) backend on the same bytes, and two
+    // live checkpoint writers on one file is not a supported shape. With
+    // the cadence at 60 s neither task writes during the test, and the
+    // armed ring-head fault can only be taken by one of the two racing
+    // user commits — deterministic.
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            squeezefs::uring_fs::clear_faults();
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let vol = dir.path().join("rollback.v3.meta");
+    std::fs::File::create(&vol)
+        .unwrap()
+        .set_len(V3_VOL_SIZE)
+        .unwrap();
+    format_v3(&vol, V3_VOL_SIZE, &v3_format_opts())
+        .await
+        .unwrap();
+
+    let be = KvMetaBackend::open(&vol).await.unwrap();
+    let routed = std::sync::Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
+        be.clone(),
+    )]));
+
+    let parent = routed
+        .create(1, "racedir", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+
+    let mut failures_seen = 0u32;
+    for round in 0..24u32 {
+        // Arm a persistent single-offset write error at the CURRENT ring
+        // head: the next reservation's entry write fails; every later
+        // reservation (different offsets) succeeds.
+        let head = be.journal_ring().core().head();
+        squeezefs::uring_fs::arm_sector_write_error(journal_physical_offset(&be, head));
+
+        let a = {
+            let r = routed.clone();
+            let name = format!("race-a-{round}");
+            tokio::spawn(async move { r.create(parent, &name, libc::S_IFREG | 0o644, 0, 0).await })
+        };
+        let b = {
+            let r = routed.clone();
+            let name = format!("race-b-{round}");
+            tokio::spawn(async move { r.create(parent, &name, libc::S_IFREG | 0o644, 0, 0).await })
+        };
+        let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+        squeezefs::uring_fs::clear_faults();
+
+        // Exactly one op takes the armed offset (the checkpoint cadence
+        // is parked, so no other reservation can absorb it): the first
+        // reservation's entry covers the head byte and fails; the
+        // second's range starts past it and commits.
+        let failed: Vec<&str> = [("a", &ra), ("b", &rb)]
+            .iter()
+            .filter(|(_, r)| r.is_err())
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "round {round}: exactly one racing create must take the armed ring-head fault \
+             (got a={ra:?} b={rb:?})"
+        );
+        failures_seen += failed.len() as u32;
+
+        // The survivor resolves; the failed name does not (rolled back).
+        for (name, res) in [
+            (format!("race-a-{round}"), &ra),
+            (format!("race-b-{round}"), &rb),
+        ] {
+            match res {
+                Ok(inode) => {
+                    let got = routed.lookup(parent, &name).await.unwrap_or_else(|e| {
+                        panic!("round {round}: committed create '{name}' must resolve: {e}")
+                    });
+                    assert_eq!(got.ino, inode.ino);
+                }
+                Err(_) => {
+                    assert!(
+                        routed.lookup(parent, &name).await.is_err(),
+                        "round {round}: failed create '{name}' still visible — rollback leaked"
+                    );
+                }
+            }
+        }
+
+        // RAM == replay (the §4.4 pt 4 theorem): a fresh mount of the
+        // same bytes folds to exactly the live in-RAM state — the failed
+        // writer's hole is dropped, the concurrent committed Δtime on the
+        // shared parent-key survives the rollback.
+        let d_live = squeezefs::meta_backend::kv::builder::digest_walk(&be.trees())
+            .await
+            .unwrap();
+        let replayed = KvMetaBackend::open(&vol).await.unwrap();
+        let d_replay = digest_backend(&replayed).await.unwrap();
+        assert_eq!(
+            d_live, d_replay,
+            "round {round}: live state and replay diverged after the rollback race"
+        );
+    }
+    assert!(
+        failures_seen > 0,
+        "the armed ring-head fault never fired — the race case tested nothing"
+    );
+
+    // The single-offset failures were sporadic, not repeated: the volume
+    // must NOT have escalated to fail-stop.
+    assert!(
+        !be.is_failed(),
+        "sporadic single-write failures must not latch the volume failed"
+    );
+}
+
+/// §4.4 pt 4 escalation: repeated journal-write failures (a poisoned
+/// device) latch the volume failed — mutations return EIO fast, reads
+/// keep serving, and the routed layer mirrors the latch into
+/// `disabled_volumes` (the existing fail-stop mechanism).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_repeated_journal_failures_escalate_to_disabled_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let vol = dir.path().join("escalate.v3.meta");
+    std::fs::File::create(&vol)
+        .unwrap()
+        .set_len(V3_VOL_SIZE)
+        .unwrap();
+    format_v3(&vol, V3_VOL_SIZE, &v3_format_opts())
+        .await
+        .unwrap();
+    let be = KvMetaBackend::open(&vol).await.unwrap();
+    let routed = std::sync::Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
+        be.clone(),
+    )]));
+
+    routed
+        .create(1, "pre-fail", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("healthy create");
+
+    // Kill the device: the torn-write fault poisons the path — every
+    // subsequent request on it fails EIO (the 'device died' model).
+    let head = be.journal_ring().core().head();
+    squeezefs::uring_fs::arm_torn_write(journal_physical_offset(&be, head), 0);
+
+    let mut failures = 0;
+    for i in 0..8 {
+        if routed
+            .create(1, &format!("dead-{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .is_err()
+        {
+            failures += 1;
+        }
+        if be.is_failed() {
+            break;
+        }
+    }
+    assert!(failures >= 3, "poisoned-path creates must fail");
+    assert!(
+        be.is_failed(),
+        "repeated journal write failures must latch the volume failed (§4.4 pt 4)"
+    );
+    squeezefs::uring_fs::clear_faults();
+
+    // The latch holds after the fault clears: EIO until remount.
+    assert!(
+        routed
+            .create(1, "post-fail", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .is_err(),
+        "a failed volume must refuse mutations until remount"
+    );
+    // The routed layer mirrored the latch into disabled_volumes.
+    assert!(
+        routed.disabled_volumes.contains_key(&0),
+        "the failed volume must be marked in disabled_volumes"
+    );
+    // Reads on the already-mounted state keep serving (fail-stop is for
+    // mutations; the RAM-authoritative read side is intact).
+    assert!(be.lookup(1, "pre-fail").await.is_ok());
 }

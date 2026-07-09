@@ -1093,3 +1093,823 @@ async fn v3_mount_surfaces_ledger_and_allocator_state() {
         "unset builder times default to 0 (the determinism contract)"
     );
 }
+
+// ===========================================================================
+// PR K6b — the mutating `Metadata` conformance suite (both formats), the
+// §4.4 pt 6 Δtime shared-parent contract, v3 persistence across remounts,
+// the §4.8 monotonic-ino contract, the unknown-ro write gate, and the R10
+// ring-full liveness storm (§4.4 pt 5).
+//
+// The v2 suite is the shared contract: every conformance case below runs
+// the SAME assertions against a v2 volume (`MetaLvBackend` behind the
+// dispatch) and a v3 volume (`KvMetaBackend`), per the K6b mandate.
+// ===========================================================================
+
+use squeezefs::error::SqueezefsError;
+use squeezefs::meta_backend::kv::{META_KV_NODE_COMPACTIONS, META_KV_NODE_SPLITS};
+use squeezefs::meta_backend::{RoutedMetaBackend, VolumeBackend as VB};
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::Arc;
+
+/// A fresh, EMPTY, mutable volume of the given format behind the dispatch
+/// (the mutating suite builds all content through the trait surface).
+async fn mutable_volume(kind: Kind) -> (VolumeBackend, NamedTempFile) {
+    let file = NamedTempFile::new().expect("temp volume");
+    match kind {
+        Kind::V2 => {
+            let storage = MetaLvStorage::open(file.path(), V2_VOL_LEN).unwrap();
+            MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+                .await
+                .unwrap();
+        }
+        Kind::V3 => {
+            file.as_file().set_len(V3_VOL_LEN).unwrap();
+            format_v3(
+                file.path(),
+                V3_VOL_LEN,
+                &FormatV3Options {
+                    node_size: V3_NODE_SIZE,
+                    journal_len_override: Some(V3_RING_LEN),
+                    force: false,
+                    full_wipe: false,
+                    format_config_xattr: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let backend = VolumeBackend::open_for_mount(file.path().to_str().unwrap())
+        .await
+        .expect("open_for_mount");
+    (backend, file)
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+#[rstest::rstest]
+#[case::v2(Kind::V2)]
+#[case::v3(Kind::V3)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_create_lookup_conformance(#[case] kind: Kind) {
+    let (b, _f) = mutable_volume(kind).await;
+
+    let t0 = now_ns();
+    let dir = b
+        .create(ROOT_INO, "dir", libc::S_IFDIR | 0o750, 1000, 1000)
+        .await
+        .expect("mkdir");
+    assert_eq!(dir.mode, libc::S_IFDIR | 0o750);
+    assert_eq!((dir.uid, dir.gid), (1000, 1000));
+    assert!(dir.ino > ROOT_INO);
+
+    let f = b
+        .create(dir.ino, "file.txt", libc::S_IFREG | 0o644, 7, 8)
+        .await
+        .expect("create file");
+    assert_eq!(f.mode, libc::S_IFREG | 0o644);
+    assert_eq!((f.uid, f.gid), (7, 8));
+    assert_eq!(f.nlink, 1, "a fresh regular file has nlink 1");
+    assert_eq!(f.size, 0);
+
+    // lookup and getattr agree with the create return.
+    let by_lookup = b.lookup(dir.ino, "file.txt").await.expect("lookup");
+    assert_eq!(by_lookup.ino, f.ino);
+    let by_getattr = b.getattr(f.ino).await.expect("getattr");
+    assert_eq!(
+        (
+            by_getattr.mode,
+            by_getattr.uid,
+            by_getattr.gid,
+            by_getattr.nlink
+        ),
+        (f.mode, f.uid, f.gid, f.nlink)
+    );
+
+    // The parent's times were bumped by the create.
+    let parent_after = b.getattr(dir.ino).await.unwrap();
+    assert!(
+        parent_after.mtime >= t0 && parent_after.ctime >= t0,
+        "create must update parent mtime/ctime (mtime {} ctime {} vs t0 {t0})",
+        parent_after.mtime,
+        parent_after.ctime
+    );
+
+    // Duplicate name: refused, naming the conflict.
+    let err = b
+        .create(dir.ino, "file.txt", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect_err("duplicate create must fail")
+        .to_string();
+    assert!(
+        err.contains("already exists"),
+        "EEXIST shape must name the conflict, got: {err}"
+    );
+
+    // Create under a missing parent: loud.
+    assert!(
+        b.create(999_999, "x", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .is_err(),
+        "create under a missing parent must error"
+    );
+
+    // setgid inheritance: a setgid parent stamps its gid on children and
+    // propagates setgid to subdirectories (the v2 contract).
+    let sg = b
+        .create(
+            ROOT_INO,
+            "sgid",
+            libc::S_IFDIR | libc::S_ISGID | 0o770,
+            0,
+            4242,
+        )
+        .await
+        .unwrap();
+    let child_f = b
+        .create(sg.ino, "f", libc::S_IFREG | 0o600, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(child_f.gid, 4242, "setgid dir stamps its gid on files");
+    let child_d = b
+        .create(sg.ino, "d", libc::S_IFDIR | 0o700, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(child_d.gid, 4242);
+    assert_ne!(
+        child_d.mode & libc::S_ISGID,
+        0,
+        "setgid propagates to subdirectories"
+    );
+}
+
+#[rstest::rstest]
+#[case::v2(Kind::V2)]
+#[case::v3(Kind::V3)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_unlink_and_link_conformance(#[case] kind: Kind) {
+    let (b, _f) = mutable_volume(kind).await;
+
+    let f = b
+        .create(ROOT_INO, "a.txt", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+
+    // Hard link: nlink 2, both names resolve to one ino.
+    let linked = b.link(f.ino, ROOT_INO, "b.txt").await.expect("link");
+    assert_eq!(linked.ino, f.ino);
+    assert_eq!(linked.nlink, 2);
+    assert_eq!(b.lookup(ROOT_INO, "b.txt").await.unwrap().ino, f.ino);
+
+    // Link to an existing name: refused.
+    assert!(
+        b.link(f.ino, ROOT_INO, "a.txt").await.is_err(),
+        "link over an existing name must fail"
+    );
+
+    // Unlink one name: the other survives with nlink 1.
+    let gone = b.unlink(ROOT_INO, "a.txt").await.expect("unlink");
+    assert_eq!(gone, f.ino, "unlink returns the child ino");
+    assert!(
+        b.lookup(ROOT_INO, "a.txt").await.is_err(),
+        "unlinked name must stop resolving"
+    );
+    let survivor = b.lookup(ROOT_INO, "b.txt").await.unwrap();
+    assert_eq!(survivor.ino, f.ino);
+    assert_eq!(survivor.nlink, 1, "nlink decremented by the unlink");
+
+    // Unlink of a missing name: loud.
+    let err = b
+        .unlink(ROOT_INO, "never-existed")
+        .await
+        .expect_err("unlink of a missing name must fail")
+        .to_string();
+    assert!(
+        err.to_lowercase().contains("not found"),
+        "unlink ENOENT shape, got: {err}"
+    );
+
+    // Directory unlink zeroes the child's nlink (the rmdir shape).
+    let d = b
+        .create(ROOT_INO, "subdir", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+    b.unlink(ROOT_INO, "subdir").await.expect("rmdir shape");
+    assert!(
+        b.lookup(ROOT_INO, "subdir").await.is_err(),
+        "removed dir must stop resolving"
+    );
+    let _ = d;
+}
+
+#[rstest::rstest]
+#[case::v2(Kind::V2)]
+#[case::v3(Kind::V3)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_rename_conformance(#[case] kind: Kind) {
+    let (b, _f) = mutable_volume(kind).await;
+
+    let d1 = b
+        .create(ROOT_INO, "d1", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+    let d2 = b
+        .create(ROOT_INO, "d2", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+    let f = b
+        .create(d1.ino, "orig", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+
+    // Plain move across directories.
+    b.rename(d1.ino, "orig", d2.ino, "moved", 0)
+        .await
+        .expect("plain rename");
+    assert!(b.lookup(d1.ino, "orig").await.is_err(), "old name gone");
+    assert_eq!(
+        b.lookup(d2.ino, "moved").await.unwrap().ino,
+        f.ino,
+        "new name resolves to the same ino"
+    );
+
+    // NOREPLACE against an existing destination: EEXIST, raw os error.
+    let blocker = b
+        .create(d2.ino, "blocker", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let err = b
+        .rename(d2.ino, "moved", d2.ino, "blocker", libc::RENAME_NOREPLACE)
+        .await
+        .expect_err("NOREPLACE over an existing name must fail");
+    match &err {
+        SqueezefsError::Io(io) => assert_eq!(
+            io.raw_os_error(),
+            Some(libc::EEXIST),
+            "NOREPLACE must surface EEXIST, got {io:?}"
+        ),
+        other => panic!("NOREPLACE must be an Io(EEXIST) error, got {other:?}"),
+    }
+
+    // Replacing rename (no flags): destination unlinked, source moves in.
+    b.rename(d2.ino, "moved", d2.ino, "blocker", 0)
+        .await
+        .expect("replacing rename");
+    assert_eq!(b.lookup(d2.ino, "blocker").await.unwrap().ino, f.ino);
+    assert!(b.lookup(d2.ino, "moved").await.is_err());
+    let replaced = b.getattr(blocker.ino).await;
+    if let Ok(i) = replaced {
+        assert_eq!(i.nlink, 0, "replaced destination's nlink must drop to 0");
+    }
+
+    // EXCHANGE swaps the two names' inos.
+    let g = b
+        .create(d1.ino, "swap-me", libc::S_IFREG | 0o600, 0, 0)
+        .await
+        .unwrap();
+    b.rename(d1.ino, "swap-me", d2.ino, "blocker", libc::RENAME_EXCHANGE)
+        .await
+        .expect("exchange rename");
+    assert_eq!(b.lookup(d1.ino, "swap-me").await.unwrap().ino, f.ino);
+    assert_eq!(b.lookup(d2.ino, "blocker").await.unwrap().ino, g.ino);
+
+    // EXCHANGE with a missing side: ENOENT.
+    let err = b
+        .rename(d1.ino, "no-src", d2.ino, "blocker", libc::RENAME_EXCHANGE)
+        .await
+        .expect_err("exchange with missing source must fail");
+    match &err {
+        SqueezefsError::Io(io) => assert_eq!(io.raw_os_error(), Some(libc::ENOENT)),
+        other => panic!("exchange-ENOENT shape, got {other:?}"),
+    }
+
+    // Both flags together: EINVAL.
+    let err = b
+        .rename(
+            d1.ino,
+            "x",
+            d2.ino,
+            "y",
+            libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE,
+        )
+        .await
+        .expect_err("NOREPLACE+EXCHANGE must fail");
+    match &err {
+        SqueezefsError::Io(io) => assert_eq!(io.raw_os_error(), Some(libc::EINVAL)),
+        other => panic!("EINVAL shape, got {other:?}"),
+    }
+
+    // Missing source, no flags: NotFound.
+    assert!(
+        b.rename(d1.ino, "ghost", d2.ino, "z", 0).await.is_err(),
+        "rename of a missing source must fail"
+    );
+}
+
+#[rstest::rstest]
+#[case::v2(Kind::V2)]
+#[case::v3(Kind::V3)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_setattr_conformance(#[case] kind: Kind) {
+    let (b, _f) = mutable_volume(kind).await;
+    let f = b
+        .create(ROOT_INO, "attrs", libc::S_IFREG | 0o644, 10, 20)
+        .await
+        .unwrap();
+
+    let before = b.getattr(f.ino).await.unwrap();
+    let t0 = now_ns();
+
+    // chmod: ctime auto-bumps.
+    let after = b
+        .setattr(
+            f.ino,
+            Some(libc::S_IFREG | 0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("chmod");
+    assert_eq!(after.mode, libc::S_IFREG | 0o600);
+    assert!(
+        after.ctime >= t0,
+        "ctime must auto-bump on chmod ({} vs {t0})",
+        after.ctime
+    );
+    assert!(after.ctime >= before.ctime);
+
+    // chown + size + explicit times honored verbatim.
+    let after = b
+        .setattr(
+            f.ino,
+            None,
+            Some(0),
+            Some(0),
+            Some(4096),
+            Some(111),
+            Some(222),
+            Some(333),
+        )
+        .await
+        .expect("chown+truncate+times");
+    assert_eq!((after.uid, after.gid, after.size), (0, 0, 4096));
+    assert_eq!((after.atime, after.mtime, after.ctime), (111, 222, 333));
+
+    // Persisted: getattr agrees.
+    let got = b.getattr(f.ino).await.unwrap();
+    assert_eq!((got.uid, got.gid, got.size), (0, 0, 4096));
+    assert_eq!((got.atime, got.mtime, got.ctime), (111, 222, 333));
+
+    // setattr on a missing ino: loud.
+    assert!(
+        b.setattr(999_999, Some(0o600), None, None, None, None, None, None)
+            .await
+            .is_err(),
+        "setattr of a missing ino must error"
+    );
+}
+
+#[rstest::rstest]
+#[case::v2(Kind::V2)]
+#[case::v3(Kind::V3)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_xattr_conformance(#[case] kind: Kind) {
+    let (b, _f) = mutable_volume(kind).await;
+    let f = b
+        .create(ROOT_INO, "x", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+
+    // Set, read back, overwrite, list, remove.
+    b.setxattr(f.ino, "user.one", b"v1").await.expect("set");
+    assert_eq!(
+        b.getxattr(f.ino, "user.one").await.unwrap().as_deref(),
+        Some(b"v1".as_slice())
+    );
+    b.setxattr(f.ino, "user.one", b"v2-overwrite")
+        .await
+        .expect("overwrite");
+    assert_eq!(
+        b.getxattr(f.ino, "user.one").await.unwrap().as_deref(),
+        Some(b"v2-overwrite".as_slice())
+    );
+    b.setxattr(f.ino, "user.two", b"22").await.unwrap();
+    let mut names = b.listxattr(f.ino).await.unwrap();
+    names.sort();
+    assert_eq!(names, vec!["user.one".to_string(), "user.two".to_string()]);
+
+    b.removexattr(f.ino, "user.one").await.expect("remove");
+    assert_eq!(
+        b.getxattr(f.ino, "user.one").await.unwrap(),
+        None,
+        "removed xattr reads as absent"
+    );
+    assert_eq!(b.listxattr(f.ino).await.unwrap(), vec!["user.two"]);
+
+    // removexattr of an absent name: loud on both formats (the v2 shape).
+    assert!(
+        b.removexattr(f.ino, "user.ghost").await.is_err(),
+        "removexattr of an absent name must error"
+    );
+
+    // The capability boundary: a 12 KiB value exceeds v2's 8 KiB block
+    // cap and sits inside v3's `node_size/4` cap (§4.2 capability lift).
+    let big = vec![0x5A; 12 * 1024];
+    match kind {
+        Kind::V2 => assert!(
+            b.setxattr(f.ino, "user.big", &big).await.is_err(),
+            "v2 must refuse a 12 KiB xattr value"
+        ),
+        Kind::V3 => {
+            b.setxattr(f.ino, "user.big", &big)
+                .await
+                .expect("v3 accepts a 12 KiB value (cap = node_size/4)");
+            assert_eq!(b.getxattr(f.ino, "user.big").await.unwrap(), Some(big));
+        }
+    }
+}
+
+#[rstest::rstest]
+#[case::v2(Kind::V2)]
+#[case::v3(Kind::V3)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_destroy_and_layout_conformance(#[case] kind: Kind) {
+    let (b, _f) = mutable_volume(kind).await;
+    let f = b
+        .create(ROOT_INO, "doomed", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+
+    // The fsync/release writeback shape (§5.3): layout xattr + size in
+    // one call; on v3 this is ONE two-record transaction.
+    b.set_layout_and_size(f.ino, b"layout-bytes-0123", 8192)
+        .await
+        .expect("set_layout_and_size");
+    assert_eq!(
+        b.getxattr(f.ino, "layout").await.unwrap().as_deref(),
+        Some(b"layout-bytes-0123".as_slice())
+    );
+    assert_eq!(b.getattr(f.ino).await.unwrap().size, 8192);
+
+    // unlink + destroy: the reclaim path. The inode and its xattrs are
+    // gone; the batch surface tolerates missing inos (v2 skip contract).
+    b.unlink(ROOT_INO, "doomed").await.unwrap();
+    b.destroy_inode(f.ino).await.expect("destroy");
+    assert!(
+        b.getattr(f.ino).await.is_err(),
+        "destroyed ino must stop resolving"
+    );
+    assert_eq!(
+        b.getxattr(f.ino, "layout").await.unwrap(),
+        None,
+        "destroy must reap the layout xattr"
+    );
+    b.destroy_inodes(&[f.ino, 987_654])
+        .await
+        .expect("destroy of missing inos is a no-op (v2 skip contract)");
+}
+
+/// §4.8: v3 inos are monotonic and never reused — destroy-then-create
+/// yields a strictly larger ino (v2 reuses; not asserted there).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_monotonic_ino_no_reuse() {
+    let (b, _f) = mutable_volume(Kind::V3).await;
+    let a = b
+        .create(ROOT_INO, "first", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    b.unlink(ROOT_INO, "first").await.unwrap();
+    b.destroy_inode(a.ino).await.unwrap();
+    let c = b
+        .create(ROOT_INO, "second", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    assert!(
+        c.ino > a.ino,
+        "v3 must never reuse inos: {} then {}",
+        a.ino,
+        c.ino
+    );
+}
+
+/// §4.4 pt 6: concurrent same-directory creates under the SHARED parent
+/// lock (the routed layer's production shape) — all succeed, parent times
+/// advance, every child resolves. Runs against BOTH formats through
+/// `RoutedMetaBackend::new_dispatch` (v2 = 16-byte staged patch, v3 =
+/// Δtime merge records).
+#[rstest::rstest]
+#[case::v2(Kind::V2)]
+#[case::v3(Kind::V3)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routed_shared_parent_create_storm(#[case] kind: Kind) {
+    let (backend, _f) = mutable_volume(kind).await;
+    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![backend]));
+
+    let dir = routed
+        .create(ROOT_INO, "storm", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+    let t0 = now_ns();
+
+    let mut handles = Vec::new();
+    for t in 0..4u32 {
+        let r = routed.clone();
+        let parent = dir.ino;
+        handles.push(tokio::spawn(async move {
+            for i in 0..25u32 {
+                r.create(parent, &format!("f-{t}-{i}"), libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .expect("storm create");
+            }
+        }));
+    }
+    for h in handles {
+        h.await.expect("storm task");
+    }
+
+    for t in 0..4u32 {
+        for i in 0..25u32 {
+            assert!(
+                routed.lookup(dir.ino, &format!("f-{t}-{i}")).await.is_ok(),
+                "storm child f-{t}-{i} must resolve"
+            );
+        }
+    }
+    let after = routed.getattr(dir.ino).await.unwrap();
+    assert!(
+        after.mtime >= t0 && after.ctime >= t0,
+        "parent times must reflect the storm (Δtime merge records, §4.4 pt 6)"
+    );
+    assert_eq!(
+        routed.readdir(dir.ino, 0, usize::MAX).await.unwrap().len(),
+        100,
+        "readdir must list every storm child"
+    );
+}
+
+/// v3 persistence — clean shutdown: mutations survive a full checkpoint +
+/// task drain + remount with an EMPTY replay window (tail == head).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_mutations_survive_clean_shutdown_remount() {
+    let (backend, file) = mutable_volume(Kind::V3).await;
+    let VolumeBackend::V3(be) = &backend else {
+        unreachable!()
+    };
+
+    let d = backend
+        .create(ROOT_INO, "keep", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+    for i in 0..30 {
+        let f = backend
+            .create(d.ino, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        backend
+            .setxattr(f.ino, "user.tag", format!("t{i}").as_bytes())
+            .await
+            .unwrap();
+    }
+    let d1 = digest_backend(be).await.unwrap();
+
+    be.shutdown().await.expect("clean shutdown");
+    be.shutdown().await.expect("shutdown is idempotent");
+    drop(backend);
+
+    let re = KvMetaBackend::open(file.path()).await.expect("remount");
+    assert_eq!(
+        re.replay_stats().entries,
+        0,
+        "a clean shutdown checkpoints everything: the replay window is empty"
+    );
+    assert_eq!(
+        digest_backend(&re).await.unwrap(),
+        d1,
+        "post-fold digest must survive the shutdown/remount"
+    );
+    assert_eq!(re.lookup(ROOT_INO, "keep").await.unwrap().ino, d.ino);
+    let f0 = re.lookup(d.ino, "f0").await.unwrap();
+    assert_eq!(
+        re.getxattr(f0.ino, "user.tag").await.unwrap().as_deref(),
+        Some(b"t0".as_slice())
+    );
+}
+
+/// v3 persistence — NO shutdown: acked (deferred-mode) mutations are in
+/// the journal's page cache; a remount replays them (D0, §4.10). The
+/// flush cadence is parked at 60 s so the window cannot be checkpointed
+/// away before the drop (the assertion needs a non-empty window).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_mutations_survive_remount_via_replay() {
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let body = async {
+        let (backend, file) = mutable_volume(Kind::V3).await;
+        let f = backend
+            .create(ROOT_INO, "replayed", libc::S_IFREG | 0o640, 3, 4)
+            .await
+            .unwrap();
+        backend
+            .setattr(f.ino, None, None, None, Some(777), None, None, None)
+            .await
+            .unwrap();
+        drop(backend); // no shutdown, no checkpoint requirement
+        (file, f.ino)
+    }
+    .await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let (file, ino) = body;
+
+    let re = KvMetaBackend::open(file.path()).await.expect("remount");
+    assert!(
+        re.replay_stats().entries > 0,
+        "the un-checkpointed window must replay"
+    );
+    let got = re.lookup(ROOT_INO, "replayed").await.unwrap();
+    assert_eq!((got.ino, got.uid, got.gid, got.size), (ino, 3, 4, 777));
+    assert!(
+        re.next_ino() > ino,
+        "§4.8: next_ino must clear replayed inos"
+    );
+}
+
+/// K6a hand-off: unknown `features_ro` bits mount read-only — K6b's write
+/// path must withhold mutations (§4.11) while reads keep serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_unknown_ro_bit_withholds_mutations() {
+    let (backend, file) = mutable_volume(Kind::V3).await;
+    backend
+        .create(ROOT_INO, "pre-ro", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let VolumeBackend::V3(be) = &backend else {
+        unreachable!()
+    };
+    be.shutdown().await.unwrap();
+    let sb = be.superblock().clone();
+    drop(backend);
+
+    let mut ro = sb;
+    ro.features_ro |= 1 << 5;
+    write_superblock_v3(file.path(), &ro).await.unwrap();
+
+    let re = KvMetaBackend::open(file.path()).await.expect("ro mount");
+    assert_eq!(re.superblock().unknown_ro(), 1 << 5);
+    // Reads serve.
+    assert!(re.lookup(ROOT_INO, "pre-ro").await.is_ok());
+    // Every mutation is withheld.
+    assert!(
+        Metadata::create(
+            re.as_ref(),
+            ROOT_INO,
+            "post-ro",
+            libc::S_IFREG | 0o644,
+            0,
+            0
+        )
+        .await
+        .is_err(),
+        "unknown ro bits must withhold create"
+    );
+    assert!(
+        Metadata::setxattr(re.as_ref(), ROOT_INO, "user.x", b"v")
+            .await
+            .is_err(),
+        "unknown ro bits must withhold setxattr"
+    );
+}
+
+/// v3 strict mode (`SQUEEZEFS_META_FLUSH_INTERVAL_MS=0`): every commit
+/// barriers through the SyncCoalescer before acking (§4.6 pt 4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_strict_mode_commits_barrier_per_commit() {
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "0");
+    let result = async {
+        let (backend, file) = mutable_volume(Kind::V3).await;
+        let f = backend
+            .create(ROOT_INO, "strict", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("strict-mode create");
+        drop(backend);
+        // Strict mode already barriered: a power-cut style reopen (page
+        // cache is shared for a file, so this is a replay check, not a
+        // physical-durability one — the crash harness owns that half).
+        let re = KvMetaBackend::open(file.path()).await.unwrap();
+        assert_eq!(re.lookup(ROOT_INO, "strict").await.unwrap().ino, f.ino);
+    };
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), result).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    out.expect("strict-mode ops must not hang");
+}
+
+/// **R10 — the ring-full liveness storm (§4.4 pt 5).** A commit storm
+/// against a TINY `--meta-journal-mb`-class ring (512 KiB — barely above
+/// the reserve + max-entry floor) with concurrent SMO pressure (64 KiB
+/// nodes split under load). Must drain and complete — never deadlock:
+/// admission parks hold no node locks, SMOs draw from the checkpoint-task
+/// reserve, and the minimal checkpoint consumes zero ring bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn v3_ring_full_liveness_storm_drains() {
+    let file = NamedTempFile::new().unwrap();
+    file.as_file().set_len(V3_VOL_LEN).unwrap();
+    format_v3(
+        file.path(),
+        V3_VOL_LEN,
+        &FormatV3Options {
+            node_size: 64 * 1024,
+            journal_len_override: Some(512 * 1024), // floor is 384 KiB
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .unwrap();
+    let backend = VolumeBackend::open_for_mount(file.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let stalls_probe = match &backend {
+        VB::V3(be) => be.clone(),
+        _ => unreachable!(),
+    };
+    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![backend]));
+
+    let smo_before = META_KV_NODE_SPLITS.load(AtomicOrdering::Relaxed)
+        + META_KV_NODE_COMPACTIONS.load(AtomicOrdering::Relaxed);
+
+    // 8 directories, 16 writer tasks: ~2,400 creates + 2,400 setxattrs
+    // ≈ 1.2 MB of journal entries against a ~250 KiB user budget — the
+    // ring must wrap under sustained admission pressure.
+    let mut dirs = Vec::new();
+    for i in 0..8 {
+        dirs.push(
+            routed
+                .create(ROOT_INO, &format!("dir{i}"), libc::S_IFDIR | 0o755, 0, 0)
+                .await
+                .unwrap()
+                .ino,
+        );
+    }
+    let storm = async {
+        let mut handles = Vec::new();
+        for t in 0..16u32 {
+            let r = routed.clone();
+            let parent = dirs[(t % 8) as usize];
+            handles.push(tokio::spawn(async move {
+                for i in 0..150u32 {
+                    let f = r
+                        .create(parent, &format!("s{t}-{i}"), libc::S_IFREG | 0o644, 0, 0)
+                        .await
+                        .expect("storm create must eventually admit");
+                    r.setxattr(f.ino, "user.payload", &[0xEE; 200])
+                        .await
+                        .expect("storm setxattr");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("storm task must finish (no deadlock)");
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(180), storm)
+        .await
+        .expect("R10: the storm must drain — a hang here is the ring-full deadlock class");
+
+    // The ring actually filled (admission parks happened)…
+    assert!(
+        stalls_probe.journal_full_stalls() > 0,
+        "the storm never filled the 512 KiB ring — grow the storm or shrink the ring"
+    );
+    // …and SMOs ran concurrently on the checkpoint task.
+    let smo_after = META_KV_NODE_SPLITS.load(AtomicOrdering::Relaxed)
+        + META_KV_NODE_COMPACTIONS.load(AtomicOrdering::Relaxed);
+    assert!(
+        smo_after > smo_before,
+        "64 KiB nodes under a 2,400-file storm must split/compact (SMO pressure)"
+    );
+
+    // Everything the storm acked is present and consistent.
+    for (d, dir) in dirs.iter().enumerate() {
+        let n = routed.readdir(*dir, 0, usize::MAX).await.unwrap().len();
+        assert_eq!(n, 300, "dir{d} must list every storm child");
+    }
+
+    // And the volume survives a clean remount with a matching digest.
+    let d_live = digest_backend(&stalls_probe).await.unwrap();
+    stalls_probe.shutdown().await.unwrap();
+    drop(routed);
+    let re = KvMetaBackend::open(file.path()).await.unwrap();
+    assert_eq!(
+        digest_backend(&re).await.unwrap(),
+        d_live,
+        "storm state must survive remount byte-for-byte (post-fold digest)"
+    );
+}

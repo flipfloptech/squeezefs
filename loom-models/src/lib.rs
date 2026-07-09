@@ -41,6 +41,16 @@
 //!   seq (the root-fallback soundness rule, risk R3), and the compaction
 //!   reserve is never consumable by user claims while internal claims
 //!   drain it exactly.
+//! - [`node_state_core`]: the KV node lifecycle word (CoW KV metadata
+//!   design §4.6/§10, PR K5 —
+//!   clean/dirty/serializing/superseded) — invariants: a commit's
+//!   `mark_dirty` and an SMO's `supersede` can never jointly lose a
+//!   record (either the apply is refused or the supersede outcome
+//!   reports the dirt for the successor build); clock eviction wins only
+//!   from the exact clean state and never against a node that just
+//!   accepted dirt (§4.5 dirty pinning); freeze-swap conserves records
+//!   across a racing apply (frozen + open == applied, dirty bit exact);
+//!   at most one freeze is ever in flight.
 //!
 //! Models run only under `--cfg loom` (see `tests/run_loom.sh`); a plain
 //! `cargo test` here compiles the cores against std atomics and runs
@@ -60,12 +70,17 @@ pub mod incarnation_core;
 pub mod journal_core;
 #[path = "../../third_party/fuse3/src/raw/connection/lease_core.rs"]
 pub mod lease_core;
+#[path = "../../src/meta_backend/kv/node_state_core.rs"]
+pub mod node_state_core;
 #[path = "../../src/refcount_core.rs"]
 pub mod refcount_core;
 
 #[cfg(all(test, loom))]
 mod models {
-    use crate::{alloc_core, alloc_ext_core, gauge_core, incarnation_core, journal_core, lease_core};
+    use crate::{
+        alloc_core, alloc_ext_core, gauge_core, incarnation_core, journal_core, lease_core,
+        node_state_core,
+    };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
     use loom::thread;
@@ -977,6 +992,170 @@ mod models {
             live.dedup();
             assert_eq!(live.len(), 3, "three unique live claims");
             assert_eq!(core.free_extents(), 0);
+        });
+    }
+
+    /// Node-lifecycle invariant #1 (design §4.6 "supersede vs revalidate",
+    /// PR K5): a commit's `mark_dirty` racing an SMO's `supersede` can
+    /// never jointly lose a record — whichever RMW lands first, either the
+    /// apply is refused (`Err(Superseded)`, the revalidation outcome) or
+    /// the supersede outcome reports `was_dirty` so the successor build
+    /// carries the delta. `Ok` + `was_dirty == false` would be a silently
+    /// dropped record.
+    #[test]
+    fn node_state_supersede_never_loses_a_racing_apply() {
+        loom::model(|| {
+            let st = Arc::new(node_state_core::NodeState::new());
+
+            let committer = {
+                let st = Arc::clone(&st);
+                thread::spawn(move || st.mark_dirty().is_ok())
+            };
+            let outcome = st.supersede().expect("first supersede wins");
+            let applied = committer.join().unwrap();
+
+            assert!(
+                !(applied && !outcome.was_dirty),
+                "a record was applied but the SMO saw a clean node — lost update"
+            );
+            assert!(
+                st.is_superseded(),
+                "terminal state must hold after the race"
+            );
+            // Post-terminal applies are always refused (the §4.6
+            // lock-then-revalidate-then-retry contract).
+            assert!(st.mark_dirty().is_err(), "apply accepted after supersede");
+        });
+    }
+
+    /// Node-lifecycle invariant #2 (design §4.5 dirty pinning, PR K5):
+    /// clock eviction (`try_evict`, a clean-only CAS) can never win
+    /// against a node that just accepted dirt — `evicted && applied` is
+    /// unrepresentable, and the loser of either race fails loud.
+    #[test]
+    fn node_state_evict_never_wins_against_accepted_dirt() {
+        loom::model(|| {
+            let st = Arc::new(node_state_core::NodeState::new());
+
+            let evictor = {
+                let st = Arc::clone(&st);
+                thread::spawn(move || st.try_evict())
+            };
+            let applied = st.mark_dirty().is_ok();
+            let evicted = evictor.join().unwrap();
+
+            assert!(
+                applied ^ evicted,
+                "exactly one of apply/evict wins the clean word \
+                 (applied {applied}, evicted {evicted})"
+            );
+            if applied {
+                assert!(st.is_dirty(), "accepted dirt must be visible");
+                assert!(!st.is_superseded(), "loser eviction must not sever");
+            } else {
+                assert!(st.is_superseded(), "winner eviction severs the object");
+            }
+        });
+    }
+
+    /// Node-lifecycle invariant #3 (design §4.6 pt 1 "freeze-swap vs
+    /// concurrent apply", PR K5): the freeze atomically swaps the delta
+    /// out while applies keep landing — records are conserved (frozen +
+    /// open == applied), the dirty bit is exact (set iff the open delta is
+    /// non-empty), and no interleaving strands a record in neither pile.
+    /// The delta is modeled as a loom-checked counter cell swapped under
+    /// the same lock the node cache uses (a loom Mutex standing in for the
+    /// tokio per-node RwLock), so the model exercises the shipped word
+    /// protocol composed exactly as `node_cache.rs` drives it.
+    #[test]
+    fn node_state_freeze_swap_conserves_records() {
+        loom::model(|| {
+            let st = Arc::new(node_state_core::NodeState::new());
+            let open = Arc::new(loom::sync::Mutex::new(0u64)); // open-delta records
+
+            // Seed one applied record so a freeze is always legal.
+            {
+                let mut g = open.lock().unwrap();
+                st.mark_dirty().expect("seed apply");
+                *g += 1;
+            }
+
+            // Committer: one more apply under the lock (§4.4 pt 1).
+            let committer = {
+                let st = Arc::clone(&st);
+                let open = Arc::clone(&open);
+                thread::spawn(move || {
+                    let mut g = open.lock().unwrap();
+                    if st.mark_dirty().is_ok() {
+                        *g += 1;
+                    }
+                })
+            };
+
+            // Writeback: freeze under the lock (swap the delta out), write
+            // outside it, end the freeze (§4.6 pt 1).
+            let frozen: u64 = {
+                let mut g = open.lock().unwrap();
+                match st.begin_freeze() {
+                    Ok(()) => {
+                        let f = *g;
+                        *g = 0;
+                        f
+                    }
+                    Err(e) => panic!("freeze refused on a dirty node: {e:?}"),
+                }
+            };
+            let redirtied = st.end_freeze();
+
+            committer.join().unwrap();
+
+            let open_now = *open.lock().unwrap();
+            assert_eq!(
+                frozen + open_now,
+                2,
+                "records conserved across the swap (frozen {frozen}, open {open_now})"
+            );
+            assert_eq!(
+                st.is_dirty(),
+                open_now > 0,
+                "dirty bit must exactly track the open delta"
+            );
+            if redirtied {
+                assert!(
+                    open_now > 0,
+                    "end_freeze reported re-accumulated dirt that does not exist"
+                );
+            }
+            assert!(
+                !st.is_freezing(),
+                "freeze window must be closed after end_freeze"
+            );
+        });
+    }
+
+    /// Node-lifecycle invariant #4 (design §4.6: SMOs and writeback run
+    /// serialized — a second in-flight freeze is a protocol bug the core
+    /// must refuse): two racing `begin_freeze` calls on a dirty node admit
+    /// exactly one winner.
+    #[test]
+    fn node_state_at_most_one_freeze_in_flight() {
+        loom::model(|| {
+            let st = Arc::new(node_state_core::NodeState::new());
+            st.mark_dirty().expect("dirty");
+
+            let racer = {
+                let st = Arc::clone(&st);
+                thread::spawn(move || st.begin_freeze().is_ok())
+            };
+            let mine = st.begin_freeze().is_ok();
+            let theirs = racer.join().unwrap();
+
+            assert!(
+                mine ^ theirs,
+                "exactly one freeze may win (mine {mine}, theirs {theirs})"
+            );
+            assert!(st.is_freezing(), "the winner's freeze is in flight");
+            assert!(!st.is_dirty(), "the swap cleared the dirty bit");
         });
     }
 }

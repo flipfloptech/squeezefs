@@ -14,9 +14,9 @@
 //! `tests/crash_contract_tests.rs`.
 
 use squeezefs::meta_backend::kv::node::{
-    append_bset, compact_node, load_node, record_value_cap, split_node, write_node, AppendDest,
-    NodeLayout, NodeWriteParams, SplitDest, DEFAULT_NODE_SIZE, MAX_NODE_SIZE, MIN_NODE_SIZE,
-    NODE_PAGE,
+    append_bset, compact_node, key_successor, load_node, record_value_cap, split_node, write_node,
+    AppendDest, NodeLayout, NodeWriteParams, SplitDest, DEFAULT_NODE_SIZE, MAX_NODE_SIZE,
+    MIN_NODE_SIZE, NODE_PAGE,
 };
 use squeezefs::meta_backend::kv::record::{
     inode_key, Folded, InodeDelta, InodeValue, Record, RecordKind,
@@ -739,7 +739,10 @@ async fn test_split_partitions_key_space_into_two_fresh_nodes() {
         "concatenation reproduces the fold, in order"
     );
 
-    // Inclusive key-space bounds (§4.6 revalidation contract).
+    // Inclusive key-space bounds (§4.6 revalidation contract): the sides
+    // PARTITION the source range — right.min = successor(left.max), so no
+    // key the parent separators can route is rejected by `min ≤ key ≤ max`
+    // revalidation (an unroutable gap would loop the K5 writer retry).
     assert_eq!(left.header().min_key, src.header().min_key);
     assert_eq!(right.header().max_key, src.header().max_key);
     let lb = left.bset(0).expect("base");
@@ -751,8 +754,12 @@ async fn test_split_partitions_key_space_into_two_fresh_nodes() {
     );
     assert_eq!(
         right.header().min_key,
-        rb.record(0).key.to_vec(),
-        "right.min = first right key"
+        key_successor(&left.header().max_key),
+        "right.min = successor(left.max): gap-free partition"
+    );
+    assert!(
+        right.header().min_key <= rb.record(0).key.to_vec(),
+        "right's first key is within its bounds"
     );
     assert!(
         left.header().max_key < right.header().min_key,

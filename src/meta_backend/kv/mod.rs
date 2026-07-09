@@ -23,6 +23,15 @@
 //! A/B bitmap pages + journaled alloc/free deltas + typed ENOSPC surface
 //! ([`alloc_ext`]).
 //!
+//! PR K5 adds the btree over a RAM-authoritative node cache: the pure
+//! lock-free node lifecycle core ([`node_state_core`], loom-modeled —
+//! clean/dirty/serializing/superseded, freeze-swap vs apply, supersede vs
+//! revalidate), demand paging with arc-swap immutable snapshots /
+//! latch-free reads / clock eviction / single-flight loads / the cache
+//! budget knob ([`node_cache`], §4.5), and lookup/insert/delete/range with
+//! the §4.6 SMO protocol — serialized SMO execution, interior locks
+//! SMO-only, writer lock-then-revalidate-then-retry ([`tree`]).
+//!
 //! The record/bset layer is pure and in-memory; nothing here is mount-wired
 //! yet. Per the design's liveness convention, K1–K5 code is
 //! production-unreachable until PR K6a wires the mount path; it is kept
@@ -36,7 +45,10 @@ pub mod checkpoint;
 pub mod journal;
 pub mod journal_core;
 pub mod node;
+pub mod node_cache;
+pub mod node_state_core;
 pub mod record;
+pub mod tree;
 
 use std::sync::atomic::AtomicU64;
 
@@ -62,6 +74,38 @@ pub static META_KV_DELTA_ORPHANS: AtomicU64 = AtomicU64::new(0);
 /// as `meta_kv_node_dropped_tail_bsets` when K6a wires the mount path; until
 /// then it is read by the node-layer tests and the crash harness.
 pub static META_KV_NODE_DROPPED_TAIL_BSETS: AtomicU64 = AtomicU64::new(0);
+
+/// Node-cache hits: latch-free map reads served from an arc-swap snapshot
+/// (design §4.5/§10 — the Stat-regression early signal). Stats-JSON wiring
+/// as `meta_kv_node_cache_hits` is PR K6a/K7's; until then the tree tests
+/// read it.
+pub static META_KV_NODE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Node-cache misses: demand-page loads actually performed (single-flight
+/// collapses racing callers onto one load — the losers re-check the map
+/// and count as hits). Surfaced as `meta_kv_node_cache_misses` in K6a/K7.
+pub static META_KV_NODE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Clock evictions of clean, unpinned nodes (design §4.5: dirty nodes are
+/// pinned until writeback; interior nodes and roots pinned uncondition-
+/// ally). Surfaced as `meta_kv_node_cache_evictions` in K6a/K7.
+pub static META_KV_NODE_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Node splits executed by the serialized SMO task (design §4.6/§10).
+/// Surfaced as `meta_kv_node_splits` in K6a/K7.
+pub static META_KV_NODE_SPLITS: AtomicU64 = AtomicU64::new(0);
+
+/// Node compactions (1:1 CoW rewrites folding the bset log) executed by
+/// the serialized SMO task (design §4.6/§10; compaction:append ratio
+/// > ~1:8 ⇒ node_size or cadence mistuned). Surfaced as
+/// `meta_kv_node_compactions` in K6a/K7.
+pub static META_KV_NODE_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Commit-path revalidation retries (design §4.6: a writer locked a leaf
+/// an SMO had superseded between resolution and lock — unlock, re-resolve,
+/// retry; SMOs are rare and serialized, so the loop is short). Surfaced as
+/// `meta_kv_commit_smo_retries` in K6a/K7.
+pub static META_KV_COMMIT_SMO_RETRIES: AtomicU64 = AtomicU64::new(0);
 
 /// Errors from the pure KV encoding / fold layer.
 ///

@@ -357,6 +357,15 @@ impl LoadedNode {
     }
 }
 
+/// The smallest key strictly greater than `key` in memcmp order:
+/// `key ⧺ 0x00`. Sibling nodes partition the key space with it
+/// (`right.min = key_successor(left.max)`, [`split_node`]) so the §4.6
+/// revalidation predicate `min_key ≤ key ≤ max_key` admits every key the
+/// interior separators can route to the node — no unroutable gaps.
+pub fn key_successor(_key: &[u8]) -> Vec<u8> {
+    todo!()
+}
+
 /// Round `len` up to the next [`NODE_PAGE`] multiple.
 fn page_align(len: usize) -> usize {
     len.div_ceil(NODE_PAGE) * NODE_PAGE

@@ -613,6 +613,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bset_nway_merge_reverses_same_key_runs_within_one_source() {
+        // A same-key multi-seq run inside ONE bset (storage order is
+        // (key, seq) ASCENDING — e.g. a K5 frozen delta carrying a Put and
+        // its later Delete): merge's documented contract is newest-first
+        // per key group, so the run must come out REVERSED, and the fold
+        // over the merged group must see the tombstone, not the Put.
+        let single = build_bset(
+            &[
+                put(1, 3),
+                Record::delete(inode_key(1).to_vec(), 8),
+                put(2, 5),
+            ],
+            8,
+        )
+        .expect("build");
+        let older = build_bset(&[put(1, 1)], 1).expect("build");
+        let sources = [
+            BsetView::parse(&single).expect("parse"),
+            BsetView::parse(&older).expect("parse"),
+        ];
+
+        let merged: Vec<(Vec<u8>, u64)> =
+            merge(&sources).map(|r| (r.key.to_vec(), r.seq)).collect();
+        assert_eq!(
+            merged,
+            vec![
+                (inode_key(1).to_vec(), 8), // the in-source run, newest first
+                (inode_key(1).to_vec(), 3),
+                (inode_key(1).to_vec(), 1), // then the older source
+                (inode_key(2).to_vec(), 5),
+            ],
+            "a same-key run within one source must merge newest-seq-first"
+        );
+
+        // And the compaction fold over it keeps the tombstone (seq 8 ≥
+        // durable tail 4), never resurrecting the shadowed Put.
+        let folded = compact(&sources, 4).expect("compact");
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].kind, RecordKind::Delete);
+        assert_eq!(folded[0].seq, 8);
+        assert_eq!(folded[1].key, inode_key(2).to_vec());
+    }
+
     // -- lookup fold across sources ---------------------------------------------
 
     #[test]

@@ -1006,7 +1006,15 @@ async fn million_entry_directory_storm_create_lookup_readdir_rmdir() {
         entries as f64 / create_elapsed.as_secs_f64()
     );
 
-    // ---- Lookup p50: big dir within 2× small dir (§8 row 6).
+    // ---- Lookup p50: big dir within 2× small dir (§8 row 6 — the
+    // O(dir-size) → O(log) claim; v2's find_dentry was a linear Vec scan
+    // per lookup). Both sides sample the SAME post-storm tree with the
+    // SAME access shape — 2,000 samples over 100 names — so directory
+    // size is the only variable: the small dir physically has 100 names,
+    // and sampling thousands of DISTINCT big-dir names instead would
+    // measure memory-hierarchy warmth (2,000 keys scattered over ~400
+    // leaves), not directory-size dependence. The scattered-cold shape
+    // is measured and reported alongside, un-gated.
     let p50 = |mut samples: Vec<Duration>| -> Duration {
         samples.sort_unstable();
         samples[samples.len() / 2]
@@ -1018,16 +1026,32 @@ async fn million_entry_directory_storm_create_lookup_readdir_rmdir() {
         routed.lookup(small.ino, &name).await.expect("small lookup");
         small_samples.push(t.elapsed());
     }
+    // 100 fixed names, stride-spread across the whole keyspace (multiple
+    // leaves participate), each sampled 20× — the small-dir shape.
+    let stride = (entries as u64 / 100).max(1);
     let mut big_samples = Vec::with_capacity(2000);
-    let stride = (entries as u64 / 2000).max(1);
     for i in 0..2000u64 {
-        let name = format!("f{:07}", (i * stride) % entries as u64);
+        let name = format!("f{:07}", ((i % 100) * stride) % entries as u64);
         let t = Instant::now();
         routed.lookup(dir.ino, &name).await.expect("big lookup");
         big_samples.push(t.elapsed());
     }
-    let (small_p50, big_p50) = (p50(small_samples), p50(big_samples));
-    eprintln!("[scale] lookup p50: small-dir {small_p50:.2?}, {entries}-entry dir {big_p50:.2?}");
+    // The scattered-cold shape: 2,000 distinct names (reported, not
+    // gated — it varies with cache warmth, not directory size).
+    let scatter_stride = (entries as u64 / 2000).max(1);
+    let mut scattered_samples = Vec::with_capacity(2000);
+    for i in 0..2000u64 {
+        let name = format!("f{:07}", (i * scatter_stride) % entries as u64);
+        let t = Instant::now();
+        routed.lookup(dir.ino, &name).await.expect("big lookup");
+        scattered_samples.push(t.elapsed());
+    }
+    let (small_p50, big_p50, scattered_p50) =
+        (p50(small_samples), p50(big_samples), p50(scattered_samples));
+    eprintln!(
+        "[scale] lookup p50: small-dir {small_p50:.2?}, {entries}-entry dir {big_p50:.2?} \
+         (matched shape; gated), {scattered_p50:.2?} (2000 distinct names; reported)"
+    );
     assert!(
         big_p50 <= small_p50 * 2,
         "big-dir lookup p50 ({big_p50:?}) must stay within 2× the small-dir p50 ({small_p50:?}) — §8 row 6"

@@ -1611,7 +1611,7 @@ async fn rightmost_separator_pointer_record_replays_clean() {
         i += 1;
         assert!(i < 5_000, "xattr storm never split the tree — harness bug");
         // Give the threshold maintenance passes their turn.
-        if i % 8 == 0 {
+        if i.is_multiple_of(8) {
             tokio::task::yield_now().await;
         }
     }

@@ -340,7 +340,20 @@ impl KvTree {
     /// ([`NodeCache::load`]); both restart the walk from the (possibly
     /// swapped) root, bounded by [`RETRY_BUDGET`].
     async fn descend(&self, key: &[u8], target_level: u8) -> Result<Arc<CachedNode>, KvError> {
-        'restart: for _ in 0..RETRY_BUDGET {
+        'restart: for attempt in 0..RETRY_BUDGET {
+            if attempt > 0 {
+                // Cooperative restart: every reason to be here is a racing
+                // SMO's swap window (retired extent / stale seq / routing
+                // hole), and the cached-node misses short-circuit
+                // SYNCHRONOUSLY (`try_get` miss ⇒ `load` refusal on a
+                // retired extent), so a spinning reader can burn the whole
+                // budget inside one held window without ever letting the
+                // SMO task finish it — "retry budget exhausted" fired
+                // ~1/2 bench runs once §4.6 pt 1 threshold wakes made
+                // SMOs frequent. Yielding turns the budget into 256
+                // scheduling opportunities, not 256 spins.
+                tokio::task::yield_now().await;
+            }
             let root = self.root();
             let Some(mut cur) = (match self.cache.try_get(root.addr) {
                 Some(n) => Some(n),
@@ -520,7 +533,7 @@ impl KvTree {
         kind: RecordKind,
         value: Bytes,
     ) -> Result<bool, KvError> {
-        self.check_key(key)?;
+        self.check_interior_key(key)?;
         self.seq.fetch_max(seq, Ordering::AcqRel);
         if self.root_level().await? < level {
             return Ok(false); // shorter mounted structure: unroutable
@@ -552,6 +565,24 @@ impl KvTree {
         if key.is_empty() || key >= &KEY_SPACE_MAX[..] {
             return Err(KvError::Corrupt(format!(
                 "tree key must be non-empty and sort below KEY_SPACE_MAX (len {})",
+                key.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Interior (separator) keys live in a wider domain than content
+    /// keys: a child's inclusive `max_key` — the rightmost sibling's is
+    /// exactly `KEY_SPACE_MAX` (the K2/K5 gap-free partition rule), and
+    /// every rightmost-leaf SMO journals a pointer record under that
+    /// key. Replay must accept it (§4.1: nothing inside the window fails
+    /// a mount loud — and this record is a correct artifact, not
+    /// damage), so the guard admits the top separator inclusively.
+    fn check_interior_key(&self, key: &[u8]) -> Result<(), KvError> {
+        if key.is_empty() || key > &KEY_SPACE_MAX[..] {
+            return Err(KvError::Corrupt(format!(
+                "interior separator key must be non-empty and sort at-or-below \
+                 KEY_SPACE_MAX (len {})",
                 key.len()
             )));
         }

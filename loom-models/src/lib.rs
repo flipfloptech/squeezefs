@@ -126,7 +126,11 @@ mod models {
             live.sort_unstable();
             let mut dedup = live.clone();
             dedup.dedup();
-            assert_eq!(live.len(), dedup.len(), "freed slot double-claimed: {live:?}");
+            assert_eq!(
+                live.len(),
+                dedup.len(),
+                "freed slot double-claimed: {live:?}"
+            );
             assert_eq!(
                 a.allocated_count(),
                 live.len() as u64,
@@ -186,7 +190,10 @@ mod models {
                 4,
                 "popcount must exclude reserved bits and racing frees of them"
             );
-            assert!(a.is_set(4) && a.is_set(5), "reserved bits must survive free()");
+            assert!(
+                a.is_set(4) && a.is_set(5),
+                "reserved bits must survive free()"
+            );
         });
     }
 
@@ -287,7 +294,10 @@ mod models {
             if acquired {
                 // The clone holds the only remaining reference; its release
                 // must be the terminal one.
-                assert!(crate::refcount_core::release(&cell), "clone's release must free");
+                assert!(
+                    crate::refcount_core::release(&cell),
+                    "clone's release must free"
+                );
             }
             assert!(!crate::refcount_core::release(&cell), "double free");
         });
@@ -544,13 +554,13 @@ mod models {
         });
     }
 
-    /// Tiny journal-core geometry shared by the ring models: 2 pages × 4
-    /// entry bytes ⇒ 8 logical bytes per lap, so wrap interleavings are
-    /// reachable in a handful of operations.
-    fn tiny_ring(reserve_bytes: u64) -> journal_core::CoreGeometry {
+    /// Tiny journal-core geometry shared by the ring models: a few pages of
+    /// 4 entry bytes each, so wrap interleavings are reachable in a handful
+    /// of operations.
+    fn tiny_ring(pages: u64, reserve_bytes: u64) -> journal_core::CoreGeometry {
         journal_core::CoreGeometry {
             page_data_len: 4,
-            pages: 2,
+            pages,
             reserve_bytes,
         }
     }
@@ -561,10 +571,19 @@ mod models {
     /// lap/offset/page/segment geometry is exact — including a multi-page
     /// reservation's contiguous segments and, after a watermark advance, a
     /// reservation that wraps the ring into lap 1.
+    ///
+    /// Capacity 12 for two 3-byte admissions: a racing `try_admit` may
+    /// observe a transfer's transient double-count (`admitted` still
+    /// carrying bytes `head` already claimed — the module's deliberate
+    /// conservative read, worst case 3 + 3 + 3 = 9 here), and the protocol
+    /// promises refusal is only ever spurious, never an over-commit — so
+    /// the model sizes the ring to make both admissions unconditional and
+    /// keeps every geometry assertion deterministic. (Refusal semantics
+    /// under pressure are model #2's subject.)
     #[test]
     fn journal_core_reservations_disjoint_monotonic_wrap_exact() {
         loom::model(|| {
-            let geo = tiny_ring(0);
+            let geo = tiny_ring(3, 0); // capacity 12
             let core = Arc::new(journal_core::JournalCore::new(geo, 0, 0));
 
             let t = {
@@ -572,13 +591,13 @@ mod models {
                 thread::spawn(move || {
                     let adm = core
                         .try_admit(3, journal_core::AdmissionClass::User)
-                        .expect("3 of 8 bytes must admit");
+                        .expect("3 of 12 bytes must admit even against a transient double-count");
                     core.reserve(adm)
                 })
             };
             let adm = core
                 .try_admit(3, journal_core::AdmissionClass::User)
-                .expect("3 more of 8 bytes must admit");
+                .expect("3 more of 12 bytes must admit even against a transient double-count");
             let r_main = core.reserve(adm);
             let r_thread = t.join().unwrap();
 
@@ -589,11 +608,21 @@ mod models {
             } else {
                 (r_thread, r_main)
             };
-            assert_eq!((a.start, a.len), (0, 3), "first reservation must start the ring");
-            assert_eq!((b.start, b.len), (3, 3), "reservations must be back-to-back");
+            assert_eq!(
+                (a.start, a.len),
+                (0, 3),
+                "first reservation must start the ring"
+            );
+            assert_eq!(
+                (b.start, b.len),
+                (3, 3),
+                "reservations must be back-to-back"
+            );
             assert!(a.end() <= b.start, "reservations overlap");
             assert_eq!(a.seq(), a.start, "seq is the start position");
             assert!(b.seq() > a.seq(), "seqs must be strictly monotonic");
+            assert_eq!(core.admitted(), 0, "both admissions fully transferred");
+            assert_eq!(core.head(), 6, "head == total reserved bytes");
 
             // Geometry of the second range [3, 6): crosses the page-0/page-1
             // data boundary — multi-page, contiguous segments.
@@ -624,28 +653,34 @@ mod models {
                 "[3,6) contains exactly page 1's first logical byte (pos 4)"
             );
 
-            // Ring full at head 6 + 3 > watermark 0 + 8: admission refused
+            // Ring full at head 6 + 7 > watermark 0 + 12: admission refused
             // until the watermark advances (§4.6 pt 3), then the wrapping
             // reservation's lap/page derivation is exact.
             assert!(
-                core.try_admit(3, journal_core::AdmissionClass::User).is_none(),
+                core.try_admit(7, journal_core::AdmissionClass::User)
+                    .is_none(),
                 "admission past reusable_upto must be refused"
             );
             core.advance_reusable_upto(6);
             let adm = core
-                .try_admit(3, journal_core::AdmissionClass::User)
+                .try_admit(7, journal_core::AdmissionClass::User)
                 .expect("watermark advance must open admission");
             let r = core.reserve(adm);
-            assert_eq!((r.start, r.len), (6, 3));
+            assert_eq!((r.start, r.len), (6, 7));
             assert_eq!(geo.lap(6), 0);
-            assert_eq!(geo.lap(r.end() - 1), 1, "range [6,9) crosses into lap 1");
+            assert_eq!(geo.lap(r.end() - 1), 1, "range [6,13) crosses into lap 1");
             assert_eq!(
-                geo.segments(6, 3),
+                geo.segments(6, 7),
                 vec![
                     journal_core::PageSegment {
                         page: 1,
                         data_off: 2,
                         len: 2
+                    },
+                    journal_core::PageSegment {
+                        page: 2,
+                        data_off: 0,
+                        len: 4
                     },
                     journal_core::PageSegment {
                         page: 0,
@@ -656,9 +691,9 @@ mod models {
                 "wrap: the range re-enters page 0 at lap 1"
             );
             assert_eq!(
-                geo.owned_page_starts(6, 3),
-                vec![8],
-                "[6,9) contains page 0's lap-1 first byte (pos 8)"
+                geo.owned_page_starts(6, 7),
+                vec![8, 12],
+                "[6,13) contains page 2's first byte (8) and page 0's lap-1 first byte (12)"
             );
         });
     }
@@ -672,7 +707,7 @@ mod models {
     fn journal_core_admission_never_overcommits_reserve_protected() {
         loom::model(|| {
             // capacity 8, reserve 3 ⇒ user budget 5.
-            let geo = tiny_ring(3);
+            let geo = tiny_ring(2, 3);
             let core = Arc::new(journal_core::JournalCore::new(geo, 0, 0));
 
             let t = {
@@ -699,7 +734,8 @@ mod models {
                 .expect("checkpoint reserve must stay admissible to the checkpoint task");
             // …while a user retry is still refused (claimed 6 + 3 > 5 + 0).
             assert!(
-                core.try_admit(3, journal_core::AdmissionClass::User).is_none(),
+                core.try_admit(3, journal_core::AdmissionClass::User)
+                    .is_none(),
                 "user admission consumed the checkpoint reserve"
             );
             assert!(
@@ -726,7 +762,7 @@ mod models {
     #[test]
     fn journal_core_budget_conserved_across_transfer_release() {
         loom::model(|| {
-            let geo = tiny_ring(0);
+            let geo = tiny_ring(2, 0); // capacity 8
             let core = Arc::new(journal_core::JournalCore::new(geo, 0, 0));
 
             let t = {
@@ -747,7 +783,11 @@ mod models {
             let r = t.join().unwrap();
 
             assert_eq!(core.admitted(), 0, "transfer+release must conserve to zero");
-            assert_eq!(core.head(), 2, "head advanced by exactly the reserved bytes");
+            assert_eq!(
+                core.head(),
+                2,
+                "head advanced by exactly the reserved bytes"
+            );
             assert_eq!((r.start, r.len), (0, 2));
 
             // Exact fit: the remaining 6 bytes admit; one more byte does not.
@@ -755,7 +795,8 @@ mod models {
                 .try_admit(6, journal_core::AdmissionClass::User)
                 .expect("released budget must be re-admittable to exact fit");
             assert!(
-                core.try_admit(1, journal_core::AdmissionClass::User).is_none(),
+                core.try_admit(1, journal_core::AdmissionClass::User)
+                    .is_none(),
                 "admission past exact capacity must be refused"
             );
             core.release(exact);

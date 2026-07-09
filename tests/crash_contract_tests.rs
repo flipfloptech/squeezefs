@@ -1164,9 +1164,13 @@ async fn test_kv_ledger_torn_slot_falls_back_to_predecessor() {
             .unwrap();
     }
 
-    // Checkpoint 5 races power loss: its slot write tears mid-record (the
-    // 24 B header lands, the payload does not).
-    uring_fs::arm_torn_write(5 * ROOT_LEDGER_SLOT_LEN + 100, 64);
+    // Checkpoint 5 races power loss: its slot write tears mid-record —
+    // inside the header's checksum field (byte 20 of 24), so the stored
+    // digest is half-written. (A tear whose lost suffix happens to equal
+    // the slot's prior bytes is undetectable by construction and
+    // indistinguishable from a complete write — torn-write immunity is
+    // about never *trusting* damage, not about sensing it.)
+    uring_fs::arm_torn_write(5 * ROOT_LEDGER_SLOT_LEN + 100, 20);
     let err = write_ledger_slot(f.path(), 0, &kv_ledger_rec(5))
         .await
         .expect_err("the torn slot write fails loud to the checkpointer");

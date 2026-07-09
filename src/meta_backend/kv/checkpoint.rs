@@ -48,6 +48,12 @@ pub const ROOT_LEDGER_MAGIC: u32 = 0x4B56_524C;
 /// Fixed slot header length (`magic | len | seq | xxh3`).
 pub const ROOT_LEDGER_HDR_LEN: usize = 24;
 
+/// Fixed payload prefix: `journal_tail_seq | next_ino |
+/// alloc_bitmap_generation | n_roots`.
+const PAYLOAD_FIXED_LEN: usize = 8 + 8 + 8 + 2;
+/// Encoded size of one tree root: `tree_id | node_addr | node_seq`.
+const ROOT_ENC_LEN: usize = 1 + 8 + 8;
+
 /// One tree root named by a ledger record: `(tree_id, node_addr, node_seq)`
 /// (§4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,24 +80,118 @@ pub struct LedgerRecord {
     pub alloc_bitmap_generation: u64,
 }
 
+/// xxh3 over a slot image with the checksum field (bytes 16..24) zeroed —
+/// the header-then-payload discipline the superblock and bsets use (§4.3).
+fn slot_checksum(image: &[u8], payload_len: usize) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(&image[..16]);
+    h.update(&[0u8; 8]);
+    h.update(&image[ROOT_LEDGER_HDR_LEN..ROOT_LEDGER_HDR_LEN + payload_len]);
+    h.digest()
+}
+
 impl LedgerRecord {
     /// The slot index this record occupies (`seq % 32`).
     pub fn slot_index(&self) -> u64 {
-        todo!()
+        self.seq % ROOT_LEDGER_SLOTS
     }
 
     /// Encode into a full zero-padded 4 KiB slot image. Errors when the
     /// record cannot fit a slot (structurally impossible for the ≤ 5 trees
     /// of §4.2 — defense in depth for the record count).
     pub fn encode_slot(&self) -> Result<Vec<u8>, KvError> {
-        todo!()
+        let payload_len = PAYLOAD_FIXED_LEN + self.tree_roots.len() * ROOT_ENC_LEN;
+        if ROOT_LEDGER_HDR_LEN + payload_len > ROOT_LEDGER_SLOT_LEN as usize
+            || self.tree_roots.len() > usize::from(u16::MAX)
+        {
+            return Err(KvError::Corrupt(format!(
+                "ledger record with {} tree roots does not fit a {}-byte slot",
+                self.tree_roots.len(),
+                ROOT_LEDGER_SLOT_LEN
+            )));
+        }
+        let mut image = vec![0u8; ROOT_LEDGER_SLOT_LEN as usize];
+        image[0..4].copy_from_slice(&ROOT_LEDGER_MAGIC.to_le_bytes());
+        image[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        image[8..16].copy_from_slice(&self.seq.to_le_bytes());
+        // Checksum stamped below.
+        let mut pos = ROOT_LEDGER_HDR_LEN;
+        image[pos..pos + 8].copy_from_slice(&self.journal_tail_seq.to_le_bytes());
+        pos += 8;
+        image[pos..pos + 8].copy_from_slice(&self.next_ino.to_le_bytes());
+        pos += 8;
+        image[pos..pos + 8].copy_from_slice(&self.alloc_bitmap_generation.to_le_bytes());
+        pos += 8;
+        image[pos..pos + 2].copy_from_slice(&(self.tree_roots.len() as u16).to_le_bytes());
+        pos += 2;
+        for root in &self.tree_roots {
+            image[pos] = root.tree_id;
+            image[pos + 1..pos + 9].copy_from_slice(&root.node_addr.to_le_bytes());
+            image[pos + 9..pos + 17].copy_from_slice(&root.node_seq.to_le_bytes());
+            pos += ROOT_ENC_LEN;
+        }
+        let sum = slot_checksum(&image, payload_len);
+        image[16..24].copy_from_slice(&sum.to_le_bytes());
+        Ok(image)
     }
 
     /// Decode + verify one slot image: magic, bounds-checked lengths (§9),
     /// checksum. Any failure means "this slot holds no valid record" —
     /// the selection logic treats it as absent, never loud.
-    pub fn decode_slot(_buf: &[u8]) -> Result<Self, KvError> {
-        todo!()
+    pub fn decode_slot(buf: &[u8]) -> Result<Self, KvError> {
+        if buf.len() < ROOT_LEDGER_HDR_LEN {
+            return Err(KvError::Corrupt(format!(
+                "truncated ledger slot: {} of {ROOT_LEDGER_HDR_LEN} header bytes",
+                buf.len()
+            )));
+        }
+        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        if magic != ROOT_LEDGER_MAGIC {
+            return Err(KvError::Corrupt(format!(
+                "bad ledger slot magic {magic:#010x} (expected {ROOT_LEDGER_MAGIC:#010x})"
+            )));
+        }
+        let payload_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        // §9: the length is validated against the container before any
+        // byte it governs is touched.
+        if payload_len < PAYLOAD_FIXED_LEN || ROOT_LEDGER_HDR_LEN + payload_len > buf.len() {
+            return Err(KvError::Corrupt(format!(
+                "ledger payload length {payload_len} does not fit its slot"
+            )));
+        }
+        let seq = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let stored = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let computed = slot_checksum(buf, payload_len);
+        if stored != computed {
+            return Err(KvError::ChecksumMismatch { stored, computed });
+        }
+        let payload = &buf[ROOT_LEDGER_HDR_LEN..ROOT_LEDGER_HDR_LEN + payload_len];
+        let journal_tail_seq = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let next_ino = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+        let alloc_bitmap_generation = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+        let n_roots = usize::from(u16::from_le_bytes(payload[24..26].try_into().unwrap()));
+        if PAYLOAD_FIXED_LEN + n_roots * ROOT_ENC_LEN != payload_len {
+            return Err(KvError::Corrupt(format!(
+                "ledger n_roots {n_roots} inconsistent with payload length {payload_len}"
+            )));
+        }
+        let mut tree_roots = Vec::with_capacity(n_roots);
+        let mut pos = PAYLOAD_FIXED_LEN;
+        for _ in 0..n_roots {
+            tree_roots.push(TreeRoot {
+                tree_id: payload[pos],
+                node_addr: u64::from_le_bytes(payload[pos + 1..pos + 9].try_into().unwrap()),
+                node_seq: u64::from_le_bytes(payload[pos + 9..pos + 17].try_into().unwrap()),
+            });
+            pos += ROOT_ENC_LEN;
+        }
+        Ok(Self {
+            seq,
+            tree_roots,
+            journal_tail_seq,
+            next_ino,
+            alloc_bitmap_generation,
+        })
     }
 }
 
@@ -100,11 +200,14 @@ impl LedgerRecord {
 /// barrier (§4.6 pt 2: "the root record's own durability rides the next
 /// barrier").
 pub async fn write_ledger_slot(
-    _path: &Path,
-    _ledger_base: u64,
-    _rec: &LedgerRecord,
+    path: &Path,
+    ledger_base: u64,
+    rec: &LedgerRecord,
 ) -> Result<(), KvError> {
-    todo!()
+    let image = rec.encode_slot()?;
+    let off = ledger_base + rec.slot_index() * ROOT_LEDGER_SLOT_LEN;
+    crate::uring_fs::write_at(path, off, image).await?;
+    Ok(())
 }
 
 /// Read all 32 slots (one 128 KiB `uring_fs::read_at`) and return the
@@ -115,8 +218,22 @@ pub async fn write_ledger_slot(
 /// I/O failure only ([`KvError::Io`]) — ledger *contents* never fail loud
 /// here.
 pub async fn read_newest_ledger(
-    _path: &Path,
-    _ledger_base: u64,
+    path: &Path,
+    ledger_base: u64,
 ) -> Result<Option<LedgerRecord>, KvError> {
-    todo!()
+    let got = crate::uring_fs::read_at(path, ledger_base, ROOT_LEDGER_LEN as usize).await?;
+    let mut newest: Option<LedgerRecord> = None;
+    for slot in 0..ROOT_LEDGER_SLOTS as usize {
+        let start = slot * ROOT_LEDGER_SLOT_LEN as usize;
+        if start >= got.len() {
+            break; // short extent: the rest reads as absent
+        }
+        let end = (start + ROOT_LEDGER_SLOT_LEN as usize).min(got.len());
+        if let Ok(rec) = LedgerRecord::decode_slot(&got[start..end]) {
+            if newest.as_ref().is_none_or(|n| rec.seq > n.seq) {
+                newest = Some(rec);
+            }
+        }
+    }
+    Ok(newest)
 }

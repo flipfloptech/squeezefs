@@ -120,8 +120,15 @@ pub enum KvError {
         durable_tail: u64,
     },
 
-    /// Node extent I/O failed (the `crate::uring_fs` paths — io_uring-only
+    /// A journal entry larger than the 128 KiB whole-entry cap (design
+    /// §4.1) — the writer-side guard at commit (PR K3); replay
+    /// independently drops any `len` implying more without ever
+    /// dereferencing it. A clean commit rejection, never a panic.
+    #[error("journal entry length {len} exceeds the {cap}-byte whole-entry cap")]
+    EntryTooLarge { len: u64, cap: u64 },
+
+    /// KV extent I/O failed (the `crate::uring_fs` paths — io_uring-only
     /// per AGENTS.md; a poisoned/torn device surfaces here as `EIO`).
-    #[error("node extent I/O failed: {0}")]
+    #[error("kv extent I/O failed: {0}")]
     Io(#[from] crate::error::SqueezefsError),
 }

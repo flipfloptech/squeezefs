@@ -260,8 +260,8 @@ fn test_core_geometry_lap_offset_segments() {
     );
     assert!(geo.owned_page_starts(100, 50).is_empty());
 
-    // A 10,000-byte range starting near the end of page 0 spans three
-    // pages: partial head, full interior page, partial tail — contiguous.
+    // A 10,000-byte range starting near the end of page 0 spans four
+    // pages: partial head, full interior pages, partial tail — contiguous.
     let start = 4000;
     let segs = geo.segments(start, 10_000);
     assert_eq!(
@@ -280,14 +280,19 @@ fn test_core_geometry_lap_offset_segments() {
             PageSegment {
                 page: 2,
                 data_off: 0,
-                len: 10_000 - 72 - 4072
+                len: 4072
+            },
+            PageSegment {
+                page: 3,
+                data_off: 0,
+                len: 10_000 - 72 - 2 * 4072
             },
         ]
     );
     assert_eq!(
         geo.owned_page_starts(start, 10_000),
-        vec![4072, 2 * 4072],
-        "the range contains pages 1 and 2's first logical bytes"
+        vec![4072, 2 * 4072, 3 * 4072],
+        "the range contains pages 1, 2, and 3's first logical bytes"
     );
 
     // Wrap: a range crossing the lap boundary re-enters page 0 with lap 1.
@@ -817,12 +822,16 @@ fn test_ledger_slot_encode_decode_roundtrip() {
     let back = LedgerRecord::decode_slot(&img).expect("roundtrip");
     assert_eq!(back, rec);
 
-    // Bounds & corruption (§9): flipped payload byte, truncated image,
-    // zeroed image — all typed errors.
+    // Bounds & corruption (§9): flipped payload byte, truncation into the
+    // payload, truncation into the header, zeroed image — all typed
+    // errors. (A truncation that still contains the whole self-delimiting
+    // record decodes — the length/checksum bind the content, not the
+    // padding.)
     let mut corrupt = img.clone();
     corrupt[40] ^= 0xFF;
     assert!(LedgerRecord::decode_slot(&corrupt).is_err());
-    assert!(LedgerRecord::decode_slot(&img[..100]).is_err());
+    assert!(LedgerRecord::decode_slot(&img[..50]).is_err());
+    assert!(LedgerRecord::decode_slot(&img[..10]).is_err());
     assert!(LedgerRecord::decode_slot(&[0u8; 4096]).is_err());
 }
 

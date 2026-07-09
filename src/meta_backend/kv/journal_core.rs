@@ -43,12 +43,19 @@
 //! writeback / SMO task can always admit its interior-pointer and alloc/free
 //! records even when user commits have parked (the R10 liveness argument).
 //!
-//! `try_admit` reads `admitted` **before** `head` while `reserve` (the
-//! transfer) bumps `head` **before** decrementing `admitted`: any racing
-//! observation therefore sees `admitted + head` at-or-above the true claim
-//! (the transferred bytes are transiently counted twice, never zero times),
-//! so admission can be spuriously refused but never over-commits the ring.
-//! The CAS on `admitted` re-validates after any concurrent change.
+//! ### Why the two-counter read is safe
+//!
+//! [`JournalCore::try_admit`] reads `admitted` **before** `head`, while
+//! [`JournalCore::reserve`] (the transfer) bumps `head` **before**
+//! decrementing `admitted`. Any interleaved observation therefore sees
+//! `admitted + head` at-or-above the true claim — the transferring bytes
+//! are transiently counted twice, never zero times (the under-count would
+//! need `admitted` read *after* its decrement and `head` read *before* its
+//! increment, which the two orderings jointly forbid). Admission can be
+//! spuriously refused under a race, but can never over-commit the ring.
+//! The CAS on `admitted` re-validates after any concurrent admission,
+//! release, or transfer-completion touching it. `reusable_upto` only
+//! grows, so a stale read is conservative too.
 //!
 //! ## `reusable_upto` (§4.6 pt 3)
 //!
@@ -57,19 +64,18 @@
 //! them is *known durable* (post-barrier) — never merely because the in-RAM
 //! tail moved — so the head can never overwrite the pages a
 //! torn-newest-ledger-slot fallback would need to replay. The watermark is
-//! monotonic and never exceeds the durable tail its caller derived it from
-//! (`advance_reusable_upto` debug-asserts it never passes `head`).
+//! monotonic (`fetch_max`) and debug-asserted never to pass the head.
 
 #[cfg(loom)]
 pub(crate) mod atomic {
-    pub use loom::sync::atomic::AtomicU64;
+    pub use loom::sync::atomic::{AtomicU64, Ordering};
 }
 #[cfg(not(loom))]
 pub(crate) mod atomic {
-    pub use std::sync::atomic::AtomicU64;
+    pub use std::sync::atomic::{AtomicU64, Ordering};
 }
 
-use atomic::AtomicU64;
+use atomic::{AtomicU64, Ordering};
 
 /// Ring geometry: everything the pure core needs to derive laps, offsets,
 /// page indices, and physical segments from monotonic logical positions.
@@ -92,33 +98,33 @@ pub struct CoreGeometry {
 impl CoreGeometry {
     /// Total logical bytes per lap (`pages × page_data_len`).
     pub fn logical_len(&self) -> u64 {
-        todo!()
+        self.pages * self.page_data_len
     }
 
     /// Which lap `pos` belongs to.
-    pub fn lap(&self, _pos: u64) -> u64 {
-        todo!()
+    pub fn lap(&self, pos: u64) -> u64 {
+        pos / self.logical_len()
     }
 
     /// `pos`'s offset within its lap (`pos % logical_len`).
-    pub fn ring_offset(&self, _pos: u64) -> u64 {
-        todo!()
+    pub fn ring_offset(&self, pos: u64) -> u64 {
+        pos % self.logical_len()
     }
 
     /// Physical page index holding `pos` (`(pos / page_data_len) % pages`).
-    pub fn page_index(&self, _pos: u64) -> u64 {
-        todo!()
+    pub fn page_index(&self, pos: u64) -> u64 {
+        (pos / self.page_data_len) % self.pages
     }
 
     /// The logical position of the first byte of `pos`'s page
     /// (`pos` aligned down to `page_data_len`).
-    pub fn page_start_pos(&self, _pos: u64) -> u64 {
-        todo!()
+    pub fn page_start_pos(&self, pos: u64) -> u64 {
+        pos - (pos % self.page_data_len)
     }
 
     /// `pos`'s offset within its page's data area (`pos % page_data_len`).
-    pub fn in_page_off(&self, _pos: u64) -> u64 {
-        todo!()
+    pub fn in_page_off(&self, pos: u64) -> u64 {
+        pos % self.page_data_len
     }
 
     /// Map the logical range `[start, start + len)` onto physical page-data
@@ -126,16 +132,40 @@ impl CoreGeometry {
     /// begin mid-page, the last may end mid-page, and every interior
     /// segment covers its page's whole data area — the §4.4 pt 2 "no
     /// special casing" shape of a multi-page reservation.
-    pub fn segments(&self, _start: u64, _len: u64) -> Vec<PageSegment> {
-        todo!()
+    pub fn segments(&self, start: u64, len: u64) -> Vec<PageSegment> {
+        let mut out = Vec::new();
+        let mut pos = start;
+        let end = start + len;
+        while pos < end {
+            let in_page = self.in_page_off(pos);
+            let take = (self.page_data_len - in_page).min(end - pos);
+            out.push(PageSegment {
+                page: self.page_index(pos),
+                data_off: in_page,
+                len: take,
+            });
+            pos += take;
+        }
+        out
     }
 
     /// Logical positions of every page-first-byte inside
     /// `[start, start + len)` — the pages whose 24 B header the owner of
     /// this reservation writes (§4.4 pt 2: "exactly one committer's
     /// reservation contains each page's first logical byte").
-    pub fn owned_page_starts(&self, _start: u64, _len: u64) -> Vec<u64> {
-        todo!()
+    pub fn owned_page_starts(&self, start: u64, len: u64) -> Vec<u64> {
+        let end = start + len;
+        // First page-start position ≥ start.
+        let mut pos = match start % self.page_data_len {
+            0 => start,
+            rem => start + (self.page_data_len - rem),
+        };
+        let mut out = Vec::new();
+        while pos < end {
+            out.push(pos);
+            pos += self.page_data_len;
+        }
+        out
     }
 }
 
@@ -165,19 +195,12 @@ pub enum AdmissionClass {
 
 /// Admitted-but-not-reserved ring budget. Must be either transferred to the
 /// head ([`JournalCore::reserve`]) or given back ([`JournalCore::release`]);
-/// dropping it on the floor leaks budget forever (debug builds catch this
-/// in the owning module's tests via the accounting assertions).
+/// dropping it on the floor leaks budget forever (the owning module's tests
+/// pin the conservation accounting that would catch it).
 #[derive(Debug)]
 #[must_use = "admitted budget must be reserved or released, or the ring leaks"]
 pub struct Admission {
-    _len: u64,
-}
-
-impl Admission {
-    /// The admitted byte count.
-    pub fn byte_len(&self) -> u64 {
-        todo!()
-    }
+    len: u64,
 }
 
 /// A claimed journal range: `[start, start + len)` in logical byte space.
@@ -193,12 +216,12 @@ pub struct Reservation {
 impl Reservation {
     /// The entry seq this reservation carries (its start position).
     pub fn seq(&self) -> u64 {
-        todo!()
+        self.start
     }
 
     /// One past the last logical byte (`start + len`).
     pub fn end(&self) -> u64 {
-        todo!()
+        self.start + self.len
     }
 }
 
@@ -208,10 +231,14 @@ impl Reservation {
 /// contiguity, no ring over-commit, admitted-byte conservation across
 /// transfer/release, and reserve-not-consumable-by-users.
 pub struct JournalCore {
-    _geo: CoreGeometry,
-    _head: AtomicU64,
-    _admitted: AtomicU64,
-    _reusable_upto: AtomicU64,
+    geo: CoreGeometry,
+    /// Next reservation's logical start position (monotonic).
+    head: AtomicU64,
+    /// Bytes admitted but not yet transferred to `head`.
+    admitted: AtomicU64,
+    /// Ring-reclamation watermark (§4.6 pt 3): positions strictly below it
+    /// are overwritable.
+    reusable_upto: AtomicU64,
 }
 
 impl JournalCore {
@@ -219,58 +246,113 @@ impl JournalCore {
     /// the replay-recovered head on remount) with the reclamation watermark
     /// at `reusable_upto` (0 fresh; the mounted ledger record's durable
     /// tail on remount — §4.6 pt 3).
-    pub fn new(_geo: CoreGeometry, _head_pos: u64, _reusable_upto: u64) -> Self {
-        todo!()
+    pub fn new(geo: CoreGeometry, head_pos: u64, reusable_upto: u64) -> Self {
+        debug_assert!(geo.page_data_len > 0 && geo.pages > 0, "degenerate ring");
+        debug_assert!(
+            reusable_upto <= head_pos,
+            "watermark {reusable_upto} past head {head_pos}"
+        );
+        debug_assert!(
+            head_pos <= reusable_upto + geo.logical_len(),
+            "head {head_pos} claims more than one lap past the watermark"
+        );
+        Self {
+            geo,
+            head: AtomicU64::new(head_pos),
+            admitted: AtomicU64::new(0),
+            reusable_upto: AtomicU64::new(reusable_upto),
+        }
     }
 
     /// The ring geometry.
     pub fn geometry(&self) -> &CoreGeometry {
-        todo!()
+        &self.geo
     }
 
     /// Current head position (the next reservation's start).
     pub fn head(&self) -> u64 {
-        todo!()
+        self.head.load(Ordering::Acquire)
     }
 
     /// Bytes admitted but not yet reserved (diagnostics / accounting tests).
     pub fn admitted(&self) -> u64 {
-        todo!()
+        self.admitted.load(Ordering::Acquire)
     }
 
     /// Current ring-reclamation watermark (§4.6 pt 3).
     pub fn reusable_upto(&self) -> u64 {
-        todo!()
+        self.reusable_upto.load(Ordering::Acquire)
     }
 
     /// Admit `len` bytes of ring budget, or `None` when the ring cannot
     /// hold them without overwriting un-reclaimable pages (the caller
-    /// parks holding **no node locks** — §4.4 pt 5). Wait-free apart from
-    /// CAS retries against concurrent admissions/transfers.
-    pub fn try_admit(&self, _len: u64, _class: AdmissionClass) -> Option<Admission> {
-        todo!()
+    /// parks holding **no node locks** — §4.4 pt 5). Lock-free: a CAS loop
+    /// on `admitted` that retries only when a concurrent
+    /// admission/release/transfer moved it.
+    pub fn try_admit(&self, len: u64, class: AdmissionClass) -> Option<Admission> {
+        let reserve = match class {
+            AdmissionClass::User => self.geo.reserve_bytes,
+            AdmissionClass::Checkpoint => 0,
+        };
+        let capacity = self.geo.logical_len();
+        debug_assert!(reserve < capacity, "reserve must leave admissible space");
+        let mut adm = self.admitted.load(Ordering::Acquire);
+        loop {
+            // Read order matters: `admitted` BEFORE `head` (see module
+            // docs) so a racing transfer is double-counted, never missed.
+            let head = self.head.load(Ordering::Acquire);
+            let reusable = self.reusable_upto.load(Ordering::Acquire);
+            let claimed = head + adm;
+            if claimed + len + reserve > reusable + capacity {
+                return None;
+            }
+            match self.admitted.compare_exchange(
+                adm,
+                adm + len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Admission { len }),
+                Err(cur) => adm = cur,
+            }
+        }
     }
 
     /// Give admitted budget back (a transaction that failed before its
     /// reservation). Conservation: `admitted` decreases by exactly the
     /// admission's length; `head` is untouched.
-    pub fn release(&self, _adm: Admission) {
-        todo!()
+    pub fn release(&self, adm: Admission) {
+        let prev = self.admitted.fetch_sub(adm.len, Ordering::AcqRel);
+        debug_assert!(prev >= adm.len, "released more budget than admitted");
     }
 
     /// Transfer admitted budget to the head: the single `fetch_add` of
     /// §4.4 pt 2. Never blocks and never fails — the budget was admitted
     /// up front, so the head advance is claim-by-construction. Returns the
     /// claimed range (its start doubles as the entry seq).
-    pub fn reserve(&self, _adm: Admission) -> Reservation {
-        todo!()
+    ///
+    /// Ordering: `head` is bumped BEFORE `admitted` is decremented, pairing
+    /// with [`Self::try_admit`]'s admitted-then-head read order (module
+    /// docs) so racing admissions never under-count the claim.
+    pub fn reserve(&self, adm: Admission) -> Reservation {
+        let start = self.head.fetch_add(adm.len, Ordering::AcqRel);
+        let prev = self.admitted.fetch_sub(adm.len, Ordering::AcqRel);
+        debug_assert!(prev >= adm.len, "reserved more budget than admitted");
+        Reservation {
+            start,
+            len: adm.len,
+        }
     }
 
     /// Advance the reclamation watermark (monotonic `fetch_max`; a stale
     /// or repeated advance is a no-op). Callers pass only durable-covered
     /// tails (§4.6 pt 3); debug builds assert the watermark never passes
     /// the head.
-    pub fn advance_reusable_upto(&self, _pos: u64) {
-        todo!()
+    pub fn advance_reusable_upto(&self, pos: u64) {
+        debug_assert!(
+            pos <= self.head.load(Ordering::Acquire),
+            "watermark {pos} would pass the head"
+        );
+        self.reusable_upto.fetch_max(pos, Ordering::AcqRel);
     }
 }

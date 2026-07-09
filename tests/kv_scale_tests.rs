@@ -1483,6 +1483,167 @@ async fn threshold_writeback_drains_without_cadence() {
     be.shutdown().await.unwrap();
 }
 
+/// The latch-free traversal must never burn its whole restart budget
+/// inside one SMO swap window: `NodeCache::load` short-circuits
+/// **synchronously** for retired extents, so a reader that races the
+/// (lock-held, tens-of-µs) swap window spins its 256 restarts in ~µs
+/// without ever yielding to the very task whose window it is waiting
+/// out — "traversal retry budget exhausted (routing loop — SMO protocol
+/// bug)" surfaced ~1/2 K7 criterion runs once threshold wakes made SMOs
+/// frequent. Restarts must be cooperative (yield), making the budget
+/// mean 256 *scheduling opportunities*, not 256 spins. This storm holds
+/// readers against sustained compaction/split churn; pre-fix it trips
+/// the budget within seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn descend_survives_sustained_smo_churn() {
+    let (be, _f) = v3_volume_with_seed(TEST_SEED, 256 * 1024 * 1024).await;
+    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
+        be.clone(),
+    )]));
+    routed
+        .create(ROOT_INO, "anchor", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 6 reader tasks hammer the traversal while 2 writers keep the hot
+    // leaves churning through appends → compactions → splits.
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let r = routed.clone();
+        let stop = stop.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut n: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                r.lookup(ROOT_INO, "anchor").await.expect(
+                    "latch-free lookup must survive SMO churn (restart budget must \
+                     be cooperative, not a spin)",
+                );
+                n += 1;
+            }
+            n
+        }));
+    }
+    let mut writers = Vec::new();
+    for w in 0..2u64 {
+        let r = routed.clone();
+        let stop = stop.clone();
+        writers.push(tokio::spawn(async move {
+            let mut i: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let name = format!("churn-{w}-{i:06}");
+                r.create(ROOT_INO, &name, libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .expect("storm create");
+                r.unlink(ROOT_INO, &name).await.expect("storm unlink");
+                i += 1;
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.await.unwrap();
+    }
+    let mut lookups = 0u64;
+    for t in tasks {
+        lookups += t.await.expect("reader must not panic");
+    }
+    assert!(lookups > 0);
+    eprintln!("[smo-churn] {lookups} lookups survived 4 s of SMO churn");
+    be.shutdown().await.unwrap();
+}
+
+/// A rightmost-leaf SMO journals its successor pointer record keyed by
+/// the node's inclusive `max_key` — for the rightmost sibling that is
+/// exactly `KEY_SPACE_MAX`, the legal top separator of the §4.2 key
+/// space. Replay must accept it: §4.1's rule is that nothing inside the
+/// replay window ever fails a mount loud, and this record is not even
+/// damage — it is a correct SMO artifact. Pre-fix, `apply_replayed_interior`
+/// ran the CONTENT-key guard (`key < KEY_SPACE_MAX`) and a mount whose
+/// window held a rightmost-leaf split died with "tree key must be
+/// non-empty and sort below KEY_SPACE_MAX" (surfaced by the K7 R10 storm
+/// recalibration: the §4.6 pt 1 threshold wakes make splits frequent, and
+/// a split journaled during a final checkpoint's own flush pass lands
+/// past the captured head, staying in the window even after a clean
+/// shutdown).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rightmost_separator_pointer_record_replays_clean() {
+    // Park the cadence: only §4.6 pt 1 threshold maintenance runs, so no
+    // ledger record ever covers the storm — every record (SMO pointers
+    // included) stays in the replay window by construction.
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+
+    let file = NamedTempFile::new().expect("temp volume");
+    file.as_file().set_len(128 * 1024 * 1024).unwrap();
+    let cfg = BuilderConfig {
+        node_size: 64 * 1024, // small nodes: splits come quick
+        journal_len_override: Some(8 * 1024 * 1024),
+        hash_seed: TEST_SEED,
+        uuid: TEST_UUID,
+    };
+    ImageBuilder::new(cfg)
+        .unwrap()
+        .build(file.path(), 128 * 1024 * 1024)
+        .await
+        .unwrap();
+    let be = KvMetaBackend::open(file.path()).await.unwrap();
+
+    // Ascending-ino xattr payloads drive the xattr tree's RIGHTMOST leaf
+    // through repeated splits (keys are (ino, hash56, coll) — ino-major).
+    let splits0 = squeezefs::meta_backend::kv::META_KV_NODE_SPLITS.load(Ordering::Relaxed);
+    let mut i = 0u32;
+    while squeezefs::meta_backend::kv::META_KV_NODE_SPLITS.load(Ordering::Relaxed) < splits0 + 3 {
+        let f = be
+            .create(ROOT_INO, &format!("x{i:05}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        be.setxattr(f.ino, "user.fat", &vec![0xCD; 8000])
+            .await
+            .unwrap();
+        i += 1;
+        assert!(i < 5_000, "xattr storm never split the tree — harness bug");
+        // Give the threshold maintenance passes their turn.
+        if i % 8 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    // Let in-flight maintenance settle (bounded poll — observer only).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let survivors: Vec<u32> = (0..i).collect();
+
+    // Drop WITHOUT shutdown: no final checkpoint — the whole storm,
+    // rightmost-separator pointer records included, is the replay window.
+    drop(be);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let re = KvMetaBackend::open(file.path()).await.expect(
+        "replaying a rightmost-leaf SMO pointer record must never fail the mount loud (§4.1)",
+    );
+    for s in survivors.iter().rev().take(20) {
+        let f = re
+            .lookup(ROOT_INO, &format!("x{s:05}"))
+            .await
+            .expect("storm files must survive replay");
+        assert_eq!(
+            re.getxattr(f.ino, "user.fat")
+                .await
+                .unwrap()
+                .map(|v| v.len()),
+            Some(8000),
+            "xattr payloads must survive replay"
+        );
+    }
+    re.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // §8 paired-run tooling: rebuild a CLI-formatted meta volume as v2.
 // ---------------------------------------------------------------------------

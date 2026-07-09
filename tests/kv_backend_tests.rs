@@ -1845,9 +1845,15 @@ async fn v3_ring_full_liveness_storm_drains() {
     let smo_before = META_KV_NODE_SPLITS.load(AtomicOrdering::Relaxed)
         + META_KV_NODE_COMPACTIONS.load(AtomicOrdering::Relaxed);
 
-    // 8 directories, 16 writer tasks: ~2,400 creates + 2,400 setxattrs
-    // ≈ 1.2 MB of journal entries against a ~250 KiB user budget — the
-    // ring must wrap under sustained admission pressure.
+    // 8 directories, 16 writer tasks, 2 KiB xattr payloads: ~4,800
+    // creates + 4,800 setxattrs ≈ 12 MB of journal entries against a
+    // ~250 KiB user budget — the ring must wrap under sustained
+    // admission pressure. (PR K7's §4.6 pt 1 threshold wakes made
+    // draining aggressive enough that the original 200 B/150-iteration
+    // shape never parked: reserve-exhaustion checkpoints inside the
+    // maintenance passes advanced `reusable_upto` ahead of admission —
+    // strictly better liveness, so the storm grows to keep the PARK
+    // path exercised, which is the R10 point.)
     let mut dirs = Vec::new();
     for i in 0..8 {
         dirs.push(
@@ -1864,12 +1870,12 @@ async fn v3_ring_full_liveness_storm_drains() {
             let r = routed.clone();
             let parent = dirs[(t % 8) as usize];
             handles.push(tokio::spawn(async move {
-                for i in 0..150u32 {
+                for i in 0..300u32 {
                     let f = r
                         .create(parent, &format!("s{t}-{i}"), libc::S_IFREG | 0o644, 0, 0)
                         .await
                         .expect("storm create must eventually admit");
-                    r.setxattr(f.ino, "user.payload", &[0xEE; 200])
+                    r.setxattr(f.ino, "user.payload", &[0xEE; 2048])
                         .await
                         .expect("storm setxattr");
                 }
@@ -1899,7 +1905,7 @@ async fn v3_ring_full_liveness_storm_drains() {
     // Everything the storm acked is present and consistent.
     for (d, dir) in dirs.iter().enumerate() {
         let n = routed.readdir(*dir, 0, usize::MAX).await.unwrap().len();
-        assert_eq!(n, 300, "dir{d} must list every storm child");
+        assert_eq!(n, 600, "dir{d} must list every storm child");
     }
 
     // And the volume survives a clean remount with a matching digest.

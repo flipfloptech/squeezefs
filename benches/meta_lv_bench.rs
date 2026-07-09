@@ -151,22 +151,25 @@ fn bench_kv_meta_metadata(c: &mut Criterion) {
     });
 
     // One §5.1 streaming step: a 100-entry cookie page out of a 1,000-entry
-    // directory (the FUSE readdir hot shape after K7).
-    group.bench_function("readdir_page_100_of_1k", |b| {
-        let dir = rt.block_on(async {
-            let dir = backend
-                .create(1, "paged_dir", libc::S_IFDIR | 0o755, 0, 0)
+    // directory (the FUSE readdir hot shape after K7). Setup is hoisted
+    // out of the bench closure — criterion may invoke the routine closure
+    // more than once, and this population is not idempotent.
+    let paged_dir = rt.block_on(async {
+        let dir = backend
+            .create(1, "paged_dir", libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        for i in 0..1000u32 {
+            backend
+                .create(dir, &format!("e{i:04}"), 0o644, 0, 0)
                 .await
-                .unwrap()
-                .ino;
-            for i in 0..1000u32 {
-                backend
-                    .create(dir, &format!("e{i:04}"), 0o644, 0, 0)
-                    .await
-                    .unwrap();
-            }
-            dir
-        });
+                .unwrap();
+        }
+        dir
+    });
+    group.bench_function("readdir_page_100_of_1k", |b| {
+        let dir = paged_dir;
         b.to_async(&rt).iter(|| {
             let backend_ref = &backend;
             async move {

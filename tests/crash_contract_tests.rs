@@ -21,12 +21,23 @@
 //! (`fsync_single_barrier_tests.rs`, `fsync_coalescing_tests.rs`) are the
 //! retained-unchanged regression guard for the PR 4 `FORCE_SYNC_TX`
 //! deletion — deliberately not duplicated here (§4.3).
+//!
+//! The trailing `PR K2` section extends the harness to the v3 CoW KV node
+//! format (design-cow-kv-metadata §4.5/§4.10): torn tail bsets, the loud
+//! positional valid-bset-after-tear classifier, and torn rewrites.
 
 use squeezefs::meta_backend::inode::{read_inode, write_inode, DiskInode};
 use squeezefs::meta_backend::storage::MetaLvStorage;
 use squeezefs::meta_backend::{MetaLvBackend, Metadata};
 use squeezefs::uring_fs;
 use tempfile::NamedTempFile;
+
+use squeezefs::meta_backend::kv::node::{
+    append_bset, compact_node, encode_bset_frame, load_node, split_node, write_node, AppendDest,
+    NodeLayout, NodeWriteParams, SplitDest, DEFAULT_NODE_SIZE,
+};
+use squeezefs::meta_backend::kv::record::{inode_key, Folded, InodeValue, Record, TREE_INODES};
+use squeezefs::meta_backend::kv::{KvError, META_KV_NODE_DROPPED_TAIL_BSETS};
 
 const VOL_SIZE: u64 = 256 * 1024 * 1024;
 const JOURNAL_START: u64 = 1024 * 1024 * 104;
@@ -419,4 +430,345 @@ async fn test_journal_region_never_written() {
         before, after,
         "a mutation session must leave the journal region byte-identical"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PR K2: the v3 CoW node crash contract (design-cow-kv-metadata §4.5/§4.10).
+//
+// Node appends mutate only never-written bytes, so a torn append can only
+// damage data that was never live: dropped + counted, prior bsets intact.
+// The §4.5 positional classifier turns exactly one shape LOUD — a valid
+// same-incarnation bset beyond the tear whose journal_seq_horizon is ≤ the
+// durable tail (checkpoint-covered data cannot legitimately follow a torn
+// append; the §4.6 barrier covered every earlier one). Rewrites go to fresh
+// extents, never in place, so a torn rewrite is unreferenced garbage and
+// the old node serves. `TORN_WRITE_FAULT` is reused for tear injection.
+// ---------------------------------------------------------------------------
+
+const KV_VOL_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Fresh fixed-size file volume for injected KV node extents (no v2
+/// geometry needed — the node layer is pure over caller-provided extents).
+fn fresh_kv_volume() -> NamedTempFile {
+    let tmp = NamedTempFile::new().unwrap();
+    tmp.as_file().set_len(KV_VOL_SIZE).unwrap();
+    tmp
+}
+
+fn kv_layout() -> NodeLayout {
+    NodeLayout::new(DEFAULT_NODE_SIZE).expect("default layout")
+}
+
+fn kv_put(ino: u64, seq: u64) -> Record {
+    let v = InodeValue {
+        mode: 0o100644,
+        uid: seq as u32,
+        nlink: 1,
+        mtime: seq,
+        ctime: seq,
+        ..Default::default()
+    };
+    Record::put(inode_key(ino).to_vec(), seq, v.encode())
+}
+
+fn kv_params<'a>(addr: u64, seq: u64) -> NodeWriteParams<'a> {
+    NodeWriteParams {
+        node_addr: addr,
+        node_seq: seq,
+        tree_id: TREE_INODES,
+        level: 0,
+        min_key: b"",
+        max_key: b"\xff",
+    }
+}
+
+fn dropped_counter() -> u64 {
+    META_KV_NODE_DROPPED_TAIL_BSETS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Build `base + one appended bset` at extent 0 and return the tail offset
+/// where the next append lands.
+async fn kv_node_with_one_append(vol: &NamedTempFile, l: &NodeLayout) -> usize {
+    let written = write_node(
+        vol.path(),
+        l,
+        &kv_params(0, 1),
+        &[kv_put(1, 1), kv_put(2, 2)],
+        2,
+    )
+    .await
+    .expect("base");
+    let dest = AppendDest {
+        node_addr: 0,
+        node_seq: 1,
+        tail_offset: written.bytes_written,
+    };
+    append_bset(vol.path(), l, &dest, &[kv_put(3, 18)], 20)
+        .await
+        .expect("append 1")
+}
+
+/// K2 crash case (a): a torn tail-bset append is EIO to the writer; on
+/// reload the torn bset is dropped **and counted**
+/// (`meta_kv_node_dropped_tail_bsets`), every prior bset is intact, and the
+/// torn records were never live. A sub-frame-header tear (nothing
+/// identifiable landed) is indistinguishable from a clean end: dropped,
+/// uncounted, priors intact — the counter is the *clean-unmount* corruption
+/// alert, not a tear census (§4.5).
+#[tokio::test]
+async fn test_kv_node_torn_tail_bset_dropped_counted_priors_intact() {
+    let vol = fresh_kv_volume();
+    let _g = FaultGuard;
+    let l = kv_layout();
+    let tail = kv_node_with_one_append(&vol, &l).await;
+
+    // Tear the next append 64 bytes in: the 32 B frame header lands (this
+    // incarnation's stamp), the bset image tears.
+    uring_fs::arm_torn_write(tail as u64, 64);
+    let dest = AppendDest {
+        node_addr: 0,
+        node_seq: 1,
+        tail_offset: tail,
+    };
+    let err = append_bset(vol.path(), &l, &dest, &[kv_put(4, 22)], 30)
+        .await
+        .expect_err("torn append must report the device error");
+    match err {
+        KvError::Io(inner) => assert_eq!(inner.to_errno(), libc::EIO),
+        other => panic!("expected KvError::Io(EIO), got {other:?}"),
+    }
+    uring_fs::clear_faults();
+
+    // Reload with the torn bset inside the replay window (horizon 30 > the
+    // durable tail 15): expected power-loss artifact — silent drop, counted.
+    let before = dropped_counter();
+    let node = load_node(vol.path(), &l, 0, 15)
+        .await
+        .expect("a torn un-checkpointed tail must never fail the load");
+    assert_eq!(node.bset_count(), 2, "base + append 1 intact");
+    assert_eq!(node.dropped_tail_bsets(), 1, "the torn bset is counted");
+    assert_eq!(dropped_counter() - before, 1, "global counter mirrors it");
+    assert_eq!(
+        node.tail_offset(),
+        tail,
+        "the truncated view ends where the tear began"
+    );
+    match node.lookup(&inode_key(3)).expect("fold") {
+        Folded::Put { seq, .. } => assert_eq!(seq, 18, "prior append intact"),
+        other => panic!("expected prior append's record, got {other:?}"),
+    }
+    assert_eq!(
+        node.lookup(&inode_key(4)).expect("fold"),
+        Folded::Absent,
+        "the torn record was never live"
+    );
+
+    // Sub-header tear on a second node: not even the frame magic lands ⇒
+    // indistinguishable from a clean end. Dropped, uncounted, priors intact.
+    let addr2 = DEFAULT_NODE_SIZE as u64;
+    let w2 = write_node(vol.path(), &l, &kv_params(addr2, 5), &[kv_put(7, 7)], 7)
+        .await
+        .expect("second node");
+    uring_fs::arm_torn_write(addr2 + w2.bytes_written as u64, 2);
+    let dest2 = AppendDest {
+        node_addr: addr2,
+        node_seq: 5,
+        tail_offset: w2.bytes_written,
+    };
+    append_bset(vol.path(), &l, &dest2, &[kv_put(8, 9)], 9)
+        .await
+        .expect_err("torn append must fail");
+    uring_fs::clear_faults();
+    let before = dropped_counter();
+    let node2 = load_node(vol.path(), &l, addr2, 0).await.expect("load");
+    assert_eq!(node2.bset_count(), 1, "prior base intact");
+    assert_eq!(node2.dropped_tail_bsets(), 0, "nothing identifiable landed");
+    assert_eq!(dropped_counter(), before);
+}
+
+/// K2 crash case (b): the §4.5 **positional** classifier. A torn bset's own
+/// bytes — including its landed `journal_seq_horizon` field — are garbage
+/// and never branched on; classification uses only checksum-verified bsets
+/// beyond the tear. A valid same-incarnation bset with horizon ≤ the
+/// durable tail ⇒ LOUD typed failure (checkpoint-covered data after a tear
+/// is impossible under the §4.6 barrier); horizon > tail ⇒ silent
+/// replay-window drop; a stale-incarnation frame (recycled extent) never
+/// trips it.
+#[tokio::test]
+async fn test_kv_node_valid_bset_after_tear_horizon_le_tail_fails_loud() {
+    let vol = fresh_kv_volume();
+    let _g = FaultGuard;
+    let l = kv_layout();
+    let tail = kv_node_with_one_append(&vol, &l).await;
+    let durable_tail = 15u64;
+
+    // Torn append whose OWN horizon field (1 ≤ 15) physically lands: keep
+    // 64 covers the 32 B frame header AND the 32 B bset header. If the
+    // classifier branched on those torn bytes it would fail loud here.
+    uring_fs::arm_torn_write(tail as u64, 64);
+    let dest = AppendDest {
+        node_addr: 0,
+        node_seq: 1,
+        tail_offset: tail,
+    };
+    append_bset(vol.path(), &l, &dest, &[kv_put(4, 1)], 1)
+        .await
+        .expect_err("torn append must fail");
+    uring_fs::clear_faults();
+    let node = load_node(vol.path(), &l, 0, durable_tail)
+        .await
+        .expect("a torn bset's own horizon must never be branched on");
+    assert_eq!(node.dropped_tail_bsets(), 1);
+
+    // A valid same-incarnation bset beyond the tear, horizon 16 > tail 15:
+    // still the replay window — silent drop, counted, never loud.
+    let beyond = tail + squeezefs::meta_backend::kv::node::NODE_PAGE;
+    let replay_window_frame = encode_bset_frame(&l, 1, &[kv_put(9, 16)], 16).expect("forge frame");
+    uring_fs::write_at(vol.path(), beyond as u64, replay_window_frame)
+        .await
+        .expect("plant");
+    let node = load_node(vol.path(), &l, 0, durable_tail)
+        .await
+        .expect("replay-window bsets beyond a tear drop silently");
+    assert_eq!(
+        node.dropped_tail_bsets(),
+        2,
+        "the torn unit and the unreachable replay-window bset both count"
+    );
+    assert_eq!(node.bset_count(), 2, "the view still truncates at the tear");
+
+    // A stale-incarnation frame (node_seq 999 ≠ 1) with horizon ≤ tail:
+    // recycled-extent garbage, structurally expected — never loud.
+    let stale = encode_bset_frame(&l, 999, &[kv_put(10, 5)], 5).expect("forge stale");
+    let stale_off = beyond + squeezefs::meta_backend::kv::node::NODE_PAGE;
+    uring_fs::write_at(vol.path(), stale_off as u64, stale)
+        .await
+        .expect("plant stale");
+    load_node(vol.path(), &l, 0, durable_tail)
+        .await
+        .expect("stale-incarnation frames never trip the classifier");
+
+    // The loud shape: a valid SAME-incarnation bset beyond the tear with
+    // horizon 5 ≤ tail 15 ⇒ checkpoint-covered data follows a tear ⇒ the
+    // node must fail loud with the typed positional error.
+    let violation = encode_bset_frame(&l, 1, &[kv_put(9, 5)], 5).expect("forge violation");
+    uring_fs::write_at(vol.path(), beyond as u64, violation)
+        .await
+        .expect("plant violation");
+    let err = load_node(vol.path(), &l, 0, durable_tail)
+        .await
+        .expect_err("checkpoint-covered bset after a tear must fail LOUD");
+    match err {
+        KvError::CheckpointCoveredBsetAfterTear {
+            node_addr,
+            bset_offset,
+            horizon,
+            durable_tail: t,
+        } => {
+            assert_eq!(node_addr, 0);
+            assert_eq!(bset_offset, beyond);
+            assert_eq!(horizon, 5);
+            assert_eq!(t, durable_tail);
+        }
+        other => panic!("expected CheckpointCoveredBsetAfterTear, got {other:?}"),
+    }
+
+    // Boundary: horizon == tail is still "≤" — still loud (§4.5).
+    let boundary = encode_bset_frame(&l, 1, &[kv_put(9, 15)], durable_tail).expect("forge");
+    uring_fs::write_at(vol.path(), beyond as u64, boundary)
+        .await
+        .expect("plant boundary");
+    let err = load_node(vol.path(), &l, 0, durable_tail)
+        .await
+        .expect_err("horizon == durable tail must stay loud");
+    assert!(
+        matches!(
+            err,
+            KvError::CheckpointCoveredBsetAfterTear { horizon: 15, .. }
+        ),
+        "got {err:?}"
+    );
+}
+
+/// K2 crash case (c): a torn rewrite (compact/split) targets a FRESH extent
+/// — never in place — so the tear leaves unreferenced garbage: the write
+/// errors, the destination fails to load, and the source node is
+/// byte-identical and fully serving (§4.1/§4.10 "torn rewrite ⇒
+/// unreferenced, old node serves").
+#[tokio::test]
+async fn test_kv_node_torn_rewrite_unreferenced_old_node_untouched() {
+    let vol = fresh_kv_volume();
+    let _g = FaultGuard;
+    let l = kv_layout();
+    kv_node_with_one_append(&vol, &l).await;
+    let src = load_node(vol.path(), &l, 0, 0).await.expect("load src");
+    let image_before = uring_fs::read_at(vol.path(), 0, DEFAULT_NODE_SIZE)
+        .await
+        .expect("src image");
+
+    // Torn compaction: 20 bytes of the destination header page land — the
+    // header checksum field never does.
+    let dst = DEFAULT_NODE_SIZE as u64;
+    uring_fs::arm_torn_write(dst, 20);
+    let err = compact_node(vol.path(), &l, &src, dst, 2, 0)
+        .await
+        .expect_err("torn rewrite must report the device error");
+    match err {
+        KvError::Io(inner) => assert_eq!(inner.to_errno(), libc::EIO),
+        other => panic!("expected KvError::Io(EIO), got {other:?}"),
+    }
+    uring_fs::clear_faults();
+
+    load_node(vol.path(), &l, dst, 0)
+        .await
+        .expect_err("the torn destination must never verify");
+    let image_after = uring_fs::read_at(vol.path(), 0, DEFAULT_NODE_SIZE)
+        .await
+        .expect("src image after");
+    assert_eq!(
+        image_before, image_after,
+        "a rewrite must never write the source extent"
+    );
+    let src_again = load_node(vol.path(), &l, 0, 0)
+        .await
+        .expect("old node serves");
+    assert_eq!(src_again.bset_count(), 2);
+    match src_again.lookup(&inode_key(3)).expect("fold") {
+        Folded::Put { seq, .. } => assert_eq!(seq, 18),
+        other => panic!("expected the source record, got {other:?}"),
+    }
+
+    // Torn split: tear the LEFT destination; the fault poisons the path so
+    // the right write fails cleanly too — either way both destinations are
+    // unreferenced and the source is untouched.
+    uring_fs::arm_torn_write(2 * dst, 20);
+    let err = split_node(
+        vol.path(),
+        &l,
+        &src_again,
+        &SplitDest {
+            node_addr: 2 * dst,
+            node_seq: 3,
+        },
+        &SplitDest {
+            node_addr: 3 * dst,
+            node_seq: 4,
+        },
+        0,
+    )
+    .await
+    .expect_err("torn split must fail");
+    assert!(matches!(err, KvError::Io(_)), "got {err:?}");
+    uring_fs::clear_faults();
+
+    load_node(vol.path(), &l, 2 * dst, 0)
+        .await
+        .expect_err("torn left destination must never verify");
+    let final_image = uring_fs::read_at(vol.path(), 0, DEFAULT_NODE_SIZE)
+        .await
+        .expect("src image final");
+    assert_eq!(image_before, final_image, "source still byte-identical");
+    load_node(vol.path(), &l, 0, 0)
+        .await
+        .expect("old node still serves after the torn split");
 }

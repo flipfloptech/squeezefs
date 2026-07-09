@@ -8,12 +8,19 @@
 //! dentry/xattr hash + `coll_seq` collision scheme, and the readdir cookie
 //! contract (§5.1).
 //!
-//! Everything in this module is pure and in-memory: no I/O, no mount wiring.
-//! Per the design's liveness convention, K1–K5 code is production-unreachable
-//! until PR K6a wires the mount path; it is kept alive by its own unit tests
-//! and the `meta_lv_bench` criterion micro-benches.
+//! PR K2 adds [`node`]: the on-disk CoW btree node format — header page,
+//! bset-frame appends, the §4.5 positional torn-tail classifier, and
+//! compact/split as pure functions over caller-provided extents, with all
+//! extent I/O through `crate::uring_fs` (io_uring-only).
+//!
+//! The record/bset layer is pure and in-memory; nothing here is mount-wired
+//! yet. Per the design's liveness convention, K1–K5 code is
+//! production-unreachable until PR K6a wires the mount path; it is kept
+//! alive by its own unit/integration tests, the crash harness, and the
+//! `meta_lv_bench` criterion micro-benches.
 
 pub mod bset;
+pub mod node;
 pub mod record;
 
 use std::sync::atomic::AtomicU64;
@@ -31,6 +38,15 @@ pub static META_KV_DENTRY_COLLISION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 /// orderings. Surfaced as `meta_kv_delta_orphans` when K6a wires the mount
 /// path; until then it is read by this module's tests.
 pub static META_KV_DELTA_ORPHANS: AtomicU64 = AtomicU64::new(0);
+
+/// Torn/garbage tail bsets dropped by the §4.5 positional node-load
+/// classifier — the expected un-checkpointed-tail artifact (every truncated
+/// record has seq > the durable tail; replay re-supplies it). Nonzero after
+/// a **clean** unmount is the corruption alert, mirroring
+/// `meta_kv_replay_dropped_torn` (design §10). Surfaced on the stats inode
+/// as `meta_kv_node_dropped_tail_bsets` when K6a wires the mount path; until
+/// then it is read by the node-layer tests and the crash harness.
+pub static META_KV_NODE_DROPPED_TAIL_BSETS: AtomicU64 = AtomicU64::new(0);
 
 /// Errors from the pure KV encoding / fold layer.
 ///
@@ -64,4 +80,40 @@ pub enum KvError {
     /// limit (design §4.2 value layouts).
     #[error("name length {len} exceeds the 255-byte record limit")]
     NameTooLong { len: usize },
+
+    /// A record value larger than the per-volume cap
+    /// `min(65,536, node_size/4)` (design §4.2) — enforced at the node layer
+    /// on every write path (PR K2). A clean op rejection, never a panic.
+    #[error(
+        "record value length {len} exceeds the per-volume cap {cap} (min(65536, node_size/4))"
+    )]
+    ValueTooLarge { len: usize, cap: usize },
+
+    /// A bset append that does not fit the node's unwritten tail — the
+    /// signal for the caller (the K5/K6b writeback task) to compact
+    /// (design §4.6 pt 1: "on-disk log area full ⇒ compact").
+    #[error("node log area full: append needs {needed} bytes, tail has {available}")]
+    NodeFull { needed: usize, available: usize },
+
+    /// The §4.5 positional torn-tail classifier's **loud** outcome: a valid
+    /// same-incarnation bset beyond the tear whose `journal_seq_horizon` is
+    /// ≤ the durable journal tail. Checkpoint-covered data was barriered
+    /// before its ledger record (§4.6 ordering), so a durable-required bset
+    /// cannot legitimately follow a torn one — this is real corruption, not
+    /// a power-loss artifact, and the node must fail loud.
+    #[error(
+        "corrupt node at {node_addr:#x}: checkpoint-covered bset at node offset {bset_offset} \
+         (journal_seq_horizon {horizon} ≤ durable tail {durable_tail}) follows a torn bset"
+    )]
+    CheckpointCoveredBsetAfterTear {
+        node_addr: u64,
+        bset_offset: usize,
+        horizon: u64,
+        durable_tail: u64,
+    },
+
+    /// Node extent I/O failed (the `crate::uring_fs` paths — io_uring-only
+    /// per AGENTS.md; a poisoned/torn device surfaces here as `EIO`).
+    #[error("node extent I/O failed: {0}")]
+    Io(#[from] crate::error::SqueezefsError),
 }

@@ -6,8 +6,19 @@
 //! succeeds, record access is infallible zero-copy slicing. Binary search
 //! compares raw big-endian key bytes and never decodes values (§4.2).
 
-use super::record::{Folded, Record, RecordRef};
+use super::record::{compact_fold, fold_newest_first, Folded, Record, RecordKind, RecordRef};
 use super::KvError;
+use std::cmp::Ordering;
+
+/// xxh3 over a bset image with the checksum field (bytes 24..32) zeroed —
+/// the repo's established primitive and convention (superblock precedent).
+fn checksum_image(buf: &[u8]) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(&buf[..24]);
+    h.update(&[0u8; 8]);
+    h.update(&buf[BSET_HEADER_LEN..]);
+    h.digest()
+}
 
 /// Bset header magic (`"BSET"`).
 pub const BSET_MAGIC: u32 = 0x4253_4554;
@@ -24,8 +35,42 @@ pub const BSET_HEADER_LEN: usize = 32;
 /// duplicate `(key, seq)` pairs within one bset are a writer bug and are
 /// rejected. `journal_seq_horizon` is the newest journal seq this bset
 /// covers; the K2 torn-tail classifier branches on it (§4.5).
-pub fn build_bset(_records: &[Record], _journal_seq_horizon: u64) -> Result<Vec<u8>, KvError> {
-    todo!()
+pub fn build_bset(records: &[Record], journal_seq_horizon: u64) -> Result<Vec<u8>, KvError> {
+    if records.is_empty() {
+        return Err(KvError::Corrupt(
+            "refusing to build an empty bset (freeze writes only dirty deltas)".to_string(),
+        ));
+    }
+    for pair in records.windows(2) {
+        let ord = pair[0]
+            .key
+            .cmp(&pair[1].key)
+            .then(pair[0].seq.cmp(&pair[1].seq));
+        if ord != Ordering::Less {
+            return Err(KvError::Corrupt(format!(
+                "bset records must be strictly (key, seq) ascending; violated at seqs {} → {}",
+                pair[0].seq, pair[1].seq
+            )));
+        }
+    }
+    let data_len: usize = records.iter().map(|r| r.record_ref().encoded_len()).sum();
+    let data_len_u32 = u32::try_from(data_len)
+        .map_err(|_| KvError::Corrupt(format!("bset data length {data_len} exceeds u32")))?;
+
+    let mut out = Vec::with_capacity(BSET_HEADER_LEN + data_len);
+    out.extend_from_slice(&BSET_MAGIC.to_le_bytes());
+    out.extend_from_slice(&BSET_VERSION.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    out.extend_from_slice(&data_len_u32.to_le_bytes());
+    out.extend_from_slice(&journal_seq_horizon.to_le_bytes());
+    out.extend_from_slice(&[0u8; 8]); // checksum stamped below
+    for r in records {
+        r.record_ref().encode_into(&mut out);
+    }
+    let sum = checksum_image(&out);
+    out[24..32].copy_from_slice(&sum.to_le_bytes());
+    Ok(out)
 }
 
 /// A parsed, verified, zero-copy view over a bset image.
@@ -35,60 +80,179 @@ pub fn build_bset(_records: &[Record], _journal_seq_horizon: u64) -> Result<Vec<
 /// afterwards records are handed out as borrowed slices with no further
 /// validation cost (§4.3: per-read checksum cost is zero).
 pub struct BsetView<'a> {
-    _buf: &'a [u8],
+    buf: &'a [u8],
+    journal_seq_horizon: u64,
+    metas: Vec<RecordMeta>,
+}
+
+/// Pre-validated record geometry: [`BsetView::record`] is infallible
+/// zero-copy slicing after parse.
+#[derive(Clone, Copy)]
+struct RecordMeta {
+    key_off: u32,
+    key_len: u16,
+    kind: RecordKind,
+    seq: u64,
+    val_off: u32,
+    val_len: u32,
 }
 
 impl<'a> BsetView<'a> {
     /// Parse and verify a bset image. The buffer must be the exact
     /// `BSET_HEADER_LEN + data_len` bytes (callers slice off any node-side
     /// padding first).
-    pub fn parse(_buf: &'a [u8]) -> Result<Self, KvError> {
-        todo!()
+    pub fn parse(buf: &'a [u8]) -> Result<Self, KvError> {
+        if buf.len() < BSET_HEADER_LEN {
+            return Err(KvError::Corrupt(format!(
+                "truncated bset header: {} of {BSET_HEADER_LEN} bytes",
+                buf.len()
+            )));
+        }
+        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if magic != BSET_MAGIC {
+            return Err(KvError::Corrupt(format!(
+                "bad bset magic {magic:#010x} (expected {BSET_MAGIC:#010x})"
+            )));
+        }
+        let version = u16::from_le_bytes([buf[4], buf[5]]);
+        if version != BSET_VERSION {
+            return Err(KvError::Corrupt(format!(
+                "unsupported bset version {version} (this binary understands {BSET_VERSION})"
+            )));
+        }
+        let reserved = u16::from_le_bytes([buf[6], buf[7]]);
+        if reserved != 0 {
+            return Err(KvError::Corrupt(format!(
+                "nonzero reserved bset header field: {reserved:#06x}"
+            )));
+        }
+        let record_count = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+        let data_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
+        if buf.len() != BSET_HEADER_LEN + data_len {
+            return Err(KvError::Corrupt(format!(
+                "bset length mismatch: header says {} bytes, buffer is {}",
+                BSET_HEADER_LEN + data_len,
+                buf.len()
+            )));
+        }
+        let mut horizon_bytes = [0u8; 8];
+        horizon_bytes.copy_from_slice(&buf[16..24]);
+        let journal_seq_horizon = u64::from_le_bytes(horizon_bytes);
+        let mut checksum_bytes = [0u8; 8];
+        checksum_bytes.copy_from_slice(&buf[24..32]);
+        let stored = u64::from_le_bytes(checksum_bytes);
+        let computed = checksum_image(buf);
+        if stored != computed {
+            return Err(KvError::ChecksumMismatch { stored, computed });
+        }
+
+        // The checksum verified — the walk below guards against writer bugs
+        // (ordering) and lying lengths, once, at load (§4.3).
+        let data = &buf[BSET_HEADER_LEN..];
+        let mut metas = Vec::with_capacity(record_count);
+        let mut pos = 0usize;
+        let mut prev: Option<(&[u8], u64)> = None;
+        for i in 0..record_count {
+            let (r, used) = RecordRef::decode(&data[pos..])?;
+            if let Some((prev_key, prev_seq)) = prev {
+                let ord = prev_key.cmp(r.key).then(prev_seq.cmp(&r.seq));
+                if ord != Ordering::Less {
+                    return Err(KvError::Corrupt(format!(
+                        "bset records out of (key, seq) order at index {i}"
+                    )));
+                }
+            }
+            prev = Some((r.key, r.seq));
+            let rec_off = BSET_HEADER_LEN + pos;
+            metas.push(RecordMeta {
+                key_off: (rec_off + super::record::RECORD_HEADER_LEN) as u32,
+                key_len: r.key.len() as u16,
+                kind: r.kind,
+                seq: r.seq,
+                val_off: (rec_off + super::record::RECORD_HEADER_LEN + r.key.len()) as u32,
+                val_len: r.value.len() as u32,
+            });
+            pos += used;
+        }
+        if pos != data.len() {
+            return Err(KvError::Corrupt(format!(
+                "{} trailing byte(s) after the last bset record",
+                data.len() - pos
+            )));
+        }
+        Ok(Self {
+            buf,
+            journal_seq_horizon,
+            metas,
+        })
     }
 
     /// Number of records.
     pub fn len(&self) -> usize {
-        todo!()
+        self.metas.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.metas.is_empty()
     }
 
     /// The newest journal seq this bset covers (§4.5 classifier input).
     pub fn journal_seq_horizon(&self) -> u64 {
-        todo!()
+        self.journal_seq_horizon
     }
 
     /// The `i`-th record (records are in strict `(key, seq)` ascending
     /// order). Panics on out-of-range `i`, like slice indexing.
-    pub fn record(&self, _i: usize) -> RecordRef<'a> {
-        todo!()
+    pub fn record(&self, i: usize) -> RecordRef<'a> {
+        let m = self.metas[i];
+        RecordRef {
+            key: &self.buf[m.key_off as usize..m.key_off as usize + usize::from(m.key_len)],
+            seq: m.seq,
+            kind: m.kind,
+            value: &self.buf[m.val_off as usize..m.val_off as usize + m.val_len as usize],
+        }
+    }
+
+    /// The raw key bytes of record `i` (borrowed for the buffer lifetime).
+    #[inline]
+    fn key_at(&self, m: &RecordMeta) -> &'a [u8] {
+        &self.buf[m.key_off as usize..m.key_off as usize + usize::from(m.key_len)]
     }
 
     /// Binary search on raw key bytes — no decoding (§4.2): the index range
     /// of records whose key equals `key` (empty at the insertion point when
     /// absent). A multi-seq key yields a seq-ascending range.
-    pub fn find(&self, _key: &[u8]) -> std::ops::Range<usize> {
-        todo!()
+    pub fn find(&self, key: &[u8]) -> std::ops::Range<usize> {
+        let lo = self.metas.partition_point(|m| self.key_at(m) < key);
+        let hi = self.metas.partition_point(|m| self.key_at(m) <= key);
+        lo..hi
     }
 
     /// Iterate records in `(key, seq)` order.
     pub fn iter(&self) -> BsetIter<'_, 'a> {
-        todo!()
+        BsetIter {
+            view: self,
+            next: 0,
+        }
     }
 }
 
 /// Iterator over a [`BsetView`]'s records.
 pub struct BsetIter<'v, 'a> {
-    _view: &'v BsetView<'a>,
+    view: &'v BsetView<'a>,
+    next: usize,
 }
 
 impl<'a> Iterator for BsetIter<'_, 'a> {
     type Item = RecordRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if self.next >= self.view.len() {
+            return None;
+        }
+        let r = self.view.record(self.next);
+        self.next += 1;
+        Some(r)
     }
 }
 
@@ -98,36 +262,91 @@ impl<'a> Iterator for BsetIter<'_, 'a> {
 /// input shape. Equal `(key, seq)` across sources (a node bset overlapping
 /// the journal replay window) yields the newer source first; both survive
 /// for the fold, which is idempotent over identical-effect records.
-pub fn merge<'v, 'a>(_sources: &'v [BsetView<'a>]) -> MergeIter<'v, 'a> {
-    todo!()
+pub fn merge<'v, 'a>(sources: &'v [BsetView<'a>]) -> MergeIter<'v, 'a> {
+    MergeIter {
+        sources,
+        cursors: vec![0; sources.len()],
+    }
 }
 
 /// Iterator returned by [`merge`].
 pub struct MergeIter<'v, 'a> {
-    _sources: &'v [BsetView<'a>],
+    sources: &'v [BsetView<'a>],
+    cursors: Vec<usize>,
 }
 
 impl<'a> Iterator for MergeIter<'_, 'a> {
     type Item = RecordRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        // Linear best-cursor scan: source counts are small (a node's bset
+        // log is ~32–56 deep at 256 KiB, §4.4) and the comparison is a
+        // memcmp on ≤ 16-byte keys.
+        let mut best: Option<(usize, RecordRef<'a>)> = None;
+        for (si, view) in self.sources.iter().enumerate() {
+            let cursor = self.cursors[si];
+            if cursor >= view.len() {
+                continue;
+            }
+            let r = view.record(cursor);
+            let is_better = match &best {
+                None => true,
+                Some((_, b)) => match r.key.cmp(b.key) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    // Same key: newer seq first; on an exact (key, seq) tie
+                    // the earlier (newer) source already holds `best`.
+                    Ordering::Equal => r.seq > b.seq,
+                },
+            };
+            if is_better {
+                best = Some((si, r));
+            }
+        }
+        let (si, r) = best?;
+        self.cursors[si] += 1;
+        Some(r)
     }
 }
 
 /// Point lookup across sources (`sources[0]` newest): gather `key`'s records
 /// from every view, order newest-first, and run the single fold algebra —
 /// the same fold compaction and replay use (§4.2).
-pub fn lookup<'a>(_sources: &[BsetView<'a>], _key: &[u8]) -> Result<Folded<'a>, KvError> {
-    todo!()
+pub fn lookup<'a>(sources: &[BsetView<'a>], key: &[u8]) -> Result<Folded<'a>, KvError> {
+    let mut matches: Vec<(usize, RecordRef<'a>)> = Vec::new();
+    for (si, view) in sources.iter().enumerate() {
+        for i in view.find(key) {
+            matches.push((si, view.record(i)));
+        }
+    }
+    // Newest seq first; exact seq ties resolve by source priority (newer
+    // source first) — legal only for identical-effect records.
+    matches.sort_unstable_by(|(sa, a), (sb, b)| b.seq.cmp(&a.seq).then(sa.cmp(sb)));
+    fold_newest_first(matches.into_iter().map(|(_, r)| r))
 }
 
 /// Compact sources into one folded record per surviving key: n-way merge,
 /// group by key, [`super::record::compact_fold`] each group under the §4.2
 /// tombstone elision rule. The output is strictly key-ascending and
 /// key-unique — directly buildable into a fresh bset.
-pub fn compact(_sources: &[BsetView<'_>], _durable_tail: u64) -> Result<Vec<Record>, KvError> {
-    todo!()
+pub fn compact<'a>(sources: &[BsetView<'a>], durable_tail: u64) -> Result<Vec<Record>, KvError> {
+    let mut out = Vec::new();
+    let mut group: Vec<RecordRef<'a>> = Vec::new();
+    for r in merge(sources) {
+        if let Some(first) = group.first() {
+            if first.key != r.key {
+                if let Some(rec) = compact_fold(&group, durable_tail)? {
+                    out.push(rec);
+                }
+                group.clear();
+            }
+        }
+        group.push(r);
+    }
+    if let Some(rec) = compact_fold(&group, durable_tail)? {
+        out.push(rec);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use squeezefs::meta_backend::kv::bset::{build_bset, lookup, merge, BsetView};
+use squeezefs::meta_backend::kv::record::{
+    dentry_key, dentry_name_hash54, inode_key, DentryValue, InodeDelta, InodeValue, Record,
+};
 use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend, Metadata};
+use std::hint::black_box;
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 
@@ -60,5 +65,135 @@ fn bench_metalv_metadata(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_metalv_metadata);
+/// A key-sorted bset image of `count` dentry records under one parent, with
+/// real seeded 54-bit name hashes (PR K1 encodings, design §4.2).
+fn dentry_bset_records(parent: u64, count: usize, hash_seed: u64) -> Vec<Record> {
+    let mut keyed: Vec<([u8; 16], DentryValue)> = (0..count)
+        .map(|i| {
+            let name = format!("entry-{i:06}");
+            let hash54 = dentry_name_hash54(name.as_bytes(), hash_seed);
+            let value = DentryValue {
+                child_ino: 100 + i as u64,
+                file_type: 8, // DT_REG
+                name: name.into_bytes(),
+            };
+            (dentry_key(parent, hash54, 0), value)
+        })
+        .collect();
+    keyed.sort_by_key(|(key, _)| *key);
+    keyed
+        .into_iter()
+        .enumerate()
+        .map(|(seq, (key, value))| {
+            Record::put(
+                key.to_vec(),
+                seq as u64 + 1,
+                value.encode().expect("encode"),
+            )
+        })
+        .collect()
+}
+
+/// PR K1 micro-benches: bset build / search / merge / fold (design PR plan).
+fn bench_kv_bset(c: &mut Criterion) {
+    let mut group = c.benchmark_group("kv_bset");
+    const HASH_SEED: u64 = 0x5EED_F00D;
+
+    // Build: a compaction-output-sized bset of 2,048 dentry records.
+    let records = dentry_bset_records(1, 2048, HASH_SEED);
+    group.bench_function("build_2048_dentries", |b| {
+        b.iter(|| build_bset(black_box(&records), 2048).expect("build"));
+    });
+
+    // Search: memcmp binary search over the parsed view, cycling keys.
+    let image = build_bset(&records, 2048).expect("build");
+    let view = BsetView::parse(&image).expect("parse");
+    let probe_keys: Vec<Vec<u8>> = records.iter().map(|r| r.key.clone()).collect();
+    group.bench_function("search_2048_dentries", |b| {
+        let mut i = 0usize;
+        b.iter(|| {
+            let key = &probe_keys[i % probe_keys.len()];
+            i = i.wrapping_add(1);
+            black_box(view.find(black_box(key)))
+        });
+    });
+
+    // Merge: 8 sources × 256 interleaved inode keys — the compaction shape.
+    let shard_images: Vec<Vec<u8>> = (0..8u64)
+        .map(|shard| {
+            let recs: Vec<Record> = (0..256u64)
+                .map(|i| {
+                    let ino = i * 8 + shard;
+                    Record::put(
+                        inode_key(ino).to_vec(),
+                        ino + 1,
+                        InodeValue {
+                            size: ino,
+                            ..InodeValue::default()
+                        }
+                        .encode(),
+                    )
+                })
+                .collect();
+            build_bset(&recs, 2048).expect("build")
+        })
+        .collect();
+    let shard_views: Vec<BsetView<'_>> = shard_images
+        .iter()
+        .map(|im| BsetView::parse(im).expect("parse"))
+        .collect();
+    group.bench_function("merge_8x256", |b| {
+        b.iter(|| merge(black_box(&shard_views)).count());
+    });
+
+    // Fold: point lookup across 4 sources with a Δtime chain over a base Put
+    // — the fold algebra's hot lookup shape (§4.2).
+    let base: Vec<Record> = (0..512u64)
+        .map(|ino| {
+            Record::put(
+                inode_key(ino).to_vec(),
+                ino + 1,
+                InodeValue {
+                    size: ino * 4096,
+                    ..InodeValue::default()
+                }
+                .encode(),
+            )
+        })
+        .collect();
+    let base_image = build_bset(&base, 512).expect("build");
+    let delta_images: Vec<Vec<u8>> = (1..=3u64)
+        .map(|layer| {
+            let recs: Vec<Record> = (0..512u64)
+                .map(|ino| {
+                    Record::delta(
+                        inode_key(ino).to_vec(),
+                        1000 * layer + ino,
+                        &InodeDelta::times(layer, layer),
+                    )
+                })
+                .collect();
+            build_bset(&recs, 1000 * layer + 511).expect("build")
+        })
+        .collect();
+    // Newest first: the three delta layers, then the base bset.
+    let mut fold_views: Vec<BsetView<'_>> = delta_images
+        .iter()
+        .rev()
+        .map(|im| BsetView::parse(im).expect("parse"))
+        .collect();
+    fold_views.push(BsetView::parse(&base_image).expect("parse"));
+    group.bench_function("fold_lookup_4src_delta_chain", |b| {
+        let mut ino = 0u64;
+        b.iter(|| {
+            let key = inode_key(ino % 512);
+            ino = ino.wrapping_add(1);
+            lookup(black_box(&fold_views), black_box(&key)).expect("fold")
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_metalv_metadata, bench_kv_bset);
 criterion_main!(benches);

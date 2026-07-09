@@ -43,43 +43,88 @@ pub const HASH54_MAX: u64 = (1 << 54) - 1;
 pub const HASH56_MAX: u64 = (1 << 56) - 1;
 
 /// Build the inode-tree key for `ino` (big-endian, memcmp-ordered).
-pub fn inode_key(_ino: u64) -> [u8; INODE_KEY_LEN] {
-    todo!()
+#[inline]
+pub fn inode_key(ino: u64) -> [u8; INODE_KEY_LEN] {
+    ino.to_be_bytes()
 }
 
 /// Decode an inode-tree key; rejects wrong-length input.
-pub fn decode_inode_key(_key: &[u8]) -> Result<u64, KvError> {
-    todo!()
+pub fn decode_inode_key(key: &[u8]) -> Result<u64, KvError> {
+    if key.len() != INODE_KEY_LEN {
+        return Err(KvError::Corrupt(format!(
+            "inode key must be {INODE_KEY_LEN} bytes, got {}",
+            key.len()
+        )));
+    }
+    Ok(u64::from_be_bytes(read8(key, 0)))
+}
+
+/// Copy 8 bytes at `off` into an array (caller has length-checked the slice).
+#[inline]
+fn read8(bytes: &[u8], off: usize) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&bytes[off..off + 8]);
+    out
 }
 
 /// The packed 62-bit dentry key suffix `(hash54 << 8) | coll_seq` — the same
 /// value the readdir cookie biases by 3 (design §5.1 resume rule), which is
 /// what makes cookies stable: they *are* the key.
-pub fn dentry_key_suffix(_hash54: u64, _coll_seq: u8) -> u64 {
-    todo!()
+#[inline]
+pub fn dentry_key_suffix(hash54: u64, coll_seq: u8) -> u64 {
+    debug_assert!(hash54 <= HASH54_MAX, "hash54 exceeds 54 bits: {hash54:#x}");
+    ((hash54 & HASH54_MAX) << 8) | u64::from(coll_seq)
 }
 
 /// Build the dentry-tree key `(parent_ino, hash54, coll_seq)` — parent is the
 /// primary dimension, the packed suffix secondary, both big-endian.
-pub fn dentry_key(_parent_ino: u64, _hash54: u64, _coll_seq: u8) -> [u8; DENTRY_KEY_LEN] {
-    todo!()
+pub fn dentry_key(parent_ino: u64, hash54: u64, coll_seq: u8) -> [u8; DENTRY_KEY_LEN] {
+    let mut key = [0u8; DENTRY_KEY_LEN];
+    key[..8].copy_from_slice(&parent_ino.to_be_bytes());
+    key[8..].copy_from_slice(&dentry_key_suffix(hash54, coll_seq).to_be_bytes());
+    key
 }
 
 /// Decode a dentry-tree key into `(parent_ino, hash54, coll_seq)`; rejects
 /// wrong-length input and suffixes with the two structurally-zero top bits
 /// set (never produced by [`dentry_key`]).
-pub fn decode_dentry_key(_key: &[u8]) -> Result<(u64, u64, u8), KvError> {
-    todo!()
+pub fn decode_dentry_key(key: &[u8]) -> Result<(u64, u64, u8), KvError> {
+    if key.len() != DENTRY_KEY_LEN {
+        return Err(KvError::Corrupt(format!(
+            "dentry key must be {DENTRY_KEY_LEN} bytes, got {}",
+            key.len()
+        )));
+    }
+    let parent_ino = u64::from_be_bytes(read8(key, 0));
+    let suffix = u64::from_be_bytes(read8(key, 8));
+    if suffix >> 62 != 0 {
+        return Err(KvError::Corrupt(format!(
+            "dentry key suffix has its structurally-zero top bits set: {suffix:#x}"
+        )));
+    }
+    Ok((parent_ino, suffix >> 8, (suffix & 0xFF) as u8))
 }
 
 /// Build the xattr-tree key `(ino, hash56, coll_seq)`, big-endian.
-pub fn xattr_key(_ino: u64, _hash56: u64, _coll_seq: u8) -> [u8; XATTR_KEY_LEN] {
-    todo!()
+pub fn xattr_key(ino: u64, hash56: u64, coll_seq: u8) -> [u8; XATTR_KEY_LEN] {
+    debug_assert!(hash56 <= HASH56_MAX, "hash56 exceeds 56 bits: {hash56:#x}");
+    let mut key = [0u8; XATTR_KEY_LEN];
+    key[..8].copy_from_slice(&ino.to_be_bytes());
+    key[8..].copy_from_slice(&(((hash56 & HASH56_MAX) << 8) | u64::from(coll_seq)).to_be_bytes());
+    key
 }
 
 /// Decode an xattr-tree key into `(ino, hash56, coll_seq)`.
-pub fn decode_xattr_key(_key: &[u8]) -> Result<(u64, u64, u8), KvError> {
-    todo!()
+pub fn decode_xattr_key(key: &[u8]) -> Result<(u64, u64, u8), KvError> {
+    if key.len() != XATTR_KEY_LEN {
+        return Err(KvError::Corrupt(format!(
+            "xattr key must be {XATTR_KEY_LEN} bytes, got {}",
+            key.len()
+        )));
+    }
+    let ino = u64::from_be_bytes(read8(key, 0));
+    let suffix = u64::from_be_bytes(read8(key, 8));
+    Ok((ino, suffix >> 8, (suffix & 0xFF) as u8))
 }
 
 // ---------------------------------------------------------------------------
@@ -89,13 +134,15 @@ pub fn decode_xattr_key(_key: &[u8]) -> Result<(u64, u64, u8), KvError> {
 // ---------------------------------------------------------------------------
 
 /// 54-bit seeded dentry name hash: `xxh3_64_with_seed(name, hash_seed) >> 10`.
-pub fn dentry_name_hash54(_name: &[u8], _hash_seed: u64) -> u64 {
-    todo!()
+#[inline]
+pub fn dentry_name_hash54(name: &[u8], hash_seed: u64) -> u64 {
+    xxhash_rust::xxh3::xxh3_64_with_seed(name, hash_seed) >> 10
 }
 
 /// 56-bit seeded xattr name hash: `xxh3_64_with_seed(name, hash_seed) >> 8`.
-pub fn xattr_name_hash56(_name: &[u8], _hash_seed: u64) -> u64 {
-    todo!()
+#[inline]
+pub fn xattr_name_hash56(name: &[u8], hash_seed: u64) -> u64 {
+    xxhash_rust::xxh3::xxh3_64_with_seed(name, hash_seed) >> 8
 }
 
 // ---------------------------------------------------------------------------
@@ -106,8 +153,18 @@ pub fn xattr_name_hash56(_name: &[u8], _hash_seed: u64) -> u64 {
 /// Lowest `coll_seq` not present in `occupied` (the chain's existing
 /// same-hash entries, any order), or `None` when all 256 slots are taken.
 /// Bounded by construction — the u8 domain is the probe space.
-pub fn first_free_coll_seq<I: IntoIterator<Item = u8>>(_occupied: I) -> Option<u8> {
-    todo!()
+pub fn first_free_coll_seq<I: IntoIterator<Item = u8>>(occupied: I) -> Option<u8> {
+    let mut bits = [0u64; 4];
+    for c in occupied {
+        bits[usize::from(c >> 6)] |= 1u64 << (c & 63);
+    }
+    for (w, &word) in bits.iter().enumerate() {
+        let free = !word;
+        if free != 0 {
+            return Some((w as u8) * 64 + free.trailing_zeros() as u8);
+        }
+    }
+    None
 }
 
 /// Assign the `coll_seq` for inserting a new same-hash dentry. Callers must
@@ -115,14 +172,106 @@ pub fn first_free_coll_seq<I: IntoIterator<Item = u8>>(_occupied: I) -> Option<u
 /// is a replace, not a new slot). Chain exhaustion — a 257th same-hash name —
 /// returns [`KvError::DentryChainOverflow`] and bumps
 /// [`super::META_KV_DENTRY_COLLISION_OVERFLOWS`]; it never panics.
-pub fn assign_dentry_coll_seq<I: IntoIterator<Item = u8>>(_occupied: I) -> Result<u8, KvError> {
-    todo!()
+pub fn assign_dentry_coll_seq<I: IntoIterator<Item = u8>>(occupied: I) -> Result<u8, KvError> {
+    first_free_coll_seq(occupied).ok_or_else(|| {
+        super::META_KV_DENTRY_COLLISION_OVERFLOWS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        KvError::DentryChainOverflow
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Inode record value (design §4.2 table): the DiskInode fields minus the pad,
 // plus flags2; leading varint version tag for future extension.
 // ---------------------------------------------------------------------------
+
+/// Append a LEB128 varint (the inode value's leading version tag).
+fn encode_varint(mut v: u64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Decode a LEB128 varint from the front of `buf`: `(value, bytes consumed)`.
+fn decode_varint(buf: &[u8]) -> Result<(u64, usize), KvError> {
+    let mut v = 0u64;
+    for (i, &b) in buf.iter().enumerate() {
+        if i * 7 >= 64 {
+            return Err(KvError::Corrupt("varint exceeds 64 bits".to_string()));
+        }
+        v |= u64::from(b & 0x7F) << (i * 7);
+        if b & 0x80 == 0 {
+            return Ok((v, i + 1));
+        }
+    }
+    Err(KvError::Corrupt("truncated varint".to_string()))
+}
+
+/// Bounds-checked little-endian value reader — every length is validated
+/// against the container before any byte is dereferenced (design §9).
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize, what: &str) -> Result<&'a [u8], KvError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| KvError::Corrupt(format!("{what}: length overflows the container")))?;
+        if end > self.buf.len() {
+            return Err(KvError::Corrupt(format!(
+                "{what}: truncated (need {n} bytes at offset {}, have {})",
+                self.pos,
+                self.buf.len() - self.pos
+            )));
+        }
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self, what: &str) -> Result<u8, KvError> {
+        Ok(self.take(1, what)?[0])
+    }
+
+    fn u16(&mut self, what: &str) -> Result<u16, KvError> {
+        let b = self.take(2, what)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self, what: &str) -> Result<u32, KvError> {
+        let b = self.take(4, what)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self, what: &str) -> Result<u64, KvError> {
+        let b = self.take(8, what)?;
+        Ok(u64::from_le_bytes(read8(b, 0)))
+    }
+
+    /// Reject trailing bytes — encodings are exact.
+    fn finish(self, what: &str) -> Result<(), KvError> {
+        if self.pos != self.buf.len() {
+            return Err(KvError::Corrupt(format!(
+                "{what}: {} trailing byte(s) after the encoding",
+                self.buf.len() - self.pos
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// `flags2` bit 0: migrated quarantined ino whose v2 xattr block was presumed
 /// corrupt and not read (design §6.2).
@@ -149,12 +298,44 @@ pub struct InodeValue {
 impl InodeValue {
     /// Encode as `varint(version=1)` + fixed little-endian fields.
     pub fn encode(&self) -> Vec<u8> {
-        todo!()
+        let mut out = Vec::with_capacity(64);
+        encode_varint(INODE_VALUE_VERSION, &mut out);
+        out.extend_from_slice(&self.mode.to_le_bytes());
+        out.extend_from_slice(&self.uid.to_le_bytes());
+        out.extend_from_slice(&self.gid.to_le_bytes());
+        out.extend_from_slice(&self.nlink.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        out.extend_from_slice(&self.flags2.to_le_bytes());
+        out.extend_from_slice(&self.size.to_le_bytes());
+        out.extend_from_slice(&self.atime.to_le_bytes());
+        out.extend_from_slice(&self.mtime.to_le_bytes());
+        out.extend_from_slice(&self.ctime.to_le_bytes());
+        out
     }
 
     /// Decode; rejects unknown versions, truncation, and trailing bytes.
-    pub fn decode(_bytes: &[u8]) -> Result<Self, KvError> {
-        todo!()
+    pub fn decode(bytes: &[u8]) -> Result<Self, KvError> {
+        let (version, used) = decode_varint(bytes)?;
+        if version != INODE_VALUE_VERSION {
+            return Err(KvError::Corrupt(format!(
+                "unsupported inode value version {version} (this binary understands {INODE_VALUE_VERSION})"
+            )));
+        }
+        let mut r = Reader::new(&bytes[used..]);
+        let v = Self {
+            mode: r.u32("inode value mode")?,
+            uid: r.u32("inode value uid")?,
+            gid: r.u32("inode value gid")?,
+            nlink: r.u32("inode value nlink")?,
+            flags: r.u32("inode value flags")?,
+            flags2: r.u32("inode value flags2")?,
+            size: r.u64("inode value size")?,
+            atime: r.u64("inode value atime")?,
+            mtime: r.u64("inode value mtime")?,
+            ctime: r.u64("inode value ctime")?,
+        };
+        r.finish("inode value")?;
+        Ok(v)
     }
 }
 
@@ -175,12 +356,32 @@ pub struct DentryValue {
 impl DentryValue {
     /// Encode; names longer than 255 bytes are a clean [`KvError::NameTooLong`].
     pub fn encode(&self) -> Result<Vec<u8>, KvError> {
-        todo!()
+        if self.name.len() > 255 {
+            return Err(KvError::NameTooLong {
+                len: self.name.len(),
+            });
+        }
+        let mut out = Vec::with_capacity(10 + self.name.len());
+        out.extend_from_slice(&self.child_ino.to_le_bytes());
+        out.push(self.file_type);
+        out.push(self.name.len() as u8);
+        out.extend_from_slice(&self.name);
+        Ok(out)
     }
 
     /// Decode; rejects truncation, lying `name_len`, and trailing bytes.
-    pub fn decode(_bytes: &[u8]) -> Result<Self, KvError> {
-        todo!()
+    pub fn decode(bytes: &[u8]) -> Result<Self, KvError> {
+        let mut r = Reader::new(bytes);
+        let child_ino = r.u64("dentry value child_ino")?;
+        let file_type = r.u8("dentry value file_type")?;
+        let name_len = usize::from(r.u8("dentry value name_len")?);
+        let name = r.take(name_len, "dentry value name")?.to_vec();
+        r.finish("dentry value")?;
+        Ok(Self {
+            child_ino,
+            file_type,
+            name,
+        })
     }
 }
 
@@ -196,12 +397,26 @@ pub struct XattrValue {
 impl XattrValue {
     /// Encode; names longer than 255 bytes are a clean [`KvError::NameTooLong`].
     pub fn encode(&self) -> Result<Vec<u8>, KvError> {
-        todo!()
+        if self.name.len() > 255 {
+            return Err(KvError::NameTooLong {
+                len: self.name.len(),
+            });
+        }
+        let mut out = Vec::with_capacity(1 + self.name.len() + self.value.len());
+        out.push(self.name.len() as u8);
+        out.extend_from_slice(&self.name);
+        out.extend_from_slice(&self.value);
+        Ok(out)
     }
 
     /// Decode; rejects truncation and lying `name_len`.
-    pub fn decode(_bytes: &[u8]) -> Result<Self, KvError> {
-        todo!()
+    pub fn decode(bytes: &[u8]) -> Result<Self, KvError> {
+        let mut r = Reader::new(bytes);
+        let name_len = usize::from(r.u8("xattr value name_len")?);
+        let name = r.take(name_len, "xattr value name")?.to_vec();
+        // The value is the remainder — the record framing carries the length.
+        let value = bytes[1 + name_len..].to_vec();
+        Ok(Self { name, value })
     }
 }
 
@@ -236,24 +451,132 @@ pub struct InodeDelta {
 impl InodeDelta {
     /// The Δtime record: overwrite `mtime`/`ctime` only, so concurrent
     /// shared-parent-lock creates never clobber value fields (§4.4 pt 6).
-    pub fn times(_mtime: u64, _ctime: u64) -> Self {
-        todo!()
+    pub fn times(mtime: u64, ctime: u64) -> Self {
+        Self {
+            mask: DELTA_TIMES,
+            fields: InodeValue {
+                mtime,
+                ctime,
+                ..InodeValue::default()
+            },
+        }
     }
 
     /// Encode as `mask: u16 LE` + the masked fields in canonical field order.
     pub fn encode(&self) -> Vec<u8> {
-        todo!()
+        debug_assert_eq!(self.mask & !DELTA_MASK_ALL, 0, "unknown delta mask bits");
+        let mut out = Vec::with_capacity(2 + 6 * 4 + 4 * 8);
+        out.extend_from_slice(&self.mask.to_le_bytes());
+        if self.mask & DELTA_MODE != 0 {
+            out.extend_from_slice(&self.fields.mode.to_le_bytes());
+        }
+        if self.mask & DELTA_UID != 0 {
+            out.extend_from_slice(&self.fields.uid.to_le_bytes());
+        }
+        if self.mask & DELTA_GID != 0 {
+            out.extend_from_slice(&self.fields.gid.to_le_bytes());
+        }
+        if self.mask & DELTA_NLINK != 0 {
+            out.extend_from_slice(&self.fields.nlink.to_le_bytes());
+        }
+        if self.mask & DELTA_FLAGS != 0 {
+            out.extend_from_slice(&self.fields.flags.to_le_bytes());
+        }
+        if self.mask & DELTA_FLAGS2 != 0 {
+            out.extend_from_slice(&self.fields.flags2.to_le_bytes());
+        }
+        if self.mask & DELTA_SIZE != 0 {
+            out.extend_from_slice(&self.fields.size.to_le_bytes());
+        }
+        if self.mask & DELTA_ATIME != 0 {
+            out.extend_from_slice(&self.fields.atime.to_le_bytes());
+        }
+        if self.mask & DELTA_MTIME != 0 {
+            out.extend_from_slice(&self.fields.mtime.to_le_bytes());
+        }
+        if self.mask & DELTA_CTIME != 0 {
+            out.extend_from_slice(&self.fields.ctime.to_le_bytes());
+        }
+        out
     }
 
     /// Decode; rejects unknown mask bits, truncation, and trailing bytes.
-    pub fn decode(_bytes: &[u8]) -> Result<Self, KvError> {
-        todo!()
+    pub fn decode(bytes: &[u8]) -> Result<Self, KvError> {
+        let mut r = Reader::new(bytes);
+        let mask = r.u16("inode delta mask")?;
+        if mask & !DELTA_MASK_ALL != 0 {
+            return Err(KvError::Corrupt(format!(
+                "unknown inode delta mask bits: {mask:#06x}"
+            )));
+        }
+        let mut fields = InodeValue::default();
+        if mask & DELTA_MODE != 0 {
+            fields.mode = r.u32("inode delta mode")?;
+        }
+        if mask & DELTA_UID != 0 {
+            fields.uid = r.u32("inode delta uid")?;
+        }
+        if mask & DELTA_GID != 0 {
+            fields.gid = r.u32("inode delta gid")?;
+        }
+        if mask & DELTA_NLINK != 0 {
+            fields.nlink = r.u32("inode delta nlink")?;
+        }
+        if mask & DELTA_FLAGS != 0 {
+            fields.flags = r.u32("inode delta flags")?;
+        }
+        if mask & DELTA_FLAGS2 != 0 {
+            fields.flags2 = r.u32("inode delta flags2")?;
+        }
+        if mask & DELTA_SIZE != 0 {
+            fields.size = r.u64("inode delta size")?;
+        }
+        if mask & DELTA_ATIME != 0 {
+            fields.atime = r.u64("inode delta atime")?;
+        }
+        if mask & DELTA_MTIME != 0 {
+            fields.mtime = r.u64("inode delta mtime")?;
+        }
+        if mask & DELTA_CTIME != 0 {
+            fields.ctime = r.u64("inode delta ctime")?;
+        }
+        r.finish("inode delta")?;
+        Ok(Self { mask, fields })
     }
 
     /// Overwrite the masked fields of `base` (field overwrite — idempotent,
     /// so replaying a delta over an already-folded base is a no-op).
-    pub fn apply(&self, _base: &mut InodeValue) {
-        todo!()
+    pub fn apply(&self, base: &mut InodeValue) {
+        if self.mask & DELTA_MODE != 0 {
+            base.mode = self.fields.mode;
+        }
+        if self.mask & DELTA_UID != 0 {
+            base.uid = self.fields.uid;
+        }
+        if self.mask & DELTA_GID != 0 {
+            base.gid = self.fields.gid;
+        }
+        if self.mask & DELTA_NLINK != 0 {
+            base.nlink = self.fields.nlink;
+        }
+        if self.mask & DELTA_FLAGS != 0 {
+            base.flags = self.fields.flags;
+        }
+        if self.mask & DELTA_FLAGS2 != 0 {
+            base.flags2 = self.fields.flags2;
+        }
+        if self.mask & DELTA_SIZE != 0 {
+            base.size = self.fields.size;
+        }
+        if self.mask & DELTA_ATIME != 0 {
+            base.atime = self.fields.atime;
+        }
+        if self.mask & DELTA_MTIME != 0 {
+            base.mtime = self.fields.mtime;
+        }
+        if self.mask & DELTA_CTIME != 0 {
+            base.ctime = self.fields.ctime;
+        }
     }
 }
 
@@ -288,21 +611,41 @@ pub struct Record {
 }
 
 impl Record {
-    pub fn put(_key: Vec<u8>, _seq: u64, _value: Vec<u8>) -> Self {
-        todo!()
+    pub fn put(key: Vec<u8>, seq: u64, value: Vec<u8>) -> Self {
+        Self {
+            key,
+            seq,
+            kind: RecordKind::Put,
+            value,
+        }
     }
 
-    pub fn delta(_key: Vec<u8>, _seq: u64, _delta: &InodeDelta) -> Self {
-        todo!()
+    pub fn delta(key: Vec<u8>, seq: u64, delta: &InodeDelta) -> Self {
+        Self {
+            key,
+            seq,
+            kind: RecordKind::Delta,
+            value: delta.encode(),
+        }
     }
 
-    pub fn delete(_key: Vec<u8>, _seq: u64) -> Self {
-        todo!()
+    pub fn delete(key: Vec<u8>, seq: u64) -> Self {
+        Self {
+            key,
+            seq,
+            kind: RecordKind::Delete,
+            value: Vec::new(),
+        }
     }
 
     /// Borrow as the zero-copy view the fold and bset layers consume.
     pub fn record_ref(&self) -> RecordRef<'_> {
-        todo!()
+        RecordRef {
+            key: &self.key,
+            seq: self.seq,
+            kind: self.kind,
+            value: &self.value,
+        }
     }
 }
 
@@ -318,25 +661,88 @@ pub struct RecordRef<'a> {
 impl<'a> RecordRef<'a> {
     /// Exact encoded size (header + key + value).
     pub fn encoded_len(&self) -> usize {
-        todo!()
+        RECORD_HEADER_LEN + self.key.len() + self.value.len()
     }
 
     /// Append the framing to `out`.
-    pub fn encode_into(&self, _out: &mut Vec<u8>) {
-        todo!()
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        debug_assert!(
+            !self.key.is_empty() && self.key.len() <= usize::from(u16::MAX),
+            "record key length out of range: {}",
+            self.key.len()
+        );
+        debug_assert!(u32::try_from(self.value.len()).is_ok(), "value exceeds u32");
+        debug_assert!(
+            self.kind != RecordKind::Delete || self.value.is_empty(),
+            "tombstones carry no value"
+        );
+        out.extend_from_slice(&(self.key.len() as u16).to_le_bytes());
+        out.push(self.kind as u8);
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(&(self.value.len() as u32).to_le_bytes());
+        out.extend_from_slice(self.key);
+        out.extend_from_slice(self.value);
     }
 
     /// Decode one record from the front of `buf`, returning the view and the
     /// bytes consumed. Every length field is bounds-checked against the
     /// container before use (design §9); tombstones must carry no value;
     /// unknown kind bytes and empty keys are rejected.
-    pub fn decode(_buf: &'a [u8]) -> Result<(Self, usize), KvError> {
-        todo!()
+    pub fn decode(buf: &'a [u8]) -> Result<(Self, usize), KvError> {
+        if buf.len() < RECORD_HEADER_LEN {
+            return Err(KvError::Corrupt(format!(
+                "truncated record header: {} of {RECORD_HEADER_LEN} bytes",
+                buf.len()
+            )));
+        }
+        let key_len = usize::from(u16::from_le_bytes([buf[0], buf[1]]));
+        let kind = match buf[2] {
+            1 => RecordKind::Put,
+            2 => RecordKind::Delta,
+            3 => RecordKind::Delete,
+            other => {
+                return Err(KvError::Corrupt(format!("unknown record kind {other}")));
+            }
+        };
+        let seq = u64::from_le_bytes(read8(buf, 3));
+        let val_len = u32::from_le_bytes([buf[11], buf[12], buf[13], buf[14]]) as usize;
+        if key_len == 0 {
+            return Err(KvError::Corrupt("record with an empty key".to_string()));
+        }
+        if kind == RecordKind::Delete && val_len != 0 {
+            return Err(KvError::Corrupt(format!(
+                "tombstone carrying a {val_len}-byte value"
+            )));
+        }
+        let total = RECORD_HEADER_LEN
+            .checked_add(key_len)
+            .and_then(|n| n.checked_add(val_len))
+            .ok_or_else(|| KvError::Corrupt("record length overflow".to_string()))?;
+        if buf.len() < total {
+            return Err(KvError::Corrupt(format!(
+                "record overruns its container: needs {total} bytes, have {}",
+                buf.len()
+            )));
+        }
+        Ok((
+            Self {
+                key: &buf[RECORD_HEADER_LEN..RECORD_HEADER_LEN + key_len],
+                seq,
+                kind,
+                value: &buf[RECORD_HEADER_LEN + key_len..total],
+            },
+            total,
+        ))
     }
 
     /// Copy into an owned [`Record`].
     pub fn to_record(&self) -> Record {
-        todo!()
+        Record {
+            key: self.key.to_vec(),
+            seq: self.seq,
+            kind: self.kind,
+            value: self.value.to_vec(),
+        }
     }
 }
 
@@ -364,7 +770,10 @@ impl Folded<'_> {
     /// The user-visible projection (§4.2 digest-walk framing): live value
     /// bytes, or `None` for tombstones/absent keys alike.
     pub fn live_value(&self) -> Option<&[u8]> {
-        todo!()
+        match self {
+            Folded::Put { value, .. } => Some(value),
+            Folded::Tombstone { .. } | Folded::Absent => None,
+        }
     }
 }
 
@@ -380,11 +789,51 @@ impl Folded<'_> {
 ///   delta record is counted in [`super::META_KV_DELTA_ORPHANS`] (§4.2).
 ///
 /// Values are opaque to the fold unless deltas force a base decode.
-pub fn fold_newest_first<'a, I>(_records: I) -> Result<Folded<'a>, KvError>
+pub fn fold_newest_first<'a, I>(records: I) -> Result<Folded<'a>, KvError>
 where
     I: IntoIterator<Item = RecordRef<'a>>,
 {
-    todo!()
+    let mut deltas: Vec<RecordRef<'a>> = Vec::new();
+    let mut prev_seq = u64::MAX;
+    for r in records {
+        debug_assert!(prev_seq >= r.seq, "fold input must be newest-seq-first");
+        prev_seq = r.seq;
+        match r.kind {
+            RecordKind::Delta => deltas.push(r),
+            RecordKind::Delete => {
+                // Collected deltas are discarded: the tombstone is the
+                // underlying truth (not the orphan case — replay folds any
+                // newer delta to a counted absent on its own).
+                return Ok(Folded::Tombstone { seq: r.seq });
+            }
+            RecordKind::Put => {
+                if deltas.is_empty() {
+                    // Zero-copy: the common plain-Put lookup borrows the
+                    // bset bytes straight through.
+                    return Ok(Folded::Put {
+                        value: Cow::Borrowed(r.value),
+                        seq: r.seq,
+                    });
+                }
+                let mut base = InodeValue::decode(r.value)?;
+                // Ascending seq order: oldest delta first, newest last wins.
+                for d in deltas.iter().rev() {
+                    InodeDelta::decode(d.value)?.apply(&mut base);
+                }
+                return Ok(Folded::Put {
+                    value: Cow::Owned(base.encode()),
+                    seq: deltas[0].seq,
+                });
+            }
+        }
+    }
+    if !deltas.is_empty() {
+        // Δ-without-base (§4.2): a counted no-op, one count per orphaned
+        // delta record.
+        super::META_KV_DELTA_ORPHANS
+            .fetch_add(deltas.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(Folded::Absent)
 }
 
 /// Compaction fold (§4.2): identical algebra; the output contains one folded
@@ -396,10 +845,26 @@ where
 ///
 /// `group_newest_first` must hold one key's records, newest-seq-first.
 pub fn compact_fold(
-    _group_newest_first: &[RecordRef<'_>],
-    _durable_tail: u64,
+    group_newest_first: &[RecordRef<'_>],
+    durable_tail: u64,
 ) -> Result<Option<Record>, KvError> {
-    todo!()
+    let Some(first) = group_newest_first.first() else {
+        return Ok(None);
+    };
+    let key = first.key;
+    debug_assert!(
+        group_newest_first.iter().all(|r| r.key == key),
+        "compact_fold takes one key's records"
+    );
+    match fold_newest_first(group_newest_first.iter().copied())? {
+        Folded::Put { value, seq } => Ok(Some(Record::put(key.to_vec(), seq, value.into_owned()))),
+        // Still inside the replay window (seq ≥ tail): the tombstone must
+        // survive in the node (§4.2 elision rule).
+        Folded::Tombstone { seq } if seq >= durable_tail => {
+            Ok(Some(Record::delete(key.to_vec(), seq)))
+        }
+        Folded::Tombstone { .. } | Folded::Absent => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,15 +896,31 @@ pub enum ReaddirPos {
 /// The payload is ≤ 62 bits, so the bias can never overflow and the sign bit
 /// is always clear when the vendored fuse3 surfaces the offset as `i64` —
 /// the classic FUSE readdir bug class this encoding forecloses (§5.1).
-pub fn encode_readdir_cookie(_hash54: u64, _coll_seq: u8) -> u64 {
-    todo!()
+#[inline]
+pub fn encode_readdir_cookie(hash54: u64, coll_seq: u8) -> u64 {
+    READDIR_COOKIE_BIAS + dentry_key_suffix(hash54, coll_seq)
 }
 
 /// Decode a readdir offset. Cookies whose biased payload exceeds the 62-bit
 /// key-suffix space were never issued by this filesystem and are rejected
 /// with [`KvError::InvalidReaddirCookie`].
-pub fn decode_readdir_cookie(_cookie: u64) -> Result<ReaddirPos, KvError> {
-    todo!()
+pub fn decode_readdir_cookie(cookie: u64) -> Result<ReaddirPos, KvError> {
+    match cookie {
+        0 => Ok(ReaddirPos::Start),
+        READDIR_OFFSET_DOT => Ok(ReaddirPos::AfterDot),
+        READDIR_OFFSET_DOTDOT => Ok(ReaddirPos::AfterDotDot),
+        c => {
+            // §5.1 resume rule: entries strictly greater than c − 3.
+            let payload = c - READDIR_COOKIE_BIAS;
+            if payload > dentry_key_suffix(HASH54_MAX, u8::MAX) {
+                return Err(KvError::InvalidReaddirCookie(cookie));
+            }
+            Ok(ReaddirPos::AfterEntry {
+                hash54: payload >> 8,
+                coll_seq: (payload & 0xFF) as u8,
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

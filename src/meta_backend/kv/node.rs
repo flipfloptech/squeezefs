@@ -536,6 +536,10 @@ pub async fn write_node(
     };
     let bytes_written = image.len();
     uring_fs::write_at(path, params.node_addr, image).await?;
+    // §10 / §8 row 7: whole-node CoW rewrite bytes (compaction / split
+    // successors and builder/format output alike — every fresh image).
+    super::META_KV_NODE_REWRITE_BYTES
+        .fetch_add(bytes_written as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(WrittenNode {
         node_addr: params.node_addr,
         node_seq: params.node_seq,
@@ -580,7 +584,11 @@ pub async fn append_bset(
         });
     }
     let new_tail = dest.tail_offset + frame.len();
+    let frame_len = frame.len() as u64;
     uring_fs::write_at(path, dest.node_addr + dest.tail_offset as u64, frame).await?;
+    // §10 / §8 row 7: writeback append accounting (4 KiB-padded frames).
+    super::META_KV_NODE_APPENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    super::META_KV_NODE_APPEND_BYTES.fetch_add(frame_len, std::sync::atomic::Ordering::Relaxed);
     Ok(new_tail)
 }
 

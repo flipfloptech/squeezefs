@@ -1296,6 +1296,22 @@ impl VolumeBackend {
         }
     }
 
+    /// PR K7 (§5.1): cookie-paged readdir — `Some((cookie, entry), …)`
+    /// on v3 (each entry paired with its resume cookie,
+    /// `3 + ((hash54 << 8) | coll_seq)`), `None` on v2, whose positional
+    /// FUSE offsets predate the cookie contract and stay byte-identical.
+    pub async fn readdir_page(
+        &self,
+        dir: Ino,
+        offset: u64,
+        max: usize,
+    ) -> Result<Option<Vec<(u64, DirEntry)>>> {
+        match self {
+            VolumeBackend::V2(_) => Ok(None),
+            VolumeBackend::V3(be) => Ok(Some(be.readdir_page(dir, offset, max).await?)),
+        }
+    }
+
     /// Read dispatch: `Metadata::getxattr` shape.
     pub async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         match self {
@@ -1803,6 +1819,34 @@ impl RoutedMetaBackend {
             return 1;
         }
         (local_ino - 2) * num_volumes as u64 + volume_idx as u64 + 2
+    }
+
+    /// PR K7 (§5.1): whether `ino` routes to a format-v3 volume — the
+    /// FUSE layer's streaming-vs-snapshot readdir dispatch (v3 streams by
+    /// cookie; v2 keeps the whole-dir snapshot path byte-identical).
+    pub fn ino_routes_to_v3(&self, ino: Ino) -> bool {
+        let (v_idx, _) = self.route_ino(ino);
+        matches!(&self.volumes[v_idx], VolumeBackend::V3(_))
+    }
+
+    /// PR K7 (§5.1): one cookie-paged readdir step against `dir`'s
+    /// volume — `Some` pages of at most `max` `(resume_cookie, entry)`
+    /// pairs on v3 (dentry child inos are stored global, so no mapping),
+    /// `None` when `dir` routes to a v2 volume (the caller falls back to
+    /// the positional snapshot path). Takes the same per-volume shared
+    /// inode guard as the trait `readdir`.
+    pub async fn readdir_stream(
+        &self,
+        dir: Ino,
+        offset: u64,
+        max: usize,
+    ) -> Result<Option<Vec<(u64, DirEntry)>>> {
+        let (v_idx, local_dir) = self.route_ino(dir);
+        self.check_volume_enabled(v_idx)?;
+        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_dir).await;
+        self.volumes[v_idx]
+            .readdir_page(local_dir, offset, max)
+            .await
     }
 }
 
@@ -2985,11 +3029,13 @@ impl Metadata for RoutedMetaBackend {
         }
     }
 
-    async fn readdir(&self, dir: Ino, _offset: u64, _max: usize) -> Result<Vec<DirEntry>> {
+    async fn readdir(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>> {
         let (v_idx, local_dir) = self.route_ino(dir);
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_dir).await;
         match &self.volumes[v_idx] {
+            // v2 ignores `offset`/`max` — its documented behavior,
+            // byte-identical; the FUSE layer owns offset slicing there.
             VolumeBackend::V2(be) => {
                 let dentries = dentry::list_dentries(&be.storage, local_dir).await?;
                 let mut list = Vec::new();
@@ -3002,10 +3048,9 @@ impl Metadata for RoutedMetaBackend {
                 }
                 Ok(list)
             }
-            // The routed surface returns the whole listing on both
-            // formats until PR K7 wires the FUSE cookie contract — the
-            // FUSE layer owns offset slicing today.
-            VolumeBackend::V3(be) => be.readdir(local_dir, 0, usize::MAX).await,
+            // PR K7 (§5.1): v3 honors `offset`/`max` — offset is a
+            // readdir cookie, pages resume strictly after its key suffix.
+            VolumeBackend::V3(be) => be.readdir(local_dir, offset, max).await,
         }
     }
 

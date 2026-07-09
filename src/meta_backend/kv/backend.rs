@@ -46,10 +46,10 @@ use super::node_cache::{
     CachedNode, LiveLookup, NodeCache, NodeCacheConfig, OwnedRec, DEFAULT_WRITEBACK_DELTA_BYTES,
 };
 use super::record::{
-    decode_inode_key, decode_readdir_cookie, dentry_key, dentry_name_hash54, first_free_coll_seq,
-    inode_key, xattr_key, xattr_name_hash56, DentryValue, InodeDelta, InodeValue, ReaddirPos,
-    Record, RecordKind, XattrValue, HASH54_MAX, HASH56_MAX, TREE_ALLOC_RESERVED, TREE_DENTRIES,
-    TREE_INODES, TREE_XATTRS,
+    decode_dentry_key, decode_inode_key, decode_readdir_cookie, dentry_key, dentry_name_hash54,
+    encode_readdir_cookie, first_free_coll_seq, inode_key, xattr_key, xattr_name_hash56,
+    DentryValue, InodeDelta, InodeValue, ReaddirPos, Record, RecordKind, XattrValue, HASH54_MAX,
+    HASH56_MAX, TREE_ALLOC_RESERVED, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
 };
 use super::superblock::{classify_volume, SuperblockV3, VolumeFormat};
 use super::tree::{decode_interior_value, KvTree, RootPtr, SmoContext, SmoJournal};
@@ -455,6 +455,12 @@ impl KvMetaBackend {
         self.alloc.free_extents()
     }
 
+    /// Extents awaiting durable-checkpoint retirement (§4.7 pending-free;
+    /// `meta_kv_pending_free` on the stats surface, design §10).
+    pub fn pending_free_extents(&self) -> u64 {
+        self.alloc.pending_count()
+    }
+
     /// The volume path.
     pub fn device_path(&self) -> &Path {
         &self.path
@@ -576,6 +582,26 @@ impl KvMetaBackend {
     /// with no dentries lists empty — the v2 contract (no existence
     /// check on the read path).
     pub async fn readdir(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>> {
+        Ok(self
+            .readdir_page(dir, offset, max)
+            .await?
+            .into_iter()
+            .map(|(_cookie, entry)| entry)
+            .collect())
+    }
+
+    /// [`Self::readdir`] with each entry's §5.1 resume cookie
+    /// (`3 + ((hash54 << 8) | coll_seq)` — the dentry key suffix, biased).
+    /// PR K7's FUSE streaming path emits these as the directory offsets:
+    /// they are stable across concurrent inserts/removals (they ARE the
+    /// key), strictly ascending in emission order, and sign-bit-clear by
+    /// the 54-bit hash construction (§4.2).
+    pub async fn readdir_page(
+        &self,
+        dir: Ino,
+        offset: u64,
+        max: usize,
+    ) -> Result<Vec<(u64, DirEntry)>> {
         let mut out = Vec::new();
         if max == 0 {
             return Ok(out);
@@ -599,13 +625,17 @@ impl KvMetaBackend {
                 break;
             };
             cursor = key_successor(last_key);
-            for (_k, v) in &page {
+            for (k, v) in &page {
+                let (_parent, hash54, coll_seq) = decode_dentry_key(k)?;
                 let d = DentryValue::decode(v)?;
-                out.push(DirEntry {
-                    ino: d.child_ino,
-                    name: String::from_utf8_lossy(&d.name).into_owned(),
-                    file_type: u32::from(d.file_type) << 12,
-                });
+                out.push((
+                    encode_readdir_cookie(hash54, coll_seq),
+                    DirEntry {
+                        ino: d.child_ino,
+                        name: String::from_utf8_lossy(&d.name).into_owned(),
+                        file_type: u32::from(d.file_type) << 12,
+                    },
+                ));
             }
         }
         Ok(out)

@@ -536,6 +536,7 @@ impl KvMetaBackend {
         // SMO frees from here on are retired by the NEXT record.
         self.retire_seq.store(ckpt_seq + 1, Ordering::Release);
         self.pending_reclaim.lock().unwrap().push((ckpt_seq, tail));
+        super::META_KV_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
 
         if barrier_now {
             // Make THIS record durable now: reclamation (reusable_upto,

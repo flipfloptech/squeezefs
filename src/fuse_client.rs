@@ -39,6 +39,15 @@ pub const READDIR_VIRTUAL_CONFIG_COOKIE: u64 = (1 << 62) + 3;
 /// (see [`READDIR_VIRTUAL_CONFIG_COOKIE`]).
 pub const READDIR_VIRTUAL_STATS_COOKIE: u64 = (1 << 62) + 4;
 
+/// PR K7: real entries fetched per FUSE `readdir` call on a v3 volume.
+/// A kernel dirent buffer holds ~1–2 K entries, so one page bounds the
+/// over-fetch waste while big directories stream page by page.
+const V3_READDIR_PAGE: usize = 4096;
+
+/// `readdirplus` pages smaller: every entry carries a full attribute
+/// fetch (attr-cache-backed inode-tree point lookups).
+const V3_READDIRPLUS_PAGE: usize = 1024;
+
 /// How often a mounted client refreshes its `client:{id}` registration on the
 /// metadata volume (heartbeat), so peers can distinguish a live mount from a
 /// crashed one.
@@ -996,7 +1005,28 @@ impl SqueezefsFilesystem {
         #[cfg(not(target_os = "linux"))]
         let t_classical_sideband = 0u64;
 
-        let stats_obj = serde_json::json!({
+        // PR K7 (design §10): metrics are scoped per mounted format — the
+        // v2-only counters (`meta_commit_sectors`, `meta_inode_alloc_*`,
+        // `meta_sector_lock_*`) are emitted only when a v2 volume is
+        // mounted, and the `meta_kv_*` family only when a v3 volume is —
+        // no misleading zeros in either direction. Mixed sets emit both.
+        let (has_v2, has_v3) = self
+            .meta_backend
+            .as_ref()
+            .map(|mb| {
+                let mut v2 = false;
+                let mut v3 = false;
+                for v in &mb.volumes {
+                    match v.format_version() {
+                        2 => v2 = true,
+                        _ => v3 = true,
+                    }
+                }
+                (v2, v3)
+            })
+            .unwrap_or((false, false));
+
+        let mut stats_obj = serde_json::json!({
             "read_lru_keys": read_lru_keys,
             "write_lru_keys": write_lru_keys,
             "nvme_staged_write_file_ids": nvme_staged_write_file_ids,
@@ -1048,14 +1078,9 @@ impl SqueezefsFilesystem {
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
                 "dlm_acquire_time": METRICS.dlm_acquire_time.to_json(),
                 "writeback_queue_depth": METRICS.writeback_queue_depth.to_json(),
-                "meta_sector_lock_wait_ns": METRICS.meta_sector_lock_wait_ns.to_json(),
-                "meta_sector_lock_contended": METRICS.meta_sector_lock_contended.load(Ordering::Relaxed),
                 "meta_tx_concurrency": METRICS.meta_tx_concurrency.load(Ordering::Relaxed),
                 "meta_tx_concurrency_peak": METRICS.meta_tx_concurrency_peak.load(Ordering::Relaxed),
-                "meta_inode_alloc_cas_retries": METRICS.meta_inode_alloc_cas_retries.load(Ordering::Relaxed),
-                "meta_inode_alloc_reconciled": METRICS.meta_inode_alloc_reconciled.load(Ordering::Relaxed),
                 "meta_quarantined_inodes": METRICS.meta_quarantined_inodes.load(Ordering::Relaxed),
-                "meta_commit_sectors": METRICS.meta_commit_sectors.to_json(),
                 "meta_flush_deferred": METRICS.meta_flush_deferred.load(Ordering::Relaxed),
                 "meta_reclaim_batch_size": METRICS.meta_reclaim_batch_size.to_json(),
                 // §4.6: per-volume mount-probe classification (design
@@ -1113,6 +1138,158 @@ impl SqueezefsFilesystem {
                 "block_map_cache_size": self.router.block_map_cache.entry_count(),
             }
         });
+
+        // PR K7 (design §10): format-scoped metric families (see has_v2 /
+        // has_v3 above). Inserted post-macro so each family exists only
+        // when a volume of its format is actually mounted.
+        {
+            use crate::meta_backend::kv as meta_kv;
+            let metrics = stats_obj
+                .get_mut("metrics")
+                .and_then(|m| m.as_object_mut())
+                .expect("stats JSON carries a metrics object");
+            if has_v2 {
+                metrics.insert(
+                    "meta_sector_lock_wait_ns".into(),
+                    METRICS.meta_sector_lock_wait_ns.to_json(),
+                );
+                metrics.insert(
+                    "meta_sector_lock_contended".into(),
+                    METRICS
+                        .meta_sector_lock_contended
+                        .load(Ordering::Relaxed)
+                        .into(),
+                );
+                metrics.insert(
+                    "meta_inode_alloc_cas_retries".into(),
+                    METRICS
+                        .meta_inode_alloc_cas_retries
+                        .load(Ordering::Relaxed)
+                        .into(),
+                );
+                metrics.insert(
+                    "meta_inode_alloc_reconciled".into(),
+                    METRICS
+                        .meta_inode_alloc_reconciled
+                        .load(Ordering::Relaxed)
+                        .into(),
+                );
+                metrics.insert(
+                    "meta_commit_sectors".into(),
+                    METRICS.meta_commit_sectors.to_json(),
+                );
+            }
+            if has_v3 {
+                let load = |c: &std::sync::atomic::AtomicU64| -> serde_json::Value {
+                    c.load(Ordering::Relaxed).into()
+                };
+                metrics.insert(
+                    "meta_kv_node_cache_hits".into(),
+                    load(&meta_kv::META_KV_NODE_CACHE_HITS),
+                );
+                metrics.insert(
+                    "meta_kv_node_cache_misses".into(),
+                    load(&meta_kv::META_KV_NODE_CACHE_MISSES),
+                );
+                metrics.insert(
+                    "meta_kv_node_cache_evictions".into(),
+                    load(&meta_kv::META_KV_NODE_CACHE_EVICTIONS),
+                );
+                metrics.insert(
+                    "meta_kv_node_appends".into(),
+                    load(&meta_kv::META_KV_NODE_APPENDS),
+                );
+                metrics.insert(
+                    "meta_kv_node_append_bytes".into(),
+                    load(&meta_kv::META_KV_NODE_APPEND_BYTES),
+                );
+                metrics.insert(
+                    "meta_kv_node_rewrite_bytes".into(),
+                    load(&meta_kv::META_KV_NODE_REWRITE_BYTES),
+                );
+                metrics.insert(
+                    "meta_kv_node_compactions".into(),
+                    load(&meta_kv::META_KV_NODE_COMPACTIONS),
+                );
+                metrics.insert(
+                    "meta_kv_node_splits".into(),
+                    load(&meta_kv::META_KV_NODE_SPLITS),
+                );
+                metrics.insert(
+                    "meta_kv_journal_bytes".into(),
+                    load(&meta_kv::META_KV_JOURNAL_BYTES),
+                );
+                metrics.insert(
+                    "meta_kv_journal_entries".into(),
+                    load(&meta_kv::META_KV_JOURNAL_ENTRIES),
+                );
+                metrics.insert(
+                    "meta_kv_checkpoints".into(),
+                    load(&meta_kv::META_KV_CHECKPOINTS),
+                );
+                metrics.insert(
+                    "meta_kv_commit_smo_retries".into(),
+                    load(&meta_kv::META_KV_COMMIT_SMO_RETRIES),
+                );
+                metrics.insert(
+                    "meta_kv_node_dropped_tail_bsets".into(),
+                    load(&meta_kv::META_KV_NODE_DROPPED_TAIL_BSETS),
+                );
+                metrics.insert(
+                    "meta_kv_dentry_collision_overflows".into(),
+                    load(&meta_kv::META_KV_DENTRY_COLLISION_OVERFLOWS),
+                );
+                metrics.insert(
+                    "meta_kv_delta_orphans".into(),
+                    load(&meta_kv::META_KV_DELTA_ORPHANS),
+                );
+                // Per-volume gauges (mount-scoped replay stats, allocator
+                // occupancy, ring-admission parks), arrays parallel to
+                // `meta_format_version`; v2 arms report JSON null.
+                let per_volume = |f: &dyn Fn(
+                    &crate::meta_backend::VolumeBackend,
+                ) -> serde_json::Value|
+                 -> serde_json::Value {
+                    self.meta_backend
+                        .as_ref()
+                        .map(|mb| serde_json::Value::Array(mb.volumes.iter().map(f).collect()))
+                        .unwrap_or_default()
+                };
+                let kv_field =
+                    |v: &crate::meta_backend::VolumeBackend,
+                     f: &dyn Fn(&crate::meta_backend::kv::backend::KvMetaBackend) -> u64|
+                     -> serde_json::Value {
+                        match v {
+                            crate::meta_backend::VolumeBackend::V3(be) => f(be).into(),
+                            crate::meta_backend::VolumeBackend::V2(_) => serde_json::Value::Null,
+                        }
+                    };
+                metrics.insert(
+                    "meta_kv_replay_entries".into(),
+                    per_volume(&|v| kv_field(v, &|be| be.replay_stats().entries)),
+                );
+                metrics.insert(
+                    "meta_kv_replay_dropped_torn".into(),
+                    per_volume(&|v| kv_field(v, &|be| be.replay_stats().dropped_torn)),
+                );
+                metrics.insert(
+                    "meta_kv_replay_ms".into(),
+                    per_volume(&|v| kv_field(v, &|be| be.replay_stats().replay_ms)),
+                );
+                metrics.insert(
+                    "meta_kv_journal_full_stalls".into(),
+                    per_volume(&|v| kv_field(v, &|be| be.journal_full_stalls())),
+                );
+                metrics.insert(
+                    "meta_kv_free_extents".into(),
+                    per_volume(&|v| kv_field(v, &|be| be.free_extents())),
+                );
+                metrics.insert(
+                    "meta_kv_pending_free".into(),
+                    per_volume(&|v| kv_field(v, &|be| be.pending_free_extents())),
+                );
+            }
+        }
 
         serde_json::to_string_pretty(&stats_obj).unwrap_or_default()
     }
@@ -2111,6 +2288,31 @@ impl SqueezefsFilesystem {
         }
     }
 
+    /// PR K7 (§5.1): one v3 streaming-readdir page — `Some` pages of
+    /// `(resume_cookie, entry)` when `parent` routes to a v3 volume,
+    /// `None` for v2 (the caller keeps the positional snapshot path).
+    /// Offsets at or above the virtual-entry cookies never reach the
+    /// backend: nothing real lives there, and they do not decode as
+    /// §5.1 cookies.
+    async fn readdir_v3_page(
+        &self,
+        parent: u64,
+        offset: u64,
+        max: usize,
+    ) -> Result<Option<Vec<(u64, crate::meta_backend::DirEntry)>>, SqueezefsError> {
+        let backend = self.meta_backend.as_ref().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
+        })?;
+        if offset >= READDIR_VIRTUAL_CONFIG_COOKIE {
+            return Ok(if backend.ino_routes_to_v3(parent) {
+                Some(Vec::new())
+            } else {
+                None
+            });
+        }
+        backend.readdir_stream(parent, offset, max).await
+    }
+
     async fn get_attr_internal(&self, ino: u64) -> Result<FileAttr, SqueezefsError> {
         let mut attr = match self.attr_cache.get(&ino) {
             Some((attr, cached_at)) if cached_at.elapsed() < Duration::from_secs(1) => attr,
@@ -2743,6 +2945,17 @@ impl Filesystem for SqueezefsFilesystem {
             .meta_backend
             .as_ref()
             .expect("meta_backend must be configured");
+
+        // PR K7 (§5.1): v3 directories stream by key cookie — a per-fh
+        // whole-directory snapshot is both wasted work and an OOM hazard
+        // at 1 M entries (and the pre-K7 100 K materialization cap
+        // silently truncated bigger listings). The fh is still minted so
+        // releasedir bookkeeping stays uniform.
+        if backend.ino_routes_to_v3(inode) {
+            let fh = self.next_dir_fh.fetch_add(1, Ordering::Relaxed);
+            return Ok(ReplyOpen { fh, flags: 0 });
+        }
+
         let list = backend
             .readdir(inode, 0, 100000)
             .await
@@ -3702,6 +3915,77 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         let readdir_future = async {
+            // ---- PR K7 (§5.1): v3 volumes stream by key cookies. ----
+            let off_u = offset.max(0) as u64;
+            if let Some(page) = self
+                .readdir_v3_page(parent, off_u, V3_READDIR_PAGE)
+                .await
+                .map_err(map_squeezefs_err)?
+            {
+                // A full page may have more real entries behind it; the
+                // root virtuals ride above the whole real-cookie space and
+                // are appended only once the real stream is exhausted.
+                let more_reals = page.len() == V3_READDIR_PAGE;
+                let mut entries = Vec::with_capacity(page.len() + 4);
+                if off_u < 1 {
+                    entries.push(DirectoryEntry {
+                        name: ".".into(),
+                        kind: FileType::Directory,
+                        inode: parent,
+                        offset: 1,
+                    });
+                }
+                if off_u < 2 {
+                    let parent_parent = if parent == 1 {
+                        1
+                    } else if let Some(ref backend) = self.meta_backend {
+                        backend
+                            .lookup(parent, "..")
+                            .await
+                            .map(|inode| inode.ino)
+                            .unwrap_or(1)
+                    } else {
+                        1
+                    };
+                    entries.push(DirectoryEntry {
+                        name: "..".into(),
+                        kind: FileType::Directory,
+                        inode: parent_parent,
+                        offset: 2,
+                    });
+                }
+                for (cookie, d) in page {
+                    entries.push(DirectoryEntry {
+                        name: d.name.into(),
+                        kind: self.mode_to_file_type(d.file_type),
+                        inode: d.ino,
+                        offset: cookie as i64,
+                    });
+                }
+                if parent == 1 && !more_reals {
+                    if off_u < READDIR_VIRTUAL_CONFIG_COOKIE {
+                        entries.push(DirectoryEntry {
+                            name: ".config".into(),
+                            kind: FileType::RegularFile,
+                            inode: CONFIG_INODE,
+                            offset: READDIR_VIRTUAL_CONFIG_COOKIE as i64,
+                        });
+                    }
+                    if off_u < READDIR_VIRTUAL_STATS_COOKIE {
+                        entries.push(DirectoryEntry {
+                            name: ".stats".into(),
+                            kind: FileType::RegularFile,
+                            inode: STATS_INODE,
+                            offset: READDIR_VIRTUAL_STATS_COOKIE as i64,
+                        });
+                    }
+                }
+                use futures::stream::{self, StreamExt};
+                let stream = stream::iter(entries.into_iter().map(Ok)).boxed();
+                return Ok(ReplyDirectory { entries: stream });
+            }
+
+            // ---- Legacy positional path (v2 volumes) — unchanged. ----
             let entries_map = if let Some(stream) = self.open_dir_streams.get(&fh) {
                 stream.clone()
             } else if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
@@ -3722,7 +4006,13 @@ impl Filesystem for SqueezefsFilesystem {
                 sorted_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 let map_arc: std::sync::Arc<[(std::boxed::Box<str>, u64)]> =
                     std::sync::Arc::from(sorted_entries.into_boxed_slice());
-                self.dir_entry_cache.insert(parent, map_arc.clone());
+                // §4.5 (PR K7): only sub-10 K listings are worth pinning
+                // whole; bigger ones rebuild per call rather than OOM the
+                // cache (moka's capacity here counts directories, not
+                // entries).
+                if map_arc.len() <= DIR_ENTRY_CACHE_MAX_ENTRIES {
+                    self.dir_entry_cache.insert(parent, map_arc.clone());
+                }
                 map_arc
             };
 
@@ -3891,6 +4181,115 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         let readdirplus_future = async {
+            // ---- PR K7 (§5.1): v3 volumes stream by key cookies. ----
+            if let Some(page) = self
+                .readdir_v3_page(parent, offset, V3_READDIRPLUS_PAGE)
+                .await
+                .map_err(map_squeezefs_err)?
+            {
+                let more_reals = page.len() == V3_READDIRPLUS_PAGE;
+                let mut entries = Vec::with_capacity(page.len() + 4);
+                if offset < 1 {
+                    let attr = self
+                        .get_attr_internal(parent)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                    entries.push(DirectoryEntryPlus {
+                        name: ".".into(),
+                        kind: FileType::Directory,
+                        inode: parent,
+                        generation: 1,
+                        attr,
+                        entry_ttl: Duration::from_secs(1),
+                        attr_ttl: Duration::from_secs(1),
+                        offset: 1,
+                    });
+                }
+                if offset < 2 {
+                    let parent_parent = if parent == 1 {
+                        1
+                    } else if let Some(ref backend) = self.meta_backend {
+                        backend
+                            .lookup(parent, "..")
+                            .await
+                            .map(|inode| inode.ino)
+                            .unwrap_or(1)
+                    } else {
+                        1
+                    };
+                    let attr = self
+                        .get_attr_internal(parent_parent)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                    entries.push(DirectoryEntryPlus {
+                        name: "..".into(),
+                        kind: FileType::Directory,
+                        inode: parent_parent,
+                        generation: 1,
+                        attr,
+                        entry_ttl: Duration::from_secs(1),
+                        attr_ttl: Duration::from_secs(1),
+                        offset: 2,
+                    });
+                }
+                for (cookie, d) in page {
+                    let attr = match self.get_attr_internal(d.ino).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            error!(
+                                "readdirplus failed to get attr for child {}: {:?}",
+                                d.ino, e
+                            );
+                            continue;
+                        }
+                    };
+                    entries.push(DirectoryEntryPlus {
+                        name: d.name.into(),
+                        kind: attr.kind,
+                        inode: d.ino,
+                        generation: 1,
+                        attr,
+                        entry_ttl: Duration::from_secs(1),
+                        attr_ttl: Duration::from_secs(1),
+                        offset: cookie as i64,
+                    });
+                }
+                if parent == 1 && !more_reals {
+                    if offset < READDIR_VIRTUAL_CONFIG_COOKIE {
+                        let config_data = self.generate_config_json().await;
+                        let attr = self.get_config_attr(config_data.len() as u64);
+                        entries.push(DirectoryEntryPlus {
+                            name: ".config".into(),
+                            kind: FileType::RegularFile,
+                            inode: CONFIG_INODE,
+                            generation: 1,
+                            attr,
+                            entry_ttl: Duration::from_secs(1),
+                            attr_ttl: Duration::from_secs(1),
+                            offset: READDIR_VIRTUAL_CONFIG_COOKIE as i64,
+                        });
+                    }
+                    if offset < READDIR_VIRTUAL_STATS_COOKIE {
+                        let stats_data = self.generate_stats_json().await;
+                        let attr = self.get_stats_attr(stats_data.len() as u64);
+                        entries.push(DirectoryEntryPlus {
+                            name: ".stats".into(),
+                            kind: FileType::RegularFile,
+                            inode: STATS_INODE,
+                            generation: 1,
+                            attr,
+                            entry_ttl: Duration::from_secs(0),
+                            attr_ttl: Duration::from_secs(0),
+                            offset: READDIR_VIRTUAL_STATS_COOKIE as i64,
+                        });
+                    }
+                }
+                use futures::stream::{self, StreamExt};
+                let stream = stream::iter(entries.into_iter().map(Ok)).boxed();
+                return Ok(ReplyDirectoryPlus { entries: stream });
+            }
+
+            // ---- Legacy positional path (v2 volumes) — unchanged. ----
             let entries_map = if let Some(stream) = self.open_dir_streams.get(&fh) {
                 stream.clone()
             } else if let Some(cached_map) = self.dir_entry_cache.get(&parent) {
@@ -3911,7 +4310,10 @@ impl Filesystem for SqueezefsFilesystem {
                 sorted_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 let map_arc: std::sync::Arc<[(std::boxed::Box<str>, u64)]> =
                     std::sync::Arc::from(sorted_entries.into_boxed_slice());
-                self.dir_entry_cache.insert(parent, map_arc.clone());
+                // §4.5 (PR K7): the ≤ 10 K cache policy (see readdir).
+                if map_arc.len() <= DIR_ENTRY_CACHE_MAX_ENTRIES {
+                    self.dir_entry_cache.insert(parent, map_arc.clone());
+                }
                 map_arc
             };
 

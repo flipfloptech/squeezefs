@@ -553,6 +553,10 @@ impl JournalRing {
         } else {
             crate::uring_fs::write_at_batch(&self.path, ops).await?;
         }
+        // §10 / §8 row 7 accounting: entry bytes actually written to ring
+        // pages (headers included) — one half of the v3 device-byte story.
+        super::META_KV_JOURNAL_BYTES.fetch_add(res.len, std::sync::atomic::Ordering::Relaxed);
+        super::META_KV_JOURNAL_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

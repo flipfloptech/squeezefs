@@ -82,13 +82,23 @@ const TEST_UUID: [u8; 16] = *b"kv-scale-test!!!";
 /// v2 volumes need the fixed-geometry floor.
 const V2_VOL_LEN: u64 = 128 * 1024 * 1024;
 
-/// §8 row 6 population; `SQUEEZEFS_SCALE_DIR_ENTRIES` overrides for local
-/// iteration (the gate default is the full million).
+/// §8 row 6 population. Optimized builds (the K7 gate run, nightly,
+/// anything `--release`) default to the full million; debug builds
+/// default to 100 K — the same storm shape at 10× the cache-policy cap,
+/// measured 22 min for the full million at opt-level 0 (2.2 K trait
+/// creates/s), which would dwarf the whole per-commit serial gate.
+/// `SQUEEZEFS_SCALE_DIR_ENTRIES=1000000` forces the full population
+/// anywhere; the K7 closing report records the release-mode million-entry
+/// run as the §8 row 6 evidence.
 fn scale_dir_entries() -> usize {
     std::env::var("SQUEEZEFS_SCALE_DIR_ENTRIES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1_000_000)
+        .unwrap_or(if cfg!(debug_assertions) {
+            100_000
+        } else {
+            1_000_000
+        })
 }
 
 fn builder_config(node_size: usize, ring: Option<u64>) -> BuilderConfig {
@@ -1382,9 +1392,17 @@ fn commit_sector_buckets() -> [u64; 15] {
     out
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn write_amp_create_unlink_storm_v3_ge_10x_reduction() {
     const OPS: usize = 4_096;
+    /// A storm, not a trickle: the §4.4 write-amp arithmetic (and the
+    /// §8 row 7 gate built on it) is about storm-rate commits, where a
+    /// flush tick's 4 KiB bset frame amortizes over the tick's whole
+    /// record batch — exactly the shared-parent concurrency the routed
+    /// create path is built for (§4.4 pt 6). A serial await-loop pays a
+    /// full frame per handful of records and measures the harness's own
+    /// slowness, not the design.
+    const WRITERS: usize = 8;
 
     // ---- v3 storm: device bytes = journal entry bytes + node writeback
     // (bset appends + CoW rewrites), §8 row 7's stated accounting.
@@ -1397,13 +1415,23 @@ async fn write_amp_create_unlink_storm_v3_ge_10x_reduction() {
     let a0 = META_KV_NODE_APPEND_BYTES.load(Ordering::Relaxed);
     let r0 = META_KV_NODE_REWRITE_BYTES.load(Ordering::Relaxed);
     let n0 = META_KV_NODE_APPENDS.load(Ordering::Relaxed);
-    for i in 0..OPS {
-        let name = format!("wa{i:05}");
-        routed3
-            .create(ROOT_INO, &name, libc::S_IFREG | 0o644, 0, 0)
-            .await
-            .unwrap();
-        routed3.unlink(ROOT_INO, &name).await.unwrap();
+    let mut tasks = Vec::new();
+    for w in 0..WRITERS {
+        let r = routed3.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut i = w;
+            while i < OPS {
+                let name = format!("wa{i:05}");
+                r.create(ROOT_INO, &name, libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .expect("storm create");
+                r.unlink(ROOT_INO, &name).await.expect("storm unlink");
+                i += WRITERS;
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
     }
     // Shutdown runs the final checkpoint: every dirty bset lands, so the
     // append/rewrite deltas are complete, not clocked mid-cadence.
@@ -1420,15 +1448,28 @@ async fn write_amp_create_unlink_storm_v3_ge_10x_reduction() {
     );
     assert!(v3_journal > 0 && v3_bytes > 0, "v3 byte counters must move");
 
-    // ---- v2 storm: the same op sequence through the v2 trait surface.
+    // ---- v2 storm: the same op mix at the same concurrency through the
+    // v2 trait surface (its per-commit sector cost is rate-independent,
+    // so symmetry here only removes doubt, it does not tilt the gate).
     let (v2, _f2) = v2_volume(512 * 1024 * 1024).await;
     let s0 = commit_sector_buckets();
-    for i in 0..OPS {
-        let name = format!("wa{i:05}");
-        v2.create(1, &name, libc::S_IFREG | 0o644, 0, 0)
-            .await
-            .unwrap();
-        v2.unlink(1, &name).await.unwrap();
+    let mut tasks = Vec::new();
+    for w in 0..WRITERS {
+        let v2 = v2.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut i = w;
+            while i < OPS {
+                let name = format!("wa{i:05}");
+                v2.create(1, &name, libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .expect("v2 storm create");
+                v2.unlink(1, &name).await.expect("v2 storm unlink");
+                i += WRITERS;
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
     }
     let s1 = commit_sector_buckets();
     let v2_sectors = sectors_lower_bound(&s0, &s1);

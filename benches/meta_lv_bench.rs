@@ -1,6 +1,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use squeezefs::meta_backend::kv::alloc_ext::ExtentAllocator;
+use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::bset::{build_bset, lookup, merge, BsetView};
+use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::node::{NodeLayout, DEFAULT_NODE_SIZE};
 use squeezefs::meta_backend::kv::node_cache::{
     NodeCache, NodeCacheConfig, DEFAULT_WRITEBACK_DELTA_BYTES,
@@ -74,6 +76,109 @@ fn bench_metalv_metadata(c: &mut Criterion) {
     });
 
     group.finish();
+}
+
+/// PR K7 (§8 micro gate): the KV-path (v3) equivalents of the v2
+/// `meta_lv_metadata` trait benches — the same op shapes against a
+/// `KvMetaBackend` behind the `Metadata` trait, so criterion medians
+/// compare like-for-like (`lookup_file` ≤ v2 + 10 %; `create_unlink_file`
+/// ≤ v2, improvement expected — no sector RMW round-trip). Plus the K7
+/// streaming surface: one cookie-paged `readdir_page` step.
+fn bench_kv_meta_metadata(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let file = NamedTempFile::new().unwrap();
+    file.as_file().set_len(256 * 1024 * 1024).unwrap();
+    let backend = rt.block_on(async {
+        format_v3(
+            file.path(),
+            256 * 1024 * 1024,
+            &FormatV3Options {
+                node_size: DEFAULT_NODE_SIZE,
+                journal_len_override: None,
+                force: false,
+                full_wipe: false,
+                format_config_xattr: None,
+            },
+        )
+        .await
+        .expect("format v3");
+        KvMetaBackend::open(file.path()).await.expect("mount v3")
+    });
+
+    let mut group = c.benchmark_group("kv_meta_metadata");
+
+    group.bench_function("create_unlink_file", |b| {
+        b.to_async(&rt).iter(|| {
+            let name = format!("file_{}", rand::random::<u64>());
+            let backend_ref = &backend;
+            async move {
+                let ino = backend_ref.create(1, &name, 0o644, 0, 0).await.unwrap().ino;
+                backend_ref.unlink(1, &name).await.unwrap();
+                // Same 3-op sequence as the v2 row (there it reclaims the
+                // fixed-geometry slot; here it reaps the inode record —
+                // monotonic inos never reuse, §4.8).
+                backend_ref.destroy_inode(ino).await.unwrap();
+            }
+        });
+    });
+
+    group.bench_function("lookup_file", |b| {
+        let _ = rt.block_on(async { backend.create(1, "lookup_target", 0o644, 0, 0).await });
+        b.to_async(&rt).iter(|| {
+            let backend_ref = &backend;
+            async move {
+                backend_ref.lookup(1, "lookup_target").await.unwrap();
+            }
+        });
+    });
+
+    group.bench_function("set_get_xattr", |b| {
+        let _ = rt.block_on(async { backend.create(1, "xattr_target", 0o644, 0, 0).await });
+        let ino = rt.block_on(async { backend.lookup(1, "xattr_target").await.unwrap().ino });
+        let val = b"benchmark_value";
+        b.to_async(&rt).iter(|| {
+            let backend_ref = &backend;
+            async move {
+                backend_ref.setxattr(ino, "user.bench", val).await.unwrap();
+                let res = backend_ref
+                    .getxattr(ino, "user.bench")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(res.len(), val.len());
+            }
+        });
+    });
+
+    // One §5.1 streaming step: a 100-entry cookie page out of a 1,000-entry
+    // directory (the FUSE readdir hot shape after K7).
+    group.bench_function("readdir_page_100_of_1k", |b| {
+        let dir = rt.block_on(async {
+            let dir = backend
+                .create(1, "paged_dir", libc::S_IFDIR | 0o755, 0, 0)
+                .await
+                .unwrap()
+                .ino;
+            for i in 0..1000u32 {
+                backend
+                    .create(dir, &format!("e{i:04}"), 0o644, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            dir
+        });
+        b.to_async(&rt).iter(|| {
+            let backend_ref = &backend;
+            async move {
+                let page = backend_ref.readdir_page(dir, 0, 100).await.unwrap();
+                assert_eq!(page.len(), 100);
+                black_box(page);
+            }
+        });
+    });
+
+    group.finish();
+    rt.block_on(async { backend.shutdown().await.expect("clean shutdown") });
 }
 
 /// A key-sorted bset image of `count` dentry records under one parent, with
@@ -332,5 +437,11 @@ fn bench_kv_tree(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_metalv_metadata, bench_kv_bset, bench_kv_tree);
+criterion_group!(
+    benches,
+    bench_metalv_metadata,
+    bench_kv_meta_metadata,
+    bench_kv_bset,
+    bench_kv_tree
+);
 criterion_main!(benches);

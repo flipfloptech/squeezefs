@@ -4,6 +4,7 @@ pub mod atomicity;
 pub mod dentry;
 pub mod dlm;
 pub mod inode;
+pub mod kv;
 pub mod storage;
 pub mod sync_coalescer;
 pub mod xattr;

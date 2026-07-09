@@ -247,7 +247,9 @@ async fn test_kill9_remount_soak() {
         // Parent formats; the child mounts + churns.
         {
             let storage = MetaLvStorage::open(&vol, VOL_SIZE).unwrap();
-            MetaLvBackend::format(&storage).await.unwrap();
+            MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+                .await
+                .unwrap();
         }
 
         let mut child = Command::new(&exe)

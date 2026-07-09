@@ -129,7 +129,9 @@ async fn make_fs(test_id: &str, block_size: &str) -> Harness {
 
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_storage = MetaLvStorage::open(meta_temp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&meta_storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
+        .await
+        .unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         Arc::new(MetaLvBackend::new(meta_storage)),
     ]));

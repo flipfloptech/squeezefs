@@ -478,11 +478,6 @@ impl MetaLvBackend {
         self.storage.inode_alloc.allocated_count() as usize
     }
 
-    /// Formats the raw block storage device with a superblock and the root inode
-    pub async fn format(storage: &storage::MetaLvStorage) -> Result<()> {
-        Self::format_with_options(storage, true, true, None).await
-    }
-
     /// No-side-effect format gate (also run standalone by the CLI across ALL
     /// volumes before ANY volume is wiped, so a refused multi-volume format
     /// leaves everything intact — the only mutation is reaping provably stale
@@ -547,7 +542,23 @@ impl MetaLvBackend {
         Ok(())
     }
 
-    pub async fn format_with_options(
+    /// The v2 formatter, retained as **test surface only** from PR K6a on
+    /// (design-cow-kv-metadata §6.2, resolved OQ 4): the CLI `format`
+    /// produces v3 (`kv::builder::format_v3`), but the dual-format safety
+    /// net requires *creating* v2 volumes for as long as v2 **mount**
+    /// support exists — the K6a/K6b trait-conformance suites run against
+    /// both backends, the kill-9 soak parameterizes over both formats
+    /// (Rollout 4), and `kv_migrate_tests` (K9) needs populated-v2
+    /// sources.
+    ///
+    /// AGENTS.md no-dead-code exception (documented, per the
+    /// "exceptions only" clause): live, test-called code — not parked —
+    /// required by the dual-format contract suite and migrate tests.
+    /// **Deletion trigger** (resolved OQ 4): fleet telemetry showing
+    /// `meta_format_version == "2"` at zero — delete together with v2
+    /// mount support (Rollout 5d).
+    #[doc(hidden)]
+    pub async fn format_v2_for_tests(
         storage: &storage::MetaLvStorage,
         quick: bool,
         force: bool,
@@ -1151,6 +1162,99 @@ impl MetaLvBackend {
             self.storage.inode_alloc.free(ino);
         }
         Ok(())
+    }
+}
+
+/// One metadata volume behind the dual-format dispatch (PR K6a;
+/// design-cow-kv-metadata §4.9 "Volume routing", §6.1): static dispatch,
+/// no `dyn`, routed by superblock version at open — mixed-version volume
+/// sets are legal (migrate one volume at a time, PR K9).
+///
+/// K6a scope: construction ([`VolumeBackend::open_for_mount`]) and the
+/// **read** dispatch (`lookup`/`getattr`/`readdir`/`getxattr`/
+/// `listxattr`) — what the mount bootstrap (format-config read) and the
+/// dual-backend conformance suite consume. PR K6b extends the dispatch to
+/// the full mutating `Metadata` surface and folds it into
+/// `RoutedMetaBackend`.
+pub enum VolumeBackend {
+    /// Format version 2: the fixed-geometry `MetaLvBackend` (frozen
+    /// behavior; its whole test suite pins it).
+    V2(std::sync::Arc<MetaLvBackend>),
+    /// Format version 3: the CoW KV node layer (read side in K6a).
+    V3(std::sync::Arc<kv::backend::KvMetaBackend>),
+}
+
+impl std::fmt::Debug for VolumeBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VolumeBackend::V2(_) => f.write_str("VolumeBackend::V2"),
+            VolumeBackend::V3(be) => f.debug_tuple("VolumeBackend::V3").field(be).finish(),
+        }
+    }
+}
+
+impl VolumeBackend {
+    /// Open `path` routed by the sector-0 version gate
+    /// (`kv::superblock::classify_volume`): v2 superblocks take the
+    /// unchanged v2 path (`MetaLvStorage::open` + `validate_superblock`,
+    /// byte-identical policy); v3 superblocks mount the KV read side
+    /// (SB → ledger → bitmap → replay). Blank volumes fail loud with the
+    /// actionable "run `squeezefs format` first"; foreign magic, torn
+    /// superblocks, versions above 3, and unknown incompat feature bits
+    /// fail loud from the gate itself.
+    pub async fn open_for_mount(path: &str) -> Result<Self> {
+        let _ = path;
+        todo!("PR K6a implementation commit")
+    }
+
+    /// The volume's on-disk format version (the `meta_format_version`
+    /// stats string's source, design §10).
+    pub fn format_version(&self) -> u32 {
+        match self {
+            VolumeBackend::V2(_) => 2,
+            VolumeBackend::V3(_) => 3,
+        }
+    }
+
+    /// Read dispatch: `Metadata::lookup` shape.
+    pub async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
+        match self {
+            VolumeBackend::V2(be) => be.lookup(parent, name).await,
+            VolumeBackend::V3(be) => be.lookup(parent, name).await,
+        }
+    }
+
+    /// Read dispatch: `Metadata::getattr` shape.
+    pub async fn getattr(&self, ino: Ino) -> Result<Inode> {
+        match self {
+            VolumeBackend::V2(be) => be.getattr(ino).await,
+            VolumeBackend::V3(be) => be.getattr(ino).await,
+        }
+    }
+
+    /// Read dispatch: `Metadata::readdir` shape (v2 ignores
+    /// `offset`/`max` — its documented behavior; v3 honors them, §5.1).
+    pub async fn readdir(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>> {
+        match self {
+            VolumeBackend::V2(be) => be.readdir(dir, offset, max).await,
+            VolumeBackend::V3(be) => be.readdir(dir, offset, max).await,
+        }
+    }
+
+    /// Read dispatch: `Metadata::getxattr` shape.
+    pub async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        match self {
+            VolumeBackend::V2(be) => be.getxattr(ino, name).await,
+            VolumeBackend::V3(be) => be.getxattr(ino, name).await,
+        }
+    }
+
+    /// Read dispatch: `Metadata::listxattr` shape.
+    pub async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
+        match self {
+            VolumeBackend::V2(be) => be.listxattr(ino).await,
+            VolumeBackend::V3(be) => be.listxattr(ino).await,
+        }
     }
 }
 

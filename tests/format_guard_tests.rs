@@ -34,14 +34,16 @@ fn blank_storage() -> (NamedTempFile, MetaLvStorage) {
 
 async fn formatted_storage() -> (NamedTempFile, MetaLvStorage) {
     let (meta, storage) = blank_storage();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     (meta, storage)
 }
 
 #[tokio::test]
 async fn blank_volume_formats_without_force() {
     let (_meta, storage) = blank_storage();
-    MetaLvBackend::format_with_options(&storage, true, false, None)
+    MetaLvBackend::format_v2_for_tests(&storage, true, false, None)
         .await
         .expect("a never-formatted volume must format without --force");
 }
@@ -49,7 +51,7 @@ async fn blank_volume_formats_without_force() {
 #[tokio::test]
 async fn formatted_volume_without_force_is_refused() {
     let (_meta, storage) = formatted_storage().await;
-    let err = MetaLvBackend::format_with_options(&storage, true, false, None)
+    let err = MetaLvBackend::format_v2_for_tests(&storage, true, false, None)
         .await
         .expect_err("an already-formatted volume must be refused without --force")
         .to_string();
@@ -62,7 +64,7 @@ async fn formatted_volume_without_force_is_refused() {
 #[tokio::test]
 async fn formatted_volume_with_force_is_reformatted() {
     let (_meta, storage) = formatted_storage().await;
-    MetaLvBackend::format_with_options(&storage, true, true, None)
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
         .await
         .expect("--force must reformat an idle formatted volume");
 }
@@ -74,7 +76,7 @@ async fn live_client_blocks_format_even_with_force() {
         .await
         .unwrap();
 
-    let err = MetaLvBackend::format_with_options(&storage, true, true, None)
+    let err = MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
         .await
         .expect_err("a live mounted client must block format even with --force")
         .to_string();
@@ -92,7 +94,7 @@ async fn stale_client_does_not_block_forced_format_and_is_reaped() {
         .await
         .unwrap();
 
-    MetaLvBackend::format_with_options(&storage, true, true, None)
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
         .await
         .expect("a stale (crashed) client must not block a forced format");
 }

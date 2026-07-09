@@ -32,15 +32,21 @@
 //! the §4.6 SMO protocol — serialized SMO execution, interior locks
 //! SMO-only, writer lock-then-revalidate-then-retry ([`tree`]).
 //!
-//! The record/bset layer is pure and in-memory; nothing here is mount-wired
-//! yet. Per the design's liveness convention, K1–K5 code is
-//! production-unreachable until PR K6a wires the mount path; it is kept
-//! alive by its own unit/integration tests, the crash harness, the loom
-//! models, and the `meta_lv_bench` criterion micro-benches.
+//! PR K6a wires the mount path: [`superblock`] (SuperblockV3 + the
+//! dual-format version gate, §4.1/§6.1, resolved OQ 1 ring clamp),
+//! [`builder`] (the offline bulk image builder — §8 gate-volume producer
+//! and K9's migrate engine — plus the public v3 formatter and the §4.10
+//! digest walk), and [`backend`] (`KvMetaBackend`, the read side: mount =
+//! SB → ledger → bitmap → read-only journal replay into the K5 cache;
+//! lookups/getattr/readdir/getxattr/listxattr over tree + fold). The
+//! §4.4 commit pipeline, checkpoint scheduling, and the mutating
+//! `Metadata` impl are PR K6b's.
 
 pub mod alloc_ext;
 pub mod alloc_ext_core;
+pub mod backend;
 pub mod bset;
+pub mod builder;
 pub mod checkpoint;
 pub mod journal;
 pub mod journal_core;
@@ -48,6 +54,7 @@ pub mod node;
 pub mod node_cache;
 pub mod node_state_core;
 pub mod record;
+pub mod superblock;
 pub mod tree;
 
 use std::sync::atomic::AtomicU64;
@@ -205,4 +212,19 @@ pub enum KvError {
     /// per AGENTS.md; a poisoned/torn device surfaces here as `EIO`).
     #[error("kv extent I/O failed: {0}")]
     Io(#[from] crate::error::SqueezefsError),
+}
+
+/// Map KV-layer errors onto the crate error surface (mount / CLI / trait
+/// callers): device I/O passes through untouched; every other variant is
+/// a typed-refusal-turned-loud-message, the `InvalidOperation` class the
+/// v2 mount gates use.
+impl From<KvError> for crate::error::SqueezefsError {
+    fn from(e: KvError) -> Self {
+        match e {
+            KvError::Io(inner) => inner,
+            other => {
+                crate::error::SqueezefsError::InvalidOperation(format!("kv metadata: {other}"))
+            }
+        }
+    }
 }

@@ -25,6 +25,16 @@
 use crate::error::{Result, SqueezefsError};
 use std::path::Path;
 
+/// The v3 volumes' `meta_volume_atomicity` **contract class** (resolved
+/// OQ 2, design-cow-kv-metadata §4.10): torn-write immunity holds by
+/// construction (every unit checksummed, never-overwrite-live), so the
+/// contract field reports `cow-checksummed` regardless of hardware; the
+/// physical probe classification is surfaced alongside as
+/// `meta_volume_atomicity_physical` for operator hardware visibility.
+/// `--strict-meta-atomicity` retains its gating meaning on **v2 volumes
+/// only** — on v3 it has nothing left to gate.
+pub const META_VOLUME_ATOMICITY_COW: &str = "cow-checksummed";
+
 /// Classification of a metadata volume's 4 KiB write-atomicity evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicityClass {

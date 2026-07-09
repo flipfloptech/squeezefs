@@ -31,7 +31,9 @@ fn hist_count(buckets: &[std::sync::atomic::AtomicU64]) -> u64 {
 async fn backend_with_orphans(n: u64) -> (NamedTempFile, MetaLvBackend, Vec<u64>) {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     let backend = MetaLvBackend::new(storage);
     let mut inos = Vec::new();
     for i in 0..n {
@@ -96,7 +98,9 @@ async fn test_destroy_inodes_batch_single_transaction_zeroes_and_frees() {
 async fn test_destroy_inodes_revalidates_nlink_under_lock() {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     let backend = MetaLvBackend::new(storage);
 
     let live = backend
@@ -169,7 +173,9 @@ async fn test_reclaim_batch_bisect_poisoned_sector_wedges_only_victim() {
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
     let m = NamedTempFile::new().unwrap();
     let ms = MetaLvStorage::open(m.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&ms).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
+        .await
+        .unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         Arc::new(MetaLvBackend::new(ms)),
     ]));
@@ -272,7 +278,9 @@ async fn test_reclaim_batch_bisect_poisoned_sector_wedges_only_victim() {
 async fn test_no_deadlock_reclaim_batch_vs_create_storm() {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     let backend = std::sync::Arc::new(MetaLvBackend::new(storage));
 
     let reclaimer = {
@@ -346,7 +354,9 @@ async fn test_destroy_inodes_kills_xattrs_in_the_same_transaction() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     let backend = MetaLvBackend::new(storage);
 
     let mut inos = Vec::new();
@@ -438,7 +448,9 @@ async fn test_batch_forget_queues_reclaim_like_forget() {
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
     let m = NamedTempFile::new().unwrap();
     let ms = MetaLvStorage::open(m.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&ms).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
+        .await
+        .unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         Arc::new(MetaLvBackend::new(ms)),
     ]));

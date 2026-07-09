@@ -83,7 +83,9 @@ async fn make_with_write_cap(write_disk_cap: &str) -> H {
 
     let m = NamedTempFile::new().unwrap();
     let ms = MetaLvStorage::open(m.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&ms).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
+        .await
+        .unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         Arc::new(MetaLvBackend::new(ms)),
     ]));

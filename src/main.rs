@@ -1647,7 +1647,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         None
                     };
-                    squeezefs::meta_backend::MetaLvBackend::format_with_options(
+                    squeezefs::meta_backend::MetaLvBackend::format_v2_for_tests(
                         &storage, quick, force, pb,
                     )
                     .await

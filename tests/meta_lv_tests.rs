@@ -10,7 +10,9 @@ async fn test_metalv_format_and_mount() {
     let storage = MetaLvStorage::open(&path, 256 * 1024 * 1024).unwrap();
 
     // Format
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     // Verify Superblock
     let sb = storage.read_superblock().await.unwrap();
@@ -32,7 +34,9 @@ async fn test_seed_inode_alloc_from_table_reconstructs_bits() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     // Fresh volume: only root (ino 1, skipped) exists — [2, limit) is empty.
     storage.seed_inode_alloc_from_table().await.unwrap();
@@ -86,7 +90,9 @@ async fn test_refresh_bitmap_from_table_round_trip() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     for &ino in &[5u64, 100, 250] {
         write_inode(
@@ -137,7 +143,9 @@ async fn test_refresh_bitmap_from_table_round_trip() {
 async fn test_reconciliation_does_not_touch_journal() {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     // Journal starts at 104 MiB (Superblock::journal_start). Stamp a marker.
     let journal_start: u64 = 1024 * 1024 * 104;
@@ -173,7 +181,9 @@ async fn test_tx_read_your_own_writes_subsector() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     // A sector-aligned, zeroed scratch sector inside the inode-table region.
     let sec = 8192u64 + 4096 * 40;
@@ -217,7 +227,9 @@ async fn test_tx_full_sector_staging_overlay_unchanged() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     let sec = 8192u64 + 4096 * 41;
     let tx = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -240,7 +252,9 @@ async fn test_metalv_crud_operations() {
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
     let storage = MetaLvStorage::open(&path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     let backend = MetaLvBackend::new(storage);
 
     // Create a file in root (parent ino 1)
@@ -293,7 +307,9 @@ async fn test_metalv_bitmap_and_hash_chains() {
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
     let storage = MetaLvStorage::open(&path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     let backend = MetaLvBackend::new(storage);
 
     // 1. Stress the Free Inode Bitmap
@@ -388,7 +404,9 @@ async fn test_bench_rmdir_simulation() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
     let storage = MetaLvStorage::open(&path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     let backend = MetaLvBackend::new(storage);
 
     let parent = backend
@@ -434,7 +452,9 @@ async fn test_bench_rmdir_simulation_concurrent() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
     let storage = MetaLvStorage::open(&path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     use std::sync::Arc;
     let backend = Arc::new(MetaLvBackend::new(storage));
 
@@ -513,8 +533,12 @@ async fn test_routed_concurrent_mkdir_no_lost_inodes() {
     let tmp1 = NamedTempFile::new().unwrap();
     let s0 = MetaLvStorage::open(tmp0.path(), 256 * 1024 * 1024).unwrap();
     let s1 = MetaLvStorage::open(tmp1.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&s0).await.unwrap();
-    MetaLvBackend::format(&s1).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&s0, true, true, None)
+        .await
+        .unwrap();
+    MetaLvBackend::format_v2_for_tests(&s1, true, true, None)
+        .await
+        .unwrap();
 
     let backend = Arc::new(RoutedMetaBackend::new(vec![
         Arc::new(MetaLvBackend::new(s0)),
@@ -619,7 +643,9 @@ async fn read_sector0(storage: &MetaLvStorage) -> [u8; 4096] {
 async fn test_validate_superblock_fresh_format_round_trip() {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     let sb = storage
         .validate_superblock()
@@ -689,7 +715,9 @@ async fn test_validate_superblock_blank_volume_fails_not_formatted() {
 async fn test_validate_superblock_garbage_magic_names_magic() {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     let mut sector = read_sector0(&storage).await;
     sector[..8].copy_from_slice(b"GARBAGE!");
@@ -718,7 +746,9 @@ async fn test_validate_superblock_garbage_magic_names_magic() {
 async fn test_validate_superblock_future_version_fails() {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     let mut sector = read_sector0(&storage).await;
     sector[SB_VERSION_OFF..SB_VERSION_OFF + 4].copy_from_slice(&99u32.to_le_bytes());
@@ -745,7 +775,9 @@ async fn test_validate_superblock_future_version_fails() {
 async fn test_validate_superblock_corrupted_byte_names_checksum() {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     let mut sector = read_sector0(&storage).await;
     sector[SB_DENTRY_ROOT_OFF] ^= 0xFF; // flip a byte inside dentry_root
@@ -768,7 +800,9 @@ async fn test_validate_superblock_corrupted_byte_names_checksum() {
 async fn test_validate_superblock_legacy_zero_checksum_skips_verification() {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     // Rewrite the superblock exactly as a pre-PR-1 binary left it: same
     // fields, checksum zeroed (which no longer matches the struct bytes).
@@ -797,7 +831,9 @@ async fn test_write_superblock_stamps_real_checksum() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     let mut sb = storage.read_superblock().await.unwrap();
     sb.inode_count = 424242; // mutate a field, leave the (now stale) checksum
@@ -917,7 +953,9 @@ async fn test_setxattr_on_quarantined_legacy_ino_fails_eio_cleanly() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     // A legacy occupant: pre-fix binaries could allocate ino 1030.
     let legacy_ino = 1030u64;
@@ -994,7 +1032,9 @@ async fn test_symlink_target_read_on_quarantined_ino_eio_not_garbage() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     let legacy_ino = 1040u64;
     let mut di = DiskInode::new(legacy_ino, libc::S_IFLNK | 0o777, 0, 0);
@@ -1028,7 +1068,9 @@ async fn test_legacy_bitmap_marks_quarantine() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     let read_bitmap = |s: &MetaLvStorage| {
         let s = s.clone();
@@ -1092,7 +1134,9 @@ async fn test_quarantined_metric_counts_legacy_occupants() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     write_inode(
         &storage,
@@ -1150,7 +1194,9 @@ async fn test_quick_format_leaves_no_xattr_ghosts() {
 
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     // Prior life: a high-ino file with an xattr, and a symlink with
     // content — both blocks land beyond the 108 MiB quick-wipe window.
@@ -1184,7 +1230,9 @@ async fn test_quick_format_leaves_no_xattr_ghosts() {
         .is_some());
 
     // Quick re-format (the default `format` path is quick + force).
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
 
     // New life at the same ino numbers, no xattrs ever set.
     write_inode(

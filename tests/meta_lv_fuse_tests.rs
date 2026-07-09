@@ -61,7 +61,9 @@ async fn test_metalv_fuse_integration() {
     // Verify it is not formatted initially
     assert!(meta_storage.read_superblock().await.is_err());
 
-    MetaLvBackend::format(&meta_storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
+        .await
+        .unwrap();
 
     // Verify it is now formatted
     assert!(meta_storage.read_superblock().await.is_ok());

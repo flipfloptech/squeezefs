@@ -16,7 +16,9 @@ async fn open_backend() -> (NamedTempFile, Arc<MetaLvBackend>) {
     let s = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
     // `format` runs before any concurrent op (single-threaded), so its direct
     // sector writes are safe; the sector-lock invariant is about the serving path.
-    MetaLvBackend::format(&s).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&s, true, true, None)
+        .await
+        .unwrap();
     (tmp, Arc::new(MetaLvBackend::new(s)))
 }
 
@@ -26,7 +28,9 @@ async fn open_routed(n: usize) -> (Vec<NamedTempFile>, Arc<RoutedMetaBackend>) {
     for _ in 0..n {
         let tmp = NamedTempFile::new().unwrap();
         let s = MetaLvStorage::open(tmp.path(), 256 * 1024 * 1024).unwrap();
-        MetaLvBackend::format(&s).await.unwrap();
+        MetaLvBackend::format_v2_for_tests(&s, true, true, None)
+            .await
+            .unwrap();
         vols.push(Arc::new(MetaLvBackend::new(s)));
         tmps.push(tmp);
     }

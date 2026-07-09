@@ -22,8 +22,10 @@ fn bench_metalv_metadata(c: &mut Criterion) {
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
     let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    rt.block_on(async { MetaLvBackend::format(&meta_storage).await })
-        .unwrap();
+    rt.block_on(async {
+        MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None).await
+    })
+    .unwrap();
     let backend = MetaLvBackend::new(meta_storage);
 
     let mut group = c.benchmark_group("meta_lv_metadata");

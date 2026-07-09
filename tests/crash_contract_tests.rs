@@ -77,7 +77,9 @@ const JOURNAL_LEN: usize = 1024 * 1024 * 4;
 async fn fresh_volume() -> (NamedTempFile, MetaLvStorage) {
     let tmp = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(tmp.path(), VOL_SIZE).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     (tmp, storage)
 }
 
@@ -1632,5 +1634,156 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
         reopened, expected,
         "exactly the predecessor's retired extents re-enter the pool once \
          their retiring checkpoint is durable"
+    );
+}
+
+// ===========================================================================
+// PR K6a — superblock v3 + mount-path crash cases
+// (design-cow-kv-metadata §4.1/§4.10, PR K6a). The superblock is a
+// **durable-coverage unit**: unlike journal-window contents, a torn or
+// corrupt sector 0 fails the mount LOUD. The root ledger keeps its K3
+// semantics at the backend level: a torn newest slot falls back to the
+// predecessor and the mount serves the predecessor's state byte-intact.
+// ===========================================================================
+
+use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::builder::{digest_backend, BuilderConfig, ImageBuilder, ROOT_INO};
+use squeezefs::meta_backend::kv::checkpoint::write_ledger_slot as kv_write_ledger_slot;
+use squeezefs::meta_backend::kv::superblock::{classify_volume, write_superblock_v3};
+
+const K6A_VOL_LEN: u64 = 64 * 1024 * 1024;
+
+/// A small populated v3 image (deterministic identity, 64 KiB nodes,
+/// 1 MiB ring).
+async fn k6a_built_volume() -> NamedTempFile {
+    let f = NamedTempFile::new().unwrap();
+    f.as_file().set_len(K6A_VOL_LEN).unwrap();
+    let mut b = ImageBuilder::new(BuilderConfig {
+        node_size: 64 * 1024,
+        journal_len_override: Some(1024 * 1024),
+        hash_seed: 0xC0FFEE,
+        uuid: *b"crash-k6a-volume",
+    })
+    .unwrap();
+    let d = b.add_dir(ROOT_INO, "dir", 0o755, 0, 0).unwrap();
+    for i in 0..32 {
+        b.add_file(d, &format!("f{i:02}"), 0o644, 0, 0, i).unwrap();
+    }
+    b.build(f.path(), K6A_VOL_LEN).await.unwrap();
+    f
+}
+
+/// K6a crash case (a): a TORN superblock write ⇒ the version gate and the
+/// mount fail loud (§4.10 "loud mount failures are reserved for units with
+/// durable-coverage arguments (superblock, …)"). The tear is injected with
+/// the honest in-flight shim: the rewrite persists only a prefix, exactly
+/// a format racing power loss.
+#[tokio::test]
+async fn test_kv_v3_torn_superblock_fails_mount_loud() {
+    let f = k6a_built_volume().await;
+    let _g = FaultGuard;
+
+    // Grab the valid superblock, then re-write it torn: 100 bytes survive
+    // (magic + version + node_size + features land; geometry + checksum
+    // are lost to the tear).
+    let sb = match classify_volume(f.path()).await.unwrap() {
+        squeezefs::meta_backend::kv::superblock::VolumeFormat::V3(sb) => sb,
+        other => panic!("expected a v3 volume, got {other:?}"),
+    };
+    uring_fs::arm_torn_write(0, 100);
+    let err = write_superblock_v3(f.path(), &sb)
+        .await
+        .expect_err("the torn superblock write fails loud to the formatter");
+    assert!(matches!(err, KvError::Io(_)), "got {err:?}");
+    uring_fs::clear_faults();
+
+    // The gate refuses loud — as corruption, never as "run format" and
+    // never by silently limping into a mount.
+    let err = classify_volume(f.path())
+        .await
+        .expect_err("a torn superblock must classify loud")
+        .to_string();
+    assert!(
+        err.contains("checksum") || err.contains("corrupt"),
+        "the refusal must name the corruption, got: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("not formatted"),
+        "a torn SB is corruption, not a blank volume: {err}"
+    );
+    let err = KvMetaBackend::open(f.path())
+        .await
+        .expect_err("the mount must refuse the torn superblock")
+        .to_string();
+    assert!(
+        err.contains("checksum") || err.contains("corrupt"),
+        "got: {err}"
+    );
+}
+
+/// K6a crash case (b): a torn NEWEST ledger record at mount ⇒ the backend
+/// serves the predecessor checkpoint byte-intact (§4.1 newest-valid-wins;
+/// sound by pending-free §4.7 + the ring twin §4.6 pt 3). This is the K3
+/// slot-level case promoted to the full mount path: superblock → ledger →
+/// bitmap → replay → reads.
+#[tokio::test]
+async fn test_kv_v3_torn_newest_ledger_mount_serves_predecessor() {
+    let f = k6a_built_volume().await;
+    let _g = FaultGuard;
+
+    // Mount once clean: this is the predecessor state a fallback must
+    // reproduce exactly.
+    let (want_digest, want_seq, sb) = {
+        let be = KvMetaBackend::open(f.path()).await.unwrap();
+        (
+            digest_backend(&be).await.unwrap(),
+            be.mounted_ledger().seq,
+            be.superblock().clone(),
+        )
+    };
+
+    // A later checkpoint (seq + 1) races power loss: its slot write tears
+    // mid-record. Roots point at garbage on purpose — if the fallback ever
+    // TRUSTED this record, the mount would fail loud on a bad root.
+    let mut torn = squeezefs::meta_backend::kv::checkpoint::LedgerRecord {
+        seq: want_seq + 1,
+        tree_roots: vec![],
+        journal_tail_seq: 0,
+        next_ino: 999_999,
+        alloc_bitmap_generation: 999,
+    };
+    torn.tree_roots
+        .push(squeezefs::meta_backend::kv::checkpoint::TreeRoot {
+            tree_id: TREE_INODES,
+            node_addr: 0xDEAD_0000,
+            node_seq: 0xDEAD,
+        });
+    let slot_off = sb.root_ledger.start + (torn.seq % 32) * 4096;
+    uring_fs::arm_torn_write(slot_off + 40, 12);
+    let err = kv_write_ledger_slot(f.path(), sb.root_ledger.start, &torn)
+        .await
+        .expect_err("the torn slot write fails loud to the checkpointer");
+    assert!(matches!(err, KvError::Io(_)), "got {err:?}");
+    uring_fs::clear_faults();
+
+    // Remount: the torn newest slot loses to its intact predecessor and
+    // the served state is identical to the pre-crash mount.
+    let be = KvMetaBackend::open(f.path())
+        .await
+        .expect("a torn newest ledger slot must never fail the mount");
+    assert_eq!(
+        be.mounted_ledger().seq,
+        want_seq,
+        "mount must select the intact predecessor record"
+    );
+    assert_eq!(
+        digest_backend(&be).await.unwrap(),
+        want_digest,
+        "the predecessor's tree state must be byte-intact (post-fold digest)"
+    );
+    assert_eq!(
+        be.lookup(ROOT_INO, "dir").await.unwrap().mode & libc::S_IFMT,
+        libc::S_IFDIR,
+        "reads serve normally from the fallback state"
     );
 }

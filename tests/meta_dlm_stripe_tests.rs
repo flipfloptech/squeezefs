@@ -26,7 +26,9 @@ const ROOT: u64 = 1;
 async fn backend() -> (Arc<RoutedMetaBackend>, NamedTempFile) {
     let f = NamedTempFile::new().unwrap();
     let ms = MetaLvStorage::open(f.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&ms).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
+        .await
+        .unwrap();
     let routed = Arc::new(RoutedMetaBackend::new(vec![Arc::new(MetaLvBackend::new(
         ms,
     ))]));

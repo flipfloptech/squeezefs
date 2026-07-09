@@ -22,7 +22,9 @@ fn now_secs() -> u64 {
 async fn formatted_storage() -> (NamedTempFile, MetaLvStorage) {
     let meta = NamedTempFile::new().unwrap();
     let storage = MetaLvStorage::open(meta.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .unwrap();
     (meta, storage)
 }
 
@@ -38,7 +40,7 @@ async fn test_stale_registration_does_not_block_format() {
     xattr::set_xattr(&storage, 1, "client:live", &reg_value(now))
         .await
         .unwrap();
-    let blocked = MetaLvBackend::format_with_options(&storage, true, true, None).await;
+    let blocked = MetaLvBackend::format_v2_for_tests(&storage, true, true, None).await;
     assert!(
         blocked.is_err(),
         "a live (freshly-heartbeated) client must block format"
@@ -53,7 +55,7 @@ async fn test_stale_registration_does_not_block_format() {
         .await
         .unwrap();
 
-    let allowed = MetaLvBackend::format_with_options(&storage, true, true, None).await;
+    let allowed = MetaLvBackend::format_v2_for_tests(&storage, true, true, None).await;
     assert!(
         allowed.is_ok(),
         "a stale (crashed) client registration must not block format: {allowed:?}"
@@ -70,7 +72,7 @@ async fn test_legacy_registration_value_treated_as_stale() {
         .await
         .unwrap();
 
-    let allowed = MetaLvBackend::format_with_options(&storage, true, true, None).await;
+    let allowed = MetaLvBackend::format_v2_for_tests(&storage, true, true, None).await;
     assert!(
         allowed.is_ok(),
         "legacy timestamp-less registration must not block format: {allowed:?}"

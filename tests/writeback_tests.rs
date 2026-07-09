@@ -67,7 +67,9 @@ async fn test_writeback_queue_full_deadlock() {
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
     let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&meta_storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
+        .await
+        .unwrap();
     let meta_backend = Arc::new(MetaLvBackend::new(meta_storage));
     let routed_meta_backend = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         meta_backend,
@@ -185,7 +187,9 @@ async fn test_inline_file_layout_overflow() {
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
     let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&meta_storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
+        .await
+        .unwrap();
     let meta_backend = Arc::new(MetaLvBackend::new(meta_storage));
     let routed_meta_backend = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         meta_backend,
@@ -272,7 +276,9 @@ async fn test_indirect_block_map() {
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
     let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&meta_storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
+        .await
+        .unwrap();
     let meta_backend = Arc::new(MetaLvBackend::new(meta_storage));
     let routed_meta_backend = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         meta_backend,
@@ -663,7 +669,9 @@ async fn make_flush_fs(test_id: &str) -> FlushHarness {
 
     let meta = NamedTempFile::new().unwrap();
     let meta_storage = MetaLvStorage::open(meta.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&meta_storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
+        .await
+        .unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         Arc::new(MetaLvBackend::new(meta_storage)),
     ]));
@@ -1052,7 +1060,9 @@ async fn test_block_allocator_recovery() {
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
     let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format(&meta_storage).await.unwrap();
+    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
+        .await
+        .unwrap();
     let meta_backend = Arc::new(MetaLvBackend::new(meta_storage.clone()));
     let routed_meta_backend = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         meta_backend.clone(),

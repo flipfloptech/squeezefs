@@ -1366,6 +1366,56 @@ async fn nightly_mount_time_100m_ino() {
 }
 
 // ---------------------------------------------------------------------------
+// §8 paired-run tooling: rebuild a CLI-formatted meta volume as v2.
+// ---------------------------------------------------------------------------
+
+/// Utility for the §8 paired mount benches (not a test): the CLI formats
+/// only v3 from K6a on (resolved OQ 4 — v2 formatting is
+/// test-surface-only), but every §8 gate row is a paired v2-vs-v3
+/// comparison over REAL CLI mounts. This target rebuilds the meta volume
+/// at `SQUEEZEFS_V2_REFORMAT_META` as v2 with the §6.2 test-scoped
+/// formatter, carrying over the format-config xattr the CLI recorded —
+/// the exact shim shape the pre-K6b transport suite used. Invocation:
+///
+/// ```text
+/// SQUEEZEFS_V2_REFORMAT_META=/path/to/meta.bin \
+///   cargo test --release --test kv_scale_tests -- --ignored \
+///   --exact util_reformat_meta_volume_v2 --test-threads=1
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "paired-bench tooling — set SQUEEZEFS_V2_REFORMAT_META and run explicitly"]
+async fn util_reformat_meta_volume_v2() {
+    use squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR;
+    let meta = std::env::var("SQUEEZEFS_V2_REFORMAT_META")
+        .expect("set SQUEEZEFS_V2_REFORMAT_META to the CLI-formatted meta volume path");
+    let len = std::env::var("SQUEEZEFS_V2_REFORMAT_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256 * 1024 * 1024);
+    let meta = std::path::PathBuf::from(meta);
+
+    let cfg = KvMetaBackend::open(&meta)
+        .await
+        .expect("open the CLI-formatted v3 meta volume")
+        .getxattr(ROOT_INO, FORMAT_CONFIG_XATTR)
+        .await
+        .expect("read the recorded format config")
+        .expect("format must record the config xattr");
+    let storage = MetaLvStorage::open(&meta, len).expect("reopen meta volume");
+    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+        .await
+        .expect("v2 reformat");
+    squeezefs::meta_backend::xattr::set_xattr(&storage, 1, FORMAT_CONFIG_XATTR, &cfg)
+        .await
+        .expect("carry the format config onto the v2 volume");
+    eprintln!(
+        "[v2-reformat] {} is now format v2 ({} B)",
+        meta.display(),
+        len
+    );
+}
+
+// ---------------------------------------------------------------------------
 // §8 row 7: metadata write amplification — paired create/unlink storms.
 // ---------------------------------------------------------------------------
 

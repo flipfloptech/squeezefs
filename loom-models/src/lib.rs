@@ -34,6 +34,13 @@
 //!   `reusable_upto + capacity` less the user-invisible checkpoint
 //!   reserve), admitted bytes are conserved across transfer/release, and
 //!   the checkpoint carve-out is never consumable by user admissions.
+//! - [`alloc_ext_core`]: the KV extent allocator's lock-free bitmap /
+//!   pending-free / reserve core (CoW KV metadata design §4.7, PR K4) —
+//!   invariants: an extent is never handed to two concurrent claimers, a
+//!   pending-freed extent is never claimable before its checkpoint-durable
+//!   seq (the root-fallback soundness rule, risk R3), and the compaction
+//!   reserve is never consumable by user claims while internal claims
+//!   drain it exactly.
 //!
 //! Models run only under `--cfg loom` (see `tests/run_loom.sh`); a plain
 //! `cargo test` here compiles the cores against std atomics and runs
@@ -41,6 +48,8 @@
 
 #[path = "../../src/meta_backend/alloc_core.rs"]
 pub mod alloc_core;
+#[path = "../../src/meta_backend/kv/alloc_ext_core.rs"]
+pub mod alloc_ext_core;
 #[path = "../../src/cow_core.rs"]
 pub mod cow_core;
 #[path = "../../src/gauge_core.rs"]
@@ -56,7 +65,7 @@ pub mod refcount_core;
 
 #[cfg(all(test, loom))]
 mod models {
-    use crate::{alloc_core, gauge_core, incarnation_core, journal_core, lease_core};
+    use crate::{alloc_core, alloc_ext_core, gauge_core, incarnation_core, journal_core, lease_core};
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
     use loom::thread;
@@ -801,6 +810,173 @@ mod models {
             );
             core.release(exact);
             assert_eq!(core.admitted(), 0);
+        });
+    }
+
+    /// Extent-allocator invariant #1 (design §4.7, PR K4): two threads
+    /// racing claims on a small heap never receive the same extent —
+    /// including an extent whose pending-free was drained mid-race — and
+    /// the free budget settles to exactly `total − live claims`.
+    #[test]
+    fn alloc_ext_no_double_alloc_under_concurrent_claimers() {
+        loom::model(|| {
+            // 3 extents, no reserve, FIFO cap 2. Seed one claim, park it
+            // pending-free (tag 1), and make it durable — so the racing
+            // claimers below contend on {fresh bits} ∪ {a just-drained
+            // pending extent}, the exact reuse-race R3 worries about.
+            let core = Arc::new(alloc_ext_core::ExtCore::new(3, 0, 2));
+            let seeded = core
+                .claim(alloc_ext_core::AllocClass::User)
+                .expect("seed claim");
+            core.free_pending(seeded, 1).expect("FIFO has room");
+            let drained = core.advance_durable(1);
+            assert_eq!(drained, vec![seeded], "durable tag 1 releases the seed");
+
+            let t = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || {
+                    let a = core.claim(alloc_ext_core::AllocClass::User).ok();
+                    let b = core.claim(alloc_ext_core::AllocClass::User).ok();
+                    (a, b)
+                })
+            };
+            let (c, d) = {
+                let c = core.claim(alloc_ext_core::AllocClass::User).ok();
+                let d = core.claim(alloc_ext_core::AllocClass::User).ok();
+                (c, d)
+            };
+            let (a, b) = t.join().unwrap();
+
+            let claimed: Vec<u64> = [a, b, c, d].into_iter().flatten().collect();
+            let mut dedup = claimed.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            assert_eq!(
+                claimed.len(),
+                dedup.len(),
+                "an extent was handed to two threads: {claimed:?}"
+            );
+            assert_eq!(claimed.len(), 3, "exactly the 3-extent heap is claimable");
+            assert_eq!(
+                core.free_extents(),
+                0,
+                "budget must settle to total − live claims"
+            );
+        });
+    }
+
+    /// Extent-allocator invariant #2 (design §4.7 CoW reuse rule — the R3
+    /// root-fallback soundness gate): a pending-freed extent is NEVER
+    /// claimable before its retiring checkpoint is durable. A claimer
+    /// racing the durable-advance either fails (gate still closed) or
+    /// succeeds — and success PROVES the watermark had covered the tag,
+    /// because the drain is the only path that returns the bit.
+    #[test]
+    fn alloc_ext_pending_free_never_claimable_before_durable_seq() {
+        loom::model(|| {
+            // One extent, no reserve: the pending extent is the only
+            // possible claim, so any successful claim is THE reuse.
+            let core = Arc::new(alloc_ext_core::ExtCore::new(1, 0, 2));
+            let e = core
+                .claim(alloc_ext_core::AllocClass::User)
+                .expect("the single extent claims");
+            core.free_pending(e, 1).expect("FIFO has room");
+
+            // Thread: the checkpoint task — ledger record seq 1 becomes
+            // durable (post-barrier), opening the gate.
+            let t = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || {
+                    core.advance_durable(1);
+                })
+            };
+
+            // Main: a racing claimer.
+            let raced = match core.claim(alloc_ext_core::AllocClass::User) {
+                Ok(got) => {
+                    assert_eq!(got, e, "the only claimable extent is the drained one");
+                    assert!(
+                        core.durable_seq() >= 1,
+                        "extent reused before its retiring checkpoint (tag 1) was durable \
+                         — the §4.7 gate is broken (R3)"
+                    );
+                    true
+                }
+                Err(alloc_ext_core::ClaimError::NoSpace) => {
+                    // Gate still closed (or drain not yet run): correct.
+                    false
+                }
+            };
+            t.join().unwrap();
+
+            // With the advance joined, the extent is claimable exactly once
+            // across the whole model: whichever of the racing claim above
+            // or this retry runs after the drain wins it — never both.
+            let retry = core.claim(alloc_ext_core::AllocClass::User).is_ok();
+            assert!(
+                raced ^ retry,
+                "the drained extent must be claimed exactly once (raced {raced}, retry {retry})"
+            );
+            assert_eq!(core.free_extents(), 0, "budget settles: one live claim");
+        });
+    }
+
+    /// Extent-allocator invariant #3 (design §4.7 ENOSPC semantics):
+    /// the compaction reserve is never consumable by user claims — under
+    /// a race, exactly one of two users fits the user budget while the
+    /// internal (compaction/SMO) claimant still drains the reserve it
+    /// alone may touch; budget accounting settles exactly.
+    #[test]
+    fn alloc_ext_reserve_isolated_from_user_claims() {
+        loom::model(|| {
+            // 3 extents, reserve 2 ⇒ user budget 1.
+            let core = Arc::new(alloc_ext_core::ExtCore::new(3, 2, 2));
+
+            let t = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || core.claim(alloc_ext_core::AllocClass::User).ok())
+            };
+            let mine = core.claim(alloc_ext_core::AllocClass::User).ok();
+            let theirs = t.join().unwrap();
+
+            assert!(
+                mine.is_some() ^ theirs.is_some(),
+                "user budget 1 holds exactly one of two racing user claims"
+            );
+            assert_eq!(
+                core.free_extents(),
+                2,
+                "the reserve must survive user pressure intact"
+            );
+
+            // The internal claimant drains the reserve it alone may touch…
+            let i1 = core
+                .claim(alloc_ext_core::AllocClass::Internal)
+                .expect("internal claim must reach the reserve");
+            // …while a user retry is still refused at the floor.
+            assert_eq!(
+                core.claim(alloc_ext_core::AllocClass::User),
+                Err(alloc_ext_core::ClaimError::NoSpace),
+                "a user claim consumed the compaction reserve"
+            );
+            let i2 = core
+                .claim(alloc_ext_core::AllocClass::Internal)
+                .expect("the whole reserve is internal-claimable");
+            assert_eq!(
+                core.claim(alloc_ext_core::AllocClass::Internal),
+                Err(alloc_ext_core::ClaimError::NoSpace),
+                "an exhausted heap refuses internal claims too"
+            );
+
+            // Exact accounting: 3 claims live, none free.
+            let mut live: Vec<u64> = [mine, theirs, Some(i1), Some(i2)]
+                .into_iter()
+                .flatten()
+                .collect();
+            live.sort_unstable();
+            live.dedup();
+            assert_eq!(live.len(), 3, "three unique live claims");
+            assert_eq!(core.free_extents(), 0);
         });
     }
 }

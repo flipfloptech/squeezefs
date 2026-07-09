@@ -32,6 +32,15 @@
 //! ledger slots, and the ring-reuse-never-overwrites-the-fallback-window
 //! invariant — everything inside the replay window recovers and resyncs,
 //! never failing a mount loud.
+//!
+//! The trailing `PR K4` section extends it to the v3 extent allocator
+//! (design-cow-kv-metadata §4.7/§4.10): torn A/B bitmap slots (newest
+//! tears ⇒ the predecessor slot + journal replay reconstruct), and the
+//! risk-R3 case — tear the newest root-ledger record after
+//! compaction-heavy reuse churn ⇒ the predecessor's extents are
+//! byte-intact (pending-free never released them before the retiring
+//! checkpoint was durable), nothing double-allocated, and the full
+//! allocator state is reconstructible from the predecessor + journal.
 
 use squeezefs::meta_backend::inode::{read_inode, write_inode, DiskInode};
 use squeezefs::meta_backend::storage::MetaLvStorage;
@@ -55,6 +64,11 @@ use squeezefs::meta_backend::kv::journal::{
     JOURNAL_PAGE_LEN,
 };
 use squeezefs::meta_backend::kv::journal_core::{AdmissionClass, Reservation};
+
+use squeezefs::meta_backend::kv::alloc_ext::{
+    alloc_record, bitmap_region_len, decode_bitmap_page, free_record, ExtentAllocator,
+    ALLOC_PAGE_LEN,
+};
 
 const VOL_SIZE: u64 = 256 * 1024 * 1024;
 const JOURNAL_START: u64 = 1024 * 1024 * 104;
@@ -1281,4 +1295,342 @@ async fn test_kv_ring_reuse_never_overwrites_fallback_window() {
         .expect("never loud");
     assert_eq!(kv_recovered_inos(&recovery), vec![4, 5, 6]);
     assert_eq!(recovery.dropped_torn, 0, "a clean wrap is not a tear");
+}
+
+// ---------------------------------------------------------------------------
+// PR K4: the v3 extent-allocator crash contract
+// (design-cow-kv-metadata §4.7, §4.10, risk R3).
+// ---------------------------------------------------------------------------
+
+/// Write one journal entry of allocator delta records (admit → reserve →
+/// write, seqs restamped with the reservation seq — the K3 identity).
+async fn kv_alloc_journal(ring: &JournalRing, records: Vec<(u8, Record)>) {
+    let need = entry_len_for(&records).expect("entry under cap");
+    let adm = ring
+        .core()
+        .try_admit(need, AdmissionClass::User)
+        .expect("test ring must have room");
+    let res = ring.core().reserve(adm);
+    let records: Vec<(u8, Record)> = records
+        .into_iter()
+        .map(|(t, mut r)| {
+            r.seq = res.seq();
+            (t, r)
+        })
+        .collect();
+    ring.write_entry(&res, &records)
+        .await
+        .expect("clean entry write");
+}
+
+/// K4 crash case (a) — the §4.10 "bitmap slots (torn A ⇒ B)" unit: a
+/// checkpoint's bitmap page write tears mid-slot. The tear can only
+/// damage the slot being replaced (the writer alternates away from the
+/// newest valid copy), so mount selects the intact predecessor slot and
+/// the journal's alloc records ≥ tail re-supply exactly the deltas the
+/// torn write carried — the §4.7 "bitmap is a checkpoint accelerator,
+/// not the sole truth" rule under fire. Never loud.
+#[tokio::test]
+async fn test_kv_bitmap_torn_slot_predecessor_plus_journal_reconstruct() {
+    let ring_pages = 4u64;
+    let bitmap_base = ring_pages * JOURNAL_PAGE_LEN;
+    let total = 12u64; // one bitmap page
+    let f = NamedTempFile::new().unwrap();
+    f.as_file()
+        .set_len(bitmap_base + bitmap_region_len(total))
+        .unwrap();
+    let _g = FaultGuard;
+
+    let ring = JournalRing::new(f.path(), 0, ring_pages, 0);
+    let alloc = ExtentAllocator::format(total, 0, 4);
+
+    // Checkpoint 1 (durable): e0, e1 allocated, journaled, persisted to
+    // slot A at generation 1.
+    let e0 = alloc.claim_internal().unwrap();
+    let e1 = alloc.claim_internal().unwrap();
+    kv_alloc_journal(&ring, vec![alloc_record(e0, 0), alloc_record(e1, 0)]).await;
+    let wrote = alloc
+        .write_dirty_pages(f.path(), bitmap_base, 1)
+        .await
+        .unwrap();
+    assert_eq!(wrote, vec![0]);
+    uring_fs::fdatasync(f.path().to_path_buf()).await.unwrap();
+
+    // e2's claim lands in the journal, then checkpoint 2's page write —
+    // into slot B, away from the newest valid copy — tears mid-image.
+    let e2 = alloc.claim_internal().unwrap();
+    kv_alloc_journal(&ring, vec![alloc_record(e2, 0)]).await;
+    uring_fs::arm_torn_write(bitmap_base + ALLOC_PAGE_LEN + 64, 10);
+    let err = alloc
+        .write_dirty_pages(f.path(), bitmap_base, 2)
+        .await
+        .expect_err("the torn page write fails loud to the checkpointer");
+    assert!(matches!(err, KvError::Io(_)), "got {err:?}");
+    uring_fs::clear_faults();
+
+    // "Remount": slot A (generation 1) still verifies, torn slot B reads
+    // as absent; replaying the window re-marks e0, e1 (idempotent) and
+    // re-supplies e2 — the delta the torn write lost.
+    let region = uring_fs::read_at(f.path(), bitmap_base, bitmap_region_len(total) as usize)
+        .await
+        .unwrap();
+    let (gen_a, _) = decode_bitmap_page(&region[..ALLOC_PAGE_LEN as usize], 0)
+        .expect("the predecessor slot must survive the tear");
+    assert_eq!(gen_a, 1);
+    assert!(
+        decode_bitmap_page(&region[ALLOC_PAGE_LEN as usize..], 0).is_err(),
+        "the torn slot must read as absent, never loud"
+    );
+
+    let (_ring2, recovery) = JournalRing::recover(f.path(), 0, ring_pages, 0, 0)
+        .await
+        .expect("never loud");
+    let loaded = ExtentAllocator::load(f.path(), bitmap_base, total, 0, 4, 1, &recovery.entries)
+        .await
+        .expect("bitmap contents never fail a mount loud");
+    for e in [e0, e1, e2] {
+        assert!(
+            loaded.is_allocated(e),
+            "extent {e} lost to the torn bitmap slot"
+        );
+    }
+    assert_eq!(loaded.free_extents(), total - 3);
+    assert_eq!(
+        loaded.resume_generation(),
+        1,
+        "generation numbering resumes above the intact predecessor"
+    );
+}
+
+/// K4 crash case (b) — **risk R3**, the §4.7 pending-free rule's dedicated
+/// crash test: compaction-heavy churn (extents freed and *reused* across
+/// checkpoints), then power loss tears the NEWEST root-ledger record.
+/// Mount falls back to the predecessor — and because a freed extent is
+/// never allocatable before the freeing checkpoint's durable seq, every
+/// extent the predecessor references is byte-intact: the crashed round's
+/// claims could not have reused them. Nothing is double-allocated,
+/// nothing is lost that the predecessor + journal cannot reconstruct.
+#[tokio::test]
+async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact() {
+    // One file, four regions: ring 8 pages [0, 32 KiB); ledger 32 slots;
+    // bitmap (one page pair); a 6-extent "heap" of 4 KiB test extents.
+    const RING_PAGES: u64 = 8;
+    const LEDGER_BASE: u64 = RING_PAGES * JOURNAL_PAGE_LEN;
+    const BITMAP_BASE: u64 = LEDGER_BASE + ROOT_LEDGER_SLOTS * ROOT_LEDGER_SLOT_LEN;
+    const TOTAL_EXTENTS: u64 = 6;
+    const EXT_LEN: u64 = 4096;
+    let heap_base: u64 = BITMAP_BASE + bitmap_region_len(TOTAL_EXTENTS);
+
+    let f = NamedTempFile::new().unwrap();
+    f.as_file()
+        .set_len(heap_base + TOTAL_EXTENTS * EXT_LEN)
+        .unwrap();
+    let _g = FaultGuard;
+
+    let pattern = |round: u8, extent: u64| vec![round * 16 + extent as u8; EXT_LEN as usize];
+    let ledger_rec = |seq: u64, live: &[u64], generation: u64| LedgerRecord {
+        seq,
+        tree_roots: live
+            .iter()
+            .map(|&e| TreeRoot {
+                tree_id: TREE_INODES,
+                node_addr: heap_base + e * EXT_LEN,
+                node_seq: seq,
+            })
+            .collect(),
+        journal_tail_seq: 0,
+        next_ino: 2,
+        alloc_bitmap_generation: generation,
+    };
+
+    let ring = JournalRing::new(f.path(), 0, RING_PAGES, 0);
+    let alloc = ExtentAllocator::format(TOTAL_EXTENTS, 0, 8);
+
+    // Rounds 1..=3: full compaction cycles. Round r claims fresh extents,
+    // writes its patterns, journals the deltas, pending-frees round
+    // r−1's extents under checkpoint r, checkpoints (pages + ledger +
+    // barrier), and only then — §4.7 — releases them for reuse.
+    let mut live: Vec<u64> = Vec::new();
+    let mut freed_last_round: Vec<u64> = Vec::new();
+    let mut reuse_seen = false;
+    for round in 1u64..=3 {
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            let e = alloc.claim_internal().expect("churn heap has room");
+            claims.push(e);
+            uring_fs::write_at(f.path(), heap_base + e * EXT_LEN, pattern(round as u8, e))
+                .await
+                .unwrap();
+            kv_alloc_journal(&ring, vec![alloc_record(e, 0)]).await;
+        }
+        reuse_seen |= claims.iter().any(|e| freed_last_round.contains(e));
+
+        for &old in &live {
+            alloc.free_pending(old, round).expect("pending cap holds");
+            kv_alloc_journal(&ring, vec![free_record(old, round, 0)]).await;
+        }
+        alloc
+            .write_dirty_pages(f.path(), BITMAP_BASE, round)
+            .await
+            .unwrap();
+        write_ledger_slot(f.path(), LEDGER_BASE, &ledger_rec(round, &claims, round))
+            .await
+            .unwrap();
+        uring_fs::fdatasync(f.path().to_path_buf()).await.unwrap();
+        // The barrier makes checkpoint `round` durable: NOW its retired
+        // extents may re-enter the pool (§4.7).
+        let released = alloc.advance_durable(round);
+        assert_eq!(released, live.len() as u64);
+        freed_last_round = live.clone();
+        live = claims;
+    }
+    assert!(
+        reuse_seen,
+        "the churn must actually reuse freed extents, or R3 is untested"
+    );
+
+    // Round 4 — the crashing checkpoint: claim EVERY free extent (the
+    // heap is sized so this is exactly 4), overwrite them, journal, and
+    // pending-free round 3's extents under checkpoint 4.
+    let mut r4_claims = Vec::new();
+    for _ in 0..4 {
+        let e = alloc.claim_internal().expect("4 free extents");
+        r4_claims.push(e);
+        uring_fs::write_at(f.path(), heap_base + e * EXT_LEN, pattern(4, e))
+            .await
+            .unwrap();
+        kv_alloc_journal(&ring, vec![alloc_record(e, 0)]).await;
+    }
+    for &old in &live {
+        alloc.free_pending(old, 4).expect("pending cap holds");
+        kv_alloc_journal(&ring, vec![free_record(old, 4, 0)]).await;
+    }
+    // The §4.7 gate under pressure: round 3's extents are pending, their
+    // retiring checkpoint is NOT yet durable — a claim must refuse rather
+    // than reuse them (a broken gate would hand them out here and destroy
+    // the predecessor's state).
+    assert!(
+        matches!(alloc.claim_internal(), Err(KvError::NoSpace { .. })),
+        "pending extents must never satisfy claims before their durable seq"
+    );
+
+    // Checkpoint 4's pages land, but power loss tears its ledger slot
+    // mid-record; the barrier never fires, advance_durable(4) never runs.
+    alloc
+        .write_dirty_pages(f.path(), BITMAP_BASE, 4)
+        .await
+        .unwrap();
+    uring_fs::arm_torn_write(LEDGER_BASE + 4 * ROOT_LEDGER_SLOT_LEN + 100, 20);
+    let err = write_ledger_slot(f.path(), LEDGER_BASE, &ledger_rec(4, &r4_claims, 4))
+        .await
+        .expect_err("the torn ledger write fails loud to the checkpointer");
+    assert!(matches!(err, KvError::Io(_)), "got {err:?}");
+    uring_fs::clear_faults();
+
+    // ---- "Remount" ----
+    // Newest valid ledger record: the predecessor, checkpoint 3.
+    let mounted = read_newest_ledger(f.path(), LEDGER_BASE)
+        .await
+        .expect("ledger contents never fail the read loud")
+        .expect("predecessors exist");
+    assert_eq!(mounted.seq, 3, "torn newest slot ⇒ predecessor selected");
+
+    // THE R3 ASSERTION: every extent the predecessor references is
+    // byte-intact — round 4's claims could not have reused them because
+    // their pending-free tags (4) were never durable.
+    for root in &mounted.tree_roots {
+        let extent = (root.node_addr - heap_base) / EXT_LEN;
+        let bytes = uring_fs::read_at(f.path(), root.node_addr, EXT_LEN as usize)
+            .await
+            .unwrap();
+        assert_eq!(
+            &bytes[..],
+            &pattern(3, extent)[..],
+            "extent {extent} referenced by the mounted predecessor was \
+             overwritten — the §4.7 pending-free gate is broken (R3)"
+        );
+    }
+
+    // Reconstruction: predecessor pages (generation ≤ 4 on disk — the
+    // torn checkpoint's page writes may all have landed; newest-valid is
+    // still safe, §4.7) + journal replay rebuild the full allocator
+    // state: predecessor extents allocated (nothing lost), round-4
+    // claims allocated (their records replay), round-3 frees pending
+    // again (tags 4 > mounted 3), and NOTHING double-allocatable.
+    let (_ring2, recovery) =
+        JournalRing::recover(f.path(), 0, RING_PAGES, 0, mounted.journal_tail_seq)
+            .await
+            .expect("never loud");
+    assert_eq!(recovery.dropped_torn, 0);
+    let loaded = ExtentAllocator::load(
+        f.path(),
+        BITMAP_BASE,
+        TOTAL_EXTENTS,
+        0,
+        8,
+        mounted.seq,
+        &recovery.entries,
+    )
+    .await
+    .expect("never loud");
+
+    for root in &mounted.tree_roots {
+        let extent = (root.node_addr - heap_base) / EXT_LEN;
+        assert!(
+            loaded.is_allocated(extent),
+            "predecessor extent {extent} lost by reconstruction"
+        );
+    }
+    for &e in &r4_claims {
+        assert!(loaded.is_allocated(e), "replayed round-4 claim {e} lost");
+    }
+    assert_eq!(
+        loaded.pending_count(),
+        live.len() as u64,
+        "round-3 frees rebuild as pending (§4.7: pending-free is journaled)"
+    );
+    assert_eq!(loaded.free_extents(), 0, "occupancy reconstructs exactly");
+    assert!(
+        matches!(loaded.claim_internal(), Err(KvError::NoSpace { .. })),
+        "nothing is double-allocatable after the fallback"
+    );
+
+    // The reconstruct closes: the first post-mount checkpoint (seq 4
+    // again, bitmap generation above everything on disk — including the
+    // crashed round's landed pages) becomes durable, and only then do the
+    // predecessor's retired extents re-enter the pool.
+    let generation = loaded
+        .resume_generation()
+        .max(mounted.alloc_bitmap_generation)
+        + 1;
+    assert_eq!(
+        generation, 5,
+        "the crashed checkpoint's landed pages (generation 4) must push \
+         the resume generation past them"
+    );
+    loaded
+        .write_dirty_pages(f.path(), BITMAP_BASE, generation)
+        .await
+        .unwrap();
+    write_ledger_slot(
+        f.path(),
+        LEDGER_BASE,
+        &ledger_rec(4, &r4_claims, generation),
+    )
+    .await
+    .unwrap();
+    uring_fs::fdatasync(f.path().to_path_buf()).await.unwrap();
+    assert_eq!(loaded.advance_durable(4), 2);
+    let mut reopened = Vec::new();
+    while let Ok(e) = loaded.claim_internal() {
+        reopened.push(e);
+    }
+    reopened.sort_unstable();
+    let mut expected = live.clone();
+    expected.sort_unstable();
+    assert_eq!(
+        reopened, expected,
+        "exactly the predecessor's retired extents re-enter the pool once \
+         their retiring checkpoint is durable"
+    );
 }

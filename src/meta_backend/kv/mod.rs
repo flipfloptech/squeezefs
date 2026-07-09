@@ -18,12 +18,19 @@
 //! over `crate::uring_fs` ([`journal`], §4.1/§4.4), and the A/B root-ledger
 //! records ([`checkpoint`], §4.1 — records only; scheduling is PR K6b).
 //!
+//! PR K4 adds the extent allocator (§4.7): the pure lock-free bitmap /
+//! pending-free / reserve core ([`alloc_ext_core`], loom-modeled) and the
+//! A/B bitmap pages + journaled alloc/free deltas + typed ENOSPC surface
+//! ([`alloc_ext`]).
+//!
 //! The record/bset layer is pure and in-memory; nothing here is mount-wired
 //! yet. Per the design's liveness convention, K1–K5 code is
 //! production-unreachable until PR K6a wires the mount path; it is kept
 //! alive by its own unit/integration tests, the crash harness, the loom
 //! models, and the `meta_lv_bench` criterion micro-benches.
 
+pub mod alloc_ext;
+pub mod alloc_ext_core;
 pub mod bset;
 pub mod checkpoint;
 pub mod journal;
@@ -126,6 +133,29 @@ pub enum KvError {
     /// dereferencing it. A clean commit rejection, never a panic.
     #[error("journal entry length {len} exceeds the {cap}-byte whole-entry cap")]
     EntryTooLarge { len: u64, cap: u64 },
+
+    /// §4.7 ENOSPC: a **user-op** extent allocation refused because
+    /// granting it would dip the free budget to-or-below the compaction
+    /// reserve — which stays intact so compaction/checkpoint internals can
+    /// always fold appends and free space (no write-to-free-space
+    /// deadlock). K6a/K6b map this onto the crate error path exactly like
+    /// today's "Inode table full" → `ENOSPC` analog (`alloc.rs`). From
+    /// `claim_internal` it means the heap is genuinely exhausted.
+    #[error(
+        "no space: {free} free extents with the {reserve}-extent compaction reserve \
+         intact — allocation refused (ENOSPC)"
+    )]
+    NoSpace { free: u64, reserve: u64 },
+
+    /// The pending-free list hit its cap (design §4.7 "capped"): the
+    /// caller must force a checkpoint (whose durable barrier drains the
+    /// list via `advance_durable`) — never reuse an extent whose retiring
+    /// checkpoint is not yet durable. A clean rejection, never a panic.
+    #[error(
+        "pending-free list full ({pending} extents awaiting durable checkpoints); \
+         checkpoint required before further frees"
+    )]
+    PendingFreeFull { pending: u64 },
 
     /// KV extent I/O failed (the `crate::uring_fs` paths — io_uring-only
     /// per AGENTS.md; a poisoned/torn device surfaces here as `EIO`).

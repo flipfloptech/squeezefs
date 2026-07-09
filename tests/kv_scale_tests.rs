@@ -1365,6 +1365,66 @@ async fn nightly_mount_time_100m_ino() {
     be.shutdown().await.unwrap();
 }
 
+/// §8 micro-gate regression (found by the K7 criterion run): a
+/// create/unlink storm leaves the dentry leaf a tombstone desert until
+/// compaction folds it, and the chain-window scans behind EVERY
+/// lookup/create/unlink (`find_dentry` / `dentry_insert_key` — a ≤ 256-key
+/// window) must not fold-walk past their window's end into that desert.
+/// Before the fix a post-storm lookup cost ~1000× a pre-storm one
+/// (323 ns → 339 µs release — the §8 `lookup_file ≤ v2 + 10 %` gate is
+/// unmeetable); bounded scans keep the ratio at ~1×. The 10× assertion
+/// margin absorbs machine noise while staying two orders below the bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lookup_p50_immune_to_tombstone_desert() {
+    const PAIRS: usize = 4_096;
+    let (be, _f) = v3_volume_with_seed(TEST_SEED, 256 * 1024 * 1024).await;
+
+    be.create(ROOT_INO, "live_target", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let p50 = |mut s: Vec<Duration>| {
+        s.sort_unstable();
+        s[s.len() / 2]
+    };
+    let sample = |n: usize| {
+        let be = be.clone();
+        async move {
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                let t = Instant::now();
+                be.lookup(ROOT_INO, "live_target").await.unwrap();
+                out.push(t.elapsed());
+            }
+            out
+        }
+    };
+    // Warm-up + baseline.
+    let _ = sample(200).await;
+    let before = p50(sample(1000).await);
+
+    // The desert: create/unlink pairs sharing the root dentry leaf.
+    for i in 0..PAIRS {
+        let name = format!("desert{i:05}");
+        be.create(ROOT_INO, &name, libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        be.unlink(ROOT_INO, &name).await.unwrap();
+    }
+
+    let after = p50(sample(1000).await);
+    eprintln!(
+        "[desert] lookup p50 before {before:.2?} → after {PAIRS}-pair storm {after:.2?} \
+         ({}x)",
+        after.as_nanos() / before.as_nanos().max(1)
+    );
+    assert!(
+        after <= before.saturating_mul(10) + Duration::from_micros(20),
+        "chain-window scans must stay bounded through a tombstone desert: \
+         p50 {before:.2?} → {after:.2?} after {PAIRS} create/unlink pairs"
+    );
+    be.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // §8 paired-run tooling: rebuild a CLI-formatted meta volume as v2.
 // ---------------------------------------------------------------------------

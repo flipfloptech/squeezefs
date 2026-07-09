@@ -340,6 +340,13 @@ impl KvTree {
     /// ([`NodeCache::load`]); both restart the walk from the (possibly
     /// swapped) root, bounded by [`RETRY_BUDGET`].
     async fn descend(&self, key: &[u8], target_level: u8) -> Result<Arc<CachedNode>, KvError> {
+        // Restart-reason tallies, carried into the exhaustion error: the
+        // K7 1M-storm intermittent was diagnosed from exactly this shape
+        // (`reasons=[0,0,0,256,0,0]` — every restart on a retired child
+        // ⇒ the retire-before-route-flip ordering bug in `smo_replace`).
+        // A budget exhaustion is always a protocol bug; the tallies make
+        // the next one self-describing instead of a heisenbug hunt.
+        let mut dbg_reasons: [u32; 5] = [0; 5];
         'restart: for attempt in 0..RETRY_BUDGET {
             if attempt > 0 {
                 // Cooperative restart: every reason to be here is a racing
@@ -359,9 +366,11 @@ impl KvTree {
                 Some(n) => Some(n),
                 None => self.cache.load(root.addr).await?,
             }) else {
+                dbg_reasons[0] += 1;
                 continue 'restart; // root extent retired: racing root swap
             };
             if cur.node_seq() != root.seq {
+                dbg_reasons[1] += 1;
                 continue 'restart; // racing root swap
             }
             loop {
@@ -375,6 +384,7 @@ impl KvTree {
                 }
                 let snap = cur.snapshot();
                 let Some((_, ptr)) = snap.next_live(key, None)? else {
+                    dbg_reasons[2] += 1;
                     // Routing hole: a stale snapshot raced an SMO — restart.
                     continue 'restart;
                 };
@@ -384,9 +394,11 @@ impl KvTree {
                     None => self.cache.load(child_addr).await?,
                 };
                 let Some(child) = child else {
+                    dbg_reasons[3] += 1;
                     continue 'restart; // retired extent: stale route
                 };
                 if child.node_seq() != child_seq {
+                    dbg_reasons[4] += 1;
                     continue 'restart; // §4.2 stale pointer
                 }
                 cur = child;
@@ -394,7 +406,9 @@ impl KvTree {
         }
         Err(KvError::Corrupt(format!(
             "traversal retry budget exhausted descending to level {target_level} \
-             (routing loop — SMO protocol bug)"
+             (routing loop — SMO protocol bug) restarts \
+             [root-retired, root-seq, routing-hole, child-retired, child-seq] \
+             = {dbg_reasons:?}"
         )))
     }
 
@@ -1085,9 +1099,26 @@ impl KvTree {
                 }
             }
 
-            // Swap the cache mapping: old object retired (readers keep
-            // its snapshot), successors published.
-            self.cache.retire(node);
+            // Swap the cache mapping: successors published FIRST, then
+            // the route flip, and the old object retired LAST — all
+            // inside the lock window, but the ORDER is what latch-free
+            // readers observe. Retiring before the route flip opened a
+            // reader-visible window in which the parent's current
+            // snapshot still routed to an already-retired extent; with
+            // the SMO task descheduled mid-window under storm load that
+            // state persisted for milliseconds and readers burned the
+            // whole (yielded) restart budget on one reason — the
+            // intermittent 1M-storm budget exhaustion K7 caught,
+            // `restarts = [0,0,0,256,0]` (all child-retired). With the
+            // flip first, stragglers on the old route still resolve the
+            // still-mapped pre-SMO object — readers get its intact
+            // snapshot (§4.6: "snapshot left intact for in-flight
+            // readers"), writers fail revalidation (superseded was set
+            // above) and retry — and the retired state begins only once
+            // the new route is reader-visible. Eviction cannot re-open
+            // the window: `try_evict` is a clean-only CAS, so the
+            // superseded-but-not-yet-retired object can never be dropped
+            // from the map in between.
             for succ in &successors {
                 self.cache.publish(succ.clone());
             }
@@ -1133,6 +1164,12 @@ impl KvTree {
                 }
                 (Some(_), None) => unreachable!("parent guard taken with parent"),
             }
+            // The old extent's retired state begins only now — after the
+            // route flip (see the ordering comment above): a traversal
+            // that already resolved the old address finds the still-
+            // mapped pre-SMO object, never a load refusal reached
+            // through a still-current route.
+            self.cache.retire(node);
             drop(child_guard);
             // parent_guard drops here.
             smo_entry

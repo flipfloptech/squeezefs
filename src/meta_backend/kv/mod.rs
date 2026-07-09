@@ -13,13 +13,21 @@
 //! compact/split as pure functions over caller-provided extents, with all
 //! extent I/O through `crate::uring_fs` (io_uring-only).
 //!
+//! PR K3 adds the journal ring: the pure lock-free reservation/admission
+//! core ([`journal_core`], loom-modeled), page/entry framing + replay scan
+//! over `crate::uring_fs` ([`journal`], §4.1/§4.4), and the A/B root-ledger
+//! records ([`checkpoint`], §4.1 — records only; scheduling is PR K6b).
+//!
 //! The record/bset layer is pure and in-memory; nothing here is mount-wired
 //! yet. Per the design's liveness convention, K1–K5 code is
 //! production-unreachable until PR K6a wires the mount path; it is kept
-//! alive by its own unit/integration tests, the crash harness, and the
-//! `meta_lv_bench` criterion micro-benches.
+//! alive by its own unit/integration tests, the crash harness, the loom
+//! models, and the `meta_lv_bench` criterion micro-benches.
 
 pub mod bset;
+pub mod checkpoint;
+pub mod journal;
+pub mod journal_core;
 pub mod node;
 pub mod record;
 

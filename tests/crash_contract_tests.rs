@@ -25,6 +25,13 @@
 //! The trailing `PR K2` section extends the harness to the v3 CoW KV node
 //! format (design-cow-kv-metadata §4.5/§4.10): torn tail bsets, the loud
 //! positional valid-bset-after-tear classifier, and torn rewrites.
+//!
+//! The trailing `PR K3` section extends it to the v3 journal ring and root
+//! ledger (design-cow-kv-metadata §4.1/§4.6 pt 3/§4.10): torn entries, torn
+//! page headers, garbage lengths, holes, torn multi-page middles, torn
+//! ledger slots, and the ring-reuse-never-overwrites-the-fallback-window
+//! invariant — everything inside the replay window recovers and resyncs,
+//! never failing a mount loud.
 
 use squeezefs::meta_backend::inode::{read_inode, write_inode, DiskInode};
 use squeezefs::meta_backend::storage::MetaLvStorage;
@@ -38,6 +45,16 @@ use squeezefs::meta_backend::kv::node::{
 };
 use squeezefs::meta_backend::kv::record::{inode_key, Folded, InodeValue, Record, TREE_INODES};
 use squeezefs::meta_backend::kv::{KvError, META_KV_NODE_DROPPED_TAIL_BSETS};
+
+use squeezefs::meta_backend::kv::checkpoint::{
+    read_newest_ledger, write_ledger_slot, LedgerRecord, TreeRoot, ROOT_LEDGER_SLOTS,
+    ROOT_LEDGER_SLOT_LEN,
+};
+use squeezefs::meta_backend::kv::journal::{
+    entry_len_for, JournalRing, ENTRY_HDR_LEN, JOURNAL_PAGE_DATA_LEN, JOURNAL_PAGE_HDR_LEN,
+    JOURNAL_PAGE_LEN,
+};
+use squeezefs::meta_backend::kv::journal_core::{AdmissionClass, Reservation};
 
 const VOL_SIZE: u64 = 256 * 1024 * 1024;
 const JOURNAL_START: u64 = 1024 * 1024 * 104;
@@ -772,4 +789,492 @@ async fn test_kv_node_torn_rewrite_unreferenced_old_node_untouched() {
     load_node(vol.path(), &l, 0, 0)
         .await
         .expect("old node still serves after the torn split");
+}
+
+// ---------------------------------------------------------------------------
+// PR K3: the v3 journal ring + root ledger crash contract
+// (design-cow-kv-metadata §4.1, §4.6 pt 3, §4.10).
+//
+// The ring's replay window [tail, tail + capacity) is by definition the
+// maybe-torn region: a tear there is a legitimate power-loss artifact, so
+// NOTHING in the ring ever fails a mount loud — every case below must
+// recover-and-resync (`recover` returns Ok), with whole-entry atomicity
+// (a damaged multi-page entry drops entirely; no partial records) and
+// drop-and-resync accounting (`dropped_torn` counts confirmed mid-log
+// damage, and stays zero for trailing/end-of-log artifacts so a clean
+// unmount reports zero — the §10 corruption alert).
+//
+// Tear injection: the in-flight shim (`arm_torn_write`, the honest
+// died-mid-commit model) for last-write tears, and post-hoc byte damage
+// via `uring_fs::write_at` for mid-log tears — the §4.10 "torn + reordered
+// pages" power-loss reality, where a LATER entry's pages persisted while
+// an EARLIER write's did not (unordered page-cache writeback).
+// ---------------------------------------------------------------------------
+
+/// Zero-filled ring file: `pages` × 4 KiB at offset 0.
+fn kv_ring_file(pages: u64) -> NamedTempFile {
+    let tmp = NamedTempFile::new().unwrap();
+    tmp.as_file().set_len(pages * JOURNAL_PAGE_LEN).unwrap();
+    tmp
+}
+
+/// Entry overhead of a one-record (inode Put) journal entry.
+const KV_ENTRY_OVERHEAD: u64 = ENTRY_HDR_LEN + 1 + 15 + 8;
+
+/// Staged records for an entry of exactly `entry_len` bytes.
+fn kv_sized_records(ino: u64, entry_len: u64, marker: u8, seq: u64) -> Vec<(u8, Record)> {
+    let value = vec![marker; (entry_len - KV_ENTRY_OVERHEAD) as usize];
+    vec![(
+        TREE_INODES,
+        Record::put(inode_key(ino).to_vec(), seq, value),
+    )]
+}
+
+/// Admit → reserve → write an entry of exactly `entry_len` bytes.
+async fn kv_append(ring: &JournalRing, ino: u64, entry_len: u64, marker: u8) -> Reservation {
+    let probe = kv_sized_records(ino, entry_len, marker, 0);
+    let need = entry_len_for(&probe).expect("entry under cap");
+    assert_eq!(need, entry_len);
+    let adm = ring
+        .core()
+        .try_admit(need, AdmissionClass::User)
+        .expect("test ring must have room");
+    let res = ring.core().reserve(adm);
+    ring.write_entry(&res, &kv_sized_records(ino, entry_len, marker, res.seq()))
+        .await
+        .expect("clean entry write");
+    res
+}
+
+/// Physical file offset of logical ring position `pos` (ring base 0).
+fn kv_phys(ring: &JournalRing, pos: u64) -> u64 {
+    let geo = ring.core().geometry();
+    geo.page_index(pos) * JOURNAL_PAGE_LEN + JOURNAL_PAGE_HDR_LEN + geo.in_page_off(pos)
+}
+
+/// Post-hoc damage: overwrite `len` bytes at physical offset `off` with
+/// `0x5A` garbage via io_uring (the unordered-writeback tear model).
+async fn kv_smash(path: &std::path::Path, off: u64, len: usize) {
+    uring_fs::write_at(path, off, vec![0x5Au8; len])
+        .await
+        .expect("fault injection write");
+}
+
+/// The recovered inos, in replay order (each test entry carries one Put).
+fn kv_recovered_inos(rec: &squeezefs::meta_backend::kv::journal::JournalRecovery) -> Vec<u64> {
+    rec.entries
+        .iter()
+        .flat_map(|e| e.records.iter())
+        .map(|(_, r)| {
+            squeezefs::meta_backend::kv::record::decode_inode_key(&r.key).expect("inode key")
+        })
+        .collect()
+}
+
+/// K3 crash case (a): an in-flight tear on the LAST entry — the classic
+/// died-mid-commit. The writer sees EIO (D-level: the tx never returned);
+/// after "remount", every prior entry replays, the torn trailing entry is
+/// gone, and — because the tear is trailing, indistinguishable from the
+/// ordinary end-of-log — `dropped_torn` stays 0 (§4.1 accounting: the
+/// counter is the clean-unmount corruption alert, not a tear census).
+#[tokio::test]
+async fn test_kv_journal_torn_last_entry_recovers_prefix_not_loud() {
+    let f = kv_ring_file(4);
+    let ring = JournalRing::new(f.path(), 0, 4, 0);
+    let _g = FaultGuard;
+
+    let _a = kv_append(&ring, 1, 1000, 0xA1).await;
+    let b = kv_append(&ring, 2, 1000, 0xA2).await;
+
+    // The third entry tears 10 bytes in: its seq bytes land, nothing else.
+    let probe = kv_sized_records(3, 1000, 0xA3, 0);
+    let need = entry_len_for(&probe).unwrap();
+    let adm = ring.core().try_admit(need, AdmissionClass::User).unwrap();
+    let res = ring.core().reserve(adm);
+    uring_fs::arm_torn_write(kv_phys(&ring, res.start), 10);
+    let err = ring
+        .write_entry(&res, &kv_sized_records(3, 1000, 0xA3, res.seq()))
+        .await
+        .expect_err("torn entry write must fail loud to the writer");
+    assert!(matches!(err, KvError::Io(_)), "got {err:?}");
+    uring_fs::clear_faults();
+
+    let (_, recovery) = JournalRing::recover(f.path(), 0, 4, 0, 0)
+        .await
+        .expect("ring contents never fail a mount loud");
+    assert_eq!(kv_recovered_inos(&recovery), vec![1, 2]);
+    assert_eq!(
+        recovery.head_pos,
+        b.end(),
+        "the recovered head resumes before the torn trailing entry"
+    );
+    assert_eq!(
+        recovery.dropped_torn, 0,
+        "a trailing tear is end-of-log, not a counted drop"
+    );
+}
+
+/// K3 crash case (b): a torn entry mid-log (its pages lost while later
+/// entries' pages persisted — unordered writeback). The damaged entry
+/// drops, replay resynchronizes at the next verifiable page header, later
+/// entries are recovered, and the drop is counted (confirmed by the
+/// recovery downstream).
+#[tokio::test]
+async fn test_kv_journal_torn_entry_mid_log_drops_and_resyncs() {
+    let f = kv_ring_file(4);
+    let ring = JournalRing::new(f.path(), 0, 4, 0);
+
+    // A [0, 2000), B [2000, 4072) — page 0; C [4072, 6072) — page 1;
+    // D [6072, 8072) — page 1.
+    let _a = kv_append(&ring, 1, 2000, 0xB1).await;
+    let b = kv_append(&ring, 2, JOURNAL_PAGE_DATA_LEN - 2000, 0xB2).await;
+    let _c = kv_append(&ring, 3, 2000, 0xB3).await;
+    let _d = kv_append(&ring, 4, 2000, 0xB4).await;
+
+    // B's payload bytes are damaged in place.
+    kv_smash(f.path(), kv_phys(&ring, b.start + 100), 16).await;
+
+    let (_, recovery) = JournalRing::recover(f.path(), 0, 4, 0, 0)
+        .await
+        .expect("never loud");
+    assert_eq!(
+        kv_recovered_inos(&recovery),
+        vec![1, 3, 4],
+        "B drops; the chain resyncs at page 1 and recovers C and D"
+    );
+    assert_eq!(
+        recovery.dropped_torn, 1,
+        "one confirmed drop-and-resync event (B)"
+    );
+}
+
+/// K3 crash case (c): a torn page HEADER is never loud (§4.1). With the
+/// entry chain intact, an entry *continuing* through the dead-header page
+/// is still read at chain-known offsets and everything replays (variant
+/// a). With the chain also broken, entries *starting* in the dead page are
+/// lost, the scanner resyncs at the next verified header, and later
+/// entries are recovered (variant b).
+#[tokio::test]
+async fn test_kv_journal_torn_page_header_recovers_never_loud() {
+    // Variant (a): chain-continuation THROUGH a dead-header page.
+    // A [0, 9000) spans pages 0..2; B [9000, 11000) in page 2; C [11000,
+    // 13000) crosses into page 3.
+    {
+        let f = kv_ring_file(8);
+        let ring = JournalRing::new(f.path(), 0, 8, 0);
+        let _a = kv_append(&ring, 1, 9000, 0xC1).await;
+        let _b = kv_append(&ring, 2, 2000, 0xC2).await;
+        let _c = kv_append(&ring, 3, 2000, 0xC3).await;
+
+        // Kill page 1's header: A's continuation bytes there are untouched.
+        kv_smash(f.path(), JOURNAL_PAGE_LEN, JOURNAL_PAGE_HDR_LEN as usize).await;
+
+        let (_, recovery) = JournalRing::recover(f.path(), 0, 8, 0, 0)
+            .await
+            .expect("a torn page header must never fail the mount loud");
+        assert_eq!(
+            kv_recovered_inos(&recovery),
+            vec![1, 2, 3],
+            "the chain reads straight through the dead header (§4.1)"
+        );
+        assert_eq!(recovery.dropped_torn, 0, "nothing was lost");
+    }
+
+    // Variant (b): the same layout with A's page-0 bytes ALSO damaged: the
+    // chain breaks at A, page 1 cannot host discovery (dead header), and
+    // replay resyncs at page 2 — B and C recovered, A lost, both damage
+    // sites counted (confirmed by B's recovery).
+    {
+        let f = kv_ring_file(8);
+        let ring = JournalRing::new(f.path(), 0, 8, 0);
+        let _a = kv_append(&ring, 1, 9000, 0xC4).await;
+        let _b = kv_append(&ring, 2, 2000, 0xC5).await;
+        let _c = kv_append(&ring, 3, 2000, 0xC6).await;
+
+        kv_smash(f.path(), JOURNAL_PAGE_LEN, JOURNAL_PAGE_HDR_LEN as usize).await;
+        kv_smash(f.path(), kv_phys(&ring, 200), 16).await; // A's payload
+
+        let (_, recovery) = JournalRing::recover(f.path(), 0, 8, 0, 0)
+            .await
+            .expect("never loud");
+        assert_eq!(
+            kv_recovered_inos(&recovery),
+            vec![2, 3],
+            "entries starting in/behind the dead region die; resync recovers B, C"
+        );
+        assert_eq!(
+            recovery.dropped_torn, 2,
+            "two confirmed damage events: A's torn entry + page 1's dead header"
+        );
+    }
+}
+
+/// K3 crash case (d): a garbage `len` probe — both over the 128 KiB cap
+/// and under-cap-but-overrunning-the-window — is dropped and resynced
+/// WITHOUT the length ever being dereferenced (§4.1/§9: the bound is
+/// enforced before any byte it governs is read). Later entries recover.
+#[tokio::test]
+async fn test_kv_journal_garbage_len_never_dereferenced() {
+    // len > cap.
+    {
+        let f = kv_ring_file(4);
+        let ring = JournalRing::new(f.path(), 0, 4, 0);
+        // A [0, 1000), B [1000, 4072) — page 0; C [4072, ...) — page 1.
+        let _a = kv_append(&ring, 1, 1000, 0xD1).await;
+        let b = kv_append(&ring, 2, JOURNAL_PAGE_DATA_LEN - 1000, 0xD2).await;
+        let _c = kv_append(&ring, 3, 1000, 0xD3).await;
+
+        // B's len field (logical bytes 8..12 of the entry) → 0xFFFFFFFF.
+        uring_fs::write_at(
+            f.path(),
+            kv_phys(&ring, b.start + 8),
+            vec![0xFF, 0xFF, 0xFF, 0xFF],
+        )
+        .await
+        .unwrap();
+
+        let (_, recovery) = JournalRing::recover(f.path(), 0, 4, 0, 0)
+            .await
+            .expect("a garbage len must never be dereferenced, let alone be loud");
+        assert_eq!(kv_recovered_inos(&recovery), vec![1, 3]);
+        assert_eq!(recovery.dropped_torn, 1);
+    }
+
+    // len ≤ cap but overrunning the replay window.
+    {
+        let f = kv_ring_file(4);
+        let ring = JournalRing::new(f.path(), 0, 4, 0);
+        let _a = kv_append(&ring, 1, 1000, 0xD4).await;
+        let b = kv_append(&ring, 2, JOURNAL_PAGE_DATA_LEN - 1000, 0xD5).await;
+        let _c = kv_append(&ring, 3, 1000, 0xD6).await;
+
+        // 100,000 < the cap, but far past the 4-page window.
+        uring_fs::write_at(
+            f.path(),
+            kv_phys(&ring, b.start + 8),
+            100_000u32.to_le_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let (_, recovery) = JournalRing::recover(f.path(), 0, 4, 0, 0)
+            .await
+            .expect("never loud");
+        assert_eq!(kv_recovered_inos(&recovery), vec![1, 3]);
+        assert_eq!(recovery.dropped_torn, 1);
+    }
+}
+
+/// K3 crash case (e): a hole — one entry's whole page (header and all)
+/// never landed while its neighbors' pages did (§4.10 caveat (a) made
+/// concrete). Replay applies the entries around the hole and counts one
+/// confirmed drop.
+#[tokio::test]
+async fn test_kv_journal_hole_then_resync_recovers_later_entries() {
+    let f = kv_ring_file(4);
+    let ring = JournalRing::new(f.path(), 0, 4, 0);
+
+    // A fills page 0 exactly; B fills page 1 exactly; C [8144, 10144) in
+    // page 2.
+    let _a = kv_append(&ring, 1, JOURNAL_PAGE_DATA_LEN, 0xE1).await;
+    let _b = kv_append(&ring, 2, JOURNAL_PAGE_DATA_LEN, 0xE2).await;
+    let _c = kv_append(&ring, 3, 2000, 0xE3).await;
+
+    // B's page (page 1) never made it to the device: zero the whole page.
+    uring_fs::write_at(
+        f.path(),
+        JOURNAL_PAGE_LEN,
+        vec![0u8; JOURNAL_PAGE_LEN as usize],
+    )
+    .await
+    .unwrap();
+
+    let (_, recovery) = JournalRing::recover(f.path(), 0, 4, 0, 0)
+        .await
+        .expect("a hole must never fail the mount loud");
+    assert_eq!(
+        kv_recovered_inos(&recovery),
+        vec![1, 3],
+        "entry N torn, N+1 intact in later pages ⇒ replay applies N+1 without N (§4.10)"
+    );
+    assert_eq!(recovery.dropped_torn, 1);
+}
+
+/// K3 crash case (f): a torn MIDDLE page of a multi-page entry ⇒ the whole
+/// entry drops (one entry = one atomicity unit — no partial records can
+/// ever be replayed), and entries in later intact pages are recovered
+/// through the continuation pages' `first_entry_off` chain (§4.1).
+#[tokio::test]
+async fn test_kv_journal_torn_middle_page_of_multipage_entry() {
+    let f = kv_ring_file(8);
+    let ring = JournalRing::new(f.path(), 0, 8, 0);
+
+    // E [0, 9000) spans pages 0,1,2; F [9000, 11000) in page 2;
+    // G [11000, 13000) crosses pages 2→3.
+    let e = kv_append(&ring, 1, 9000, 0xF1).await;
+    let _f2 = kv_append(&ring, 2, 2000, 0xF2).await;
+    let _g = kv_append(&ring, 3, 2000, 0xF3).await;
+
+    // Damage E's continuation bytes in its MIDDLE page (page 1).
+    kv_smash(f.path(), kv_phys(&ring, e.start + 5000), 16).await;
+
+    let (_, recovery) = JournalRing::recover(f.path(), 0, 8, 0, 0)
+        .await
+        .expect("never loud");
+    assert_eq!(
+        kv_recovered_inos(&recovery),
+        vec![2, 3],
+        "E drops whole (no partial records); F and G are recovered"
+    );
+    assert!(
+        recovery.entries.iter().all(|en| en.seq != e.seq()),
+        "no fragment of the torn multi-page entry may replay"
+    );
+    assert_eq!(recovery.dropped_torn, 1, "one confirmed drop (E)");
+}
+
+fn kv_ledger_rec(seq: u64) -> LedgerRecord {
+    LedgerRecord {
+        seq,
+        tree_roots: vec![TreeRoot {
+            tree_id: TREE_INODES,
+            node_addr: 0x40000 * seq,
+            node_seq: seq,
+        }],
+        journal_tail_seq: 100 * seq,
+        next_ino: 2 + seq,
+        alloc_bitmap_generation: seq,
+    }
+}
+
+/// K3 crash case (g): a torn newest ledger slot ⇒ mount selects the
+/// predecessor (§4.1 newest-valid-wins); a second corrupted slot falls
+/// back one more. Ledger contents never fail the read loud.
+#[tokio::test]
+async fn test_kv_ledger_torn_slot_falls_back_to_predecessor() {
+    let f = NamedTempFile::new().unwrap();
+    f.as_file()
+        .set_len(ROOT_LEDGER_SLOTS * ROOT_LEDGER_SLOT_LEN)
+        .unwrap();
+    let _g = FaultGuard;
+
+    for seq in 1..=4 {
+        write_ledger_slot(f.path(), 0, &kv_ledger_rec(seq))
+            .await
+            .unwrap();
+    }
+
+    // Checkpoint 5 races power loss: its slot write tears mid-record (the
+    // 24 B header lands, the payload does not).
+    uring_fs::arm_torn_write(5 * ROOT_LEDGER_SLOT_LEN + 100, 64);
+    let err = write_ledger_slot(f.path(), 0, &kv_ledger_rec(5))
+        .await
+        .expect_err("the torn slot write fails loud to the checkpointer");
+    assert!(matches!(err, KvError::Io(_)), "got {err:?}");
+    uring_fs::clear_faults();
+
+    let newest = read_newest_ledger(f.path(), 0)
+        .await
+        .expect("ledger contents never fail the read loud")
+        .expect("valid predecessors exist");
+    assert_eq!(
+        newest,
+        kv_ledger_rec(4),
+        "the torn newest slot loses to seq 4"
+    );
+
+    // Slot 4's record decays too (a second, older tear): fall back again.
+    kv_smash(f.path(), 4 * ROOT_LEDGER_SLOT_LEN + 30, 8).await;
+    let newest = read_newest_ledger(f.path(), 0).await.unwrap().unwrap();
+    assert_eq!(
+        newest,
+        kv_ledger_rec(3),
+        "double fallback: newest VALID wins"
+    );
+}
+
+/// K3 crash case (h) — the §4.6 pt 3 invariant with no other test: ring
+/// reuse never overwrites the root-fallback window. The head bounds
+/// against `reusable_upto` (advanced only after the retiring ledger record
+/// is durable), NOT the in-RAM tail — so when the newest ledger slot tears,
+/// the predecessor's whole replay window is still byte-intact; and once the
+/// watermark does advance, the ring wraps and the retired entries can never
+/// be resurrected.
+#[tokio::test]
+async fn test_kv_ring_reuse_never_overwrites_fallback_window() {
+    let ring_f = kv_ring_file(8); // capacity 8 × 4072 = 32,576 logical bytes
+    let ledger_f = NamedTempFile::new().unwrap();
+    ledger_f
+        .as_file()
+        .set_len(ROOT_LEDGER_SLOTS * ROOT_LEDGER_SLOT_LEN)
+        .unwrap();
+    let ring = JournalRing::new(ring_f.path(), 0, 8, 0);
+
+    // Five 6,000-byte entries: head 30,000 of 32,576.
+    let mut rs = Vec::new();
+    for i in 1..=5u64 {
+        rs.push(kv_append(&ring, i, 6000, 0x60 + i as u8).await);
+    }
+
+    // Checkpoint 1 (durable): tail = e1 (everything still live).
+    let mut l1 = kv_ledger_rec(1);
+    l1.journal_tail_seq = rs[0].seq();
+    write_ledger_slot(ledger_f.path(), 0, &l1).await.unwrap();
+
+    // Checkpoint 2 advances the in-RAM tail to e4 and writes its ledger
+    // record — but the record is NOT yet known durable, so reusable_upto
+    // must NOT move, and the head must refuse to grow into [e1, e4):
+    let mut l2 = kv_ledger_rec(2);
+    l2.journal_tail_seq = rs[3].seq();
+    write_ledger_slot(ledger_f.path(), 0, &l2).await.unwrap();
+    assert!(
+        ring.core().try_admit(6000, AdmissionClass::User).is_none(),
+        "the head must bound against reusable_upto, never the in-RAM tail (§4.6 pt 3)"
+    );
+
+    // Power loss tears checkpoint 2's slot. Mount falls back to seq 1 —
+    // and BECAUSE the admission above was refused, its whole window
+    // [e1, head) replays intact.
+    kv_smash(ledger_f.path(), 2 * ROOT_LEDGER_SLOT_LEN + 40, 8).await;
+    let mounted = read_newest_ledger(ledger_f.path(), 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(mounted.seq, 1, "torn newest slot ⇒ predecessor selected");
+    let (_, recovery) = JournalRing::recover(ring_f.path(), 0, 8, 0, mounted.journal_tail_seq)
+        .await
+        .expect("never loud");
+    assert_eq!(
+        kv_recovered_inos(&recovery),
+        vec![1, 2, 3, 4, 5],
+        "the fallback window is byte-intact: ring reuse never overwrote it"
+    );
+    assert_eq!(recovery.dropped_torn, 0);
+
+    // Checkpoint 2 retries and THIS time is known durable (post-barrier):
+    // the watermark advances, admission opens, the ring wraps over the
+    // retired entries…
+    write_ledger_slot(ledger_f.path(), 0, &l2).await.unwrap();
+    uring_fs::fdatasync(ledger_f.path().to_path_buf())
+        .await
+        .unwrap();
+    ring.core().advance_reusable_upto(l2.journal_tail_seq);
+    let r6 = kv_append(&ring, 6, 6000, 0x66).await;
+    assert!(
+        r6.end() > ring.core().geometry().logical_len(),
+        "the new entry wrapped into lap 1 over retired pages"
+    );
+
+    // …and a mount from checkpoint 2 replays exactly its window: e4, e5,
+    // e6 — the overwritten e1..e3 can never be resurrected.
+    let mounted = read_newest_ledger(ledger_f.path(), 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(mounted.seq, 2);
+    let (_, recovery) = JournalRing::recover(ring_f.path(), 0, 8, 0, mounted.journal_tail_seq)
+        .await
+        .expect("never loud");
+    assert_eq!(kv_recovered_inos(&recovery), vec![4, 5, 6]);
+    assert_eq!(recovery.dropped_torn, 0, "a clean wrap is not a tear");
 }

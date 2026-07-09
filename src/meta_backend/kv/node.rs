@@ -355,6 +355,14 @@ impl LoadedNode {
             tail_offset: self.tail_offset,
         }
     }
+
+    /// Decompose into `(header, extent buffer, verified bset ranges, tail
+    /// offset)` — the K5 node cache takes ownership of the verified extent
+    /// bytes zero-copy (its arc-swap snapshots slice this `Bytes`; §4.5
+    /// "readers hand out Bytes/slice views into the snapshot").
+    pub fn into_parts(self) -> (NodeHeader, Bytes, Vec<Range<usize>>, usize) {
+        (self.header, self.buf, self.bset_ranges, self.tail_offset)
+    }
 }
 
 /// The smallest key strictly greater than `key` in memcmp order:
@@ -362,8 +370,11 @@ impl LoadedNode {
 /// (`right.min = key_successor(left.max)`, [`split_node`]) so the §4.6
 /// revalidation predicate `min_key ≤ key ≤ max_key` admits every key the
 /// interior separators can route to the node — no unroutable gaps.
-pub fn key_successor(_key: &[u8]) -> Vec<u8> {
-    todo!()
+pub fn key_successor(key: &[u8]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(key.len() + 1);
+    s.extend_from_slice(key);
+    s.push(0);
+    s
 }
 
 /// Round `len` up to the next [`NODE_PAGE`] multiple.
@@ -806,11 +817,13 @@ pub struct SplitDest {
 /// Split `src` (+ the frozen-delta `extra_records`, as in [`compact_node`])
 /// into two fresh nodes (left, right) at caller-provided extents: fold,
 /// partition the folded records at an encoded-byte-balanced key boundary,
-/// and write two images. Key-space bounds: left spans
+/// and write two images. Key-space bounds **partition** the source range
+/// with no gap (the §4.6 revalidation contract `min_key ≤ key ≤ max_key`
+/// must admit every key the interior separators route here): left spans
 /// `[src.min_key, last left key]`, right spans
-/// `[first right key, src.max_key]` — the parent-pointer update belongs to
-/// the K5 SMO task. Fewer than two folded records cannot split
-/// ([`KvError::Corrupt`]); destinations must be fresh and distinct.
+/// `[`[`key_successor`]`(last left key), src.max_key]` — the parent-pointer
+/// update belongs to the K5 SMO task. Fewer than two folded records cannot
+/// split ([`KvError::Corrupt`]); destinations must be fresh and distinct.
 pub async fn split_node(
     path: impl AsRef<Path>,
     layout: &NodeLayout,
@@ -865,6 +878,11 @@ pub async fn split_node(
         horizon,
     )
     .await?;
+    // Partition rule (§4.6 revalidation): right.min = successor(left.max),
+    // never the first right key — a tighter bound would leave keys in
+    // (left.max, first right key) routable by the parent separator yet
+    // rejected by revalidation, an unroutable gap.
+    let right_min = key_successor(&left_records[left_records.len() - 1].key);
     let right_written = write_node(
         path,
         layout,
@@ -873,7 +891,7 @@ pub async fn split_node(
             node_seq: right.node_seq,
             tree_id: src.header.tree_id,
             level: src.header.level,
-            min_key: &right_records[0].key,
+            min_key: &right_min,
             max_key: &src.header.max_key,
         },
         right_records,

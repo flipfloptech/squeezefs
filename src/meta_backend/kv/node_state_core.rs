@@ -47,14 +47,21 @@
 
 #[cfg(loom)]
 pub(crate) mod atomic {
-    pub use loom::sync::atomic::AtomicU64;
+    pub use loom::sync::atomic::{AtomicU64, Ordering};
 }
 #[cfg(not(loom))]
 pub(crate) mod atomic {
-    pub use std::sync::atomic::AtomicU64;
+    pub use std::sync::atomic::{AtomicU64, Ordering};
 }
 
-use atomic::AtomicU64;
+use atomic::{AtomicU64, Ordering};
+
+/// The open delta holds records not yet frozen into a bset image.
+const DIRTY: u64 = 1;
+/// A writeback/SMO froze the delta and its image is in flight (§4.6 pt 1).
+const FREEZING: u64 = 1 << 1;
+/// Terminal: the object is severed from the cache (SMO swap or eviction).
+const SUPERSEDED: u64 = 1 << 2;
 
 /// The §4.6 lifecycle state, decoded from the packed word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +110,7 @@ pub struct SupersedeOutcome {
 /// The packed lock-free lifecycle word. See the module docs for the
 /// protocol; `loom-models/` pins the invariants.
 pub struct NodeState {
-    _word: AtomicU64,
+    word: AtomicU64,
 }
 
 impl Default for NodeState {
@@ -115,30 +122,41 @@ impl Default for NodeState {
 impl NodeState {
     /// A fresh `clean` node.
     pub fn new() -> Self {
-        todo!()
+        Self {
+            word: AtomicU64::new(0),
+        }
     }
 
     /// Decode the current lifecycle state (`SUPERSEDED` dominates,
     /// `FREEZING` before `DIRTY` — a serializing node with re-accumulated
     /// dirt is still *serializing*).
     pub fn state(&self) -> LifecycleState {
-        todo!()
+        let w = self.word.load(Ordering::Acquire);
+        if w & SUPERSEDED != 0 {
+            LifecycleState::Superseded
+        } else if w & FREEZING != 0 {
+            LifecycleState::Serializing
+        } else if w & DIRTY != 0 {
+            LifecycleState::Dirty
+        } else {
+            LifecycleState::Clean
+        }
     }
 
     /// Whether the open delta holds un-flushed records.
     pub fn is_dirty(&self) -> bool {
-        todo!()
+        self.word.load(Ordering::Acquire) & DIRTY != 0
     }
 
     /// Whether a frozen delta image is in flight (§4.6 pt 1).
     pub fn is_freezing(&self) -> bool {
-        todo!()
+        self.word.load(Ordering::Acquire) & FREEZING != 0
     }
 
     /// Whether the object is severed from the cache — the §4.6
     /// revalidation predicate (checked under the node lock by writers).
     pub fn is_superseded(&self) -> bool {
-        todo!()
+        self.word.load(Ordering::Acquire) & SUPERSEDED != 0
     }
 
     /// A commit applied records to the open delta: set `DIRTY` — unless
@@ -147,7 +165,19 @@ impl NodeState {
     /// atomic RMW: the superseded check and the dirty set cannot be split
     /// by a racing [`Self::supersede`] / [`Self::try_evict`].
     pub fn mark_dirty(&self) -> Result<(), Superseded> {
-        todo!()
+        let prev = self
+            .word
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |w| {
+                if w & SUPERSEDED != 0 {
+                    None
+                } else {
+                    Some(w | DIRTY)
+                }
+            });
+        match prev {
+            Ok(_) => Ok(()),
+            Err(_) => Err(Superseded),
+        }
     }
 
     /// Begin the §4.6 pt 1 freeze-swap: atomically clear `DIRTY` and set
@@ -156,7 +186,27 @@ impl NodeState {
     /// — never I/O under the lock. Concurrent `mark_dirty` calls after the
     /// swap re-set `DIRTY` for the fresh delta.
     pub fn begin_freeze(&self) -> Result<(), FreezeRefused> {
-        todo!()
+        let mut w = self.word.load(Ordering::Acquire);
+        loop {
+            if w & SUPERSEDED != 0 {
+                return Err(FreezeRefused::Superseded);
+            }
+            if w & FREEZING != 0 {
+                return Err(FreezeRefused::AlreadyFreezing);
+            }
+            if w & DIRTY == 0 {
+                return Err(FreezeRefused::NotDirty);
+            }
+            match self.word.compare_exchange_weak(
+                w,
+                (w & !DIRTY) | FREEZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(cur) => w = cur,
+            }
+        }
     }
 
     /// The frozen image reached its destination (append committed, or the
@@ -165,14 +215,24 @@ impl NodeState {
     /// signal. Callable on a superseded node (the SMO tidies up after the
     /// swap); the terminal bit is untouched.
     pub fn end_freeze(&self) -> bool {
-        todo!()
+        let prev = self.word.fetch_and(!FREEZING, Ordering::AcqRel);
+        debug_assert!(prev & FREEZING != 0, "end_freeze without begin_freeze");
+        prev & DIRTY != 0
     }
 
     /// The frozen image could not be written and the caller restored it to
     /// the open delta: clear `FREEZING`, re-set `DIRTY` — the records are
     /// accounted dirty again and a later cycle retries.
     pub fn abort_freeze(&self) {
-        todo!()
+        let prev = self
+            .word
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |w| {
+                Some((w & !FREEZING) | DIRTY)
+            });
+        debug_assert!(
+            prev.unwrap_or(0) & FREEZING != 0,
+            "abort_freeze without begin_freeze"
+        );
     }
 
     /// Terminal §4.6 transition: the SMO swapped the cache mapping to the
@@ -182,7 +242,14 @@ impl NodeState {
     /// in flight. Errors if already superseded (double-swap is an SMO
     /// serialization bug, surfaced loud but panic-free).
     pub fn supersede(&self) -> Result<SupersedeOutcome, Superseded> {
-        todo!()
+        let prev = self.word.fetch_or(SUPERSEDED, Ordering::AcqRel);
+        if prev & SUPERSEDED != 0 {
+            return Err(Superseded);
+        }
+        Ok(SupersedeOutcome {
+            was_dirty: prev & DIRTY != 0,
+            was_freezing: prev & FREEZING != 0,
+        })
     }
 
     /// Clock eviction's gate (§4.5): sever the object **only** from the
@@ -191,6 +258,8 @@ impl NodeState {
     /// holds an in-flight freeze, and a writer that lost the race fails
     /// [`Self::mark_dirty`] loud and re-resolves through the cache.
     pub fn try_evict(&self) -> bool {
-        todo!()
+        self.word
+            .compare_exchange(0, SUPERSEDED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }

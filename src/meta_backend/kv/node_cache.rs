@@ -16,7 +16,7 @@
 //!   buffers — no lock, no copy. Writers swap a new snapshot after the RAM
 //!   apply.
 //! - **Demand paging**: a miss reads the whole extent with one
-//!   `uring_fs::read_at` inside K2's `load_node` (header + bset
+//!   `uring_fs::read_at` inside K2's [`load_node`] (header + bset
 //!   verification + the §4.5 torn-tail classifier), then builds the
 //!   snapshot. Loads are **single-flight** per node address (the
 //!   `routing.rs` inflight-guard discipline: losers wait on a broadcast
@@ -34,14 +34,17 @@
 //! loom-modeled [`super::node_state_core`]; the tree logic (traversal,
 //! writer revalidation, the §4.6 SMO protocol) is [`super::tree`].
 
-use super::node::{LoadedNode, NodeLayout};
+use super::bset::BsetView;
+use super::node::{
+    encode_bset_frame, load_node, AppendDest, LoadedNode, NodeLayout, BSET_FRAME_LEN,
+};
 use super::node_state_core::NodeState;
-use super::record::{Record, RecordKind, RecordRef};
+use super::record::{fold_newest_first, Folded, Record, RecordKind, RecordRef};
 use super::KvError;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Default node-cache budget: 512 MiB (§3 / §4.5 — the
@@ -72,6 +75,23 @@ pub struct NodeCacheConfig {
     pub writeback_delta_bytes: usize,
 }
 
+// ---------------------------------------------------------------------------
+// The immutable snapshot: merged-sorted record view (§4.5).
+// ---------------------------------------------------------------------------
+
+/// One record's position in the merged index: which backing buffer and
+/// where. 24 bytes packed; ~2,000-record leaves index in ~48 KiB.
+#[derive(Debug, Clone, Copy)]
+struct IdxRec {
+    src: u16,
+    kind: RecordKind,
+    key_len: u16,
+    key_off: u32,
+    val_off: u32,
+    val_len: u32,
+    seq: u64,
+}
+
 /// The merged-sorted view over every durable/frozen record source of a
 /// node: bset images (extent slices and frozen delta images) plus an index
 /// ordered `(key asc, seq desc)` — the K1 fold algebra's input shape, so
@@ -80,22 +100,139 @@ pub struct NodeCacheConfig {
 struct RecordIndex {
     /// Backing bset images, oldest → newest. `Bytes` clones are refcounts:
     /// entries borrow these buffers zero-copy.
-    _sources: Vec<Bytes>,
+    sources: Vec<Bytes>,
     /// Merged records, `(key asc, seq desc, newer-source-first)`.
-    _entries: Vec<IdxRec>,
+    entries: Vec<IdxRec>,
 }
 
-/// One record's position in the merged index: which backing buffer and
-/// where. 24 bytes packed; ~2,000-record leaves index in ~48 KiB.
-#[derive(Debug, Clone, Copy)]
-struct IdxRec {
-    _src: u16,
-    _kind: RecordKind,
-    _key_len: u16,
-    _key_off: u32,
-    _val_off: u32,
-    _val_len: u32,
-    _seq: u64,
+impl RecordIndex {
+    /// Merge-build from bset images, **oldest → newest** (append order).
+    /// Ties on `(key, seq)` order the newer source first — the
+    /// [`super::bset::merge`] convention.
+    fn build(sources: Vec<Bytes>) -> Result<Self, KvError> {
+        let views: Vec<BsetView<'_>> = sources
+            .iter()
+            .map(|s| BsetView::parse(s))
+            .collect::<Result<_, _>>()?;
+        let total: usize = views.iter().map(|v| v.len()).sum();
+        let mut entries = Vec::with_capacity(total);
+        // K-way cursor merge over per-source (key asc, seq asc) views,
+        // yielding (key asc, seq desc, newer source first) — the same
+        // order bset::merge yields, tracked per source so entries can
+        // reference their backing buffer.
+        let mut cursors = vec![0usize; views.len()];
+        loop {
+            let mut best: Option<(usize, RecordRef<'_>)> = None;
+            for si in (0..views.len()).rev() {
+                // Newest source first so equal (key, seq) prefers it.
+                if cursors[si] >= views[si].len() {
+                    continue;
+                }
+                let r = views[si].record(cursors[si]);
+                let better = match &best {
+                    None => true,
+                    Some((_, b)) => match r.key.cmp(b.key) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Greater => false,
+                        std::cmp::Ordering::Equal => r.seq > b.seq,
+                    },
+                };
+                if better {
+                    best = Some((si, r));
+                }
+            }
+            let Some((si, r)) = best else { break };
+            cursors[si] += 1;
+            let base = sources[si].as_ptr() as usize;
+            let key_off = r.key.as_ptr() as usize - base;
+            let val_off = if r.value.is_empty() {
+                0
+            } else {
+                r.value.as_ptr() as usize - base
+            };
+            debug_assert!(key_off + r.key.len() <= sources[si].len());
+            entries.push(IdxRec {
+                src: u16::try_from(si).map_err(|_| {
+                    KvError::Corrupt(format!("record index with {} sources", sources.len()))
+                })?,
+                kind: r.kind,
+                key_len: r.key.len() as u16,
+                key_off: key_off as u32,
+                val_off: val_off as u32,
+                val_len: r.value.len() as u32,
+                seq: r.seq,
+            });
+        }
+        // Normalize each same-key run to `seq desc` (newer source breaking
+        // exact ties). The cursor merge above orders records newest-first
+        // ACROSS sources, but **within one source** a multi-seq key is
+        // stored `seq asc` (bsets are `(key, seq)` ascending — a frozen
+        // delta carrying `Put` then `Delete` of one key is the everyday
+        // case), and the fold algebra's input contract is strictly
+        // newest-first (§4.2).
+        let key_of = |e: &IdxRec| {
+            &sources[e.src as usize][e.key_off as usize..e.key_off as usize + e.key_len as usize]
+        };
+        let mut i = 0;
+        while i < entries.len() {
+            let mut j = i + 1;
+            while j < entries.len() && key_of(&entries[j]) == key_of(&entries[i]) {
+                j += 1;
+            }
+            if j - i > 1 {
+                entries[i..j].sort_by(|a, b| b.seq.cmp(&a.seq).then(b.src.cmp(&a.src)));
+            }
+            i = j;
+        }
+        Ok(Self { sources, entries })
+    }
+
+    #[inline]
+    fn key_at(&self, e: &IdxRec) -> &[u8] {
+        &self.sources[e.src as usize][e.key_off as usize..e.key_off as usize + e.key_len as usize]
+    }
+
+    #[inline]
+    fn value_at(&self, e: &IdxRec) -> &[u8] {
+        &self.sources[e.src as usize][e.val_off as usize..e.val_off as usize + e.val_len as usize]
+    }
+
+    #[inline]
+    fn record_ref(&self, i: usize) -> RecordRef<'_> {
+        let e = &self.entries[i];
+        RecordRef {
+            key: self.key_at(e),
+            seq: e.seq,
+            kind: e.kind,
+            value: self.value_at(e),
+        }
+    }
+
+    /// `[lo, hi)` of entries whose key equals `key`.
+    fn group_bounds(&self, key: &[u8]) -> std::ops::Range<usize> {
+        let lo = self.entries.partition_point(|e| self.key_at(e) < key);
+        let hi = self.entries.partition_point(|e| self.key_at(e) <= key);
+        lo..hi
+    }
+
+    /// Index of the first entry with key ≥ `from`.
+    fn first_at_or_after(&self, from: &[u8]) -> usize {
+        self.entries.partition_point(|e| self.key_at(e) < from)
+    }
+
+    /// Zero-copy `Bytes` slice of entry `i`'s value.
+    fn value_bytes(&self, i: usize) -> Bytes {
+        let e = &self.entries[i];
+        self.sources[e.src as usize]
+            .slice(e.val_off as usize..e.val_off as usize + e.val_len as usize)
+    }
+
+    /// Zero-copy `Bytes` slice of entry `i`'s key.
+    fn key_bytes(&self, i: usize) -> Bytes {
+        let e = &self.entries[i];
+        self.sources[e.src as usize]
+            .slice(e.key_off as usize..e.key_off as usize + e.key_len as usize)
+    }
 }
 
 /// An open-delta record: the RAM-applied twin of [`Record`] with `Bytes`
@@ -111,7 +248,22 @@ pub struct OwnedRec {
 impl OwnedRec {
     /// Borrow as the fold algebra's view.
     pub fn record_ref(&self) -> RecordRef<'_> {
-        todo!()
+        RecordRef {
+            key: &self.key,
+            seq: self.seq,
+            kind: self.kind,
+            value: &self.value,
+        }
+    }
+
+    /// Copy into the K1 owned record (bset build / append input).
+    fn to_record(&self) -> Record {
+        Record {
+            key: self.key.to_vec(),
+            seq: self.seq,
+            kind: self.kind,
+            value: self.value.to_vec(),
+        }
     }
 }
 
@@ -131,84 +283,182 @@ pub enum LiveLookup {
 /// Readers load the `Arc`, search, and hand out `Bytes` — no lock, no
 /// copy; a writer swaps a whole new snapshot after its RAM apply.
 pub struct NodeSnapshot {
-    _base: Arc<RecordIndex>,
+    base: Arc<RecordIndex>,
     /// Open-delta records, `(key asc, seq asc)` — always newer than every
     /// base record (seqs are assigned monotonically inside the node-lock
     /// window, §4.4 pt 2).
-    _overlay: Arc<Vec<OwnedRec>>,
+    overlay: Arc<Vec<OwnedRec>>,
 }
 
 impl NodeSnapshot {
     /// Records in the open-delta overlay (tests / writeback sizing).
     pub fn overlay_len(&self) -> usize {
-        todo!()
+        self.overlay.len()
     }
 
     /// Total indexed records across serialized sources (not folded).
     pub fn indexed_len(&self) -> usize {
-        todo!()
+        self.base.entries.len()
+    }
+
+    fn overlay_group(&self, key: &[u8]) -> std::ops::Range<usize> {
+        let lo = self.overlay.partition_point(|r| &r.key[..] < key);
+        let hi = self.overlay.partition_point(|r| &r.key[..] <= key);
+        lo..hi
     }
 
     /// Fold one key with the single K1 algebra: overlay group newest-first,
     /// then base group (already `(seq desc)`), zero-copy value return.
-    pub fn lookup(&self, _key: &[u8]) -> Result<LiveLookup, KvError> {
-        todo!()
+    pub fn lookup(&self, key: &[u8]) -> Result<LiveLookup, KvError> {
+        let og = self.overlay_group(key);
+        let bg = self.base.group_bounds(key);
+        // Gather newest-first: overlay reversed (seq asc storage), then base.
+        let mut refs: Vec<RecordRef<'_>> = Vec::with_capacity(og.len() + bg.len());
+        let mut providers: Vec<Provider> = Vec::with_capacity(og.len() + bg.len());
+        for i in og.clone().rev() {
+            refs.push(self.overlay[i].record_ref());
+            providers.push(Provider::Overlay(i));
+        }
+        for i in bg.clone() {
+            refs.push(self.base.record_ref(i));
+            providers.push(Provider::Base(i));
+        }
+        match fold_newest_first(refs.iter().copied())? {
+            Folded::Absent => Ok(LiveLookup::Absent),
+            Folded::Tombstone { .. } => Ok(LiveLookup::Tombstone),
+            Folded::Put { value, .. } => Ok(LiveLookup::Live(match value {
+                std::borrow::Cow::Owned(v) => Bytes::from(v),
+                std::borrow::Cow::Borrowed(v) => {
+                    self.materialize(&refs, &providers, v).ok_or_else(|| {
+                        KvError::Corrupt(
+                            "folded borrow does not match any gathered record".to_string(),
+                        )
+                    })?
+                }
+            })),
+        }
+    }
+
+    /// Map a fold's borrowed value back to its provider for a zero-copy
+    /// `Bytes` (the borrow is always one gathered record's value slice).
+    fn materialize(
+        &self,
+        refs: &[RecordRef<'_>],
+        providers: &[Provider],
+        v: &[u8],
+    ) -> Option<Bytes> {
+        for (r, p) in refs.iter().zip(providers) {
+            if std::ptr::eq(r.value.as_ptr(), v.as_ptr()) && r.value.len() == v.len() {
+                return Some(match p {
+                    Provider::Overlay(i) => self.overlay[*i].value.clone(),
+                    Provider::Base(i) => self.base.value_bytes(*i),
+                });
+            }
+        }
+        None
     }
 
     /// The next **live** `(key, value)` with key ≥ `from` (fold-walked:
     /// tombstoned/orphaned keys are skipped) — the range-scan / interior
     /// routing primitive. Zero-copy on both key and value.
-    pub fn next_live(&self, _from: &[u8]) -> Result<Option<(Bytes, Bytes)>, KvError> {
-        todo!()
+    pub fn next_live(&self, from: &[u8]) -> Result<Option<(Bytes, Bytes)>, KvError> {
+        let mut cursor: Vec<u8> = from.to_vec();
+        loop {
+            let bi = self.base.first_at_or_after(&cursor);
+            let oi = self.overlay.partition_point(|r| &r.key[..] < &cursor[..]);
+            let bk =
+                (bi < self.base.entries.len()).then(|| self.base.key_at(&self.base.entries[bi]));
+            let ok = (oi < self.overlay.len()).then(|| &self.overlay[oi].key[..]);
+            let key: &[u8] = match (bk, ok) {
+                (None, None) => return Ok(None),
+                (Some(b), None) => b,
+                (None, Some(o)) => o,
+                (Some(b), Some(o)) => {
+                    if b <= o {
+                        b
+                    } else {
+                        o
+                    }
+                }
+            };
+            let key_owned; // key borrow ends at lookup; keep bytes for return
+            let key_bytes = if bk == Some(key) {
+                key_owned = self.base.key_bytes(bi);
+                key_owned.clone()
+            } else {
+                self.overlay[oi].key.clone()
+            };
+            match self.lookup(key_bytes.as_ref())? {
+                LiveLookup::Live(v) => return Ok(Some((key_bytes, v))),
+                LiveLookup::Tombstone | LiveLookup::Absent => {
+                    // Advance past this key: successor = key ⧺ 0x00.
+                    cursor.clear();
+                    cursor.extend_from_slice(&key_bytes);
+                    cursor.push(0);
+                }
+            }
+        }
     }
 }
+
+enum Provider {
+    Base(usize),
+    Overlay(usize),
+}
+
+// ---------------------------------------------------------------------------
+// The cached node.
+// ---------------------------------------------------------------------------
 
 /// The mutable half of a node, guarded by the per-node write lock
 /// (§4.4 pt 1: locks cover RAM mutation only — the append itself runs
 /// outside, on the serialized writeback/SMO task).
 pub struct NodeDirty {
     /// Open-delta records, `(key asc, seq asc)`.
-    _overlay: Vec<OwnedRec>,
-    /// Encoded size of the overlay (writeback threshold input).
-    _overlay_bytes: usize,
+    overlay: Vec<OwnedRec>,
+    /// Encoded size of `overlay` (writeback threshold input).
+    overlay_bytes: usize,
     /// A frozen delta not yet appended: `(records, bset image)` — the bset
     /// image is already merged into the snapshot base; the records are the
     /// append/compact input (§4.6 pt 1).
-    _frozen: Option<FrozenDelta>,
+    frozen: Option<FrozenDelta>,
     /// Node-relative offset of the unwritten tail (advances per append).
-    _tail_offset: usize,
+    tail_offset: usize,
 }
 
 /// A frozen-but-unwritten delta (§4.6 pt 1 snapshot-then-write).
 #[derive(Clone)]
 pub struct FrozenDelta {
-    _records: Arc<Vec<Record>>,
+    records: Arc<Vec<Record>>,
     /// Max record seq — the bset `journal_seq_horizon`.
-    _horizon: u64,
+    horizon: u64,
     /// Encoded frame length (fit check before the append attempt).
-    _frame_len: usize,
+    frame_len: usize,
 }
 
 impl NodeDirty {
     /// Encoded bytes currently in the open delta.
     pub fn overlay_bytes(&self) -> usize {
-        todo!()
+        self.overlay_bytes
     }
 
     /// Records currently in the open delta.
     pub fn overlay_len(&self) -> usize {
-        todo!()
+        self.overlay.len()
     }
 
     /// Whether a frozen delta awaits its append/compact.
     pub fn has_frozen(&self) -> bool {
-        todo!()
+        self.frozen.is_some()
     }
 
     /// The frozen-but-unwritten delta records (the SMO's `extra_records`
     /// fold input — §4.6). Empty when no freeze is outstanding.
     pub fn frozen_records(&self) -> Vec<Record> {
-        todo!()
+        self.frozen
+            .as_ref()
+            .map(|f| f.records.as_ref().clone())
+            .unwrap_or_default()
     }
 
     /// Take the open delta (the §4.6 "delta that accumulated during the
@@ -216,31 +466,45 @@ impl NodeDirty {
     /// into the successors' open deltas. Published snapshots are immutable
     /// and keep serving the pre-swap view.
     pub fn take_overlay(&mut self) -> Vec<OwnedRec> {
-        todo!()
+        self.overlay_bytes = 0;
+        std::mem::take(&mut self.overlay)
     }
 
     /// Node-relative unwritten-tail offset.
     pub fn tail_offset(&self) -> usize {
-        todo!()
+        self.tail_offset
     }
 }
 
 /// One cached node: immutable identity + lifecycle word + arc-swap'd
 /// snapshot + the lock-guarded dirty half (§4.5).
 pub struct CachedNode {
-    _addr: u64,
-    _node_seq: u64,
-    _tree_id: u8,
-    _level: u8,
-    _min_key: Vec<u8>,
-    _max_key: Vec<u8>,
-    _state: NodeState,
-    _snapshot: ArcSwap<NodeSnapshot>,
-    _dirty: tokio::sync::RwLock<NodeDirty>,
+    addr: u64,
+    node_seq: u64,
+    tree_id: u8,
+    level: u8,
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
+    state: NodeState,
+    snapshot: ArcSwap<NodeSnapshot>,
+    dirty: tokio::sync::RwLock<NodeDirty>,
     /// Clock second-chance bit (set on access).
-    _ref_bit: AtomicBool,
+    ref_bit: AtomicBool,
     /// Interior nodes and tree roots never evict (§4.5).
-    _pinned: AtomicBool,
+    pinned: AtomicBool,
+}
+
+impl std::fmt::Debug for CachedNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedNode")
+            .field("addr", &self.addr)
+            .field("node_seq", &self.node_seq)
+            .field("tree_id", &self.tree_id)
+            .field("level", &self.level)
+            .field("state", &self.state.state())
+            .field("pinned", &self.pinned.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl CachedNode {
@@ -249,65 +513,92 @@ impl CachedNode {
     /// Born clean; an SMO successor inherits the displaced open delta via
     /// [`Self::apply_locked`] under the SMO's lock window (the §4.6
     /// "bounded second merge").
-    pub fn from_loaded(_loaded: LoadedNode, _pinned: bool) -> Result<Arc<Self>, KvError> {
-        todo!()
+    pub fn from_loaded(loaded: LoadedNode, pinned: bool) -> Result<Arc<Self>, KvError> {
+        let (header, buf, bset_ranges, tail_offset) = loaded.into_parts();
+        let sources: Vec<Bytes> = bset_ranges.iter().map(|r| buf.slice(r.clone())).collect();
+        let base = Arc::new(RecordIndex::build(sources)?);
+        Ok(Arc::new(Self {
+            addr: header.node_addr,
+            node_seq: header.node_seq,
+            tree_id: header.tree_id,
+            level: header.level,
+            min_key: header.min_key,
+            max_key: header.max_key,
+            state: NodeState::new(),
+            snapshot: ArcSwap::from_pointee(NodeSnapshot {
+                base,
+                overlay: Arc::new(Vec::new()),
+            }),
+            dirty: tokio::sync::RwLock::new(NodeDirty {
+                overlay: Vec::new(),
+                overlay_bytes: 0,
+                frozen: None,
+                tail_offset,
+            }),
+            ref_bit: AtomicBool::new(true),
+            pinned: AtomicBool::new(pinned),
+        }))
     }
 
     /// Extent byte address (the cache key).
     pub fn addr(&self) -> u64 {
-        todo!()
+        self.addr
     }
 
     /// Node incarnation (§4.2 `child_node_seq` stale-pointer detection).
     pub fn node_seq(&self) -> u64 {
-        todo!()
+        self.node_seq
     }
 
     pub fn tree_id(&self) -> u8 {
-        todo!()
+        self.tree_id
     }
 
     /// 0 = leaf; interior levels are pinned and SMO-lock-only (§4.6).
     pub fn level(&self) -> u8 {
-        todo!()
+        self.level
     }
 
     /// Inclusive key-space lower bound (§4.6 revalidation input).
     pub fn min_key(&self) -> &[u8] {
-        todo!()
+        &self.min_key
     }
 
     /// Inclusive key-space upper bound (§4.6 revalidation input).
     pub fn max_key(&self) -> &[u8] {
-        todo!()
+        &self.max_key
     }
 
     /// The lock-free lifecycle word (loom-modeled, §4.6).
     pub fn state(&self) -> &NodeState {
-        todo!()
+        &self.state
     }
 
     /// Latch-free read entry: the current immutable snapshot.
     pub fn snapshot(&self) -> Arc<NodeSnapshot> {
-        todo!()
+        self.snapshot.load_full()
     }
 
     /// The per-node write lock (§4.4 pt 1 / §4.9 4b). Commit-path writers
     /// take it on **leaves only**; interior locks belong to the serialized
     /// SMO task — that split is what keeps the lock populations acyclic.
     pub fn lock(&self) -> &tokio::sync::RwLock<NodeDirty> {
-        todo!()
+        &self.dirty
     }
 
     /// Pin (tree roots after [`super::tree::KvTree::open`]; interior nodes
     /// pin at construction).
     pub fn pin(&self) {
-        todo!()
+        self.pinned.store(true, Ordering::Release);
     }
 
     /// Whether this node is exempt from eviction.
     pub fn is_pinned(&self) -> bool {
-        todo!()
+        self.pinned.load(Ordering::Acquire)
+    }
+
+    fn touch(&self) {
+        self.ref_bit.store(true, Ordering::Relaxed);
     }
 
     /// Apply records to the open delta **under the held write lock** and
@@ -317,10 +608,28 @@ impl CachedNode {
     /// revalidate first, so this is the caught-bug path, not control flow.
     pub fn apply_locked(
         &self,
-        _guard: &mut NodeDirty,
-        _records: Vec<OwnedRec>,
+        guard: &mut NodeDirty,
+        records: Vec<OwnedRec>,
     ) -> Result<(), KvError> {
-        todo!()
+        if self.state.mark_dirty().is_err() {
+            return Err(KvError::Corrupt(format!(
+                "apply on superseded node {:#x} (revalidation bypassed?)",
+                self.addr
+            )));
+        }
+        for rec in records {
+            let pos = guard
+                .overlay
+                .partition_point(|r| (&r.key[..], r.seq) <= (&rec.key[..], rec.seq));
+            guard.overlay_bytes += rec.record_ref().encoded_len();
+            guard.overlay.insert(pos, rec);
+        }
+        let cur = self.snapshot.load();
+        self.snapshot.store(Arc::new(NodeSnapshot {
+            base: cur.base.clone(),
+            overlay: Arc::new(guard.overlay.clone()),
+        }));
+        Ok(())
     }
 
     /// The §4.6 pt 1 freeze-swap, **under the held write lock**: move the
@@ -331,29 +640,84 @@ impl CachedNode {
     /// awaiting I/O.
     pub fn freeze_locked(
         &self,
-        _guard: &mut NodeDirty,
-        _layout: &NodeLayout,
+        guard: &mut NodeDirty,
+        layout: &NodeLayout,
     ) -> Result<Option<FrozenDelta>, KvError> {
-        todo!()
+        if guard.frozen.is_some() {
+            return Ok(guard.frozen.clone());
+        }
+        if guard.overlay.is_empty() {
+            return Ok(None);
+        }
+        self.state.begin_freeze().map_err(|e| {
+            KvError::Corrupt(format!("freeze refused on node {:#x}: {e:?}", self.addr))
+        })?;
+        let records: Vec<Record> = guard.overlay.iter().map(|r| r.to_record()).collect();
+        let horizon = records.iter().map(|r| r.seq).max().unwrap_or(0);
+        let frame = encode_bset_frame(layout, self.node_seq, &records, horizon)?;
+        let frame_len = frame.len();
+        let frame = Bytes::from(frame);
+        // The frame's embedded bset becomes one more index source.
+        let bset_len = u32::from_le_bytes([frame[20], frame[21], frame[22], frame[23]]) as usize;
+        let bset_image = frame.slice(BSET_FRAME_LEN..BSET_FRAME_LEN + bset_len);
+        let cur = self.snapshot.load();
+        let mut sources = cur.base.sources.clone();
+        sources.push(bset_image);
+        let base = Arc::new(RecordIndex::build(sources)?);
+        guard.overlay.clear();
+        guard.overlay_bytes = 0;
+        let frozen = FrozenDelta {
+            records: Arc::new(records),
+            horizon,
+            frame_len,
+        };
+        guard.frozen = Some(frozen.clone());
+        self.snapshot.store(Arc::new(NodeSnapshot {
+            base,
+            overlay: Arc::new(Vec::new()),
+        }));
+        Ok(Some(frozen))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The cache.
+// ---------------------------------------------------------------------------
+
+/// Removes the inflight single-flight entry and wakes waiters even if the
+/// loading future is cancelled mid-load (the `routing.rs` inflight-guard
+/// discipline).
+struct InflightLoadGuard<'a> {
+    cache: &'a NodeCache,
+    addr: u64,
+    tx: tokio::sync::broadcast::Sender<()>,
+}
+
+impl Drop for InflightLoadGuard<'_> {
+    fn drop(&mut self) {
+        self.cache
+            .inflight
+            .remove_if_sync(&self.addr, |tx| tx.same_channel(&self.tx));
+        let _ = self.tx.send(());
     }
 }
 
 /// The per-volume node cache (§4.5). All extent I/O flows through the K2
 /// node layer (`crate::uring_fs`, io_uring-only).
 pub struct NodeCache {
-    _cfg: NodeCacheConfig,
-    _map: scc::HashMap<u64, Arc<CachedNode>>,
-    _inflight: scc::HashMap<u64, tokio::sync::broadcast::Sender<()>>,
+    cfg: NodeCacheConfig,
+    map: scc::HashMap<u64, Arc<CachedNode>>,
+    inflight: scc::HashMap<u64, tokio::sync::broadcast::Sender<()>>,
     /// Clock ring: FIFO of candidate addresses + per-node second-chance
     /// ref bits (the sharded-clock family of `src/cache/lru.rs`, sized for
     /// node counts). Stale entries (evicted/superseded nodes) fall out on
     /// pop.
-    _clock: scc::Queue<u64>,
-    _cached_bytes: AtomicU64,
+    clock: scc::Queue<u64>,
+    cached_bytes: AtomicU64,
     /// The durable journal tail (§4.5 torn-tail classifier input, §4.2
     /// tombstone elision floor). K6b's checkpoint advances it; tests drive
     /// it directly.
-    _durable_tail: AtomicU64,
+    durable_tail: AtomicU64,
     /// Extents an SMO retired whose **disk image lags the RAM-authoritative
     /// state that superseded it** (the open delta moved into successor
     /// nodes' RAM, never onto this extent). A traversal holding a pre-SMO
@@ -364,67 +728,91 @@ pub struct NodeCache {
     /// ([`Self::publish`] of a reused extent). In-flight readers that
     /// already hold the superseded object's `Arc` keep reading its intact
     /// snapshot (§4.6) — this set only guards re-loads from disk.
-    _retired: scc::HashSet<u64>,
+    retired: scc::HashSet<u64>,
+}
+
+impl std::fmt::Debug for NodeCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCache")
+            .field("nodes", &self.map.len())
+            .field("cached_bytes", &self.cached_bytes.load(Ordering::Relaxed))
+            .field("budget_bytes", &self.cfg.budget_bytes)
+            .finish()
+    }
 }
 
 impl NodeCache {
-    pub fn new(_cfg: NodeCacheConfig) -> Arc<Self> {
-        todo!()
+    pub fn new(cfg: NodeCacheConfig) -> Arc<Self> {
+        Arc::new(Self {
+            cfg,
+            map: scc::HashMap::default(),
+            inflight: scc::HashMap::default(),
+            clock: scc::Queue::default(),
+            cached_bytes: AtomicU64::new(0),
+            durable_tail: AtomicU64::new(0),
+            retired: scc::HashSet::default(),
+        })
     }
 
     /// The cache's placement/policy config.
     pub fn config(&self) -> &NodeCacheConfig {
-        todo!()
+        &self.cfg
     }
 
     /// Byte address of heap extent `extent`.
-    pub fn extent_addr(&self, _extent: u64) -> u64 {
-        todo!()
+    pub fn extent_addr(&self, extent: u64) -> u64 {
+        self.cfg.heap_base + extent * self.cfg.layout.node_size() as u64
     }
 
     /// Heap extent index of node address `addr`.
-    pub fn addr_extent(&self, _addr: u64) -> u64 {
-        todo!()
+    pub fn addr_extent(&self, addr: u64) -> u64 {
+        (addr - self.cfg.heap_base) / self.cfg.layout.node_size() as u64
     }
 
     /// Current durable journal tail (§4.6 pt 2's checkpoint output; a test
     /// / K6b input here).
     pub fn durable_tail(&self) -> u64 {
-        todo!()
+        self.durable_tail.load(Ordering::Acquire)
     }
 
     /// Advance the durable tail (monotonic).
-    pub fn set_durable_tail(&self, _tail: u64) {
-        todo!()
+    pub fn set_durable_tail(&self, tail: u64) {
+        self.durable_tail.fetch_max(tail, Ordering::AcqRel);
     }
 
     /// Bytes currently charged against the budget.
     pub fn cached_bytes(&self) -> u64 {
-        todo!()
+        self.cached_bytes.load(Ordering::Acquire)
     }
 
     /// Whether `addr` is currently mapped (tests).
-    pub fn contains(&self, _addr: u64) -> bool {
-        todo!()
+    pub fn contains(&self, addr: u64) -> bool {
+        self.map.contains_sync(&addr)
     }
 
     /// Visit every mapped node (the K6b checkpoint's dirty-set walk; the
     /// tree's `flush_dirty` uses it today). Not a consistent snapshot —
     /// racing inserts/evictions may or may not be visited, which is fine
     /// for its callers (they re-check per node under its lock).
-    pub fn for_each_node(&self, _f: impl FnMut(&Arc<CachedNode>)) {
-        todo!()
+    pub fn for_each_node(&self, mut f: impl FnMut(&Arc<CachedNode>)) {
+        self.map.iter_sync(|_, v| {
+            f(v);
+            true
+        });
     }
 
     /// Latch-free map read: `Some` is a cache hit (counted). The returned
     /// `Arc` stays valid across eviction — readers keep their snapshots by
     /// refcount.
-    pub fn try_get(&self, _addr: u64) -> Option<Arc<CachedNode>> {
-        todo!()
+    pub fn try_get(&self, addr: u64) -> Option<Arc<CachedNode>> {
+        let node = self.map.read_sync(&addr, |_, v| v.clone())?;
+        node.touch();
+        super::META_KV_NODE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        Some(node)
     }
 
     /// Single-flight demand page (§4.5): exactly one loader per address
-    /// reads the extent (K2 `load_node`: one `uring_fs::read_at`, header
+    /// reads the extent (K2 [`load_node`]: one `uring_fs::read_at`, header
     /// + bset verification, torn-tail classification); losers wait on the
     /// loader's broadcast and re-check the map.
     ///
@@ -433,15 +821,71 @@ impl NodeCache {
     /// would time-travel acked records. Only a traversal holding a
     /// pre-SMO parent snapshot can reach one — it must restart from the
     /// tree root through current snapshots (see [`super::tree`]).
-    pub async fn load(&self, _addr: u64) -> Result<Option<Arc<CachedNode>>, KvError> {
-        todo!()
+    pub async fn load(&self, addr: u64) -> Result<Option<Arc<CachedNode>>, KvError> {
+        loop {
+            if let Some(node) = self.map.read_async(&addr, |_, v| v.clone()).await {
+                node.touch();
+                super::META_KV_NODE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(node));
+            }
+            if self.retired.contains_sync(&addr) {
+                return Ok(None);
+            }
+            // Miss: exactly one loader per address; losers wait and re-check.
+            let guard = {
+                match self.inflight.entry_async(addr).await {
+                    scc::hash_map::Entry::Occupied(e) => {
+                        let mut rx = e.get().subscribe();
+                        drop(e);
+                        // Sender dropped (loader done or cancelled) also
+                        // wakes us; either way, re-check the map.
+                        let _ = rx.recv().await;
+                        continue;
+                    }
+                    scc::hash_map::Entry::Vacant(e) => {
+                        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+                        e.insert_entry(tx.clone());
+                        InflightLoadGuard {
+                            cache: self,
+                            addr,
+                            tx,
+                        }
+                    }
+                }
+            };
+            let loaded =
+                load_node(&self.cfg.path, &self.cfg.layout, addr, self.durable_tail()).await?;
+            // Re-check after the read: a retire during our load means the
+            // bytes we hold are the lagging image (a mapping existed until
+            // [`Self::retire`] ran, and retire marks the set BEFORE
+            // dropping the mapping — so a loader that missed the map is
+            // guaranteed to see the mark here).
+            if self.retired.contains_sync(&addr) {
+                return Ok(None);
+            }
+            let node = CachedNode::from_loaded(loaded, false)?;
+            if node.level() > 0 {
+                node.pin(); // §4.5: interior nodes always pinned.
+            }
+            self.publish(node.clone());
+            super::META_KV_NODE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+            drop(guard);
+            return Ok(Some(node));
+        }
     }
 
     /// [`Self::try_get`] or [`Self::load`], erroring on a retired address
     /// — for callers that resolve through current state by construction
     /// (tree open, the SMO's own reloads, tests).
-    pub async fn get(&self, _addr: u64) -> Result<Arc<CachedNode>, KvError> {
-        todo!()
+    pub async fn get(&self, addr: u64) -> Result<Arc<CachedNode>, KvError> {
+        if let Some(node) = self.try_get(addr) {
+            return Ok(node);
+        }
+        self.load(addr).await?.ok_or_else(|| {
+            KvError::Corrupt(format!(
+                "node {addr:#x} is a retired extent (stale pointer outside a traversal)"
+            ))
+        })
     }
 
     /// Publish a node built by the caller (an SMO successor, a fresh tree
@@ -449,8 +893,28 @@ impl NodeCache {
     /// (a reused extent hosts current state again — stale pointers to its
     /// previous life are caught by the §4.2 `node_seq` check), charge the
     /// budget, enter the clock, evict down to budget if needed.
-    pub fn publish(&self, _node: Arc<CachedNode>) {
-        todo!()
+    pub fn publish(&self, node: Arc<CachedNode>) {
+        let addr = node.addr();
+        let evictable = !node.is_pinned();
+        match self.map.entry_sync(addr) {
+            scc::hash_map::Entry::Occupied(mut e) => {
+                // Replacing a mapping (an SMO successor over a stale
+                // demand-loaded object): sever the old one.
+                let old = e.get().clone();
+                let _ = old.state().supersede();
+                *e.get_mut() = node;
+            }
+            scc::hash_map::Entry::Vacant(e) => {
+                e.insert_entry(node);
+                self.cached_bytes
+                    .fetch_add(self.cfg.layout.node_size() as u64, Ordering::AcqRel);
+            }
+        }
+        self.retired.remove_sync(&addr);
+        if evictable {
+            self.clock.push(addr);
+        }
+        self.evict_to_budget();
     }
 
     /// Sever an SMO-superseded node: mark its extent retired **before**
@@ -460,8 +924,54 @@ impl NodeCache {
     /// node's write lock) owns the [`NodeState::supersede`] transition and
     /// the pending-free of the extent (§4.7). In-flight readers keep the
     /// object's snapshot alive by refcount (§4.6).
-    pub fn retire(&self, _node: &Arc<CachedNode>) {
-        todo!()
+    pub fn retire(&self, node: &Arc<CachedNode>) {
+        self.retired.insert_sync(node.addr()).ok();
+        if self
+            .map
+            .remove_if_sync(&node.addr(), |v| Arc::ptr_eq(v, node))
+            .is_some()
+        {
+            self.cached_bytes
+                .fetch_sub(self.cfg.layout.node_size() as u64, Ordering::AcqRel);
+        }
+    }
+
+    /// Clock sweep (§4.5): second-chance FIFO; clean unpinned nodes evict
+    /// by dropping the Arc (in-flight readers keep their snapshots alive);
+    /// dirty/serializing nodes are pinned by [`NodeState::try_evict`]'s
+    /// clean-only CAS; interior/root pins are skipped outright. Bounded to
+    /// two laps so an all-pinned cache cannot spin.
+    fn evict_to_budget(&self) {
+        let mut attempts = 2 * (self.map.len() + 1);
+        while self.cached_bytes.load(Ordering::Acquire) > self.cfg.budget_bytes && attempts > 0 {
+            attempts -= 1;
+            let Some(entry) = self.clock.pop() else { break };
+            let addr = **entry;
+            let Some(node) = self.map.read_sync(&addr, |_, v| v.clone()) else {
+                continue; // stale clock entry
+            };
+            if node.is_pinned() {
+                continue; // pinned entries never re-enter the clock
+            }
+            if node.ref_bit.swap(false, Ordering::AcqRel) {
+                self.clock.push(addr); // second chance
+                continue;
+            }
+            if node.state().try_evict() {
+                if self
+                    .map
+                    .remove_if_sync(&addr, |v| Arc::ptr_eq(v, &node))
+                    .is_some()
+                {
+                    self.cached_bytes
+                        .fetch_sub(self.cfg.layout.node_size() as u64, Ordering::AcqRel);
+                    super::META_KV_NODE_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                // Dirty / serializing: pinned until writeback (§4.5).
+                self.clock.push(addr);
+            }
+        }
     }
 
     /// Append the frozen delta of `node` to its extent tail — the §4.6
@@ -470,7 +980,41 @@ impl NodeCache {
     /// freeze ended); `Ok(false)` = the frame does not fit
     /// ([`KvError::NodeFull`] downgraded to a signal) — the caller
     /// compacts/splits instead (§4.6 pt 1).
-    pub async fn append_frozen(&self, _node: &Arc<CachedNode>) -> Result<bool, KvError> {
-        todo!()
+    pub async fn append_frozen(&self, node: &Arc<CachedNode>) -> Result<bool, KvError> {
+        let (frozen, tail) = {
+            let g = node.lock().read().await;
+            match &g.frozen {
+                None => return Ok(true), // nothing to do
+                Some(f) => (f.clone(), g.tail_offset),
+            }
+        };
+        if tail + frozen.frame_len > self.cfg.layout.node_size() {
+            return Ok(false);
+        }
+        let dest = AppendDest {
+            node_addr: node.addr(),
+            node_seq: node.node_seq(),
+            tail_offset: tail,
+        };
+        match super::node::append_bset(
+            &self.cfg.path,
+            &self.cfg.layout,
+            &dest,
+            &frozen.records,
+            frozen.horizon,
+        )
+        .await
+        {
+            Ok(new_tail) => {
+                let mut g = node.lock().write().await;
+                g.tail_offset = new_tail;
+                g.frozen = None;
+                drop(g);
+                node.state().end_freeze();
+                Ok(true)
+            }
+            Err(KvError::NodeFull { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }

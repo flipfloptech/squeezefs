@@ -262,33 +262,67 @@ impl<'a> Iterator for BsetIter<'_, 'a> {
 /// input shape. Equal `(key, seq)` across sources (a node bset overlapping
 /// the journal replay window) yields the newer source first; both survive
 /// for the fold, which is idempotent over identical-effect records.
+///
+/// A same-key multi-seq run **within one source** (bsets store `(key, seq)`
+/// ascending — e.g. a frozen delta carrying a `Put` then its `Delete`) is
+/// emitted in reverse storage order so the newest-first contract holds
+/// there too; the per-source candidate is the run's highest un-emitted seq.
 pub fn merge<'v, 'a>(sources: &'v [BsetView<'a>]) -> MergeIter<'v, 'a> {
     MergeIter {
         sources,
         cursors: vec![0; sources.len()],
+        run_emitted: vec![0; sources.len()],
     }
 }
 
 /// Iterator returned by [`merge`].
 pub struct MergeIter<'v, 'a> {
     sources: &'v [BsetView<'a>],
+    /// Start of the current same-key run per source.
     cursors: Vec<usize>,
+    /// How many of the current run have been emitted (runs emit in reverse,
+    /// newest seq first).
+    run_emitted: Vec<usize>,
+}
+
+impl<'v, 'a> MergeIter<'v, 'a> {
+    /// The exclusive end of the same-key run starting at `cursors[si]`.
+    fn run_end(&self, si: usize) -> usize {
+        let view = &self.sources[si];
+        let start = self.cursors[si];
+        let key = view.record(start).key;
+        let mut end = start + 1;
+        while end < view.len() && view.record(end).key == key {
+            end += 1;
+        }
+        end
+    }
+
+    /// This source's candidate: the highest un-emitted seq of its current
+    /// key run (bsets are seq-ascending within a key, so that is the run
+    /// scanned from the back).
+    fn candidate(&self, si: usize) -> Option<(usize, RecordRef<'a>)> {
+        let view = &self.sources[si];
+        if self.cursors[si] >= view.len() {
+            return None;
+        }
+        let idx = self.run_end(si) - 1 - self.run_emitted[si];
+        Some((idx, view.record(idx)))
+    }
 }
 
 impl<'a> Iterator for MergeIter<'_, 'a> {
     type Item = RecordRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Linear best-cursor scan: source counts are small (a node's bset
-        // log is ~32–56 deep at 256 KiB, §4.4) and the comparison is a
-        // memcmp on ≤ 16-byte keys.
+        // Linear best-candidate scan: source counts are small (a node's
+        // bset log is ~32–56 deep at 256 KiB, §4.4) and the comparison is
+        // a memcmp on ≤ 16-byte keys.
         let mut best: Option<(usize, RecordRef<'a>)> = None;
-        for (si, view) in self.sources.iter().enumerate() {
-            let cursor = self.cursors[si];
-            if cursor >= view.len() {
+        for si in 0..self.sources.len() {
+            let Some((_, r)) = self.candidate(si) else {
                 continue;
-            }
-            let r = view.record(cursor);
+            };
             let is_better = match &best {
                 None => true,
                 Some((_, b)) => match r.key.cmp(b.key) {
@@ -304,7 +338,12 @@ impl<'a> Iterator for MergeIter<'_, 'a> {
             }
         }
         let (si, r) = best?;
-        self.cursors[si] += 1;
+        let run_end = self.run_end(si);
+        self.run_emitted[si] += 1;
+        if self.cursors[si] + self.run_emitted[si] == run_end {
+            self.cursors[si] = run_end;
+            self.run_emitted[si] = 0;
+        }
         Some(r)
     }
 }

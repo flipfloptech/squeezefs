@@ -1,10 +1,19 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use squeezefs::meta_backend::kv::alloc_ext::ExtentAllocator;
 use squeezefs::meta_backend::kv::bset::{build_bset, lookup, merge, BsetView};
+use squeezefs::meta_backend::kv::node::{NodeLayout, DEFAULT_NODE_SIZE};
+use squeezefs::meta_backend::kv::node_cache::{
+    NodeCache, NodeCacheConfig, DEFAULT_WRITEBACK_DELTA_BYTES,
+};
 use squeezefs::meta_backend::kv::record::{
     dentry_key, dentry_name_hash54, inode_key, DentryValue, InodeDelta, InodeValue, Record,
+    TREE_INODES,
 };
+use squeezefs::meta_backend::kv::tree::{KvTree, SmoContext};
 use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend, Metadata};
 use std::hint::black_box;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 
@@ -195,5 +204,131 @@ fn bench_kv_bset(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_metalv_metadata, bench_kv_bset);
+/// PR K5 micro-benches: btree point lookup (hot cache / cold demand page),
+/// insert (commit-path resolve→lock→revalidate→apply), and range scan over
+/// arc-swap snapshots (design PR plan; §4.5 read-path claims).
+fn bench_kv_tree(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("kv_tree");
+    const KEYS: u64 = 100_000;
+
+    // A file-backed volume with a 100 K-key inode tree, fully written back.
+    let build_volume = |budget_nodes: u64| -> (NamedTempFile, Arc<NodeCache>, KvTree, SmoContext) {
+        let file = NamedTempFile::new().expect("temp volume");
+        let node_size = DEFAULT_NODE_SIZE;
+        let extents = 4096u64;
+        file.as_file()
+            .set_len(extents * node_size as u64)
+            .expect("size volume");
+        let cache = NodeCache::new(NodeCacheConfig {
+            path: file.path().to_path_buf(),
+            layout: NodeLayout::new(node_size).expect("layout"),
+            heap_base: 0,
+            budget_bytes: budget_nodes * node_size as u64,
+            writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
+        });
+        let alloc = Arc::new(ExtentAllocator::format(extents, 0, 4096));
+        let mut ctx = SmoContext::new(alloc);
+        let tree = rt.block_on(async {
+            let tree = KvTree::create(
+                cache.clone(),
+                &mut ctx,
+                TREE_INODES,
+                Arc::new(AtomicU64::new(0)),
+            )
+            .await
+            .expect("create");
+            for i in 0..KEYS {
+                let mut v = vec![0u8; 48];
+                v[..8].copy_from_slice(&i.to_le_bytes());
+                tree.insert(&inode_key(i), v).await.expect("insert");
+                if i % 4096 == 0 {
+                    while tree.maintenance_pending() {
+                        tree.run_maintenance(&mut ctx).await.expect("maintenance");
+                    }
+                }
+            }
+            tree.flush_dirty(&mut ctx).await.expect("flush");
+            tree
+        });
+        (file, cache, tree, ctx)
+    };
+
+    // Hot point lookup: everything cached; latch-free snapshot fold.
+    let (_hot_file, _hot_cache, hot_tree, _hot_ctx) = build_volume(4096);
+    group.bench_function("point_lookup_hot_100k", |b| {
+        let mut i = 0u64;
+        b.to_async(&rt).iter(|| {
+            let tree = &hot_tree;
+            let key = inode_key(i % KEYS);
+            i = i.wrapping_add(7919);
+            async move {
+                black_box(tree.lookup(black_box(&key)).await.expect("lookup"));
+            }
+        });
+    });
+
+    // Range scan: 1,024 records per iteration through held snapshots.
+    group.bench_function("range_scan_1k_of_100k", |b| {
+        let mut i = 0u64;
+        b.to_async(&rt).iter(|| {
+            let tree = &hot_tree;
+            let start = inode_key((i * 1024) % (KEYS - 2048));
+            i = i.wrapping_add(1);
+            async move {
+                let out = tree
+                    .range(black_box(&start), &inode_key(KEYS), 1024)
+                    .await
+                    .expect("range");
+                black_box(out.len());
+            }
+        });
+    });
+
+    // Cold point lookup: a 2-node budget forces demand paging (leaf
+    // eviction) on nearly every probe — one 256 KiB uring read + snapshot
+    // build per miss.
+    let (_cold_file, _cold_cache, cold_tree, _cold_ctx) = build_volume(2);
+    group.bench_function("point_lookup_cold_demand_page", |b| {
+        let mut i = 0u64;
+        b.to_async(&rt).iter(|| {
+            let tree = &cold_tree;
+            // Stride across leaves so consecutive probes never share one.
+            let key = inode_key((i * 40_009) % KEYS);
+            i = i.wrapping_add(1);
+            async move {
+                black_box(tree.lookup(black_box(&key)).await.expect("lookup"));
+            }
+        });
+    });
+
+    // Insert: resolve → lock → revalidate → apply + snapshot swap, with
+    // maintenance amortized inline (the K6b cadence stand-in; the tokio
+    // Mutex is uncontended — it exists to carry &mut SmoContext into the
+    // async closure).
+    let (_ins_file, _ins_cache, ins_tree, ins_ctx) = build_volume(4096);
+    let ins_ctx = tokio::sync::Mutex::new(ins_ctx);
+    group.bench_function("insert_48b", |b| {
+        let mut i = KEYS;
+        b.to_async(&rt).iter(|| {
+            let tree = &ins_tree;
+            let ctx = &ins_ctx;
+            let key = inode_key(i);
+            let mut v = vec![0u8; 48];
+            v[..8].copy_from_slice(&i.to_le_bytes());
+            i += 1;
+            async move {
+                tree.insert(black_box(&key), v).await.expect("insert");
+                if tree.maintenance_pending() {
+                    let mut ctx = ctx.lock().await;
+                    tree.run_maintenance(&mut ctx).await.expect("maintenance");
+                }
+            }
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_metalv_metadata, bench_kv_bset, bench_kv_tree);
 criterion_main!(benches);

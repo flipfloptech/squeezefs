@@ -187,6 +187,88 @@ impl RecordIndex {
         Ok(Self { sources, entries })
     }
 
+    /// Extend the merged view with ONE newer bset image appended to
+    /// `sources` — the freeze hot path (§4.6 pt 1). A two-way merge of
+    /// the existing entries (already `(key asc, seq desc, src desc)`)
+    /// with the new source's records: O(existing + new), never
+    /// re-parsing the old images. `build` over all sources is a k-way
+    /// cursor merge that scans every source per emitted entry — O(total
+    /// × sources) with a full re-parse — which the K7 threshold-wake
+    /// cadence turned into 37 % of the serial create path (one freeze
+    /// per ~40 records instead of per tick).
+    ///
+    /// Exact-`(key, seq)` ties order the NEW source first (idempotent
+    /// replay re-freezing a record that already reached a bset) — the
+    /// `build`/`bset::merge` convention, by construction here since the
+    /// new source has the highest `src`.
+    fn extend_with(&self, new_source: Bytes) -> Result<Self, KvError> {
+        let view = BsetView::parse(&new_source)?;
+        let si = self.sources.len();
+        let src = u16::try_from(si)
+            .map_err(|_| KvError::Corrupt(format!("record index with {} sources", si + 1)))?;
+        let mut sources = self.sources.clone(); // Bytes clones: refcounts only
+        sources.push(new_source.clone());
+
+        // The new view's entries in output order: bsets store a key's
+        // records seq ASC — reverse every same-key run to seq DESC.
+        let base = new_source.as_ptr() as usize;
+        let mut fresh: Vec<IdxRec> = Vec::with_capacity(view.len());
+        let mut i = 0usize;
+        while i < view.len() {
+            let mut j = i + 1;
+            while j < view.len() && view.record(j).key == view.record(i).key {
+                j += 1;
+            }
+            for k in (i..j).rev() {
+                let r = view.record(k);
+                let key_off = r.key.as_ptr() as usize - base;
+                let val_off = if r.value.is_empty() {
+                    0
+                } else {
+                    r.value.as_ptr() as usize - base
+                };
+                debug_assert!(key_off + r.key.len() <= new_source.len());
+                fresh.push(IdxRec {
+                    src,
+                    kind: r.kind,
+                    key_len: r.key.len() as u16,
+                    key_off: key_off as u32,
+                    val_off: val_off as u32,
+                    val_len: r.value.len() as u32,
+                    seq: r.seq,
+                });
+            }
+            i = j;
+        }
+
+        // Linear merge on (key asc, seq desc, src desc).
+        fn key_of<'a>(srcs: &'a [Bytes], e: &IdxRec) -> &'a [u8] {
+            let s = &srcs[e.src as usize];
+            &s[e.key_off as usize..e.key_off as usize + e.key_len as usize]
+        }
+        let mut entries = Vec::with_capacity(self.entries.len() + fresh.len());
+        let (mut a, mut b) = (0usize, 0usize);
+        while a < self.entries.len() && b < fresh.len() {
+            let ea = &self.entries[a];
+            let eb = &fresh[b];
+            let take_a = match key_of(&sources, ea).cmp(key_of(&sources, eb)) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Greater => false,
+                std::cmp::Ordering::Equal => ea.seq > eb.seq, // tie ⇒ new (higher src) first
+            };
+            if take_a {
+                entries.push(*ea);
+                a += 1;
+            } else {
+                entries.push(*eb);
+                b += 1;
+            }
+        }
+        entries.extend_from_slice(&self.entries[a..]);
+        entries.extend_from_slice(&fresh[b..]);
+        Ok(Self { sources, entries })
+    }
+
     #[inline]
     fn key_at(&self, e: &IdxRec) -> &[u8] {
         &self.sources[e.src as usize][e.key_off as usize..e.key_off as usize + e.key_len as usize]
@@ -758,13 +840,14 @@ impl CachedNode {
         let frame = encode_bset_frame(layout, self.node_seq, &records, horizon)?;
         let frame_len = frame.len();
         let frame = Bytes::from(frame);
-        // The frame's embedded bset becomes one more index source.
+        // The frame's embedded bset becomes one more index source —
+        // merged INCREMENTALLY (O(existing + new)): the k-way rebuild
+        // was 37 % of the serial create path once threshold wakes made
+        // freezes per-bset-worth frequent (§4.6 pt 1, PR K7).
         let bset_len = u32::from_le_bytes([frame[20], frame[21], frame[22], frame[23]]) as usize;
         let bset_image = frame.slice(BSET_FRAME_LEN..BSET_FRAME_LEN + bset_len);
         let cur = self.snapshot.load();
-        let mut sources = cur.base.sources.clone();
-        sources.push(bset_image);
-        let base = Arc::new(RecordIndex::build(sources)?);
+        let base = Arc::new(cur.base.extend_with(bset_image)?);
         guard.overlay.clear();
         guard.overlay_bytes = 0;
         let frozen = FrozenDelta {

@@ -1109,8 +1109,10 @@ impl KvMetaBackend {
                     .expect("node is in its own lock set");
                 node.apply_locked(&mut guards[gi], group)?;
             }
-            // Writeback pressure (§4.6 pt 1) — flagged inside the window,
-            // drained by the checkpoint task.
+            // Writeback pressure (§4.6 pt 1's SECOND trigger: "when a
+            // node's dirty delta exceeds a bset worth") — flagged inside
+            // the window, drained by the checkpoint task.
+            let mut threshold_crossed = false;
             for (gi, node) in lock_set.iter().enumerate() {
                 if guards[gi].overlay_bytes() >= self.cache.config().writeback_delta_bytes {
                     let (tree_id, _) = recs
@@ -1120,9 +1122,18 @@ impl KvMetaBackend {
                         .map(|((t, _), _)| (*t, ()))
                         .expect("group nonempty implies a record");
                     self.tree_by_id(tree_id).enqueue_maintenance(node.addr());
+                    threshold_crossed = true;
                 }
             }
             drop(guards);
+            if threshold_crossed {
+                // Wake the task for a maintenance-only pass NOW (appends,
+                // no barrier/ledger — those stay on cadence): letting the
+                // open delta balloon for a whole tick makes every commit's
+                // RAM apply pay O(delta) — the K7 create-row cliff. The
+                // permit coalesces storms into one pending wake.
+                self.ckpt_wake.notify_one();
+            }
             break (res, undo);
         };
 

@@ -345,26 +345,72 @@ async fn checkpoint_task(
     // iff this task is still running.
     let _alive = alive;
     let mut last_checkpoint = std::time::Instant::now();
+    // A FIXED cadence (not sleep-in-select, which would re-arm on every
+    // wake): §4.6 pt 1 threshold wakes must never starve the cadence's
+    // barriers/checkpoints under a sustained storm.
+    let period = std::time::Duration::from_millis(interval_ms);
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(interval_ms)) => {}
-            _ = wake.notified() => {}
-        }
+        let cadence = tokio::select! {
+            _ = ticker.tick() => true,
+            _ = wake.notified() => false,
+        };
         let Some(be) = weak.upgrade() else {
             return; // backend dropped without shutdown: exit, leak nothing
         };
         let shutting_down = be.is_shutting_down();
-        if let Err(e) = tick(&be, &mut last_checkpoint, shutting_down).await {
-            log::warn!(
-                "kv checkpoint tick failed on {:?}: {e} (state stays RAM-consistent; \
-                 retrying next tick)",
-                be.device_path()
-            );
-        }
-        if shutting_down {
-            return; // final checkpoint ran inside the tick
+        if cadence || shutting_down {
+            if let Err(e) = tick(&be, &mut last_checkpoint, shutting_down).await {
+                log::warn!(
+                    "kv checkpoint tick failed on {:?}: {e} (state stays RAM-consistent; \
+                     retrying next tick)",
+                    be.device_path()
+                );
+            }
+            if shutting_down {
+                return; // final checkpoint ran inside the tick
+            }
+        } else {
+            // §4.6 pt 1's threshold trigger (a commit crossed a bset
+            // worth of open delta): appends only — no barrier, no ledger,
+            // both stay on the cadence. Commit RAM-apply cost is O(open
+            // delta), so the drain must not wait out the tick.
+            if let Err(e) = maintenance_pass(&be).await {
+                log::warn!(
+                    "kv maintenance pass failed on {:?}: {e} (state stays RAM-consistent; \
+                     the cadence tick retries)",
+                    be.device_path()
+                );
+            }
+            // Work arrived while draining (or a reserve drain deferred
+            // it): re-arm and return to the select so the ticker still
+            // gets its turn — never spin the cadence out.
+            if be.trees().into_iter().any(|t| t.maintenance_pending()) {
+                wake.notify_one();
+            }
         }
     }
+}
+
+/// The maintenance-only wake body: drain every tree's threshold queue
+/// (bset appends + any compact/split the appends force). Journal-reserve
+/// exhaustion runs one full checkpoint cycle — the §4.4 pt 5 zero-ring-
+/// byte drain — exactly like the cadence tick's maintenance step.
+async fn maintenance_pass(be: &Arc<KvMetaBackend>) -> Result<(), KvError> {
+    let mut smo = be.smo.lock().await;
+    for tree in be.trees() {
+        loop {
+            match tree.run_maintenance(&mut smo).await {
+                Ok(_) => break,
+                Err(KvError::JournalReserveExhausted { .. }) => {
+                    be.checkpoint_cycle(&mut smo, true).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One task tick: maintenance → deferred flush barrier → checkpoint when

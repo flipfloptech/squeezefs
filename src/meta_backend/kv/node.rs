@@ -335,17 +335,26 @@ pub async fn load_node(
     todo!("PR K2 implementation commit")
 }
 
-/// Compact `src` into a single-base-bset node at a **fresh** caller-provided
+/// Compact `src` — its on-disk bset log **plus** `extra_records`, the
+/// caller's frozen dirty delta that no longer fits the log (§4.6 pt 1 /
+/// SMO successor build: "re-freeze any delta that accumulated … into the
+/// successor") — into a single-base-bset node at a **fresh** caller-provided
 /// extent (`dst_addr` ≠ the source extent — never in place, §4.1): n-way
 /// merge + the single fold algebra with the §4.2 tombstone-elision rule at
-/// `durable_tail`. Identity (tree_id, level, min/max keys) carries over from
-/// `src`; the output horizon is the max over source bset horizons. A folded
-/// output too large for one node is [`KvError::NodeFull`] — the caller's
-/// signal to split instead (§4.6 pt 1).
+/// `durable_tail`. `extra_records` is the newest fold source and must be
+/// strictly `(key, seq)` ascending (bset build rules); empty is legal.
+/// Identity (tree_id, level, min/max keys) carries over from `src`; the
+/// output horizon is the max over source bset horizons and `extra_records`
+/// seqs. A folded output too large for one node is [`KvError::NodeFull`] —
+/// the caller's signal to split instead (§4.6 pt 1: "oversized
+/// post-compaction ⇒ split"); a node's own log alone can never overflow
+/// (folding only reclaims append padding), so that signal is reachable
+/// exactly when the frozen delta folds in.
 pub async fn compact_node(
     path: impl AsRef<Path>,
     layout: &NodeLayout,
     src: &LoadedNode,
+    extra_records: &[Record],
     dst_addr: u64,
     dst_node_seq: u64,
     durable_tail: u64,
@@ -354,6 +363,7 @@ pub async fn compact_node(
         path.as_ref(),
         layout,
         src,
+        extra_records,
         dst_addr,
         dst_node_seq,
         durable_tail,
@@ -368,10 +378,11 @@ pub struct SplitDest {
     pub node_seq: u64,
 }
 
-/// Split `src` into two fresh nodes (left, right) at caller-provided
-/// extents: fold as in [`compact_node`], partition the folded records at an
-/// encoded-byte-balanced key boundary, and write two images. Key-space
-/// bounds: left spans `[src.min_key, last left key]`, right spans
+/// Split `src` (+ the frozen-delta `extra_records`, as in [`compact_node`])
+/// into two fresh nodes (left, right) at caller-provided extents: fold,
+/// partition the folded records at an encoded-byte-balanced key boundary,
+/// and write two images. Key-space bounds: left spans
+/// `[src.min_key, last left key]`, right spans
 /// `[first right key, src.max_key]` — the parent-pointer update belongs to
 /// the K5 SMO task. Fewer than two folded records cannot split
 /// ([`KvError::Corrupt`]); destinations must be fresh and distinct.
@@ -379,10 +390,19 @@ pub async fn split_node(
     path: impl AsRef<Path>,
     layout: &NodeLayout,
     src: &LoadedNode,
+    extra_records: &[Record],
     left: &SplitDest,
     right: &SplitDest,
     durable_tail: u64,
 ) -> Result<(WrittenNode, WrittenNode), KvError> {
-    let _ = (path.as_ref(), layout, src, left, right, durable_tail);
+    let _ = (
+        path.as_ref(),
+        layout,
+        src,
+        extra_records,
+        left,
+        right,
+        durable_tail,
+    );
     todo!("PR K2 implementation commit")
 }

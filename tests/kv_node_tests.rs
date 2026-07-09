@@ -585,12 +585,12 @@ async fn test_compact_folds_into_fresh_extent_old_untouched() {
         .expect("src image");
 
     // Compacting IN PLACE is a protocol violation, refused before any I/O.
-    let err = compact_node(vol.path(), &l, &src, src_addr, 2, 6)
+    let err = compact_node(vol.path(), &l, &src, &[], src_addr, 2, 6)
         .await
         .expect_err("in-place compaction must be refused");
     assert!(matches!(err, KvError::Corrupt(_)), "got {err:?}");
 
-    let compacted = compact_node(vol.path(), &l, &src, dst_addr, 2, 6)
+    let compacted = compact_node(vol.path(), &l, &src, &[], dst_addr, 2, 6)
         .await
         .expect("compact");
     assert_eq!(compacted.node_addr, dst_addr);
@@ -688,7 +688,7 @@ async fn test_split_partitions_key_space_into_two_fresh_nodes() {
 
     // Destination hygiene: fresh + distinct.
     assert!(
-        split_node(vol.path(), &l, &src, &left_dest, &left_dest, 300)
+        split_node(vol.path(), &l, &src, &[], &left_dest, &left_dest, 300)
             .await
             .is_err(),
         "left == right must be refused"
@@ -698,13 +698,13 @@ async fn test_split_partitions_key_space_into_two_fresh_nodes() {
         node_seq: 2,
     };
     assert!(
-        split_node(vol.path(), &l, &src, &bad, &right_dest, 300)
+        split_node(vol.path(), &l, &src, &[], &bad, &right_dest, 300)
             .await
             .is_err(),
         "splitting onto the source extent must be refused"
     );
 
-    let (lw, rw) = split_node(vol.path(), &l, &src, &left_dest, &right_dest, 300)
+    let (lw, rw) = split_node(vol.path(), &l, &src, &[], &left_dest, &right_dest, 300)
         .await
         .expect("split");
     assert!(
@@ -781,6 +781,7 @@ async fn test_split_partitions_key_space_into_two_fresh_nodes() {
         vol.path(),
         &l,
         &one,
+        &[],
         &SplitDest {
             node_addr: 4 * n,
             node_seq: 9,
@@ -796,20 +797,22 @@ async fn test_split_partitions_key_space_into_two_fresh_nodes() {
     assert!(matches!(err, KvError::Corrupt(_)), "got {err:?}");
 }
 
-/// `compact_node` refuses (typed `NodeFull`) when the folded output cannot
-/// fit one node — the §4.6 "oversized post-compaction ⇒ split" signal — and
-/// `split_node` then handles exactly that input.
+/// The §4.6 pt 1 escalation, end to end: a node whose log is `NodeFull`
+/// compacts together with the frozen dirty delta that no longer fits
+/// (`extra_records` — the K5 SMO's successor-build input); when even the
+/// fold cannot fit one node, `compact_node` refuses with the typed
+/// `NodeFull` split signal and `split_node` absorbs exactly that input.
+/// (A node's own log alone can never overflow — folding only reclaims
+/// append padding — so the signal is reachable exactly this way.)
 #[tokio::test]
 async fn test_compact_overflow_signals_split() {
     let vol = fresh_volume();
     let small = NodeLayout::new(MIN_NODE_SIZE).expect("64 KiB layout");
 
-    // Fill a 64 KiB node's log with ~2 KiB-value records across appends:
-    // 15 pages × one ~2 KiB record — the folded output (~34 KiB of live
-    // records) fits; so instead use ~3.5 KiB values: 15 × ~3.6 KiB ≈ 54 KiB
-    // of live payload > 63 KiB? Not quite — drive it deterministically:
-    // every record is distinct-keyed, values sized so the SUM of folded
-    // records exceeds node capacity while each append is one page.
+    // Fill the 64 KiB node's log completely: 15 appends × one ~4 KiB-value
+    // record (each padded frame = 2 pages) would overshoot — use 15 one-page
+    // frames with ~2 KiB values, distinct keys: the log is full at ~34 KiB
+    // of live payload.
     write_node(vol.path(), &small, &params(0, 1, b"", b"\xff"), &[], 0)
         .await
         .expect("header-only");
@@ -819,17 +822,22 @@ async fn test_compact_overflow_signals_split() {
         tail_offset: NODE_PAGE,
     };
     for i in 0..15u64 {
-        let rec = Record::put(inode_key(i).to_vec(), i + 1, vec![0x11; 4000]);
+        let rec = Record::put(inode_key(i).to_vec(), i + 1, vec![0x11; 2048]);
         dest.tail_offset = append_bset(vol.path(), &small, &dest, &[rec], i + 1)
             .await
             .expect("append");
     }
     let src = load_node(vol.path(), &small, 0, 0).await.expect("load");
     assert_eq!(src.bset_count(), 15);
+    assert_eq!(src.tail_offset(), MIN_NODE_SIZE, "log full");
 
-    // 15 × ~4 KiB live records ≈ 60 KiB + base-bset/header overhead
-    // > 64 KiB − 4 KiB header page ⇒ the fold cannot fit one node.
-    let err = compact_node(vol.path(), &small, &src, MIN_NODE_SIZE as u64, 2, 0)
+    // The frozen delta that no longer fits the log: 8 more distinct-keyed
+    // ~4 KiB-value records. Fold = 15 × ~2 KiB + 8 × ~4 KiB ≈ 64 KiB of
+    // records > 64 KiB − 4 KiB header − bset overhead ⇒ cannot fit.
+    let extra: Vec<Record> = (100..108u64)
+        .map(|i| Record::put(inode_key(i).to_vec(), i, vec![0x22; 4096]))
+        .collect();
+    let err = compact_node(vol.path(), &small, &src, &extra, MIN_NODE_SIZE as u64, 2, 0)
         .await
         .expect_err("oversized fold must not silently write");
     assert!(
@@ -837,22 +845,29 @@ async fn test_compact_overflow_signals_split() {
         "compact overflow is the typed split signal, got {err:?}"
     );
 
-    // And the split of the same source succeeds.
+    // Without the frozen delta the same log compacts fine (padding reclaim).
+    let alone = compact_node(vol.path(), &small, &src, &[], MIN_NODE_SIZE as u64, 2, 0)
+        .await
+        .expect("a node's own log always compacts");
+    assert_eq!(alone.record_count, 15);
+
+    // And the split of the oversized fold succeeds, preserving every record.
     let (lw, rw) = split_node(
         vol.path(),
         &small,
         &src,
-        &SplitDest {
-            node_addr: MIN_NODE_SIZE as u64,
-            node_seq: 2,
-        },
+        &extra,
         &SplitDest {
             node_addr: 2 * MIN_NODE_SIZE as u64,
             node_seq: 3,
+        },
+        &SplitDest {
+            node_addr: 3 * MIN_NODE_SIZE as u64,
+            node_seq: 4,
         },
         0,
     )
     .await
     .expect("split absorbs the oversized fold");
-    assert_eq!(lw.record_count + rw.record_count, 15);
+    assert_eq!(lw.record_count + rw.record_count, 15 + 8);
 }

@@ -710,7 +710,7 @@ async fn test_kv_node_torn_rewrite_unreferenced_old_node_untouched() {
     // header checksum field never does.
     let dst = DEFAULT_NODE_SIZE as u64;
     uring_fs::arm_torn_write(dst, 20);
-    let err = compact_node(vol.path(), &l, &src, dst, 2, 0)
+    let err = compact_node(vol.path(), &l, &src, &[], dst, 2, 0)
         .await
         .expect_err("torn rewrite must report the device error");
     match err {
@@ -746,6 +746,7 @@ async fn test_kv_node_torn_rewrite_unreferenced_old_node_untouched() {
         vol.path(),
         &l,
         &src_again,
+        &[],
         &SplitDest {
             node_addr: 2 * dst,
             node_seq: 3,

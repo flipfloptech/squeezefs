@@ -40,7 +40,7 @@
 //! The bitmap is a **checkpoint accelerator, not the sole truth**: every
 //! alloc/free emits a journal record and mount replays records ≥ tail over
 //! the loaded pages. Allocator deltas ride the K3 entry framing tagged
-//! [`TREE_ALLOC_RESERVED`](super::record::TREE_ALLOC_RESERVED) — §4.2
+//! [`super::record::TREE_ALLOC_RESERVED`] — §4.2
 //! reserves that id for the snapshot-era
 //! refcounted-extent *node tree*; until then it unambiguously names
 //! journal-resident allocator records (allocator state never lives in

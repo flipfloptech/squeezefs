@@ -360,22 +360,35 @@ pub enum LiveLookup {
     Absent,
 }
 
+/// Published open-delta records newer than the last `stable` re-merge:
+/// the per-apply snapshot publish clones only this run, so it stays
+/// small by construction (PR K7: the whole-overlay clone per commit was
+/// ~44 % of the serial create path — Bytes refcount storms on clone AND
+/// on the previous snapshot's drop).
+const OVERLAY_TAIL_MAX: usize = 8;
+
 /// The immutable, latch-free read view of one node (§4.5): a merged
 /// record index over every serialized source plus the open-delta overlay.
 /// Readers load the `Arc`, search, and hand out `Bytes` — no lock, no
 /// copy; a writer swaps a whole new snapshot after its RAM apply.
 pub struct NodeSnapshot {
     base: Arc<RecordIndex>,
-    /// Open-delta records, `(key asc, seq asc)` — always newer than every
-    /// base record (seqs are assigned monotonically inside the node-lock
-    /// window, §4.4 pt 2).
-    overlay: Arc<Vec<OwnedRec>>,
+    /// Open-delta records, two key-sorted runs. `stable` is Arc-SHARED
+    /// across publishes (O(1) per apply); `tail` holds the ≤
+    /// [`OVERLAY_TAIL_MAX`] records applied since the last re-merge and
+    /// is the only per-apply clone. Fold precedence: per key, every
+    /// `tail` record is at least as new as every `stable` record, and
+    /// both are newer than `base` — enforced by the monotonic per-node
+    /// seq mint, with the apply path forcing a re-merge on any observed
+    /// seq inversion (replayed original seqs at mount).
+    stable: Arc<Vec<OwnedRec>>,
+    tail: Arc<Vec<OwnedRec>>,
 }
 
 impl NodeSnapshot {
     /// Records in the open-delta overlay (tests / writeback sizing).
     pub fn overlay_len(&self) -> usize {
-        self.overlay.len()
+        self.stable.len() + self.tail.len()
     }
 
     /// Total indexed records across serialized sources (not folded).
@@ -383,35 +396,35 @@ impl NodeSnapshot {
         self.base.entries.len()
     }
 
-    fn overlay_group(&self, key: &[u8]) -> std::ops::Range<usize> {
-        let lo = self.overlay.partition_point(|r| &r.key[..] < key);
-        let hi = self.overlay.partition_point(|r| &r.key[..] <= key);
+    fn run_group(run: &[OwnedRec], key: &[u8]) -> std::ops::Range<usize> {
+        let lo = run.partition_point(|r| &r.key[..] < key);
+        let hi = run.partition_point(|r| &r.key[..] <= key);
         lo..hi
     }
 
-    /// Fold one key with the single K1 algebra: overlay group newest-first,
+    /// Fold one key with the single K1 algebra: overlay runs newest-first
+    /// (tail, then stable — see the run ordering invariant on the struct),
     /// then base group (already `(seq desc)`), zero-copy value return.
+    /// The gather is a chained iterator — no per-fold allocation (PR K7:
+    /// two Vecs per fold showed up in every chain probe behind every
+    /// lookup/create/unlink).
     pub fn lookup(&self, key: &[u8]) -> Result<LiveLookup, KvError> {
-        let og = self.overlay_group(key);
+        let tg = Self::run_group(&self.tail, key);
+        let sg = Self::run_group(&self.stable, key);
         let bg = self.base.group_bounds(key);
-        // Gather newest-first: overlay reversed (seq asc storage), then base.
-        let mut refs: Vec<RecordRef<'_>> = Vec::with_capacity(og.len() + bg.len());
-        let mut providers: Vec<Provider> = Vec::with_capacity(og.len() + bg.len());
-        for i in og.clone().rev() {
-            refs.push(self.overlay[i].record_ref());
-            providers.push(Provider::Overlay(i));
-        }
-        for i in bg.clone() {
-            refs.push(self.base.record_ref(i));
-            providers.push(Provider::Base(i));
-        }
-        match fold_newest_first(refs.iter().copied())? {
+        let gather = tg
+            .clone()
+            .rev()
+            .map(|i| self.tail[i].record_ref())
+            .chain(sg.clone().rev().map(|i| self.stable[i].record_ref()))
+            .chain(bg.clone().map(|i| self.base.record_ref(i)));
+        match fold_newest_first(gather)? {
             Folded::Absent => Ok(LiveLookup::Absent),
             Folded::Tombstone { .. } => Ok(LiveLookup::Tombstone),
             Folded::Put { value, .. } => Ok(LiveLookup::Live(match value {
                 std::borrow::Cow::Owned(v) => Bytes::from(v),
                 std::borrow::Cow::Borrowed(v) => {
-                    self.materialize(&refs, &providers, v).ok_or_else(|| {
+                    self.materialize(tg, sg, bg, v).ok_or_else(|| {
                         KvError::Corrupt(
                             "folded borrow does not match any gathered record".to_string(),
                         )
@@ -422,37 +435,50 @@ impl NodeSnapshot {
     }
 
     /// Map a fold's borrowed value back to its provider for a zero-copy
-    /// `Bytes` (the borrow is always one gathered record's value slice).
+    /// `Bytes` (the borrow is always one gathered record's value slice;
+    /// the groups are re-walked by pointer — bounded by the chain length).
     fn materialize(
         &self,
-        refs: &[RecordRef<'_>],
-        providers: &[Provider],
+        tg: std::ops::Range<usize>,
+        sg: std::ops::Range<usize>,
+        bg: std::ops::Range<usize>,
         v: &[u8],
     ) -> Option<Bytes> {
-        for (r, p) in refs.iter().zip(providers) {
-            if std::ptr::eq(r.value.as_ptr(), v.as_ptr()) && r.value.len() == v.len() {
-                return Some(match p {
-                    Provider::Overlay(i) => self.overlay[*i].value.clone(),
-                    Provider::Base(i) => self.base.value_bytes(*i),
-                });
+        let hit = |val: &[u8]| std::ptr::eq(val.as_ptr(), v.as_ptr()) && val.len() == v.len();
+        for i in tg {
+            if hit(&self.tail[i].value) {
+                return Some(self.tail[i].value.clone());
+            }
+        }
+        for i in sg {
+            if hit(&self.stable[i].value) {
+                return Some(self.stable[i].value.clone());
+            }
+        }
+        for i in bg {
+            if hit(self.base.value_at(&self.base.entries[i])) {
+                return Some(self.base.value_bytes(i));
             }
         }
         None
     }
 
-    /// The newest record seq present for `key` across the overlay and
-    /// every serialized source, or `None` when the key has no records —
-    /// the §4.4 pt 4 rollback's seq-conditional probe ("rollback restores
-    /// a key only if its newest dirty record still bears this tx's seq").
+    /// The newest record seq present for `key` across the overlay runs
+    /// and every serialized source, or `None` when the key has no records
+    /// — the §4.4 pt 4 rollback's seq-conditional probe ("rollback
+    /// restores a key only if its newest dirty record still bears this
+    /// tx's seq").
     pub fn newest_record_seq(&self, key: &[u8]) -> Option<u64> {
-        let og = self.overlay_group(key);
-        let overlay_newest = og.clone().next_back().map(|i| self.overlay[i].seq);
+        let tg = Self::run_group(&self.tail, key);
+        let sg = Self::run_group(&self.stable, key);
+        let tail_newest = tg.clone().next_back().map(|i| self.tail[i].seq);
+        let stable_newest = sg.clone().next_back().map(|i| self.stable[i].seq);
         let bg = self.base.group_bounds(key);
         // Base groups are (seq desc): the first entry is the newest.
         let base_newest = (!bg.is_empty()).then(|| self.base.entries[bg.start].seq);
-        match (overlay_newest, base_newest) {
-            (None, None) => None,
-            (a, b) => Some(a.unwrap_or(0).max(b.unwrap_or(0))),
+        match (tail_newest, stable_newest, base_newest) {
+            (None, None, None) => None,
+            (a, b, c) => Some(a.unwrap_or(0).max(b.unwrap_or(0)).max(c.unwrap_or(0))),
         }
     }
 
@@ -477,33 +503,35 @@ impl NodeSnapshot {
         let mut cursor: Vec<u8> = from.to_vec();
         loop {
             let bi = self.base.first_at_or_after(&cursor);
-            let oi = self.overlay.partition_point(|r| &r.key[..] < &cursor[..]);
+            let si = self.stable.partition_point(|r| &r.key[..] < &cursor[..]);
+            let ti = self.tail.partition_point(|r| &r.key[..] < &cursor[..]);
             let bk =
                 (bi < self.base.entries.len()).then(|| self.base.key_at(&self.base.entries[bi]));
-            let ok = (oi < self.overlay.len()).then(|| &self.overlay[oi].key[..]);
-            let key: &[u8] = match (bk, ok) {
-                (None, None) => return Ok(None),
-                (Some(b), None) => b,
-                (None, Some(o)) => o,
-                (Some(b), Some(o)) => {
-                    if b <= o {
-                        b
-                    } else {
-                        o
-                    }
-                }
+            let sk = (si < self.stable.len()).then(|| &self.stable[si].key[..]);
+            let tk = (ti < self.tail.len()).then(|| &self.tail[ti].key[..]);
+            // Minimum candidate key across the three sorted sources.
+            let mut key: Option<&[u8]> = bk;
+            for cand in [sk, tk] {
+                key = match (key, cand) {
+                    (None, c) => c,
+                    (k, None) => k,
+                    (Some(k), Some(c)) => Some(if c < k { c } else { k }),
+                };
+            }
+            let Some(key) = key else {
+                return Ok(None);
             };
             if let Some(end) = end_inclusive {
                 if key > end {
                     return Ok(None);
                 }
             }
-            let key_owned; // key borrow ends at lookup; keep bytes for return
             let key_bytes = if bk == Some(key) {
-                key_owned = self.base.key_bytes(bi);
-                key_owned.clone()
+                self.base.key_bytes(bi)
+            } else if sk == Some(key) {
+                self.stable[si].key.clone()
             } else {
-                self.overlay[oi].key.clone()
+                self.tail[ti].key.clone()
             };
             match self.lookup(key_bytes.as_ref())? {
                 LiveLookup::Live(v) => return Ok(Some((key_bytes, v))),
@@ -518,11 +546,6 @@ impl NodeSnapshot {
     }
 }
 
-enum Provider {
-    Base(usize),
-    Overlay(usize),
-}
-
 // ---------------------------------------------------------------------------
 // The cached node.
 // ---------------------------------------------------------------------------
@@ -531,10 +554,24 @@ enum Provider {
 /// (§4.4 pt 1: locks cover RAM mutation only — the append itself runs
 /// outside, on the serialized writeback/SMO task).
 pub struct NodeDirty {
-    /// Open-delta records, `(key asc, seq asc)`.
+    /// Open-delta records, `(key asc, seq asc)` — the AUTHORITATIVE
+    /// merged view (freeze, SMO take-over, and rollback all operate on
+    /// it, exactly as before the two-run publish split below).
     overlay: Vec<OwnedRec>,
     /// Encoded size of `overlay` (writeback threshold input).
     overlay_bytes: usize,
+    /// Publish mirrors of `overlay`, split so the per-apply snapshot swap
+    /// clones only a bounded tail (PR K7): `merge(snap_stable, snap_tail)
+    /// == overlay` at every publish point. `snap_stable` is Arc-shared
+    /// with published snapshots; `snap_tail` holds the ≤
+    /// [`OVERLAY_TAIL_MAX`] records applied since the last re-merge.
+    snap_stable: Arc<Vec<OwnedRec>>,
+    snap_tail: Vec<OwnedRec>,
+    /// Highest record seq ever applied to this node — the run-precedence
+    /// guard: an apply carrying a seq at-or-below it (mount replay's
+    /// original seqs) forces a stable re-merge, keeping "tail ≥ stable
+    /// per key" true by construction everywhere else.
+    max_applied_seq: u64,
     /// A frozen delta not yet appended: `(records, bset image)` — the bset
     /// image is already merged into the snapshot base; the records are the
     /// append/compact input (§4.6 pt 1).
@@ -581,9 +618,12 @@ impl NodeDirty {
     /// Take the open delta (the §4.6 "delta that accumulated during the
     /// build") — SMO-only, under the child's write lock; the records move
     /// into the successors' open deltas. Published snapshots are immutable
-    /// and keep serving the pre-swap view.
+    /// and keep serving the pre-swap view (the mirrors are cleared but no
+    /// new snapshot is published here — §4.6: "snapshot left intact").
     pub fn take_overlay(&mut self) -> Vec<OwnedRec> {
         self.overlay_bytes = 0;
+        self.snap_stable = Arc::new(Vec::new());
+        self.snap_tail.clear();
         std::mem::take(&mut self.overlay)
     }
 
@@ -650,11 +690,15 @@ impl CachedNode {
             state: NodeState::new(),
             snapshot: ArcSwap::from_pointee(NodeSnapshot {
                 base,
-                overlay: Arc::new(Vec::new()),
+                stable: Arc::new(Vec::new()),
+                tail: Arc::new(Vec::new()),
             }),
             dirty: tokio::sync::RwLock::new(NodeDirty {
                 overlay: Vec::new(),
                 overlay_bytes: 0,
+                snap_stable: Arc::new(Vec::new()),
+                snap_tail: Vec::new(),
+                max_applied_seq: 0,
                 frozen: None,
                 tail_offset,
             }),
@@ -749,12 +793,45 @@ impl CachedNode {
                 .overlay
                 .partition_point(|r| (&r.key[..], r.seq) <= (&rec.key[..], rec.seq));
             guard.overlay_bytes += rec.record_ref().encoded_len();
-            guard.overlay.insert(pos, rec);
+            // Run-precedence guard: mount replay applies ORIGINAL seqs,
+            // which may sort below records already published (idempotent
+            // duplicates and window interleavings). Fold order requires
+            // "tail ≥ stable per key", so a non-monotonic apply re-merges
+            // the whole overlay into a fresh stable run instead of
+            // riding the tail (replay-only cost, bounded by the window).
+            let monotonic = rec.seq > guard.max_applied_seq;
+            guard.max_applied_seq = guard.max_applied_seq.max(rec.seq);
+            if monotonic {
+                let tpos = guard
+                    .snap_tail
+                    .partition_point(|r| (&r.key[..], r.seq) <= (&rec.key[..], rec.seq));
+                guard.snap_tail.insert(tpos, rec.clone());
+                guard.overlay.insert(pos, rec);
+            } else {
+                guard.overlay.insert(pos, rec);
+                guard.snap_stable = Arc::new(guard.overlay.clone());
+                guard.snap_tail.clear();
+            }
         }
+        // Publish: Arc-share the stable run, clone only the small tail
+        // (PR K7 — the whole-overlay clone per apply was ~44 % of the
+        // serial create path). Tail overflow re-merges into a fresh
+        // stable run, amortizing the full clone over OVERLAY_TAIL_MAX
+        // applies.
+        if guard.snap_tail.len() > OVERLAY_TAIL_MAX {
+            guard.snap_stable = Arc::new(guard.overlay.clone());
+            guard.snap_tail.clear();
+        }
+        debug_assert_eq!(
+            guard.snap_stable.len() + guard.snap_tail.len(),
+            guard.overlay.len(),
+            "publish mirrors must partition the authoritative overlay"
+        );
         let cur = self.snapshot.load();
         self.snapshot.store(Arc::new(NodeSnapshot {
             base: cur.base.clone(),
-            overlay: Arc::new(guard.overlay.clone()),
+            stable: guard.snap_stable.clone(),
+            tail: Arc::new(guard.snap_tail.clone()),
         }));
         Ok(())
     }
@@ -806,10 +883,15 @@ impl CachedNode {
                 .iter()
                 .map(|r| r.record_ref().encoded_len())
                 .sum();
+            // Rollback is cold: resync the publish mirrors with a full
+            // re-merge and publish the corrected view.
+            guard.snap_stable = Arc::new(guard.overlay.clone());
+            guard.snap_tail.clear();
             let cur = self.snapshot.load();
             self.snapshot.store(Arc::new(NodeSnapshot {
                 base: cur.base.clone(),
-                overlay: Arc::new(guard.overlay.clone()),
+                stable: guard.snap_stable.clone(),
+                tail: Arc::new(Vec::new()),
             }));
         }
         removed
@@ -850,6 +932,8 @@ impl CachedNode {
         let base = Arc::new(cur.base.extend_with(bset_image)?);
         guard.overlay.clear();
         guard.overlay_bytes = 0;
+        guard.snap_stable = Arc::new(Vec::new());
+        guard.snap_tail.clear();
         let frozen = FrozenDelta {
             records: Arc::new(records),
             horizon,
@@ -858,7 +942,8 @@ impl CachedNode {
         guard.frozen = Some(frozen.clone());
         self.snapshot.store(Arc::new(NodeSnapshot {
             base,
-            overlay: Arc::new(Vec::new()),
+            stable: Arc::new(Vec::new()),
+            tail: Arc::new(Vec::new()),
         }));
         Ok(Some(frozen))
     }

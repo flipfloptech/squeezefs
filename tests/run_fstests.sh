@@ -293,8 +293,11 @@ EOF
 # whenever a new test surfaces a bug — that is the whole point of the tier.
 # Provenance (2026-07-09/10 v3 bring-up):
 #   112/616/617/618 = copy_file_range crawl (fix 97e2ed4)
-#   075/091/616     = hole-read / writeback-race data-path family
-#                     (fix 37fe5eb; durable writeback-race follow-up open)
+#   616             = hole-read family: PUNCH_HOLE/truncate coherence
+#                     (fixes 37fe5eb + 49286ee stale-size truncate) — GREEN
+#   075/091         = DISTINCT open bug: O_DIRECT / large-file lost-write
+#                     (reads zeros where data was written — opposite
+#                     direction from the hole bug); follow-up open
 #   008/009/285/316 = fallocate / zero-range / SEEK_HOLE / punch coverage
 #   003/069/469     = pre-existing FUSE-class failures tracked for delta
 #   001/013/074/127/213/263 = mount-cycle + fsx/fsstress core soak

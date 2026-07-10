@@ -305,7 +305,16 @@ impl BackendRouter {
     )> {
         let mut healthy_backends = Vec::new();
 
-        if self.is_backend_healthy("backend_0") {
+        // The `backend_0` default slot is a placement candidate ONLY when no
+        // named volume is registered (bare routers: offline tools, tests).
+        // On real mounts every volume — including the first, whose
+        // device/allocator ARE the default slot — is registered under its
+        // real name, and the phantom must not appear in write placement,
+        // health scoring, or the data-volume table. `backend_0` remains a
+        // pure key-resolution ALIAS of the default slot for legacy
+        // unprefixed / `backend_0://` block keys (see `parse_block_key`,
+        // `get_backend`, `free_block`).
+        if self.backends.is_empty() && self.is_backend_healthy("backend_0") {
             let health = self.get_backend_health("backend_0");
             healthy_backends.push((
                 "backend_0".to_string(),
@@ -382,6 +391,35 @@ impl BackendRouter {
             .parse::<u64>()
             .map_err(|_| err_invalid_offset())?;
         Ok((be_id.to_string(), offset))
+    }
+
+    /// The key string to PERSIST for a block just written at `offset` on the
+    /// backend `get_active_backend`/`get_backend` selected as `be_id`.
+    ///
+    /// Invariant: a persisted key must resolve — through
+    /// [`Self::parse_block_key`], now and after remount — to the same
+    /// device/allocator pair the bytes were written on. An unprefixed key
+    /// resolves to the DEFAULT slot (the `backend_0` legacy alias), so it is
+    /// only correct when the selected backend IS the default slot: the
+    /// bare-router `backend_0` id itself, or a named registration of the
+    /// first volume (main.rs registers the first volume's device/allocator
+    /// Arcs both as the default slot and under the real name). Those cases
+    /// keep today's on-disk naming — single-volume volumes stay byte-
+    /// identical with their historical unprefixed keys. Every other named
+    /// backend gets an explicit `name://offset` key; persisting a bare key
+    /// for those was the multi-volume wrong-device read/free bug.
+    pub fn persist_block_key(&self, be_id: &str, offset: u64) -> String {
+        if be_id == "backend_0" {
+            return offset.to_string();
+        }
+        if let Some(be) = self.backends.get(be_id) {
+            if std::sync::Arc::ptr_eq(&be.device, &self.default_device)
+                && std::sync::Arc::ptr_eq(&be.block_allocator, &self.default_allocator)
+            {
+                return offset.to_string();
+            }
+        }
+        format!("{}://{}", be_id, offset)
     }
 
     pub fn parse_block_offset(&self, block_key: &str) -> Result<u64> {
@@ -561,11 +599,18 @@ impl BackendRouter {
             loop {
                 interval.tick().await;
 
+                // Probe the default slot under the legacy `backend_0` name
+                // only on bare routers: on real mounts the first volume's
+                // device IS the default slot and is probed under its real
+                // name — a phantom probe would double-count it and leak the
+                // reserved alias into health state and logs.
                 let mut outcomes: Vec<(String, crate::health::Probe)> = Vec::new();
-                outcomes.push((
-                    "backend_0".to_string(),
-                    perform_device_health_check(&router.default_device).await,
-                ));
+                if router.backends.is_empty() {
+                    outcomes.push((
+                        "backend_0".to_string(),
+                        perform_device_health_check(&router.default_device).await,
+                    ));
+                }
                 for entry in router.backends.iter() {
                     outcomes.push((
                         entry.key().clone(),
@@ -599,17 +644,22 @@ impl BackendRouter {
                         "Active write backend '{}' is unhealthy! Initiating failover...",
                         active_be
                     );
+                    // Fail over to a healthy NAMED volume; the `backend_0`
+                    // default slot is a candidate only on bare routers (same
+                    // policy as `get_active_backend`).
                     let mut fallback_be = None;
-                    if router.is_backend_healthy("backend_0") {
-                        fallback_be = Some("backend_0".to_string());
-                    } else {
-                        for entry in router.backends.iter() {
-                            let be_id = entry.key();
-                            if router.is_backend_healthy(be_id) {
-                                fallback_be = Some(be_id.clone());
-                                break;
-                            }
+                    for entry in router.backends.iter() {
+                        let be_id = entry.key();
+                        if router.is_backend_healthy(be_id) {
+                            fallback_be = Some(be_id.clone());
+                            break;
                         }
+                    }
+                    if fallback_be.is_none()
+                        && router.backends.is_empty()
+                        && router.is_backend_healthy("backend_0")
+                    {
+                        fallback_be = Some("backend_0".to_string());
                     }
 
                     if let Some(healthy_be) = fallback_be {
@@ -896,7 +946,7 @@ impl DataRouter {
                 (be, off, dev)
             };
 
-            let block_key = format!("{}://{}", be_id, offset);
+            let block_key = self.backend_router.persist_block_key(&be_id, offset);
             let data_bytes = bytes::Bytes::from(serialized_map);
             nvme_writer.write_block(offset, data_bytes).await?;
 
@@ -1450,13 +1500,13 @@ impl DataRouter {
             .get_crypto()
             .process_write_async(bytes::Bytes::from(raw))
             .await?;
-        let (_be_id, allocator, writer) = self.backend_router.get_active_backend()?;
+        let (be_id, allocator, writer) = self.backend_router.get_active_backend()?;
         if processed.len() as u64 > allocator.chunk_size() {
             // Incompressible expansion past the block size: stays resident.
             return Ok(false);
         }
         let offset = allocator.allocate_block().await?;
-        let block_key = offset.to_string();
+        let block_key = self.backend_router.persist_block_key(&be_id, offset);
         if let Err(e) = writer.write_block(offset, processed).await {
             let _ = allocator.free_block(offset).await;
             return Err(e);
@@ -2221,10 +2271,10 @@ impl DataRouter {
                         .process_write_async(shared_data.clone())
                         .await?;
 
-                    let (_be_id, block_allocator, nvme_writer) =
+                    let (be_id, block_allocator, nvme_writer) =
                         self.backend_router.get_active_backend()?;
                     let be_offset = block_allocator.allocate_block().await?;
-                    let stored_block_key = be_offset.to_string();
+                    let stored_block_key = self.backend_router.persist_block_key(&be_id, be_offset);
 
                     nvme_writer.write_block(be_offset, processed_data).await?;
                     block_allocator.publish_block(be_offset);
@@ -2340,7 +2390,7 @@ impl DataRouter {
                 payload.slice_ref(sub)
             };
 
-            let (_be_id, block_allocator, nvme_writer) =
+            let (be_id, block_allocator, nvme_writer) =
                 match self.backend_router.get_active_backend() {
                     Ok(res) => res,
                     Err(e) => {
@@ -2360,7 +2410,7 @@ impl DataRouter {
                     return Err(e);
                 }
             };
-            let stored_block_key = offset.to_string();
+            let stored_block_key = self.backend_router.persist_block_key(&be_id, offset);
             allocated_keys.push(stored_block_key.clone());
 
             let chunk_len = chunk.len();
@@ -2547,10 +2597,12 @@ impl DataRouter {
                     block_data.into_bytes()
                 };
 
-                let (_be_id, block_allocator, nvme_writer) =
+                let (be_id, block_allocator, nvme_writer) =
                     router_clone.backend_router.get_active_backend()?;
                 let offset = block_allocator.allocate_block().await?;
-                let stored_new_block_key = offset.to_string();
+                let stored_new_block_key = router_clone
+                    .backend_router
+                    .persist_block_key(&be_id, offset);
 
                 let processed_block = crypto.process_write_async(block_bytes.clone()).await?;
                 nvme_writer.write_block(offset, processed_block).await?;

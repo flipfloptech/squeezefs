@@ -33,14 +33,13 @@ pub fn load_or_create_config() -> ConfigList {
             return cfg;
         }
     }
-    // Default fallback
-    let mut data_volumes = HashMap::new();
-    let mut data_volume_statuses = HashMap::new();
-    data_volumes.insert(
-        "backend_0".to_string(),
-        "/dev/shm/squeezefs_default_backend".to_string(),
-    );
-    data_volume_statuses.insert("backend_0".to_string(), "enabled".to_string());
+    // Default fallback. Data volumes start EMPTY: real volumes register at
+    // mount from the resolved data paths, and `config data-volume add` fills
+    // this map explicitly. The old hardcoded `backend_0` seed (a legacy
+    // key-resolution alias, not a volume — its `backing_dev` was not even a
+    // real path) leaked a phantom entry into every runtime config.
+    let data_volumes = HashMap::new();
+    let data_volume_statuses = HashMap::new();
 
     let mut metadata_volumes = HashMap::new();
     let mut metadata_volume_statuses = HashMap::new();

@@ -165,11 +165,10 @@ fn pattern_block(b: usize) -> Vec<u8> {
 async fn read_config_json(h: &H) -> serde_json::Value {
     let attr = h.fs.getattr(h.req, CONFIG_INODE, None, 0).await.unwrap();
     let len = attr.attr.size;
-    let reply = h
-        .fs
-        .read(h.req, CONFIG_INODE, 0, 0, len as u32)
-        .await
-        .unwrap();
+    let reply =
+        h.fs.read(h.req, CONFIG_INODE, 0, 0, len as u32)
+            .await
+            .unwrap();
     serde_json::from_slice(&reply.data).expect(".config must be valid JSON")
 }
 
@@ -246,12 +245,11 @@ async fn test_multi_volume_placement_never_selects_phantom_backend_0() {
 
     let mut seen = std::collections::HashSet::new();
     for i in 0..64 {
-        let (be_id, _, _) = h
-            .fs
-            .router
-            .backend_router
-            .get_active_backend()
-            .unwrap_or_else(|e| panic!("get_active_backend #{i} failed: {e:?}"));
+        let (be_id, _, _) =
+            h.fs.router
+                .backend_router
+                .get_active_backend()
+                .unwrap_or_else(|e| panic!("get_active_backend #{i} failed: {e:?}"));
         assert_ne!(
             be_id, "backend_0",
             "write placement selected the phantom backend_0 with 4 real named volumes registered"
@@ -277,12 +275,11 @@ async fn test_single_volume_placement_never_selects_phantom_backend_0() {
     let h = harness(&["solo1"]).await;
 
     for i in 0..16 {
-        let (be_id, _, _) = h
-            .fs
-            .router
-            .backend_router
-            .get_active_backend()
-            .unwrap_or_else(|e| panic!("get_active_backend #{i} failed: {e:?}"));
+        let (be_id, _, _) =
+            h.fs.router
+                .backend_router
+                .get_active_backend()
+                .unwrap_or_else(|e| panic!("get_active_backend #{i} failed: {e:?}"));
         assert_eq!(
             be_id, "solo1",
             "single-volume placement must name the real registered volume, never the phantom"
@@ -344,13 +341,12 @@ async fn test_multi_volume_striped_burst_reads_back_and_frees_cleanly() {
     purge_read_tiers(&h);
 
     for b in 0..nblocks {
-        let reply = h
-            .fs
-            .read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("read of block {b} errored (EIO/ENOENT surfaced to the app): {e:?}")
-            });
+        let reply =
+            h.fs.read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("read of block {b} errored (EIO/ENOENT surfaced to the app): {e:?}")
+                });
         assert_eq!(
             &reply.data[..],
             &expected[b * BLOCK..(b + 1) * BLOCK],
@@ -400,22 +396,20 @@ async fn assert_legacy_keys_resolve(h: &H) {
     let bare = offset.to_string();
     let prefixed = format!("backend_0://{offset}");
 
-    let via_bare = h
-        .fs
-        .router
-        .backend_router
-        .read_block(&bare, BLOCK)
-        .await
-        .expect("legacy UNPREFIXED block key must resolve to the first/primary volume");
+    let via_bare =
+        h.fs.router
+            .backend_router
+            .read_block(&bare, BLOCK)
+            .await
+            .expect("legacy UNPREFIXED block key must resolve to the first/primary volume");
     assert_eq!(&via_bare[..], &payload[..]);
 
-    let via_prefix = h
-        .fs
-        .router
-        .backend_router
-        .read_block(&prefixed, BLOCK)
-        .await
-        .expect("legacy backend_0:// block key must resolve to the first/primary volume");
+    let via_prefix =
+        h.fs.router
+            .backend_router
+            .read_block(&prefixed, BLOCK)
+            .await
+            .expect("legacy backend_0:// block key must resolve to the first/primary volume");
     assert_eq!(&via_prefix[..], &payload[..]);
 
     // The alias must also route frees/refcounts to the first volume.
@@ -423,9 +417,17 @@ async fn assert_legacy_keys_resolve(h: &H) {
         h.fs.router.backend_router.increment_refcount(&prefixed),
         "refcount take through the backend_0 alias failed"
     );
-    h.fs.router.backend_router.free_block(&prefixed).await.unwrap();
+    h.fs.router
+        .backend_router
+        .free_block(&prefixed)
+        .await
+        .unwrap();
     h.fs.router.backend_router.free_block(&bare).await.unwrap();
-    assert_eq!(alloc.get_used_blocks(), 0, "alias frees must land on volume 1");
+    assert_eq!(
+        alloc.get_used_blocks(),
+        0,
+        "alias frees must land on volume 1"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -458,14 +460,16 @@ async fn test_single_volume_persisted_keys_stay_unprefixed_and_read_back() {
     let ino = create_file(&h, "solo_burst.bin").await;
     let expected = striped_burst(&h, ino, nblocks).await;
 
-    let meta = h
-        .fs
-        .router
-        .fetch_metadata(&squeezefs::keys::inode_path(ino))
-        .await
-        .unwrap();
+    let meta =
+        h.fs.router
+            .fetch_metadata(&squeezefs::keys::inode_path(ino))
+            .await
+            .unwrap();
     assert_eq!(meta.file_type, "striped");
-    let map = meta.block_map.as_ref().expect("striped file has a block map");
+    let map = meta
+        .block_map
+        .as_ref()
+        .expect("striped file has a block map");
     assert_eq!(map.len(), nblocks);
     for (idx, key) in map {
         assert!(
@@ -477,11 +481,10 @@ async fn test_single_volume_persisted_keys_stay_unprefixed_and_read_back() {
 
     purge_read_tiers(&h);
     for b in 0..nblocks {
-        let reply = h
-            .fs
-            .read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32)
-            .await
-            .unwrap();
+        let reply =
+            h.fs.read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32)
+                .await
+                .unwrap();
         assert_eq!(
             &reply.data[..],
             &expected[b * BLOCK..(b + 1) * BLOCK],
@@ -632,7 +635,10 @@ mod cli {
 
     impl Drop for Mount {
         fn drop(&mut self) {
-            let _ = Command::new("fusermount3").arg("-uz").arg(&self.mnt).status();
+            let _ = Command::new("fusermount3")
+                .arg("-uz")
+                .arg(&self.mnt)
+                .status();
             let _ = self.child.kill();
             let _ = self.child.wait();
             let _ = std::fs::remove_dir_all(&self.base);
@@ -764,7 +770,9 @@ mod cli {
 
         // .config: EXACTLY the named volumes, no phantom.
         let cfg = config_json(&mount);
-        let table = cfg["data_volumes"].as_object().expect("data_volumes object");
+        let table = cfg["data_volumes"]
+            .as_object()
+            .expect("data_volumes object");
         let mut keys: Vec<_> = table.keys().cloned().collect();
         keys.sort();
         assert_eq!(
@@ -822,7 +830,9 @@ mod cli {
         let mut mount = mount_volumes("single", &["solo1"]);
 
         let cfg = config_json(&mount);
-        let table = cfg["data_volumes"].as_object().expect("data_volumes object");
+        let table = cfg["data_volumes"]
+            .as_object()
+            .expect("data_volumes object");
         let keys: Vec<_> = table.keys().cloned().collect();
         assert_eq!(
             keys,

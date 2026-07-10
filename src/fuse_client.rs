@@ -845,7 +845,22 @@ impl SqueezefsFilesystem {
     async fn sync_runtime_config_to_daemon(&self) {
         let cfg = crate::config_ops::load_or_create_config();
 
+        let have_named_backends = !self.router.backend_router.backends.is_empty();
         for (vol_name, status) in &cfg.data_volume_statuses {
+            // With named volumes registered, only statuses for REGISTERED
+            // names apply. A stale runtime config (the file outlives daemon
+            // generations) carrying a phantom `backend_0: disabled` entry
+            // would otherwise mark the default slot unhealthy and fail every
+            // legacy unprefixed/`backend_0://` key read through the alias.
+            if have_named_backends
+                && !self
+                    .router
+                    .backend_router
+                    .backends
+                    .contains_key(vol_name.as_str())
+            {
+                continue;
+            }
             if status == "disabled" {
                 self.router
                     .backend_router
@@ -896,10 +911,22 @@ impl SqueezefsFilesystem {
             .join(",");
         format_fields.insert("disk_cache_paths".to_string(), active_dirs_str);
 
+        // The data-volume table lists EXACTLY the registered named volumes.
+        // `backend_0` is a legacy key-resolution alias of the default slot,
+        // not a volume: surfacing it here (pre-fix) made it a phantom entry
+        // in `.config` on every multi-volume mount. Only a bare router (no
+        // named registrations — offline tools, tests) still reports its
+        // default slot under the legacy name.
         let mut data_volumes = serde_json::Map::new();
-        let mut data_vol_names = vec!["backend_0".to_string()];
-        for item in self.router.backend_router.backends.iter() {
-            data_vol_names.push(item.key().clone());
+        let mut data_vol_names: Vec<String> = self
+            .router
+            .backend_router
+            .backends
+            .iter()
+            .map(|item| item.key().clone())
+            .collect();
+        if data_vol_names.is_empty() {
+            data_vol_names.push("backend_0".to_string());
         }
 
         for name in data_vol_names {
@@ -2084,7 +2111,7 @@ impl SqueezefsFilesystem {
             .get_crypto()
             .process_write_async(plaintext)
             .await?;
-        let (_be_id, block_allocator, nvme_writer) =
+        let (be_id, block_allocator, nvme_writer) =
             self.router.backend_router.get_active_backend()?;
         // Marks the key's incarnation unstable: racing validated cache fills
         // of a reused key fail their seqlock check instead of caching
@@ -2100,7 +2127,7 @@ impl SqueezefsFilesystem {
         // would otherwise evict genuinely hot read data with 2,560 plaintext
         // blocks.
         block_allocator.publish_block(offset);
-        let new_key = offset.to_string();
+        let new_key = self.router.backend_router.persist_block_key(&be_id, offset);
         // A no-put owner must PURGE the reused key's read tiers instead
         // (PR 6 equivalence with the deleted `write_striped` direct route,
         // whose unconditional fresh-plaintext put overwrote any stale
@@ -6608,14 +6635,14 @@ async fn upload_active_block_bytes(
         .get_crypto()
         .process_write_async(block_bytes.clone())
         .await?;
-    let (_be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
+    let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
     let offset = block_allocator.allocate_block().await?;
     if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
         let _ = block_allocator.free_block(offset).await;
         return Err(e);
     }
     block_allocator.publish_block(offset);
-    let stored_block_key = offset.to_string();
+    let stored_block_key = router.backend_router.persist_block_key(&be_id, offset);
 
     let entries = [(b, stored_block_key)];
     let displaced = router
@@ -6703,7 +6730,7 @@ async fn flush_one_active_block(
             return Ok(());
         }
 
-        let (_be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
+        let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
         let offset = block_allocator.allocate_block().await?;
 
         let block_data_source = match router.cache.nvme.staged_dma_source(&cache_key) {
@@ -6741,7 +6768,7 @@ async fn flush_one_active_block(
         }
         block_allocator.publish_block(offset);
 
-        let stored_block_key = offset.to_string();
+        let stored_block_key = router.backend_router.persist_block_key(&be_id, offset);
 
         // §5.3 one merge discipline: current-map RMW under INODE_META_LOCKS,
         // still under this block's lock (hazard 1). Free only the

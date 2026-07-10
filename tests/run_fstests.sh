@@ -295,9 +295,14 @@ EOF
 #   112/616/617/618 = copy_file_range crawl (fix 97e2ed4)
 #   616             = hole-read family: PUNCH_HOLE/truncate coherence
 #                     (fixes 37fe5eb + 49286ee stale-size truncate) — GREEN
-#   075/091         = DISTINCT open bug: O_DIRECT / large-file lost-write
-#                     (reads zeros where data was written — opposite
-#                     direction from the hole bug); follow-up open
+#   075/091         = write-visibility family: fallocate size clobber under
+#                     a lagging durable size, truncate leaving parked/staged
+#                     active-block overlays alive, overlay-blind
+#                     copy_file_range, unwritten uring read-dest regions,
+#                     flush-merge-vs-prune reordering (layout-prune epoch),
+#                     dual-overlay authority (fix 93dce89) — GREEN 3/3 each;
+#                     rare residual on 075.2 soaks = the pre-existing
+#                     reused-key stale-fill family (8e3995e follow-up)
 #   008/009/285/316 = fallocate / zero-range / SEEK_HOLE / punch coverage
 #   003/069/469     = pre-existing FUSE-class failures tracked for delta
 #   001/013/074/127/213/263 = mount-cycle + fsx/fsstress core soak

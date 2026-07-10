@@ -1556,9 +1556,22 @@ async fn test_mixed_v2_v3_volumes_spill_per_volume() {
         "v3 ino routes to volume 1"
     );
 
-    // The SAME 1000-entry shape (≈20 KiB serialized) exceeds v2's ≈4 KiB
-    // usable cap yet sits well under v3's ≈60 KiB: §5.3 ⇒ spill on v2, inline
-    // on v3.
+    // §5.3 per-ino cap contract, pinned directly: v2 → 8 KiB fixed slot; v3 →
+    // min(65_536, node_size/4) = 64 KiB at the default node.
+    assert_eq!(
+        routed.xattr_value_cap(v2_ino),
+        8192,
+        "v2 per-ino xattr value cap is the fixed 8 KiB slot"
+    );
+    assert_eq!(
+        routed.xattr_value_cap(v3_ino),
+        65536,
+        "v3 per-ino xattr value cap is min(65536, node_size/4) at the default node"
+    );
+
+    // The SAME 1000-entry shape: v2 keeps the legacy 32-entry ceiling so 1000
+    // spills at its old boundary; v3 lifts the boundary to its 64 KiB record
+    // cap (≈20 KiB serialized ≪ 60 KiB) so it stays inline — §5.3 per volume.
     let n = 1000usize;
     for ino in [v2_ino, v3_ino] {
         let path = format!("inode_{ino}");
@@ -1572,12 +1585,12 @@ async fn test_mixed_v2_v3_volumes_spill_per_volume() {
     let v3_layout = persisted_layout(&routed, v3_ino).await;
     assert!(
         is_indirect(&v2_layout),
-        "v2 file must spill at its small (8 KiB) cap (id={:?})",
+        "v2 file must spill at the legacy 32-entry boundary (id={:?})",
         v2_layout.block_map_id
     );
     assert!(
         is_inline(&v3_layout),
-        "v3 file must stay INLINE to its larger (64 KiB) cap (id={:?})",
+        "v3 file must stay INLINE to its larger (64 KiB) record cap (id={:?})",
         v3_layout.block_map_id
     );
 

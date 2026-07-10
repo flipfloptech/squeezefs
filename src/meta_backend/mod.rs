@@ -1829,6 +1829,25 @@ impl RoutedMetaBackend {
         matches!(&self.volumes[v_idx], VolumeBackend::V3(_))
     }
 
+    /// PR K8 (design-cow-kv-metadata §5.3): the per-ino xattr value cap — the
+    /// largest inline xattr value `ino`'s volume can hold. A *non-trait*
+    /// capability accessor (the `Metadata` trait stays unchanged, §5.1). The
+    /// v3 layout inline-spill decision (`DataRouter::save_metadata_to_backend`)
+    /// consults it, so a v3 volume set with differing `node_size` spills per
+    /// volume by serialized size; v2 fixed-geometry volumes keep their legacy
+    /// 32-entry inline ceiling (§6.1 byte-identical), for which this reports
+    /// the fixed 8 KiB xattr value slot. v2 → 8_192; v3 → the record-value cap
+    /// `min(65_536, node_size/4)` (§4.2).
+    pub fn xattr_value_cap(&self, ino: Ino) -> usize {
+        /// The v2 `xattr::XattrEntry::val` field capacity (`[[u8; 32]; 256]`).
+        const V2_XATTR_VALUE_CAP: usize = 8192;
+        let (v_idx, _) = self.route_ino(ino);
+        match &self.volumes[v_idx] {
+            VolumeBackend::V2(_) => V2_XATTR_VALUE_CAP,
+            VolumeBackend::V3(be) => be.record_value_cap(),
+        }
+    }
+
     /// PR K7 (§5.1): one cookie-paged readdir step against `dir`'s
     /// volume — `Some` pages of at most `max` `(resume_cookie, entry)`
     /// pairs on v3 (dentry child inos are stored global, so no mapping),

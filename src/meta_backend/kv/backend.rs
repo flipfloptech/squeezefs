@@ -466,6 +466,15 @@ impl KvMetaBackend {
         &self.path
     }
 
+    /// This volume's per-record value cap `min(65_536, node_size/4)` (§4.2) —
+    /// the largest inline xattr value it can store. PR K8 (§5.3): the data
+    /// path consults it (via [`crate::meta_backend::RoutedMetaBackend::xattr_value_cap`])
+    /// to decide the per-volume layout inline-spill boundary, so mixed v2/v3
+    /// (and mixed-`node_size` v3) sets spill per volume.
+    pub fn record_value_cap(&self) -> usize {
+        self.cache.config().layout.record_value_cap()
+    }
+
     /// The three logical trees, tree-id order (inodes, dentries, xattrs)
     /// — the digest walk's input ([`super::builder::digest_walk`]).
     pub fn trees(&self) -> [&KvTree; 3] {

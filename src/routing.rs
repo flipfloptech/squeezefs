@@ -43,6 +43,14 @@ pub fn parse_inode_from_path(path: &str) -> u64 {
     }
 }
 
+/// PR K8 (design-cow-kv-metadata §5.3): headroom subtracted from a volume's
+/// per-ino xattr value cap to derive the inline block-map ceiling
+/// (`LAYOUT_INLINE_MAX = xattr_value_cap(ino) - LAYOUT_INLINE_HEADROOM`). It
+/// covers the KV record framing (xattr name + envelope) so the persisted
+/// `"layout"` value stays under the node layer's own record cap, with slack
+/// for the non-block-map layout fields. 4 KiB at every knob setting.
+const LAYOUT_INLINE_HEADROOM: usize = 4096;
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default, Debug)]
 pub struct LayoutMetadata {
     pub file_type: String,
@@ -751,24 +759,53 @@ impl DataRouter {
         }
 
         let mut old_indirect_to_free = None;
+        // The layout as it would be persisted INLINE (block map retained under
+        // the inline sentinel). The indirect branch below overwrites the map /
+        // id only if the serialized value spills past the per-volume cap.
         let mut layout = LayoutMetadata {
             file_type: m.file_type.clone(),
             size: m.size,
-            block_map_id: m.block_map_id.clone(),
+            block_map_id: m.block_map.as_ref().map(|_| format!("block_map_{}", ino)),
             block_prefix: m.block_prefix.clone(),
             file_id: m.file_id.clone(),
             data_key: m.data_key.as_ref().map(|b| b.to_vec()),
             block_map: m.block_map.clone(),
         };
 
-        // Determine if we need an indirect block map
-        let needs_indirect = if let Some(ref bm) = m.block_map {
-            bm.len() > 32
-        } else {
-            false
-        };
+        // §5.3: spill the inline block map to an indirect block only when the
+        // serialized layout value would exceed the target volume's per-ino
+        // record cap (`LAYOUT_INLINE_MAX = xattr_value_cap(ino) - 4 KiB framing
+        // headroom`) — not a fixed > 32-entry count. On v3 (64 KiB default cap)
+        // a file whose block map serializes within ~60 KiB (≈ 6 GiB at 4 MiB
+        // blocks) keeps an inline map; v2's 8 KiB cap keeps its conservative
+        // early spill automatically. Beyond the cap the indirect mechanism is
+        // used unchanged.
+        let inline_bytes = bincode::serialize(&layout).map_err(|e| {
+            SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to serialize binary layout: {:?}", e),
+            ))
+        })?;
+        let needs_indirect = m.block_map.as_ref().is_some_and(|bm| {
+            if backend.ino_routes_to_v3(ino) {
+                // v3 (§5.3): the lift — spill only when the serialized layout
+                // value would exceed the per-volume record cap (minus framing
+                // headroom), keeping a file whose block map serializes within
+                // ~60 KiB (≈ 6 GiB at 4 MiB blocks) inline.
+                inline_bytes.len()
+                    > backend
+                        .xattr_value_cap(ino)
+                        .saturating_sub(LAYOUT_INLINE_HEADROOM)
+            } else {
+                // v2 fixed geometry: the byte-identical legacy 32-entry inline
+                // ceiling the whole v2 suite pins (§6.1). A small-node v3 shares
+                // v2's 8 KiB cap value, so the format — not the cap — selects
+                // the rule; v2 keeps "today's boundary" (§5.3).
+                bm.len() > 32
+            }
+        });
 
-        if needs_indirect {
+        let bytes = if needs_indirect {
             let bm = m.block_map.as_ref().unwrap();
             let mut entries: Vec<(u32, u64)> = Vec::with_capacity(bm.len());
             for (&b, s) in bm {
@@ -811,23 +848,24 @@ impl DataRouter {
 
             layout.block_map = None;
             layout.block_map_id = Some(format!("indirect:{}", block_key));
+
+            bincode::serialize(&layout).map_err(|e| {
+                SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Failed to serialize binary layout: {:?}", e),
+                ))
+            })?
         } else {
-            // Check if we need to free an old indirect block
+            // Collapsing back to (or staying) inline: free any old indirect
+            // block; the inline layout value is already serialized above.
             if let Some(ref map_id) = m.block_map_id {
                 if map_id.starts_with("indirect:") {
                     let old_block_key = map_id.strip_prefix("indirect:").unwrap();
                     old_indirect_to_free = Some(old_block_key.to_string());
                 }
             }
-            layout.block_map_id = m.block_map.as_ref().map(|_| format!("block_map_{}", ino));
-        }
-
-        let bytes = bincode::serialize(&layout).map_err(|e| {
-            SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize binary layout: {:?}", e),
-            ))
-        })?;
+            inline_bytes
+        };
 
         backend.set_layout_and_size(ino, &bytes, m.size).await?;
         // Keep hot cache coherent without a remove+refetch on the next write.

@@ -5,7 +5,7 @@
 | **Title** | SqueezeFS MetaLV v3: CoW KV node layer (large log-structured btree nodes, logical journal, atomic-by-construction crash contract) replacing the fixed inode/dentry/xattr tables |
 | **Author** | _(placeholder — assign on review)_ |
 | **Date** | 2026-07-08 |
-| **Status** | **Approved (design consensus 2026-07-08; 3 review rounds, 22 issues resolved)** |
+| **Status** | **Implemented (K0–K10 merged 2026-07-09/10; see `.benchmarks/2026-07-09-kv-v3-gates.md`)** |
 | **Repo** | `/home/justin/Source/squeezefs`, branch `dev` |
 | **Intended home** | `docs/design-cow-kv-metadata.md` |
 | **Reviewers** | MetaLV / FUSE owners |
@@ -581,3 +581,24 @@ Ordered branches off `dev`; **tests land first in every PR as their own commit(s
 - **Changes**: documentation closure; no code.
 
 **Dependency graph**: K0 → K1 → {K2, K3} → K4 → K5 → K6a → K6b → K7 → {K8, K9} → K10. K2 and K3 are parallelizable; K8 and K9 are parallelizable after K7. Nothing merges past K6b until the dual-format kill-9 soak is green in nightly; nothing merges past K7 until the §8 gates are committed to `.benchmarks/`.
+
+### As-built merge log (`dev`)
+
+Every PR merged `--ff-only` to `dev` per the workflow. Verify with `git log`.
+
+| PR | Commit | Merged subject |
+|---|---|---|
+| K0 | `0aeecde` | `docs(meta): CoW KV metadata design (PR K0)` |
+| K1 | `6ba0381` | `feat(meta): kv record & bset encodings + the fold algebra` |
+| K2 | `aeec709` | `feat(meta): kv node format — load, append, compact, split` |
+| K3 | `5ab1645` | `feat(meta): kv journal ring, reservation core, root ledger` |
+| K4 | `5bccc84` | `feat(meta): kv extent allocator — A/B bitmap, journaled deltas, pending-free` |
+| K5 | `cce6b98` | `feat(meta): kv btree + node cache — demand paging, latch-free reads, SMO state machine` |
+| K6a | `6687dc5` | `feat(meta): superblock v3, dual-format mount dispatch, kv read path, image builder` |
+| K6b | `043cca3` | `feat(meta): kv commit pipeline + checkpoint/writeback — v3 volumes go read-write` |
+| K7 | `9c0d01c` | `docs(bench): K7 closing report — all §8 gates green, root-suite deltas zero` |
+| K8 | `522c61c` | `feat(routing): lift layout-xattr inline spill to the per-volume record cap` |
+| K9 | `c25fc19` | `feat(meta): squeezefs migrate — offline v2 → v3 converter` |
+| K10 | _(this PR)_ | `docs(meta): v3 durability, migrate runbook, AGENTS/README closure (PR K10)` |
+
+Measured evidence for the §8 gates is in `.benchmarks/2026-07-09-kv-v3-gates.md` (K7).

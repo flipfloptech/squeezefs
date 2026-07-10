@@ -64,7 +64,7 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
 ---
 
 * **Format Squeezefs Volume:**
-  Initialize physical block maps and metadata tables. Executes concurrently across all target devices.
+  Initialize physical block maps and metadata. New metadata volumes are formatted as **v3** (CoW KV metadata — see [Metadata Durability](#metadata-durability-crash-contract)). Executes concurrently across all target devices.
   ```bash
   squeezefs format sqmeta://<meta_dev> [sqmeta://...] sqdata://<data_dev> [sqdata://...] [options]
   ```
@@ -73,6 +73,8 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   - `--capacity <bytes>`: Maximum capacity of the volume (default: auto-detected or 1PB).
   - `--inodes <count>`: Hard quota limit for number of inodes (default: `1000000`).
   - `--full`: Performs full block-aligned zero-wiping of the backing device capacity with a progress bar (default is quick-format).
+  - `--meta-node-kib <64|128|256|512|1024>`: v3 metadata btree node size in KiB (default `256`). Below `256` prints a warning — the per-volume record-value cap drops to `node_size/4`, so large xattrs / layout maps spill to the indirect mechanism sooner.
+  - `--meta-journal-mb <MiB>`: v3 metadata journal ring size, overriding the default `clamp(volume/64, 8 MiB, 32 MiB)`.
 
 * **Mount Squeezefs:**
   ```bash
@@ -90,6 +92,12 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   Prints a detailed formatted configuration and volume health status summary:
   ```bash
   squeezefs status sqmeta://<meta_dev>
+  ```
+
+* **Migrate Metadata v2 → v3 (offline):**
+  Convert a v2 metadata volume to v3 in place. Offline (unmount first), crash-safe, and idempotent. See the [migration runbook](#migrating-a-v2-volume-to-v3-offline).
+  ```bash
+  squeezefs migrate sqmeta://<meta_dev> [--grow <bytes>] [--dry-run]
   ```
 
 * **Unmount Squeezefs:**
@@ -157,3 +165,45 @@ SqueezeFS states its metadata crash-consistency contract explicitly as three lev
 - `--strict-meta-atomicity` (mount flag, or `strict_meta_atomicity` in the runtime config): refuse to mount unless every metadata volume classifies as `atomic4k`. Default off (file-backed dev volumes are the test substrate).
 - `SQUEEZEFS_META_FLUSH_INTERVAL_MS`: deferred metadata durability window in ms (default `50`); `0` = strict sync-on-commit — every metadata commit returns only after a post-apply device barrier. Legacy alias `SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS` is honored; the new name wins if both are set.
 - `SQUEEZEFS_RECLAIM_BATCH`: inode-reclaim group-commit batch size (default `64`, clamp 1–1024).
+
+### Format v3 (CoW KV metadata) — stronger by construction
+
+New metadata volumes format as **v3**: a copy-on-write, typed key/value btree (bcachefs-style 256 KiB CoW nodes + a logical reservation journal + background checkpoints) that replaces v2's fixed inode/dentry/xattr geometry. **v2 volumes keep mounting unchanged**, and a mixed v2/v3 volume set is legal. Full design: `docs/design-cow-kv-metadata.md`; measured gates: `.benchmarks/2026-07-09-kv-v3-gates.md`.
+
+In plain operational terms, v3 makes the crash contract **strictly stronger than D0/D1/D2**:
+
+- **Every on-disk unit is checksummed** — superblock, journal pages and entries, btree nodes, bsets, the allocator bitmap, and root-ledger slots.
+- **Torn writes are detected and ignored, never applied.** A torn journal entry, node append, or ledger slot fails its checksum and the last consistent state serves (the old copy-on-write node / the predecessor ledger record). Nothing overwrites live data in place.
+- **Whole-transaction atomicity**: one transaction = one checksummed journal entry, replayed all-or-nothing at mount. A transaction is never visible half-applied.
+- **D1/D2 collapse**: because integrity no longer depends on hardware sector atomicity, the D1 (atomic-4KiB) vs D2 (non-atomic) distinction **disappears for v3 metadata** — a file-backed v3 volume gets the same integrity guarantee as an atomic-4KiB device. The sector-atomicity probe still runs and is reported as `meta_volume_atomicity_physical`, while the contract field `meta_volume_atomicity` reads `cow-checksummed`; `--strict-meta-atomicity` therefore gates **v2 volumes only**.
+
+Capacity/scale lifts vs v2: ≥ 100 M inodes per volume, 1 M+ entries per directory, unlimited xattrs (values up to `min(64 KiB, node_size/4)`), and O(active-set) mount time (a 100 M-inode volume cold-mounts in ~22 ms on the reference box).
+
+**v3 tuning knobs** (format-time and mount-env):
+
+- `--meta-node-kib <64|128|256|512|1024>` (format): btree node size, default `256`. Below 256 the per-volume record-value cap becomes `node_size/4` and a warning prints, spilling large xattrs / layout maps to the indirect mechanism sooner — leave at 256 unless cold-read latency on tiny-record workloads dominates.
+- `--meta-journal-mb <MiB>` (format): journal ring size; default `clamp(volume/64, 8 MiB, 32 MiB)`.
+- `SQUEEZEFS_META_NODE_CACHE_MB` (mount env): RAM budget for the demand-paged node cache (default `512`).
+- `SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES` (mount env): dirty-node checkpoint cap; bounds the mount-replay working set (default `4096`).
+- `SQUEEZEFS_META_FLUSH_INTERVAL_MS` (mount env): reused as the v3 journal/checkpoint cadence — `0` = strict per-commit durability, exactly as for v2.
+
+### Migrating a v2 volume to v3 (offline)
+
+`squeezefs migrate` converts a v2 metadata volume to v3 **in place, offline** — the volume must be unmounted (a live client refuses the migration). It builds the v3 image into the free tail beyond the last live v2 xattr block, `fdatasync`s it, then flips the superblock at a **single checksummed sector**. No live v2 byte is touched before the flip, so migration is **crash-safe and idempotent**: interrupt it and re-run — a finished conversion is a clean no-op, an incomplete one restarts. On success it reclaims v2's dead journal region and per-ino xattr reservation as free v3 extents. **Back up the volume first regardless.**
+
+```bash
+# 1. Dry run — build + verify the conversion and print the round-trip digest diff
+#    WITHOUT flipping the superblock (nothing is committed):
+squeezefs migrate sqmeta://<meta_dev> --dry-run
+
+# 2. Convert in place:
+squeezefs migrate sqmeta://<meta_dev>
+
+# 3. If the free tail is too small for the v3 image, grow a FILE-BACKED volume
+#    (refused on block devices — grow those externally or migrate to a new device):
+squeezefs migrate sqmeta://<meta_dev> --grow 300M
+
+# 4. Verify — mount and confirm the .stats inode reports meta_format_version "3".
+```
+
+Roll the fleet one volume per maintenance window (mixed v2/v3 sets are legal). v2 mount support stays until fleet telemetry shows no `meta_format_version == "2"` volumes remain.

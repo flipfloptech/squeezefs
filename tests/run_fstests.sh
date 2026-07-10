@@ -278,10 +278,39 @@ EOF
 /sbin/mkfs.fuse.squeezefs "$SCRATCH_DEV"
 
 # 6. Run fstests
-if [ $# -eq 0 ]; then
-    TEST_ARGS=("-g" "auto")
-else
+#
+# Test tiers (see AGENTS.md "Test tiering"):
+#   - explicit args    -> exactly those tests (targeted fix loop:
+#                         `sudo tests/run_fstests.sh generic/616`)
+#   - FSTESTS_QUICK=1   -> the curated squeezefs regression set below
+#                         (per-PR data-path tier; minutes, not hours)
+#   - no args           -> full `-g auto` inventory (nightly / release-gate
+#                         tier; ~5 h — run once, never between fixes)
+#
+# SQUEEZEFS_FSTESTS_QUICK is the STANDING REGRESSION SET: every fstests case
+# that has ever caught a real SqueezeFS bug, plus core fsx/fsstress data-path
+# soakers, hole/punch/seek coverage, and mount-cycle basics. GROW THIS LIST
+# whenever a new test surfaces a bug — that is the whole point of the tier.
+# Provenance (2026-07-09/10 v3 bring-up):
+#   112/616/617/618 = copy_file_range crawl (fix 97e2ed4)
+#   075/091/616     = hole-read / writeback-race data-path family
+#                     (fix 37fe5eb; durable writeback-race follow-up open)
+#   008/009/285/316 = fallocate / zero-range / SEEK_HOLE / punch coverage
+#   003/069/469     = pre-existing FUSE-class failures tracked for delta
+#   001/013/074/127/213/263 = mount-cycle + fsx/fsstress core soak
+SQUEEZEFS_FSTESTS_QUICK=(
+    generic/001 generic/003 generic/008 generic/009 generic/013
+    generic/069 generic/074 generic/075 generic/091 generic/112
+    generic/127 generic/213 generic/263 generic/285 generic/316
+    generic/469 generic/616 generic/617 generic/618
+)
+
+if [ $# -gt 0 ]; then
     TEST_ARGS=("${@}")
+elif [ "${FSTESTS_QUICK:-0}" = "1" ]; then
+    TEST_ARGS=("${SQUEEZEFS_FSTESTS_QUICK[@]}")
+else
+    TEST_ARGS=("-g" "auto")
 fi
 echo "Running fstests with arguments: ${TEST_ARGS[*]}..."
 cd "$XFSTESTS_DIR"

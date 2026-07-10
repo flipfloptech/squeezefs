@@ -461,6 +461,23 @@ sudo tests/run_elbencho_mount.sh
 
 Prerequisites: Volume formatted/mounted per `QUICKSTART.md`. Failures here can pass pure unit tests and still indicate mount regressions.
 
+### Test tiering (do not run acceptance suites at per-commit cadence)
+
+fstests/LTP are **wall-clock-bound** (fixed-duration fsx/fsstress soaks, mount-cycle overhead) — a full `-g auto` is ~5 h regardless of CPU speed. Running them per fix wastes hours re-failing tests already known to fail. Use three tiers:
+
+| Tier | What | When | Cost |
+|------|------|------|------|
+| **Per-commit** | the cargo gate (clippy/fmt/`test --test-threads=1`/doc/bench-smoke; loom when a lock-free core changes) | every commit | ~5 min |
+| **Per-PR (data-path)** | `FSTESTS_QUICK=1 sudo tests/run_fstests.sh` — the curated `SQUEEZEFS_FSTESTS_QUICK` regression set + `sudo tests/run_ltp_syscalls.sh` | PRs touching the write/read/layout/FUSE paths | ~15–20 min |
+| **Nightly / release-gate** | full `sudo tests/run_fstests.sh` (`-g auto`), full LTP, `sudo tests/run_elbencho_mount.sh`, `long_validation.py` scale mounts | nightly + closing gates (e.g. the K7 §8 gate) | hours, unattended |
+
+**`SQUEEZEFS_FSTESTS_QUICK`** (defined in `tests/run_fstests.sh`) is the **standing regression set**: every fstests case that has ever caught a real SqueezeFS bug, plus core fsx/fsstress soak, hole/punch/seek coverage, and mount basics. **Grow it whenever a new test surfaces a bug** — that is the point of the tier. When an external suite catches a bug, also **port the scenario into a fast `cargo` test** (the `tests/*_tests.rs` layer) so the per-commit tier gains the coverage permanently.
+
+**Fix-loop discipline (inventory once, then targeted):**
+1. **Inventory once** — one full `-g auto` produces the complete failure list. Do **not** re-run the full suite between fixes.
+2. **Targeted fix loop** — per failure *family* (cluster related failures; one root cause often spans several tests): tests-first fix → verify the single case with `sudo tests/run_fstests.sh generic/NNN` (minutes) → merge.
+3. **One final sweep** — a single full `-g auto` after the last fix (and nightly thereafter) to catch fix interactions.
+
 ---
 
 ## Benchmarks & Profiling

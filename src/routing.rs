@@ -499,6 +499,16 @@ impl BackendRouter {
         }
     }
 
+    /// Whether `block_key` names an allocator-managed offset at all. Legacy
+    /// `block_prefix`-style keys (`…/part_N`) and keys of unknown backends
+    /// are NOT allocator offsets — they can never be freed + reallocated
+    /// under the same key string, so incarnation validation is vacuous for
+    /// them (a fill of such a key is always serve-valid; it is still never
+    /// cache-published, preserving the historical publish gate).
+    pub(crate) fn key_incarnation_tracked(&self, block_key: &str) -> bool {
+        self.allocator_for_key(block_key).is_some()
+    }
+
     /// Free one reference on a block key. The hole punch is destructive
     /// device I/O and runs ONLY on the terminal release (a non-terminal
     /// free must never zero a clone's still-referenced bytes), and runs in
@@ -1049,10 +1059,33 @@ impl DataRouter {
         Ok(decompressed)
     }
 
+    /// Fetch a block by key without binding validation. Only for callers
+    /// that cannot serve wrong-block bytes to anyone: cache warmers
+    /// (prefetch) and single-key uses where the key is not resolved from a
+    /// block map snapshot. Data-serving striped paths must go through
+    /// [`Self::get_block_for_index`] instead (reused-key stale-fill family).
     pub async fn get_cached_or_fetch_block(
         &self,
         block_key: &str,
     ) -> Result<crate::cache::pool::ReadBlockValue> {
+        Ok(self.get_cached_or_fetch_block_traced(block_key).await?.0)
+    }
+
+    /// [`Self::get_cached_or_fetch_block`] plus the fill's INCARNATION
+    /// VALIDITY: `true` when the returned bytes provably belong to the key's
+    /// current incarnation — a cache-tier hit (entries always hold current-
+    /// incarnation bytes: validated fills publish-then-revalidate-then-undo,
+    /// owners put fresh bytes or purge, displacement purges both tiers), an
+    /// untracked legacy key (never freed/reallocated), or a device fill whose
+    /// incarnation seqlock was stable before the read and unchanged after.
+    /// `false` means the key transitioned (allocate/publish/free) during the
+    /// device read: the bytes may be a dead incarnation's and the caller must
+    /// re-resolve — serving them for a resolved block index is exactly the
+    /// reused-key stale-fill corruption.
+    async fn get_cached_or_fetch_block_traced(
+        &self,
+        block_key: &str,
+    ) -> Result<(crate::cache::pool::ReadBlockValue, bool)> {
         // Single-flight block fetch. Waiters must not hang if they miss the
         // completion broadcast (subscribe-after-send race under multi-thread
         // large sequential reads + prefetch). Always re-check caches and use a
@@ -1064,7 +1097,10 @@ impl DataRouter {
         loop {
             if let Some(cached_block) = self.cache.read_lru.get(block_key) {
                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
+                return Ok((
+                    crate::cache::pool::ReadBlockValue::Bytes(cached_block),
+                    true,
+                ));
             }
 
             if let Some(cached_block) = self.cache.nvme.read_cached_block(block_key) {
@@ -1082,7 +1118,7 @@ impl DataRouter {
                 // device-validated fills (below) and legitimate owners;
                 // NVMe-tier hits stay NVMe-tier hits — the bytes still
                 // serve this caller.
-                return Ok(crate::cache::pool::ReadBlockValue::Bytes(bytes));
+                return Ok((crate::cache::pool::ReadBlockValue::Bytes(bytes), true));
             }
 
             if std::time::Instant::now() >= deadline {
@@ -1099,7 +1135,10 @@ impl DataRouter {
                 // Completion may have raced between get_sync and subscribe — recheck.
                 if let Some(cached_block) = self.cache.read_lru.get(block_key) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
+                    return Ok((
+                        crate::cache::pool::ReadBlockValue::Bytes(cached_block),
+                        true,
+                    ));
                 }
                 if self.inflight_block_reads.get_sync(block_key).is_none() {
                     // Primary finished; loop to re-read caches.
@@ -1145,6 +1184,10 @@ impl DataRouter {
                         }
                     };
                     let downloaded_bytes = downloaded;
+                    // Untracked keys (legacy `…/part_N`, unknown backends) are
+                    // never freed/reallocated: the fill is serve-valid by
+                    // construction, though still never cache-published.
+                    let mut serve_valid = !self.backend_router.key_incarnation_tracked(block_key);
                     let publishable = incarnation.filter(|&before| {
                         self.backend_router
                             .fill_incarnation_still(block_key, before)
@@ -1193,15 +1236,22 @@ impl DataRouter {
                         // write-through path). Undo on any movement: a
                         // poisoned entry is at worst transient — removed by
                         // the very task that published it — never sticky.
-                        if !self
+                        // The same final check is the fill's serve validity:
+                        // word stable before the read and unchanged through
+                        // the puts ⇒ the bytes are the key's current
+                        // incarnation.
+                        serve_valid = self
                             .backend_router
-                            .fill_incarnation_still(block_key, before)
-                        {
+                            .fill_incarnation_still(block_key, before);
+                        if !serve_valid {
                             self.cache.read_lru.remove(block_key);
                             self.cache.nvme.remove_cached_read_block(block_key);
                         }
                     }
-                    return Ok(crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes));
+                    return Ok((
+                        crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes),
+                        serve_valid,
+                    ));
                 }
                 Err(_) => {
                     // Lost the race to insert — loop and wait on the winner.
@@ -1209,6 +1259,91 @@ impl DataRouter {
                 }
             }
         }
+    }
+
+    /// The CURRENT block-index→key binding of `(file_path, b)`, as fresh as
+    /// the last completed block-map merge. The RAM `metadata_cache` entry is
+    /// consulted WITHOUT the TTL gate: every merge/save republishes the entry
+    /// under `INODE_META_LOCKS` (`save_metadata_to_backend`) strictly BEFORE
+    /// its caller frees the displaced keys, so any entry present here is at
+    /// least as fresh as every merge whose displaced key could have been
+    /// reallocated by the time this runs. On a miss, `fetch_metadata`'s
+    /// refill reads the backend under the same lock (serialized ≥ merges).
+    async fn current_block_binding(&self, file_path: &str, b: u32) -> Result<Option<String>> {
+        let meta = match self.metadata_cache.get(file_path) {
+            Some(m) => m,
+            None => self.fetch_metadata(file_path).await?,
+        };
+        if meta.block_map.is_none() && meta.block_map_id.is_none() && meta.block_prefix.is_none() {
+            // The file no longer carries a striped layout (concurrent
+            // truncate/delete/layout flip): every striped binding is gone.
+            return Ok(None);
+        }
+        let mut keys = self.load_striped_block_keys(file_path, &meta, b, b).await?;
+        Ok(keys.pop().and_then(|(_, k)| k))
+    }
+
+    /// BINDING-VALIDATED striped block serve — the reused-key stale-fill fix
+    /// (the `8e3995e` follow-up). Block keys are device-offset strings; the
+    /// incarnation seqlock validates KEY↔CONTENT for cache publishes but
+    /// cannot protect a reader whose BLOCK-INDEX→KEY resolution went stale:
+    /// after displace→free→reallocate the key legitimately holds the NEW
+    /// owner's bytes, a fill of them validates perfectly, and serving them
+    /// for the resolved index returns another block's content (the rare
+    /// generic/075.2 soak corruption — stale data exactly one block over at
+    /// the same intra-block offset; zeros when the key was freed but not yet
+    /// reused).
+    ///
+    /// Serve rule: bytes obtained for key K are returned for block `b` only
+    /// when (a) the fetch was incarnation-valid (tier hit, untracked key, or
+    /// seqlock stable-and-unchanged across the device read) AND (b) the
+    /// CURRENT map still binds `b → K` once the bytes are in hand. If K were
+    /// rebound to `b` after its observed incarnation died, it must have been
+    /// freed (retire, gen+1) and republished (gen+1) in between — (a) would
+    /// have failed — so (a) ∧ (b) proves the serve is the block's current
+    /// content, linearized at the recheck. On any movement: re-resolve the
+    /// binding and retry (`Ok(None)` = the block is a hole in the current
+    /// map — the caller serves zeros). Latch-free: the recheck is a moka get
+    /// + scc reads on the hot path.
+    ///
+    /// `resolved_key` is the caller's (possibly stale) map resolution;
+    /// `None` short-circuits to a hole.
+    pub async fn get_block_for_index(
+        &self,
+        file_path: &str,
+        b: u32,
+        resolved_key: Option<&str>,
+    ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
+        // Each retry re-resolves against the freshest map, so consecutive
+        // failures require back-to-back whole COW-rewrite cycles of this one
+        // block landing inside single fetches — churn far past any real
+        // workload. Exhaustion fails loud rather than serving unproven bytes.
+        const MAX_REBINDS: usize = 8;
+        let mut key: Option<String> = resolved_key.map(str::to_string);
+        for _ in 0..MAX_REBINDS {
+            let Some(cur_key) = key else {
+                return Ok(None);
+            };
+            let (val, incarnation_valid) = self.get_cached_or_fetch_block_traced(&cur_key).await?;
+            // Recheck the binding only AFTER the bytes are in hand: the
+            // proof needs (movement between snapshot and serve) ⇒ (word
+            // changed), which only holds when the recheck follows the read.
+            let current = self.current_block_binding(file_path, b).await?;
+            if incarnation_valid && current.as_deref() == Some(cur_key.as_str()) {
+                return Ok(Some(val));
+            }
+            METRICS
+                .stale_binding_rebinds
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "stale-binding rebind: file={} block={} resolved_key={} current={:?} fill_valid={}",
+                file_path, b, cur_key, current, incarnation_valid
+            );
+            key = current;
+        }
+        Err(SqueezefsError::Io(std::io::Error::other(format!(
+            "block {b} of {file_path} did not settle after {MAX_REBINDS} binding rebinds"
+        ))))
     }
 
     pub async fn fetch_metadata(&self, file_path: &str) -> Result<CachedMetadata> {
@@ -1588,20 +1723,35 @@ impl DataRouter {
         Ok(Some(displaced))
     }
 
+    /// Bump the RAM metadata entry's size floor (write handler's
+    /// `expected_new_size` publish).
+    ///
+    /// Runs under `INODE_META_LOCKS`: this is a get→mutate→insert on the same
+    /// entry every block-map merge republishes, and an unserialized insert
+    /// whose get (or refill await) completed just before a concurrent merge
+    /// RESURRECTS THE PRE-MERGE MAP with a fresh `cached_at` — every read for
+    /// the next TTL second then resolves block→key bindings whose keys are
+    /// displaced, freed, and up for reallocation (the reused-key stale-fill
+    /// family's widest window). The refill leg inlines `fetch_metadata`'s
+    /// locked body (that call would retake this lock).
     pub async fn update_metadata_cache_size(&self, file_path: &str, size: u64) {
-        if let Some(mut entry) = self.metadata_cache.get(file_path) {
+        let ino = parse_inode_from_path(file_path);
+        let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+        let entry = match self.metadata_cache.get(file_path) {
+            Some(entry) => Some(entry),
+            None => match self.fetch_metadata_from_backend(ino).await {
+                Ok(Some(m)) => {
+                    self.metadata_cache.insert(file_path.to_string(), m.clone());
+                    Some(m)
+                }
+                Ok(None) | Err(_) => None,
+            },
+        };
+        if let Some(mut entry) = entry {
             if size > entry.size {
                 entry.size = size;
                 entry.cached_at = std::time::Instant::now();
                 self.metadata_cache.insert(file_path.to_string(), entry);
-            }
-        } else {
-            if let Ok(mut entry) = self.fetch_metadata(file_path).await {
-                if size > entry.size {
-                    entry.size = size;
-                    entry.cached_at = std::time::Instant::now();
-                    self.metadata_cache.insert(file_path.to_string(), entry);
-                }
             }
         }
     }
@@ -2232,8 +2382,13 @@ impl DataRouter {
                 return Err(e);
             }
 
-            // Cache plaintext block for subsequent reads (key = block key, not file path).
+            // Cache plaintext block for subsequent reads (key = block key, not
+            // file path). The fresh put covers the RAM tier; purge the NVMe
+            // read tier like the no-put owners do (`upload_full_block`) — a
+            // validated fill of this key's dying incarnation may have
+            // published there before our allocate.
             self.cache.read_lru.put(&stored_block_key, chunk);
+            self.cache.nvme.remove_cached_read_block(&stored_block_key);
             block_allocator.publish_block(offset);
 
             block_mappings.push((block_count.to_string(), stored_block_key.clone()));
@@ -2282,48 +2437,20 @@ impl DataRouter {
             old_block_keys.push(block_map.get(&b).cloned());
         }
 
-        // Pre-resolve cache hits on the main thread and spawn tasks to modify affected blocks concurrently
+        // Spawn tasks to modify affected blocks concurrently. The old
+        // main-thread cache pre-resolve is gone: a pre-resolved buffer is a
+        // binding snapshot that ages while the task waits to run — exactly
+        // the reused-key stale-fill window — so every RMW seed now resolves
+        // through the binding-validated fetch inside its task.
         use futures::stream::{FuturesUnordered, StreamExt};
         let tasks = FuturesUnordered::new();
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
             crate::bg_admit::striped_block_concurrency(),
         ));
 
-        let mut pre_resolved_blocks = Vec::with_capacity(old_block_keys.len());
-        for (idx, b) in (start_block..=end_block).enumerate() {
-            let block_start_file_offset = b as u64 * block_size;
-            let block_end_file_offset = block_start_file_offset + block_size;
-            let overlap_start = std::cmp::max(block_start_file_offset, offset);
-            let overlap_end = std::cmp::min(block_end_file_offset, end_pos);
-            let needs_existing = {
-                let existing_block_end = std::cmp::min(existing_size, block_end_file_offset);
-                existing_block_end > block_start_file_offset
-                    && (overlap_start > block_start_file_offset || overlap_end < existing_block_end)
-            };
-
-            let mut resolved = None;
-            if needs_existing {
-                if let Some(ref bk) = old_block_keys[idx] {
-                    if let Some(cached_block) = self.cache.read_lru.get(bk) {
-                        resolved = Some(crate::cache::pool::ReadBlockValue::Bytes(cached_block));
-                    } else if let Some(cached_block) = self.cache.nvme.read_cached_block(bk) {
-                        // NVMe hit consumed directly — no RAM re-promote
-                        // (unprovable entry provenance under key reuse; see
-                        // get_cached_or_fetch_block).
-                        resolved = Some(crate::cache::pool::ReadBlockValue::Bytes(
-                            bytes::Bytes::from(cached_block),
-                        ));
-                    }
-                }
-            }
-            pre_resolved_blocks.push(resolved);
-        }
-
         let mut old_keys_iter = old_block_keys.into_iter();
-        let mut pre_resolved_iter = pre_resolved_blocks.into_iter();
         for b in start_block..=end_block {
             let old_block_key = old_keys_iter.next().unwrap();
-            let pre_resolved = pre_resolved_iter.next().unwrap();
 
             let block_start_file_offset = b as u64 * block_size;
             let block_end_file_offset = block_start_file_offset + block_size;
@@ -2344,6 +2471,7 @@ impl DataRouter {
             let router_clone = self.clone();
             let crypto = self.get_crypto().clone();
             let read_lru = self.cache.read_lru.clone();
+            let file_path_clone = file_path.to_string();
 
             let needs_existing = {
                 let existing_block_end = std::cmp::min(existing_size, block_end_file_offset);
@@ -2376,30 +2504,29 @@ impl DataRouter {
                     data_slice
                 } else {
                     let mut block_data = if needs_existing {
-                        if let Some(resolved) = pre_resolved {
-                            match resolved {
-                                crate::cache::pool::ReadBlockValue::Pooled(p) => p,
-                                crate::cache::pool::ReadBlockValue::Bytes(b) => {
-                                    let mut pooled = BUFFER_POOL.alloc();
-                                    pooled.resize(b.len(), 0);
-                                    pooled.copy_from_slice(&b);
-                                    pooled
-                                }
+                        // Binding-validated RMW seed (reused-key stale-fill
+                        // family): the resolved key may have been displaced,
+                        // freed and reallocated to ANOTHER block by the time
+                        // this task runs — seeding from it would merge user
+                        // data over a foreign block's bytes and upload the
+                        // result (persistent corruption). A hole rebind
+                        // seeds zeros.
+                        match router_clone
+                            .get_block_for_index(&file_path_clone, b, old_block_key.as_deref())
+                            .await?
+                        {
+                            Some(crate::cache::pool::ReadBlockValue::Pooled(p)) => p,
+                            Some(crate::cache::pool::ReadBlockValue::Bytes(b)) => {
+                                let mut pooled = BUFFER_POOL.alloc();
+                                pooled.resize(b.len(), 0);
+                                pooled.copy_from_slice(&b);
+                                pooled
                             }
-                        } else if let Some(ref bk) = old_block_key {
-                            match router_clone.get_cached_or_fetch_block(bk).await? {
-                                crate::cache::pool::ReadBlockValue::Pooled(p) => p,
-                                crate::cache::pool::ReadBlockValue::Bytes(b) => {
-                                    let mut pooled = BUFFER_POOL.alloc();
-                                    pooled.resize(b.len(), 0);
-                                    pooled.copy_from_slice(&b);
-                                    pooled
-                                }
+                            None => {
+                                let mut pooled = BUFFER_POOL.alloc();
+                                pooled.resize(rel_end, 0);
+                                pooled
                             }
-                        } else {
-                            let mut pooled = BUFFER_POOL.alloc();
-                            pooled.resize(rel_end, 0);
-                            pooled
                         }
                     } else {
                         let mut pooled = BUFFER_POOL.alloc();
@@ -2431,8 +2558,18 @@ impl DataRouter {
                 // Cache + publish only after the device write: a racing
                 // validated fill for this key must either see the durable bytes
                 // or fail its incarnation check — never observe (and cache) the
-                // pre-write contents of a reused offset.
+                // pre-write contents of a reused offset. The fresh put covers
+                // the RAM tier; the NVMe read tier must be PURGED like the
+                // no-put owners do (`upload_full_block`) — a validated fill of
+                // the key's dying incarnation may have published there before
+                // our allocate, and a put-owner that only overwrites RAM
+                // leaves that entry to serve dead bytes once the RAM entry
+                // evicts.
                 read_lru.put(&stored_new_block_key, block_bytes);
+                router_clone
+                    .cache
+                    .nvme
+                    .remove_cached_read_block(&stored_new_block_key);
                 block_allocator.publish_block(offset);
 
                 Ok::<_, SqueezefsError>((b, stored_new_block_key))
@@ -2586,12 +2723,25 @@ impl DataRouter {
                                     Ok(crate::cache::pool::ReadBlockValue::Bytes(
                                         bytes::Bytes::from(overlay),
                                     ))
-                                } else if let Some(block_key) = block_key_opt {
-                                    router.get_cached_or_fetch_block(&block_key).await
                                 } else {
-                                    let mut buf = BUFFER_POOL.alloc();
-                                    buf.resize(block_size as usize, 0);
-                                    Ok(crate::cache::pool::ReadBlockValue::Pooled(buf))
+                                    // Binding-validated serve (reused-key
+                                    // stale-fill family): a stale b→key
+                                    // resolution must re-resolve, never
+                                    // return another block's bytes. A
+                                    // hole (initial or concurrent punch)
+                                    // reads zeros.
+                                    match router
+                                        .get_block_for_index(&fp, b_idx, block_key_opt.as_deref())
+                                        .await
+                                    {
+                                        Ok(Some(v)) => Ok(v),
+                                        Ok(None) => {
+                                            let mut buf = BUFFER_POOL.alloc();
+                                            buf.resize(block_size as usize, 0);
+                                            Ok(crate::cache::pool::ReadBlockValue::Pooled(buf))
+                                        }
+                                        Err(e) => Err(e),
+                                    }
                                 };
                                 (i, res)
                             }
@@ -2780,6 +2930,15 @@ impl DataRouter {
                         .load_striped_block_keys(file_path, &meta, start_block, end_block)
                         .await?;
                     if let Some((_, b_key_opt)) = block_keys.first() {
+                        // Tier fast path with binding recheck (reused-key
+                        // stale-fill family): a zero-copy NVMe read-cache hit
+                        // is copied out first — the mmap shard guard never
+                        // lives across an await — then served only if the
+                        // CURRENT map still binds this block to the key (tier
+                        // entries always hold their key's current-incarnation
+                        // bytes, so binding currency alone validates the
+                        // serve). On movement the validated loop below
+                        // re-resolves and overwrites the dest.
                         if let Some(ref b_key) = b_key_opt {
                             if let Some(guard) =
                                 self.cache.nvme.get_cached_read_block_range_zero_copy(
@@ -2808,11 +2967,45 @@ impl DataRouter {
                                 } else {
                                     bytes::Bytes::copy_from_slice(&guard)
                                 };
-                                return Ok((data, None));
-                            } else {
-                                // Single block cache miss: download directly in-line (zero-copy, no spawn)
-                                let downloaded = if let Some(dest) = dest_addr {
+                                drop(guard);
+                                if self
+                                    .current_block_binding(file_path, start_block)
+                                    .await?
+                                    .as_deref()
+                                    == Some(b_key.as_str())
+                                {
+                                    return Ok((data, None));
+                                }
+                                METRICS
+                                    .stale_binding_rebinds
+                                    .fetch_add(1, Ordering::Relaxed);
+                                debug!(
+                                    "stale-binding rebind (single-block tier hit): file={} block={} key={}",
+                                    file_path, start_block, b_key
+                                );
+                            }
+                        }
+
+                        // Validated resolve: raw full-block DMA into the uring
+                        // payload dest when possible (revalidated afterwards),
+                        // else the binding-validated fetch loop. `None` = the
+                        // block is a hole in the CURRENT map.
+                        let downloaded: Option<crate::cache::pool::ReadBlockValue> = match b_key_opt
+                        {
+                            Some(b_key) => {
+                                let mut resolved = None;
+                                if let Some(dest) = dest_addr {
                                     if slice_start == 0 && slice_len as u64 == block_size {
+                                        // Zero-copy device→payload DMA. The raw read
+                                        // bypasses the single-flight fill, so it
+                                        // carries the fill discipline itself:
+                                        // incarnation snapshot before, still-check
+                                        // after, then the binding recheck. On any
+                                        // movement the validated loop below
+                                        // overwrites the dest.
+                                        let tracked =
+                                            self.backend_router.key_incarnation_tracked(b_key);
+                                        let before = self.backend_router.fill_incarnation(b_key);
                                         self.backend_router
                                             .read_block_with_dest(
                                                 b_key,
@@ -2820,43 +3013,95 @@ impl DataRouter {
                                                 Some(dest),
                                             )
                                             .await?;
-                                        let len = block_size as usize;
-                                        let dest_ptr = dest as *mut u8;
-                                        let b = bytes::Bytes::from_owner(
-                                            crate::cache::pool::UringBufOwner {
-                                                ptr: dest_ptr,
-                                                len,
-                                            },
-                                        );
-                                        crate::cache::pool::ReadBlockValue::Bytes(b)
-                                    } else {
-                                        let val = self.get_cached_or_fetch_block(b_key).await?;
-                                        let start = std::cmp::min(slice_start as usize, val.len());
-                                        let end = std::cmp::min(
-                                            (slice_start + slice_len as u64) as usize,
-                                            val.len(),
-                                        );
-                                        let len = end - start;
-                                        let dest_ptr = dest as *mut u8;
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(
-                                                val[start..end].as_ptr(),
-                                                dest_ptr,
-                                                len,
+                                        let incarnation_ok = !tracked
+                                            || before.is_some_and(|bf| {
+                                                self.backend_router
+                                                    .fill_incarnation_still(b_key, bf)
+                                            });
+                                        if incarnation_ok
+                                            && self
+                                                .current_block_binding(file_path, start_block)
+                                                .await?
+                                                .as_deref()
+                                                == Some(b_key.as_str())
+                                        {
+                                            let len = block_size as usize;
+                                            let dest_ptr = dest as *mut u8;
+                                            let b = bytes::Bytes::from_owner(
+                                                crate::cache::pool::UringBufOwner {
+                                                    ptr: dest_ptr,
+                                                    len,
+                                                },
                                             );
+                                            resolved =
+                                                Some(crate::cache::pool::ReadBlockValue::Bytes(b));
+                                        } else {
+                                            METRICS
+                                                .stale_binding_rebinds
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            debug!(
+                                                    "stale-binding rebind (raw dest read): file={} block={} key={}",
+                                                    file_path, start_block, b_key
+                                                );
                                         }
-                                        let b = bytes::Bytes::from_owner(
-                                            crate::cache::pool::UringBufOwner {
-                                                ptr: dest_ptr,
-                                                len,
-                                            },
-                                        );
-                                        crate::cache::pool::ReadBlockValue::Bytes(b)
                                     }
-                                } else {
-                                    self.get_cached_or_fetch_block(b_key).await?
-                                };
+                                }
+                                match resolved {
+                                    Some(r) => Some(r),
+                                    None => {
+                                        let val = self
+                                            .get_block_for_index(
+                                                file_path,
+                                                start_block,
+                                                Some(b_key),
+                                            )
+                                            .await?;
+                                        match (val, dest_addr) {
+                                            (Some(val), Some(dest)) => {
+                                                let start =
+                                                    std::cmp::min(slice_start as usize, val.len());
+                                                let end = std::cmp::min(
+                                                    (slice_start + slice_len as u64) as usize,
+                                                    val.len(),
+                                                );
+                                                let len = end - start;
+                                                let dest_ptr = dest as *mut u8;
+                                                unsafe {
+                                                    std::ptr::copy_nonoverlapping(
+                                                        val[start..end].as_ptr(),
+                                                        dest_ptr,
+                                                        len,
+                                                    );
+                                                    // Unwritten remainder of the reused
+                                                    // uring dest region must never replay
+                                                    // a previous reply's bytes.
+                                                    if len < slice_len as usize {
+                                                        std::ptr::write_bytes(
+                                                            dest_ptr.add(len),
+                                                            0,
+                                                            slice_len as usize - len,
+                                                        );
+                                                    }
+                                                }
+                                                let b = bytes::Bytes::from_owner(
+                                                    crate::cache::pool::UringBufOwner {
+                                                        ptr: dest_ptr,
+                                                        len,
+                                                    },
+                                                );
+                                                Some(crate::cache::pool::ReadBlockValue::Bytes(b))
+                                            }
+                                            (Some(val), None) => Some(val),
+                                            (None, _) => None,
+                                        }
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
 
+                        match downloaded {
+                            Some(downloaded) => {
                                 if self.should_prefetch_after_striped_read(
                                     file_path,
                                     start_block,
@@ -2891,24 +3136,28 @@ impl DataRouter {
                                     return Ok((data, Some(std::sync::Arc::new(downloaded))));
                                 }
                             }
-                        } else {
-                            // Hole support: return zero-filled slice
-                            let len = slice_len as usize;
-                            let data = if let Some(dest) = dest_addr {
-                                let dest_ptr = dest as *mut u8;
-                                unsafe {
-                                    std::ptr::write_bytes(dest_ptr, 0, len);
-                                    bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
-                                        ptr: dest_ptr,
-                                        len,
-                                    })
-                                }
-                            } else {
-                                let mut hole_pooled = BUFFER_POOL.alloc();
-                                hole_pooled.resize(len, 0);
-                                bytes::Bytes::copy_from_slice(&hole_pooled)
-                            };
-                            return Ok((data, None));
+                            None => {
+                                // Hole (initial resolution or rebound to a
+                                // punched/truncated index): zero-filled slice.
+                                let len = slice_len as usize;
+                                let data = if let Some(dest) = dest_addr {
+                                    let dest_ptr = dest as *mut u8;
+                                    unsafe {
+                                        std::ptr::write_bytes(dest_ptr, 0, len);
+                                        bytes::Bytes::from_owner(
+                                            crate::cache::pool::UringBufOwner {
+                                                ptr: dest_ptr,
+                                                len,
+                                            },
+                                        )
+                                    }
+                                } else {
+                                    let mut hole_pooled = BUFFER_POOL.alloc();
+                                    hole_pooled.resize(len, 0);
+                                    bytes::Bytes::copy_from_slice(&hole_pooled)
+                                };
+                                return Ok((data, None));
+                            }
                         }
                     }
                 }
@@ -2963,42 +3212,31 @@ impl DataRouter {
                         // remainder is zeroed (holes read zeros).
                         let cache_key =
                             crate::keys::active_block_for_path(&file_path_clone, b_idx).to_string();
-                        let written: usize = if let Some(active_data) =
-                            router.cache.nvme.read_staged(&cache_key)
-                        {
-                            let start = std::cmp::min(rel_start, active_data.len());
-                            let end = std::cmp::min(rel_start + copy_len, active_data.len());
-                            let actual_copy = end - start;
-                            if actual_copy > 0 {
-                                unsafe {
-                                    let dest = (raw_ptr + dest_start) as *mut u8;
-                                    std::ptr::copy_nonoverlapping(
-                                        active_data[start..end].as_ptr(),
-                                        dest,
-                                        actual_copy,
-                                    );
-                                }
-                            }
-                            actual_copy
-                        } else if let Some(ref b_key) = b_key_opt {
-                            if let Some(cached_block) = router.cache.read_lru.get(b_key) {
-                                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                let start = std::cmp::min(rel_start, cached_block.len());
-                                let end = std::cmp::min(rel_start + copy_len, cached_block.len());
+                        let written: usize =
+                            if let Some(active_data) = router.cache.nvme.read_staged(&cache_key) {
+                                let start = std::cmp::min(rel_start, active_data.len());
+                                let end = std::cmp::min(rel_start + copy_len, active_data.len());
                                 let actual_copy = end - start;
                                 if actual_copy > 0 {
                                     unsafe {
                                         let dest = (raw_ptr + dest_start) as *mut u8;
                                         std::ptr::copy_nonoverlapping(
-                                            cached_block[start..end].as_ptr(),
+                                            active_data[start..end].as_ptr(),
                                             dest,
                                             actual_copy,
                                         );
                                     }
                                 }
                                 actual_copy
-                            } else {
-                                let downloaded = router.get_cached_or_fetch_block(b_key).await?;
+                            } else if let Some(downloaded) = router
+                                .get_block_for_index(&file_path_clone, b_idx, b_key_opt.as_deref())
+                                .await?
+                            {
+                                // Binding-validated serve (reused-key stale-fill
+                                // family): the RAM-LRU fast path lives inside the
+                                // primitive; a stale b→key resolution re-resolves
+                                // instead of copying another block's bytes into
+                                // this block's dest region.
                                 let start = std::cmp::min(rel_start, downloaded.len());
                                 let end = std::cmp::min(rel_start + copy_len, downloaded.len());
                                 let actual_copy = end - start;
@@ -3013,11 +3251,11 @@ impl DataRouter {
                                     }
                                 }
                                 actual_copy
-                            }
-                        } else {
-                            // Hole block: nothing to copy — zero the whole region.
-                            0
-                        };
+                            } else {
+                                // Hole block (initial resolution or rebound to a
+                                // punched/truncated index): zero the whole region.
+                                0
+                            };
                         if written < copy_len {
                             unsafe {
                                 std::ptr::write_bytes(

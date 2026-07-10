@@ -446,7 +446,7 @@ fn stamp_block(b: u64, generation: u64) -> Vec<u8> {
 fn check_stamps(data: &[u8], file_off: u64, tag: &str) {
     for (i, w) in data.chunks_exact(8).enumerate() {
         let off = file_off + (i as u64) * 8;
-        if off % 8 != 0 {
+        if !off.is_multiple_of(8) {
             continue;
         }
         let word = u64::from_le_bytes(w.try_into().unwrap());

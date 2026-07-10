@@ -353,6 +353,12 @@ pub struct Metrics {
     pub del_obj: Align64<AtomicU64>,
     pub cache_hits: Align64<AtomicU64>,
     pub cache_misses: Align64<AtomicU64>,
+    /// Striped serves whose block-index→key binding (or device-fill
+    /// incarnation) moved between resolution and fetch and were re-resolved
+    /// instead of served (the reused-key stale-fill family, `8e3995e`
+    /// follow-up). Each increment is an averted wrong-block serve — the live
+    /// detector for the free→reallocate ABA window.
+    pub stale_binding_rebinds: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -1068,6 +1074,7 @@ impl SqueezefsFilesystem {
                 "cache_hits": hits,
                 "cache_misses": misses,
                 "cache_hit_ratio": ratio,
+                "stale_binding_rebinds": METRICS.stale_binding_rebinds.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
@@ -1653,16 +1660,21 @@ impl SqueezefsFilesystem {
                                 // merged block completes and write-through
                                 // displaces + frees `bk` before a detached tier
                                 // publish of its old bytes lands. Route through
-                                // the shared single-flight validated fill:
-                                // read_lru → NVMe tier (served without the
-                                // unprovable-provenance RAM re-promote) → device
-                                // read under the incarnation seqlock (snapshot →
-                                // read → publish → REvalidate → undo; the
-                                // detached NVMe-tier publish re-checks before
-                                // and after its put). The previous hand-rolled
-                                // read published both tiers with no validation —
-                                // the stale-fill follow-up filed in 8e3995e.
-                                existing = Some(self.router.get_cached_or_fetch_block(&bk).await?);
+                                // the BINDING-VALIDATED fetch (the 8e3995e
+                                // follow-up, closed): single-flight validated
+                                // fill (read_lru → NVMe tier → device read
+                                // under the incarnation seqlock) PLUS the
+                                // block-index→key recheck once the bytes are
+                                // in hand — a key reallocated to another block
+                                // mid-seed would otherwise become this RMW's
+                                // base and merge user data over a foreign
+                                // block's bytes (persistent corruption). A
+                                // hole rebind (concurrent truncate/punch)
+                                // seeds zeros.
+                                existing = self
+                                    .router
+                                    .get_block_for_index(&file_path, b as u32, Some(&bk))
+                                    .await?;
                             }
                         }
 
@@ -6757,7 +6769,19 @@ async fn flush_one_active_block(
         // Cache in RAM (bypass entirely if file is striped layout). Promotion
         // puts a detached copy — never the guard-backed staging bytes (§5.5).
         match lru_copy {
-            Some(copy) => router.cache.read_lru.put(&stored_block_key, copy),
+            Some(copy) => {
+                // Put-owner of a possibly-reused key: the fresh put covers
+                // the RAM tier; the NVMe read tier still needs the purge — a
+                // validated fill of the key's dying incarnation may have
+                // published there before our allocate, and it would serve
+                // dead bytes once the RAM entry evicts (same
+                // dead-incarnation shielding as `upload_full_block`, PR 6).
+                router.cache.read_lru.put(&stored_block_key, copy);
+                router
+                    .cache
+                    .nvme
+                    .remove_cached_read_block(&stored_block_key);
+            }
             None => {
                 // No-put owner of a possibly-reused key: purge instead (same
                 // dead-incarnation shielding as `upload_full_block`, PR 6).

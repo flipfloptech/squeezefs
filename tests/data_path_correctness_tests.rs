@@ -1153,11 +1153,15 @@ async fn test_rmw_seed_nvme_tier_hit_does_not_repromote_into_ram_lru() {
 }
 
 /// A device-read RMW seed whose block key's incarnation is NOT stable at
-/// fill time must hand the bytes to the merge UNCACHED — publishing them
-/// would poison the shared read tiers for the key's (new) owner. This is
-/// the same seqlock gate `get_cached_or_fetch_block` enforces
-/// (fill_incarnation → None ⇒ no publish); the hand-rolled seed read
-/// published both tiers with no validation at all.
+/// fill time must never publish the bytes into the shared read tiers —
+/// publishing would poison the key for its (new) owner. Since the
+/// binding-validated serve (the reused-key stale-fill fix), the seed also
+/// refuses to USE such unproven bytes at all: a still-mapped key that never
+/// settles is indistinguishable from a key mid-reallocation, so the write
+/// fails LOUD (EIO after bounded rebind retries) instead of merging user
+/// data over bytes that may belong to a dead incarnation. In production the
+/// state is transient by protocol — owners publish before merging — so a
+/// retry against a settled map succeeds (the heal leg below).
 #[tokio::test]
 async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
     let h = make().await;
@@ -1202,9 +1206,25 @@ async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
     h.fs.router.cache.nvme.remove_cached_read_block(&dk);
 
     // Partial overwrite INSIDE block 1: the seed misses every cache and
-    // device-reads the in-flight key.
+    // device-reads the in-flight key. The unproven bytes must be refused
+    // loud — not merged, not published.
     let patch: Vec<u8> = (0..100).map(|i| ((i % 97) as u8) ^ 0x33).collect();
-    write_at(&h, ino, (block + 10) as u64, &patch).await;
+    let refused =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            (block + 10) as u64,
+            bytes::Bytes::copy_from_slice(&patch),
+            0,
+            0,
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "RMW seed merged over a never-settling UNSTABLE incarnation instead \
+         of failing loud — user data over possibly-dead bytes"
+    );
 
     assert!(
         h.fs.router.cache.read_lru.get(&dk).is_none(),
@@ -1217,19 +1237,24 @@ async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
          the NVMe read tier — an unvalidated fill that poisons the key's owner"
     );
 
-    // Sanity: the write path merged over OUR in-flight mapping (the seed
-    // really resolved `dk`), and uncached ≠ unserved — the merge seeded
-    // from the device bytes.
+    // Sanity: the refused write left OUR in-flight mapping in place (the
+    // seed really resolved `dk` and retried against it).
     let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
     assert_eq!(
         meta.block_map.as_ref().and_then(|bm| bm.get(&1)),
         Some(&dk),
         "test premise: block 1 must still resolve to the in-flight key"
     );
+
+    // Heal leg: the owner publishes (the transient window closes, as every
+    // production owner does before merging) — the same write now seeds from
+    // the settled incarnation and succeeds.
+    allocator.publish_block(dest);
+    write_at(&h, ino, (block + 10) as u64, &patch).await;
     let mut expected = seeded.clone();
     expected[10..110].copy_from_slice(&patch);
     let got = read_at(&h, ino, block as u64, block as u32).await;
-    assert_eq!(got, expected, "unstable-incarnation seed content mismatch");
+    assert_eq!(got, expected, "post-publish seed content mismatch");
 }
 
 // ===========================================================================

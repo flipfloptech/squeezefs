@@ -300,9 +300,13 @@ EOF
 #                     active-block overlays alive, overlay-blind
 #                     copy_file_range, unwritten uring read-dest regions,
 #                     flush-merge-vs-prune reordering (layout-prune epoch),
-#                     dual-overlay authority (fix 93dce89) — GREEN 3/3 each;
-#                     rare residual on 075.2 soaks = the pre-existing
-#                     reused-key stale-fill family (8e3995e follow-up)
+#                     dual-overlay authority (fix 93dce89) — GREEN 3/3 each.
+#                     The rare 075.2 soak residual (stale bytes one block
+#                     over — the reused-key stale-fill / block-index→key
+#                     binding ABA, 8e3995e follow-up) is closed by the
+#                     binding-validated serve fix; regression pins live in
+#                     tests/reused_key_stale_fill_tests.rs and averted
+#                     serves surface as stale_binding_rebinds on .stats
 #   008/009/285/316 = fallocate / zero-range / SEEK_HOLE / punch coverage
 #   003/069/469     = pre-existing FUSE-class failures tracked for delta
 #   001/013/074/127/213/263 = mount-cycle + fsx/fsstress core soak

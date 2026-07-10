@@ -41,7 +41,9 @@ async fn test_metalv_fuse_integration() {
         dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
 
     let router = DataRouter::new(

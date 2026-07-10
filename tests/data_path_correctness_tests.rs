@@ -56,7 +56,9 @@ async fn make() -> H {
         dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
@@ -1313,7 +1315,9 @@ async fn v3_spill_router(
         dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
 
@@ -1525,7 +1529,9 @@ async fn test_mixed_v2_v3_volumes_spill_per_volume() {
         dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
 

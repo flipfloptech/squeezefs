@@ -295,7 +295,9 @@ async fn fuse_fs(routed: Arc<RoutedMetaBackend>, test_id: &str) -> FuseHarness {
         dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, block_alloc, nvme_dev);
     let mut fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);

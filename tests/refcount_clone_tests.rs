@@ -58,7 +58,9 @@ async fn make_router() -> (
         dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm, cache, ba.clone(), nvme);
 
@@ -334,7 +336,9 @@ async fn make_router_v3() -> (
         dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm, cache, ba.clone(), nvme);
 

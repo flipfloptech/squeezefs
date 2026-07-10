@@ -455,6 +455,12 @@ pub struct Metrics {
     /// transaction (design §4.5) — headroom before `SQUEEZEFS_RECLAIM_BATCH`
     /// needs raising.
     pub meta_reclaim_batch_size: Align64<QueueDepthHistogram>,
+    /// Staging dirs whose content was discarded at init because it was
+    /// stamped by a DEAD filesystem generation (or predated generation
+    /// stamping) — the reformat-over-stale-staging guard (`cache::nvme::
+    /// bind_staging_generation`). One increment per discarded dir; exactly
+    /// once per dir after a reformat, 0 on every warm restart.
+    pub staging_generation_discards: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -1108,6 +1114,7 @@ impl SqueezefsFilesystem {
                 "bg_spawn_admitted": METRICS.bg_spawn_admitted.load(Ordering::Relaxed),
                 "bg_spawn_rejected": METRICS.bg_spawn_rejected.load(Ordering::Relaxed),
                 "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),
+                "staging_generation_discards": METRICS.staging_generation_discards.load(Ordering::Relaxed),
                 "nvme_unaligned_write_fallbacks": METRICS.nvme_unaligned_write_fallbacks.load(Ordering::Relaxed),
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),

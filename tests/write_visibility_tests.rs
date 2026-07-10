@@ -85,7 +85,9 @@ async fn make(fmt: Fmt) -> H {
         dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);

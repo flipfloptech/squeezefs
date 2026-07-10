@@ -3279,6 +3279,75 @@ impl RoutedMetaBackend {
     }
 }
 
+/// The mounted volume set's **filesystem generation identity** — what a
+/// `squeezefs format` invocation changes and nothing else does. Local NVMe
+/// staging is bound to this identity (`cache::nvme` stamps it into every
+/// staging dir and discards staging content stamped by a DEAD generation
+/// before any recovery/seeding runs — the reformat-over-stale-staging
+/// poisoning fix).
+///
+/// Per-volume identity, strongest existing stamp per format:
+/// - **v3**: the superblock `uuid` (`kv::superblock::SuperblockV3::uuid`) —
+///   random at every format ([`kv::builder::BuilderConfig::new`]), read
+///   straight off sector 0 without mounting the volume.
+/// - **v2**: the v2 superblock is deterministic (no uuid, no timestamp), so
+///   the identity comes from the `user.squeezefs.format_config` root xattr
+///   the CLI records on the FIRST volume: its `fs_uuid` field (random per
+///   format invocation since this fix; a config-JSON addition, NOT a v2
+///   on-disk format change) when present, else a content hash of the raw
+///   config bytes (pre-fix volumes), else the `unstamped` sentinel
+///   (non-first v2 volumes carry no config). Pre-fix staging dirs carry no
+///   marker at all, so they are discarded once regardless — the weak v2
+///   fallbacks only ever have to distinguish generations for volumes
+///   formatted before `fs_uuid` existed.
+///
+/// The set identity is the ORDERED join of per-volume identities:
+/// `route_ino` stripes by volume order, so a reordered volume set is a
+/// different metadata view and must not adopt the old set's staging.
+pub async fn volume_set_generation(meta_lvs: &[String]) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut parts = Vec::with_capacity(meta_lvs.len());
+    for path in meta_lvs {
+        let part = match kv::superblock::classify_volume(std::path::Path::new(path)).await? {
+            kv::superblock::VolumeFormat::Blank => {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "Metadata volume {path} is not formatted (zeroed superblock) — cannot \
+                     derive a filesystem generation; run `squeezefs format` first"
+                )));
+            }
+            kv::superblock::VolumeFormat::V3(sb) => {
+                let mut s = String::with_capacity(3 + 32);
+                s.push_str("v3:");
+                for b in sb.uuid {
+                    let _ = write!(s, "{b:02x}");
+                }
+                s
+            }
+            kv::superblock::VolumeFormat::V2(_) => {
+                // The unchanged v2 open path (same 128 MiB file floor as
+                // `VolumeBackend::open_for_mount`).
+                let storage = storage::MetaLvStorage::open(path, 128 * 1024 * 1024)?;
+                match xattr::get_xattr(&storage, 1, kv::builder::FORMAT_CONFIG_XATTR).await? {
+                    Some(bytes) => {
+                        let fs_uuid = serde_json::from_slice::<crate::FormatConfig>(&bytes)
+                            .ok()
+                            .and_then(|cfg| cfg.fs_uuid);
+                        match fs_uuid {
+                            Some(uuid) => format!("v2:{uuid}"),
+                            None => {
+                                format!("v2:cfg-{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes))
+                            }
+                        }
+                    }
+                    None => "v2:unstamped".to_string(),
+                }
+            }
+        };
+        parts.push(part);
+    }
+    Ok(parts.join("|"))
+}
+
 #[cfg(test)]
 mod flusher_tests {
     use super::*;

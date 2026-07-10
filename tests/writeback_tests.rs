@@ -52,7 +52,9 @@ async fn test_writeback_queue_full_deadlock() {
         dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
 
     let router = DataRouter::new(
@@ -178,7 +180,9 @@ async fn test_inline_file_layout_overflow() {
         dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
 
     let router = DataRouter::new(dlm.clone(), cache, block_alloc, nvme_dev);
@@ -267,7 +271,9 @@ async fn test_indirect_block_map() {
         dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
 
     let router = DataRouter::new(dlm.clone(), cache, block_alloc.clone(), nvme_dev);
@@ -465,7 +471,9 @@ async fn make_staging_sandbox(test_id: &str) -> StagingSandbox {
         dlm.meta_client().clone(),
         ba,
         dev.clone(),
+        None,
     )
+    .await
     .unwrap();
     StagingSandbox {
         nvme: cache.nvme.clone(),
@@ -662,7 +670,9 @@ async fn make_flush_fs(test_id: &str) -> FlushHarness {
         dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, block_alloc, nvme_dev);
     let mut fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
@@ -1045,7 +1055,9 @@ async fn test_block_allocator_recovery() {
         dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
 
     let router = DataRouter::new(

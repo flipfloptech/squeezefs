@@ -73,7 +73,9 @@ async fn make(test_id: &str) -> H {
         dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm, cache, ba, nvme.clone());
     H {

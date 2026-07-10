@@ -74,7 +74,9 @@ async fn make_with_write_cap(write_disk_cap: &str) -> H {
         dlm.meta_client().clone(),
         ba.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
     let nvme = cache.nvme.clone();
     let max_write_bytes = nvme.max_write_bytes();
@@ -383,7 +385,9 @@ async fn test_stage_write_shard_full_is_loud_never_lossy() {
         dlm.meta_client().clone(),
         ba.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
     let st = cache.nvme.clone();
 
@@ -540,6 +544,9 @@ async fn test_remount_budget_counts_staged_entries_only() {
     );
     let dir = tempdir().unwrap();
 
+    // Both sessions carry the SAME filesystem generation: the remount
+    // seeding contract below runs BEHIND a matching generation gate (the
+    // reformat-over-stale-staging fix must not regress warm restarts).
     let mk = || {
         TieredCache::new(
             vec![dir.path().to_path_buf()],
@@ -550,12 +557,12 @@ async fn test_remount_budget_counts_staged_entries_only() {
             dlm.meta_client().clone(),
             ba.clone(),
             nvme_dev.clone(),
+            Some("staging-budget-remount-generation"),
         )
-        .unwrap()
     };
 
     // Session A: one staged file + one orphan active block, then "crash".
-    let a = mk();
+    let a = mk().await.unwrap();
     a.nvme
         .stage_write("/f1", "file-id-1", &vec![0x11u8; STAGED_LEN], 7)
         .await
@@ -568,7 +575,7 @@ async fn test_remount_budget_counts_staged_entries_only() {
     drop(a);
 
     // Session B: recovery must seed the budget from the staged entry only.
-    let bch = mk();
+    let bch = mk().await.unwrap();
     let seeded = bch.nvme.current_staged_write_bytes();
     assert!(
         seeded >= STAGED_LEN as u64,

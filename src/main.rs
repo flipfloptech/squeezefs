@@ -1600,6 +1600,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let config = FormatConfig {
                 name: "squeezefs".to_string(),
+                // Filesystem-generation stamp: fresh per format invocation.
+                // v2 volume sets derive their staging generation identity
+                // from this config field (v3 sets use the superblock uuid)
+                // — see `meta_backend::volume_set_generation`.
+                fs_uuid: Some(uuid::Uuid::new_v4().to_string()),
                 block_size: parsed_block_size,
                 capacity: total_capacity,
                 inodes,
@@ -2130,6 +2135,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let nvme_dev =
                 std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(first_data_path));
 
+            // Filesystem generation of the mounted volume set (v3 superblock
+            // uuids / v2 config identity, ordered): local staging is bound
+            // to it, so a reformat that did not wipe the staging dirs can
+            // never poison this mount with dead-generation segments.
+            let fs_generation = squeezefs::meta_backend::volume_set_generation(&meta_lvs).await?;
+
             let cache = TieredCache::new(
                 active_staging_dirs.clone(),
                 Some(&resolved_read_mem_cache_size),
@@ -2139,7 +2150,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 dlm.meta_client().clone(),
                 block_alloc.clone(),
                 nvme_dev.clone(),
-            )?;
+                Some(&fs_generation),
+            )
+            .await?;
 
             if let Some(ref addr) = p2p_addr {
                 let _ = cache.nvme.p2p_addr.set(addr.clone());
@@ -2528,7 +2541,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 dlm.meta_client().clone(),
                 block_alloc.clone(),
                 nvme_dev.clone(),
-            )?;
+                // Offline tool without a metadata volume set: no filesystem
+                // generation to bind — adopt existing staging untouched.
+                None,
+            )
+            .await?;
             let router = DataRouter::new(dlm, cache, block_alloc.clone(), nvme_dev.clone());
 
             // Run purely offline on default backend_0

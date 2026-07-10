@@ -167,7 +167,9 @@ async fn test_reclaim_batch_bisect_poisoned_sector_wedges_only_victim() {
         dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
@@ -442,7 +444,9 @@ async fn test_batch_forget_queues_reclaim_like_forget() {
         dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
+        None,
     )
+    .await
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);

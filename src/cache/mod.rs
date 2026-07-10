@@ -22,7 +22,10 @@ impl TieredCache {
         self.nvme.set_backend_router(router);
     }
 
-    pub fn new(
+    /// `fs_generation` binds local staging to the mounted filesystem
+    /// generation (see [`nvme::NvmeStaging::new`]); `None` only for
+    /// offline tooling with no metadata volume set.
+    pub async fn new(
         staging_dirs: Vec<PathBuf>,
         read_mem_cache_size: Option<&str>,
         write_mem_cache_size: Option<&str>,
@@ -32,6 +35,7 @@ impl TieredCache {
         redis_client: std::sync::Arc<crate::dlm::MetaClient>,
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+        fs_generation: Option<&str>,
     ) -> Result<Self> {
         let gds = gds::GdsCache::new(staging_dirs.clone());
 
@@ -99,7 +103,9 @@ impl TieredCache {
             block_allocator.clone(),
             nvme_writer.clone(),
             redis_client,
-        )?;
+            fs_generation,
+        )
+        .await?;
 
         // Spawn background dehydration task to move evicted RAM blocks to NVMe
         if let Some(mut evict_rx) = read_lru.take_evict_rx() {

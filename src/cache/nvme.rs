@@ -9,6 +9,135 @@ use tokio::time::{self, Duration};
 
 use xxhash_rust::xxh3::xxh3_64;
 
+/// Marker file binding a staging dir to the filesystem generation
+/// (`meta_backend::volume_set_generation`) it was populated by. Lives at
+/// the root of every staging dir handed to [`NvmeStaging::new`].
+pub const STAGING_GENERATION_MARKER: &str = ".squeezefs_generation";
+
+/// Marker header line: versions the marker format itself, so a future
+/// identity-scheme change can re-stamp instead of misparsing.
+const STAGING_GENERATION_HEADER: &str = "squeezefs-staging-generation-v1";
+
+/// Full marker file image for `fs_generation`.
+fn generation_marker_content(fs_generation: &str) -> Vec<u8> {
+    format!("{STAGING_GENERATION_HEADER}\n{fs_generation}\n").into_bytes()
+}
+
+/// Remove every regular file directly inside `dir` (segment files; the dir
+/// itself and any nested dirs/symlinks stay). Follows `dir` when it is the
+/// mount layout's `cache_segment -> ../cache_segment` symlink — stale
+/// offset-keyed read-cache blocks are exactly as poisonous as stale staging
+/// segments. Returns `(files_removed, bytes_removed)`; a missing dir is
+/// zero work. Directory enumeration/unlink are std::fs by design — the
+/// uring-fs exclusion list ("directory create/remove metadata").
+fn wipe_segment_files(dir: &std::path::Path) -> std::io::Result<(usize, u64)> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e),
+    };
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_file() {
+            bytes += meta.len();
+            fs::remove_file(entry.path())?;
+            files += 1;
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// Remove stale GDS read-cache materializations (`*.gds_cache`) at the
+/// staging-dir root — same offset/object-keyed poisoning class as the
+/// segment files.
+fn wipe_gds_cache_files(dir: &std::path::Path) -> std::io::Result<(usize, u64)> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e),
+    };
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let is_gds = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(".gds_cache"));
+        if !is_gds {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_file() {
+            bytes += meta.len();
+            fs::remove_file(entry.path())?;
+            files += 1;
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// Bind `dir` to `fs_generation` BEFORE any segment is mapped, recovered,
+/// or budget-seeded (the reformat-over-stale-staging fix):
+///
+/// - marker matches ⇒ same generation, keep everything (warm restart);
+/// - marker missing/unreadable/mismatched with NO segment data ⇒ stamp;
+/// - marker missing/unreadable/mismatched WITH segment data ⇒ the content
+///   belongs to a DEAD filesystem generation (or predates generation
+///   stamping): discard it — wipe segment files in `cache_segment/` and
+///   `staging_segment/` plus `*.gds_cache` materializations — with ONE
+///   loud log line, bump `staging_generation_discards`, then stamp.
+///
+/// Marker I/O is io_uring (`crate::uring_fs`); the stamp is fdatasync'd so
+/// a fresh generation is never adopted volatile.
+async fn bind_staging_generation(dir: &std::path::Path, fs_generation: &str) -> Result<()> {
+    let marker_path = dir.join(STAGING_GENERATION_MARKER);
+    let expected = generation_marker_content(fs_generation);
+
+    let found = crate::uring_fs::read_all(&marker_path).await.ok();
+    if found.as_deref() == Some(expected.as_slice()) {
+        return Ok(());
+    }
+
+    let cache_dir = dir.join("cache_segment");
+    let staging_dir = dir.join("staging_segment");
+    let has_data = dir_has_segment_data(&cache_dir) || dir_has_segment_data(&staging_dir);
+    if has_data {
+        let (cf, cb) = wipe_segment_files(&cache_dir)?;
+        let (sf, sb) = wipe_segment_files(&staging_dir)?;
+        let (gf, gb) = wipe_gds_cache_files(dir)?;
+        crate::fuse_client::METRICS
+            .staging_generation_discards
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let found_desc = match &found {
+            Some(bytes) => format!(
+                "marker {:?}",
+                String::from_utf8_lossy(bytes).replace('\n', "\\n")
+            ),
+            None => "no readable generation marker".to_string(),
+        };
+        log::warn!(
+            "STAGING GENERATION MISMATCH at {}: discarding staging content from a dead \
+             filesystem generation ({found_desc}, mounted generation \"{fs_generation}\") — \
+             removed {} staging segment file(s) ({} bytes), {} read-cache segment file(s) \
+             ({} bytes), {} gds cache file(s) ({} bytes); staged writes and active blocks \
+             stamped by the old generation are gone by design (reformat discards data)",
+            dir.display(),
+            sf,
+            sb,
+            cf,
+            cb,
+            gf,
+            gb,
+        );
+    }
+
+    crate::uring_fs::write_all(&marker_path, expected).await?;
+    crate::uring_fs::fdatasync(&marker_path).await?;
+    Ok(())
+}
+
 pub fn dir_has_segment_data(path: &std::path::Path) -> bool {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
@@ -288,14 +417,31 @@ pub struct PendingStagedWrite {
 }
 
 impl NvmeStaging {
-    pub fn new(
+    /// `fs_generation` binds every staging dir to the mounted filesystem
+    /// generation (`meta_backend::volume_set_generation`): the generation
+    /// gate runs FIRST, so segment recovery, index rebuild, and
+    /// budget/ledger seeding below only ever see same-generation content.
+    /// `None` is for offline tooling with no metadata volume set (`clone`):
+    /// existing staging is adopted untouched and never stamped.
+    pub async fn new(
         staging_dirs: Vec<PathBuf>,
         max_write_bytes: u64,
         max_read_bytes: u64,
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
         redis_client: std::sync::Arc<crate::dlm::MetaClient>,
+        fs_generation: Option<&str>,
     ) -> Result<Self> {
+        // Generation gate (reformat-over-stale-staging fix): validate the
+        // marker and discard dead-generation content BEFORE any segment is
+        // scanned, mapped, or recovered.
+        if let Some(fs_generation) = fs_generation {
+            for dir in &staging_dirs {
+                fs::create_dir_all(dir)?;
+                bind_staging_generation(dir, fs_generation).await?;
+            }
+        }
+
         // Initialize directories for segments
         let mut read_cache_dirs = Vec::new();
         let mut staging_segment_dirs = Vec::new();

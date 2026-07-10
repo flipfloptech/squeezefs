@@ -55,7 +55,9 @@ async fn make_min_fs(test_id: &str) -> MinFs {
         dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
 
     let router = DataRouter::new(dlm.clone(), cache, block_alloc, nvme_dev);

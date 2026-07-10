@@ -117,20 +117,20 @@ async fn bind_staging_generation(dir: &std::path::Path, fs_generation: &str) -> 
             ),
             None => "no readable generation marker".to_string(),
         };
-        log::warn!(
+        let msg = format!(
             "STAGING GENERATION MISMATCH at {}: discarding staging content from a dead \
              filesystem generation ({found_desc}, mounted generation \"{fs_generation}\") — \
-             removed {} staging segment file(s) ({} bytes), {} read-cache segment file(s) \
-             ({} bytes), {} gds cache file(s) ({} bytes); staged writes and active blocks \
-             stamped by the old generation are gone by design (reformat discards data)",
+             removed {sf} staging segment file(s) ({sb} bytes), {cf} read-cache segment \
+             file(s) ({cb} bytes), {gf} gds cache file(s) ({gb} bytes); staged writes and \
+             active blocks stamped by the old generation are gone by design (reformat \
+             discards data)",
             dir.display(),
-            sf,
-            sb,
-            cf,
-            cb,
-            gf,
-            gb,
         );
+        // Loud at DEFAULT verbosity: the daemon's env_logger default filter
+        // is ERROR, so a warn alone is invisible on a stock mount. Console
+        // line (stderr → daemon log / terminal) + the structured record.
+        eprintln!("{msg}");
+        log::warn!("{msg}");
     }
 
     crate::uring_fs::write_all(&marker_path, expected).await?;

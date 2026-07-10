@@ -454,3 +454,111 @@ async fn punch_then_reuse_reads_zeros_v3() {
 async fn punch_then_reuse_reads_zeros_v2() {
     punch_then_reuse_reads_zeros(Fmt::V2).await;
 }
+
+// ---------------------------------------------------------------------------
+// 6. Writeback-vs-hole race (the durable `generic/616` residual). A
+//    `truncate`-DOWN must remove ALL data beyond `new_size` even when the
+//    daemon's view of the *current* size is STALE and SMALLER than the file's
+//    true physical extent.
+//
+//    Root cause (confirmed by daemon tracing under `fsx -S 0 -U` == generic/616
+//    on a striped/staged file): `DataRouter::truncate_layout` decided
+//    grow-vs-shrink from `fetch_metadata().size`, which lags the true extent
+//    when the hot layout-cache entry was evicted and the backend layout size
+//    persist was deferred (staged/dirty layouts persist only on fsync; the
+//    striped variant lags in a narrower window). With the stale size
+//    `old < new_size < physical`, the shrink was misclassified as a GROW and
+//    the code SKIPPED truncating the staged blob / pruning the striped block
+//    map. The stale bytes in `[new_size, physical)` survived and resurfaced as
+//    non-zero data the moment the file was re-extended over them — a durable
+//    corruption (survives daemon SIGKILL + remount), not a page-cache artifact.
+//
+//    This test injects that exact precondition deterministically: grow the
+//    file, then rewrite the hot cache entry with a stale-small `size` (the
+//    state `fetch_metadata` returns after eviction + a lagging backend
+//    persist), then truncate DOWN into `(stale, physical)`, re-extend, and
+//    require the re-exposed region to read zeros. Format-agnostic (v2 + v3),
+//    all three layouts.
+// ---------------------------------------------------------------------------
+
+async fn truncate_down_stale_size_reads_zeros(
+    fmt: Fmt,
+    stale: u64,
+    small_present: u64,
+    mid: u64,
+    big: u64,
+    lname: &str,
+) {
+    let h = make(fmt).await;
+    let ino = create(&h, "wbrace").await;
+
+    // Grow the file to `big` with a recognizable pattern everywhere.
+    write_at(&h, ino, 0, &vec![POISON; big as usize]).await;
+
+    // Simulate the confirmed corruption precondition: the hot layout-cache
+    // entry now reports a size (`stale`) SMALLER than the true physical extent
+    // (`big`) while the layout (staged file_id / striped block map / inline
+    // data_key) still describes all `big` bytes — exactly what
+    // `fetch_metadata` returns after the fresh entry is evicted and the
+    // backend layout size persist has lagged behind the last writes.
+    let file_path = squeezefs::keys::inode_path(ino);
+    let mut m =
+        h.fs.router
+            .fetch_metadata(&file_path)
+            .await
+            .expect("fetch meta");
+    assert_eq!(m.size, big, "[{fmt:?}/{lname}] setup: physical size");
+    m.size = stale;
+    m.cached_at = std::time::Instant::now();
+    h.fs.router.metadata_cache.insert(file_path.clone(), m);
+
+    // Truncate DOWN to `mid`, with `stale < mid < big`. The buggy path treats
+    // this as a grow (mid >= stale) and never removes the bytes in [mid, big).
+    truncate_to(&h, ino, mid).await;
+
+    // Re-extend past the truncated region so [mid, big) is now a POSIX hole.
+    truncate_to(&h, ino, big).await;
+
+    let tag = format!("{fmt:?}/{lname} truncate-down-stale-size");
+    assert_eq!(size_of(&h, ino).await, big, "[{tag}] size after re-extend");
+    // The re-exposed hole MUST read zeros — never the stale POISON.
+    assert_hole(&h, ino, mid, big - mid, &tag).await;
+    // Data that survived the truncate (below `small_present`) is preserved.
+    if small_present > 0 {
+        assert_fill(&h, ino, 0, small_present, POISON, &tag).await;
+    }
+
+    // DURABILITY: drop the hot layout cache so the next read must resolve the
+    // layout from the persisted backend (and the data from the durable staging
+    // blob / striped blocks), never a RAM snapshot. This proves the truncate
+    // removed the stale bytes from the DURABLE store, not just the page/RAM
+    // cache — the property that made the original bug survive daemon SIGKILL +
+    // remount. `truncate_layout` already drops read_lru/write_lru, so evicting
+    // metadata_cache forces the whole read through the durable path.
+    h.fs.router.metadata_cache.invalidate(&file_path);
+    let dtag = format!("{tag} (durable re-read)");
+    assert_hole(&h, ino, mid, big - mid, &dtag).await;
+    if small_present > 0 {
+        assert_fill(&h, ino, 0, small_present, POISON, &dtag).await;
+    }
+}
+
+async fn truncate_down_stale_size_all_layouts(fmt: Fmt) {
+    // inline (<= 4 KiB): stale/mid/big all inline-sized.
+    truncate_down_stale_size_reads_zeros(fmt, 512, 1024, 2048, 3500, "inline").await;
+    // staged (4 KiB .. 64 KiB): all <= BS so the file stays a single blob.
+    truncate_down_stale_size_reads_zeros(fmt, 8_000, 12_000, 24_000, 50_000, "staged").await;
+    // striped (> 64 KiB): mid is block-aligned (2 * BS) so only whole-block
+    // removal is exercised; blocks 2..=3 must be dropped by the truncate.
+    truncate_down_stale_size_reads_zeros(fmt, 80_000, 60_000, 2 * BS, 250_000, "striped").await;
+}
+
+#[tokio::test]
+async fn truncate_down_stale_size_reads_zeros_v3() {
+    truncate_down_stale_size_all_layouts(Fmt::V3).await;
+}
+
+#[tokio::test]
+async fn truncate_down_stale_size_reads_zeros_v2() {
+    truncate_down_stale_size_all_layouts(Fmt::V2).await;
+}

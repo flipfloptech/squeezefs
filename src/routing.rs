@@ -3285,39 +3285,34 @@ impl DataRouter {
     pub async fn truncate_layout(&self, ino: u64, new_size: u64, fencing_token: u64) -> Result<()> {
         let file_path = crate::keys::inode_path(ino);
         let mut meta = self.fetch_metadata(&file_path).await?;
-        let old_size = meta.size;
 
-        // Striped files: every save that carries an existing striped block
-        // map goes through the merge primitive (§5.3 one merge discipline).
-        // Both legs were stale-snapshot saves racing the data-path merges:
-        // grow rewrote the whole map "without mutating it" (a live
-        // lost-update once write-through publishes continuously), shrink's
-        // retain-and-save was serialized only by setattr's inode write lock.
-        // Inline/staged files keep the whole-meta save below — their RAM
-        // meta (dirty inline payload / staged identity) is the truth a
-        // backend re-read cannot carry, and they have no striped map to
-        // lose.
+        // `truncate_layout` is only ever called from the SETATTR(size) handler,
+        // whose `new_size` is the kernel-authoritative new file length: after
+        // it, the file is EXACTLY `new_size` bytes and NOTHING beyond may
+        // survive on any tier.
+        //
+        // Do NOT gate the removal of data beyond `new_size` on a grow-vs-shrink
+        // test against `meta.size`. That size is laggable: the hot layout-cache
+        // entry can be evicted and refilled from the backend, whose layout-size
+        // persist trails the last writes (staged/dirty layouts persist only on
+        // fsync; the striped map lags in a narrower window). When the observed
+        // `meta.size` is smaller than the file's true physical extent, a real
+        // shrink was misclassified as a grow, the "remove beyond new_size" step
+        // was SKIPPED, and the stale bytes in `[new_size, physical)` resurfaced
+        // as a non-zero read the moment the file was re-extended over them — the
+        // durable `generic/616` hole-vs-writeback corruption.
+        //
+        // The removal operations below are idempotent no-ops when there is
+        // nothing beyond `new_size` (a genuine grow), so running them
+        // unconditionally is both correct and cheap on the grow path.
+
         if meta.file_type == "striped" {
-            if new_size >= old_size {
-                // Growing: degenerate size-only merge — the CURRENT map is
-                // re-read and saved under INODE_META_LOCKS.
-                self.merge_block_mappings(
-                    ino,
-                    BlockMapOp::Merge(&[]),
-                    new_size,
-                    LayoutFlip::KeepLayout,
-                    fencing_token,
-                )
-                .await?;
-                // The re-exposed range [old_size, new_size) is a hole; drop any
-                // whole-file RAM snapshot so a re-extend after a shrink reads
-                // the (holey) block map, never a stale full-length cache.
-                self.cache.write_lru.remove(&file_path);
-                self.cache.read_lru.remove(&file_path);
-                return Ok(());
-            }
-            // Shrinking: removal-RMW on the same primitive; removed keys
-            // come back as the free list (post-publish free discipline).
+            // Removal-RMW through the shared merge primitive (§5.3 one merge
+            // discipline): read→prune blocks whose start is >= new_size→save,
+            // serialized under INODE_META_LOCKS against every other striped-map
+            // writer so a concurrent write-through's entries are never dropped.
+            // For a genuine grow this removes no blocks and just publishes
+            // `size = new_size`. `TruncateFrom` sets the size authoritatively.
             let removed = self
                 .merge_block_mappings(
                     ino,
@@ -3341,25 +3336,13 @@ impl DataRouter {
             return Ok(());
         }
 
-        if new_size >= old_size {
-            // Growing the file: update size
-            meta.size = new_size;
-            self.save_metadata_to_backend(ino, &meta, fencing_token)
-                .await?;
-            self.metadata_cache.insert(file_path.clone(), meta);
-            // Re-exposed [old_size, new_size) is a hole: invalidate any stale
-            // whole-file snapshot (inline/staged data_key stays short, so a
-            // cached full-length copy would otherwise serve stale tail bytes).
-            self.cache.write_lru.remove(&file_path);
-            self.cache.read_lru.remove(&file_path);
-            return Ok(());
-        }
-
-        // Shrinking the file
+        // inline / staged: authoritatively drop everything beyond new_size.
         meta.size = new_size;
 
         let mut blocks_to_free = Vec::new();
 
+        // A staged file may carry a promoted/spilled block map alongside its
+        // ring blob: prune any block that starts at/after new_size.
         if let Some(ref mut block_map) = meta.block_map {
             let block_size = self.block_size.load(Ordering::Relaxed);
             block_map.retain(|&b, bk| {
@@ -3376,18 +3359,30 @@ impl DataRouter {
 
         if meta.file_type == "inline" {
             if let Some(ref mut data) = meta.data_key {
-                data.truncate(new_size as usize);
+                // `Bytes::truncate` is shrink-only (no-op when already shorter),
+                // so this is safe on the grow path too.
+                if data.len() as u64 > new_size {
+                    data.truncate(new_size as usize);
+                }
             }
         } else if meta.file_type == "staged" {
             if let Some(ref file_id) = meta.file_id {
+                // Physically shrink the staging-ring blob to new_size. Keyed on
+                // the ACTUAL blob length, never the laggable `meta.size`, so a
+                // blob left longer than the logical size by a stale-size grow
+                // misclassification is corrected here. Re-stage only when it
+                // actually shrinks (a grow leaves the blob short — its tail is
+                // an implicit-zero hole the read/RMW paths already honor).
                 if let Some(data) = self.cache.nvme.read_staged(file_id) {
-                    let mut updated_data = data;
-                    updated_data.truncate(new_size as usize);
-                    let _ = self
-                        .cache
-                        .nvme
-                        .stage_write(&file_path, file_id, &updated_data, fencing_token)
-                        .await;
+                    if data.len() as u64 > new_size {
+                        let mut updated_data = data;
+                        updated_data.truncate(new_size as usize);
+                        let _ = self
+                            .cache
+                            .nvme
+                            .stage_write(&file_path, file_id, &updated_data, fencing_token)
+                            .await;
+                    }
                 }
             }
         }

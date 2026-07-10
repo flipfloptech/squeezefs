@@ -48,8 +48,9 @@ use super::node_cache::{
 use super::record::{
     decode_dentry_key, decode_inode_key, decode_readdir_cookie, dentry_key, dentry_name_hash54,
     encode_readdir_cookie, first_free_coll_seq, inode_key, xattr_key, xattr_name_hash56,
-    DentryValue, InodeDelta, InodeValue, ReaddirPos, Record, RecordKind, XattrValue, HASH54_MAX,
-    HASH56_MAX, TREE_ALLOC_RESERVED, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+    DentryValue, InodeDelta, InodeValue, ReaddirPos, Record, RecordKind, XattrValue,
+    FLAGS2_QUARANTINE_CONTENT_LOST, HASH54_MAX, HASH56_MAX, TREE_ALLOC_RESERVED, TREE_DENTRIES,
+    TREE_INODES, TREE_XATTRS,
 };
 use super::superblock::{classify_volume, SuperblockV3, VolumeFormat};
 use super::tree::{decode_interior_value, KvTree, RootPtr, SmoContext, SmoJournal};
@@ -461,6 +462,13 @@ impl KvMetaBackend {
         self.alloc.pending_count()
     }
 
+    /// Whether heap `extent` is allocated (or pending-free). Used by the
+    /// migrate reclaim-accounting tests to assert that the v2 dead journal
+    /// region + xattr reservation came back as *free* v3 extents (§6.2).
+    pub fn extent_allocated(&self, extent: u64) -> bool {
+        self.alloc.is_allocated(extent)
+    }
+
     /// The volume path.
     pub fn device_path(&self) -> &Path {
         &self.path
@@ -586,6 +594,14 @@ impl KvMetaBackend {
         })
     }
 
+    /// The full packed [`InodeValue`] of `ino` (or `None` if absent) —
+    /// exposes `flags`/`flags2`/`nlink` that the FUSE-facing [`Inode`] drops.
+    /// Used by the migrate verification path and its tests to assert the §6.2
+    /// `QUARANTINE_CONTENT_LOST` flag carryover.
+    pub async fn inode_value(&self, ino: Ino) -> Result<Option<InodeValue>> {
+        Ok(self.read_inode_value(ino).await?)
+    }
+
     /// List `dir` per the module-docs offset contract; at most `max`
     /// entries, hash order (legal POSIX readdir order, risk R8). An ino
     /// with no dentries lists empty — the v2 contract (no existence
@@ -652,9 +668,28 @@ impl KvMetaBackend {
 
     /// One xattr value; `Ok(None)` for absent names and inos alike (the
     /// v2 degrade contract).
+    ///
+    /// Quarantine carryover (design §6.2): a migrated quarantined **symlink**
+    /// (`flags2` `QUARANTINE_CONTENT_LOST`, mode `S_IFLNK`) whose target was
+    /// never migrated returns `EIO` on the `system.symlink` read — preserving
+    /// v2's degrade (`xattr.rs` quarantine branch). Regular quarantined inos
+    /// keep no xattrs, so their reads already fold to `Ok(None)` (empty) with
+    /// no extra check.
     pub async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         if name.len() > 255 {
             return Ok(None);
+        }
+        if name == "system.symlink" {
+            if let Some(v) = self.read_inode_value(ino).await? {
+                if v.flags2 & FLAGS2_QUARANTINE_CONTENT_LOST != 0
+                    && (v.mode & libc::S_IFMT) == libc::S_IFLNK
+                {
+                    return Err(self.eio(&format!(
+                        "symlink-target read on quarantined ino {ino}: content lost at migration \
+                         (§6.2), readlink degrades to EIO"
+                    )));
+                }
+            }
         }
         let hash = xattr_name_hash56(name.as_bytes(), self.sb.hash_seed);
         let start = xattr_key(ino, hash, 0);

@@ -638,6 +638,156 @@ pub struct BuiltImage {
     pub extents_allocated: u64,
 }
 
+/// Records for the three trees of a migrated image, each **key-ascending**
+/// (the `TreeWriter` packing contract). Assembled by
+/// [`crate::meta_backend::kv::migrate`] from the v2 namespace.
+pub struct MigrateImageInput {
+    pub inode_records: Vec<Record>,
+    pub dentry_records: Vec<Record>,
+    pub xattr_records: Vec<Record>,
+    pub next_ino: u64,
+}
+
+/// Write a v3 image **in place into the free tail** of an existing v2 volume
+/// (design §6.2), driving the same node/bitmap/ledger engine as
+/// [`ImageBuilder::build`] but
+/// **never touching a live v2 byte and never flipping the superblock** — the
+/// caller ([`crate::meta_backend::kv::migrate`]) verifies the round-trip
+/// digest and only then stamps sector 0.
+///
+/// `sb` must come from [`SuperblockV3::plan_migrate`]: a whole-device heap from
+/// offset 0 with the ledger|journal|bitmap triple reserved at `build_start` in
+/// the tail. Steps:
+///
+/// 1. **Zero** the reserved-triple region fully (a clean ring/ledger/bitmap
+///    scaffold) and the 32 KiB xattr-block header sectors across the rest of
+///    the build region (§6.2 defense-in-depth: kill any stale v2 xattr magic a
+///    prior torn run left, so a v2 remount between a torn migrate and its
+///    re-run degrades cleanly).
+/// 2. Seed the allocator with extent 0 (the superblock sector) plus the whole
+///    `[1, first_node_extent)` prefix marked **allocated** — steering the
+///    lowest-first `TreeWriter` into the tail so no live v2 extent is written.
+/// 3. Pack the three trees bottom-up into the tail via `TreeWriter`.
+/// 4. **Release** the reclaimed low region `[1, build_start_extent)` back to
+///    free — the v2 tables + dead journal region + used xattr blocks become
+///    free v3 extents (§6.2) — leaving only the superblock, the reserved
+///    triple, and the built nodes allocated.
+/// 5. Persist the bitmap (generation 1) and the bootstrap ledger record, then
+///    `fdatasync` — the barrier the caller's flip rides behind.
+pub async fn build_migrated_image(
+    path: &Path,
+    device_len: u64,
+    sb: &SuperblockV3,
+    input: &MigrateImageInput,
+) -> Result<BuiltImage, KvError> {
+    let layout = NodeLayout::new(sb.node_size as usize)?;
+    let build_start = sb.root_ledger.start;
+    let first_node_off = sb.first_node_offset();
+
+    // (1) Clean scaffold + defense-in-depth header wipe (§6.2).
+    zero_range(path, build_start, first_node_off - build_start).await?;
+    zero_block_header_sectors(path, first_node_off, device_len).await?;
+
+    // (2) Allocator steering: reserve extent 0 (superblock) + everything below
+    // the first node extent, so the lowest-first claimer lands in the tail.
+    let total_extents = sb.total_extents();
+    let build_start_extent = sb.extent_of_offset(build_start);
+    let first_node_extent = sb.extent_of_offset(first_node_off);
+    let mut alloc = ExtentAllocator::format(
+        total_extents,
+        compaction_reserve_extents(total_extents),
+        BUILDER_PENDING_CAP,
+    );
+    for extent in 0..first_node_extent {
+        alloc.mark_allocated(extent);
+    }
+
+    // (3) Pack the trees into the tail.
+    let mut tree_roots = Vec::with_capacity(3);
+    let nodes_written;
+    {
+        let mut writer = TreeWriter {
+            path,
+            layout: &layout,
+            heap_base: sb.heap.start,
+            alloc: &alloc,
+            next_node_seq: 0,
+            nodes_written: 0,
+        };
+        for (tree_id, records) in [
+            (TREE_INODES, input.inode_records.clone()),
+            (TREE_DENTRIES, input.dentry_records.clone()),
+            (TREE_XATTRS, input.xattr_records.clone()),
+        ] {
+            let (addr, seq) = writer.write_tree(tree_id, records).await?;
+            tree_roots.push(TreeRoot {
+                tree_id,
+                node_addr: addr,
+                node_seq: seq,
+            });
+        }
+        nodes_written = writer.nodes_written;
+    }
+
+    // (4) Reclaim the low region [1, build_start_extent) as free v3 extents.
+    for extent in 1..build_start_extent {
+        alloc.release_unpublished(extent);
+    }
+
+    // (5) Persist bitmap + bootstrap ledger, then barrier.
+    alloc
+        .write_dirty_pages(path, sb.alloc_bitmap.start, 1)
+        .await?;
+    let ledger = LedgerRecord {
+        seq: 1,
+        tree_roots,
+        journal_tail_seq: 0,
+        next_ino: input.next_ino,
+        alloc_bitmap_generation: 1,
+    };
+    write_ledger_slot(path, sb.root_ledger.start, &ledger).await?;
+    crate::uring_fs::fdatasync(path.to_path_buf()).await?;
+
+    Ok(BuiltImage {
+        superblock: sb.clone(),
+        ledger_seq: ledger.seq,
+        next_ino: input.next_ino,
+        nodes_written,
+        extents_allocated: nodes_written,
+    })
+}
+
+/// Zero the first `SECTOR_SIZE` bytes of every 32 KiB xattr-block boundary in
+/// `[start, end)` (§6.2 quick-format ghost-kill precedent), batched. Kills any
+/// stale v2 xattr magic (`0x58415452`) a prior torn migrate left in the build
+/// region, so a v2 remount between a torn run and its re-run degrades cleanly.
+async fn zero_block_header_sectors(path: &Path, start: u64, end: u64) -> Result<(), KvError> {
+    use crate::meta_backend::storage::SECTOR_SIZE;
+    use crate::meta_backend::xattr::XATTR_BLOCK_SIZE;
+    let stride = XATTR_BLOCK_SIZE as u64;
+    let header = bytes::Bytes::from(vec![0u8; SECTOR_SIZE]);
+    // v2 xattr blocks sit at 72 MiB + ino·32 KiB; build_start is node-size
+    // (≥ 256 KiB) aligned, already on the 32 KiB grid — round up defensively.
+    let mut off = start.div_ceil(stride) * stride;
+    let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
+    while off < end {
+        ops.push((off, header.clone()));
+        if ops.len() == 128 {
+            crate::uring_fs::write_at_batch(path, std::mem::take(&mut ops)).await?;
+        }
+        off += stride;
+    }
+    match ops.len() {
+        0 => {}
+        1 => {
+            let (o, d) = ops.pop().expect("len 1");
+            crate::uring_fs::write_at(path, o, d).await?;
+        }
+        _ => crate::uring_fs::write_at_batch(path, ops).await?,
+    }
+    Ok(())
+}
+
 /// The §4.10 post-fold digest walk: xxh3 over every **live** record of
 /// the given trees — `(tree_id, key, folded value)` in tree-id-then-key
 /// order; tombstones and unfolded deltas excluded — so two states compare
@@ -670,6 +820,26 @@ pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
 /// Convenience: [`digest_walk`] over a mounted backend's three trees.
 pub async fn digest_backend(backend: &KvMetaBackend) -> Result<u64, KvError> {
     digest_walk(&backend.trees()).await
+}
+
+/// The [`digest_walk`] hash over an in-memory record set (all `Put`s, one per
+/// key, each tree's records **key-ascending**) — byte-identical to
+/// [`digest_walk`] on the trees those records build. Migrate compares the
+/// source records against the read-back v3 image with it (the §6.2 round-trip
+/// self-check and `--dry-run` diff), so a build/write/read defect is caught
+/// before the superblock flip.
+pub fn digest_record_set(trees: &[(u8, &[Record])]) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    for (tree_id, records) in trees {
+        h.update(&[*tree_id]);
+        for rec in *records {
+            h.update(&(rec.key.len() as u64).to_le_bytes());
+            h.update(&rec.key);
+            h.update(&(rec.value.len() as u64).to_le_bytes());
+            h.update(&rec.value);
+        }
+    }
+    h.digest()
 }
 
 /// `squeezefs format` options for one metadata volume (the CLI arm's

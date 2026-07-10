@@ -610,7 +610,7 @@ impl MetaLvStorage {
     /// derive from the same authoritative source (the inode table); the
     /// visited `DiskInode` lets seeding classify quarantined legacy occupants
     /// (symlink vs regular — §4.4) without a second table pass.
-    async fn scan_used_inodes<F: FnMut(u64, &crate::meta_backend::inode::DiskInode)>(
+    pub(crate) async fn scan_used_inodes<F: FnMut(u64, &crate::meta_backend::inode::DiskInode)>(
         &self,
         mut visit: F,
     ) -> Result<()> {

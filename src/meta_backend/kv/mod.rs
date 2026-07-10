@@ -41,6 +41,15 @@
 //! lookups/getattr/readdir/getxattr/listxattr over tree + fold). The
 //! §4.4 commit pipeline, checkpoint scheduling, and the mutating
 //! `Metadata` impl are PR K6b's.
+//!
+//! PR K9 adds [`migrate`]: the offline `squeezefs migrate` v2 → v3 converter
+//! (§6.2). It reads the whole v2 namespace via the v2 read path, drives the
+//! K6a [`builder`] engine to build a v3 image **in the free tail** of the
+//! existing volume (whole-device heap; ledger/journal/bitmap reserved at
+//! `build_start`, [`superblock::SuperblockV3::plan_migrate`]), verifies the
+//! round-trip [`builder::digest_walk`], then commits a single crash-safe,
+//! idempotent superblock flip — reclaiming the v2 tables, dead journal region,
+//! and xattr reservation as free v3 extents.
 
 pub mod alloc_ext;
 pub mod alloc_ext_core;
@@ -50,6 +59,7 @@ pub mod builder;
 pub mod checkpoint;
 pub mod journal;
 pub mod journal_core;
+pub mod migrate;
 pub mod node;
 pub mod node_cache;
 pub mod node_state_core;

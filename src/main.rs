@@ -133,6 +133,24 @@ enum Commands {
         /// Metadata URI (sqmeta://...)
         meta_uri: String,
     },
+    /// Convert a metadata volume from format v2 to v3 in place (offline).
+    ///
+    /// Crash-safe and idempotent: interrupt it and re-run — a completed
+    /// conversion is a clean no-op, an incomplete one restarts. The volume
+    /// must be unmounted (a live client refuses the migration).
+    Migrate {
+        /// Metadata URI (sqmeta://...) or path to the metadata volume
+        meta_uri: String,
+        /// Grow a file-backed volume to this total size (e.g. "300M") when the
+        /// free tail is too small to hold the v3 image. Refused on block
+        /// devices (grow them externally or migrate to a larger device).
+        #[arg(long)]
+        grow: Option<String>,
+        /// Build + verify the conversion and report the round-trip digest diff
+        /// WITHOUT flipping the superblock — nothing is committed.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Mount squeezefs at a target path
     Mount {
         /// Metadata URIs (sqmeta://...) and Mountpoint path (last argument)
@@ -1807,6 +1825,84 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Clients { meta_uri: _ } => {
             squeezefs::set_fs_prefix("squeezefs");
             println!("No active clients connected.");
+        }
+        Commands::Migrate {
+            meta_uri,
+            grow,
+            dry_run,
+        } => {
+            squeezefs::set_fs_prefix("squeezefs");
+            let path = if meta_uri.starts_with("sqmeta://") {
+                parse_block_uri(&meta_uri, "sqmeta://")?
+                    .into_iter()
+                    .next()
+                    .ok_or("Error: empty sqmeta:// URI")?
+            } else {
+                meta_uri.clone()
+            };
+            let grow_to_bytes = match grow {
+                Some(ref g) => Some(parse_human_readable_size(g)?),
+                None => None,
+            };
+            let opts = squeezefs::meta_backend::kv::migrate::MigrateOptions {
+                grow_to_bytes,
+                dry_run,
+                ..Default::default()
+            };
+            let _ctrl_c_guard = spawn_ctrl_c_handler("migrating");
+            let report =
+                squeezefs::meta_backend::kv::migrate::migrate_volume(Path::new(&path), &opts)
+                    .await?;
+            if report.already_v3 {
+                println!("{path} is already format v3 — nothing to migrate (no-op).");
+            } else {
+                if let Some(new_len) = report.grew_to {
+                    println!(
+                        "Grew {path} to {} to fit the v3 image.",
+                        format_size_human(new_len)
+                    );
+                }
+                println!(
+                    "{} v2 → v3 migration of {path}:",
+                    if report.dry_run {
+                        "DRY-RUN"
+                    } else {
+                        "Completed"
+                    }
+                );
+                println!(
+                    "  {} inodes, {} dentries, {} xattrs migrated ({} quarantined ino(s) carried \
+                     content-lost)",
+                    report.inodes_migrated,
+                    report.dentries_migrated,
+                    report.xattrs_migrated,
+                    report.quarantined_inodes
+                );
+                println!(
+                    "  round-trip digest {:#018x} (source == built: {})",
+                    report.built_digest,
+                    report.source_digest == report.built_digest
+                );
+                println!(
+                    "  build region base {} ; {} node(s) written ; next_ino {}",
+                    format_size_human(report.build_start),
+                    report.nodes_written,
+                    report.next_ino
+                );
+                println!(
+                    "  reclaimed as free v3 extents: {} (dead journal region) + {} (xattr \
+                     reservation) ; {} / {} heap extents free",
+                    report.reclaimed_journal_extents,
+                    report.reclaimed_reservation_extents,
+                    report.free_extents_after,
+                    report.total_extents
+                );
+                if report.dry_run {
+                    println!("  --dry-run: superblock NOT flipped; no changes committed.");
+                } else if report.flipped {
+                    println!("  superblock flipped to v3 (durable). Mount it to verify.");
+                }
+            }
         }
         Commands::Mount {
             args,

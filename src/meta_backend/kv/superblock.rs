@@ -214,6 +214,122 @@ impl SuperblockV3 {
         })
     }
 
+    /// Plan a **migrated** volume's geometry (design §6.2 in-place tail
+    /// build): the v3 heap spans the whole reclaimed device from offset 0
+    /// (extent 0 holds the sector-0 superblock and stays reserved), while the
+    /// fixed ledger | journal | bitmap triple is written into *reserved
+    /// extents* at `build_start` — the free tail beyond the highest live v2
+    /// xattr block, so no live v2 byte is touched before the single-sector
+    /// flip. Everything below `build_start` (v2 tables, the dead journal
+    /// region, the whole xattr reservation) becomes free heap extents once the
+    /// bitmap marks only the reserved triple + built nodes allocated.
+    ///
+    /// `build_start` must be node-size aligned. The journal ring is clamped on
+    /// the *whole device* (resolved OQ 1). Fails loud if the reserved triple
+    /// plus the §4.7 compaction reserve cannot fit before the device end — the
+    /// structural half of the §6.2 deficit refusal (the node-count half lives
+    /// in [`crate::meta_backend::kv::migrate`]).
+    pub fn plan_migrate(
+        device_len: u64,
+        build_start: u64,
+        node_size: usize,
+        journal_len_override: Option<u64>,
+        uuid: [u8; 16],
+        hash_seed: u64,
+    ) -> Result<Self, KvError> {
+        let layout = NodeLayout::new(node_size)?;
+        let node_size = layout.node_size() as u64;
+        if build_start == 0 || build_start % node_size != 0 {
+            return Err(KvError::Corrupt(format!(
+                "migrate build_start {build_start} must be a nonzero multiple of the node size \
+                 {node_size}"
+            )));
+        }
+
+        // Whole-device heap from offset 0; extent 0 carries the superblock and
+        // is reserved by the builder.
+        let total_extents = device_len / node_size;
+        let heap = ExtentRef {
+            start: 0,
+            len: total_extents * node_size,
+        };
+
+        let root_ledger = ExtentRef {
+            start: build_start,
+            len: ROOT_LEDGER_LEN,
+        };
+        let journal_len = match journal_len_override {
+            Some(len) => {
+                let floor = 256 * 1024 + MAX_ENTRY_LEN;
+                if len % JOURNAL_PAGE_LEN != 0 || len < floor {
+                    return Err(KvError::Corrupt(format!(
+                        "journal ring override {len} bytes is invalid: must be a 4 KiB multiple \
+                         of at least {floor} bytes (reserve + one max entry)"
+                    )));
+                }
+                len
+            }
+            None => journal_ring_len(device_len),
+        };
+        let journal = ExtentRef {
+            start: root_ledger.end(),
+            len: journal_len,
+        };
+        let alloc_bitmap = ExtentRef {
+            start: journal.end(),
+            len: bitmap_region_len(total_extents),
+        };
+
+        // The reserved triple + at least the compaction reserve and the three
+        // tree roots must fit before the heap (device) end.
+        let first_node_off = alloc_bitmap.end().div_ceil(node_size) * node_size;
+        let min_tail = (compaction_reserve_extents(total_extents) + 4) * node_size;
+        if first_node_off + min_tail > heap.end() {
+            return Err(KvError::Corrupt(format!(
+                "metadata volume too small to migrate in place: the v3 fixed structures end at \
+                 {first_node_off} and need at least {min_tail} more bytes for the compaction \
+                 reserve and tree roots, but the heap ends at {} — grow the volume (--grow) or \
+                 migrate to a larger device",
+                heap.end()
+            )));
+        }
+
+        let sb = Self {
+            node_size: node_size as u32,
+            features_incompat: FEATURE_INCOMPAT_KV_V3,
+            features_ro: 0,
+            root_ledger,
+            journal,
+            alloc_bitmap,
+            heap,
+            uuid,
+            hash_seed,
+        };
+        sb.validate_geometry()?;
+        Ok(sb)
+    }
+
+    /// The heap extent whose first byte is at `offset` (or that contains
+    /// `offset`): `(offset - heap.start) / node_size`. Panics if `offset` is
+    /// below the heap. The migrate builder uses it to map the reserved-triple
+    /// and first-node byte offsets onto extent indices.
+    pub fn extent_of_offset(&self, offset: u64) -> u64 {
+        (offset - self.heap.start) / u64::from(self.node_size)
+    }
+
+    /// Physical byte offset of the first node extent (the extent just past the
+    /// reserved ledger|journal|bitmap triple, rounded up to an extent
+    /// boundary). For a fresh image this equals `heap.start`; for a migrated
+    /// image it is the first extent above the in-tail reserved triple.
+    pub fn first_node_offset(&self) -> u64 {
+        let ns = u64::from(self.node_size);
+        if self.alloc_bitmap.end() <= self.heap.start {
+            self.heap.start
+        } else {
+            self.alloc_bitmap.end().div_ceil(ns) * ns
+        }
+    }
+
     /// Heap extent count (`heap.len / node_size`).
     pub fn total_extents(&self) -> u64 {
         self.heap.len / u64::from(self.node_size)
@@ -347,10 +463,28 @@ impl SuperblockV3 {
     }
 
     /// §9 bounds discipline: every geometry field validated before any
-    /// caller dereferences it. Regions must ascend without overlap
-    /// (SB | ledger | journal | bitmap | heap), lengths must match their
-    /// consumers' fixed shapes, and the heap must hold whole aligned
-    /// extents covering the bitmap's bit range.
+    /// caller dereferences it. The ledger | journal | bitmap triple must
+    /// ascend without overlap and above sector 0; lengths must match their
+    /// consumers' fixed shapes; and the heap must be whole aligned extents
+    /// covering the bitmap's bit range.
+    ///
+    /// Two legal placements of that fixed triple relative to the heap
+    /// (design §4.1 "no hardcoded offsets except sector 0 — placed wherever
+    /// free space exists"):
+    ///
+    /// * **fresh format** ([`SuperblockV3::plan`]) — `SB | ledger | journal
+    ///   | bitmap | heap`, the triple entirely *below* `heap.start`;
+    /// * **migrated volume** ([`SuperblockV3::plan_migrate`], §6.2 in-place
+    ///   tail build) — the heap spans the whole reclaimed device and the
+    ///   fixed triple lives in *reserved extents inside it* (the bitmap
+    ///   marks those extents allocated so the allocator never hands them
+    ///   out; that is the builder's contract, not something this structural
+    ///   check can see). Then the triple is entirely within
+    ///   `[heap.start, heap.end)` and `heap.start ≤ ledger.start`.
+    ///
+    /// Both are accepted; anything else is corruption. This is a strict
+    /// superset of the pre-migrate rule (the fresh arm is unchanged), so no
+    /// fresh-format volume that validated before validates differently now.
     fn validate_geometry(&self) -> Result<(), KvError> {
         let layout = NodeLayout::new(self.node_size as usize)?;
         let node_size = layout.node_size() as u64;
@@ -383,14 +517,33 @@ impl SuperblockV3 {
                 self.alloc_bitmap.start
             ));
         }
-        if self.heap.start < self.alloc_bitmap.end()
-            || self.heap.start % NODE_PAGE as u64 != 0
+        if self.heap.start % NODE_PAGE as u64 != 0
             || self.heap.len < node_size
             || self.heap.len % node_size != 0
         {
             return corrupt(format!(
-                "heap [{}, +{}) must follow the bitmap in whole {node_size}-byte extents",
+                "heap [{}, +{}) must be whole {node_size}-byte extents on a {NODE_PAGE}-byte \
+                 boundary",
                 self.heap.start, self.heap.len
+            ));
+        }
+        // The fixed ledger/journal/bitmap triple (already validated ascending
+        // & non-overlapping above) is placed against the heap in one of the
+        // two legal ways documented on this fn: entirely below it (fresh
+        // format) or entirely within it on reserved extents (migrated volume,
+        // §6.2). Anything else is corruption.
+        let triple_below_heap = self.alloc_bitmap.end() <= self.heap.start;
+        let triple_within_heap =
+            self.heap.start <= self.root_ledger.start && self.alloc_bitmap.end() <= self.heap.end();
+        if !(triple_below_heap || triple_within_heap) {
+            return corrupt(format!(
+                "fixed structures (ledger/journal/bitmap ending at {}) must sit either entirely \
+                 below heap.start {} (fresh format) or entirely within the heap [{}, {}) on \
+                 reserved extents (migrated volume) — got neither",
+                self.alloc_bitmap.end(),
+                self.heap.start,
+                self.heap.start,
+                self.heap.end()
             ));
         }
         if self.alloc_bitmap.len < bitmap_region_len(self.total_extents()) {

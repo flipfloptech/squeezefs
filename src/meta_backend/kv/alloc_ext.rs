@@ -325,6 +325,18 @@ impl ExtentAllocator {
         }
     }
 
+    /// Mark `extent` allocated before the allocator is shared — the offline
+    /// builder / migrate steering surface (design §6.2). Mirrors the mount
+    /// seeding path ([`super::alloc_ext_core::ExtCore::mark_allocated`]); the
+    /// page is marked dirty so a subsequent [`Self::write_dirty_pages`]
+    /// persists it. `&mut self` on purpose: it sets the bit before debiting
+    /// the free budget, only safe while the allocator is not yet shared with
+    /// claimers. Idempotent; out-of-range indices are ignored.
+    pub fn mark_allocated(&mut self, extent: u64) {
+        self.core.mark_allocated(extent);
+        self.mark_dirty(extent);
+    }
+
     /// Mount: load the newest valid A/B slot per page (one region-sized
     /// `uring_fs::read_at`; invalid/missing slots read as absent — never
     /// loud, the K3 ledger discipline), seed the mirror, then replay the

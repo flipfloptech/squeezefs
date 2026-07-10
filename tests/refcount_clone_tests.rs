@@ -17,9 +17,14 @@
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
-use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend, Metadata};
+use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
+use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
+use squeezefs::meta_backend::{
+    storage::MetaLvStorage, MetaLvBackend, Metadata, RoutedMetaBackend, VolumeBackend,
+};
 use squeezefs::nvme_dev::NvmeBlockDev;
-use squeezefs::routing::{CachedMetadata, DataRouter};
+use squeezefs::routing::{CachedMetadata, DataRouter, LayoutMetadata};
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile};
 
@@ -287,4 +292,140 @@ async fn test_terminal_free_punches_before_offset_is_reallocatable() {
         !ba.begin_free(b),
         "non-terminal release must not report terminal"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PR K8 (design-cow-kv-metadata §5.3): lifting the inline-spill ceiling keeps
+// large v3 files' block maps INLINE (up to the per-volume record cap) instead
+// of forcing them to an indirect block past 32 entries. Clone must keep
+// pinning every block of such an inline-mapped large source — the lift must
+// not break the all-or-nothing refcount pin.
+// ---------------------------------------------------------------------------
+
+/// A router wired to a single-v3-volume routed backend (same shape as
+/// [`make_router`], but format v3 so the spill lift applies).
+async fn make_router_v3() -> (
+    DataRouter,
+    Arc<BlockAllocator>,
+    Arc<RoutedMetaBackend>,
+    NamedTempFile,
+    NamedTempFile,
+    tempfile::TempDir,
+) {
+    let dlm = DlmClient::new("local").unwrap();
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), "refcount_clone_v3_test")
+            .await
+            .unwrap(),
+    );
+    let s = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme.clone(),
+    )
+    .unwrap();
+    let router = DataRouter::new(dlm, cache, ba.clone(), nvme);
+
+    let m = NamedTempFile::new().unwrap();
+    m.as_file().set_len(128 * 1024 * 1024).unwrap();
+    ImageBuilder::new(BuilderConfig {
+        node_size: DEFAULT_NODE_SIZE,
+        journal_len_override: None,
+        hash_seed: 0x5CA1_AB1E_0DD5_9111,
+        uuid: *b"k8-clone-lift!!!",
+    })
+    .unwrap()
+    .build(m.path(), 128 * 1024 * 1024)
+    .await
+    .unwrap();
+    let be = KvMetaBackend::open(m.path()).await.unwrap();
+    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]));
+    router.set_meta_backend(routed.clone());
+    (router, ba, routed, b, m, s)
+}
+
+/// The spill lift keeps a large v3 file's map inline; `clone_file` must still
+/// pin EVERY source block (all-or-nothing) — the lift is refcount-safe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_clone_of_large_inline_v3_file_pins_every_block() {
+    let (router, ba, routed, _b, _m, _s) = make_router_v3().await;
+
+    // 40 real blocks — past the pre-K8 32-entry inline ceiling, so the source
+    // sits in the lifted inline regime on v3.
+    let n = 40usize;
+    let mut offsets = Vec::with_capacity(n);
+    for _ in 0..n {
+        let off = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(off);
+        offsets.push(off);
+    }
+    let block_map: Vec<(u32, String)> = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, o)| (i as u32, o.to_string()))
+        .collect();
+
+    let src = mk_ino(&routed, "large_inline_src").await;
+    let dest = mk_ino(&routed, "large_inline_dest").await;
+    let src_ino: u64 = src.strip_prefix("inode_").unwrap().parse().unwrap();
+    seed_meta(
+        &router,
+        &src,
+        striped_meta(&block_map, n as u64 * 4096, true),
+    )
+    .await;
+
+    // The source persisted INLINE on v3 (the whole point of the lift): the
+    // block map rides in the layout value under the inline sentinel.
+    let bytes = routed
+        .getxattr(src_ino, "layout")
+        .await
+        .unwrap()
+        .expect("layout xattr present");
+    let layout = bincode::deserialize::<LayoutMetadata>(&bytes).unwrap();
+    assert!(
+        layout.block_map.is_some()
+            && layout
+                .block_map_id
+                .as_deref()
+                .unwrap()
+                .starts_with("block_map_"),
+        "a large ({n}-entry) v3 source must persist INLINE (id={:?})",
+        layout.block_map_id,
+    );
+    assert_eq!(
+        layout.block_map.as_ref().unwrap().len(),
+        n,
+        "the inline source map holds every block"
+    );
+
+    // Clone must pin every block (all-or-nothing).
+    router
+        .clone_file(&src, &dest, Some(1), Some(1))
+        .await
+        .expect("clone of an inline-mapped large v3 file must succeed");
+
+    // Each source block is now pinned twice (alloc + clone). Drop the source's
+    // reference on each; a further pin must still succeed — an unpinned clone
+    // would have left count 1 → the drop would be terminal → refusal here.
+    for off in &offsets {
+        let key = off.to_string();
+        ba.free_block(*off).await.expect("drop source ref");
+        assert!(
+            router.backend_router.increment_refcount(&key),
+            "clone did not pin block {off} (dropping the source ref was terminal)"
+        );
+    }
 }

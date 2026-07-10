@@ -9,9 +9,14 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
-use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend};
+use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
+use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
+use squeezefs::meta_backend::{
+    storage::MetaLvStorage, MetaLvBackend, Metadata, RoutedMetaBackend, VolumeBackend,
+};
 use squeezefs::nvme_dev::NvmeBlockDev;
-use squeezefs::routing::DataRouter;
+use squeezefs::routing::{CachedMetadata, DataRouter, LayoutMetadata};
 use std::ffi::OsStr;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile, TempDir};
@@ -1225,4 +1230,357 @@ async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
     expected[10..110].copy_from_slice(&patch);
     let got = read_at(&h, ino, block as u64, block as u32).await;
     assert_eq!(got, expected, "unstable-incarnation seed content mismatch");
+}
+
+// ===========================================================================
+// PR K8 (design-cow-kv-metadata §5.3): the layout-xattr inline-spill ceiling
+// moves from a fixed > 32-entry count (≈128 MiB files) to the target volume's
+// per-ino record-value cap (`min(65_536, node_size/4)` on v3, 8_192 on v2)
+// minus a 4 KiB framing headroom. The block-map structure, the indirect-block
+// mechanism, and every persistence path are UNCHANGED — only the spill
+// predicate at the `save_metadata_to_backend` choke point moves, per-volume.
+//
+// These exercise the change through the backend (the router's public
+// writeback flow + the routed backend's `getxattr("layout")`), the mode the
+// §5.3 change lives in — mirroring the sibling refcount-clone suite's style.
+// ===========================================================================
+
+/// Fixed identity for the deterministic v3 images these tests build.
+const K8_SEED: u64 = 0x5CA1_AB1E_0DD5_9111;
+const K8_UUID: [u8; 16] = *b"k8-spill-lift!!!";
+/// Router block size == the allocator chunk size (4 MiB), so an indirect
+/// block is read back whole.
+const K8_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
+
+/// A `DataRouter` wired to a single-v3-volume `RoutedMetaBackend` with the
+/// given node size. Returns the temp handles that must outlive the router.
+async fn v3_spill_router(
+    node_size: usize,
+    tag: &str,
+) -> (
+    DataRouter,
+    Arc<RoutedMetaBackend>,
+    DlmClient,
+    NamedTempFile,
+    NamedTempFile,
+    TempDir,
+) {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", K8_BLOCK_SIZE.to_string());
+    let dlm = DlmClient::new("local").unwrap();
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), tag)
+            .await
+            .unwrap(),
+    );
+    let staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![staging.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("128MB"),
+        Some("128MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme.clone(),
+    )
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+
+    let meta = NamedTempFile::new().unwrap();
+    meta.as_file().set_len(128 * 1024 * 1024).unwrap();
+    let cfg = BuilderConfig {
+        node_size,
+        journal_len_override: None,
+        hash_seed: K8_SEED,
+        uuid: K8_UUID,
+    };
+    ImageBuilder::new(cfg)
+        .unwrap()
+        .build(meta.path(), 128 * 1024 * 1024)
+        .await
+        .unwrap();
+    let be = KvMetaBackend::open(meta.path()).await.unwrap();
+    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]));
+    router.set_meta_backend(routed.clone());
+    (router, routed, dlm, backing, meta, staging)
+}
+
+/// Persist a seeded dirty layout while HOLDING a freshly-acquired lease, so
+/// the fencing token is current. The process-global "local" DLM fencing map
+/// is shared across tests (the FUSE tests in this suite bump it), so a
+/// hardcoded token goes stale; acquiring mirrors the production writer path.
+async fn persist_under_lease(router: &DataRouter, dlm: &DlmClient, path: &str) {
+    let lease = dlm
+        .acquire_lock(path, None, std::time::Duration::from_secs(5))
+        .await
+        .expect("acquire lease");
+    router
+        .persist_dirty_layout_if_needed(path, lease.fencing_token())
+        .await
+        .expect("persist layout");
+}
+
+/// A dirty striped `CachedMetadata` with `n` distinct block-map entries
+/// (valid numeric offsets), ready for `persist_dirty_layout_if_needed`.
+fn striped_map_meta(n: usize, block_size: u64) -> CachedMetadata {
+    let mut bm = std::collections::HashMap::with_capacity(n);
+    for i in 0..n as u32 {
+        bm.insert(i, (i as u64 * block_size).to_string());
+    }
+    CachedMetadata {
+        file_type: "striped".to_string(),
+        size: n as u64 * block_size,
+        block_map: Some(bm),
+        layout_dirty: true,
+        ..Default::default()
+    }
+}
+
+async fn mk_striped_file(routed: &RoutedMetaBackend, name: &str) -> u64 {
+    routed
+        .create(1, name, libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("create")
+        .ino
+}
+
+async fn persisted_layout(routed: &RoutedMetaBackend, ino: u64) -> LayoutMetadata {
+    let bytes = routed
+        .getxattr(ino, "layout")
+        .await
+        .expect("getxattr layout")
+        .expect("layout xattr present");
+    bincode::deserialize::<LayoutMetadata>(&bytes).expect("deserialize layout")
+}
+
+/// Inline: the block map rides in the layout value under the inline sentinel.
+fn is_inline(l: &LayoutMetadata) -> bool {
+    l.block_map.is_some()
+        && l.block_map_id
+            .as_deref()
+            .is_some_and(|s| s.starts_with("block_map_"))
+}
+/// Indirect: the map spilled to a block, id points at it, no inline map.
+fn is_indirect(l: &LayoutMetadata) -> bool {
+    l.block_map.is_none()
+        && l.block_map_id
+            .as_deref()
+            .is_some_and(|s| s.starts_with("indirect:"))
+}
+
+/// §5.3 headline: a ≈6 GiB-shaped file (≈1,500 blocks @ 4 MiB) keeps an
+/// INLINE block map on a default-node (256 KiB ⇒ 64 KiB cap) v3 volume —
+/// the pre-K8 > 32-entry rule would have forced it to an indirect block.
+#[tokio::test]
+async fn test_v3_six_gib_shaped_file_keeps_inline_map() {
+    let (router, routed, dlm, _b, _m, _s) = v3_spill_router(DEFAULT_NODE_SIZE, "k8_six_gib").await;
+    let ino = mk_striped_file(&routed, "six_gib_shaped").await;
+    let path = format!("inode_{ino}");
+
+    let n = 1500usize; // ≈6 GiB at 4 MiB blocks; ≈30 KiB serialized ≪ 60 KiB cap.
+    let meta = striped_map_meta(n, K8_BLOCK_SIZE);
+    let expect = meta.block_map.clone().unwrap();
+    router.metadata_cache.insert(path.clone(), meta);
+    persist_under_lease(&router, &dlm, &path).await;
+
+    let layout = persisted_layout(&routed, ino).await;
+    assert!(
+        is_inline(&layout),
+        "a 6-GiB-shaped ({n}-entry) block map must stay INLINE on v3 \
+         (id={:?}, has_map={})",
+        layout.block_map_id,
+        layout.block_map.is_some(),
+    );
+    // End-to-end round-trip: every entry preserved inline, byte-exact.
+    let got = layout.block_map.unwrap();
+    assert_eq!(got.len(), n, "all {n} inline entries preserved");
+    assert_eq!(got, expect, "inline block map round-trips exactly");
+}
+
+/// §5.3 spill boundary, BOTH directions: inline while under the cap, spill to
+/// the (unchanged) indirect block when it grows past it, exact read-back of
+/// the already-indirect map, and re-inline on shrink.
+#[tokio::test]
+async fn test_v3_spill_boundary_roundtrips_both_directions() {
+    let (router, routed, dlm, _b, _m, _s) = v3_spill_router(DEFAULT_NODE_SIZE, "k8_boundary").await;
+    let ino = mk_striped_file(&routed, "boundary").await;
+    let path = format!("inode_{ino}");
+
+    // (a) 200 entries — past the OLD 32-entry rule, ≈4 KiB ≪ 60 KiB — inline.
+    router
+        .metadata_cache
+        .insert(path.clone(), striped_map_meta(200, K8_BLOCK_SIZE));
+    persist_under_lease(&router, &dlm, &path).await;
+    assert!(
+        is_inline(&persisted_layout(&routed, ino).await),
+        "200-entry map must stay inline (lifted past the old 32-entry rule)"
+    );
+
+    // (b) grow past the cap (5000 entries ≈ 100 KiB) → spills to indirect.
+    let big = striped_map_meta(5000, K8_BLOCK_SIZE);
+    let big_map = big.block_map.clone().unwrap();
+    router.metadata_cache.insert(path.clone(), big);
+    persist_under_lease(&router, &dlm, &path).await;
+    let grown = persisted_layout(&routed, ino).await;
+    assert!(
+        is_indirect(&grown),
+        "5000-entry map must spill to an indirect block (id={:?})",
+        grown.block_map_id
+    );
+
+    // (c) read the already-indirect map back — every entry exact.
+    let key = grown
+        .block_map_id
+        .as_deref()
+        .unwrap()
+        .strip_prefix("indirect:")
+        .unwrap();
+    let raw = router
+        .backend_router
+        .read_block(key, K8_BLOCK_SIZE as usize)
+        .await
+        .expect("read indirect block");
+    let entries: Vec<(u32, u64)> = bincode::deserialize(&raw).expect("deserialize indirect map");
+    assert_eq!(
+        entries.len(),
+        big_map.len(),
+        "indirect map holds every entry"
+    );
+    let round: std::collections::HashMap<u32, u64> = entries.into_iter().collect();
+    for (b, s) in &big_map {
+        assert_eq!(
+            round.get(b),
+            Some(&s.parse::<u64>().unwrap()),
+            "indirect entry {b} must round-trip"
+        );
+    }
+
+    // (d) shrink back under the cap → re-inlines (indirect mechanism unchanged).
+    let mut shrunk = striped_map_meta(80, K8_BLOCK_SIZE);
+    shrunk.block_map_id = grown.block_map_id.clone(); // let save free the old indirect block
+    router.metadata_cache.insert(path.clone(), shrunk);
+    persist_under_lease(&router, &dlm, &path).await;
+    assert!(
+        is_inline(&persisted_layout(&routed, ino).await),
+        "shrunk map must re-inline"
+    );
+}
+
+/// §5.3 per-volume behavior: one v2 + one v3 volume in the same routed mount;
+/// the SAME block-map shape spills on v2 (8 KiB cap) but stays inline on v3
+/// (64 KiB cap). Routing is pinned via `route_ino`/`make_global_ino`.
+#[tokio::test]
+async fn test_mixed_v2_v3_volumes_spill_per_volume() {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", K8_BLOCK_SIZE.to_string());
+    let dlm = DlmClient::new("local").unwrap();
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), "k8_mixed")
+            .await
+            .unwrap(),
+    );
+    let staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![staging.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("128MB"),
+        Some("128MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme.clone(),
+    )
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+
+    // Volume 0 = v2 (8 KiB xattr-value cap); volume 1 = v3 (default 64 KiB cap).
+    let v2f = NamedTempFile::new().unwrap();
+    let v2s = MetaLvStorage::open(v2f.path(), 128 * 1024 * 1024).unwrap();
+    MetaLvBackend::format_v2_for_tests(&v2s, true, true, None)
+        .await
+        .unwrap();
+    let v3f = NamedTempFile::new().unwrap();
+    v3f.as_file().set_len(128 * 1024 * 1024).unwrap();
+    ImageBuilder::new(BuilderConfig {
+        node_size: DEFAULT_NODE_SIZE,
+        journal_len_override: None,
+        hash_seed: K8_SEED,
+        uuid: K8_UUID,
+    })
+    .unwrap()
+    .build(v3f.path(), 128 * 1024 * 1024)
+    .await
+    .unwrap();
+    let v3be = KvMetaBackend::open(v3f.path()).await.unwrap();
+    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![
+        VolumeBackend::V2(Arc::new(MetaLvBackend::new(v2s))),
+        VolumeBackend::V3(v3be),
+    ]));
+    router.set_meta_backend(routed.clone());
+
+    assert_eq!(routed.volumes[0].format_version(), 2, "volume 0 is v2");
+    assert_eq!(routed.volumes[1].format_version(), 3, "volume 1 is v3");
+
+    // One inode on each arm; compute the routed global ino and pin routing.
+    let v2_local = routed.volumes[0]
+        .create(1, "on_v2", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let v3_local = routed.volumes[1]
+        .create(1, "on_v3", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let v2_ino = routed.make_global_ino(v2_local, 0);
+    let v3_ino = routed.make_global_ino(v3_local, 1);
+    assert_eq!(
+        routed.route_ino(v2_ino),
+        (0, v2_local),
+        "v2 ino routes to volume 0"
+    );
+    assert_eq!(
+        routed.route_ino(v3_ino),
+        (1, v3_local),
+        "v3 ino routes to volume 1"
+    );
+
+    // The SAME 1000-entry shape (≈20 KiB serialized) exceeds v2's ≈4 KiB
+    // usable cap yet sits well under v3's ≈60 KiB: §5.3 ⇒ spill on v2, inline
+    // on v3.
+    let n = 1000usize;
+    for ino in [v2_ino, v3_ino] {
+        let path = format!("inode_{ino}");
+        router
+            .metadata_cache
+            .insert(path.clone(), striped_map_meta(n, K8_BLOCK_SIZE));
+        persist_under_lease(&router, &dlm, &path).await;
+    }
+
+    let v2_layout = persisted_layout(&routed, v2_ino).await;
+    let v3_layout = persisted_layout(&routed, v3_ino).await;
+    assert!(
+        is_indirect(&v2_layout),
+        "v2 file must spill at its small (8 KiB) cap (id={:?})",
+        v2_layout.block_map_id
+    );
+    assert!(
+        is_inline(&v3_layout),
+        "v3 file must stay INLINE to its larger (64 KiB) cap (id={:?})",
+        v3_layout.block_map_id
+    );
+
+    // Keep temp backing/volumes alive to end of scope.
+    let _keep = (backing, v2f, v3f, staging);
 }

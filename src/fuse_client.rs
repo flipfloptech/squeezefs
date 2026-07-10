@@ -589,8 +589,15 @@ pub struct SqueezefsFilesystem {
     pub latest_stats_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
     pub latest_config_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
     pub inodes_limit: std::sync::Arc<std::sync::OnceLock<u64>>,
-    pub session_connection:
+    /// Shared across every `SqueezefsFilesystem` clone. `start_mount` publishes
+    /// the live `FuseConnection` here *after* `session.mount(fs.clone(), …)` has
+    /// already consumed the clone the request handlers run on, so the cell must
+    /// be shared (`Arc`): a per-clone `ArcSwap` would leave the handler's clone
+    /// permanently seeing `None`, silently disabling the read zero-copy payload
+    /// destination (`get_payload_buffer` in `read`).
+    pub session_connection: std::sync::Arc<
         arc_swap::ArcSwap<Option<std::sync::Arc<fuse3::raw::connection::FuseConnection>>>,
+    >,
     pub open_inodes: std::sync::Arc<dashmap::DashMap<u64, usize, ahash::RandomState>>,
     pub reclaim_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     /// FUSE-over-io_uring surfaces Destroy once per queue; teardown must
@@ -635,7 +642,10 @@ impl Clone for SqueezefsFilesystem {
             latest_stats_json: arc_swap::ArcSwap::new(self.latest_stats_json.load_full()),
             latest_config_json: arc_swap::ArcSwap::new(self.latest_config_json.load_full()),
             inodes_limit: self.inodes_limit.clone(),
-            session_connection: arc_swap::ArcSwap::new(self.session_connection.load_full()),
+            // Share the one cell — never split it per clone, or the mounted
+            // handler clone would not observe the connection start_mount
+            // publishes after mount (re-enables the read zero-copy dest).
+            session_connection: self.session_connection.clone(),
             open_inodes: self.open_inodes.clone(),
             reclaim_semaphore: self.reclaim_semaphore.clone(),
             dismount_once: self.dismount_once.clone(),
@@ -726,7 +736,9 @@ impl SqueezefsFilesystem {
             latest_stats_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
             latest_config_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
             inodes_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
-            session_connection: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
+            session_connection: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
+                None,
+            ))),
             open_inodes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),

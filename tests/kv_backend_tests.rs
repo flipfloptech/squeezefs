@@ -989,6 +989,74 @@ fn format_opts(force: bool) -> FormatV3Options {
     }
 }
 
+/// A QUICK reformat (`--force` without `--full`) must bury the previous
+/// generation's records. Quick format zeroes only `[0, heap.start)` — heap
+/// extents keep the dead generation's bytes — so the fresh image's nodes
+/// land on extents still carrying the dead generation's appended tail-bset
+/// frames. Node seqs restart identically every generation, so those frames
+/// satisfy the `node_seq_at_write == node_seq` chain check and the dead
+/// tree's records RESURRECT into the fresh volume (field shape 2026-07-10:
+/// a reformatted 1-meta/1-data volume mounted with `checked=176,
+/// valid_inodes=57` on an empty ledger, bench failing ENOENT on phantom
+/// metadata; the sibling of the stale-staging poisoning).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_quick_reformat_buries_previous_generation_records() {
+    let file = NamedTempFile::new().unwrap();
+    file.as_file().set_len(V3_VOL_LEN).unwrap();
+    format_v3(file.path(), V3_VOL_LEN, &format_opts(false))
+        .await
+        .expect("generation 1 format");
+
+    // Generation 1: populate through the live write path, then checkpoint
+    // everything into node tail-bsets via clean shutdown.
+    let be = KvMetaBackend::open(file.path()).await.expect("gen1 open");
+    for i in 0..200 {
+        be.create(ROOT_INO, &format!("gen1_{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("gen1 create");
+    }
+    be.shutdown().await.expect("gen1 clean shutdown");
+    drop(be);
+
+    // Generation 2: QUICK reformat — heap extents keep gen1 bytes.
+    format_v3(file.path(), V3_VOL_LEN, &format_opts(true))
+        .await
+        .expect("generation 2 quick reformat");
+
+    let be = KvMetaBackend::open(file.path()).await.expect("gen2 open");
+    let entries = be.readdir(ROOT_INO, 0, 4096).await.expect("gen2 readdir");
+    let ghosts: Vec<&str> = entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .filter(|n| n.starts_with("gen1_"))
+        .collect();
+    assert!(
+        ghosts.is_empty(),
+        "quick reformat resurrected {} dead-generation dentries (node_seq \
+         tail-bset ABA across generations), e.g. {:?}",
+        ghosts.len(),
+        ghosts.first()
+    );
+    assert!(
+        be.lookup(ROOT_INO, "gen1_0").await.is_err(),
+        "dead generation's file served by the freshly formatted volume"
+    );
+    // The fresh volume must also produce a fresh generation identity
+    // (superblock uuid) — the staging generation binding depends on it.
+    let g1 = match classify_volume(file.path()).await.unwrap() {
+        VolumeFormat::V3(sb) => sb.uuid,
+        other => panic!("expected v3, got {other:?}"),
+    };
+    format_v3(file.path(), V3_VOL_LEN, &format_opts(true))
+        .await
+        .expect("generation 3 quick reformat");
+    let g2 = match classify_volume(file.path()).await.unwrap() {
+        VolumeFormat::V3(sb) => sb.uuid,
+        other => panic!("expected v3, got {other:?}"),
+    };
+    assert_ne!(g1, g2, "every format invocation mints a fresh uuid");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v3_format_guards_match_the_preflight_contract() {
     let file = NamedTempFile::new().unwrap();

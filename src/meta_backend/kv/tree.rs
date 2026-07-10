@@ -970,9 +970,19 @@ impl KvTree {
             let recs: Vec<Record> = successors
                 .iter()
                 .map(|s| {
+                    // RECORD seq 0 — the builder's separator convention.
+                    // Record seqs are the JOURNAL-domain per-key fold
+                    // order; `self.next_seq()` is the NODE-seq counter
+                    // (a different domain, uuid-based since the quick-
+                    // reformat burial fix). Stamping node seqs here made
+                    // every later pointer-flip record (ring-position seq)
+                    // fold BELOW the bootstrap separator — a permanent
+                    // stale route to a retired extent (the storm test's
+                    // child-retired loop). A fresh root has no earlier
+                    // records for these keys, so 0 is exact.
                     Record::put(
                         s.max_key().to_vec(),
-                        self.next_seq(),
+                        0,
                         encode_interior_value(s.addr(), s.node_seq()),
                     )
                 })

@@ -429,7 +429,10 @@ impl ImageBuilder {
             layout: &self.layout,
             heap_base: sb.heap.start,
             alloc: &alloc,
-            next_node_seq: 0,
+            // Generation-namespaced (uuid-derived) so heap extents reused
+            // across a quick reformat never chain the dead generation's
+            // tail bsets — see [`node_seq_base`].
+            next_node_seq: node_seq_base(self.cfg.uuid),
             nodes_written: 0,
         };
         let mut tree_roots = Vec::with_capacity(3);
@@ -485,6 +488,20 @@ impl ImageBuilder {
 /// convention by shifting back.
 fn dt_of(mode: u32) -> u8 {
     ((mode & libc::S_IFMT) >> 12) as u8
+}
+
+/// Node-seq base for a fresh image, namespaced by the volume's generation
+/// `uuid` (random per format invocation): quick format zeroes only
+/// `[0, heap.start)`, so heap extents keep the DEAD generation's appended
+/// tail-bset frames — if node seqs restarted at 0 every generation (they
+/// did), those frames satisfy the §4.5 `node_seq_at_write == node_seq`
+/// chain check on the fresh image's identically-seqed nodes and the dead
+/// tree's records resurrect. Deriving the base from the uuid makes a
+/// cross-generation seq collision as improbable as a checksum collision
+/// while keeping the builder's determinism contract (fixed uuid ⇒ fixed
+/// image). Top bit cleared: 2^63 of monotonic headroom before wrap.
+fn node_seq_base(uuid: [u8; 16]) -> u64 {
+    u64::from_le_bytes(uuid[..8].try_into().expect("8-byte slice")) & (u64::MAX >> 1)
 }
 
 /// Zero `[start, start + len)` in bounded chunks via `uring_fs`.
@@ -711,7 +728,10 @@ pub async fn build_migrated_image(
             layout: &layout,
             heap_base: sb.heap.start,
             alloc: &alloc,
-            next_node_seq: 0,
+            // Generation-namespaced, same reasoning as `ImageBuilder::build`
+            // — a migrated volume's heap is the whole reclaimed device, full
+            // of v2-era (and torn-migrate) residue.
+            next_node_seq: node_seq_base(sb.uuid),
             nodes_written: 0,
         };
         for (tree_id, records) in [

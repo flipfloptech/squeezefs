@@ -4800,28 +4800,54 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(ReplyCopyFileRange { copied: src_size });
         }
 
-        // 3. General copy: read range from source, write to destination
+        // 3. General partial-range copy.
+        //
+        // The kernel (vfs_copy_file_range -> generic_copy_file_checks) has
+        // already clamped `length` to the source's EOF (its cached `i_size`)
+        // before dispatching, so a nonzero `length` here denotes bytes the
+        // caller is entitled to copy. The handler must therefore ALWAYS make
+        // forward progress: returning copied == 0 for a nonzero request wedges
+        // a copy_file_range caller loop (fsx advances only on nr > 0 and never
+        // breaks on nr == 0) — the live generic/616 (v3) / generic/112 (v2)
+        // CRAWL. Honor the kernel's `length` directly; do NOT re-clamp against
+        // our own `meta.size`. Under the FUSE writeback cache a deferred write
+        // flush can race a truncate-extend and leave `meta.size` (what
+        // get_file_size reports) lagging the kernel `i_size`, so clamping to it
+        // would still return 0 for an off_in the kernel considers in-bounds
+        // (reproduced live). A staged/inline file whose logical size outran its
+        // physical data reads back short; treat that gap as a hole (zeros).
+        if length == 0 {
+            return Ok(ReplyCopyFileRange { copied: 0 });
+        }
+
+        // Bound per-call work/allocation; a short copy is legal and the caller
+        // loops, so this keeps forward progress without an unbounded buffer.
+        const CFR_MAX_CHUNK: u64 = 16 * 1024 * 1024;
+        let effective_len = length.min(CFR_MAX_CHUNK) as usize;
+
         let src_data = bytes::Bytes::from(
             self.router
                 .read_file(&src_path)
                 .await
                 .map_err(map_squeezefs_err)?,
         );
-        if off_in >= src_data.len() as u64 {
-            return Ok(ReplyCopyFileRange { copied: 0 });
-        }
-
-        let start = off_in as usize;
-        let end = std::cmp::min((off_in + length) as usize, src_data.len());
-        // SAFETY: start < src_data.len() checked on line 4278, and end is clamped to src_data.len()
-        let chunk = unsafe {
-            let sub = src_data.get_unchecked(start..end);
-            src_data.slice_ref(sub)
+        let off = off_in as usize;
+        let phys = src_data.len();
+        // `effective_len > 0` here (length > 0), so the chunk is always
+        // non-empty regardless of the physical/logical gap.
+        let chunk: bytes::Bytes = if off < phys && off + effective_len <= phys {
+            // Fully backed by physical data: zero-copy slice.
+            src_data.slice(off..off + effective_len)
+        } else {
+            // Range straddles or lies within a hole: assemble exactly
+            // effective_len bytes — real data first, then zeros for the hole.
+            let mut buf = vec![0u8; effective_len];
+            if off < phys {
+                let take = (phys - off).min(effective_len);
+                buf[..take].copy_from_slice(&src_data[off..off + take]);
+            }
+            bytes::Bytes::from(buf)
         };
-
-        if chunk.is_empty() {
-            return Ok(ReplyCopyFileRange { copied: 0 });
-        }
 
         // Perform write to destination
         let target_fencing_token = if let Some(ref dl) = dest_lease {
@@ -4836,13 +4862,13 @@ impl Filesystem for SqueezefsFilesystem {
             0
         };
 
+        let copied_len = effective_len as u64;
         self.router
-            .write_file(&dest_path, off_out, chunk.clone(), target_fencing_token)
+            .write_file(&dest_path, off_out, chunk, target_fencing_token)
             .await
             .map_err(map_squeezefs_err)?;
 
         // Update destination size and times in metadata backend
-        let copied_len = chunk.len() as u64;
         let new_dest_size = std::cmp::max(dest_size, off_out + copied_len);
 
         if let Some(ref backend) = self.meta_backend {

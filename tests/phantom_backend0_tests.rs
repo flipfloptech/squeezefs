@@ -107,7 +107,9 @@ async fn harness(volume_names: &[&str]) -> H {
         dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
+        None,
     )
+    .await
     .unwrap();
 
     let router = DataRouter::new(dlm.clone(), cache, first_alloc.clone(), first_dev.clone());

@@ -1012,10 +1012,9 @@ impl DataRouter {
         let metadata_capacity = std::cmp::max(10_000, total_memory / 200_000);
         let block_map_capacity = std::cmp::max(50_000, total_memory / 50_000);
 
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(16);
-        let stripe_permits = cores * 4;
+        // Process parallelism, not the (possibly core-pinned) constructor
+        // thread's mask — the Hang-1 sizing poison collapsed this to 4.
+        let stripe_permits = crate::cpu::process_parallelism() * 4;
         let stripe_write_semaphore =
             std::sync::Arc::new(tokio::sync::Semaphore::new(stripe_permits));
 
@@ -1491,8 +1490,11 @@ impl DataRouter {
         };
         let Some(raw) = nvme.read_staged(file_id) else {
             // Counted but not resident (should not happen): reconcile so the
-            // budget cannot leak.
-            nvme.remove_staged_if_generation(file_id, gen);
+            // budget cannot leak. Blocking-pool hop: shard WRITE lock
+            // (shard-lock invariant rule 2).
+            let _ = nvme
+                .remove_staged_if_generation_async(file_id.to_string(), gen)
+                .await;
             return Ok(false);
         };
 
@@ -1554,7 +1556,10 @@ impl DataRouter {
 
         match commit {
             Ok(true) => {
-                nvme.remove_staged_if_generation(file_id, gen);
+                // Blocking-pool hop: shard WRITE lock (invariant rule 2).
+                let _ = nvme
+                    .remove_staged_if_generation_async(file_id.to_string(), gen)
+                    .await;
                 Ok(true)
             }
             Ok(false) => {
@@ -1604,7 +1609,8 @@ impl DataRouter {
         keep_block_key: Option<&str>,
     ) {
         if let Some(fid) = old_ring_id {
-            self.cache.nvme.remove_staged(fid);
+            // Blocking-pool hop: shard WRITE lock (invariant rule 2).
+            let _ = self.cache.nvme.remove_staged_async(fid.to_string()).await;
         }
         let mut freed = std::collections::HashSet::new();
         for map in old_maps.into_iter().flatten() {
@@ -2194,7 +2200,12 @@ impl DataRouter {
             let stage_res = self
                 .cache
                 .nvme
-                .stage_write(file_path, &new_file_id, &payload_bytes, fencing_token)
+                .stage_write(
+                    file_path,
+                    &new_file_id,
+                    payload_bytes.clone(),
+                    fencing_token,
+                )
                 .await;
 
             let shared_data = payload_bytes;
@@ -3415,7 +3426,12 @@ impl DataRouter {
             if let Some(data) = self.cache.nvme.read_staged(file_id) {
                 self.cache
                     .nvme
-                    .stage_write(dest, &new_file_id, &data, resolved_dest_token)
+                    .stage_write(
+                        dest,
+                        &new_file_id,
+                        bytes::Bytes::from(data),
+                        resolved_dest_token,
+                    )
                     .await?;
             }
             updated_meta.file_id = Some(new_file_id);
@@ -3587,7 +3603,12 @@ impl DataRouter {
                         let _ = self
                             .cache
                             .nvme
-                            .stage_write(&file_path, file_id, &updated_data, fencing_token)
+                            .stage_write(
+                                &file_path,
+                                file_id,
+                                bytes::Bytes::from(updated_data),
+                                fencing_token,
+                            )
                             .await;
                     }
                 }
@@ -3675,7 +3696,8 @@ impl DataRouter {
 
         if meta.file_type == "staged" {
             if let Some(ref file_id) = meta.file_id {
-                self.cache.nvme.remove_staged(file_id);
+                // Blocking-pool hop: shard WRITE lock (invariant rule 2).
+                let _ = self.cache.nvme.remove_staged_async(file_id.clone()).await;
             }
         }
 
@@ -3713,13 +3735,16 @@ impl DataRouter {
                 block_indices.insert(b as u64);
             }
         }
-        for b in block_indices {
-            // Canonical key form (`…:block_{b}`): the previous hand-rolled
-            // `active_block:{path}:{b}` never matched a real entry, leaking
-            // staged overlays past delete to shadow a reused inode's reads.
-            let key = crate::keys::active_block_for_path(file_path, b as u32).to_string();
-            self.cache.nvme.remove_active_block(&key);
-        }
+        // Canonical key form (`…:block_{b}`): the previous hand-rolled
+        // `active_block:{path}:{b}` never matched a real entry, leaking
+        // staged overlays past delete to shadow a reused inode's reads.
+        // One blocking-pool hop for the whole sweep: each removal is a
+        // staging shard WRITE lock (shard-lock invariant rule 2).
+        let keys: Vec<String> = block_indices
+            .into_iter()
+            .map(|b| crate::keys::active_block_for_path(file_path, b as u32).to_string())
+            .collect();
+        let _ = self.cache.nvme.remove_active_blocks_async(keys).await;
 
         self.cache.write_lru.remove(file_path);
         self.cache.read_lru.remove(file_path);

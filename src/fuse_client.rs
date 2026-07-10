@@ -679,10 +679,9 @@ impl SqueezefsFilesystem {
             .ok()
             .and_then(|val| val.parse::<usize>().ok())
             .unwrap_or_else(|| {
-                let cores = std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(4);
-                std::cmp::max(4, cores)
+                // Process parallelism, not the (possibly core-pinned)
+                // constructor thread's mask — the Hang-1 sizing poison.
+                std::cmp::max(4, crate::cpu::process_parallelism())
             });
         info!(
             "Dynamic reclaim concurrency limit configured: {}",
@@ -734,12 +733,7 @@ impl SqueezefsFilesystem {
             writeback_queue_cap: queue_cap,
             client_id: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             mountpoint: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
-            max_background_uploads: {
-                let cores = std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(4);
-                std::cmp::max(16, cores * 2)
-            },
+            max_background_uploads: std::cmp::max(16, crate::cpu::process_parallelism() * 2),
             active_block_buffers: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
@@ -1831,12 +1825,14 @@ impl SqueezefsFilesystem {
                                     cache_key.clone(),
                                     block_data,
                                     fencing_token,
-                                );
+                                )
+                                .await;
                             }
                         }
                     }
                 } else {
-                    self.insert_active_block_buffer(cache_key.clone(), block_data, fencing_token);
+                    self.insert_active_block_buffer(cache_key.clone(), block_data, fencing_token)
+                        .await;
                     std::mem::drop(block_guard);
                 }
 
@@ -1908,7 +1904,12 @@ impl SqueezefsFilesystem {
                     let block_guard = block_lock.lock().await;
                     let key = crate::keys::active_block(ino, b).to_string();
                     self.active_block_buffers.remove(&key);
-                    self.router.cache.nvme.remove_active_block(&key);
+                    // Blocking-pool hop: shard WRITE lock (invariant rule 2).
+                    self.router
+                        .cache
+                        .nvme
+                        .remove_active_block_async(key)
+                        .await?;
                     drop(block_guard);
                     whole_idxs.push(b as u32);
                 } else {
@@ -2190,7 +2191,12 @@ impl SqueezefsFilesystem {
         // bytes — drop it, as the routing striped merge does.
         let cache_key = crate::keys::active_block(ino, b as u64).to_string();
         self.active_block_buffers.remove(&cache_key);
-        self.router.cache.nvme.remove_active_block(&cache_key);
+        // Blocking-pool hop: shard WRITE lock (invariant rule 2).
+        self.router
+            .cache
+            .nvme
+            .remove_active_block_async(cache_key)
+            .await?;
         let file_path = crate::keys::inode_path(ino);
         self.router.cache.write_lru.remove(&file_path);
         self.router.cache.read_lru.remove(&file_path);
@@ -2327,7 +2333,7 @@ impl SqueezefsFilesystem {
         Some((ino_str.parse().ok()?, block_str.parse().ok()?))
     }
 
-    fn insert_active_block_buffer(
+    async fn insert_active_block_buffer(
         &self,
         cache_key: String,
         block_data: crate::cache::active_block::ActiveBlockBuf,
@@ -2368,11 +2374,15 @@ impl SqueezefsFilesystem {
                 // Zero-complete Fresh victims under their lock: recycled
                 // pool bytes must never reach staging (§5.3 exit 2).
                 data.zero_complete();
-                if !self.router.cache.nvme.put_active_block(
-                    &spill_key,
-                    data.as_slice(),
-                    fencing_token,
-                ) {
+                // Blocking-pool hop: shard WRITE lock (invariant rule 2).
+                let admitted = self
+                    .router
+                    .cache
+                    .nvme
+                    .put_active_block_async(spill_key.clone(), data.snapshot(), fencing_token)
+                    .await
+                    .unwrap_or(false);
+                if !admitted {
                     // Staging refused (never-lossy backpressure): keep the
                     // buffer in RAM — exceeding the soft cap beats losing
                     // dirty data. fsync drains it durably.

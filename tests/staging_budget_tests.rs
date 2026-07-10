@@ -393,14 +393,16 @@ async fn test_stage_write_shard_full_is_loud_never_lossy() {
 
     let payload = |fill: u8| vec![fill; 300 * 1024];
     for (id, fill) in [("id-a", 0xA1u8), ("id-b", 0xB2), ("id-c", 0xC3)] {
-        st.stage_write(&format!("/{id}"), id, &payload(fill), 1)
+        st.stage_write(&format!("/{id}"), id, bytes::Bytes::from(payload(fill)), 1)
             .await
             .unwrap_or_else(|e| panic!("stage {id} failed: {e:?}"));
     }
 
     // A fourth 300 KiB entry cannot fit without destroying id-a: it must be
     // refused loudly (no promotion is wired on this bare cache).
-    let res = st.stage_write("/id-d", "id-d", &payload(0xD4), 1).await;
+    let res = st
+        .stage_write("/id-d", "id-d", bytes::Bytes::from(payload(0xD4)), 1)
+        .await;
     assert!(
         res.is_err(),
         "over-capacity stage_write silently destroyed a live staged entry"
@@ -409,7 +411,12 @@ async fn test_stage_write_shard_full_is_loud_never_lossy() {
     // An entry larger than the whole pool must be an error, not a silent
     // success-with-drop.
     let res = st
-        .stage_write("/id-huge", "id-huge", &vec![0xEE; 2 * 1024 * 1024], 1)
+        .stage_write(
+            "/id-huge",
+            "id-huge",
+            bytes::Bytes::from(vec![0xEE; 2 * 1024 * 1024]),
+            1,
+        )
         .await;
     assert!(res.is_err(), "oversized stage_write reported success");
 
@@ -425,7 +432,12 @@ async fn test_stage_write_shard_full_is_loud_never_lossy() {
     // an in-place overwrite of the sole copy is torn on crash, so it must be
     // refused loudly too, leaving every entry (including id-a) intact.
     let res = st
-        .stage_write("/id-a", "id-a", &vec![0x5A; 200 * 1024], 1)
+        .stage_write(
+            "/id-a",
+            "id-a",
+            bytes::Bytes::from(vec![0x5A; 200 * 1024]),
+            1,
+        )
         .await;
     assert!(
         res.is_err(),
@@ -564,7 +576,12 @@ async fn test_remount_budget_counts_staged_entries_only() {
     // Session A: one staged file + one orphan active block, then "crash".
     let a = mk().await.unwrap();
     a.nvme
-        .stage_write("/f1", "file-id-1", &vec![0x11u8; STAGED_LEN], 7)
+        .stage_write(
+            "/f1",
+            "file-id-1",
+            bytes::Bytes::from(vec![0x11u8; STAGED_LEN]),
+            7,
+        )
         .await
         .expect("stage_write failed");
     assert!(

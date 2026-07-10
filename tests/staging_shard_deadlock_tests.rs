@@ -33,8 +33,7 @@ fn test_shard_read_does_not_park_executor_behind_queued_writer() {
     let dir = tempfile::tempdir().expect("tempdir");
     // One shard: every key collides — guard, writer, and probe share the lock.
     let cache = Arc::new(
-        squeezefs::tiering::nvme::NvmeCache::new(&[dir.path()], &[1 << 20], 1)
-            .expect("nvme cache"),
+        squeezefs::tiering::nvme::NvmeCache::new(&[dir.path()], &[1 << 20], 1).expect("nvme cache"),
     );
 
     let meta = [0u8; 8];
@@ -123,8 +122,7 @@ fn test_shard_read_does_not_park_executor_behind_queued_writer() {
 fn test_queued_writer_completes_once_guard_drops() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = Arc::new(
-        squeezefs::tiering::nvme::NvmeCache::new(&[dir.path()], &[1 << 20], 1)
-            .expect("nvme cache"),
+        squeezefs::tiering::nvme::NvmeCache::new(&[dir.path()], &[1 << 20], 1).expect("nvme cache"),
     );
     let meta = [0u8; 8];
     assert!(cache.reserve_and_write(
@@ -135,7 +133,9 @@ fn test_queued_writer_completes_once_guard_drops() {
         None
     ));
 
-    let guard = cache.get_static(&Bytes::from_static(b"victim")).expect("resident");
+    let guard = cache
+        .get_static(&Bytes::from_static(b"victim"))
+        .expect("resident");
 
     let w_started = Arc::new(AtomicBool::new(false));
     let ws = w_started.clone();
@@ -156,7 +156,10 @@ fn test_queued_writer_completes_once_guard_drops() {
 
     drop(guard);
     let removed = writer.join().expect("writer thread");
-    assert!(removed.is_some(), "queued writer must complete after guard drop");
+    assert!(
+        removed.is_some(),
+        "queued writer must complete after guard drop"
+    );
     assert!(
         cache.get_static(&Bytes::from_static(b"victim")).is_none(),
         "removal must be visible once the writer completes"

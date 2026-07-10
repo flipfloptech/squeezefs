@@ -460,9 +460,9 @@ impl NvmeStaging {
             staging_segment_dirs_have_data.push(ss_has_data);
         }
 
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(16);
+        // Process parallelism, not the (possibly core-pinned) constructor
+        // thread's mask — the Hang-1 sizing poison (see `crate::cpu`).
+        let cores = crate::cpu::process_parallelism();
         let default_shards = std::cmp::max(cores.next_power_of_two(), 16);
 
         let (read_shards, actual_max_read_bytes) = if max_read_bytes < 10 * 1024 * 1024 {
@@ -617,11 +617,18 @@ impl NvmeStaging {
     }
 
     /// Stage a write locally into staging_nvme_cache using zero-copy memory-mapped segments.
+    ///
+    /// `data` is owned (`Bytes`, refcounted — no payload copy) because the
+    /// ring write takes the staging shard WRITE lock, which must run on the
+    /// blocking pool (shard-lock invariant rule 2, `tiering::nvme::NvmeShard`):
+    /// a shard writer legitimately waits for §5.5 read guards held across
+    /// awaits, so acquiring it on an async executor thread can park the very
+    /// thread that must poll the guard holder (the Hang-1 wedge shape).
     pub async fn stage_write(
         &self,
         file_path: &str,
         file_id: &str,
-        data: &[u8],
+        data: bytes::Bytes,
         fencing_token: u64,
     ) -> Result<()> {
         let meta = StagedMetadata {
@@ -704,33 +711,41 @@ impl NvmeStaging {
         // a concurrent promotion/unlink of the same id either completes fully
         // before (and sees the old generation) or after (and sees the bumped
         // generation) — it can never remove the ring entry we just wrote.
+        // spawn_blocking: the ring write is a staging shard WRITE lock
+        // (shard-lock invariant rule 2 — never park an async executor on it).
         let (admitted, replaced_cost, is_new) = {
-            let mut entry = self
-                .staged_ledger
-                .entry_sync(file_id.to_string())
-                .or_insert((0, 0));
-            let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
-            // Memory-mapped copy directly (lock-free, zero disk syscall wait).
-            // The segment never destroys live entries: refusal here is loud
-            // backpressure and the caller escalates to a durable spill.
-            let admitted = self.staging_nvme_cache.reserve_and_write(
-                key_bytes.clone(),
-                meta_len,
-                &meta_bytes,
-                data,
-                None,
-            );
-            if admitted {
-                let (cost, gen) = *entry.get();
-                *entry.get_mut() = (padded_size, gen.wrapping_add(1));
-                (true, cost, is_new)
-            } else {
-                // Drop a placeholder created for this refused stage.
-                if entry.get().0 == 0 {
-                    let _ = entry.remove();
+            let ledger = self.staged_ledger.clone();
+            let staging = self.staging_nvme_cache.clone();
+            let file_id_owned = file_id.to_string();
+            let key_clone = key_bytes.clone();
+            let data_clone = data.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut entry = ledger.entry_sync(file_id_owned).or_insert((0, 0));
+                let is_new = staging.get(&key_clone).is_none();
+                // Memory-mapped copy directly (lock-free, zero disk syscall wait).
+                // The segment never destroys live entries: refusal here is loud
+                // backpressure and the caller escalates to a durable spill.
+                let admitted = staging.reserve_and_write(
+                    key_clone.clone(),
+                    meta_len,
+                    &meta_bytes,
+                    &data_clone,
+                    None,
+                );
+                if admitted {
+                    let (cost, gen) = *entry.get();
+                    *entry.get_mut() = (padded_size, gen.wrapping_add(1));
+                    (true, cost, is_new)
+                } else {
+                    // Drop a placeholder created for this refused stage.
+                    if entry.get().0 == 0 {
+                        let _ = entry.remove();
+                    }
+                    (false, 0, false)
                 }
-                (false, 0, false)
-            }
+            })
+            .await
+            .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))?
         };
         if !admitted {
             return Err(SqueezefsError::Io(std::io::Error::new(
@@ -934,6 +949,67 @@ impl NvmeStaging {
     /// Remove a staged write from staging_nvme_cache.
     pub fn remove_staged(&self, file_id: &str) -> Option<Vec<u8>> {
         self.remove_active_block(file_id)
+    }
+
+    // ---- blocking-pool variants (shard-lock invariant rule 2) ----
+    //
+    // The staging shard WRITE lock legitimately waits for §5.5 read guards
+    // held across awaits (`tiering::nvme::NvmeShard` doc), so acquiring it
+    // on an async executor thread can park the very thread that must poll
+    // the guard holder — the Hang-1 total-daemon wedge. Async contexts use
+    // these wrappers; the sync originals remain for blocking contexts
+    // (existing `spawn_blocking` closures, the merge worker, tests).
+
+    /// [`Self::remove_active_block`] on the blocking pool, for async callers.
+    pub async fn remove_active_block_async(&self, key: String) -> Result<Option<Vec<u8>>> {
+        let nvme = self.clone();
+        tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
+            .await
+            .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))
+    }
+
+    /// Remove many active blocks in ONE blocking-pool hop (delete/reclaim
+    /// paths sweep every block index of an inode).
+    pub async fn remove_active_blocks_async(&self, keys: Vec<String>) -> Result<()> {
+        let nvme = self.clone();
+        tokio::task::spawn_blocking(move || {
+            for key in keys {
+                nvme.remove_active_block(&key);
+            }
+        })
+        .await
+        .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))
+    }
+
+    /// [`Self::remove_staged`] on the blocking pool, for async callers.
+    pub async fn remove_staged_async(&self, file_id: String) -> Result<Option<Vec<u8>>> {
+        self.remove_active_block_async(file_id).await
+    }
+
+    /// [`Self::remove_staged_if_generation`] on the blocking pool, for async callers.
+    pub async fn remove_staged_if_generation_async(
+        &self,
+        file_id: String,
+        gen: u64,
+    ) -> Result<bool> {
+        let nvme = self.clone();
+        tokio::task::spawn_blocking(move || nvme.remove_staged_if_generation(&file_id, gen))
+            .await
+            .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))
+    }
+
+    /// [`Self::put_active_block`] on the blocking pool, for async callers.
+    /// `data` is `Bytes` (refcounted) — no payload copy.
+    pub async fn put_active_block_async(
+        &self,
+        key: String,
+        data: bytes::Bytes,
+        fencing_token: u64,
+    ) -> Result<bool> {
+        let nvme = self.clone();
+        tokio::task::spawn_blocking(move || nvme.put_active_block(&key, &data, fencing_token))
+            .await
+            .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))
     }
 
     /// Read staged data directly from staging_nvme_cache memory-mapped segments.

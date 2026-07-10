@@ -17,10 +17,13 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 /// Shared permit pool sized from host parallelism.
+///
+/// PROCESS parallelism, not `available_parallelism()`: this Lazy is first
+/// touched from a core-pinned runtime worker, whose 1-CPU affinity mask
+/// would collapse every cores-based pool to its floor (the Hang-1 sizing
+/// poison — see `crate::cpu`).
 pub static BG_TASK_SEM: Lazy<Arc<Semaphore>> = Lazy::new(|| {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let cores = crate::cpu::process_parallelism();
     // Generous enough for sequential read prefetch bursts; hard-capped vs. unbounded spawn.
     Arc::new(Semaphore::new(std::cmp::max(32, cores * 8)))
 });
@@ -37,18 +40,20 @@ pub const PREFETCH_BLOCK_CONCURRENCY: usize = 8;
 
 /// Cores-based concurrency for striped block I/O (reads and writes).
 ///
-/// Policy: `clamp(cores * 2, 4, 64)`. Override with
-/// [`set_striped_block_concurrency`] (`0` restores auto).
+/// Policy: `clamp(cores * 2, 4, 64)` where `cores` is the PROCESS
+/// parallelism (`crate::cpu`) — callers are routinely core-pinned runtime
+/// workers whose own affinity mask is 1 CPU (the Hang-1 sizing poison
+/// reported `striped_block_concurrency == 4` on a 16-core mount). Override
+/// with [`set_striped_block_concurrency`] (`0` restores auto).
 #[inline]
 pub fn striped_block_concurrency() -> usize {
     let over = STRIPED_BLOCK_CONCURRENCY_OVERRIDE.load(Ordering::Relaxed);
     if over > 0 {
         return over;
     }
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    cores.saturating_mul(2).clamp(4, 64)
+    crate::cpu::process_parallelism()
+        .saturating_mul(2)
+        .clamp(4, 64)
 }
 
 /// Set striped block concurrency. Pass `0` to restore the auto (cores-based) policy.
@@ -96,8 +101,5 @@ pub fn available_permits() -> usize {
 
 /// Total configured capacity of the background pool.
 pub fn capacity() -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    std::cmp::max(32, cores * 8)
+    std::cmp::max(32, crate::cpu::process_parallelism() * 8)
 }

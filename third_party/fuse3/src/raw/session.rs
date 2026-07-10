@@ -4596,12 +4596,45 @@ struct TpcScheduler {
 }
 
 impl TpcScheduler {
+    /// CPU ids of the PROCESS affinity mask (the main thread's — tid == pid
+    /// — which is never core-pinned), NOT the calling thread's.
+    ///
+    /// `TPC_SCHEDULER` is a `Lazy` first touched from a FUSE dispatch task,
+    /// which the embedding daemon runs on a runtime worker pinned to ONE
+    /// core. `core_affinity::get_core_ids()` consults the calling thread's
+    /// mask, so sizing from it collapsed the whole handler pool to a single
+    /// LocalSet thread — every handler future serialized onto it, and one
+    /// synchronously parked handler wedged every FUSE request on the mount
+    /// (the SqueezeFS Hang-1 fsx `copy_file_range` wedge).
+    fn process_core_ids() -> Vec<core_affinity::CoreId> {
+        // SAFETY: zeroed cpu_set_t is a valid empty set; sched_getaffinity
+        // writes at most size_of::<cpu_set_t>() bytes into it.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(
+                std::process::id() as libc::pid_t,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &mut set,
+            ) == 0
+            {
+                let ids: Vec<core_affinity::CoreId> = (0..libc::CPU_SETSIZE as usize)
+                    .filter(|&i| libc::CPU_ISSET(i, &set))
+                    .map(|id| core_affinity::CoreId { id })
+                    .collect();
+                if !ids.is_empty() {
+                    return ids;
+                }
+            }
+        }
+        core_affinity::get_core_ids().unwrap_or_default()
+    }
+
     fn new() -> Self {
-        let mut core_ids = core_affinity::get_core_ids().unwrap_or_default();
-        if !core_ids.is_empty() {
+        let mut core_ids = Self::process_core_ids();
+        if core_ids.len() > 1 {
             core_ids.remove(0); // Reserve Core 0 for OS kernel tasks
         }
-        
+
         let mut senders = Vec::new();
         let core_count = if core_ids.is_empty() {
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16)

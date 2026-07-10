@@ -132,6 +132,31 @@ impl std::ops::Deref for NvmeCacheReadGuard {
 unsafe impl Send for NvmeCacheReadGuard {}
 unsafe impl Sync for NvmeCacheReadGuard {}
 
+/// One mmap segment + its index, guarded by a parking_lot `RwLock`.
+///
+/// **Shard-lock acquisition invariant (the Hang-1 CFR wedge fix).**
+/// parking_lot's `RwLock` is WRITER-PREFERRING: once a writer is queued, a
+/// plain `read()` PARKS the calling thread. §5.5 read guards
+/// ([`NvmeCacheReadGuard`]) are held across awaits (DMA, reply), so a plain
+/// read on an async executor thread closes a dependency cycle: the parked
+/// executor can no longer poll the guard-holding future the queued writer
+/// is waiting on — the observed total-daemon wedge (fsx `copy_file_range`;
+/// gdb: handler thread in `lock_shared` under `LocalSet::tick`,
+/// blocking-pool writer in `wait_for_readers`). Rules, enforced across this
+/// module and pinned by `tests/staging_shard_deadlock_tests.rs`:
+///
+/// 1. **Reads never park behind a QUEUED writer** — every shared
+///    acquisition uses `read_recursive()`. An executor thread then waits
+///    only for an ACTIVE writer's bounded, executor-independent critical
+///    section (a sync index/memcpy op on a blocking-pool thread).
+/// 2. **Writers never run on async executor threads** — `put` /
+///    `reserve_and_write` / `remove` reach the staging cache via
+///    `spawn_blocking` (see `cache::nvme::NvmeStaging`), because a writer
+///    legitimately waits for §5.5 guards with await-side lifetimes.
+///
+/// Writer starvation is not a concern: a writer becomes ACTIVE as soon as
+/// the reader count gaps to zero, non-guard reads are µs-scale, and §5.5
+/// guards are bounded (one transform-or-DMA / one reply).
 pub struct NvmeShard {
     inner: RwLock<NvmeShardInner>,
     _file: Option<File>, // Keep file handle alive if file-backed
@@ -178,7 +203,9 @@ impl NvmeShard {
     }
 
     pub fn get<'a>(&'a self, key: &Bytes) -> Option<NvmeReadGuard<'a>> {
-        let inner = self.inner.read();
+        // read_recursive: never park behind a queued writer (shard-lock
+        // invariant — see the `NvmeShard` doc).
+        let inner = self.inner.read_recursive();
         if let Some(&meta) = inner.map.get(key) {
             // Verify magic
             let magic =
@@ -496,7 +523,7 @@ impl NvmeShard {
 
     /// Whether `key` currently has a live entry in this shard.
     pub fn has_key(&self, key: &Bytes) -> bool {
-        self.inner.read().map.contains_key(key)
+        self.inner.read_recursive().map.contains_key(key)
     }
 
     pub fn remove(&self, key: &Bytes) -> Option<Bytes> {
@@ -531,11 +558,21 @@ impl NvmeShard {
     }
 
     pub fn active_keys(&self) -> Vec<Bytes> {
-        self.inner.read().active_keys.iter().cloned().collect()
+        self.inner
+            .read_recursive()
+            .active_keys
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn current_bytes(&self) -> usize {
-        self.inner.read().map.values().map(|m| m.len).sum()
+        self.inner
+            .read_recursive()
+            .map
+            .values()
+            .map(|m| m.len)
+            .sum()
     }
 
     pub fn recover_index(&self) {
@@ -704,7 +741,11 @@ impl NvmeCache {
             if dev.online.load(Ordering::Relaxed) {
                 let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
                 let shard = &dev.shards[shard_idx];
-                let inner = shard.inner.read();
+                // read_recursive: never park behind a queued writer (shard-
+                // lock invariant — see the `NvmeShard` doc). This is the
+                // §5.5 guard acquisition itself AND the executor-side probe
+                // that closed the Hang-1 cycle when it parked.
+                let inner = shard.inner.read_recursive();
                 if let Some(&meta) = inner.map.get(key) {
                     let magic = u32::from_le_bytes(
                         inner.mmap[meta.offset..meta.offset + 4]

@@ -9,6 +9,7 @@ pub mod bg_admit;
 pub mod cache;
 pub mod config_ops;
 pub(crate) mod cow_core;
+pub mod cpu;
 pub mod crypto_compress;
 pub mod dlm;
 pub mod error;

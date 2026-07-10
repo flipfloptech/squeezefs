@@ -1,0 +1,456 @@
+//! Regression harness for the HOLES-READ-STALE-BYTES family (format-agnostic,
+//! shared data path — reproduces on BOTH v2 and v3). A POSIX hole — any region
+//! never written, punched, or exposed by extending a file past its data — MUST
+//! read back as zeros. SqueezeFS returned stale/prior block contents for
+//! several hole-creating paths:
+//!
+//!   1. `fallocate(FALLOC_FL_PUNCH_HOLE)` acked the punch but never zeroed or
+//!      unmapped the range — a later read returned the pre-punch bytes. This is
+//!      the `mkfs.xfs` BLKDISCARD-then-trust-zeroing corruption (LTP `writev03`
+//!      xfs leg → `XFS: failed to locate log tail`). See the "writev03 BROKEN"
+//!      section of `.benchmarks/2026-07-09-kv-v3-gates.md`.
+//!   2. `truncate`-down → re-extend of a striped file left the surviving
+//!      partial block's tail mapped with stale bytes — the re-exposed region
+//!      read stale instead of zeros (the residual `generic/616` mismatch left
+//!      after the copy_file_range crawl fix, commit 97e2ed4).
+//!
+//! The unifying contract these tests pin, for PUNCH / TRUNCATE-EXTEND /
+//! FALLOCATE-EXTEND / sparse-write, across inline / staged / striped layouts,
+//! on BOTH v2 and v3: **an unwritten / punched / extended region reads zeros,
+//! adjacent real data is preserved, and the file size follows POSIX.**
+
+use fuse3::raw::prelude::Filesystem;
+use fuse3::raw::Request;
+use squeezefs::block_allocator::BlockAllocator;
+use squeezefs::cache::TieredCache;
+use squeezefs::dlm::DlmClient;
+use squeezefs::fuse_client::SqueezefsFilesystem;
+use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
+use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
+use squeezefs::meta_backend::{
+    storage::MetaLvStorage, MetaLvBackend, RoutedMetaBackend, VolumeBackend,
+};
+use squeezefs::nvme_dev::NvmeBlockDev;
+use squeezefs::routing::DataRouter;
+use std::ffi::OsStr;
+use std::sync::Arc;
+use tempfile::{tempdir, NamedTempFile, TempDir};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fmt {
+    V2,
+    V3,
+}
+
+/// 64 KiB block size so one harness covers all three layouts:
+/// inline (<= 4 KiB), staged (4 KiB .. 64 KiB), striped (> 64 KiB).
+const BS: u64 = 65536;
+const POISON: u8 = 0xAB;
+
+struct H {
+    fs: SqueezefsFilesystem,
+    req: Request,
+    _b: NamedTempFile,
+    _m: NamedTempFile,
+    _s: TempDir,
+}
+
+async fn make(fmt: Fmt) -> H {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
+    let dlm = DlmClient::new("local").unwrap();
+
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), "hole_test")
+            .await
+            .unwrap(),
+    );
+    let s = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("128MB"),
+        Some("128MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme.clone(),
+    )
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+
+    let m = NamedTempFile::new().unwrap();
+    m.as_file().set_len(128 * 1024 * 1024).unwrap();
+    let routed: Arc<RoutedMetaBackend> = match fmt {
+        Fmt::V2 => {
+            let ms = MetaLvStorage::open(m.path(), 128 * 1024 * 1024).unwrap();
+            MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
+                .await
+                .unwrap();
+            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V2(
+                Arc::new(MetaLvBackend::new(ms)),
+            )]))
+        }
+        Fmt::V3 => {
+            ImageBuilder::new(BuilderConfig {
+                node_size: DEFAULT_NODE_SIZE,
+                journal_len_override: None,
+                hash_seed: 0xC0FF_EE00_1234_5678,
+                uuid: *b"hole-regress-v3!",
+            })
+            .unwrap()
+            .build(m.path(), 128 * 1024 * 1024)
+            .await
+            .unwrap();
+            let be = KvMetaBackend::open(m.path()).await.unwrap();
+            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]))
+        }
+    };
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed);
+
+    let req = Request {
+        unique: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        pid: 1,
+    };
+    H {
+        fs,
+        req,
+        _b: b,
+        _m: m,
+        _s: s,
+    }
+}
+
+async fn create(h: &H, name: &str) -> u64 {
+    h.fs.create(h.req, 1, OsStr::new(name), libc::S_IFREG | 0o644, 0)
+        .await
+        .unwrap()
+        .attr
+        .ino
+}
+
+async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
+    let w =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            off,
+            bytes::Bytes::copy_from_slice(data),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(w.written as usize, data.len(), "short write at off {off}");
+}
+
+async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
+    h.fs.read(h.req, ino, 0, off, size)
+        .await
+        .unwrap()
+        .data
+        .to_vec()
+}
+
+async fn truncate_to(h: &H, ino: u64, size: u64) {
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            size: Some(size),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn size_of(h: &H, ino: u64) -> u64 {
+    h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr.size
+}
+
+async fn punch(h: &H, ino: u64, off: u64, len: u64) {
+    h.fs.fallocate(
+        h.req,
+        ino,
+        0,
+        off,
+        len,
+        (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE) as u32,
+    )
+    .await
+    .unwrap();
+}
+
+/// Plain `fallocate(mode=0)` — allocate and extend the file size to
+/// `offset + length` if beyond EOF. The grown region is a hole.
+async fn fallocate_extend(h: &H, ino: u64, off: u64, len: u64) {
+    h.fs.fallocate(h.req, ino, 0, off, len, 0).await.unwrap();
+}
+
+/// Every byte in `[off, off+len)` reads back as zero (a hole). A short read is
+/// acceptable ONLY if what is returned is all zeros — the kernel zero-fills the
+/// tail below i_size — but any non-zero (stale) byte fails.
+async fn assert_hole(h: &H, ino: u64, off: u64, len: u64, tag: &str) {
+    let got = read_at(h, ino, off, len as u32).await;
+    if let Some(pos) = got.iter().position(|&b| b != 0) {
+        panic!(
+            "[{tag}] HOLE READ STALE: byte at file offset {} = {:#x} (expected 0); \
+             read {} of {} requested bytes, {} non-zero",
+            off + pos as u64,
+            got[pos],
+            got.len(),
+            len,
+            got.iter().filter(|&&b| b != 0).count()
+        );
+    }
+}
+
+/// Every byte in `[off, off+len)` reads back as `val` (preserved real data).
+async fn assert_fill(h: &H, ino: u64, off: u64, len: u64, val: u8, tag: &str) {
+    let got = read_at(h, ino, off, len as u32).await;
+    assert_eq!(
+        got.len(),
+        len as usize,
+        "[{tag}] short read of live data at off {off}: got {} want {len}",
+        got.len()
+    );
+    if let Some(pos) = got.iter().position(|&b| b != val) {
+        panic!(
+            "[{tag}] LIVE DATA CORRUPTED: byte at file offset {} = {:#x} (expected {:#x})",
+            off + pos as u64,
+            got[pos],
+            val
+        );
+    }
+}
+
+/// Sizes hitting each layout at BS = 64 KiB: inline, staged, striped.
+const LAYOUTS: [(usize, &str); 3] = [(2048, "inline"), (40_000, "staged"), (200_000, "striped")];
+
+// ---------------------------------------------------------------------------
+// 1. PUNCH_HOLE reads zeros (all layouts) — the writev03 / mkfs.xfs bug.
+// ---------------------------------------------------------------------------
+
+async fn punch_reads_zeros(fmt: Fmt) {
+    for (idx, (size, lname)) in LAYOUTS.iter().enumerate() {
+        let h = make(fmt).await;
+        let size = *size as u64;
+        let ino = create(&h, &format!("punch{idx}")).await;
+        write_at(&h, ino, 0, &vec![POISON; size as usize]).await;
+
+        // Punch an interior sub-range, leaving a head and a tail of real data.
+        let p_off = size / 4;
+        let p_len = size / 2;
+        punch(&h, ino, p_off, p_len).await;
+
+        let tag = format!("{fmt:?}/{lname} punch");
+        // Size is unchanged (PUNCH_HOLE implies KEEP_SIZE).
+        assert_eq!(
+            size_of(&h, ino).await,
+            size,
+            "[{tag}] size changed by punch"
+        );
+        // Punched interior reads zeros; head and tail keep POISON.
+        assert_fill(&h, ino, 0, p_off, POISON, &tag).await;
+        assert_hole(&h, ino, p_off, p_len, &tag).await;
+        assert_fill(&h, ino, p_off + p_len, size - (p_off + p_len), POISON, &tag).await;
+    }
+}
+
+#[tokio::test]
+async fn punch_reads_zeros_v3() {
+    punch_reads_zeros(Fmt::V3).await;
+}
+
+#[tokio::test]
+async fn punch_reads_zeros_v2() {
+    punch_reads_zeros(Fmt::V2).await;
+}
+
+/// A block-aligned whole-block striped punch (the mkfs.xfs BLKDISCARD shape):
+/// the entire middle block is punched and must read zeros; the neighbours stay.
+async fn punch_whole_block_striped(fmt: Fmt) {
+    let h = make(fmt).await;
+    let size = 4 * BS; // 4 full blocks
+    let ino = create(&h, "punchwb").await;
+    write_at(&h, ino, 0, &vec![POISON; size as usize]).await;
+
+    // Punch block index 1 and 2 exactly (block-aligned).
+    punch(&h, ino, BS, 2 * BS).await;
+
+    let tag = format!("{fmt:?}/striped whole-block punch");
+    assert_eq!(size_of(&h, ino).await, size, "[{tag}] size changed");
+    assert_fill(&h, ino, 0, BS, POISON, &tag).await;
+    assert_hole(&h, ino, BS, 2 * BS, &tag).await;
+    assert_fill(&h, ino, 3 * BS, BS, POISON, &tag).await;
+}
+
+#[tokio::test]
+async fn punch_whole_block_striped_v3() {
+    punch_whole_block_striped(Fmt::V3).await;
+}
+
+#[tokio::test]
+async fn punch_whole_block_striped_v2() {
+    punch_whole_block_striped(Fmt::V2).await;
+}
+
+// ---------------------------------------------------------------------------
+// 2. truncate-down → re-extend reads zeros (all layouts) — the generic/616
+//    residual: a striped file's surviving partial block kept a stale tail.
+// ---------------------------------------------------------------------------
+
+async fn truncate_extend_reads_zeros(fmt: Fmt) {
+    for (idx, (size, lname)) in LAYOUTS.iter().enumerate() {
+        let h = make(fmt).await;
+        let size = *size as u64;
+        let ino = create(&h, &format!("trunc{idx}")).await;
+        write_at(&h, ino, 0, &vec![POISON; size as usize]).await;
+
+        // Shrink to a non-block-aligned midpoint, then re-extend to the
+        // original size. [small, size) must now be a hole.
+        let small = size / 3;
+        truncate_to(&h, ino, small).await;
+        truncate_to(&h, ino, size).await;
+
+        let tag = format!("{fmt:?}/{lname} truncate-extend");
+        assert_eq!(
+            size_of(&h, ino).await,
+            size,
+            "[{tag}] size wrong after re-extend"
+        );
+        assert_fill(&h, ino, 0, small, POISON, &tag).await;
+        assert_hole(&h, ino, small, size - small, &tag).await;
+    }
+}
+
+#[tokio::test]
+async fn truncate_extend_reads_zeros_v3() {
+    truncate_extend_reads_zeros(Fmt::V3).await;
+}
+
+#[tokio::test]
+async fn truncate_extend_reads_zeros_v2() {
+    truncate_extend_reads_zeros(Fmt::V2).await;
+}
+
+// ---------------------------------------------------------------------------
+// 3. fallocate-extend (grow) reads zeros (all layouts).
+// ---------------------------------------------------------------------------
+
+async fn fallocate_extend_reads_zeros(fmt: Fmt) {
+    for (idx, (size, lname)) in LAYOUTS.iter().enumerate() {
+        let h = make(fmt).await;
+        let size = *size as u64;
+        let ino = create(&h, &format!("falloc{idx}")).await;
+        write_at(&h, ino, 0, &vec![POISON; size as usize]).await;
+
+        // Extend past EOF by more than a block so the grown region spans fresh
+        // (unmapped) blocks as well as the tail of the last data block.
+        let extra = 100_000u64;
+        fallocate_extend(&h, ino, size, extra).await;
+
+        let tag = format!("{fmt:?}/{lname} fallocate-extend");
+        assert_eq!(size_of(&h, ino).await, size + extra, "[{tag}] size wrong");
+        assert_fill(&h, ino, 0, size, POISON, &tag).await;
+        assert_hole(&h, ino, size, extra, &tag).await;
+    }
+}
+
+#[tokio::test]
+async fn fallocate_extend_reads_zeros_v3() {
+    fallocate_extend_reads_zeros(Fmt::V3).await;
+}
+
+#[tokio::test]
+async fn fallocate_extend_reads_zeros_v2() {
+    fallocate_extend_reads_zeros(Fmt::V2).await;
+}
+
+// ---------------------------------------------------------------------------
+// 4. sparse write past a truncated hole (the mmap-write-then-read-other-page
+//    shape): truncate to 0, write one interior region, leaving earlier blocks
+//    as holes that must read zeros.
+// ---------------------------------------------------------------------------
+
+async fn sparse_write_hole_reads_zeros(fmt: Fmt) {
+    let h = make(fmt).await;
+    let ino = create(&h, "sparse").await;
+    // Seed then discard, so the freed blocks carry POISON on the device.
+    write_at(&h, ino, 0, &vec![POISON; (4 * BS) as usize]).await;
+    truncate_to(&h, ino, 0).await;
+
+    // Sparse write one page inside block 2, leaving blocks 0 and 1 as holes.
+    let page = 4096u64;
+    let woff = 2 * BS + 8192;
+    write_at(&h, ino, woff, &vec![0xCD; page as usize]).await;
+
+    let tag = format!("{fmt:?}/striped sparse-write");
+    assert_eq!(size_of(&h, ino).await, woff + page, "[{tag}] size wrong");
+    // Earlier blocks are holes even though the same offsets once held POISON.
+    assert_hole(&h, ino, 0, 2 * BS, &tag).await;
+    // The written page is intact; its block's head is a hole.
+    assert_hole(&h, ino, 2 * BS, 8192, &tag).await;
+    assert_fill(&h, ino, woff, page, 0xCD, &tag).await;
+}
+
+#[tokio::test]
+async fn sparse_write_hole_reads_zeros_v3() {
+    sparse_write_hole_reads_zeros(Fmt::V3).await;
+}
+
+#[tokio::test]
+async fn sparse_write_hole_reads_zeros_v2() {
+    sparse_write_hole_reads_zeros(Fmt::V2).await;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Punched striped blocks freed to the allocator must never read back
+//    through a reused offset — the incarnation / block-reuse guarantee.
+// ---------------------------------------------------------------------------
+
+async fn punch_then_reuse_reads_zeros(fmt: Fmt) {
+    let h = make(fmt).await;
+    let size = 4 * BS;
+    let a = create(&h, "reuse_a").await;
+    write_at(&h, a, 0, &vec![POISON; size as usize]).await;
+
+    // Punch the whole middle (blocks 1 and 2), returning those offsets to the
+    // allocator's free list.
+    punch(&h, a, BS, 2 * BS).await;
+
+    // A second file reuses the just-freed offsets with a distinct pattern.
+    let b = create(&h, "reuse_b").await;
+    write_at(&h, b, 0, &vec![0xCD; (2 * BS) as usize]).await;
+
+    let tag = format!("{fmt:?}/striped punch-then-reuse");
+    // File A's punched range still reads zeros, never B's 0xCD or the old POISON.
+    assert_fill(&h, a, 0, BS, POISON, &tag).await;
+    assert_hole(&h, a, BS, 2 * BS, &tag).await;
+    assert_fill(&h, a, 3 * BS, BS, POISON, &tag).await;
+    // File B is intact.
+    assert_fill(&h, b, 0, 2 * BS, 0xCD, &tag).await;
+}
+
+#[tokio::test]
+async fn punch_then_reuse_reads_zeros_v3() {
+    punch_then_reuse_reads_zeros(Fmt::V3).await;
+}
+
+#[tokio::test]
+async fn punch_then_reuse_reads_zeros_v2() {
+    punch_then_reuse_reads_zeros(Fmt::V2).await;
+}

@@ -115,6 +115,11 @@ pub enum BlockMapOp<'a> {
     /// removal set on the same primitive; removed keys come back as the
     /// free list.
     TruncateFrom { new_size: u64 },
+    /// Remove a specific set of whole block indices (hole punch): each
+    /// removed index becomes a hole (read returns zeros) and its displaced
+    /// key comes back as the free list. The logical size is untouched (a
+    /// punch keeps the file size) — the `min_size` floor holds it in place.
+    RemoveBlocks(&'a [u32]),
 }
 
 /// Layout-field policy for [`DataRouter::merge_block_mappings`] — an
@@ -175,6 +180,22 @@ fn err_backend_not_found(be_id: &str) -> crate::error::SqueezefsError {
         "Storage backend '{}' not found/offline",
         be_id
     ))
+}
+
+/// Strip a stored block-map value (`proto://offset:extra` or `offset:extra`)
+/// down to the free-able key (`proto://offset` / `offset`) that
+/// [`BackendRouter::free_blocks`] expects. The map stores per-block extra
+/// (packed length / crypto framing) after the offset; the allocator only keys
+/// on the offset.
+fn clean_block_key(bk: &str) -> String {
+    if let Some(pos) = bk.find("://") {
+        let proto = &bk[..pos];
+        let rest = &bk[pos + 3..];
+        let offset = rest.split(':').next().unwrap_or(rest);
+        format!("{}://{}", proto, offset)
+    } else {
+        bk.split(':').next().unwrap_or(bk).to_string()
+    }
 }
 
 impl BackendRouter {
@@ -1468,6 +1489,22 @@ impl DataRouter {
                 });
                 current.size = new_size;
             }
+            BlockMapOp::RemoveBlocks(idxs) => {
+                for &b in idxs {
+                    if let Some(bk) = block_map.remove(&b) {
+                        purge(&bk);
+                        displaced.push(bk);
+                    }
+                }
+                // A punch never grows or shrinks the file: hold the size at the
+                // caller's floor / freshest RAM size (same discipline as Merge).
+                current.size = std::cmp::max(current.size, min_size);
+                if let Some(cached) = self.metadata_cache.get(&file_path) {
+                    if cached.size > current.size {
+                        current.size = cached.size;
+                    }
+                }
+            }
         }
         current.block_map = Some(block_map);
 
@@ -1736,21 +1773,28 @@ impl DataRouter {
                 .map(|m| m.is_empty())
                 .unwrap_or(true);
 
+        // RMW base. The whole-file RAM snapshot (write_lru/read_lru keyed by
+        // file_path) is trusted ONLY for inline files, where it is coherent
+        // (small, fully rewritten each write). For a STAGED file it can be a
+        // stale snapshot left by a prior `read_file` (copy_file_range source
+        // read) or an inline-era write — RMW-ing from it would re-stage stale
+        // bytes and revert a just-punched/written range (the generic/616
+        // residual). Staged reads its authoritative base from the staging ring
+        // (or the promoted durable block), which tracks every mutation.
         let mut existing_data = if full_overwrite_empty {
             Vec::new()
-        } else if let Some(cached) = self.cache.write_lru.get(file_path) {
-            cached.to_vec()
-        } else if let Some(cached) = self.cache.read_lru.get(file_path) {
-            cached.to_vec()
+        } else if meta.file_type == "inline" {
+            if let Some(cached) = self.cache.write_lru.get(file_path) {
+                cached.to_vec()
+            } else if let Some(cached) = self.cache.read_lru.get(file_path) {
+                cached.to_vec()
+            } else if let Some(ref d) = meta.data_key {
+                d.to_vec()
+            } else {
+                Vec::new()
+            }
         } else {
             match meta.file_type.as_str() {
-                "inline" => {
-                    if let Some(ref d) = meta.data_key {
-                        d.to_vec()
-                    } else {
-                        Vec::new()
-                    }
-                }
                 "staged" => {
                     if let Some(ref file_id) = meta.file_id {
                         if let Some(staged_data) = self.cache.nvme.read_staged(file_id) {
@@ -1909,6 +1953,17 @@ impl DataRouter {
                     updated_meta.cached_at = std::time::Instant::now();
                     self.metadata_cache
                         .insert(file_path.to_string(), updated_meta);
+                    // Drop any stale whole-file RAM snapshot: the staging ring
+                    // entry is now authoritative for this file, but a prior
+                    // `read_file` (e.g. a copy_file_range source read) or an
+                    // inline-era write may have cached the whole file under
+                    // `file_path`. Reads prefer that cache (read_file_range*),
+                    // so leaving it would serve pre-write bytes — including
+                    // reading a just-punched/zeroed range as its stale prior
+                    // contents (generic/616). The inline and spill branches
+                    // already refresh these tiers; the staged branch must too.
+                    self.cache.write_lru.remove(file_path);
+                    self.cache.read_lru.remove(file_path);
                     // The fresh stage supersedes any promoted/spilled durable
                     // copy of older content. The ring entry itself is the
                     // fresh data (replaced in-place by stage_write) — keep it.
@@ -2695,36 +2750,15 @@ impl DataRouter {
         bytes::Bytes,
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     )> {
-        // Tier 2 check: System RAM LRU Caches
-        let mut cached_opt = self.cache.read_lru.get(file_path);
-        if cached_opt.is_none() {
-            cached_opt = self.cache.write_lru.get(file_path);
-        }
-        if let Some(cached_data) = cached_opt {
-            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-            let start = std::cmp::min(offset as usize, cached_data.len());
-            let end = std::cmp::min((offset + size as u64) as usize, cached_data.len());
-            let len = end - start;
-            let data = if let Some(dest) = dest_addr {
-                let dest_ptr = dest as *mut u8;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(cached_data[start..end].as_ptr(), dest_ptr, len);
-                    bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
-                        ptr: dest_ptr,
-                        len,
-                    })
-                }
-            } else {
-                // SAFETY: start and end are clamped to cached_data.len()
-                unsafe {
-                    let sub = cached_data.get_unchecked(start..end);
-                    cached_data.slice_ref(sub)
-                }
-            };
-            return Ok((data, None));
-        }
-
-        // Fetch file metadata from local cache or Garnet
+        // Fetch metadata first. The whole-file RAM snapshot (read_lru /
+        // write_lru keyed by file_path) is deliberately NOT consulted on the
+        // read data path: it is a whole-file copy that goes stale under
+        // sub-file mutations (write / punch / truncate) of staged & striped
+        // files — a punched or truncated range would otherwise read its prior
+        // bytes instead of zeros (the generic/616 residual). Each layout below
+        // serves from its authoritative, mutation-tracking tier instead: the
+        // inline `data_key`, the staging ring (staged), or the per-block read
+        // caches / hole map (striped).
         let meta = self.fetch_metadata(file_path).await?;
 
         match meta.file_type.as_str() {
@@ -3275,6 +3309,11 @@ impl DataRouter {
                     fencing_token,
                 )
                 .await?;
+                // The re-exposed range [old_size, new_size) is a hole; drop any
+                // whole-file RAM snapshot so a re-extend after a shrink reads
+                // the (holey) block map, never a stale full-length cache.
+                self.cache.write_lru.remove(&file_path);
+                self.cache.read_lru.remove(&file_path);
                 return Ok(());
             }
             // Shrinking: removal-RMW on the same primitive; removed keys
@@ -3288,23 +3327,17 @@ impl DataRouter {
                     fencing_token,
                 )
                 .await?;
-            let blocks_to_free: Vec<String> = removed
-                .iter()
-                .map(|bk| {
-                    if let Some(pos) = bk.find("://") {
-                        let proto = &bk[..pos];
-                        let rest = &bk[pos + 3..];
-                        let offset = rest.split(':').next().unwrap_or(rest);
-                        format!("{}://{}", proto, offset)
-                    } else {
-                        bk.split(':').next().unwrap_or(bk).to_string()
-                    }
-                })
-                .collect();
+            let blocks_to_free: Vec<String> =
+                removed.iter().map(|bk| clean_block_key(bk)).collect();
             if !blocks_to_free.is_empty() {
                 let free_refs: Vec<&str> = blocks_to_free.iter().map(|s| s.as_str()).collect();
                 let _ = self.backend_router.free_blocks(&free_refs).await;
             }
+            // The bytes past new_size are gone; drop the whole-file RAM
+            // snapshot so a later re-extend reads zeros for the hole rather
+            // than slicing stale bytes from a cached full-length copy.
+            self.cache.write_lru.remove(&file_path);
+            self.cache.read_lru.remove(&file_path);
             return Ok(());
         }
 
@@ -3313,7 +3346,12 @@ impl DataRouter {
             meta.size = new_size;
             self.save_metadata_to_backend(ino, &meta, fencing_token)
                 .await?;
-            self.metadata_cache.insert(file_path, meta);
+            self.metadata_cache.insert(file_path.clone(), meta);
+            // Re-exposed [old_size, new_size) is a hole: invalidate any stale
+            // whole-file snapshot (inline/staged data_key stays short, so a
+            // cached full-length copy would otherwise serve stale tail bytes).
+            self.cache.write_lru.remove(&file_path);
+            self.cache.read_lru.remove(&file_path);
             return Ok(());
         }
 
@@ -3328,15 +3366,7 @@ impl DataRouter {
                 let block_start = b as u64 * block_size;
                 if block_start >= new_size {
                     self.cache.read_lru.remove(bk);
-                    let clean_bk = if let Some(pos) = bk.find("://") {
-                        let proto = &bk[..pos];
-                        let rest = &bk[pos + 3..];
-                        let offset = rest.split(':').next().unwrap_or(rest);
-                        format!("{}://{}", proto, offset)
-                    } else {
-                        bk.split(':').next().unwrap_or(bk).to_string()
-                    };
-                    blocks_to_free.push(clean_bk);
+                    blocks_to_free.push(clean_block_key(bk));
                     false // Remove from block_map
                 } else {
                     true
@@ -3365,7 +3395,12 @@ impl DataRouter {
         // Save updated metadata
         self.save_metadata_to_backend(ino, &meta, fencing_token)
             .await?;
-        self.metadata_cache.insert(file_path, meta);
+        self.metadata_cache.insert(file_path.clone(), meta);
+
+        // The truncated tail is gone: drop any whole-file RAM snapshot so a
+        // later re-extend reads zeros instead of a stale full-length copy.
+        self.cache.write_lru.remove(&file_path);
+        self.cache.read_lru.remove(&file_path);
 
         // Free the shrunken blocks
         if !blocks_to_free.is_empty() {
@@ -3373,6 +3408,49 @@ impl DataRouter {
             let _ = self.backend_router.free_blocks(&free_refs).await;
         }
 
+        Ok(())
+    }
+
+    /// Hole-punch a set of WHOLE striped block indices: remove them from the
+    /// block map (a subsequent read of an unmapped index returns zeros — see
+    /// `read_file_range*`) and free their offsets, keeping the logical size
+    /// (`min_size`) unchanged. The removed offsets are freed only AFTER the new
+    /// map is published (`merge_block_mappings` purges every read tier for the
+    /// displaced keys first), and `free_blocks` runs the destructive device
+    /// punch inside the allocator's `begin_free → punch → finish_free` window,
+    /// so a reused offset can never be read back through the stale map (the
+    /// incarnation-seqlock guarantee). The caller must first drop any in-RAM
+    /// active-block buffer / staged copy for these indices (those tiers are
+    /// owned by the FUSE layer). Partial-edge blocks are NOT handled here — the
+    /// caller RMW-zeros those through the write path.
+    pub async fn punch_striped_blocks(
+        &self,
+        ino: u64,
+        block_idxs: &[u32],
+        min_size: u64,
+        fencing_token: u64,
+    ) -> Result<()> {
+        if block_idxs.is_empty() {
+            return Ok(());
+        }
+        let removed = self
+            .merge_block_mappings(
+                ino,
+                BlockMapOp::RemoveBlocks(block_idxs),
+                min_size,
+                LayoutFlip::KeepLayout,
+                fencing_token,
+            )
+            .await?;
+        let blocks_to_free: Vec<String> = removed.iter().map(|bk| clean_block_key(bk)).collect();
+        if !blocks_to_free.is_empty() {
+            let free_refs: Vec<&str> = blocks_to_free.iter().map(|s| s.as_str()).collect();
+            let _ = self.backend_router.free_blocks(&free_refs).await;
+        }
+        // Drop the whole-file RAM snapshot: the punched indices are holes now.
+        let file_path = crate::keys::inode_path(ino);
+        self.cache.write_lru.remove(&file_path);
+        self.cache.read_lru.remove(&file_path);
         Ok(())
     }
 
@@ -3389,15 +3467,7 @@ impl DataRouter {
         if let Some(ref block_map) = meta.block_map {
             for bk in block_map.values() {
                 self.cache.read_lru.remove(bk);
-                let clean_bk = if let Some(pos) = bk.find("://") {
-                    let proto = &bk[..pos];
-                    let rest = &bk[pos + 3..];
-                    let offset = rest.split(':').next().unwrap_or(rest);
-                    format!("{}://{}", proto, offset)
-                } else {
-                    bk.split(':').next().unwrap_or(bk).to_string()
-                };
-                blocks_to_free.push(clean_bk);
+                blocks_to_free.push(clean_block_key(bk));
             }
         }
 

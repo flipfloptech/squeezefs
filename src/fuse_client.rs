@@ -1760,6 +1760,160 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
+    /// Punch a hole: make `[offset, offset+length)` read back as zeros WITHOUT
+    /// changing the file's logical size (POSIX `FALLOC_FL_PUNCH_HOLE`). A hole
+    /// reads as zeros (an unwritten / punched / extended region), so this is the
+    /// zero-or-unmap primitive shared by the fallocate handler.
+    ///
+    /// - **Striped:** whole covered blocks are unmapped + freed (real holes,
+    ///   space reclaimed, incarnation-retired so a reused offset never reads
+    ///   back through the stale map); partial edges are RMW-zeroed through the
+    ///   write path (preserving the un-punched bytes of the edge block).
+    /// - **inline / staged:** the covered sub-range is RMW-zeroed in place via
+    ///   the router write path (which refreshes the whole-file cache too).
+    ///
+    /// Caller MUST hold the per-inode write guard (serializes against writes;
+    /// makes any in-flight writeback for a dropped block a no-op — the worker
+    /// skips a `NotFound` active block and takes the same guard before its map
+    /// merge). Size is never grown (`end` is clamped to EOF).
+    async fn punch_hole_range(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        let file_path = crate::keys::inode_path(ino);
+        let meta = self.router.fetch_metadata(&file_path).await?;
+        if length == 0 {
+            return Ok(());
+        }
+        // Honor the kernel's punch range [offset, offset+length). Do NOT clamp
+        // `end` to our own `meta.size`: under the FUSE writeback cache a
+        // deferred write flush leaves `meta.size` (what fetch_metadata reports)
+        // lagging the kernel `i_size`, so clamping would skip zeroing a tail the
+        // kernel considers in-bounds — the punched range then reads its stale
+        // prior bytes (the generic/616 residual; same laggable-size trap the
+        // copy_file_range fix hit). The kernel only punches within `i_size`, so
+        // zeroing the full range is safe and reconciles the lagging size.
+        let end = offset + length;
+        // Size floor for map/layout saves: never regress below the freshest
+        // known size, and let the punched range extend it if our size lagged.
+        let size_floor = meta.size.max(end);
+
+        if meta.file_type == "striped" {
+            let bs = self.router.block_size.load(Ordering::Relaxed);
+            let start_b = offset / bs;
+            let end_b = (end - 1) / bs;
+            let mut whole_idxs: Vec<u32> = Vec::new();
+            for b in start_b..=end_b {
+                let b_start = b * bs;
+                let b_end = b_start + bs;
+                let cov_start = std::cmp::max(offset, b_start);
+                let cov_end = std::cmp::min(end, b_end);
+                if cov_start == b_start && cov_end == b_end {
+                    // Whole block → hole. Drop the RAM + staged active-block
+                    // copy under the block lock (serialize against a racing
+                    // flush) before it is unmapped + freed below.
+                    let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b as u32);
+                    let block_guard = block_lock.lock().await;
+                    let key = crate::keys::active_block(ino, b).to_string();
+                    self.active_block_buffers.remove(&key);
+                    self.router.cache.nvme.remove_active_block(&key);
+                    drop(block_guard);
+                    whole_idxs.push(b as u32);
+                } else {
+                    // Partial edge → RMW-zero exactly the covered sub-range via
+                    // the striped write path: it consumes the active buffer /
+                    // device block as the RMW base, overlays zeros in the
+                    // covered range (recorded as covered), and preserves the
+                    // un-punched bytes.
+                    let zeros = bytes::Bytes::from(vec![0u8; (cov_end - cov_start) as usize]);
+                    self.write_file_staged(ino, cov_start, zeros, size_floor, fencing_token)
+                        .await?;
+                }
+            }
+            // Unmap + free the whole blocks (holes); the size floor keeps the
+            // logical size at least the freshest known / punched extent.
+            self.router
+                .punch_striped_blocks(ino, &whole_idxs, size_floor, fencing_token)
+                .await?;
+        } else {
+            // inline / staged: RMW-zero the covered range in place through the
+            // router write path. It reads the authoritative base (staging for
+            // staged, data_key for inline) and rewrites the range as zeros.
+            let zeros = bytes::Bytes::from(vec![0u8; (end - offset) as usize]);
+            self.router
+                .write_file(&file_path, offset, zeros, fencing_token)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Grow a file's logical size to `target_size` (a no-op if already at least
+    /// that large). The newly exposed region [old_size, target_size) is a hole
+    /// (reads zeros). Shared by the fallocate preallocate/extend and ZERO_RANGE
+    /// paths.
+    async fn extend_file_size(
+        &self,
+        ino: u64,
+        target_size: u64,
+        fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        let backend = self.meta_backend.as_ref().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
+        })?;
+
+        let disk_inode = backend.getattr(ino).await?;
+        let old_size = disk_inode.size;
+        if target_size <= old_size {
+            return Ok(());
+        }
+
+        // Update in backend
+        backend
+            .setattr(ino, None, None, None, Some(target_size), None, None, None)
+            .await?;
+
+        // Update layout size. Striped files go through the §5.3 degenerate
+        // size-only merge: the old whole-meta save of a stale snapshot under NO
+        // lock could rewrite the block map "without mutating it", dropping
+        // mappings a concurrent write-through just published. Inline/staged
+        // files keep the whole-meta save — their RAM meta (dirty inline payload
+        // / staged identity) is the truth a backend re-read cannot carry, and
+        // they have no striped map to lose.
+        let file_path = crate::keys::inode_path(ino);
+        if let Ok(mut meta) = self.router.fetch_metadata(&file_path).await {
+            if meta.file_type == "striped" {
+                let _ = self
+                    .router
+                    .merge_block_mappings(
+                        ino,
+                        crate::routing::BlockMapOp::Merge(&[]),
+                        target_size,
+                        crate::routing::LayoutFlip::KeepLayout,
+                        fencing_token,
+                    )
+                    .await;
+            } else {
+                meta.size = target_size;
+                let _ = self
+                    .router
+                    .save_metadata_to_backend(ino, &meta, fencing_token)
+                    .await;
+            }
+        }
+
+        // Update cache
+        if let Some((mut attr, _)) = self.attr_cache.get(&ino) {
+            attr.size = target_size;
+            attr.blocks = target_size.div_ceil(512);
+            self.attr_cache
+                .insert(ino, (attr, std::time::Instant::now()));
+        }
+        Ok(())
+    }
+
     /// Upload a content-complete block directly: crypto → allocate → DMA →
     /// block-map merge (zero-copy write-path design §5.3, PR 4). Caller
     /// holds `BLOCK_FLUSH_LOCKS(ino, b)`; MUST NOT hold the inode write
@@ -3628,6 +3782,42 @@ impl Filesystem for SqueezefsFilesystem {
 
             if let Some(new_size) = size_to_set {
                 let fencing_token = self.dlm.get_fencing_token_ino(ino);
+
+                // Striped shrink to a non-block-aligned size: the block that
+                // straddles new_size survives the map removal below with stale
+                // bytes in [new_size, block_end). A later re-extend would read
+                // those instead of zeros (a hole must read zeros). RMW-zero that
+                // tail now, while the file is still at its old size so the write
+                // never grows it — the block is then stored clean.
+                if new_size < current_inode.size {
+                    let bs = self.router.block_size.load(Ordering::Relaxed);
+                    if bs > 0 && new_size % bs != 0 {
+                        let file_path = crate::keys::inode_path(ino);
+                        if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
+                            if meta.file_type == "striped" {
+                                let block_end = (new_size / bs + 1) * bs;
+                                let zero_to = std::cmp::min(current_inode.size, block_end);
+                                if zero_to > new_size {
+                                    let zeros = bytes::Bytes::from(vec![
+                                        0u8;
+                                        (zero_to - new_size)
+                                            as usize
+                                    ]);
+                                    self.write_file_staged(
+                                        ino,
+                                        new_size,
+                                        zeros,
+                                        current_inode.size,
+                                        fencing_token,
+                                    )
+                                    .await
+                                    .map_err(map_squeezefs_err)?;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 self.router
                     .truncate_layout(ino, new_size, fencing_token)
                     .await
@@ -5067,68 +5257,57 @@ impl Filesystem for SqueezefsFilesystem {
             "FUSE Fallocate: ino = {}, offset = {}, length = {}, mode = {}",
             ino, offset, length, mode
         );
+        const PUNCH_HOLE: u32 = libc::FALLOC_FL_PUNCH_HOLE as u32;
+        const KEEP_SIZE: u32 = libc::FALLOC_FL_KEEP_SIZE as u32;
+        const ZERO_RANGE: u32 = libc::FALLOC_FL_ZERO_RANGE as u32;
+        const COLLAPSE_RANGE: u32 = libc::FALLOC_FL_COLLAPSE_RANGE as u32;
+        const INSERT_RANGE: u32 = libc::FALLOC_FL_INSERT_RANGE as u32;
+
+        // COLLAPSE_RANGE / INSERT_RANGE shift file contents (not a hole op).
+        // They are not implemented; reject them loudly so callers (and fsx)
+        // fall back instead of silently corrupting via the extend path below.
+        if mode & (COLLAPSE_RANGE | INSERT_RANGE) != 0 {
+            return Err(Errno::from(libc::EOPNOTSUPP));
+        }
+
+        // PUNCH_HOLE / ZERO_RANGE: the range must read back as zeros (a hole).
+        // PUNCH_HOLE always keeps the size; ZERO_RANGE may grow it when
+        // KEEP_SIZE is clear. Zero the in-bounds portion durably, then extend.
+        if mode & (PUNCH_HOLE | ZERO_RANGE) != 0 {
+            if length == 0 {
+                return Ok(());
+            }
+            // Lock order (P1-9): inode write guard (1) BEFORE the lease (2).
+            let _guard = self.active_inode_locks.get_inode_lock(ino).write().await;
+            let fencing_token = self
+                .get_or_acquire_lease(ino)
+                .await
+                .map_err(map_squeezefs_err)?;
+
+            // Zero the part that overlaps existing data (punch_hole_range clamps
+            // to the current EOF); any region past EOF becomes a hole via the
+            // size extension below and already reads zeros.
+            self.punch_hole_range(ino, offset, length, fencing_token)
+                .await
+                .map_err(map_squeezefs_err)?;
+
+            if mode & ZERO_RANGE != 0 && mode & KEEP_SIZE == 0 {
+                let target_size = offset + length;
+                self.extend_file_size(ino, target_size, fencing_token)
+                    .await
+                    .map_err(map_squeezefs_err)?;
+            }
+            return Ok(());
+        }
 
         // Pre-allocation isn't strictly required to reserve physical space in our NVMe-oF backend volume
         // as blocks are sparse/dynamic by nature. We just update the size attribute if we are extending.
         if mode & libc::FALLOC_FL_KEEP_SIZE as u32 == 0 {
-            let backend = self
-                .meta_backend
-                .as_ref()
-                .ok_or_else(|| {
-                    SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
-                })
-                .map_err(map_squeezefs_err)?;
-
-            let disk_inode = backend.getattr(ino).await.map_err(map_squeezefs_err)?;
-            let old_size = disk_inode.size;
-
+            let fencing_token = self.dlm.get_fencing_token_ino(ino);
             let target_size = offset + length;
-            if target_size > old_size {
-                // Update in backend
-                backend
-                    .setattr(ino, None, None, None, Some(target_size), None, None, None)
-                    .await
-                    .map_err(map_squeezefs_err)?;
-
-                // Update layout size. Striped files go through the §5.3
-                // degenerate size-only merge: the old whole-meta save of a
-                // stale snapshot under NO lock could rewrite the block map
-                // "without mutating it", dropping mappings a concurrent
-                // write-through just published. Inline/staged files keep
-                // the whole-meta save — their RAM meta (dirty inline
-                // payload / staged identity) is the truth a backend re-read
-                // cannot carry, and they have no striped map to lose.
-                let file_path = crate::keys::inode_path(ino);
-                if let Ok(mut meta) = self.router.fetch_metadata(&file_path).await {
-                    let fencing_token = self.dlm.get_fencing_token_ino(ino);
-                    if meta.file_type == "striped" {
-                        let _ = self
-                            .router
-                            .merge_block_mappings(
-                                ino,
-                                crate::routing::BlockMapOp::Merge(&[]),
-                                target_size,
-                                crate::routing::LayoutFlip::KeepLayout,
-                                fencing_token,
-                            )
-                            .await;
-                    } else {
-                        meta.size = target_size;
-                        let _ = self
-                            .router
-                            .save_metadata_to_backend(ino, &meta, fencing_token)
-                            .await;
-                    }
-                }
-
-                // Update cache
-                if let Some((mut attr, _)) = self.attr_cache.get(&ino) {
-                    attr.size = target_size;
-                    attr.blocks = target_size.div_ceil(512);
-                    self.attr_cache
-                        .insert(ino, (attr, std::time::Instant::now()));
-                }
-            }
+            self.extend_file_size(ino, target_size, fencing_token)
+                .await
+                .map_err(map_squeezefs_err)?;
         }
 
         Ok(())

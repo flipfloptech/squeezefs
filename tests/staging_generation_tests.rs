@@ -293,7 +293,7 @@ async fn poison_staging(
         .stage_write(
             "inode_2",
             "dead-generation-file-id",
-            &vec![0xAAu8; STAGED_LEN],
+            bytes::Bytes::from(vec![0xAAu8; STAGED_LEN]),
             7,
         )
         .await
@@ -438,7 +438,12 @@ async fn same_generation_warm_remount_keeps_staging(fmt: Fmt) {
     // Session A of THIS generation stages one file, then "crashes".
     let a = bare_cache(staging.path(), data.path(), &alloc, Some(&gen)).await;
     a.nvme
-        .stage_write("inode_2", "warm-file-id", &vec![0x11u8; STAGED_LEN], 3)
+        .stage_write(
+            "inode_2",
+            "warm-file-id",
+            bytes::Bytes::from(vec![0x11u8; STAGED_LEN]),
+            3,
+        )
         .await
         .expect("stage_write failed");
     drop(a);

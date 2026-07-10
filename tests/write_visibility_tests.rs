@@ -412,7 +412,226 @@ async fn truncate_straddle_tail_stale_durable_size_v3() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. delete_file must remove the staged `active_block:` entries under the
+// 4. copy_file_range must see parked active-block overlays on BOTH sides:
+//    the source read is router-level (block map + read tiers) and missed the
+//    FUSE-layer parked buffer of a partial striped write (copying stale
+//    zeros/pre-write bytes — the residual generic/075.2 lost-copy), and the
+//    striped destination write bypassed the parked overlay so the copied
+//    bytes were shadowed on the next read/flush.
+// ---------------------------------------------------------------------------
+
+async fn cfr(h: &H, ino: u64, off_in: u64, ino_out: u64, off_out: u64, len: u64) -> u64 {
+    h.fs.copy_file_range(h.req, ino, 0, off_in, ino_out, 0, off_out, len, 0)
+        .await
+        .unwrap()
+        .copied
+}
+
+async fn copy_file_range_sees_parked_overlays(fmt: Fmt) {
+    let tag = format!("{fmt:?}/cfr-parked");
+    let h = make(fmt).await;
+    let ino = create(&h, "cfrsrc").await;
+
+    // Striped file covering blocks 0..2.
+    write_at(&h, ino, 0, &vec![0x11u8; (3 * BS) as usize]).await;
+
+    // Parked partial writes: 0x77 in block 0 (the copy SOURCE), 0x22 in
+    // block 1 (a parked overlay the copy DESTINATION lands next to).
+    write_at(&h, ino, 0x5000, &vec![0x77u8; 0x800]).await;
+    write_at(&h, ino, BS + 0x1000, &vec![0x22u8; 0x800]).await;
+
+    // Same-file copy: parked-source bytes into the parked-dest block.
+    let copied = cfr(&h, ino, 0x5000, ino, BS + 0x1400, 0x400).await;
+    assert_eq!(copied, 0x400, "[{tag}] short copy");
+
+    // The copied range must carry the parked 0x77 bytes...
+    assert_fill(&h, ino, BS + 0x1400, 0x400, 0x77, &tag).await;
+    // ...the parked destination neighbors survive...
+    assert_fill(&h, ino, BS + 0x1000, 0x400, 0x22, &tag).await;
+    // ...and the source itself is untouched.
+    assert_fill(&h, ino, 0x5000, 0x800, 0x77, &tag).await;
+    assert_fill(&h, ino, 0, 0x5000, 0x11, &tag).await;
+
+    // Nothing degrades across the durable flush cycle.
+    fsync(&h, ino).await;
+    assert_fill(&h, ino, BS + 0x1400, 0x400, 0x77, &tag).await;
+    assert_fill(&h, ino, BS + 0x1000, 0x400, 0x22, &tag).await;
+    assert_fill(&h, ino, BS + 0x1800, 0x800, 0x11, &tag).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copy_file_range_sees_parked_overlays_v2() {
+    copy_file_range_sees_parked_overlays(Fmt::V2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copy_file_range_sees_parked_overlays_v3() {
+    copy_file_range_sees_parked_overlays(Fmt::V3).await;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Multi-block zero-copy reads must WRITE every byte of the caller's dest
+//    buffer. The FUSE-over-io_uring payload buffer is reused across requests:
+//    a dest region left untouched — a hole block, or the tail past a short
+//    tier copy — replays the PREVIOUS reply's bytes to the kernel (transient
+//    stale read; the on-disk content stays correct, which is exactly the
+//    generic/075.2 empty-good/bad-diff failure shape).
+// ---------------------------------------------------------------------------
+
+async fn multiblock_read_zeroes_hole_into_reused_dest(fmt: Fmt) {
+    let tag = format!("{fmt:?}/multiblock-hole-dest");
+    let h = make(fmt).await;
+    let ino = create(&h, "mbhole").await;
+    let file_path = format!("inode_{ino}");
+
+    // Striped file, then punch block 1 whole: a REAL unmapped hole block
+    // (a promotion-time zero block would be mapped and mask the bug).
+    write_at(&h, ino, 0, &vec![0x11u8; (2 * BS) as usize]).await;
+    write_at(&h, ino, 2 * BS, &vec![0x33u8; BS as usize]).await;
+    h.fs.fallocate(
+        h.req,
+        ino,
+        0,
+        BS,
+        BS,
+        (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE) as u32,
+    )
+    .await
+    .unwrap();
+    fsync(&h, ino).await;
+
+    // Simulate the reused uring payload buffer: poisoned with a previous
+    // reply's bytes.
+    let read_off = BS / 2;
+    let read_len = (2 * BS) as usize; // spans blocks 0(tail), 1(hole), 2(head)
+    let mut dest = vec![0xAAu8; read_len];
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy(
+                &file_path,
+                read_off,
+                read_len as u32,
+                Some(dest.as_mut_ptr() as u64),
+            )
+            .await
+            .unwrap();
+    assert_eq!(data.len(), read_len, "[{tag}] short multi-block read");
+
+    let expect_at = |off: u64| -> u8 {
+        if off < BS {
+            0x11
+        } else if off < 2 * BS {
+            0 // hole
+        } else {
+            0x33
+        }
+    };
+    for (i, &got) in dest.iter().enumerate() {
+        let off = read_off + i as u64;
+        let want = expect_at(off);
+        assert_eq!(
+            got, want,
+            "[{tag}] dest byte at file offset {off:#x} = {got:#x}, want {want:#x} \
+             (0xAA = recycled previous-reply bytes leaked through)"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiblock_read_zeroes_hole_into_reused_dest_v2() {
+    multiblock_read_zeroes_hole_into_reused_dest(Fmt::V2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiblock_read_zeroes_hole_into_reused_dest_v3() {
+    multiblock_read_zeroes_hole_into_reused_dest(Fmt::V3).await;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Layout-prune epoch: a delayed block-map merge (writeback worker / batch
+//    flush) whose content was captured BEFORE a truncate/punch pruned the map
+//    must be refused — merging it would re-insert the pruned block with
+//    pre-prune content (the generic/075.2 flush-vs-truncate resurrection
+//    race, observed live as a post-truncate `Merge` re-adding the dead
+//    block). Pins the primitive: prune ops bump the epoch; an epoch-guarded
+//    merge with a stale capture returns None and applies nothing.
+// ---------------------------------------------------------------------------
+
+async fn prune_epoch_refuses_stale_delayed_merge(fmt: Fmt) {
+    let tag = format!("{fmt:?}/prune-epoch");
+    let h = make(fmt).await;
+    let ino = create(&h, "epoch").await;
+    let file_path = format!("inode_{ino}");
+
+    // Striped file: blocks 0..2 mapped.
+    write_at(&h, ino, 0, &vec![0x11u8; (3 * BS) as usize]).await;
+    fsync(&h, ino).await;
+    let token = h.fs.dlm().get_fencing_token_ino(ino);
+
+    // A delayed flush captures its content (and the epoch) here...
+    let captured = squeezefs::routing::layout_prune_epoch(ino);
+
+    // ...then a truncate prunes blocks 1..2 (bumps the epoch)...
+    truncate_to(&h, ino, BS / 2).await;
+    assert_ne!(
+        squeezefs::routing::layout_prune_epoch(ino),
+        captured,
+        "[{tag}] truncate must bump the layout-prune epoch"
+    );
+
+    // ...and the delayed merge must now be refused wholesale.
+    let refused =
+        h.fs.router
+            .merge_block_mappings_if_epoch(
+                ino,
+                squeezefs::routing::BlockMapOp::Merge(&[(2u32, "999999".to_string())]),
+                0,
+                squeezefs::routing::LayoutFlip::ToStripedKeepStagedIdentity,
+                token,
+                Some(captured),
+            )
+            .await
+            .unwrap();
+    assert!(
+        refused.is_none(),
+        "[{tag}] stale-epoch merge must be refused, got {refused:?}"
+    );
+
+    // The pruned region stays a hole (re-expose it first).
+    write_at(&h, ino, 2 * BS + BS / 2, &[0x33u8; 16]).await;
+    assert_hole(&h, ino, BS, BS, &tag).await;
+
+    // A fresh capture merges normally (sanity: the guard refuses only
+    // genuinely stale captures).
+    let fresh = squeezefs::routing::layout_prune_epoch(ino);
+    let applied =
+        h.fs.router
+            .merge_block_mappings_if_epoch(
+                ino,
+                squeezefs::routing::BlockMapOp::Merge(&[]),
+                0,
+                squeezefs::routing::LayoutFlip::KeepLayout,
+                token,
+                Some(fresh),
+            )
+            .await
+            .unwrap();
+    assert!(applied.is_some(), "[{tag}] fresh-epoch merge must apply");
+    let _ = file_path;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_epoch_refuses_stale_delayed_merge_v2() {
+    prune_epoch_refuses_stale_delayed_merge(Fmt::V2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_epoch_refuses_stale_delayed_merge_v3() {
+    prune_epoch_refuses_stale_delayed_merge(Fmt::V3).await;
+}
+
+// ---------------------------------------------------------------------------
+// 7. delete_file must remove the staged `active_block:` entries under the
 //    canonical key (`active_block:{path}:block_{b}`); the malformed key it
 //    used (`active_block:{path}:{b}`) left stale staged overlays alive to
 //    shadow a reused inode's reads.

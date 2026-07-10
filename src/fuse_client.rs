@@ -1672,6 +1672,37 @@ impl SqueezefsFilesystem {
                         )
                     };
 
+                // ONE-AUTHORITY INVARIANT (generic/075.2): per block, the
+                // newest content lives in exactly one overlay — the RAM
+                // parked buffer XOR the staged `active_block:` entry. We now
+                // own the RMW base (consumed the parked buffer, read the
+                // staged entry, or seeded device/fresh) and are about to
+                // mutate + re-park/upload it, so any staged sibling is
+                // superseded: remove it under this block's lock. Leaving it
+                // let flush_one_active_block upload the STALE staged copy
+                // over the newer merge, and let router reads serve pre-write
+                // bytes through the ACTIVE_STAGED tier once the RAM buffer
+                // moved on (both observed live in the fsx-075 soak). Any
+                // queued WritebackRequest for it becomes a clean no-op; the
+                // durability promise transfers to this write's own
+                // park/write-through path.
+                //
+                // spawn_blocking (same rule as every put_active_block call):
+                // the staging-shard WRITE lock is a parking_lot lock, and
+                // §5.5 DMA sources hold the shard READ lock ACROSS awaits —
+                // parking an async worker on the writer side starves the
+                // executor until no worker is left to poll the guard-holding
+                // tasks (observed live: total daemon wedge under the fsx-075
+                // harness, every worker parked in NvmeShard lock_shared/
+                // lock_exclusive).
+                {
+                    let nvme = self.router.cache.nvme.clone();
+                    let key = cache_key.clone();
+                    tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+
                 // 2. Merge the request slice. `make_mut` mutates only
                 // provably-unique memory: a live reader snapshot forces a
                 // copy-on-write instead of mutating aliased bytes (P0 fix,
@@ -1862,10 +1893,98 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
+    /// Drop every active-block overlay — parked RAM `ActiveBlockBuf` and
+    /// staged `active_block:` ring entry — whose block lies entirely at/after
+    /// `new_size`. Truncate prunes those blocks from the map; an overlay that
+    /// survives the prune is stale beyond-EOF content that would serve
+    /// single-block reads, seed the next partial write's RMW, or re-merge
+    /// into the map on the next flush (the generic/075.2 stale-data
+    /// resurrection). Caller MUST hold the per-inode write guard; each
+    /// removal runs under that block's `BLOCK_FLUSH_LOCKS` (lock order 1→3),
+    /// making any in-flight writeback for the dropped block a NotFound no-op.
+    async fn drop_active_block_overlays_beyond(&self, ino: u64, new_size: u64) {
+        let bs = self.router.block_size.load(Ordering::Relaxed);
+        if bs == 0 {
+            return;
+        }
+        let first_dead_block = new_size.div_ceil(bs);
+        let prefix = crate::keys::active_block_ino_prefix(ino);
+        let mut dead: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for r in self.active_block_buffers.iter() {
+            if let Some((i, b)) = Self::parse_active_block_key(r.key()) {
+                if i == ino && (b as u64) >= first_dead_block {
+                    dead.insert(b);
+                }
+            }
+        }
+        // Staged overlays can exist without a RAM buffer (RAM-cap spill,
+        // write-through staging fallback awaiting writeback): sweep the
+        // staging key space too. Truncate is a cold path; the key list is
+        // bounded by the staging budget.
+        for key in self.router.cache.nvme.list_staged_files() {
+            if !key.starts_with(prefix.as_str()) {
+                continue;
+            }
+            if let Some((i, b)) = Self::parse_active_block_key(&key) {
+                if i == ino && (b as u64) >= first_dead_block {
+                    dead.insert(b);
+                }
+            }
+        }
+        for b in dead {
+            let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
+            let _block_guard = block_lock.lock().await;
+            let key = crate::keys::active_block(ino, b as u64).to_string();
+            self.active_block_buffers.remove(&key);
+            // spawn_blocking: the staging-shard WRITE lock must never park
+            // an async worker (§5.5 read guards are held across DMA awaits;
+            // see flush_one_active_block).
+            let nvme = self.router.cache.nvme.clone();
+            if tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
+                .await
+                .is_err()
+            {
+                continue;
+            }
+        }
+    }
+
+    /// The freshest known logical size of `ino`: the maximum of the durable
+    /// inode size and the RAM-side caches the write path updates synchronously
+    /// (`metadata_cache`, `attr_cache`). The durable size LAGS the truth —
+    /// staged/inline writes defer their layout+size persist to the fsync/flush
+    /// cadence — so any size-classifying decision (grow-vs-shrink, extend
+    /// no-op) taken against the durable size alone misclassifies whenever
+    /// unflushed writes grew the file (the generic/091 lost-write family).
+    /// Taking the max never regresses: each source only ever runs behind the
+    /// kernel-observed size, never ahead of it.
+    async fn freshest_size(&self, ino: u64) -> Result<u64, SqueezefsError> {
+        let backend = self.meta_backend.as_ref().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
+        })?;
+        let mut size = backend.getattr(ino).await?.size;
+        let file_path = crate::keys::inode_path(ino);
+        if let Some(m) = self.router.metadata_cache.get(&file_path) {
+            size = size.max(m.size);
+        }
+        if let Some((attr, _)) = self.attr_cache.get(&ino) {
+            size = size.max(attr.size);
+        }
+        Ok(size)
+    }
+
     /// Grow a file's logical size to `target_size` (a no-op if already at least
     /// that large). The newly exposed region [old_size, target_size) is a hole
     /// (reads zeros). Shared by the fallocate preallocate/extend and ZERO_RANGE
     /// paths.
+    ///
+    /// MUST never shrink: the no-op gate compares against the FRESHEST size
+    /// (durable + RAM caches), not the laggable durable inode size, and the
+    /// layout-size stores below only ever move the size up. Gating on the
+    /// durable size alone let an in-bounds (interior) fallocate issued while
+    /// staged writes were still unflushed clobber the logical size DOWN to
+    /// `offset + length`, hiding all data beyond it — the generic/091
+    /// "written data reads back zeros" corruption.
     async fn extend_file_size(
         &self,
         ino: u64,
@@ -1876,8 +1995,7 @@ impl SqueezefsFilesystem {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
 
-        let disk_inode = backend.getattr(ino).await?;
-        let old_size = disk_inode.size;
+        let old_size = self.freshest_size(ino).await?;
         if target_size <= old_size {
             return Ok(());
         }
@@ -1907,7 +2025,7 @@ impl SqueezefsFilesystem {
                         fencing_token,
                     )
                     .await;
-            } else {
+            } else if meta.size < target_size {
                 meta.size = target_size;
                 let _ = self
                     .router
@@ -1916,12 +2034,14 @@ impl SqueezefsFilesystem {
             }
         }
 
-        // Update cache
+        // Update cache (never regress a fresher attr size).
         if let Some((mut attr, _)) = self.attr_cache.get(&ino) {
-            attr.size = target_size;
-            attr.blocks = target_size.div_ceil(512);
-            self.attr_cache
-                .insert(ino, (attr, std::time::Instant::now()));
+            if attr.size < target_size {
+                attr.size = target_size;
+                attr.blocks = target_size.div_ceil(512);
+                self.attr_cache
+                    .insert(ino, (attr, std::time::Instant::now()));
+            }
         }
         Ok(())
     }
@@ -2377,7 +2497,6 @@ impl SqueezefsFilesystem {
                     &dlm_clone,
                     &locks_clone,
                     is_striped,
-                    false,
                 )
                 .await?;
 
@@ -3794,21 +3913,33 @@ impl Filesystem for SqueezefsFilesystem {
 
             if let Some(new_size) = size_to_set {
                 let fencing_token = self.dlm.get_fencing_token_ino(ino);
+                // Classify grow-vs-shrink against the FRESHEST size, never the
+                // durable inode size alone: staged/inline writes defer their
+                // layout+size persist, so `current_inode.size` lags and a real
+                // shrink would be misclassified as a grow (skipping the
+                // straddle-zero below — the generic/075 stale-tail trap).
+                let old_size = self
+                    .freshest_size(ino)
+                    .await
+                    .map_err(map_squeezefs_err)?
+                    .max(current_inode.size);
 
                 // Striped shrink to a non-block-aligned size: the block that
                 // straddles new_size survives the map removal below with stale
                 // bytes in [new_size, block_end). A later re-extend would read
                 // those instead of zeros (a hole must read zeros). RMW-zero that
                 // tail now, while the file is still at its old size so the write
-                // never grows it — the block is then stored clean.
-                if new_size < current_inode.size {
+                // never grows it — the block is then stored clean. This consumes
+                // (and thereby clips) any parked/staged overlay of the straddling
+                // block as its RMW base.
+                if new_size < old_size {
                     let bs = self.router.block_size.load(Ordering::Relaxed);
                     if bs > 0 && new_size % bs != 0 {
                         let file_path = crate::keys::inode_path(ino);
                         if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
                             if meta.file_type == "striped" {
                                 let block_end = (new_size / bs + 1) * bs;
-                                let zero_to = std::cmp::min(current_inode.size, block_end);
+                                let zero_to = std::cmp::min(old_size, block_end);
                                 if zero_to > new_size {
                                     let zeros = bytes::Bytes::from(vec![
                                         0u8;
@@ -3819,7 +3950,7 @@ impl Filesystem for SqueezefsFilesystem {
                                         ino,
                                         new_size,
                                         zeros,
-                                        current_inode.size,
+                                        old_size,
                                         fencing_token,
                                     )
                                     .await
@@ -3829,6 +3960,16 @@ impl Filesystem for SqueezefsFilesystem {
                         }
                     }
                 }
+
+                // Blocks entirely at/after new_size are GONE: their parked RAM
+                // buffers and staged `active_block:` overlays must die with
+                // them, or the stale overlay outlives the map prune — serving
+                // pre-truncate bytes to single-block reads, seeding the next
+                // partial write's RMW, and re-merging the whole stale block on
+                // the next flush (the generic/075.2 resurrection). Purge BEFORE
+                // the map prune so a racing writeback upload NotFound-skips;
+                // one that already merged is pruned by truncate_layout below.
+                self.drop_active_block_overlays_beyond(ino, new_size).await;
 
                 self.router
                     .truncate_layout(ino, new_size, fencing_token)
@@ -4838,6 +4979,22 @@ impl Filesystem for SqueezefsFilesystem {
         let src_path = format!("inode_{}", inode);
         let dest_path = format!("inode_{}", inode_out);
 
+        // 0. Make the SOURCE fully visible to the router-level reads below.
+        // The copy reads the source through `DataRouter::read_file` (and the
+        // whole-file clone through the block map), which cannot see the
+        // FUSE-layer parked `ActiveBlockBuf`s / staged `active_block:`
+        // overlays a partial striped write leaves behind — the copy would
+        // silently source pre-write bytes (zeros for a hole-extending write):
+        // the generic/075.2 lost-copy corruption. Flush-merges them into the
+        // map BEFORE taking the inode guards (the flush takes the write guard
+        // internally when it has work; a no-overlay scan is one prefix pass).
+        {
+            let src_flush_token = self.dlm.get_fencing_token_ino(inode);
+            let _ = self
+                .flush_active_blocks_with_retry(inode, src_flush_token)
+                .await;
+        }
+
         // 1. Acquire local locks on both inodes to ensure consistency and prevent deadlocks
         let src_lock_arc = self.get_inode_lock(inode);
         let dest_lock_arc = if inode != inode_out {
@@ -5065,13 +5222,44 @@ impl Filesystem for SqueezefsFilesystem {
         };
 
         let copied_len = effective_len as u64;
-        self.router
-            .write_file(&dest_path, off_out, chunk, target_fencing_token)
-            .await
-            .map_err(map_squeezefs_err)?;
+        let new_dest_size = std::cmp::max(dest_size, off_out + copied_len);
+        // Route the destination write the same way the WRITE handler does:
+        // a STRIPED destination goes through `write_file_staged` — the one
+        // striped write path — whose per-block RMW consumes the parked
+        // `ActiveBlockBuf` overlays. `DataRouter::write_file`'s striped leg
+        // RMWs from the map/read tiers only, so a copy into a block with a
+        // parked partial write would base itself on stale bytes AND be
+        // shadowed by the parked overlay on the next read/flush (the
+        // generic/075.2 family). Inline/staged destinations keep the router
+        // write (their authoritative bases live router-side, and layout
+        // promotion happens there).
+        let dest_is_striped = self
+            .router
+            .metadata_cache
+            .get(&dest_path)
+            .map(|m| m.file_type == "striped")
+            .unwrap_or_else(|| {
+                // Cold cache: classify by the freshest known size, exactly
+                // like the WRITE handler's attr fallback.
+                dest_size > self.router.block_size.load(Ordering::Relaxed)
+            });
+        if dest_is_striped {
+            if new_dest_size > dest_size {
+                self.router
+                    .update_metadata_cache_size(&dest_path, new_dest_size)
+                    .await;
+            }
+            self.write_file_staged(inode_out, off_out, chunk, dest_size, target_fencing_token)
+                .await
+                .map_err(map_squeezefs_err)?;
+        } else {
+            self.router
+                .write_file(&dest_path, off_out, chunk, target_fencing_token)
+                .await
+                .map_err(map_squeezefs_err)?;
+        }
 
         // Update destination size and times in metadata backend
-        let new_dest_size = std::cmp::max(dest_size, off_out + copied_len);
 
         if let Some(ref backend) = self.meta_backend {
             let _ = backend
@@ -5315,6 +5503,10 @@ impl Filesystem for SqueezefsFilesystem {
         // Pre-allocation isn't strictly required to reserve physical space in our NVMe-oF backend volume
         // as blocks are sparse/dynamic by nature. We just update the size attribute if we are extending.
         if mode & libc::FALLOC_FL_KEEP_SIZE as u32 == 0 {
+            // Serialize against writes/truncates (lock order 1) so the
+            // freshest-size gate inside extend_file_size cannot race a
+            // concurrent size change.
+            let _guard = self.active_inode_locks.get_inode_lock(ino).write().await;
             let fencing_token = self.dlm.get_fencing_token_ino(ino);
             let target_size = offset + length;
             self.extend_file_size(ino, target_size, fencing_token)
@@ -6287,7 +6479,6 @@ async fn run_constant_writeback_worker(
                 &dlm_clone,
                 &locks_clone,
                 is_striped,
-                false,
             )
             .await
             {
@@ -6341,158 +6532,44 @@ async fn requeue_or_hard_fail(
     }
 }
 
-/// Upload one staged active block via the §5.5 write-only guard-backed DMA
-/// source (zero staging copy). Resolves carrying keys/sizes only — the
-/// staging guard is provably dead inside [`cache::nvme::write_block_from_staging`]
-/// before this future completes, so the batch stage never carries guards in
-/// its `results`.
-async fn upload_single_active_block_data(
-    ino: u64,
-    b: u32,
-    router: &DataRouter,
-    cache_promotion_copy: bool,
-) -> Result<(u32, u64), SqueezefsError> {
-    let cache_key = crate::keys::active_block(ino, b as u64).to_string();
-
-    let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
-    let start_block_lock = std::time::Instant::now();
-    let block_guard = block_lock.lock().await;
-    METRICS.block_lock_wait.record(start_block_lock.elapsed());
-
-    let block_data_source = match router.cache.nvme.staged_dma_source(&cache_key) {
-        Some(s) => s,
-        None => {
-            return Err(SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "active block buffer not found",
-            )))
-        }
-    };
-    // §5.5: guard-backed bytes never enter any cache — the promotion LRU
-    // seed (not-yet-striped files only, cold path) is a bounded real copy
-    // taken while the source is alive.
-    let lru_copy = cache_promotion_copy.then(|| block_data_source.detached_copy());
-    drop(block_guard);
-
-    let (_be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
-    let offset = block_allocator.allocate_block().await?;
-
-    // Consumes the source (crypto transform severs the guard pre-DMA;
-    // passthrough DMAs straight off the staging mmap and drops the guard on
-    // completion — normative §5.5 sequencing).
-    if let Err(e) = crate::cache::nvme::write_block_from_staging(
-        router.get_crypto(),
-        &nvme_writer,
-        offset,
-        block_data_source,
-    )
-    .await
-    {
-        error!(
-            "upload_single_active_block_data: Failed to upload block {} of inode {} to NVMe: {:?}",
-            b, ino, e
-        );
-        let _ = block_allocator.free_block(offset).await;
-        return Err(e);
-    }
-    block_allocator.publish_block(offset);
-
-    // Post-DMA, post-publish, pre-merge — the same put point as the routing
-    // striped path (`routing.rs` per-block task): the key stays unreferenced
-    // until the block-map merge below publishes it.
-    match lru_copy {
-        Some(copy) => router.cache.read_lru.put(&offset.to_string(), copy),
-        None => {
-            // No-put owner of a possibly-reused key: purge instead (same
-            // dead-incarnation shielding as `upload_full_block`, PR 6).
-            let new_key = offset.to_string();
-            router.cache.read_lru.remove(&new_key);
-            router.cache.nvme.remove_cached_read_block(&new_key);
-        }
-    }
-
-    Ok((b, offset))
-}
-
+/// Flush every listed staged active block of `ino` durably: one atomic
+/// per-block unit each ([`flush_one_active_block`] — upload AND merge under
+/// that block's `BLOCK_FLUSH_LOCKS`), streamed with bounded concurrency.
+/// Distinct blocks merge independently (the §5.3 primitive serializes map
+/// RMW under `INODE_META_LOCKS`); a missing staged source is a clean no-op.
+///
+/// Deliberately takes NO `active_inode_locks` guard: per-block atomicity
+/// (hazard 1) and the layout-prune epoch (hazard 2) carry the correctness,
+/// and callers reach here from under the inode WRITE guard (punch/truncate →
+/// write_file_staged → enqueue_writeback full-queue fallback), where the old
+/// batch-merge write().await self-deadlocked.
 async fn flush_due_active_blocks_for_inode(
     ino: u64,
     block_indices: Vec<u32>,
     fencing_token: u64,
     router: &DataRouter,
     _dlm: &DlmClient,
-    active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
+    _active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
 ) -> Result<(), SqueezefsError> {
     use futures::stream::{self, StreamExt};
 
     let file_path = crate::keys::inode_path(ino);
     let meta = router.fetch_metadata(&file_path).await?;
-
     let is_striped = meta.file_type == "striped";
+
     let router_clone = router.clone();
-    // Promotion LRU seeding happens inside the per-block future with a
-    // detached copy (§5.5): the batch results carry keys/sizes only, never
-    // guard-backed bytes.
-    let cache_promotion_copy = !is_striped;
-
-    let mut flushes = stream::iter(block_indices.into_iter().map(move |block_idx| {
-        let router = router_clone.clone();
-        async move {
-            upload_single_active_block_data(ino, block_idx, &router, cache_promotion_copy).await
-        }
-    }))
-    .buffer_unordered(8);
-
-    let mut results = Vec::new();
-    while let Some(res) = flushes.next().await {
-        match res {
-            Ok(r) => results.push(r),
-            Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-    }
-
-    if results.is_empty() {
-        return Ok(());
-    }
-
-    // fsync-vs-write serialization (lock order position 1, left as-is); the
-    // map RMW itself goes through the shared merge primitive below.
-    let write_lock = active_inode_locks.get_inode_lock(ino);
-    let _write_guard = write_lock.write().await;
-
-    // One merge for the whole batch via the §5.3 primitive: current-map
-    // RMW under INODE_META_LOCKS, freeing only the displaced-from-current
-    // keys it returns (the old start-of-call snapshot frees could free a
-    // block a concurrent writer just published).
-    let entries: Vec<(u32, String)> = results
-        .iter()
-        .map(|&(b, offset)| (b, offset.to_string()))
-        .collect();
-    let displaced = router
-        .merge_block_mappings(
-            ino,
-            crate::routing::BlockMapOp::Merge(&entries),
-            0,
-            crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
-            fencing_token,
-        )
-        .await?;
-    for bk in displaced {
-        let _ = router.backend_router.free_block(&bk).await;
-    }
-
-    for &(b, _) in &results {
-        let cache_key = crate::keys::active_block(ino, b as u64).to_string();
-        let current_token = router.cache.nvme.get_staged_fencing_token(&cache_key);
-        if let Some(tok) = current_token {
-            if tok == fencing_token {
-                router.cache.nvme.remove_active_block(&cache_key);
+    let mut flushes =
+        stream::iter(block_indices.into_iter().map(move |block_idx| {
+            let router = router_clone.clone();
+            async move {
+                flush_one_active_block(ino, block_idx, fencing_token, &router, is_striped).await
             }
-        } else {
-            router.cache.nvme.remove_active_block(&cache_key);
-        }
-    }
+        }))
+        .buffer_unordered(8);
 
+    while let Some(res) = flushes.next().await {
+        res?;
+    }
     Ok(())
 }
 
@@ -6544,6 +6621,8 @@ async fn upload_active_block_bytes(
     Ok(())
 }
 
+/// Writeback-worker entry: the inode READ guard (fsync-vs-write ordering
+/// courtesy) around the atomic per-block unit.
 async fn flush_single_active_block(
     ino: u64,
     b: u32,
@@ -6552,119 +6631,175 @@ async fn flush_single_active_block(
     _dlm: &DlmClient,
     active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
     is_striped: bool,
-    locked: bool,
+) -> Result<(), SqueezefsError> {
+    let _inode_guard = active_inode_locks.get_inode_lock(ino).read().await;
+    flush_one_active_block(ino, b, fencing_token, router, is_striped).await
+}
+
+/// ONE ATOMIC PER-BLOCK FLUSH UNIT: upload staged active block `b` and merge
+/// it into the map. Two delayed-merge hazards force its shape (the
+/// generic/075.2 stale-data / lost-write family):
+///
+/// 1. LOST UPDATE between concurrent flushes of the SAME block: reading the
+///    source under the block lock but merging after dropping it lets two
+///    flushes merge in reverse content order — the older upload's merge
+///    displaces the newer key and the newest bytes silently vanish from the
+///    map (observed live: writeback worker vs batch flush of one block).
+///    Fix: hold the BLOCK lock across upload AND merge — the same discipline
+///    as the write-through `upload_full_block` (block lock →
+///    `INODE_META_LOCKS` is the established 3 → 3.5 extended order). The old
+///    post-drop `active_inode_locks.write()` batch-merge acquisition is GONE:
+///    it added no content protection and self-deadlocked when the flush was
+///    reached from under the inode write guard (punch/truncate →
+///    write_file_staged → enqueue_writeback full-queue fallback).
+/// 2. PRUNE UNDO: a truncate/punch between capture and merge is silently
+///    reverted by the merge (it re-inserts the pruned block with pre-prune
+///    content). The layout-prune epoch is captured with the content and
+///    revalidated inside the merge's critical section; on mismatch the
+///    orphaned upload is freed and the flush re-captures — after a prune the
+///    purged source is gone, so the retry no-ops.
+async fn flush_one_active_block(
+    ino: u64,
+    b: u32,
+    fencing_token: u64,
+    router: &DataRouter,
+    is_striped: bool,
 ) -> Result<(), SqueezefsError> {
     let cache_key = crate::keys::active_block(ino, b as u64).to_string();
 
-    let lock_opt = if !locked {
-        Some(active_inode_locks.get_inode_lock(ino))
-    } else {
-        None
-    };
+    for _attempt in 0..8 {
+        let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
+        let start_block_lock = std::time::Instant::now();
+        let _block_guard = block_lock.lock().await;
+        METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
-    let mut _inode_guard = None;
-    if let Some(ref l) = lock_opt {
-        _inode_guard = Some(l.read().await);
-    }
+        let capture_epoch = crate::routing::layout_prune_epoch(ino);
+        // Existence probe WITHOUT holding a shard guard across the meta-I/O
+        // allocate below: the §5.5 DMA source is a staging-shard READ guard,
+        // and a task suspended on `allocate_block().await` while holding it
+        // parks every subsequent shard access behind parking_lot's queued-
+        // writer fairness until the executor has no worker left to resume
+        // this task — the observed total-wedge under the fsx-075 harness.
+        // Allocate first (no guard), then take the source; the only await
+        // under the guard is the DMA itself, whose request owns the guard.
+        if router
+            .cache
+            .nvme
+            .read_staged_zero_copy(&cache_key)
+            .is_none()
+        {
+            return Ok(());
+        }
 
-    let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
-    let start_block_lock = std::time::Instant::now();
-    let block_guard = block_lock.lock().await;
-    METRICS.block_lock_wait.record(start_block_lock.elapsed());
+        let (_be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
+        let offset = block_allocator.allocate_block().await?;
 
-    let block_data_source = match router.cache.nvme.staged_dma_source(&cache_key) {
-        Some(s) => s,
-        None => return Ok(()),
-    };
+        let block_data_source = match router.cache.nvme.staged_dma_source(&cache_key) {
+            Some(s) => s,
+            None => {
+                // Purged between probe and capture (truncate/punch/newer
+                // write): nothing to flush.
+                let _ = block_allocator.free_block(offset).await;
+                return Ok(());
+            }
+        };
 
-    // §5.5: guard-backed bytes never enter any cache — the promotion LRU
-    // seed (not-yet-striped files only, cold path) is a bounded real copy
-    // taken while the source is alive; striped flushes never put.
-    let lru_copy = (!is_striped).then(|| block_data_source.detached_copy());
+        // §5.5: guard-backed bytes never enter any cache — the promotion LRU
+        // seed (not-yet-striped files only, cold path) is a bounded real copy
+        // taken while the source is alive; striped flushes never put.
+        let lru_copy = (!is_striped).then(|| block_data_source.detached_copy());
 
-    let (_be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
-    let offset = block_allocator.allocate_block().await?;
-
-    // Consumes the source (crypto transform severs the guard pre-DMA;
-    // passthrough DMAs straight off the staging mmap). The guard is provably
-    // dead when this returns — the meta merge and `remove_active_block`
-    // below take same-shard write locks (normative §5.5 sequencing).
-    if let Err(e) = crate::cache::nvme::write_block_from_staging(
-        router.get_crypto(),
-        &nvme_writer,
-        offset,
-        block_data_source,
-    )
-    .await
-    {
-        error!(
-            "flush_single_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
-            b, ino, e
-        );
-        let _ = block_allocator.free_block(offset).await;
-        return Err(e);
-    }
-    block_allocator.publish_block(offset);
-
-    let stored_block_key = offset.to_string();
-
-    std::mem::drop(block_guard);
-    std::mem::drop(_inode_guard);
-
-    // fsync-vs-write serialization (lock order position 1, left as-is); the
-    // map RMW itself goes through the shared merge primitive below.
-    let write_lock = active_inode_locks.get_inode_lock(ino);
-    let mut _write_guard = None;
-    if !locked {
-        _write_guard = Some(write_lock.write().await);
-    }
-
-    // §5.3 one merge discipline: current-map RMW under INODE_META_LOCKS.
-    // Free only the displaced-from-current keys the primitive returns —
-    // the old start-of-call `old_block_key` free was exactly the
-    // stale-snapshot anti-pattern the routing merge comment forbids
-    // (freeing it could free a block a concurrent writer just published).
-    let entries = [(b, stored_block_key.clone())];
-    let displaced = router
-        .merge_block_mappings(
-            ino,
-            crate::routing::BlockMapOp::Merge(&entries),
-            0,
-            crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
-            fencing_token,
+        // Consumes the source (crypto transform severs the guard pre-DMA;
+        // passthrough DMAs straight off the staging mmap). The guard is provably
+        // dead when this returns (normative §5.5 sequencing).
+        if let Err(e) = crate::cache::nvme::write_block_from_staging(
+            router.get_crypto(),
+            &nvme_writer,
+            offset,
+            block_data_source,
         )
-        .await?;
-
-    // Cache in RAM (bypass entirely if file is striped layout). Promotion
-    // puts a detached copy — never the guard-backed staging bytes (§5.5).
-    match lru_copy {
-        Some(copy) => router.cache.read_lru.put(&stored_block_key, copy),
-        None => {
-            // No-put owner of a possibly-reused key: purge instead (same
-            // dead-incarnation shielding as `upload_full_block`, PR 6).
-            router.cache.read_lru.remove(&stored_block_key);
-            router
-                .cache
-                .nvme
-                .remove_cached_read_block(&stored_block_key);
+        .await
+        {
+            error!(
+                "flush_one_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
+                b, ino, e
+            );
+            let _ = block_allocator.free_block(offset).await;
+            return Err(e);
         }
-    }
+        block_allocator.publish_block(offset);
 
-    for bk in displaced {
-        let _ = router.backend_router.free_block(&bk).await;
-    }
+        let stored_block_key = offset.to_string();
 
-    // ONLY remove active write block from cache if it hasn't been modified by a newer write
-    let current_token = router.cache.nvme.get_staged_fencing_token(&cache_key);
-    if let Some(tok) = current_token {
-        if tok == fencing_token {
-            router.cache.nvme.remove_active_block(&cache_key);
+        // §5.3 one merge discipline: current-map RMW under INODE_META_LOCKS,
+        // still under this block's lock (hazard 1). Free only the
+        // displaced-from-current keys the primitive returns — the old
+        // start-of-call `old_block_key` free was exactly the stale-snapshot
+        // anti-pattern the routing merge comment forbids.
+        let entries = [(b, stored_block_key.clone())];
+        let Some(displaced) = router
+            .merge_block_mappings_if_epoch(
+                ino,
+                crate::routing::BlockMapOp::Merge(&entries),
+                0,
+                crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
+                fencing_token,
+                Some(capture_epoch),
+            )
+            .await?
+        else {
+            // A prune invalidated this capture (hazard 2): the uploaded
+            // block is unreachable — free it and re-capture.
+            let _ = block_allocator.free_block(offset).await;
+            continue;
+        };
+
+        // Cache in RAM (bypass entirely if file is striped layout). Promotion
+        // puts a detached copy — never the guard-backed staging bytes (§5.5).
+        match lru_copy {
+            Some(copy) => router.cache.read_lru.put(&stored_block_key, copy),
+            None => {
+                // No-put owner of a possibly-reused key: purge instead (same
+                // dead-incarnation shielding as `upload_full_block`, PR 6).
+                router.cache.read_lru.remove(&stored_block_key);
+                router
+                    .cache
+                    .nvme
+                    .remove_cached_read_block(&stored_block_key);
+            }
         }
-    } else {
-        router.cache.nvme.remove_active_block(&cache_key);
-    }
 
-    Ok(())
+        for bk in displaced {
+            let _ = router.backend_router.free_block(&bk).await;
+        }
+
+        // ONLY remove active write block from cache if it hasn't been
+        // modified by a newer write. spawn_blocking: the shard WRITE lock
+        // must never park an async worker (see the probe comment above —
+        // this exact remove was a parked frame in the observed wedge).
+        {
+            let nvme = router.cache.nvme.clone();
+            let key = cache_key.clone();
+            let token = fencing_token;
+            tokio::task::spawn_blocking(move || {
+                let current_token = nvme.get_staged_fencing_token(&key);
+                if let Some(tok) = current_token {
+                    if tok == token {
+                        nvme.remove_active_block(&key);
+                    }
+                } else {
+                    nvme.remove_active_block(&key);
+                }
+            })
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+
+        return Ok(());
+    }
+    Err(SqueezefsError::InvalidOperation(format!(
+        "flush_one_active_block: layout-prune epoch kept moving for ino {ino} block {b}"
+    )))
 }
 
 /// Drain one reclaim batch: after the first ino arrives, hold a short

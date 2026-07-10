@@ -32,6 +32,29 @@ use uuid::Uuid;
 static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
     once_cell::sync::Lazy::new(StripeLocks::new);
 
+/// Per-inode (striped, collision-tolerant) LAYOUT-PRUNE EPOCH — a latch-free
+/// monotonic counter bumped under `INODE_META_LOCKS` by every block-map
+/// PRUNING merge (`TruncateFrom`, `RemoveBlocks`). The delayed-merge flush
+/// paths (writeback worker / batch active-block flush) capture content OUTSIDE
+/// the inode write guard and merge it later; without the epoch, a truncate or
+/// punch that lands between their capture and their merge is silently undone —
+/// the merge re-inserts the pruned block with pre-prune content (the
+/// generic/075.2 stale-data resurrection race). Those paths capture the epoch
+/// at content-capture time and merge via
+/// [`DataRouter::merge_block_mappings_if_epoch`], which refuses (returns
+/// `None`) when the epoch moved; the caller frees its orphaned upload and
+/// retries against the post-prune state. Shard collisions only ever cause a
+/// spurious retry, never a missed invalidation.
+static LAYOUT_PRUNE_EPOCHS: once_cell::sync::Lazy<StripeLocks<std::sync::atomic::AtomicU64, 4096>> =
+    once_cell::sync::Lazy::new(StripeLocks::new);
+
+/// Current layout-prune epoch for `ino` (Acquire).
+pub fn layout_prune_epoch(ino: u64) -> u64 {
+    LAYOUT_PRUNE_EPOCHS
+        .get_inode_lock(ino)
+        .load(Ordering::Acquire)
+}
+
 pub fn parse_inode_from_path(path: &str) -> u64 {
     if path.starts_with("inode_") {
         path.strip_prefix("inode_")
@@ -1437,8 +1460,45 @@ impl DataRouter {
         layout_flip: LayoutFlip,
         fencing_token: u64,
     ) -> Result<Vec<String>> {
+        self.merge_block_mappings_if_epoch(ino, op, min_size, layout_flip, fencing_token, None)
+            .await
+            .map(|d| d.expect("unconditional merge cannot be epoch-refused"))
+    }
+
+    /// [`Self::merge_block_mappings`] with delayed-merge revalidation: when
+    /// `expected_epoch` is `Some(e)` and the inode's layout-prune epoch no
+    /// longer equals `e` (a truncate/punch pruned the map after the caller
+    /// captured its content), the merge is REFUSED under the same
+    /// `INODE_META_LOCKS` critical section — nothing is applied or saved and
+    /// `Ok(None)` is returned. The caller must discard/free its
+    /// now-unreachable upload and re-capture against the post-prune state.
+    pub async fn merge_block_mappings_if_epoch(
+        &self,
+        ino: u64,
+        op: BlockMapOp<'_>,
+        min_size: u64,
+        layout_flip: LayoutFlip,
+        fencing_token: u64,
+        expected_epoch: Option<u64>,
+    ) -> Result<Option<Vec<String>>> {
         let file_path = crate::keys::inode_path(ino);
         let _map_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+
+        let epoch_word = LAYOUT_PRUNE_EPOCHS.get_inode_lock(ino);
+        if let Some(expected) = expected_epoch {
+            if epoch_word.load(Ordering::Acquire) != expected {
+                return Ok(None);
+            }
+        }
+        // Pruning ops invalidate every in-flight delayed merge: bump under
+        // the meta lock, BEFORE the save, so a delayed merge serialized after
+        // this critical section observes the new epoch and refuses.
+        if matches!(
+            op,
+            BlockMapOp::TruncateFrom { .. } | BlockMapOp::RemoveBlocks(_)
+        ) {
+            epoch_word.fetch_add(1, Ordering::Release);
+        }
 
         let mut current = match self.fetch_metadata_from_backend(ino).await? {
             Some(m) => m,
@@ -1525,7 +1585,7 @@ impl DataRouter {
         // same guard.
         self.save_metadata_to_backend(ino, &current, fencing_token)
             .await?;
-        Ok(displaced)
+        Ok(Some(displaced))
     }
 
     pub async fn update_metadata_cache_size(&self, file_path: &str, size: u64) {
@@ -2435,25 +2495,33 @@ impl DataRouter {
     }
 
     /// Read file data, attempting to satisfy the read via the fastest cache tier.
-    /// Read file data, attempting to satisfy the read via the fastest cache tier.
     pub async fn read_file(&self, file_path: &str) -> Result<Vec<u8>> {
-        // Tier 2 check: System RAM LRU Caches
-        let mut cached_opt = self.cache.write_lru.get(file_path);
-        if cached_opt.is_none() {
-            cached_opt = self.cache.read_lru.get(file_path);
-        }
-        if let Some(cached_data) = cached_opt {
-            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                "Routing: Cache hit (Tier 2 - System RAM) for '{}'",
-                file_path
-            );
-            return Ok(cached_data.to_vec());
-        }
-        METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-
         // Fetch file metadata from local cache or metadata backend
         let meta = self.fetch_metadata(file_path).await?;
+
+        // The whole-file RAM snapshot (write_lru/read_lru keyed by file_path)
+        // is trusted ONLY for inline files, where every write rewrites it
+        // atomically. For striped files it goes stale under sub-file
+        // mutations that never touch it — a PARKED partial-block write
+        // mutates only its ActiveBlockBuf, so a snapshot cached by an earlier
+        // read_file silently misses those bytes (the generic/075.2 lost-copy:
+        // copy_file_range sourced a stale short snapshot). Same discipline as
+        // read_file_range_zero_copy.
+        if meta.file_type == "inline" {
+            let mut cached_opt = self.cache.write_lru.get(file_path);
+            if cached_opt.is_none() {
+                cached_opt = self.cache.read_lru.get(file_path);
+            }
+            if let Some(cached_data) = cached_opt {
+                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "Routing: Cache hit (Tier 2 - System RAM) for '{}'",
+                    file_path
+                );
+                return Ok(cached_data.to_vec());
+            }
+        }
+        METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let data = match meta.file_type.as_str() {
             "inline" => {
@@ -2499,13 +2567,26 @@ impl DataRouter {
                     .await?;
 
                 // P1-5: bounded concurrency (order preserved via index sort).
+                // Tier order mirrors read_file_range_zero_copy: the staged
+                // `active_block:` overlay (a spilled / writeback-pending
+                // partial block) is NEWER than the mapped block and must win.
                 use futures::stream::{self, StreamExt};
+                let file_path_owned = file_path.to_string();
                 let mut indexed: Vec<(usize, Result<crate::cache::pool::ReadBlockValue>)> =
                     stream::iter(block_keys.into_iter().enumerate().map(
-                        |(i, (_, block_key_opt))| {
+                        |(i, (b_idx, block_key_opt))| {
                             let router = self.clone();
+                            let fp = file_path_owned.clone();
                             async move {
-                                let res = if let Some(block_key) = block_key_opt {
+                                let cache_key =
+                                    crate::keys::active_block_for_path(&fp, b_idx).to_string();
+                                let res = if let Some(overlay) =
+                                    router.cache.nvme.read_staged(&cache_key)
+                                {
+                                    Ok(crate::cache::pool::ReadBlockValue::Bytes(
+                                        bytes::Bytes::from(overlay),
+                                    ))
+                                } else if let Some(block_key) = block_key_opt {
                                     router.get_cached_or_fetch_block(&block_key).await
                                 } else {
                                     let mut buf = BUFFER_POOL.alloc();
@@ -2538,206 +2619,16 @@ impl DataRouter {
             }
         };
 
-        // Cache in Tier 2: System RAM (Read Cache)
-        self.cache
-            .read_lru
-            .put(file_path, bytes::Bytes::from(data.clone()));
+        // Cache in Tier 2 (System RAM) — inline only: that is the only
+        // layout whose whole-file snapshot every mutation path keeps
+        // coherent (and the only layout the read side above consults it for).
+        if meta.file_type == "inline" {
+            self.cache
+                .read_lru
+                .put(file_path, bytes::Bytes::from(data.clone()));
+        }
 
         Ok(data)
-    }
-
-    /// Read a specific byte range of a file, downloading only the required 4MB blocks.
-    pub async fn read_file_range(
-        &self,
-        file_path: &str,
-        offset: u64,
-        size: u32,
-    ) -> Result<Vec<u8>> {
-        // Tier 2 check: System RAM LRU Caches
-        let mut cached_opt = self.cache.write_lru.get(file_path);
-        if cached_opt.is_none() {
-            cached_opt = self.cache.read_lru.get(file_path);
-        }
-        if let Some(cached_data) = cached_opt {
-            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-            let start = std::cmp::min(offset as usize, cached_data.len());
-            let end = std::cmp::min((offset + size as u64) as usize, cached_data.len());
-            return Ok(cached_data[start..end].to_vec());
-        }
-
-        // Fetch file metadata from local cache or metadata backend
-        let meta = self.fetch_metadata(file_path).await?;
-
-        match meta.file_type.as_str() {
-            "inline" => {
-                let decompressed = if let Some(ref data) = meta.data_key {
-                    data.to_vec()
-                } else {
-                    Vec::new()
-                };
-                let start = std::cmp::min(offset as usize, decompressed.len());
-                let end = std::cmp::min((offset + size as u64) as usize, decompressed.len());
-                Ok(decompressed[start..end].to_vec())
-            }
-            "staged" => {
-                let file_id = meta.file_id.as_deref().ok_or_else(|| {
-                    SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
-                })?;
-
-                if let Some(staged_data) = self.cache.nvme.read_staged(file_id) {
-                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    let start = std::cmp::min(offset as usize, staged_data.len());
-                    let end = std::cmp::min((offset + size as u64) as usize, staged_data.len());
-                    Ok(staged_data[start..end].to_vec())
-                } else {
-                    let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
-                    if let Some(mapping_str) = mapping_opt {
-                        let (offset_u64, off, sz) = self.parse_block_mapping(&mapping_str)?;
-                        let packed_bytes =
-                            self.nvme_writer.read_block(offset_u64 + off, sz).await?;
-                        let decompressed =
-                            self.get_crypto().process_read_async(packed_bytes).await?;
-                        if offset >= decompressed.len() as u64 {
-                            return Ok(Vec::new());
-                        }
-                        let start = offset as usize;
-                        let end =
-                            std::cmp::min((offset + size as u64) as usize, decompressed.len());
-                        Ok(decompressed[start..end].to_vec())
-                    } else {
-                        Err(SqueezefsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("Staged file ID {} mapping not found in metadata", file_id),
-                        )))
-                    }
-                }
-            }
-            "striped" => {
-                let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
-                let file_size = meta.size;
-
-                if offset >= file_size {
-                    return Ok(Vec::new());
-                }
-
-                let end_offset = std::cmp::min(offset + size as u64, file_size);
-                if offset >= end_offset {
-                    return Ok(Vec::new());
-                }
-
-                let start_block = (offset / block_size) as u32;
-                let end_block = ((end_offset - 1) / block_size) as u32;
-
-                let block_keys = self
-                    .load_striped_block_keys(file_path, &meta, start_block, end_block)
-                    .await?;
-
-                // P1-5: admit each block task under STRIPED_IO_SEM (bounded concurrency).
-                let mut futures = Vec::new();
-                for (b_idx, b_key_opt) in block_keys {
-                    let router = self.clone();
-                    let b_start_offset = b_idx as u64 * block_size;
-                    let b_end_offset = b_start_offset + block_size;
-                    let slice_start = std::cmp::max(offset, b_start_offset) - b_start_offset;
-                    let slice_end = std::cmp::min(end_offset, b_end_offset);
-                    let rel_end = slice_end - b_start_offset;
-                    let slice_len = (rel_end - slice_start) as u32;
-                    let file_path_clone = file_path.to_string();
-                    let permit = crate::bg_admit::STRIPED_IO_SEM
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| {
-                            SqueezefsError::InvalidOperation(
-                                "striped read admission closed".to_string(),
-                            )
-                        })?;
-                    futures.push(tokio::spawn(async move {
-                        let _permit = permit;
-                        let cache_key =
-                            crate::keys::active_block_for_path(&file_path_clone, b_idx).to_string();
-                        let block_data = if let Some(active_data) =
-                            router.cache.nvme.read_staged(&cache_key)
-                        {
-                            let start = std::cmp::min(slice_start as usize, active_data.len());
-                            let end = std::cmp::min(
-                                (slice_start + slice_len as u64) as usize,
-                                active_data.len(),
-                            );
-                            let mut sliced_pooled = BUFFER_POOL.alloc();
-                            sliced_pooled.resize(slice_len as usize, 0);
-                            sliced_pooled[0..end - start].copy_from_slice(&active_data[start..end]);
-                            sliced_pooled
-                        } else if let Some(ref b_key) = b_key_opt {
-                            if let Some(cached_block) = router.cache.read_lru.get(b_key) {
-                                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                let start = std::cmp::min(slice_start as usize, cached_block.len());
-                                let end = std::cmp::min(
-                                    (slice_start + slice_len as u64) as usize,
-                                    cached_block.len(),
-                                );
-                                let mut sliced_pooled = BUFFER_POOL.alloc();
-                                sliced_pooled.resize(slice_len as usize, 0);
-                                sliced_pooled[0..end - start]
-                                    .copy_from_slice(&cached_block[start..end]);
-                                sliced_pooled
-                            } else {
-                                let downloaded = router.get_cached_or_fetch_block(b_key).await?;
-                                let start = std::cmp::min(slice_start as usize, downloaded.len());
-                                let end = std::cmp::min(
-                                    (slice_start + slice_len as u64) as usize,
-                                    downloaded.len(),
-                                );
-                                let mut sliced_pooled = BUFFER_POOL.alloc();
-                                sliced_pooled.resize(slice_len as usize, 0);
-                                sliced_pooled[0..end - start]
-                                    .copy_from_slice(&downloaded[start..end]);
-                                sliced_pooled
-                            }
-                        } else {
-                            // Hole support: return zero-filled block
-                            let mut hole_pooled = BUFFER_POOL.alloc();
-                            hole_pooled.resize(slice_len as usize, 0);
-                            hole_pooled
-                        };
-                        Ok::<_, SqueezefsError>((b_idx, block_data))
-                    }));
-                }
-
-                let results = futures::future::try_join_all(futures).await.map_err(|e| {
-                    SqueezefsError::Io(std::io::Error::other(format!(
-                        "Parallel block download task panicked: {:?}",
-                        e
-                    )))
-                })?;
-
-                let mut results_sorted = Vec::new();
-                for res in results {
-                    results_sorted.push(res?);
-                }
-                results_sorted.sort_by_key(|r| r.0);
-
-                let mut range_data = Vec::new();
-                for (_, block_data) in results_sorted {
-                    range_data.extend_from_slice(&block_data);
-                }
-
-                if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
-                    self.schedule_striped_prefetch(
-                        file_path.to_string(),
-                        meta.clone(),
-                        end_block.saturating_add(1),
-                        block_size,
-                    );
-                }
-
-                Ok(range_data)
-            }
-            _ => Err(SqueezefsError::InvalidOperation(format!(
-                "Unknown file type: {}",
-                meta.file_type
-            ))),
-        }
     }
 
     pub async fn read_file_range_zero_copy(
@@ -3061,9 +2952,20 @@ impl DataRouter {
                                 "striped read admission closed".to_string(),
                             )
                         })?;
+                        // Every byte of this block's dest region [dest_start,
+                        // dest_start + copy_len) MUST be written: with a uring
+                        // payload dest (`dest_addr`), the buffer is REUSED
+                        // across requests, so a region left unwritten — a hole
+                        // block, or the tail past a short tier copy — replays
+                        // the previous reply's bytes to the kernel (transient
+                        // stale-read corruption; the on-disk file is fine).
+                        // Each arm reports how many bytes it wrote; the
+                        // remainder is zeroed (holes read zeros).
                         let cache_key =
                             crate::keys::active_block_for_path(&file_path_clone, b_idx).to_string();
-                        if let Some(active_data) = router.cache.nvme.read_staged(&cache_key) {
+                        let written: usize = if let Some(active_data) =
+                            router.cache.nvme.read_staged(&cache_key)
+                        {
                             let start = std::cmp::min(rel_start, active_data.len());
                             let end = std::cmp::min(rel_start + copy_len, active_data.len());
                             let actual_copy = end - start;
@@ -3077,6 +2979,7 @@ impl DataRouter {
                                     );
                                 }
                             }
+                            actual_copy
                         } else if let Some(ref b_key) = b_key_opt {
                             if let Some(cached_block) = router.cache.read_lru.get(b_key) {
                                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -3093,6 +2996,7 @@ impl DataRouter {
                                         );
                                     }
                                 }
+                                actual_copy
                             } else {
                                 let downloaded = router.get_cached_or_fetch_block(b_key).await?;
                                 let start = std::cmp::min(rel_start, downloaded.len());
@@ -3108,6 +3012,19 @@ impl DataRouter {
                                         );
                                     }
                                 }
+                                actual_copy
+                            }
+                        } else {
+                            // Hole block: nothing to copy — zero the whole region.
+                            0
+                        };
+                        if written < copy_len {
+                            unsafe {
+                                std::ptr::write_bytes(
+                                    (raw_ptr + dest_start + written) as *mut u8,
+                                    0,
+                                    copy_len - written,
+                                );
                             }
                         }
                         Ok::<(), SqueezefsError>(())
@@ -3507,7 +3424,10 @@ impl DataRouter {
             }
         }
         for b in block_indices {
-            let key = format!("active_block:{}:{}", file_path, b);
+            // Canonical key form (`…:block_{b}`): the previous hand-rolled
+            // `active_block:{path}:{b}` never matched a real entry, leaking
+            // staged overlays past delete to shadow a reused inode's reads.
+            let key = crate::keys::active_block_for_path(file_path, b as u32).to_string();
             self.cache.nvme.remove_active_block(&key);
         }
 

@@ -792,7 +792,12 @@ where
     let mut deltas: Vec<RecordRef<'a>> = Vec::new();
     let mut prev_seq = u64::MAX;
     for r in records {
-        debug_assert!(prev_seq >= r.seq, "fold input must be newest-seq-first");
+        debug_assert!(
+            prev_seq >= r.seq,
+            "fold input must be newest-seq-first (prev_seq={prev_seq}, r.seq={}, key={:?})",
+            r.seq,
+            r.key
+        );
         prev_seq = r.seq;
         match r.kind {
             RecordKind::Delta => deltas.push(r),

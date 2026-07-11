@@ -1686,6 +1686,32 @@ impl DataRouter {
             .and_then(map0)
     }
 
+    /// The freshest observable layout identity of `file_path`: the RAM
+    /// metadata cache (every transition publishes here synchronously,
+    /// including RAM-only dirty layouts the backend has not seen), falling
+    /// back to the authoritative backend. Deliberately does NOT insert the
+    /// backend snapshot into the cache — an unlocked insert here could
+    /// clobber a concurrent writer's fresher RAM entry (`fetch_metadata`
+    /// owns the locked refill).
+    async fn freshest_layout_identity(&self, file_path: &str) -> Option<CachedMetadata> {
+        if let Some(m) = self.metadata_cache.get(file_path) {
+            return Some(m);
+        }
+        let ino = parse_inode_from_path(file_path);
+        self.fetch_metadata_from_backend(ino).await.ok().flatten()
+    }
+
+    /// Fetch + decode the promoted/spilled durable copy of a staged file
+    /// (`block_map[0]`). The caller owns binding revalidation: these bytes
+    /// may belong to a freed-and-reused block if the identity moved while
+    /// the read was in flight.
+    async fn read_promoted_staged_block(&self, block_key: &str) -> Result<bytes::Bytes> {
+        let offset_u64 = self.backend_router.parse_block_offset(block_key)?;
+        let sz = self.block_size.load(Ordering::Acquire) as usize;
+        let packed_bytes = self.nvme_writer.read_block(offset_u64, sz).await?;
+        self.get_crypto().process_read_async(packed_bytes).await
+    }
+
     /// Release the artifacts of a superseded staged layout *after* the new
     /// layout is published (backend as applicable + RAM cache): the staging
     /// ring entry (returns its budget) and any promoted/spilled durable
@@ -2157,8 +2183,17 @@ impl DataRouter {
                         if let Some(staged_data) = self.cache.nvme.read_staged(file_id) {
                             staged_data
                         } else {
-                            let mapping_opt =
-                                meta.block_map.as_ref().and_then(|bm| bm.get(&0).cloned());
+                            // Ring miss under the inode write lock +
+                            // BLOCK_FLUSH_LOCKS: the only racer that can move
+                            // this identity is the merge-worker promotion,
+                            // which publishes `block_map[0]` (RAM cache +
+                            // backend) strictly BEFORE removing the ring
+                            // entry — so resolve the promoted mapping through
+                            // ALL sources (snapshot, cache, backend), not the
+                            // possibly-pre-promotion snapshot alone. A miss
+                            // everywhere = genuine crash loss (zeros base per
+                            // the D0 degrade contract).
+                            let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
                             if let Some(mapping_str) = mapping_opt {
                                 let (offset_u64, off, sz) =
                                     self.parse_block_mapping(&mapping_str)?;
@@ -2816,7 +2851,7 @@ impl DataRouter {
         // serves from its authoritative, mutation-tracking tier instead: the
         // inline `data_key`, the staging ring (staged), or the per-block read
         // caches / hole map (striped).
-        let meta = self.fetch_metadata(file_path).await?;
+        let mut meta = self.fetch_metadata(file_path).await?;
 
         // POSIX full-length below-EOF contract (the generic/617 short-read
         // family): every leg below returns EXACTLY
@@ -2827,139 +2862,233 @@ impl DataRouter {
         // is an implicit-zero hole that must be FILLED here, bounded by the
         // request length. The page cache masked short replies for buffered
         // reads; O_DIRECT (fsx -Z) hands them to userspace as short reads.
-        match meta.file_type.as_str() {
-            "inline" => {
-                if offset >= meta.size {
-                    return Ok((bytes::Bytes::new(), None));
-                }
-                let want = (std::cmp::min(offset + size as u64, meta.size) - offset) as usize;
-                let dlen = meta.data_key.as_ref().map(|d| d.len()).unwrap_or(0);
-                let start = std::cmp::min(offset as usize, dlen);
-                let end = std::cmp::min(offset as usize + want, dlen);
-                let mut out = vec![0u8; want];
-                if start < end {
-                    out[..end - start]
-                        .copy_from_slice(&meta.data_key.as_ref().expect("dlen > 0")[start..end]);
-                }
-                Ok((bytes::Bytes::from(out), None))
+        //
+        // Staged-identity revalidation (the fstests 074/127/616 transient-
+        // zeros family): reads run UNLOCKED, so `meta` can be superseded
+        // mid-read by a re-stage / promotion / spill / layout flip. Every
+        // such transition publishes its NEW identity (RAM metadata cache +
+        // backend as applicable) strictly BEFORE releasing the old one's
+        // artifacts, so a read that loses its identity re-resolves the
+        // freshest one and re-dispatches — bounded — instead of concluding
+        // the payload is gone. The zeros-degrade leg is reserved for a
+        // STABLE lost identity (crash recovery discarded the payload):
+        // ring entry gone AND no promoted mapping AND no in-flight stage
+        // (budget ledger empty) AND the identity unchanged on re-resolve.
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            if attempts > 64 {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "read_file_range_zero_copy: staged identity of {file_path} kept moving \
+                     after {attempts} re-resolves (offset {offset}, size {size})"
+                )));
             }
-            "staged" => {
-                let file_id = meta.file_id.as_ref().ok_or_else(|| {
-                    SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
-                })?;
-
-                if let Some(guard) = self.cache.nvme.read_staged_zero_copy(file_id) {
-                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+            match meta.file_type.as_str() {
+                "inline" => {
                     if offset >= meta.size {
                         return Ok((bytes::Bytes::new(), None));
                     }
-                    // Full below-EOF length; the blob may be shorter than the
-                    // logical size (truncate-up hole tail) — pad with zeros.
                     let want = (std::cmp::min(offset + size as u64, meta.size) - offset) as usize;
-                    let start = std::cmp::min(offset as usize, guard.len);
-                    let end = std::cmp::min(offset as usize + want, guard.len);
-                    let phys = end - start;
-                    let (data, backing) = if let Some(dest) = dest_addr {
-                        let dest_ptr = dest as *mut u8;
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                guard[start..end].as_ptr(),
-                                dest_ptr,
-                                phys,
-                            );
-                            if want > phys {
-                                std::ptr::write_bytes(dest_ptr.add(phys), 0, want - phys);
-                            }
-                            let d = bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
-                                ptr: dest_ptr,
-                                len: want,
-                            });
-                            (d, None)
-                        }
-                    } else if phys == want {
-                        let mut sliced_guard = guard;
-                        sliced_guard.offset += start;
-                        sliced_guard.len = phys;
-                        let d = bytes::Bytes::copy_from_slice(&sliced_guard);
-                        (d, None)
-                    } else {
-                        let mut out = vec![0u8; want];
-                        out[..phys].copy_from_slice(&guard[start..end]);
-                        (bytes::Bytes::from(out), None)
-                    };
-                    Ok((data, backing))
-                } else {
-                    let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
-                    if let Some(bk) = mapping_opt {
+                    let dlen = meta.data_key.as_ref().map(|d| d.len()).unwrap_or(0);
+                    let start = std::cmp::min(offset as usize, dlen);
+                    let end = std::cmp::min(offset as usize + want, dlen);
+                    let mut out = vec![0u8; want];
+                    if start < end {
+                        out[..end - start].copy_from_slice(
+                            &meta.data_key.as_ref().expect("dlen > 0")[start..end],
+                        );
+                    }
+                    return Ok((bytes::Bytes::from(out), None));
+                }
+                "staged" => {
+                    let file_id = meta.file_id.clone().ok_or_else(|| {
+                        SqueezefsError::InvalidOperation(
+                            "Missing file_id for staged file".to_string(),
+                        )
+                    })?;
+
+                    if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&file_id) {
+                        // Ring entries always hold their identity's CURRENT
+                        // payload: a same-key re-stage replaces the entry
+                        // atomically for readers (see NvmeShard::reserve_and_write
+                        // phase 2), so a hit needs no further validation.
+                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                         if offset >= meta.size {
                             return Ok((bytes::Bytes::new(), None));
                         }
-                        let offset_u64 = self.backend_router.parse_block_offset(&bk)?;
-                        let sz = self.block_size.load(Ordering::Acquire) as usize;
-                        let packed_bytes = self.nvme_writer.read_block(offset_u64, sz).await?;
-                        let decompressed =
-                            self.get_crypto().process_read_async(packed_bytes).await?;
-                        // Full below-EOF length: the promoted block may be
-                        // shorter than the logical size — its tail (and any
-                        // in-bounds offset past the physical end) is an
-                        // implicit-zero hole.
+                        // Full below-EOF length; the blob may be shorter than the
+                        // logical size (truncate-up hole tail) — pad with zeros.
                         let want =
                             (std::cmp::min(offset + size as u64, meta.size) - offset) as usize;
-                        let dlen = decompressed.len();
-                        let start = std::cmp::min(offset as usize, dlen);
-                        let end = std::cmp::min(offset as usize + want, dlen);
-                        let mut out = vec![0u8; want];
-                        if start < end {
-                            out[..end - start].copy_from_slice(&decompressed[start..end]);
-                        }
-                        Ok((bytes::Bytes::from(out), None))
-                    } else {
-                        // Ring entry gone (crash-torn → discarded by segment
-                        // recovery, or never flushed before a kill) and no
-                        // promoted mapping: the payload is LOST. D0 degrade
-                        // contract — acked-unfsynced staged data MAY be lost
-                        // but must never error: serve size-consistent zeros
-                        // (the file exists at meta.size with no backing
-                        // bytes — hole semantics), loudly.
-                        let len = lost_staged_range_len(meta.size, offset, size);
-                        self.note_lost_staged_payload(file_path, file_id);
-                        Ok((bytes::Bytes::from(vec![0u8; len]), None))
+                        let start = std::cmp::min(offset as usize, guard.len);
+                        let end = std::cmp::min(offset as usize + want, guard.len);
+                        let phys = end - start;
+                        let (data, backing) = if let Some(dest) = dest_addr {
+                            let dest_ptr = dest as *mut u8;
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    guard[start..end].as_ptr(),
+                                    dest_ptr,
+                                    phys,
+                                );
+                                if want > phys {
+                                    std::ptr::write_bytes(dest_ptr.add(phys), 0, want - phys);
+                                }
+                                let d =
+                                    bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
+                                        ptr: dest_ptr,
+                                        len: want,
+                                    });
+                                (d, None)
+                            }
+                        } else if phys == want {
+                            let mut sliced_guard = guard;
+                            sliced_guard.offset += start;
+                            sliced_guard.len = phys;
+                            let d = bytes::Bytes::copy_from_slice(&sliced_guard);
+                            (d, None)
+                        } else {
+                            let mut out = vec![0u8; want];
+                            out[..phys].copy_from_slice(&guard[start..end]);
+                            (bytes::Bytes::from(out), None)
+                        };
+                        return Ok((data, backing));
                     }
+
+                    // Ring miss. A LIVE staged identity is reachable through
+                    // exactly one of: a promoted/spilled durable mapping
+                    // (published before the ring entry was released), an
+                    // in-flight stage (budget ledger still counts the id), or a
+                    // NEWER identity already published in the metadata cache
+                    // (layout flip / spill re-id). Resolve in that order;
+                    // degrade to zeros ONLY for a stable lost identity.
+                    if let Some(bk) = self.staged_block_mapping(file_path, &meta).await {
+                        if offset >= meta.size {
+                            return Ok((bytes::Bytes::new(), None));
+                        }
+                        let fetched = self.read_promoted_staged_block(&bk).await;
+                        // Binding revalidation (the promoted-mapping ABA — same
+                        // serve rule as the striped binding-validated fetch):
+                        // the durable copy is freed the moment a newer identity
+                        // publishes (`release_superseded_staged` runs strictly
+                        // AFTER the publish), so if the CURRENT identity still
+                        // binds (staged, this file_id, block_map[0] == bk) after
+                        // the fetch completed, the fetched bytes are the live
+                        // incarnation. On movement: re-resolve and retry — a
+                        // fetch error is surfaced only for a stable binding
+                        // (real I/O error, not freed-and-reused bytes).
+                        let fresh = self.freshest_layout_identity(file_path).await;
+                        let still_bound = fresh.as_ref().is_some_and(|f| {
+                            f.file_type == "staged"
+                                && f.file_id.as_deref() == Some(file_id.as_str())
+                                && f.block_map
+                                    .as_ref()
+                                    .and_then(|bm| bm.get(&0))
+                                    .is_some_and(|cur| *cur == bk)
+                        });
+                        match fetched {
+                            Ok(decompressed) if still_bound => {
+                                // Full below-EOF length: the promoted block may
+                                // be shorter than the logical size — its tail
+                                // (and any in-bounds offset past the physical
+                                // end) is an implicit-zero hole.
+                                let want = (std::cmp::min(offset + size as u64, meta.size) - offset)
+                                    as usize;
+                                let dlen = decompressed.len();
+                                let start = std::cmp::min(offset as usize, dlen);
+                                let end = std::cmp::min(offset as usize + want, dlen);
+                                let mut out = vec![0u8; want];
+                                if start < end {
+                                    out[..end - start].copy_from_slice(&decompressed[start..end]);
+                                }
+                                return Ok((bytes::Bytes::from(out), None));
+                            }
+                            Err(e) if still_bound => return Err(e),
+                            _ => {
+                                METRICS
+                                    .staged_identity_retries
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if let Some(f) = fresh {
+                                    meta = f;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
+                    // No mapping either: re-resolve the identity.
+                    if let Some(fresh) = self.freshest_layout_identity(file_path).await {
+                        if fresh.file_type != "staged"
+                            || fresh.file_id.as_deref() != Some(file_id.as_str())
+                        {
+                            // The identity MOVED (layout flip, spill re-id,
+                            // re-created file): re-dispatch against it.
+                            METRICS
+                                .staged_identity_retries
+                                .fetch_add(1, Ordering::Relaxed);
+                            meta = fresh;
+                            continue;
+                        }
+                    }
+                    if self.cache.nvme.staged_generation(&file_id).is_some() {
+                        // Same identity, budget-counted but not ring-resident: a
+                        // stage/promotion of this id is IN FLIGHT. Bounded
+                        // backoff, then re-resolve — never zeros for live data.
+                        METRICS
+                            .staged_identity_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        if attempts <= 4 {
+                            tokio::task::yield_now().await;
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                        continue;
+                    }
+
+                    // STABLE lost identity: ring entry gone (crash-torn →
+                    // discarded by segment recovery, or never flushed before a
+                    // kill), no promoted mapping, no in-flight stage, and the
+                    // identity unchanged on re-resolve. D0 degrade contract —
+                    // acked-unfsynced staged data MAY be lost by a crash but
+                    // must never error: serve size-consistent zeros (the file
+                    // exists at meta.size with no backing bytes — hole
+                    // semantics), loudly.
+                    let len = lost_staged_range_len(meta.size, offset, size);
+                    self.note_lost_staged_payload(file_path, &file_id);
+                    return Ok((bytes::Bytes::from(vec![0u8; len]), None));
                 }
-            }
-            "striped" => {
-                let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
-                let file_size = meta.size;
+                "striped" => {
+                    let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
+                    let file_size = meta.size;
 
-                if offset >= file_size {
-                    return Ok((bytes::Bytes::new(), None));
-                }
+                    if offset >= file_size {
+                        return Ok((bytes::Bytes::new(), None));
+                    }
 
-                let end_offset = std::cmp::min(offset + size as u64, file_size);
-                if offset >= end_offset {
-                    return Ok((bytes::Bytes::new(), None));
-                }
+                    let end_offset = std::cmp::min(offset + size as u64, file_size);
+                    if offset >= end_offset {
+                        return Ok((bytes::Bytes::new(), None));
+                    }
 
-                let start_block = (offset / block_size) as u32;
-                let end_block = ((end_offset - 1) / block_size) as u32;
+                    let start_block = (offset / block_size) as u32;
+                    let end_block = ((end_offset - 1) / block_size) as u32;
 
-                // 1. Single block read optimization: check cache and staging zero-copy
-                if start_block == end_block {
-                    let b_idx = start_block;
-                    let b_start_offset = b_idx as u64 * block_size;
-                    let slice_start = offset - b_start_offset;
-                    let slice_len = (end_offset - offset) as u32;
-                    let cache_key =
-                        crate::keys::active_block_for_path(file_path, b_idx).to_string();
+                    // 1. Single block read optimization: check cache and staging zero-copy
+                    if start_block == end_block {
+                        let b_idx = start_block;
+                        let b_start_offset = b_idx as u64 * block_size;
+                        let slice_start = offset - b_start_offset;
+                        let slice_len = (end_offset - offset) as u32;
+                        let cache_key =
+                            crate::keys::active_block_for_path(file_path, b_idx).to_string();
 
-                    // Check active block staging first
-                    if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&cache_key) {
-                        let start = std::cmp::min(slice_start as usize, guard.len);
-                        let end =
-                            std::cmp::min((slice_start + slice_len as u64) as usize, guard.len);
-                        let len = end - start;
-                        let (data, backing) =
-                            if let Some(dest) = dest_addr {
+                        // Check active block staging first
+                        if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&cache_key) {
+                            let start = std::cmp::min(slice_start as usize, guard.len);
+                            let end =
+                                std::cmp::min((slice_start + slice_len as u64) as usize, guard.len);
+                            let len = end - start;
+                            let (data, backing) = if let Some(dest) = dest_addr {
                                 let dest_ptr = dest as *mut u8;
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
@@ -2979,298 +3108,311 @@ impl DataRouter {
                                 let d = bytes::Bytes::copy_from_slice(&sliced_guard);
                                 (d, None)
                             };
-                        return Ok((data, backing));
-                    }
-
-                    // Check NVMe read block cache next
-                    let block_keys = self
-                        .load_striped_block_keys(file_path, &meta, start_block, end_block)
-                        .await?;
-                    if let Some((_, b_key_opt)) = block_keys.first() {
-                        // Tier fast path with binding recheck (reused-key
-                        // stale-fill family): a zero-copy NVMe read-cache hit
-                        // is copied out first — the mmap shard guard never
-                        // lives across an await — then served only if the
-                        // CURRENT map still binds this block to the key (tier
-                        // entries always hold their key's current-incarnation
-                        // bytes, so binding currency alone validates the
-                        // serve). On movement the validated loop below
-                        // re-resolves and overwrites the dest.
-                        if let Some(ref b_key) = b_key_opt {
-                            if let Some(guard) =
-                                self.cache.nvme.get_cached_read_block_range_zero_copy(
-                                    b_key,
-                                    slice_start,
-                                    slice_len,
-                                )
-                            {
-                                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                let len = guard.len();
-                                let data = if let Some(dest) = dest_addr {
-                                    let dest_ptr = dest as *mut u8;
-                                    unsafe {
-                                        std::ptr::copy_nonoverlapping(
-                                            guard.as_ptr(),
-                                            dest_ptr,
-                                            len,
-                                        );
-                                        bytes::Bytes::from_owner(
-                                            crate::cache::pool::UringBufOwner {
-                                                ptr: dest_ptr,
-                                                len,
-                                            },
-                                        )
-                                    }
-                                } else {
-                                    bytes::Bytes::copy_from_slice(&guard)
-                                };
-                                drop(guard);
-                                if self
-                                    .current_block_binding(file_path, start_block)
-                                    .await?
-                                    .as_deref()
-                                    == Some(b_key.as_str())
-                                {
-                                    return Ok((data, None));
-                                }
-                                METRICS
-                                    .stale_binding_rebinds
-                                    .fetch_add(1, Ordering::Relaxed);
-                                debug!(
-                                    "stale-binding rebind (single-block tier hit): file={} block={} key={}",
-                                    file_path, start_block, b_key
-                                );
-                            }
+                            return Ok((data, backing));
                         }
 
-                        // Validated resolve: raw full-block DMA into the uring
-                        // payload dest when possible (revalidated afterwards),
-                        // else the binding-validated fetch loop. `None` = the
-                        // block is a hole in the CURRENT map.
-                        let downloaded: Option<crate::cache::pool::ReadBlockValue> = match b_key_opt
-                        {
-                            Some(b_key) => {
-                                let mut resolved = None;
-                                if let Some(dest) = dest_addr {
-                                    if slice_start == 0 && slice_len as u64 == block_size {
-                                        // Zero-copy device→payload DMA. The raw read
-                                        // bypasses the single-flight fill, so it
-                                        // carries the fill discipline itself:
-                                        // incarnation snapshot before, still-check
-                                        // after, then the binding recheck. On any
-                                        // movement the validated loop below
-                                        // overwrites the dest.
-                                        let tracked =
-                                            self.backend_router.key_incarnation_tracked(b_key);
-                                        let before = self.backend_router.fill_incarnation(b_key);
-                                        self.backend_router
-                                            .read_block_with_dest(
-                                                b_key,
-                                                block_size as usize,
-                                                Some(dest),
-                                            )
-                                            .await?;
-                                        let incarnation_ok = !tracked
-                                            || before.is_some_and(|bf| {
-                                                self.backend_router
-                                                    .fill_incarnation_still(b_key, bf)
-                                            });
-                                        if incarnation_ok
-                                            && self
-                                                .current_block_binding(file_path, start_block)
-                                                .await?
-                                                .as_deref()
-                                                == Some(b_key.as_str())
-                                        {
-                                            let len = block_size as usize;
-                                            let dest_ptr = dest as *mut u8;
-                                            let b = bytes::Bytes::from_owner(
+                        // Check NVMe read block cache next
+                        let block_keys = self
+                            .load_striped_block_keys(file_path, &meta, start_block, end_block)
+                            .await?;
+                        if let Some((_, b_key_opt)) = block_keys.first() {
+                            // Tier fast path with binding recheck (reused-key
+                            // stale-fill family): a zero-copy NVMe read-cache hit
+                            // is copied out first — the mmap shard guard never
+                            // lives across an await — then served only if the
+                            // CURRENT map still binds this block to the key (tier
+                            // entries always hold their key's current-incarnation
+                            // bytes, so binding currency alone validates the
+                            // serve). On movement the validated loop below
+                            // re-resolves and overwrites the dest.
+                            if let Some(ref b_key) = b_key_opt {
+                                if let Some(guard) =
+                                    self.cache.nvme.get_cached_read_block_range_zero_copy(
+                                        b_key,
+                                        slice_start,
+                                        slice_len,
+                                    )
+                                {
+                                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                    let len = guard.len();
+                                    let data = if let Some(dest) = dest_addr {
+                                        let dest_ptr = dest as *mut u8;
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                guard.as_ptr(),
+                                                dest_ptr,
+                                                len,
+                                            );
+                                            bytes::Bytes::from_owner(
                                                 crate::cache::pool::UringBufOwner {
                                                     ptr: dest_ptr,
                                                     len,
                                                 },
-                                            );
-                                            resolved =
-                                                Some(crate::cache::pool::ReadBlockValue::Bytes(b));
-                                        } else {
-                                            METRICS
-                                                .stale_binding_rebinds
-                                                .fetch_add(1, Ordering::Relaxed);
-                                            debug!(
+                                            )
+                                        }
+                                    } else {
+                                        bytes::Bytes::copy_from_slice(&guard)
+                                    };
+                                    drop(guard);
+                                    if self
+                                        .current_block_binding(file_path, start_block)
+                                        .await?
+                                        .as_deref()
+                                        == Some(b_key.as_str())
+                                    {
+                                        return Ok((data, None));
+                                    }
+                                    METRICS
+                                        .stale_binding_rebinds
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    debug!(
+                                    "stale-binding rebind (single-block tier hit): file={} block={} key={}",
+                                    file_path, start_block, b_key
+                                );
+                                }
+                            }
+
+                            // Validated resolve: raw full-block DMA into the uring
+                            // payload dest when possible (revalidated afterwards),
+                            // else the binding-validated fetch loop. `None` = the
+                            // block is a hole in the CURRENT map.
+                            let downloaded: Option<crate::cache::pool::ReadBlockValue> =
+                                match b_key_opt {
+                                    Some(b_key) => {
+                                        let mut resolved = None;
+                                        if let Some(dest) = dest_addr {
+                                            if slice_start == 0 && slice_len as u64 == block_size {
+                                                // Zero-copy device→payload DMA. The raw read
+                                                // bypasses the single-flight fill, so it
+                                                // carries the fill discipline itself:
+                                                // incarnation snapshot before, still-check
+                                                // after, then the binding recheck. On any
+                                                // movement the validated loop below
+                                                // overwrites the dest.
+                                                let tracked = self
+                                                    .backend_router
+                                                    .key_incarnation_tracked(b_key);
+                                                let before =
+                                                    self.backend_router.fill_incarnation(b_key);
+                                                self.backend_router
+                                                    .read_block_with_dest(
+                                                        b_key,
+                                                        block_size as usize,
+                                                        Some(dest),
+                                                    )
+                                                    .await?;
+                                                let incarnation_ok = !tracked
+                                                    || before.is_some_and(|bf| {
+                                                        self.backend_router
+                                                            .fill_incarnation_still(b_key, bf)
+                                                    });
+                                                if incarnation_ok
+                                                    && self
+                                                        .current_block_binding(
+                                                            file_path,
+                                                            start_block,
+                                                        )
+                                                        .await?
+                                                        .as_deref()
+                                                        == Some(b_key.as_str())
+                                                {
+                                                    let len = block_size as usize;
+                                                    let dest_ptr = dest as *mut u8;
+                                                    let b = bytes::Bytes::from_owner(
+                                                        crate::cache::pool::UringBufOwner {
+                                                            ptr: dest_ptr,
+                                                            len,
+                                                        },
+                                                    );
+                                                    resolved = Some(
+                                                        crate::cache::pool::ReadBlockValue::Bytes(
+                                                            b,
+                                                        ),
+                                                    );
+                                                } else {
+                                                    METRICS
+                                                        .stale_binding_rebinds
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    debug!(
                                                     "stale-binding rebind (raw dest read): file={} block={} key={}",
                                                     file_path, start_block, b_key
                                                 );
-                                        }
-                                    }
-                                }
-                                match resolved {
-                                    Some(r) => Some(r),
-                                    None => {
-                                        let val = self
-                                            .get_block_for_index(
-                                                file_path,
-                                                start_block,
-                                                Some(b_key),
-                                            )
-                                            .await?;
-                                        match (val, dest_addr) {
-                                            (Some(val), Some(dest)) => {
-                                                let start =
-                                                    std::cmp::min(slice_start as usize, val.len());
-                                                let end = std::cmp::min(
-                                                    (slice_start + slice_len as u64) as usize,
-                                                    val.len(),
-                                                );
-                                                let len = end - start;
-                                                let dest_ptr = dest as *mut u8;
-                                                unsafe {
-                                                    std::ptr::copy_nonoverlapping(
-                                                        val[start..end].as_ptr(),
-                                                        dest_ptr,
-                                                        len,
-                                                    );
-                                                    // Unwritten remainder of the reused
-                                                    // uring dest region must never replay
-                                                    // a previous reply's bytes.
-                                                    if len < slice_len as usize {
-                                                        std::ptr::write_bytes(
-                                                            dest_ptr.add(len),
-                                                            0,
-                                                            slice_len as usize - len,
-                                                        );
-                                                    }
                                                 }
-                                                let b = bytes::Bytes::from_owner(
-                                                    crate::cache::pool::UringBufOwner {
-                                                        ptr: dest_ptr,
-                                                        len,
-                                                    },
-                                                );
-                                                Some(crate::cache::pool::ReadBlockValue::Bytes(b))
                                             }
-                                            (Some(val), None) => Some(val),
-                                            (None, _) => None,
+                                        }
+                                        match resolved {
+                                            Some(r) => Some(r),
+                                            None => {
+                                                let val = self
+                                                    .get_block_for_index(
+                                                        file_path,
+                                                        start_block,
+                                                        Some(b_key),
+                                                    )
+                                                    .await?;
+                                                match (val, dest_addr) {
+                                                    (Some(val), Some(dest)) => {
+                                                        let start = std::cmp::min(
+                                                            slice_start as usize,
+                                                            val.len(),
+                                                        );
+                                                        let end = std::cmp::min(
+                                                            (slice_start + slice_len as u64)
+                                                                as usize,
+                                                            val.len(),
+                                                        );
+                                                        let len = end - start;
+                                                        let dest_ptr = dest as *mut u8;
+                                                        unsafe {
+                                                            std::ptr::copy_nonoverlapping(
+                                                                val[start..end].as_ptr(),
+                                                                dest_ptr,
+                                                                len,
+                                                            );
+                                                            // Unwritten remainder of the reused
+                                                            // uring dest region must never replay
+                                                            // a previous reply's bytes.
+                                                            if len < slice_len as usize {
+                                                                std::ptr::write_bytes(
+                                                                    dest_ptr.add(len),
+                                                                    0,
+                                                                    slice_len as usize - len,
+                                                                );
+                                                            }
+                                                        }
+                                                        let b = bytes::Bytes::from_owner(
+                                                            crate::cache::pool::UringBufOwner {
+                                                                ptr: dest_ptr,
+                                                                len,
+                                                            },
+                                                        );
+                                                        Some(crate::cache::pool::ReadBlockValue::Bytes(b))
+                                                    }
+                                                    (Some(val), None) => Some(val),
+                                                    (None, _) => None,
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                            }
-                            None => None,
-                        };
+                                    None => None,
+                                };
 
-                        match downloaded {
-                            Some(downloaded) => {
-                                if self.should_prefetch_after_striped_read(
-                                    file_path,
-                                    start_block,
-                                    end_block,
-                                ) {
-                                    self.schedule_striped_prefetch(
-                                        file_path.to_string(),
-                                        meta.clone(),
-                                        end_block.saturating_add(1),
-                                        block_size,
-                                    );
-                                }
+                            match downloaded {
+                                Some(downloaded) => {
+                                    if self.should_prefetch_after_striped_read(
+                                        file_path,
+                                        start_block,
+                                        end_block,
+                                    ) {
+                                        self.schedule_striped_prefetch(
+                                            file_path.to_string(),
+                                            meta.clone(),
+                                            end_block.saturating_add(1),
+                                            block_size,
+                                        );
+                                    }
 
-                                if let Some(dest) = dest_addr {
-                                    let len = (end_offset - offset) as usize;
-                                    let data = bytes::Bytes::from_owner(
-                                        crate::cache::pool::UringBufOwner {
-                                            ptr: dest as *mut u8,
-                                            len,
-                                        },
-                                    );
-                                    return Ok((data, Some(std::sync::Arc::new(downloaded))));
-                                } else {
-                                    let start =
-                                        std::cmp::min(slice_start as usize, downloaded.len());
-                                    let end = std::cmp::min(
-                                        (slice_start + slice_len as u64) as usize,
-                                        downloaded.len(),
-                                    );
-                                    let slice: &[u8] = &downloaded[start..end];
-                                    let data = bytes::Bytes::copy_from_slice(slice);
-                                    return Ok((data, Some(std::sync::Arc::new(downloaded))));
-                                }
-                            }
-                            None => {
-                                // Hole (initial resolution or rebound to a
-                                // punched/truncated index): zero-filled slice.
-                                let len = slice_len as usize;
-                                let data = if let Some(dest) = dest_addr {
-                                    let dest_ptr = dest as *mut u8;
-                                    unsafe {
-                                        std::ptr::write_bytes(dest_ptr, 0, len);
-                                        bytes::Bytes::from_owner(
+                                    if let Some(dest) = dest_addr {
+                                        let len = (end_offset - offset) as usize;
+                                        let data = bytes::Bytes::from_owner(
                                             crate::cache::pool::UringBufOwner {
-                                                ptr: dest_ptr,
+                                                ptr: dest as *mut u8,
                                                 len,
                                             },
-                                        )
+                                        );
+                                        return Ok((data, Some(std::sync::Arc::new(downloaded))));
+                                    } else {
+                                        let start =
+                                            std::cmp::min(slice_start as usize, downloaded.len());
+                                        let end = std::cmp::min(
+                                            (slice_start + slice_len as u64) as usize,
+                                            downloaded.len(),
+                                        );
+                                        let slice: &[u8] = &downloaded[start..end];
+                                        let data = bytes::Bytes::copy_from_slice(slice);
+                                        return Ok((data, Some(std::sync::Arc::new(downloaded))));
                                     }
-                                } else {
-                                    let mut hole_pooled = BUFFER_POOL.alloc();
-                                    hole_pooled.resize(len, 0);
-                                    bytes::Bytes::copy_from_slice(&hole_pooled)
-                                };
-                                return Ok((data, None));
+                                }
+                                None => {
+                                    // Hole (initial resolution or rebound to a
+                                    // punched/truncated index): zero-filled slice.
+                                    let len = slice_len as usize;
+                                    let data = if let Some(dest) = dest_addr {
+                                        let dest_ptr = dest as *mut u8;
+                                        unsafe {
+                                            std::ptr::write_bytes(dest_ptr, 0, len);
+                                            bytes::Bytes::from_owner(
+                                                crate::cache::pool::UringBufOwner {
+                                                    ptr: dest_ptr,
+                                                    len,
+                                                },
+                                            )
+                                        }
+                                    } else {
+                                        let mut hole_pooled = BUFFER_POOL.alloc();
+                                        hole_pooled.resize(len, 0);
+                                        bytes::Bytes::copy_from_slice(&hole_pooled)
+                                    };
+                                    return Ok((data, None));
+                                }
                             }
                         }
                     }
-                }
 
-                // 2. Multi-block or cache miss: load and assemble using pooled buffer
-                let block_keys = self
-                    .load_striped_block_keys(file_path, &meta, start_block, end_block)
-                    .await?;
+                    // 2. Multi-block or cache miss: load and assemble using pooled buffer
+                    let block_keys = self
+                        .load_striped_block_keys(file_path, &meta, start_block, end_block)
+                        .await?;
 
-                let final_len = (end_offset - offset) as usize;
-                let (raw_ptr, final_buf_opt) = if let Some(dest) = dest_addr {
-                    (dest as usize, None)
-                } else {
-                    let mut final_buf = BUFFER_POOL.alloc();
-                    final_buf.resize(final_len, 0);
-                    let ptr = final_buf.as_mut_ptr() as usize;
-                    (ptr, Some(final_buf))
-                };
+                    let final_len = (end_offset - offset) as usize;
+                    let (raw_ptr, final_buf_opt) = if let Some(dest) = dest_addr {
+                        (dest as usize, None)
+                    } else {
+                        let mut final_buf = BUFFER_POOL.alloc();
+                        final_buf.resize(final_len, 0);
+                        let ptr = final_buf.as_mut_ptr() as usize;
+                        (ptr, Some(final_buf))
+                    };
 
-                // Spawn concurrent tasks to download block data in parallel.
-                // Acquire the admission permit *inside* each task so the coordinator
-                // never holds N permits while spawning (can deadlock the semaphore
-                // when block_count > permit pool under nested multi-block reads).
-                let mut futures = Vec::new();
-                for (b_idx, b_key_opt) in block_keys {
-                    let router = self.clone();
-                    let b_start_offset = b_idx as u64 * block_size;
-                    let b_end_offset = b_start_offset + block_size;
-                    let slice_start = std::cmp::max(offset, b_start_offset);
-                    let slice_end = std::cmp::min(end_offset, b_end_offset);
-                    let dest_start = (slice_start - offset) as usize;
-                    let copy_len = (slice_end - slice_start) as usize;
+                    // Spawn concurrent tasks to download block data in parallel.
+                    // Acquire the admission permit *inside* each task so the coordinator
+                    // never holds N permits while spawning (can deadlock the semaphore
+                    // when block_count > permit pool under nested multi-block reads).
+                    let mut futures = Vec::new();
+                    for (b_idx, b_key_opt) in block_keys {
+                        let router = self.clone();
+                        let b_start_offset = b_idx as u64 * block_size;
+                        let b_end_offset = b_start_offset + block_size;
+                        let slice_start = std::cmp::max(offset, b_start_offset);
+                        let slice_end = std::cmp::min(end_offset, b_end_offset);
+                        let dest_start = (slice_start - offset) as usize;
+                        let copy_len = (slice_end - slice_start) as usize;
 
-                    let rel_start = (slice_start - b_start_offset) as usize;
-                    let file_path_clone = file_path.to_string();
-                    let sem = crate::bg_admit::STRIPED_IO_SEM.clone();
+                        let rel_start = (slice_start - b_start_offset) as usize;
+                        let file_path_clone = file_path.to_string();
+                        let sem = crate::bg_admit::STRIPED_IO_SEM.clone();
 
-                    futures.push(tokio::spawn(async move {
-                        let _permit = sem.acquire_owned().await.map_err(|_| {
-                            SqueezefsError::InvalidOperation(
-                                "striped read admission closed".to_string(),
-                            )
-                        })?;
-                        // Every byte of this block's dest region [dest_start,
-                        // dest_start + copy_len) MUST be written: with a uring
-                        // payload dest (`dest_addr`), the buffer is REUSED
-                        // across requests, so a region left unwritten — a hole
-                        // block, or the tail past a short tier copy — replays
-                        // the previous reply's bytes to the kernel (transient
-                        // stale-read corruption; the on-disk file is fine).
-                        // Each arm reports how many bytes it wrote; the
-                        // remainder is zeroed (holes read zeros).
-                        let cache_key =
-                            crate::keys::active_block_for_path(&file_path_clone, b_idx).to_string();
-                        let written: usize =
-                            if let Some(active_data) = router.cache.nvme.read_staged(&cache_key) {
+                        futures.push(tokio::spawn(async move {
+                            let _permit = sem.acquire_owned().await.map_err(|_| {
+                                SqueezefsError::InvalidOperation(
+                                    "striped read admission closed".to_string(),
+                                )
+                            })?;
+                            // Every byte of this block's dest region [dest_start,
+                            // dest_start + copy_len) MUST be written: with a uring
+                            // payload dest (`dest_addr`), the buffer is REUSED
+                            // across requests, so a region left unwritten — a hole
+                            // block, or the tail past a short tier copy — replays
+                            // the previous reply's bytes to the kernel (transient
+                            // stale-read corruption; the on-disk file is fine).
+                            // Each arm reports how many bytes it wrote; the
+                            // remainder is zeroed (holes read zeros).
+                            let cache_key =
+                                crate::keys::active_block_for_path(&file_path_clone, b_idx)
+                                    .to_string();
+                            let written: usize = if let Some(active_data) =
+                                router.cache.nvme.read_staged(&cache_key)
+                            {
                                 let start = std::cmp::min(rel_start, active_data.len());
                                 let end = std::cmp::min(rel_start + copy_len, active_data.len());
                                 let actual_copy = end - start;
@@ -3313,54 +3455,57 @@ impl DataRouter {
                                 // punched/truncated index): zero the whole region.
                                 0
                             };
-                        if written < copy_len {
-                            unsafe {
-                                std::ptr::write_bytes(
-                                    (raw_ptr + dest_start + written) as *mut u8,
-                                    0,
-                                    copy_len - written,
-                                );
+                            if written < copy_len {
+                                unsafe {
+                                    std::ptr::write_bytes(
+                                        (raw_ptr + dest_start + written) as *mut u8,
+                                        0,
+                                        copy_len - written,
+                                    );
+                                }
                             }
-                        }
-                        Ok::<(), SqueezefsError>(())
-                    }));
-                }
+                            Ok::<(), SqueezefsError>(())
+                        }));
+                    }
 
-                let results = futures::future::try_join_all(futures).await.map_err(|e| {
-                    SqueezefsError::Io(std::io::Error::other(format!(
-                        "Parallel block download task panicked: {:?}",
-                        e
+                    let results = futures::future::try_join_all(futures).await.map_err(|e| {
+                        SqueezefsError::Io(std::io::Error::other(format!(
+                            "Parallel block download task panicked: {:?}",
+                            e
+                        )))
+                    })?;
+
+                    for res in results {
+                        res?;
+                    }
+
+                    if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
+                        self.schedule_striped_prefetch(
+                            file_path.to_string(),
+                            meta.clone(),
+                            end_block.saturating_add(1),
+                            block_size,
+                        );
+                    }
+
+                    if let Some(final_buf) = final_buf_opt {
+                        let data = bytes::Bytes::copy_from_slice(&final_buf[..final_len]);
+                        return Ok((data, Some(std::sync::Arc::new(final_buf))));
+                    } else {
+                        let data = bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
+                            ptr: dest_addr.unwrap() as *mut u8,
+                            len: final_len,
+                        });
+                        return Ok((data, None));
+                    }
+                }
+                _ => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "Unknown file type: {}",
+                        meta.file_type
                     )))
-                })?;
-
-                for res in results {
-                    res?;
-                }
-
-                if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
-                    self.schedule_striped_prefetch(
-                        file_path.to_string(),
-                        meta.clone(),
-                        end_block.saturating_add(1),
-                        block_size,
-                    );
-                }
-
-                if let Some(final_buf) = final_buf_opt {
-                    let data = bytes::Bytes::copy_from_slice(&final_buf[..final_len]);
-                    Ok((data, Some(std::sync::Arc::new(final_buf))))
-                } else {
-                    let data = bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
-                        ptr: dest_addr.unwrap() as *mut u8,
-                        len: final_len,
-                    });
-                    Ok((data, None))
                 }
             }
-            _ => Err(SqueezefsError::InvalidOperation(format!(
-                "Unknown file type: {}",
-                meta.file_type
-            ))),
         }
     }
 

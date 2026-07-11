@@ -212,7 +212,11 @@ async fn size_of(h: &H, ino: u64) -> u64 {
 }
 
 /// Peak process RSS (VmHWM) in kB — the daemon-side "did we materialize the
-/// hole" signal. HWM never decreases, so each test measures its own delta.
+/// hole" signal. Nominally monotonic, but the kernel folds per-thread RSS
+/// counters in batches, so back-to-back readings can wobble a few KiB in
+/// either direction (visible since dead staging extents started punching
+/// their pages) — deltas use `saturating_sub` and assert only the MiB-scale
+/// bound that matters.
 fn vm_hwm_kb() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
     for line in status.lines() {
@@ -263,7 +267,7 @@ async fn huge_sparse_far_write_is_bounded_and_omap() {
     write_at(&h, ino, 0, &buf).await; // staged 64 KiB
     let hwm_before = vm_hwm_kb();
     write_at(&h, ino, HUGE - BS, &buf).await; // the promotion write
-    let hwm_delta = vm_hwm_kb() - hwm_before;
+    let hwm_delta = vm_hwm_kb().saturating_sub(hwm_before);
 
     assert!(
         hwm_delta < RSS_BOUND_KB,
@@ -320,7 +324,7 @@ async fn sparse_far_write_unaligned_straddle_correct() {
     let far = vec![b'f'; BS as usize];
     let hwm_before = vm_hwm_kb();
     write_at(&h, ino, off, &far).await;
-    let hwm_delta = vm_hwm_kb() - hwm_before;
+    let hwm_delta = vm_hwm_kb().saturating_sub(hwm_before);
     assert!(
         hwm_delta < RSS_BOUND_KB,
         "unaligned sparse far write materialized the hole: delta {hwm_delta} kB"
@@ -357,7 +361,7 @@ async fn truncate_up_then_small_write_preserves_size_bounded() {
 
     let data = vec![b'd'; 4096];
     write_at(&h, ino, 0, &data).await;
-    let hwm_delta = vm_hwm_kb() - hwm_before;
+    let hwm_delta = vm_hwm_kb().saturating_sub(hwm_before);
     assert!(
         hwm_delta < RSS_BOUND_KB,
         "truncate-up + small write materialized the hole: delta {hwm_delta} kB"
@@ -404,7 +408,7 @@ async fn copy_file_range_source_read_is_bounded() {
             .await
             .expect("copy_file_range")
             .copied;
-    let hwm_delta = vm_hwm_kb() - hwm_before;
+    let hwm_delta = vm_hwm_kb().saturating_sub(hwm_before);
 
     assert!(
         hwm_delta < RSS_BOUND_KB,
@@ -433,7 +437,7 @@ async fn cacheless_far_write_is_bounded_and_omap() {
     let far = vec![b'F'; 4096];
     let hwm_before = vm_hwm_kb();
     write_at(&h, ino, HUGE - 4096, &far).await;
-    let hwm_delta = vm_hwm_kb() - hwm_before;
+    let hwm_delta = vm_hwm_kb().saturating_sub(hwm_before);
     assert!(
         hwm_delta < RSS_BOUND_KB,
         "cache-less sparse far write materialized the hole: delta {hwm_delta} kB"

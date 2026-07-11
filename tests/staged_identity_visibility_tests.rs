@@ -470,6 +470,86 @@ async fn ring_same_key_replace_is_atomic_for_readers() {
 }
 
 // ---------------------------------------------------------------------------
+// In-flight placements are untouchable: a replace copies its payload OUTSIDE
+// the shard lock, so a concurrent different-key placement (wrap-around /
+// punched-hole reuse) that ignores the not-yet-indexed extent rewrites those
+// bytes before the index insert — the first key then serves the second key's
+// whole payload (observed live: a staged file reading back another file's
+// fill under capacity churn). Two writers churn disjoint keys through a
+// shard small enough to wrap constantly; every key must read back exactly
+// its own last-written fill.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn ring_concurrent_placements_never_overlap() {
+    use squeezefs::tiering::nvme::NvmeCache;
+
+    let dir = tempdir().unwrap();
+    // 2 MiB shard, 2 writers x 4 keys x 100 KiB payloads (+ replace
+    // headroom): placements constantly wrap and reuse punched holes.
+    let cache = Arc::new(NvmeCache::new(&[dir.path()], &[2 * 1024 * 1024], 1).unwrap());
+    let payload_len = 100 * 1024;
+
+    let mut writers = Vec::new();
+    for w in 0..2u8 {
+        let cache = cache.clone();
+        writers.push(tokio::task::spawn_blocking(move || {
+            let mut last_fill = [0u8; 4];
+            for round in 0..400u32 {
+                for k in 0..4u8 {
+                    let key = Bytes::from(format!("w{w}-key{k}"));
+                    // Promotion-shaped churn: removing an entry punches a
+                    // hole BEHIND the cursor, which first-fit then offers to
+                    // the next placement — the geometry that overlapped an
+                    // in-flight copy.
+                    if round % 3 == 2 && k % 2 == (w % 2) {
+                        if cache.remove(&key).is_some() {
+                            last_fill[k as usize] = 0;
+                        }
+                        continue;
+                    }
+                    let fill = 1 + ((round as u8) % 100) + w * 100 + k;
+                    let meta = vec![7u8; 32];
+                    // Refusal is legal backpressure (both writers mid-flight
+                    // can exceed the shard); the key keeps its old payload.
+                    if cache.reserve_and_write(key, 32, &meta, &vec![fill; payload_len], None) {
+                        last_fill[k as usize] = fill;
+                    }
+                }
+            }
+            last_fill
+        }));
+    }
+    let mut finals = Vec::new();
+    for w in writers {
+        finals.push(w.await.expect("ring writer panicked"));
+    }
+
+    for (w, fills) in finals.iter().enumerate() {
+        for (k, &fill) in fills.iter().enumerate() {
+            if fill == 0 {
+                continue; // every stage refused (cannot happen, but be safe)
+            }
+            let key = Bytes::from(format!("w{w}-key{k}"));
+            let copy = {
+                let guard = cache
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("w{w}-key{k} lost from the ring"));
+                guard.guard.mmap[guard.offset..guard.offset + guard.len].to_vec()
+            };
+            let payload = &copy[40..];
+            assert_eq!(payload.len(), payload_len, "w{w}-key{k} wrong length");
+            if let Some(pos) = payload.iter().position(|&b| b != fill) {
+                panic!(
+                    "CROSS-KEY CLOBBER: w{w}-key{k} byte {pos:#x} = {:#04x}, want fill {fill:#04x} \
+                     (a concurrent placement overwrote an in-flight copy)",
+                    payload[pos]
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RC4: dead ring extents must not retain RSS. Re-staging one key walks the
 // segment first-fit; every superseded copy is dead the moment the replace
 // lands and its pages must be returned to the OS (punched/madvised), or a

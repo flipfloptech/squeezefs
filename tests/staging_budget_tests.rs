@@ -161,6 +161,32 @@ async fn read_all(h: &H, ino: u64, size: u32) -> Vec<u8> {
         .to_vec()
 }
 
+/// Byte-exact fill check with a DIAGNOSTIC summary instead of two 60 KiB
+/// vec dumps: first mismatch offset, its value, and the distinct foreign
+/// bytes — enough to tell zeros (lost payload) from another file's fill
+/// (cross-entry clobber) from a torn mix.
+fn assert_content(got: &[u8], fill: u8, what: &str) {
+    if got.len() != STAGED_LEN {
+        panic!(
+            "{what} corrupt after capacity churn: short read {} of {STAGED_LEN}",
+            got.len()
+        );
+    }
+    if let Some(pos) = got.iter().position(|&b| b != fill) {
+        let mut foreign: Vec<u8> = got.iter().copied().filter(|&b| b != fill).collect();
+        foreign.sort_unstable();
+        foreign.dedup();
+        let foreign_count = got.iter().filter(|&&b| b != fill).count();
+        panic!(
+            "{what} corrupt after capacity churn: first mismatch at {pos:#x} \
+             (got {:#04x}, want {fill:#04x}); {foreign_count}/{} bytes foreign, \
+             distinct foreign values {foreign:x?}",
+            got[pos],
+            got.len()
+        );
+    }
+}
+
 fn budget(h: &H) -> u64 {
     h.nvme.current_staged_write_bytes()
 }
@@ -281,11 +307,7 @@ async fn test_staging_full_writes_recover_and_drain() {
 
     for (ino, fill) in &inos {
         let got = read_all(&h, *ino, STAGED_LEN as u32).await;
-        assert_eq!(
-            got,
-            vec![*fill; STAGED_LEN],
-            "file {fill} corrupt after capacity churn"
-        );
+        assert_content(&got, *fill, &format!("sequential file {fill}"));
     }
 
     // Concurrent wave across the same saturated pool.
@@ -310,11 +332,7 @@ async fn test_staging_full_writes_recover_and_drain() {
     }
     for (ino, fill) in conc {
         let got = read_all(&fsarc, ino, STAGED_LEN as u32).await;
-        assert_eq!(
-            got,
-            vec![fill; STAGED_LEN],
-            "concurrent file {fill} corrupt after capacity churn"
-        );
+        assert_content(&got, fill, &format!("concurrent file {fill}"));
     }
 
     let end = wait_budget_below(&fsarc, fsarc.max_write_bytes, 30).await;

@@ -437,6 +437,12 @@ pub struct Metrics {
     /// data MAY be lost, must never error). Nonzero after a crash remount
     /// = data loss happened and was degraded, not errored.
     pub staged_payload_lost_reads: Align64<AtomicU64>,
+    /// Staged reads that lost a race with an identity transition (re-stage /
+    /// promotion / spill / layout flip) and re-resolved the fresh identity
+    /// instead of serving zeros or freed bytes (the fstests 074/127/616
+    /// transient-zeros family). A live health signal, not an error: bounded
+    /// retries that converge. Sustained growth without churn = investigate.
+    pub staged_identity_retries: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -1058,6 +1064,7 @@ impl SqueezefsFilesystem {
                 "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),
                 "staging_generation_discards": METRICS.staging_generation_discards.load(Ordering::Relaxed),
                 "staged_payload_lost_reads": METRICS.staged_payload_lost_reads.load(Ordering::Relaxed),
+                "staged_identity_retries": METRICS.staged_identity_retries.load(Ordering::Relaxed),
                 "nvme_unaligned_write_fallbacks": METRICS.nvme_unaligned_write_fallbacks.load(Ordering::Relaxed),
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),

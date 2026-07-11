@@ -23,6 +23,17 @@ pub struct NvmeShardInner {
     active_keys: VecDeque<Bytes>,
     write_offset: usize,
     capacity: usize,
+    /// IN-FLIGHT placements: extents whose payload copy runs OUTSIDE the
+    /// shard lock and which are not yet indexed in `map`. Every placement
+    /// decision (first-fit `fits`, put's cursor walk, eviction targets)
+    /// must treat these as occupied: a concurrent writer that reuses an
+    /// in-flight extent (wrap-around or a punched hole next to it) rewrites
+    /// the bytes BEFORE the first writer's phase-2 index insert, and the
+    /// first key then serves the second key's payload verbatim — observed
+    /// live as a staged file reading back another file's whole fill under
+    /// capacity churn. Pushed in phase 1 (locked), removed in phase 2
+    /// (locked).
+    pending: Vec<(usize, usize)>,
 }
 
 impl NvmeShardInner {
@@ -234,6 +245,7 @@ impl NvmeShard {
                 active_keys: VecDeque::new(),
                 write_offset: 0,
                 capacity,
+                pending: Vec::new(),
             }),
             // Keep the file open so optional uring fdatasync can target the segment (P2-8).
             _file: Some(file),
@@ -250,6 +262,7 @@ impl NvmeShard {
                 active_keys: VecDeque::new(),
                 write_offset: 0,
                 capacity,
+                pending: Vec::new(),
             }),
             _file: None,
         })
@@ -317,6 +330,32 @@ impl NvmeShard {
                 target_offset = 0;
             }
 
+            // In-flight placements are UNTOUCHABLE (see the `pending` field
+            // doc): bump the cursor past any overlapping one — their copies
+            // land outside the lock and eviction cannot see them. Bounded:
+            // on a pathological layout, skip the put (a cache put is
+            // best-effort; callers treat a miss as a refetch).
+            let mut bumps = inner.pending.len() + 2;
+            loop {
+                let conflict = inner
+                    .pending
+                    .iter()
+                    .copied()
+                    .find(|&(s, e)| target_offset < e && target_offset + block_size > s);
+                let Some((_, conflict_end)) = conflict else {
+                    break;
+                };
+                if bumps == 0 {
+                    return Vec::new();
+                }
+                bumps -= 1;
+                target_offset = (conflict_end + alignment - 1) & !(alignment - 1);
+                if target_offset + block_size > capacity {
+                    inner.evict_overlapping(target_offset, capacity, &mut evicted);
+                    target_offset = 0;
+                }
+            }
+
             // Recompute after wrap-around to ensure aligned
             let target_offset = (target_offset + alignment - 1) & !(alignment - 1);
             let val_offset =
@@ -332,6 +371,10 @@ impl NvmeShard {
                 inner.active_keys.retain(|k| k != &key);
             }
 
+            // Reserve the in-flight extent against concurrent placements.
+            inner
+                .pending
+                .push((target_offset, target_offset + block_size));
             inner.write_offset = target_offset + block_size;
             let mmap_ptr = inner.mmap.as_ptr() as *mut u8;
             (
@@ -396,6 +439,7 @@ impl NvmeShard {
                 offset: target_offset,
                 len: block_size,
             };
+            inner.pending.retain(|&(s, _)| s != target_offset);
             inner.map.insert(key.clone(), meta);
             inner.active_keys.push_back(key);
         }
@@ -448,11 +492,16 @@ impl NvmeShard {
             }
 
             // Live extents (including any current copy of `key`: replacing
-            // the sole copy in place would be torn by a crash mid-write).
+            // the sole copy in place would be torn by a crash mid-write)
+            // PLUS in-flight placements (`pending`): their copies run
+            // outside the lock and are not yet indexed — reusing one would
+            // rewrite bytes another key is about to publish (see the
+            // `pending` field doc).
             let mut live: Vec<(usize, usize)> = inner
                 .map
                 .values()
                 .map(|m| (m.offset, m.offset + m.len))
+                .chain(inner.pending.iter().copied())
                 .collect();
             live.sort_unstable();
 
@@ -501,6 +550,10 @@ impl NvmeShard {
             // missed here fell into the zeros-degrade leg).
             let old_meta = inner.map.get(&key).copied();
 
+            // Reserve the in-flight extent against concurrent placements.
+            inner
+                .pending
+                .push((target_offset, target_offset + block_size));
             inner.write_offset = target_offset + block_size;
             let mmap_ptr = inner.mmap.as_ptr() as *mut u8;
             (target_offset, val_offset, block_size, old_meta, mmap_ptr)
@@ -572,6 +625,7 @@ impl NvmeShard {
                 offset: target_offset,
                 len: block_size,
             };
+            inner.pending.retain(|&(s, _)| s != target_offset);
             if inner.map.insert(key.clone(), meta).is_some() {
                 inner.active_keys.retain(|k| k != &key);
             }

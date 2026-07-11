@@ -512,6 +512,24 @@ const WRITEBACK_MAX_ATTEMPTS: u32 = 4;
 /// P1-3: max partial blocks held only in RAM (not yet staged).
 const MAX_ACTIVE_BLOCK_BUFFERS: usize = 256;
 
+/// Kernel ABI (include/uapi/linux/fuse.h, fuse ≥ 7.38 / Linux ≥ 6.2):
+/// open-reply flag that lets the kernel take the inode lock SHARED instead
+/// of EXCLUSIVE for non-extending O_DIRECT writes on this open. Older
+/// kernels ignore unknown open flags, so advertising it is always safe.
+const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
+
+/// Open/create reply flags for REGULAR files (the virtual .stats/.config
+/// opens reply `FOPEN_DIRECT_IO` separately — see `open`). Parallel direct
+/// writes are safe under this daemon's lock model: the write handler
+/// serializes per inode via `active_inode_locks` for meta-prep and
+/// per-block `BLOCK_FLUSH_LOCKS` for data merges (lock order P1), so
+/// kernel-parallel submission cannot reorder a block's merges; extending
+/// writes stay kernel-exclusive regardless (fuse_dio_lock's past-EOF
+/// check), preserving size-extension ordering.
+const fn regular_open_reply_flags() -> u32 {
+    FOPEN_PARALLEL_DIRECT_WRITES
+}
+
 #[derive(Debug, Clone)]
 pub struct WritebackRequest {
     pub ino: u64,
@@ -3215,7 +3233,7 @@ impl Filesystem for SqueezefsFilesystem {
                 attr,
                 generation: 1,
                 fh: inode.ino,
-                flags: 0,
+                flags: regular_open_reply_flags(),
             })
         };
 
@@ -3270,7 +3288,7 @@ impl Filesystem for SqueezefsFilesystem {
         // File handle is just the inode number for simplicity in this design
         Ok(ReplyOpen {
             fh: inode,
-            flags: 0,
+            flags: regular_open_reply_flags(),
         })
     }
 

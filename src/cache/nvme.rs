@@ -1231,8 +1231,13 @@ impl NvmeStaging {
         }
         let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
         let val_bytes = data;
+        // Evictions are discarded here, so use the non-materializing put:
+        // the materializing flavor pays an mmap page-in + memcpy of every
+        // victim payload under the shard write lock (measured 44% daemon
+        // CPU in memcpy + ~6x spurious device reads on the elbencho
+        // O_DIRECT sequential-read row) for bytes nothing consumes.
         self.read_nvme_cache
-            .put(key_bytes.clone(), val_bytes.clone());
+            .put_discard_evicted(key_bytes.clone(), val_bytes.clone());
 
         if let Some(dht) = self.dht_node.get() {
             let dht_clone = dht.clone();

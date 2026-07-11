@@ -41,11 +41,19 @@ impl NvmeShardInner {
         w_start < b_end && w_end > b_start
     }
 
+    /// Remove every live entry overlapping `[w_start, w_end)` from the
+    /// index. With `collect = Some(vec)` each victim's payload is copied out
+    /// of the mmap into the vec (an mmap page-in + memcpy of the full value,
+    /// under the caller-held write lock); with `None` victims are dropped
+    /// index-only — no victim byte is ever touched. The hot read-cache put
+    /// path discards evictions, so it must use `None` (the copy was 44% of
+    /// daemon CPU + ~6x spurious device reads on the elbencho O_DIRECT
+    /// sequential-read row).
     fn evict_overlapping(
         &mut self,
         w_start: usize,
         w_end: usize,
-        evicted: &mut Vec<(Bytes, Bytes)>,
+        mut collect: Option<&mut Vec<(Bytes, Bytes)>>,
     ) {
         // GEOMETRY-COMPLETE eviction: remove EVERY live entry overlapping
         // the placement range. The historical front-run walk over
@@ -71,6 +79,9 @@ impl NvmeShardInner {
             };
             self.active_keys.retain(|k| k != &key);
 
+            let Some(evicted) = collect.as_deref_mut() else {
+                continue;
+            };
             let b_start = meta.offset;
             let val_len = self.get_val_len_at(b_start);
             if meta.len < HEADER_SIZE + val_len {
@@ -303,6 +314,17 @@ impl NvmeShard {
     }
 
     pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes)> {
+        self.put_impl(key, value, true)
+    }
+
+    /// [`Self::put`] for callers that discard evictions (the read-cache hot
+    /// path): identical placement/eviction/index semantics, but victims are
+    /// dropped index-only — no mmap page-in, no memcpy, nothing returned.
+    pub fn put_discard_evicted(&self, key: Bytes, value: Bytes) {
+        let _ = self.put_impl(key, value, false);
+    }
+
+    fn put_impl(&self, key: Bytes, value: Bytes, materialize_evicted: bool) -> Vec<(Bytes, Bytes)> {
         let key_len = key.len();
         let val_len = value.len();
 
@@ -324,7 +346,11 @@ impl NvmeShard {
             // Check if we need to wrap around
             let capacity = inner.capacity;
             if target_offset + block_size > capacity {
-                inner.evict_overlapping(target_offset, capacity, &mut evicted);
+                if materialize_evicted {
+                    inner.evict_overlapping(target_offset, capacity, Some(&mut evicted));
+                } else {
+                    inner.evict_overlapping(target_offset, capacity, None);
+                }
                 target_offset = 0;
             }
 
@@ -349,7 +375,11 @@ impl NvmeShard {
                 bumps -= 1;
                 target_offset = (conflict_end + alignment - 1) & !(alignment - 1);
                 if target_offset + block_size > capacity {
-                    inner.evict_overlapping(target_offset, capacity, &mut evicted);
+                    if materialize_evicted {
+                        inner.evict_overlapping(target_offset, capacity, Some(&mut evicted));
+                    } else {
+                        inner.evict_overlapping(target_offset, capacity, None);
+                    }
                     target_offset = 0;
                 }
             }
@@ -361,7 +391,15 @@ impl NvmeShard {
             let block_size = (val_offset - target_offset) + val_len;
 
             // Evict overlapping blocks in the target range
-            inner.evict_overlapping(target_offset, target_offset + block_size, &mut evicted);
+            if materialize_evicted {
+                inner.evict_overlapping(
+                    target_offset,
+                    target_offset + block_size,
+                    Some(&mut evicted),
+                );
+            } else {
+                inner.evict_overlapping(target_offset, target_offset + block_size, None);
+            }
 
             // Invalidate/remove key from map if it already existed
             let old_meta = inner.map.remove(&key);
@@ -941,6 +979,27 @@ impl NvmeCache {
     }
 
     pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes)> {
+        match self.route_put(&key) {
+            Some((dev, shard_idx)) => dev.shards[shard_idx].put(key, value),
+            None => Vec::new(),
+        }
+    }
+
+    /// [`Self::put`] for callers that discard evictions (the read-cache hot
+    /// path, `cache_read_block`): same device affinity and eviction
+    /// semantics, but victims are dropped index-only — never paged in,
+    /// copied, or returned.
+    pub fn put_discard_evicted(&self, key: Bytes, value: Bytes) {
+        if let Some((dev, shard_idx)) = self.route_put(&key) {
+            dev.shards[shard_idx].put_discard_evicted(key, value);
+        }
+    }
+
+    /// Shared placement routing for the put flavors. Key-affine: replace an
+    /// existing copy on its own device — readers scan devices in order, so a
+    /// round-robin re-put of a resident key would leave a divergent stale
+    /// duplicate that survives remove(). New keys spread round-robin.
+    fn route_put(&self, key: &Bytes) -> Option<(Arc<NvmeDevice>, usize)> {
         let active_devices = {
             let guard = self.devices.read();
             guard
@@ -951,23 +1010,20 @@ impl NvmeCache {
         };
 
         if active_devices.is_empty() {
-            return Vec::new();
+            return None;
         }
 
-        // Key-affine: replace an existing copy on its own device — readers
-        // scan devices in order, so a round-robin re-put of a resident key
-        // would leave a divergent stale duplicate that survives remove().
         for dev in &active_devices {
-            let shard_idx = (xxh3_64(&key) as usize) % dev.shards.len();
-            if dev.shards[shard_idx].has_key(&key) {
-                return dev.shards[shard_idx].put(key, value);
+            let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
+            if dev.shards[shard_idx].has_key(key) {
+                return Some((dev.clone(), shard_idx));
             }
         }
 
         let idx = self.write_counter.fetch_add(1, Ordering::Relaxed) % active_devices.len();
-        let dev = &active_devices[idx];
-        let shard_idx = (xxh3_64(&key) as usize) % dev.shards.len();
-        dev.shards[shard_idx].put(key, value)
+        let dev = active_devices[idx].clone();
+        let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
+        Some((dev, shard_idx))
     }
 
     /// Admit `key` without ever destroying live entries (see the shard-level

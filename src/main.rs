@@ -744,6 +744,132 @@ fn get_default_staging_dir() -> PathBuf {
     }
 }
 
+/// Resolve the mountpoint from the `mount` CLI shape: the first positional
+/// when `--meta-lv` supplies the volumes, else the last. `None` when the
+/// positional count is wrong — the existing arg-error paths own those
+/// messages.
+#[cfg(unix)]
+fn mount_cli_mountpoint(args: &[String], meta_lv: &Option<Vec<String>>) -> Option<PathBuf> {
+    if meta_lv.is_some() {
+        args.first().map(PathBuf::from)
+    } else if args.len() >= 2 {
+        Some(PathBuf::from(&args[args.len() - 1]))
+    } else {
+        None
+    }
+}
+
+/// PARENT-side mountpoint preflight: the daemon's own refusal conditions
+/// (fuse3 `Session::mount_empty_check` refuses a non-empty mountpoint
+/// unconditionally — `MountOptions::nonempty` is never set — and
+/// `start_mount` refuses a stale ENOTCONN/EIO attachment), hoisted so they
+/// fail BEFORE daemonizing and before any volume is touched. Without this
+/// the child refused the mountpoint after the fork and the parent could
+/// only report a generic handshake failure (the live-diagnosed
+/// "not ready in 30 seconds" while `$MNT/stray` was the actual cause).
+#[cfg(unix)]
+fn validate_mountpoint_preflight(mountpoint: &Path) -> Result<(), String> {
+    let meta = match std::fs::metadata(mountpoint) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "mountpoint '{}' does not exist",
+                mountpoint.display()
+            ));
+        }
+        Err(e) => {
+            let os = e.raw_os_error();
+            if os == Some(libc::ENOTCONN) || os == Some(libc::EIO) {
+                return Err(format!(
+                    "mountpoint '{}' is a stale FUSE mount ({}); run `squeezefs umount {}` \
+                     (or `umount -l`) first",
+                    mountpoint.display(),
+                    e,
+                    mountpoint.display()
+                ));
+            }
+            return Err(format!(
+                "cannot access mountpoint '{}': {}",
+                mountpoint.display(),
+                e
+            ));
+        }
+    };
+    if !meta.is_dir() {
+        return Err(format!(
+            "mountpoint '{}' is not a directory",
+            mountpoint.display()
+        ));
+    }
+    // Mirror of the daemon's empty check: name the first stray entry so
+    // the operator knows exactly what blocks the mount.
+    let mut entries = std::fs::read_dir(mountpoint)
+        .map_err(|e| format!("cannot read mountpoint '{}': {}", mountpoint.display(), e))?;
+    if let Some(first) = entries.next() {
+        let name = first
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "<unreadable entry>".to_string());
+        return Err(format!(
+            "mountpoint '{}' is not empty (found '{}'); refusing to mount",
+            mountpoint.display(),
+            name
+        ));
+    }
+    Ok(())
+}
+
+/// Fail the mount bootstrap loud. On a daemonized child (stdout/stderr
+/// already point at /dev/null or the log file) the message is ALSO written
+/// to the parent's handshake pipe, so the parent surfaces the actual
+/// reason instead of a generic "child exited early".
+#[cfg(unix)]
+fn mount_bootstrap_fail(msg: &str) -> ! {
+    eprintln!("Error: {msg}");
+    let fd = DAEMON_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let line = format!("Error: {msg}\n");
+        let _ = unsafe { libc::write(fd, line.as_ptr() as *const libc::c_void, line.len()) };
+        let _ = unsafe { libc::close(fd) };
+        DAEMON_PIPE.store(-1, std::sync::atomic::Ordering::Relaxed);
+    }
+    std::process::exit(1);
+}
+
+/// Bounded tail of the daemon log (the parent's last diagnostic when a
+/// child died without a pipe message — e.g. SIGKILL'd by the OOM killer).
+#[cfg(unix)]
+fn print_daemon_log_tail(path: &Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 4096;
+    const TAIL_LINES: usize = 20;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return;
+    }
+    if f.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .is_err()
+    {
+        return;
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<&str> = text.lines().collect();
+    let shown = &lines[lines.len().saturating_sub(TAIL_LINES)..];
+    if shown.iter().all(|l| l.trim().is_empty()) {
+        return;
+    }
+    eprintln!("--- daemon log tail ({}) ---", path.display());
+    for line in shown {
+        eprintln!("{line}");
+    }
+}
+
 fn resolve_local_sqpoll_cpu(explicit_override: Option<u32>) -> Option<u32> {
     explicit_override.filter(|value| *value > 0)
 }
@@ -815,6 +941,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Mountpoint preflight in the PARENT, before daemonizing and before any
+    // volume is touched: the daemon's refusal conditions (exists / is a
+    // directory / is empty / not a stale attachment) fail instantly with a
+    // precise error on the caller's console — never a generic handshake
+    // timeout after the child refused post-fork.
+    #[cfg(unix)]
+    if let Commands::Mount {
+        ref args,
+        ref meta_lv,
+        ..
+    } = &cli.command
+    {
+        if let Some(mountpoint) = mount_cli_mountpoint(args, meta_lv) {
+            if let Err(msg) = validate_mountpoint_preflight(&mountpoint) {
+                eprintln!("Error: {msg}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     #[cfg(unix)]
     if let Commands::Mount {
         ref args,
@@ -849,11 +995,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Failed to fork daemon process");
                 std::process::exit(1);
             } else if pid > 0 {
-                // Parent process
+                // Parent process: wait for the child's handshake — "ready\n"
+                // (mount armed), an "Error:"/"Panic:" line (child refused —
+                // surface its ACTUAL reason), EOF (child gone), or the 30 s
+                // deadline. The pre-fix handshake discarded collected error
+                // content and printed a bogus "not ready in 30 seconds"
+                // whenever the child had not been reaped yet (the
+                // live-diagnosed non-empty-mountpoint symptom).
                 libc::close(pipefd[1]);
 
-                let mut child_error = String::new();
+                let mut child_output = String::new();
                 let mut ready = false;
+                let mut child_failed = false;
                 let start = std::time::Instant::now();
 
                 print!("Mounting Squeezefs at {:?}...", mountpoint_path);
@@ -895,12 +1048,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if n == 0 {
                         break;
                     }
-                    if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
-                        child_error.push_str(s);
-                        if child_error.contains("ready\n") {
-                            ready = true;
-                            break;
-                        }
+                    child_output.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+                    if child_output.contains("ready\n") {
+                        ready = true;
+                        break;
+                    }
+                    // A complete failure line ends the wait immediately —
+                    // the child is exiting, not becoming ready.
+                    if (child_output.contains("Error:") || child_output.contains("Panic:"))
+                        && child_output.ends_with('\n')
+                    {
+                        child_failed = true;
+                        break;
                     }
                 }
 
@@ -912,46 +1071,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     libc::close(pipefd[0]);
                     std::process::exit(0);
-                } else {
-                    let mut status = 0;
-                    let wait_res = libc::waitpid(pid, &mut status, libc::WNOHANG);
-                    if wait_res == pid {
-                        let mut buf = [0u8; 1024];
-                        loop {
-                            let n = libc::read(
-                                pipefd[0],
-                                buf.as_mut_ptr() as *mut libc::c_void,
-                                buf.len(),
-                            );
-                            if n <= 0 {
-                                break;
-                            }
-                            if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
-                                child_error.push_str(s);
-                            }
-                        }
-                        let clean_err = child_error.replace("ready\n", "");
-                        if !clean_err.trim().is_empty() {
-                            eprintln!(
-                                "Failed to start squeezefs daemon. Child error:\n{}",
-                                clean_err
-                            );
-                        } else {
-                            eprintln!(
-                                "Failed to start squeezefs daemon. Child process exited early."
-                            );
-                        }
-                    } else {
-                        eprintln!("The mount point is not ready in 30 seconds, exiting");
-                        let _ = std::process::Command::new("umount")
-                            .arg("-l")
-                            .arg(&mountpoint_path)
-                            .output();
-                        libc::kill(pid, libc::SIGKILL);
-                    }
-                    libc::close(pipefd[0]);
-                    std::process::exit(1);
                 }
+
+                // Not ready. Reap the child with a bounded grace so a child
+                // that already reported failure (or closed the pipe on its
+                // way out) is never misreported as a 30 s timeout.
+                let mut status = 0;
+                let mut child_exited = false;
+                let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let r = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                    if r == pid || r < 0 {
+                        child_exited = true;
+                        break;
+                    }
+                    if std::time::Instant::now() >= reap_deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !child_exited {
+                    // Genuine wedge: detach the mountpoint and kill the child.
+                    let _ = std::process::Command::new("umount")
+                        .arg("-l")
+                        .arg(&mountpoint_path)
+                        .output();
+                    libc::kill(pid, libc::SIGKILL);
+                    let _ = libc::waitpid(pid, &mut status, 0);
+                }
+
+                // Drain whatever the child managed to write before it died
+                // (non-blocking: the writer may be gone or SIGKILL'd).
+                let flags = libc::fcntl(pipefd[0], libc::F_GETFL);
+                if flags >= 0 {
+                    let _ = libc::fcntl(pipefd[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                    if n <= 0 {
+                        break;
+                    }
+                    child_output.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+                }
+                libc::close(pipefd[0]);
+
+                let reason = child_output.replace("ready\n", "");
+                let reason = reason.trim();
+                if !reason.is_empty() {
+                    eprintln!("Failed to start squeezefs daemon:\n{}", reason);
+                } else if child_failed || child_exited {
+                    eprintln!(
+                        "Failed to start squeezefs daemon: the daemon exited before the mount \
+                         became ready (no error reported over the handshake pipe)."
+                    );
+                } else {
+                    eprintln!(
+                        "Error: mount did not become ready within 30 seconds; the daemon was \
+                         killed and {:?} lazily detached.",
+                        mountpoint_path
+                    );
+                }
+                if let Some(ref log_path) = cli.log_file {
+                    print_daemon_log_tail(log_path);
+                }
+                std::process::exit(1);
             }
 
             // Child process continues here
@@ -1037,25 +1221,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..
     } = &cli.command
     {
+        // NOTE: failures below may run in the daemonized CHILD (stderr →
+        // /dev/null or the log file): `mount_bootstrap_fail` also reports
+        // them over the handshake pipe so the parent prints the reason.
         let (meta_lvs, mountpoint) = if let Some(ref m_lvs) = meta_lv {
             if args.is_empty() {
-                eprintln!("Error: Mountpoint path is required");
-                std::process::exit(1);
+                mount_bootstrap_fail("Mountpoint path is required");
             }
             let m_point = PathBuf::from(&args[0]);
             (m_lvs.clone(), m_point)
         } else {
             if args.len() < 2 {
-                eprintln!("Error: Metadata URI (sqmeta://...) and Mountpoint path are required");
-                std::process::exit(1);
+                mount_bootstrap_fail(
+                    "Metadata URI (sqmeta://...) and Mountpoint path are required",
+                );
             }
             let mut m_lvs = Vec::new();
             for i in 0..(args.len() - 1) {
                 match parse_block_uri(&args[i], "sqmeta://") {
                     Ok(parsed) => m_lvs.extend(parsed),
                     Err(e) => {
-                        eprintln!("Error parsing Metadata URI: {}", e);
-                        std::process::exit(1);
+                        mount_bootstrap_fail(&format!("failed to parse Metadata URI: {}", e));
                     }
                 }
             }
@@ -1066,29 +1252,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let uid = unsafe { libc::getuid() };
         if uid != 0 {
             if !mountpoint.exists() {
-                eprintln!("Error: Mountpoint {:?} does not exist.", mountpoint);
-                std::process::exit(1);
+                mount_bootstrap_fail(&format!("Mountpoint {:?} does not exist.", mountpoint));
             }
             use std::os::unix::fs::MetadataExt;
             match std::fs::metadata(&mountpoint) {
                 Ok(meta) => {
                     if meta.uid() != uid {
-                        eprintln!(
-                            "Error: Mountpoint {:?} is owned by UID {}, but current user is UID {}.",
+                        mount_bootstrap_fail(&format!(
+                            "Mountpoint {:?} is owned by UID {}, but current user is UID {}. \
+                             Please use a mountpoint owned by you, or run with sudo.",
                             mountpoint,
                             meta.uid(),
                             uid
-                        );
-                        eprintln!("Please use a mountpoint owned by you, or run with sudo.");
-                        std::process::exit(1);
+                        ));
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Error: Failed to read metadata of mountpoint {:?}: {}",
+                    mount_bootstrap_fail(&format!(
+                        "Failed to read metadata of mountpoint {:?}: {}",
                         mountpoint, e
-                    );
-                    std::process::exit(1);
+                    ));
                 }
             }
 
@@ -1125,11 +1308,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let val_opt = match val_opt {
             Ok(v) => v,
             Err(e) => {
-                eprintln!(
-                    "Error: Failed to read format config from metadata volume {}: {}",
+                mount_bootstrap_fail(&format!(
+                    "Failed to read format config from metadata volume {}: {}",
                     first_meta_path, e
-                );
-                std::process::exit(1);
+                ));
             }
         };
 
@@ -1137,13 +1319,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(val) => match serde_json::from_slice(&val) {
                 Ok(cfg) => cfg,
                 Err(e) => {
-                    eprintln!("Error: Failed to parse format config: {}", e);
-                    std::process::exit(1);
+                    mount_bootstrap_fail(&format!("Failed to parse format config: {}", e));
                 }
             },
             None => {
-                eprintln!("Error: Format configuration not found on root inode. Is this volume formatted?");
-                std::process::exit(1);
+                mount_bootstrap_fail(
+                    "Format configuration not found on root inode. Is this volume formatted?",
+                );
             }
         };
 

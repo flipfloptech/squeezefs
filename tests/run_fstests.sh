@@ -340,18 +340,20 @@ EOF
 #   074/127/616 (+075) = staged-identity transient-ZEROS family (fixes
 #                     f924085 atomic ring replace + 0a184f3 read-side
 #                     identity revalidation; RSS-creep reclaim rides
-#                     f924085) — see the FIXED row in the expected-result
+#                     f924085) — see the FIXED rows in the expected-result
 #                     table below; pins in
-#                     tests/staged_identity_visibility_tests.rs. 074 also
-#                     carries a DISTINCT pre-existing striped/mmap
-#                     stale-fill residual (fstest.3 leg, budget-dependent)
-#                     — see the FAIL row below.
+#                     tests/staged_identity_visibility_tests.rs. 074's
+#                     second, distinct striped/mmap stale-fill bug
+#                     (fstest.3 leg, budget-dependent) = FIXED by the
+#                     put-ring geometry-complete eviction (f29520e) — see
+#                     its FIXED row below; pins in
+#                     tests/reused_key_stale_fill_tests.rs.
 #   001/013/074/127/213/263 = mount-cycle + fsx/fsstress core soak
 #
 # DETERMINISTIC EXPECTED RESULT of this tier (2026-07-11, post 285/617 +
-# staged-identity transient-zeros fixes). Anything deviating from this
-# table is a REGRESSION:
-#   PASS (deterministic): 001 008 013 069 075 091 112 127 263 285 469
+# staged-identity transient-zeros + 074 striped stale-fill fixes).
+# Anything deviating from this table is a REGRESSION:
+#   PASS (deterministic): 001 008 013 069 074 075 091 112 127 263 285 469
 #                     616 617 618
 #   NOTRUN (deterministic, platform): 009 316 — both _require xfs_io fiemap;
 #                     FUSE has no FIEMAP ioctl. Kept as canaries: they start
@@ -390,22 +392,25 @@ EOF
 #           fixed: dead ring extents punched). Pins in
 #           tests/staged_identity_visibility_tests.rs. A recurrence of
 #           the ZEROS signature on these tests IS a regression.
-#   FAIL (nondeterministic, REAL pre-existing — distinct striped-tier bug,
-#         under watch):
-#     074 = the fstest.3 leg only (-s 30M -b 512 -m: mmap-written striped
-#           files re-read after kernel reclaim) under the harness's
-#           500 MB disk-cache budget: whole 512 B blocks read back as a
-#           NEARBY ROUND's fill (loop±1/2 at block-scale offsets) — STALE
-#           CONTENT, never zeros. NOT the staged-identity family: fires
-#           with staged_payload_lost_reads == staged_identity_retries ==
-#           stale_binding_rebinds == 0, reproduces identically on pristine
-#           dev@74190d2 (5/6 vs 4-6/6 post-fix; fresh volume 4/6), and is
-#           budget-dependent (uncapped mounts: 0/8). Isolated repro:
-#           fstest -n 3 -F -l 10 -f 5 -s 31457280 -b 512 -m under
-#           --disk-cache-size 500MB. Falsified so far: read-side
-#           active-buffer checkout reprobe (0/6), RAM->NVMe dehydration
-#           publish (0/6 disabled). Needs its own striped
-#           writeback/allocator-reuse root-cause effort.
+#   074 striped/mmap stale-fill (the fstest.3 leg, -s 30M -b 512 -m under
+#           the harness's 500 MB disk-cache budget) = FIXED
+#           (fix/striped-stale-fill-074: 34c0871 red pins + f29520e).
+#           Was: whole 512 B blocks reading back a NEARBY round's fill
+#           (stale content, never zeros; all staged-identity counters
+#           silent; durable state clean — a poisoned NVMe read-cache
+#           entry probed live). Root cause: NvmeShard::evict_overlapping
+#           walked only the FRONT RUN of active_keys assuming queue order
+#           == ring-position order; same-key replaces + out-of-order
+#           concurrent placements broke it, the sweep stopped early, and
+#           a placement memcpy CLOBBERED a live indexed entry — served
+#           under a valid key + incarnation + binding. Eviction is now
+#           geometry-complete against the authoritative extent map;
+#           defense in depth: terminal-free read-tier purge + incarnation-
+#           validated non-owner publishes (dehydration, p2p). Acceptance
+#           2026-07-11: isolated repro 12/12 (was 4-11/12 failing),
+#           ./check generic/074 6/6, read-verify diagnostic 0 mismatches.
+#           Pins in tests/reused_key_stale_fill_tests.rs. A recurrence of
+#           the stale-fill signature on 074 IS a regression.
 #   FLAKE (pre-existing capacity shape under SQUEEZEFS_FSTESTS_MEMMAX=8G):
 #     tier-tail tests (observed on 618) can fail via _check_dmesg when the
 #           TEST daemon's CUMULATIVE budgeted RSS over the 19-test roll

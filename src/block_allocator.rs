@@ -435,38 +435,32 @@ impl BlockAllocator {
                                         }
                                     }
                                 }
-                                // 2. Check for inline block map
+                                // 2. Check for inline block map. Stored
+                                // values are backend-true key strings with an
+                                // optional `:extra` trailer after the offset —
+                                // strip the trailer with `clean_block_key`
+                                // (NEVER a bare `split(':')`, which mangles
+                                // prefixed keys: `oss2://123` → `oss2`) and
+                                // recover ONLY the offsets THIS volume owns —
+                                // the same alias-aware matching as the
+                                // indirect branch above.
                                 if let Some(ref bm) = layout.block_map {
                                     for offset_str in bm.values() {
-                                        let block_key =
-                                            offset_str.split(':').next().unwrap_or(offset_str);
-                                        let mut matches = false;
-                                        let mut block_offset = 0;
-                                        if let Ok((be_id, offset)) =
-                                            backend_router.parse_block_key(block_key)
-                                        {
-                                            if be_id == self._volume_id.as_ref()
-                                                || ((be_id == "backend_0" || be_id == "squeezefs")
-                                                    && (self._volume_id.as_ref() == "squeezefs"
-                                                        || self._volume_id.as_ref()
-                                                            == backend_router
-                                                                .default_allocator
-                                                                .volume_id()))
-                                            {
-                                                matches = true;
-                                                block_offset = offset;
-                                            }
-                                        } else if let Ok(offset) = block_key.parse::<u64>() {
-                                            if self._volume_id.as_ref() == "squeezefs"
-                                                || self._volume_id.as_ref()
-                                                    == backend_router.default_allocator.volume_id()
-                                            {
-                                                matches = true;
-                                                block_offset = offset;
-                                            }
-                                        }
-                                        if matches {
-                                            let block_idx = block_offset / self.chunk_size;
+                                        let block_key = crate::routing::clean_block_key(offset_str);
+                                        let Ok((be_id, offset)) =
+                                            backend_router.parse_block_key(&block_key)
+                                        else {
+                                            continue;
+                                        };
+                                        let owned = be_id == self._volume_id.as_ref()
+                                            || ((be_id == "backend_0" || be_id == "squeezefs")
+                                                && (self._volume_id.as_ref() == "squeezefs"
+                                                    || self._volume_id.as_ref()
+                                                        == backend_router
+                                                            .default_allocator
+                                                            .volume_id()));
+                                        if owned {
+                                            let block_idx = offset / self.chunk_size;
                                             let _ = self.recover_block(block_idx).await;
                                         }
                                     }

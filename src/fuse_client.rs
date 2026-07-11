@@ -6438,6 +6438,42 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
+    /// Regular-file open/create replies must advertise
+    /// FOPEN_PARALLEL_DIRECT_WRITES (kernel ABI bit 1 << 6, fuse ≥ 7.38 /
+    /// Linux ≥ 6.2). Without it the kernel takes the inode lock EXCLUSIVE
+    /// around every O_DIRECT write submission, so multi-threaded /
+    /// iodepth>1 O_DIRECT writers to one file serialize in the kernel
+    /// before the daemon ever sees a request (elbencho `-w -b 4k --iodepth
+    /// 16 --direct`: 16 in-flight buys zero concurrency). Daemon-side
+    /// correctness does not depend on that kernel lock: the write handler
+    /// serializes per inode via `active_inode_locks` for meta-prep and
+    /// per-block `BLOCK_FLUSH_LOCKS` for data merges, and concurrent
+    /// overlapping O_DIRECT writes carry no POSIX atomicity guarantee.
+    /// Extending writes stay kernel-exclusive regardless (fuse_dio_lock
+    /// checks past-EOF), so size-extension ordering is unaffected.
+    #[test]
+    fn regular_open_reply_advertises_parallel_direct_writes() {
+        assert_eq!(
+            FOPEN_PARALLEL_DIRECT_WRITES,
+            1 << 6,
+            "kernel ABI value for FOPEN_PARALLEL_DIRECT_WRITES is 1 << 6 \
+             (include/uapi/linux/fuse.h); any other value advertises a \
+             different capability"
+        );
+        assert_eq!(
+            regular_open_reply_flags(),
+            FOPEN_PARALLEL_DIRECT_WRITES,
+            "regular files must advertise exactly parallel direct writes \
+             (no FOPEN_DIRECT_IO — the page-cache path stays enabled)"
+        );
+        assert_eq!(
+            regular_open_reply_flags() & 1,
+            0,
+            "FOPEN_DIRECT_IO must stay reserved for the virtual \
+             .stats/.config inodes"
+        );
+    }
+
     #[test]
     fn component_name_len_accepts_name_max() {
         let name = "a".repeat(FUSE_NAME_MAX);

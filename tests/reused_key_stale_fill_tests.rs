@@ -548,3 +548,211 @@ async fn stress_recycled_keys() {
 async fn stress_recycled_keys_v3() {
     stress_recycled_keys().await;
 }
+
+// ---------------------------------------------------------------------------
+// The generic/074 fstest.3 striped stale-fill family: a STRAGGLER validated-
+// fill publish (its spawn_blocking put delayed by blocking-pool backlog under
+// cache-budget pressure) lands AFTER the displacement purge of its key yet
+// PASSES its incarnation after-check — the displaced key's incarnation
+// retires only at `begin_free`, which runs strictly later (after the merge's
+// KV save + caller unwind). The poisoned tier entry then serves the key's
+// previous bytes to the key's NEXT owner: under O_TRUNC+rewrite churn with
+// free-list reuse, that is the SAME (file, block) — the binding recheck
+// passes and a nearby round's fill reaches the page cache (observed live:
+// tier probe showed the NVMe read cache holding V_old for a key whose
+// device held V_new, all family counters silent).
+//
+// Contracts pinned here:
+//   1. A TERMINAL free purges the key's read tiers inside the
+//      begin_free→finish_free window: any straggler publish either lands
+//      before the purge (removed) or after the retire (its own after-check
+//      fails and undoes it). No interleaving leaves a dead incarnation's
+//      bytes readable once the key is reallocatable.
+//   2. Every read-tier publish that is not an owner's fresh-bytes put must
+//      be INCARNATION-VALIDATED (the dehydration worker and the p2p store
+//      published unconditionally): a retired/unstable key must never stick.
+// ---------------------------------------------------------------------------
+
+/// Contract 1: free_block's terminal release leaves NO read-tier entry under
+/// the freed key — the straggler-publish poison cannot survive into the
+/// key's next incarnation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_free_purges_read_tiers() {
+    let h = make().await;
+    let ino = create(&h, "free_purges").await;
+
+    // Striped file (two blocks — one-block files stay staged in this
+    // harness geometry); block 0 lands through the write-through path.
+    write_at(&h, ino, 0, &vec![0x5Au8; 2 * BS as usize]).await;
+    let map = block_map_of(&h, ino).await;
+    let k = map.get(&0).expect("block 0 mapped").clone();
+
+    // A straggler publish that raced the (future) displacement: bytes of the
+    // key's CURRENT incarnation land in both read tiers — legitimate today.
+    let stale = bytes::Bytes::from(vec![0xDEu8; BS as usize]);
+    h.fs.router
+        .cache
+        .nvme
+        .cache_read_block(&k, stale.clone())
+        .unwrap();
+    h.fs.router.cache.read_lru.put(&k, stale);
+    assert!(
+        h.fs.router.cache.nvme.get_cached_read_block(&k).is_some(),
+        "harness: NVMe read-cache entry must exist before the free"
+    );
+
+    // Terminal free (refcount 1 -> 0).
+    h.fs.router.backend_router.free_block(&k).await.unwrap();
+
+    assert!(
+        h.fs.router.cache.nvme.get_cached_read_block(&k).is_none(),
+        "TERMINAL FREE LEFT A POISONABLE NVMe READ-CACHE ENTRY under {k}: \
+         the key's next owner would serve the dead incarnation's bytes \
+         (the generic/074 fstest.3 stale-fill)"
+    );
+    assert!(
+        h.fs.router.cache.read_lru.get(&k).is_none(),
+        "TERMINAL FREE LEFT A POISONABLE RAM-LRU ENTRY under {k}"
+    );
+}
+
+/// Contract 2: the validated read-cache publish refuses retired/unstable
+/// incarnations (dehydration + p2p route through it), keeps stable ones,
+/// and stays vacuously open for untracked legacy keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_validated_read_cache_publish_incarnation_gate() {
+    let h = make().await;
+    let ino = create(&h, "validated_publish").await;
+
+    write_at(&h, ino, 0, &vec![0x11u8; 2 * BS as usize]).await;
+    let map = block_map_of(&h, ino).await;
+    let k = map.get(&0).expect("block 0 mapped").clone();
+
+    // (a) Stable incarnation: the validated publish sticks.
+    let bytes_now = bytes::Bytes::from(vec![0x22u8; 4096]);
+    assert!(
+        h.fs.router.cache.nvme.cache_read_block_validated(
+            &k,
+            bytes_now,
+            h.fs.router.backend_router.as_ref()
+        ),
+        "stable-incarnation publish must stick"
+    );
+    assert!(h.fs.router.cache.nvme.get_cached_read_block(&k).is_some());
+
+    // (b) Retired incarnation (terminal free): the publish must NOT stick —
+    // a dehydration/p2p straggler carrying the dead incarnation's bytes.
+    h.fs.router.backend_router.free_block(&k).await.unwrap();
+    let stale = bytes::Bytes::from(vec![0x33u8; 4096]);
+    assert!(
+        !h.fs.router.cache.nvme.cache_read_block_validated(
+            &k,
+            stale,
+            h.fs.router.backend_router.as_ref()
+        ),
+        "retired-incarnation publish must be refused"
+    );
+    assert!(
+        h.fs.router.cache.nvme.get_cached_read_block(&k).is_none(),
+        "refused publish must leave no entry"
+    );
+
+    // (c) Untracked legacy key (never allocator-managed): vacuously valid.
+    let legacy = "legacy_prefix/part_7";
+    let legacy_bytes = bytes::Bytes::from(vec![0x44u8; 4096]);
+    assert!(
+        h.fs.router.cache.nvme.cache_read_block_validated(
+            legacy,
+            legacy_bytes,
+            h.fs.router.backend_router.as_ref()
+        ),
+        "untracked legacy keys are never freed/reallocated — publish is valid"
+    );
+    assert!(h
+        .fs
+        .router
+        .cache
+        .nvme
+        .get_cached_read_block(legacy)
+        .is_some());
+}
+
+/// The put-ring integrity contract (the generic/074 corruption's physical
+/// mechanism): `NvmeShard::put`'s eviction must remove EVERY live entry
+/// overlapping the placement — front-run eviction over `active_keys`
+/// assumes ring-position order, which concurrent puts invert (in-flight
+/// placements complete out of order), so the sweep broke early and the
+/// memcpy CLOBBERED a live indexed entry: readers then served another
+/// block's bytes under a valid key + incarnation + binding. Hammer a
+/// small shard with concurrent wrapping puts; every surviving entry must
+/// read back exactly its own last-put fill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_put_ring_never_clobbers_live_entries() {
+    use squeezefs::tiering::nvme::NvmeCache;
+
+    let dir = tempfile::tempdir().unwrap();
+    // 2 MiB shard, 300 KiB values: ~6 fit; 4 writers x 8 keys wrap hard.
+    let cache = std::sync::Arc::new(NvmeCache::new(&[dir.path()], &[2 * 1024 * 1024], 1).unwrap());
+    let val_len = 300 * 1024;
+
+    let last_fill: std::sync::Arc<Vec<std::sync::atomic::AtomicU8>> = std::sync::Arc::new(
+        (0..32)
+            .map(|_| std::sync::atomic::AtomicU8::new(0))
+            .collect(),
+    );
+
+    let mut writers = Vec::new();
+    for w in 0..4u8 {
+        let cache = cache.clone();
+        let last_fill = last_fill.clone();
+        writers.push(tokio::task::spawn_blocking(move || {
+            for round in 0..300u32 {
+                for k in 0..8u8 {
+                    let slot = (w * 8 + k) as usize;
+                    let key = bytes::Bytes::from(format!("w{w}-key{k}"));
+                    let fill = 1 + ((round as u8) % 200).wrapping_add(w * 13 + k);
+                    // Publish-order discipline: record the fill BEFORE the
+                    // put so a racing final check never sees a fresher put
+                    // than the recorded fill.
+                    last_fill[slot].store(fill, std::sync::atomic::Ordering::Release);
+                    let _ = cache.put(key, bytes::Bytes::from(vec![fill; val_len]));
+                }
+            }
+        }));
+    }
+    for wtask in writers {
+        wtask.await.expect("put writer panicked");
+    }
+
+    // Every entry still resident must be EXACTLY its own last put — one
+    // uniform fill matching the recorded value. A torn / foreign fill is
+    // the live-entry clobber.
+    let mut resident = 0;
+    for w in 0..4u8 {
+        for k in 0..8u8 {
+            let slot = (w * 8 + k) as usize;
+            let key = bytes::Bytes::from(format!("w{w}-key{k}"));
+            let Some(guard) = cache.get(&key) else {
+                continue; // evicted by wrap — legal
+            };
+            resident += 1;
+            let val = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+            assert_eq!(val.len(), val_len, "w{w}-key{k} wrong length");
+            let expect = last_fill[slot].load(std::sync::atomic::Ordering::Acquire);
+            let first = val[0];
+            assert_eq!(
+                first, expect,
+                "w{w}-key{k} serves fill {first:#04x}, last put {expect:#04x} \
+                 (stale/foreign content under a live key)"
+            );
+            if let Some(pos) = val.iter().position(|&b| b != first) {
+                panic!(
+                    "LIVE ENTRY CLOBBERED: w{w}-key{k} byte {pos:#x} = {:#04x} != fill {first:#04x} \
+                     (a concurrent placement memcpy'd over an indexed entry)",
+                    val[pos]
+                );
+            }
+        }
+    }
+    assert!(resident > 0, "harness: at least some entries must survive");
+}

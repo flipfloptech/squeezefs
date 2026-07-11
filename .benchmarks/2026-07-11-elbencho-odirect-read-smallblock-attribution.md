@@ -252,3 +252,65 @@ kernel lock actually serializes):
 - Daemons caged (`systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0`) — which is
   also how the row-5 OOM finding surfaced instead of eating the host.
 - elbencho as user; sudo only for fstests; nothing pushed.
+
+---
+
+## Addendum (2026-07-11, follow-up): refetch churn FIXED — structural item 1 shipped
+
+User approved ranked-plan item 1 only. Shipped on `perf/read-tier-refetch-churn`:
+`511b2b6` (red contract tests) + `56a968b` (fix). **No eviction-policy change** — the
+074-hardened geometry-complete eviction machinery is untouched.
+
+### Root cause split (which of a/b/c dominated)
+
+- **(c-dominant) Detached-late tier publish**: the ≥64 KiB fill publish ran as a *detached*
+  `spawn_blocking`; under load it landed hundreds of ms late (self-amplifying backlog — every
+  refetch queued another 4 MiB publish; 374 blocking threads, loadavg 800 observed). Since
+  >256 KiB blocks never enter the RAM LRU and the single-flight entry drops at fetch return,
+  every next sub-block read of a just-fetched block missed all tiers and refetched from the
+  device.
+- **(b) Prefetch/foreground race**: real, but only through the same invisibility window —
+  waiters woken by the primary's guard drop missed the unpublished tier and became fresh
+  primaries (pinned red: 3 device fetches for 4 concurrent resolvers of one cold block).
+- **(a) Ring-geometry eviction**: **exonerated** for these rows — ring turnover ≈8 s vs
+  ≈0.3 s reuse window at baseline, and post-fix `get_obj/unique = 1.002` with the ring
+  geometry untouched. The new single-pass-retention contract test pins that a tier-fitting
+  working set survives a sequential pass.
+
+### Mechanism shipped
+
+`get_cached_or_fetch_block_traced`: the tier publish (same `spawn_blocking` closure, same
+before/after incarnation seqlock checks) is now **awaited before the single-flight guard
+drops**. A fill is tier-visible at return; waiters re-check and HIT; prefetch and foreground
+dedupe to exactly one fetch per unique block. The put still runs on the blocking pool (tier
+shard `parking_lot` write lock + multi-MiB memcpy never on an async worker); the awaiting
+task holds no locks (P1-9 unchanged). Contract suite:
+`tests/read_tier_refetch_churn_tests.rs` (visibility-at-return; zero-refetch sub-block read;
+concurrent dedupe == 1 fetch; sequential pass `get_obj/unique == 1.0` + single-pass
+retention — 512 KiB geometry, above the RAM-LRU gate).
+
+### Acceptance (same sandbox/protocol as above; A/B fb53442 vs 56a968b, 2 runs each)
+
+| Row | Baseline fb53442 (a/b) | Fixed 56a968b (a/b) | Δ (medians) |
+|---|---|---|---|
+| 1 fresh create 1M | 3488 / 3820 MiB/s | 4072 / 3721 MiB/s | none (within spread) ✓ |
+| 2 seq read 1M | 128 / 114 MiB/s | **787 / 786 MiB/s** | **+6.5×** (target ≥5× met) |
+| 3 rand 4k read qd16 | 210 / 112 IOPS | **306 / 302 IOPS** | **+1.5–2.7×** |
+
+Ground truth, row 2 (16 GiB dataset): device reads **429–471 GiB → 16.35 GiB (1.02×
+amplification)**; tier writes 106 GiB → 16.9 GiB (exactly one publish per block);
+`get_obj/unique` **7.32 → 1.002**; cache hits/misses flipped 5.4k/29.9k → 18.1k/4.1k;
+loadavg peak ~800 → ~21 (publish backlog storm gone). Row 3 device reads for a 30 s window:
+112–150 GiB → 26–28 GiB.
+
+Row 2 is now device/tier-bound at ~790 MiB/s on this substrate; the remaining headroom is
+the (unapproved) plan items 2/4 — sub-block ranged reads and a RAM tier for hot blocks.
+
+### Gates
+
+- Full gate at the branch tip: clippy `-D warnings` clean, fmt clean, full test suite green
+  under `--test-threads=1` (60 suites), doc zero warnings, bench smoke ok. No lock-free core
+  touched (no atomics/ordering changes) — loom not required.
+- Safety net: `reused_key_stale_fill_tests` 6/6, `staged_identity_visibility_tests` 7/7
+  serially (its RSS-drift test is parallel-mode flaky with and without this change —
+  pre-existing), fstests generic/075, 091, 616 pass, generic/074 6/6 passes.

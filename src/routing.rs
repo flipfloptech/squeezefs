@@ -1371,14 +1371,34 @@ impl DataRouter {
                             let backend_router = self.backend_router.clone();
                             let bk_clone = block_key.to_string();
                             let dl_clone = downloaded_bytes.clone();
-                            tokio::task::spawn_blocking(move || {
-                                // Detached publish: it can run arbitrarily
-                                // late, past a free + reallocation of this
-                                // key. Re-check before AND after the put —
-                                // the residual exposure is then a put→check
-                                // instruction window that a whole
-                                // free→allocate→DMA→publish cycle cannot
-                                // fit inside.
+                            // AWAITED publish — the fill is tier-visible
+                            // BEFORE the single-flight guard drops (the
+                            // read-tier refetch-churn fix): a detached
+                            // publish could run arbitrarily late behind the
+                            // blocking-pool backlog, and since >256 KiB
+                            // blocks never enter the RAM LRU, the next
+                            // sub-block read of this block missed every
+                            // tier, found no in-flight entry, and refetched
+                            // the whole block from the device — queueing
+                            // yet another publish (the elbencho row-2 6.3×
+                            // get_obj multiplier; see
+                            // tests/read_tier_refetch_churn_tests.rs).
+                            // Waiters woken by this guard's drop now
+                            // re-check the tier and HIT instead of becoming
+                            // fresh primaries. Still on the blocking pool:
+                            // the put takes the tier-shard parking_lot
+                            // write lock and moves megabytes (never on an
+                            // async worker); awaiting the JoinHandle parks
+                            // only this task, which holds no locks here.
+                            // Incarnation discipline unchanged: re-check
+                            // before AND after the put — the residual
+                            // exposure stays a put→check instruction window
+                            // that a whole free→allocate→DMA→publish cycle
+                            // cannot fit inside. A JoinError (panic/
+                            // shutdown) just loses the publish: the next
+                            // read refetches — the pre-fix behavior, never
+                            // a correctness loss.
+                            let _ = tokio::task::spawn_blocking(move || {
                                 if !backend_router.fill_incarnation_still(&bk_clone, before) {
                                     return;
                                 }
@@ -1386,7 +1406,8 @@ impl DataRouter {
                                 if !backend_router.fill_incarnation_still(&bk_clone, before) {
                                     nvme_clone.remove_cached_read_block(&bk_clone);
                                 }
-                            });
+                            })
+                            .await;
                         }
                         // Avoid flooding RAM LRU with full 4 MiB blocks under
                         // multi-GB sequential reads. Small blocks still cache.

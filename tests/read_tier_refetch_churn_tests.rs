@@ -273,7 +273,10 @@ async fn fetched_blocks_are_tier_visible_and_never_refetched() {
         "concurrent resolvers of one cold block must dedupe to a single \
          backend fetch (single-flight + publish-before-guard-drop)"
     );
-    assert!(tier_has(&h, &k2), "phase C block tier-visible at completion");
+    assert!(
+        tier_has(&h, &k2),
+        "phase C block tier-visible at completion"
+    );
 
     // ---- Phase D: sequential pass over an 8-block working set (4 MiB —
     // comfortably inside the 128 MB read tier). One fetch per unique block

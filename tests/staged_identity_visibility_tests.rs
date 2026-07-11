@@ -470,6 +470,82 @@ async fn ring_same_key_replace_is_atomic_for_readers() {
 }
 
 // ---------------------------------------------------------------------------
+// Striped-tier sibling (the generic/074 fstest.3 shape): partial writes to a
+// STRIPED file check the RAM active-block overlay out of the shared map for
+// the whole RMW (and the one-authority ring-sibling removal ran BEFORE the
+// merge landed), while capacity pressure (tiny staging budget) stretches and
+// multiplies the windows with spills/refusals. A read racing those windows
+// missed every overlay and served the durable map's PREVIOUS-round block (or
+// a hole): stale fills / zeros for acked data. Readers here must only ever
+// see the current or previous round's fill.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn striped_pressure_storm_reads_never_stale_or_zeros() {
+    let h = make("rc5s", "2MB").await;
+    let flen = 3 * BS as usize; // striped: 3 blocks of 64 KiB
+
+    let mut inos = Vec::new();
+    for i in 0..3 {
+        let ino = create(&h, &format!("striped_{i}")).await;
+        write_at(&h, ino, 0, &vec![0xAAu8; flen]).await;
+        inos.push(ino);
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for &ino in &inos {
+        for off in [0u64, BS + 512, 2 * BS + 4096] {
+            let router = h.fs.router.clone();
+            let stop = stop.clone();
+            readers.push(tokio::spawn(async move {
+                let file_path = squeezefs::keys::inode_path(ino);
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Acquire) {
+                    let (data, _b) = router
+                        .read_file_range_zero_copy(&file_path, off, 1024, None)
+                        .await
+                        .unwrap_or_else(|e| panic!("[rc5-striped] read errored: {e:?}"));
+                    assert_eq!(data.len(), 1024, "[rc5-striped] short read of live data");
+                    let first = data[0];
+                    assert!(
+                        first == 0xAA || first == 0xBB,
+                        "[rc5-striped] STALE/ZEROS: {first:#04x} at off {off} \
+                         (legal fills 0xaa/0xbb) — overlay window served the durable map"
+                    );
+                    assert!(
+                        data.iter().all(|&x| x == first),
+                        "[rc5-striped] torn 1 KiB read"
+                    );
+                    reads += 1;
+                }
+                reads
+            }));
+        }
+    }
+
+    for round in 0..12u32 {
+        let fill = if round % 2 == 0 { 0xBBu8 } else { 0xAAu8 };
+        for &ino in &inos {
+            // Full rewrite (complete blocks -> write-through under pressure).
+            write_at(&h, ino, 0, &vec![fill; flen]).await;
+            // Partial-block RMW churn (checkout windows) across all blocks.
+            for off in [512u64, BS - 512, BS + 512, 2 * BS + 512, flen as u64 - 1024] {
+                write_at(&h, ino, off, &vec![fill; 1024]).await;
+            }
+            // fsync drains buffers through the flush path (its own windows).
+            h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+        }
+    }
+
+    stop.store(true, Ordering::Release);
+    let total_reads = join_readers(readers).await;
+    assert!(
+        total_reads > 100,
+        "harness self-check: readers must actually race the writer (got {total_reads} reads)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // In-flight placements are untouchable: a replace copies its payload OUTSIDE
 // the shard lock, so a concurrent different-key placement (wrap-around /
 // punched-hole reuse) that ignores the not-yet-indexed extent rewrites those

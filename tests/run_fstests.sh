@@ -337,11 +337,22 @@ EOF
 #                     (full-length below-EOF zero-fill in
 #                     read_file_range_zero_copy; pins in
 #                     tests/read_full_length_tests.rs) — GREEN.
+#   074/127/616 (+075) = staged-identity transient-ZEROS family (fixes
+#                     f924085 atomic ring replace + 0a184f3 read-side
+#                     identity revalidation; RSS-creep reclaim rides
+#                     f924085) — see the FIXED row in the expected-result
+#                     table below; pins in
+#                     tests/staged_identity_visibility_tests.rs. 074 also
+#                     carries a DISTINCT pre-existing striped/mmap
+#                     stale-fill residual (fstest.3 leg, budget-dependent)
+#                     — see the FAIL row below.
 #   001/013/074/127/213/263 = mount-cycle + fsx/fsstress core soak
 #
-# DETERMINISTIC EXPECTED RESULT of this tier (2026-07-11, post 285/617
-# fixes). Anything deviating from this table is a REGRESSION:
-#   PASS (deterministic): 001 008 013 069 091 112 263 285 469 617 618
+# DETERMINISTIC EXPECTED RESULT of this tier (2026-07-11, post 285/617 +
+# staged-identity transient-zeros fixes). Anything deviating from this
+# table is a REGRESSION:
+#   PASS (deterministic): 001 008 013 069 075 091 112 127 263 285 469
+#                     616 617 618
 #   NOTRUN (deterministic, platform): 009 316 — both _require xfs_io fiemap;
 #                     FUSE has no FIEMAP ioctl. Kept as canaries: they start
 #                     RUNNING (and their punch/prealloc coverage arms) the
@@ -358,23 +369,54 @@ EOF
 #           so the "fallocate: No space left on device" golden line never
 #           appears. All other 213 legs pass; exactly that one missing
 #           line is the expected diff.
-#   FAIL (nondeterministic, REAL pre-existing bug — under fix-family watch):
-#     074/127/616 (+075 rarely) = transient stale/zeros reads under buffered
-#           write+read churn: ANY of the buffered fsx/fstest soakers can
-#           trip the race; measured per-run failure rates 2026-07-11:
-#           616 ~2/3, 074 ~2/3, 127 ~1/3, 075 ~1/5 (091 never observed).
-#           Signature: fstest child corruption at 512 B blocks / fsx READ
-#           BAD DATA of zeros for recently-written ranges, file durably
-#           correct afterward (transient read-side, not lost durability).
-#           Verified ZERO-DELTA vs dev@6a69952 (identical failures on the
-#           pristine baseline: seeded fsx ~1-2/3 either side, incl. 127's
-#           exact fsx line 1/3 on the baseline).
-#           Correlates with .stats staged_payload_lost_reads > 0 on a
-#           healthy mount: reads race a staged-identity transition
-#           (re-stage/promote/release window) and hit the zeros-degrade
-#           leg. Fix = staged-identity lifecycle work (read-side identity
-#           seqlock or drain-before-release), tracked as its own effort —
-#           see .benchmarks/2026-07-11-seek-hole-oom-and-quick-tier.md.
+#   127/616 (+074 fstest.2, 075) transient-ZEROS family = FIXED
+#           (fix/staged-identity-transient-zeros; ring atomic same-key
+#           replace f924085 + staged-identity read revalidation 0a184f3).
+#           Was: transient zeros reads under buffered write+read churn
+#           (fsx READ BAD DATA of zeros for recently-written ranges,
+#           durably correct afterward; 074 children corrupt), .stats
+#           staged_payload_lost_reads firing on a healthy mount. Root
+#           causes: (1) reserve_and_write removed the ring index entry for
+#           the whole replacement memcpy — every re-stage exposed a
+#           key-absent window whose readers fell into the crash-recovery
+#           zeros-degrade leg; (2) readers holding a pre-transition meta
+#           snapshot missed moved identities (staged→inline/striped, spill
+#           re-id, promote) — reads now re-resolve and re-dispatch
+#           bounded, and the zeros leg is reachable only for a STABLE lost
+#           identity (genuine crash loss). Acceptance 2026-07-11: seeded
+#           shapes 6/6 each (616 golden line, 127 fsx_std_mmap seed
+#           191110531, 074 fstest.2 -F children), lost_reads = 0 across
+#           all 18 runs + a 15-min 3.06M-op fsx churn (RSS creep also
+#           fixed: dead ring extents punched). Pins in
+#           tests/staged_identity_visibility_tests.rs. A recurrence of
+#           the ZEROS signature on these tests IS a regression.
+#   FAIL (nondeterministic, REAL pre-existing — distinct striped-tier bug,
+#         under watch):
+#     074 = the fstest.3 leg only (-s 30M -b 512 -m: mmap-written striped
+#           files re-read after kernel reclaim) under the harness's
+#           500 MB disk-cache budget: whole 512 B blocks read back as a
+#           NEARBY ROUND's fill (loop±1/2 at block-scale offsets) — STALE
+#           CONTENT, never zeros. NOT the staged-identity family: fires
+#           with staged_payload_lost_reads == staged_identity_retries ==
+#           stale_binding_rebinds == 0, reproduces identically on pristine
+#           dev@74190d2 (5/6 vs 4-6/6 post-fix; fresh volume 4/6), and is
+#           budget-dependent (uncapped mounts: 0/8). Isolated repro:
+#           fstest -n 3 -F -l 10 -f 5 -s 31457280 -b 512 -m under
+#           --disk-cache-size 500MB. Falsified so far: read-side
+#           active-buffer checkout reprobe (0/6), RAM->NVMe dehydration
+#           publish (0/6 disabled). Needs its own striped
+#           writeback/allocator-reuse root-cause effort.
+#   FLAKE (pre-existing capacity shape under SQUEEZEFS_FSTESTS_MEMMAX=8G):
+#     tier-tail tests (observed on 618) can fail via _check_dmesg when the
+#           TEST daemon's CUMULATIVE budgeted RSS over the 19-test roll
+#           (2x1GB RAM LRUs + 512MB/vol KV node cache + segments +
+#           jemalloc retention) crosses the 8G rail mid-test and the
+#           cgroup OOM-kills the daemon. NOT a leak and NOT new: pristine
+#           dev@74190d2 peaks HIGHER on the same roll (5.63 GB vs 5.06 GB
+#           sampled 2026-07-11), fresh-mount 15-min fsx churn is
+#           self-limiting (3.06M ops, negative last-10-min drift), and
+#           618 standalone passes 3/3. An OOM on an EARLY test or under a
+#           bigger cap IS a regression.
 SQUEEZEFS_FSTESTS_QUICK=(
     generic/001 generic/003 generic/008 generic/009 generic/013
     generic/069 generic/074 generic/075 generic/091 generic/112

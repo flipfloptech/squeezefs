@@ -64,12 +64,17 @@ sudo ./target/release/squeezefs mount \
 ```
 
 ### Step 5: Run the Benchmark
-Run SqueezeFS parallel benchmarks to stress metadata and raw data operations:
+Run the SqueezeFS bench: explicit phases (`-w` write / `-r` read / `--stat` / `--del`) over a persistent dataset, with a user-settable I/O block size:
 ```bash
-./target/release/squeezefs bench /mnt/squeezefs --threads 4 --large-size 64
+# Write then read back 1 GiB per thread at 1 MiB ops across 4 threads
+./target/release/squeezefs bench /mnt/squeezefs -t 4 -w -r -s 1g -b 1m
+
+# Re-read the SAME dataset at a different block size (no rewrite), then clean up
+./target/release/squeezefs bench /mnt/squeezefs -t 4 -r -s 1g -b 128k
+./target/release/squeezefs bench /mnt/squeezefs -t 4 --del -s 1g
 ```
 
-Committed reference numbers for this bench (large-seq writes ~1.8 GB/s on the reference box via the zero-copy write path) live in `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`; compare your rows against that table when validating a setup.
+Committed reference numbers (large-seq writes ~1.8 GB/s on the reference box via the zero-copy write path) live in `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`; that table's large-seq row was produced by the old bench's default workload — the equivalent new invocation is `squeezefs bench /mnt/squeezefs -w -s 128m -b 1m`. Compare your rows against it when validating a setup.
 
 ### Step 6: Unmount Safely
 Use SqueezeFS unmount to drain staging writes and cleanly shut down:

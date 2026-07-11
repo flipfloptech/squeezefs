@@ -114,17 +114,30 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   ```
 
 * **Benchmark Mountpoint:**
-  Loads layout details from the FUSE mount and performs parallel read/write benchmarks, auditing metrics against the local `.stats` file.
+  Simplified-elbencho model: explicit phases over a **persistent, reusable dataset** at `<mountpoint>/squeezefs-bench/t{tid}/f{fid}.bin`, one shape vocabulary, per-phase THROUGHPUT / IOPS / latency (min/avg/p99/max) rows, audited against the daemon's `.stats` metrics delta.
   ```bash
-  squeezefs bench <mountpoint> [options]
+  squeezefs bench <mountpoint> [phases] [shape]
+  # e.g. write then read 1 GiB/file across 4 threads at 1 MiB ops:
+  squeezefs bench /mnt/squeezefs -t 4 -w -r -s 1g -b 1m
+  # re-read the SAME dataset later at a different I/O size (no rewrite):
+  squeezefs bench /mnt/squeezefs -t 4 -r -s 1g -b 128k
   ```
-  *Options:*
-  - `--threads <num>`: Parallel workload threads (default: 4).
-  - `--iterations <num>`: Run loop count for benchmark runs.
-  - `--large-size <MB>`: Large file workload size.
-  - `--small-size <KB>`: Small file workload size.
-  - `--small-count <count>`: Small file writes count.
-  - `--direct`: Enable Direct I/O (O_DIRECT) path validation.
+  *Phases* (any combination, always executed in this fixed order; none given ⇒ `write+read`):
+  - `-w, --write`: create/overwrite the dataset, timed (includes create/open; each file is fsync'd before the clock stops — durable write numbers).
+  - `-r, --read`: read it back, timed (reuses the dataset from an earlier `-w`; loud shape-mismatch error otherwise — never silently creates files).
+  - `--stat`: stat every file, timed.
+  - `--del`: delete the dataset, timed (doubles as cleanup).
+
+  *Shape* (applies to all phases):
+  - `-t, --threads <N>`: workers (default: 1).
+  - `-n, --files <N>`: files per thread (default: 1).
+  - `-s, --size <SZ>`: file size, human units `4k`/`128k`/`4m`/`10g` or plain bytes (default: `1g`).
+  - `-b, --block <SZ>`: I/O size per operation, same units (default: `1m`).
+  - `--rand`: random offsets (shuffled full-coverage block list — every block exactly once).
+  - `--direct`: O_DIRECT (`-b` must be a multiple of 4096 and `-s` a multiple of `-b`).
+  - `-i, --iterations <N>`: repeat the selected phase set (default: 1).
+
+  Write phases fill blocks with a deterministic non-zero pattern seeded per `(thread, file, block)`, so transparent compression cannot fake throughput numbers.
 
 * **Instant Metadata Clone (CoW):**
   ```bash

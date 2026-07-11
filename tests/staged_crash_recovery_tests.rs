@@ -310,6 +310,99 @@ async fn test_recover_index_discards_corrupt_header_and_resyncs() {
 }
 
 // ===========================================================================
+// Contract 3b: READ-CACHE segments must come up COLD after a remount.
+//
+// The staging ring's keys are identity-stable across mounts (uuid file_ids;
+// inode-keyed active_block overlays) so recovering them is sound — but the
+// read cache is keyed by bare block keys whose offsets are freed and REUSED
+// across sessions, with no cross-session incarnation store to validate a
+// recovered entry against (the fill-time seqlock only guards live fills).
+// A resurrected read-cache entry under a reused key serves the PREVIOUS
+// incarnation's bytes — the crash-recovery twin of the reused-key
+// stale-fill family (fstests generic/616 zeros-read flake). A cache is
+// reconstructible: discard it at mount, never recover it.
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_read_cache_segments_do_not_resurrect_across_remount() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let meta = NamedTempFile::new().unwrap();
+    format_v3_file(meta.path(), 128 * 1024 * 1024).await;
+    let staging = tempdir().unwrap();
+
+    let block_key = "12345678";
+    let cached = pattern(9, 0, 8192);
+    let staged_content = pattern(9, 1, STAGED_LEN);
+    let file_id;
+    {
+        let h = router_h("rc_cold_vol", meta.path(), staging.path()).await;
+        h.fs.router
+            .cache
+            .nvme
+            .cache_read_block(block_key, bytes::Bytes::from(cached.clone()))
+            .expect("seed read cache");
+        assert!(
+            h.fs.router
+                .cache
+                .nvme
+                .read_cached_block(block_key)
+                .is_some(),
+            "read-cache entry must be resident before the remount"
+        );
+        // And one real staged file: staging MUST keep surviving remounts.
+        let ino =
+            h.fs.create(h.req, 1, OsStr::new("keepme.bin"), libc::S_IFREG | 0o644, 0)
+                .await
+                .expect("create")
+                .attr
+                .ino;
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            0,
+            bytes::Bytes::copy_from_slice(&staged_content),
+            0,
+            0,
+        )
+        .await
+        .expect("staged write");
+        let layout = close_and_wait_staged(&h, ino).await;
+        file_id = layout.file_id.clone().expect("file_id");
+        assert!(h.fs.router.cache.nvme.read_staged(&file_id).is_some());
+    }
+
+    // Remount over the same staging dir (same generation).
+    let h2 = router_h("rc_cold_vol", meta.path(), staging.path()).await;
+
+    // Staging ring: identity-stable, must recover.
+    let got = h2
+        .fs
+        .router
+        .cache
+        .nvme
+        .read_staged(&file_id)
+        .expect("staged ring entry must survive the remount (sole copy of dirty data)");
+    assert_bytes_exact(&staged_content, &got, "recovered staged entry");
+
+    // Read cache: keys are NOT incarnation-stable across mounts — a
+    // resurrected entry under a reused offset key serves the previous
+    // incarnation's bytes. Must come up cold.
+    assert!(
+        h2.fs
+            .router
+            .cache
+            .nvme
+            .read_cached_block(block_key)
+            .is_none(),
+        "read-cache entry RESURRECTED across remount — under offset reuse this serves \
+         another incarnation's bytes (the generic/616 zeros-read class)"
+    );
+}
+
+// ===========================================================================
 // Contract 4: router read degrade — staged meta, no ring entry, no mapping
 // ⇒ size-consistent zeros, never an error.
 // ===========================================================================

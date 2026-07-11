@@ -442,21 +442,38 @@ impl NvmeStaging {
             }
         }
 
-        // Initialize directories for segments
+        // Initialize directories for segments.
+        //
+        // Read-cache segments come up COLD on purpose: the read cache is
+        // keyed by bare block keys whose offsets are freed and REUSED
+        // across sessions, and there is no cross-session incarnation store
+        // to validate a recovered entry against (the fill-time seqlock
+        // only guards live fills). A resurrected entry under a reused key
+        // serves the PREVIOUS incarnation's bytes — the crash-recovery
+        // twin of the reused-key stale-fill family. A cache is
+        // reconstructible; stale-poisonable state is not worth recovering:
+        // wipe it, never index it. The STAGING segments are the opposite —
+        // sole copy of dirty data under identity-stable keys (uuid
+        // file_ids, inode-keyed overlays) — and are recovered below.
         let mut read_cache_dirs = Vec::new();
         let mut staging_segment_dirs = Vec::new();
-        let mut read_cache_dirs_have_data = Vec::new();
         let mut staging_segment_dirs_have_data = Vec::new();
         for dir in &staging_dirs {
             let rc_dir = dir.join("cache_segment");
             let ss_dir = dir.join("staging_segment");
-            let rc_has_data = dir_has_segment_data(&rc_dir);
             let ss_has_data = dir_has_segment_data(&ss_dir);
+            let (rc_files, rc_bytes) = wipe_segment_files(&rc_dir)?;
+            if rc_files > 0 {
+                log::info!(
+                    "staging init: discarded {rc_files} read-cache segment file(s) \
+                     ({rc_bytes} B) from a previous session — read cache starts cold \
+                     (block-key offsets are not incarnation-stable across mounts)"
+                );
+            }
             fs::create_dir_all(&rc_dir)?;
             fs::create_dir_all(&ss_dir)?;
             read_cache_dirs.push(rc_dir);
             staging_segment_dirs.push(ss_dir);
-            read_cache_dirs_have_data.push(rc_has_data);
             staging_segment_dirs_have_data.push(ss_has_data);
         }
 
@@ -529,15 +546,15 @@ impl NvmeStaging {
             write_shards,
         )?);
 
-        // Recover persistent indexes only when segment data existed before this startup.
+        // Recover the STAGING index only when segment data existed before
+        // this startup (read-cache segments were wiped above — see the
+        // init comment: never recover a cache under non-incarnation-stable
+        // keys).
         if staging_segment_dirs_have_data
             .iter()
             .any(|has_data| *has_data)
         {
             staging_nvme_cache.recover_index();
-        }
-        if read_cache_dirs_have_data.iter().any(|has_data| *has_data) {
-            read_nvme_cache.recover_index();
         }
 
         // Seed the staged-write budget from recovered *staged* entries only.

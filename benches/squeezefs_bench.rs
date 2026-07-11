@@ -150,5 +150,42 @@ fn bench_crypto_compress(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_crypto_compress);
+/// Micro-benches for the `squeezefs bench` engine helpers that sit on the
+/// load generator's per-op path: the deterministic pattern fill (runs once
+/// per written block — must comfortably outpace the mount's write
+/// throughput) and the size parser / block-order shuffle (startup cost).
+fn bench_bench_engine_helpers(c: &mut Criterion) {
+    use squeezefs::bench::{block_order, fill_block, parse_size};
+
+    let mut group = c.benchmark_group("bench_engine_helpers");
+
+    for (label, len) in [("4k", 4usize * 1024), ("1m", 1024 * 1024)] {
+        let mut buf = vec![0u8; len];
+        group.throughput(criterion::Throughput::Bytes(len as u64));
+        group.bench_with_input(BenchmarkId::new("fill_block", label), &len, |b, _| {
+            let mut block = 0u64;
+            b.iter(|| {
+                block = block.wrapping_add(1);
+                fill_block(&mut buf, 3, 7, block);
+            });
+        });
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("bench_engine_setup");
+    group.bench_function("parse_size", |b| {
+        b.iter(|| {
+            parse_size(std::hint::black_box("128k")).unwrap()
+                + parse_size(std::hint::black_box("10g")).unwrap()
+                + parse_size(std::hint::black_box("1048576")).unwrap()
+        })
+    });
+    // 1 GiB @ 1 MiB blocks = 1024 entries: the default shape's shuffle.
+    group.bench_function("block_order_rand_1024", |b| {
+        b.iter(|| block_order(std::hint::black_box(true), 1024))
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_crypto_compress, bench_bench_engine_helpers);
 criterion_main!(benches);

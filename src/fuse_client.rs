@@ -4718,27 +4718,30 @@ impl Filesystem for SqueezefsFilesystem {
         const CFR_MAX_CHUNK: u64 = 16 * 1024 * 1024;
         let effective_len = length.min(CFR_MAX_CHUNK) as usize;
 
-        let src_data = bytes::Bytes::from(
-            self.router
-                .read_file(&src_path)
-                .await
-                .map_err(map_squeezefs_err)?,
-        );
-        let off = off_in as usize;
+        // O(chunk) source read — NEVER a whole-file materialization. The old
+        // `read_file(&src_path)` assembled the entire source in RAM, which for
+        // a huge sparse file (generic/285-scale: 8 GiB–16 TiB logical) meant
+        // an O(logical size) allocation to serve a 64 KiB copy. The range
+        // read serves interior holes as zeros at their correct positions;
+        // `_src_backing` keeps any zero-copy mmap segment alive until the
+        // chunk has been consumed below.
+        let (src_data, _src_backing) = self
+            .router
+            .read_file_range_zero_copy(&src_path, off_in, effective_len as u32, None)
+            .await
+            .map_err(map_squeezefs_err)?;
         let phys = src_data.len();
         // `effective_len > 0` here (length > 0), so the chunk is always
         // non-empty regardless of the physical/logical gap.
-        let chunk: bytes::Bytes = if off < phys && off + effective_len <= phys {
+        let chunk: bytes::Bytes = if phys >= effective_len {
             // Fully backed by physical data: zero-copy slice.
-            src_data.slice(off..off + effective_len)
+            src_data.slice(0..effective_len)
         } else {
-            // Range straddles or lies within a hole: assemble exactly
-            // effective_len bytes — real data first, then zeros for the hole.
+            // Short read = the range runs past the physical tail into the
+            // hole/EOF gap: assemble exactly effective_len bytes — real data
+            // first, then zeros.
             let mut buf = vec![0u8; effective_len];
-            if off < phys {
-                let take = (phys - off).min(effective_len);
-                buf[..take].copy_from_slice(&src_data[off..off + take]);
-            }
+            buf[..phys].copy_from_slice(&src_data);
             bytes::Bytes::from(buf)
         };
 

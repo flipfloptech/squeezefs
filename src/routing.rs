@@ -2180,31 +2180,76 @@ impl DataRouter {
             }
         };
 
-        // Patch / assemble payload
-        let (payload_bytes, new_size) = if full_overwrite_empty && offset == 0 {
-            let new_size = data.len();
-            (data.clone(), new_size)
-        } else {
-            if existing_data.len() < end_offset {
-                existing_data.resize(end_offset, 0);
-            }
-            existing_data[offset as usize..end_offset].copy_from_slice(&data);
-            let new_size = existing_data.len();
-            (bytes::Bytes::from(existing_data), new_size)
-        };
+        // Logical size after this write. Folding `meta.size` in preserves a
+        // truncate-up / fallocate-extend hole (logical size beyond the
+        // physical payload): without it a small write regressed the file to
+        // its patched payload length, silently shrinking e.g. a 100 GiB
+        // truncate-up to 4 KiB (tests/sparse_write_bounded_tests.rs).
+        let existing_len = existing_data.len();
+        let new_size = existing_len.max(end_offset).max(meta.size as usize);
 
-        if end_offset > stripe_threshold || new_size > stripe_threshold {
-            // Transition layout → striped. Block data I/O runs unlocked; only
-            // the layout commit is serialized against concurrent staged
-            // promotion (see INODE_META_LOCKS).
-            let (block_mappings, _sizes, _block_count) =
-                self.durable_write_stripe_payload(payload_bytes).await?;
+        if new_size > stripe_threshold {
+            // Transition layout → striped, SPARSELY (the generic/285 OOM fix):
+            // file-content coverage is O(map), never O(logical size). Only the
+            // data-bearing blocks — those intersecting the existing payload
+            // [0, existing_len) or the new write [offset, end_offset) — are
+            // assembled and written; every other index stays UNMAPPED (a hole
+            // that reads zeros). The old path materialized the whole
+            // [0, end_offset) span in RAM and wrote every zero-filled hole
+            // block durably, which for seek_sanity_test's 8 TiB far write
+            // meant an ~8 TiB Vec zero-fill (~108 GB RSS → daemon OOM) and
+            // O(filesize) device writes for 64 KiB of data.
+            //
+            // Block data I/O runs unlocked; only the layout commit is
+            // serialized against concurrent staged promotion (see
+            // INODE_META_LOCKS).
+            let block_size = self.block_size.load(Ordering::Acquire) as usize;
+            let mut block_idxs = std::collections::BTreeSet::new();
+            for b in 0..existing_len.div_ceil(block_size) {
+                block_idxs.insert(b as u32);
+            }
+            if !data.is_empty() {
+                let first = offset as usize / block_size;
+                let last = (end_offset - 1) / block_size;
+                for b in first..=last {
+                    block_idxs.insert(b as u32);
+                }
+            }
+
+            // Per-block assembly, bounded by the write size (+1 block of
+            // existing payload): zeros base, existing bytes under, new data
+            // over. Blocks fully covered by `data` are zero-copy slices.
+            let data_start = offset as usize;
+            let mut chunks: Vec<(u32, bytes::Bytes)> = Vec::with_capacity(block_idxs.len());
+            for b in block_idxs {
+                let start = b as usize * block_size;
+                let chunk_len = block_size.min(new_size - start);
+                let chunk = if data_start <= start && end_offset >= start + chunk_len {
+                    // Entire chunk comes from the new write: slice, no copy
+                    // (the common aligned full-block case of a large write).
+                    data.slice(start - data_start..start - data_start + chunk_len)
+                } else {
+                    let mut buf = vec![0u8; chunk_len];
+                    if existing_len > start {
+                        let e_end = existing_len.min(start + chunk_len);
+                        buf[..e_end - start].copy_from_slice(&existing_data[start..e_end]);
+                    }
+                    if data_start < start + chunk_len && end_offset > start {
+                        let s = data_start.max(start);
+                        let e = end_offset.min(start + chunk_len);
+                        buf[s - start..e - start]
+                            .copy_from_slice(&data[s - data_start..e - data_start]);
+                    }
+                    bytes::Bytes::from(buf)
+                };
+                chunks.push((b, chunk));
+            }
+
+            let block_mappings = self.durable_write_sparse_blocks(chunks).await?;
 
             let mut block_map = std::collections::HashMap::new();
-            for (idx_str, key) in block_mappings {
-                if let Ok(idx) = idx_str.parse::<u32>() {
-                    block_map.insert(idx, key);
-                }
+            for (idx, key) in block_mappings {
+                block_map.insert(idx, key);
             }
 
             {
@@ -2240,6 +2285,22 @@ impl DataRouter {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+
+        // Small-layout patch/assemble. `end_offset <= new_size <=
+        // stripe_threshold <= block_size` past the promotion branch above, so
+        // this materialization is bounded by one block. `new_size` may still
+        // exceed the payload length (a truncate-up hole tail): inline/staged
+        // layouts carry that as an implicit-zero tail the read/RMW paths
+        // already honor (see truncate_layout).
+        let payload_bytes = if full_overwrite_empty && offset == 0 {
+            data.clone()
+        } else {
+            if existing_data.len() < end_offset {
+                existing_data.resize(end_offset, 0);
+            }
+            existing_data[offset as usize..end_offset].copy_from_slice(&data);
+            bytes::Bytes::from(existing_data)
+        };
 
         if new_size <= MAX_INLINE_SIZE {
             // Layout: inline — RAM only until fsync/release (writeback).
@@ -2422,76 +2483,32 @@ impl DataRouter {
 
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
-        } else {
-            // First-time striped layout (no staging dirs / above staged threshold).
-            let (block_mappings, _sizes, _block_count) =
-                self.durable_write_stripe_payload(payload_bytes).await?;
-
-            let mut block_map = std::collections::HashMap::new();
-            for (idx_str, key) in block_mappings {
-                if let Ok(idx) = idx_str.parse::<u32>() {
-                    block_map.insert(idx, key);
-                }
-            }
-
-            {
-                // First-time striped commit under INODE_META_LOCKS, for
-                // uniformity with its transition siblings above (§5.3
-                // census): without the guard, two concurrent first-writers
-                // on a brand-new file could interleave their create-time
-                // saves (the conditional block-0 guard at the top of
-                // `write_file` does not cover a default/empty `file_type`).
-                let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
-                let mut updated_meta = meta.clone();
-                updated_meta.file_type = "striped".to_string();
-                updated_meta.size = new_size as u64;
-                updated_meta.block_map = Some(block_map);
-                self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
-                    .await?;
-
-                self.cache.write_lru.remove(file_path);
-                self.cache.read_lru.remove(file_path);
-
-                self.metadata_cache
-                    .insert(file_path.to_string(), updated_meta);
-            }
-            crate::fuse_client::METRICS
-                .layout_striped_writes
-                .fetch_add(1, Ordering::Relaxed);
         }
+        // No further arm: past the promotion branch `new_size <=
+        // stripe_threshold`, which is MAX_INLINE_SIZE on cache-less volumes
+        // (inline arm always matches) and block_size when staging dirs exist
+        // (staged arm always matches).
 
         Ok(())
     }
 
-    /// Persist `payload` as contiguous stripe blocks on the active backend.
+    /// Persist a SPARSE set of `(block_idx, chunk)` stripe blocks on the
+    /// active backend, returning their `(block_idx, block_key)` mappings.
+    /// Indices absent from `chunks` stay unmapped — holes that read zeros —
+    /// which is what keeps layout promotion O(map) instead of O(logical size)
+    /// (the generic/285 OOM fix).
     ///
     /// Every block I/O is **awaited**. On any allocate/crypto/write failure, all
     /// blocks allocated in this call are freed and the error is returned so the
     /// caller can leave the prior layout (inline/staged) untouched.
-    async fn durable_write_stripe_payload(
+    async fn durable_write_sparse_blocks(
         &self,
-        payload: bytes::Bytes,
-    ) -> Result<(
-        Vec<(String, String)>,       // (block_idx, block_key)
-        Vec<(String, usize, usize)>, // (block_key, logical_len, physical_len)
-        u32,                         // block_count
-    )> {
-        let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        let mut block_mappings: Vec<(String, String)> = Vec::new();
-        let mut sizes_to_register: Vec<(String, usize, usize)> = Vec::new();
+        chunks: Vec<(u32, bytes::Bytes)>,
+    ) -> Result<Vec<(u32, String)>> {
+        let mut block_mappings: Vec<(u32, String)> = Vec::new();
         let mut allocated_keys: Vec<String> = Vec::new();
-        let mut offset_cursor = 0usize;
-        let mut block_count = 0u32;
-        let payload_len = payload.len();
 
-        while offset_cursor < payload_len {
-            let end = std::cmp::min(offset_cursor + block_size, payload_len);
-            // SAFETY: offset_cursor < payload_len, end clamped to payload_len
-            let chunk = unsafe {
-                let sub = payload.get_unchecked(offset_cursor..end);
-                payload.slice_ref(sub)
-            };
-
+        for (block_idx, chunk) in chunks {
             let (be_id, block_allocator, nvme_writer) =
                 match self.backend_router.get_active_backend() {
                     Ok(res) => res,
@@ -2515,7 +2532,6 @@ impl DataRouter {
             let stored_block_key = self.backend_router.persist_block_key(&be_id, offset);
             allocated_keys.push(stored_block_key.clone());
 
-            let chunk_len = chunk.len();
             let processed = match self.get_crypto().process_write_async(chunk.clone()).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -2525,7 +2541,6 @@ impl DataRouter {
                     return Err(e);
                 }
             };
-            let processed_len = processed.len();
 
             if let Err(e) = nvme_writer.write_block(offset, processed).await {
                 for k in &allocated_keys {
@@ -2543,13 +2558,10 @@ impl DataRouter {
             self.cache.nvme.remove_cached_read_block(&stored_block_key);
             block_allocator.publish_block(offset);
 
-            block_mappings.push((block_count.to_string(), stored_block_key.clone()));
-            sizes_to_register.push((stored_block_key, chunk_len, processed_len));
-            offset_cursor = end;
-            block_count += 1;
+            block_mappings.push((block_idx, stored_block_key));
         }
 
-        Ok((block_mappings, sizes_to_register, block_count))
+        Ok(block_mappings)
     }
 
     /// Register a completed stripe layout in MetaLV after durable block writes.
@@ -2783,156 +2795,6 @@ impl DataRouter {
         self.cache.write_lru.remove(file_path);
         self.cache.read_lru.remove(file_path);
         Ok(())
-    }
-
-    /// Read file data, attempting to satisfy the read via the fastest cache tier.
-    pub async fn read_file(&self, file_path: &str) -> Result<Vec<u8>> {
-        // Fetch file metadata from local cache or metadata backend
-        let meta = self.fetch_metadata(file_path).await?;
-
-        // The whole-file RAM snapshot (write_lru/read_lru keyed by file_path)
-        // is trusted ONLY for inline files, where every write rewrites it
-        // atomically. For striped files it goes stale under sub-file
-        // mutations that never touch it — a PARKED partial-block write
-        // mutates only its ActiveBlockBuf, so a snapshot cached by an earlier
-        // read_file silently misses those bytes (the generic/075.2 lost-copy:
-        // copy_file_range sourced a stale short snapshot). Same discipline as
-        // read_file_range_zero_copy.
-        if meta.file_type == "inline" {
-            let mut cached_opt = self.cache.write_lru.get(file_path);
-            if cached_opt.is_none() {
-                cached_opt = self.cache.read_lru.get(file_path);
-            }
-            if let Some(cached_data) = cached_opt {
-                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    "Routing: Cache hit (Tier 2 - System RAM) for '{}'",
-                    file_path
-                );
-                return Ok(cached_data.to_vec());
-            }
-        }
-        METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-
-        let data = match meta.file_type.as_str() {
-            "inline" => {
-                if let Some(ref d) = meta.data_key {
-                    d.to_vec()
-                } else {
-                    Vec::new()
-                }
-            }
-            "staged" => {
-                let file_id = meta.file_id.as_ref().ok_or_else(|| {
-                    SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
-                })?;
-
-                if let Some(staged_data) = self.cache.nvme.read_staged(file_id) {
-                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    staged_data
-                } else {
-                    let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
-                    if let Some(mapping_str) = mapping_opt {
-                        let (offset_u64, off, sz) = self.parse_block_mapping(&mapping_str)?;
-                        let packed_bytes =
-                            self.nvme_writer.read_block(offset_u64 + off, sz).await?;
-                        self.get_crypto()
-                            .process_read_async(packed_bytes)
-                            .await?
-                            .to_vec()
-                    } else {
-                        // Lost staged payload (see read_file_range_zero_copy):
-                        // degrade to size-consistent zeros, never an error.
-                        self.note_lost_staged_payload(file_path, file_id);
-                        vec![0u8; meta.size as usize]
-                    }
-                }
-            }
-            "striped" => {
-                let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
-                let meta_size = meta.size;
-                let num_blocks = meta_size.div_ceil(block_size) as u32;
-
-                let block_keys = self
-                    .load_striped_block_keys(file_path, &meta, 0, num_blocks.saturating_sub(1))
-                    .await?;
-
-                // P1-5: bounded concurrency (order preserved via index sort).
-                // Tier order mirrors read_file_range_zero_copy: the staged
-                // `active_block:` overlay (a spilled / writeback-pending
-                // partial block) is NEWER than the mapped block and must win.
-                use futures::stream::{self, StreamExt};
-                let file_path_owned = file_path.to_string();
-                let mut indexed: Vec<(usize, Result<crate::cache::pool::ReadBlockValue>)> =
-                    stream::iter(block_keys.into_iter().enumerate().map(
-                        |(i, (b_idx, block_key_opt))| {
-                            let router = self.clone();
-                            let fp = file_path_owned.clone();
-                            async move {
-                                let cache_key =
-                                    crate::keys::active_block_for_path(&fp, b_idx).to_string();
-                                let res = if let Some(overlay) =
-                                    router.cache.nvme.read_staged(&cache_key)
-                                {
-                                    Ok(crate::cache::pool::ReadBlockValue::Bytes(
-                                        bytes::Bytes::from(overlay),
-                                    ))
-                                } else {
-                                    // Binding-validated serve (reused-key
-                                    // stale-fill family): a stale b→key
-                                    // resolution must re-resolve, never
-                                    // return another block's bytes. A
-                                    // hole (initial or concurrent punch)
-                                    // reads zeros.
-                                    match router
-                                        .get_block_for_index(&fp, b_idx, block_key_opt.as_deref())
-                                        .await
-                                    {
-                                        Ok(Some(v)) => Ok(v),
-                                        Ok(None) => {
-                                            let mut buf = BUFFER_POOL.alloc();
-                                            buf.resize(block_size as usize, 0);
-                                            Ok(crate::cache::pool::ReadBlockValue::Pooled(buf))
-                                        }
-                                        Err(e) => Err(e),
-                                    }
-                                };
-                                (i, res)
-                            }
-                        },
-                    ))
-                    .buffer_unordered(crate::bg_admit::STRIPED_READ_CONCURRENCY)
-                    .collect()
-                    .await;
-                indexed.sort_by_key(|(i, _)| *i);
-
-                let mut file_data = Vec::new();
-                for (_, block_data) in indexed {
-                    file_data.extend_from_slice(&block_data?);
-                }
-                if file_data.len() > meta_size as usize {
-                    file_data.truncate(meta_size as usize);
-                }
-                file_data
-            }
-            _ => {
-                return Err(SqueezefsError::InvalidOperation(format!(
-                    "Unknown file type: {}",
-                    meta.file_type
-                )));
-            }
-        };
-
-        // Cache in Tier 2 (System RAM) — inline only: that is the only
-        // layout whose whole-file snapshot every mutation path keeps
-        // coherent (and the only layout the read side above consults it for).
-        if meta.file_type == "inline" {
-            self.cache
-                .read_lru
-                .put(file_path, bytes::Bytes::from(data.clone()));
-        }
-
-        Ok(data)
     }
 
     pub async fn read_file_range_zero_copy(

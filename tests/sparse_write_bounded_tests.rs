@@ -155,6 +155,20 @@ async fn create(h: &H, name: &str) -> u64 {
         .ino
 }
 
+/// Touch every process-wide Lazy I/O pool (BUFFER_POOL / ALIGNED_BUF_POOL /
+/// crypto scratch) with a small striped write+read BEFORE measuring: those
+/// pools pre-allocate `max(cores*16, 64)` block-sized buffers on first use —
+/// a fixed ~1 GiB one-time cost on a 32-core box that the daemon pays at
+/// mount, not an O(logical size) signal. Without the warm-up the FIRST
+/// device write in the process absorbs the pool init into its RSS delta.
+async fn warm_io_pools(h: &H) {
+    let ino = create(h, "pool_warmup").await;
+    let buf = vec![b'w'; 3 * BS as usize]; // > BS => striped, 3 blocks
+    write_at(h, ino, 0, &buf).await;
+    let got = read_at(h, ino, 0, 3 * BS as u32).await;
+    assert_eq!(got, buf, "warm-up readback");
+}
+
 async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
     let w =
         h.fs.write(
@@ -217,12 +231,11 @@ fn vm_hwm_kb() -> u64 {
 /// Number of mapped (data-bearing) blocks in the file's layout — the O(map)
 /// signal. Unmapped indices are holes.
 async fn mapped_blocks(h: &H, ino: u64) -> usize {
-    let meta = h
-        .fs
-        .router
-        .fetch_metadata(&format!("inode_{ino}"))
-        .await
-        .expect("fetch_metadata");
+    let meta =
+        h.fs.router
+            .fetch_metadata(&format!("inode_{ino}"))
+            .await
+            .expect("fetch_metadata");
     meta.block_map.as_ref().map(|m| m.len()).unwrap_or(0)
 }
 
@@ -243,6 +256,7 @@ async fn assert_zeros(h: &H, ino: u64, off: u64, len: u32, tag: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn huge_sparse_far_write_is_bounded_and_omap() {
     let h = make(true).await;
+    warm_io_pools(&h).await;
     let ino = create(&h, "seek_sanity_285").await;
     let buf = vec![b'a'; BS as usize];
 
@@ -259,7 +273,11 @@ async fn huge_sparse_far_write_is_bounded_and_omap() {
         RSS_BOUND_KB
     );
 
-    assert_eq!(size_of(&h, ino).await, HUGE, "size must be end of far write");
+    assert_eq!(
+        size_of(&h, ino).await,
+        HUGE,
+        "size must be end of far write"
+    );
 
     // O(map): only the two data-bearing 64 KiB blocks may be mapped — the
     // ~131 070 hole blocks must NOT exist (neither in RAM nor on device).
@@ -291,6 +309,7 @@ async fn huge_sparse_far_write_is_bounded_and_omap() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sparse_far_write_unaligned_straddle_correct() {
     let h = make(true).await;
+    warm_io_pools(&h).await;
     let ino = create(&h, "straddle_285").await;
     let head = vec![b'h'; 8192];
     write_at(&h, ino, 0, &head).await; // staged 8 KiB
@@ -329,6 +348,7 @@ async fn sparse_far_write_unaligned_straddle_correct() {
 #[tokio::test(flavor = "multi_thread")]
 async fn truncate_up_then_small_write_preserves_size_bounded() {
     let h = make(true).await;
+    warm_io_pools(&h).await;
     let ino = create(&h, "trunc_100g").await;
 
     let hwm_before = vm_hwm_kb();
@@ -367,6 +387,7 @@ async fn truncate_up_then_small_write_preserves_size_bounded() {
 #[tokio::test(flavor = "multi_thread")]
 async fn copy_file_range_source_read_is_bounded() {
     let h = make(true).await;
+    warm_io_pools(&h).await;
     let src = create(&h, "cfr_sparse_src").await;
     let dst = create(&h, "cfr_dst").await;
 
@@ -378,12 +399,11 @@ async fn copy_file_range_source_read_is_bounded() {
     assert_eq!(size_of(&h, src).await, HUGE);
 
     let hwm_before = vm_hwm_kb();
-    let copied = h
-        .fs
-        .copy_file_range(h.req, src, 0, 0, dst, 0, 0, BS, 0)
-        .await
-        .expect("copy_file_range")
-        .copied;
+    let copied =
+        h.fs.copy_file_range(h.req, src, 0, 0, dst, 0, 0, BS, 0)
+            .await
+            .expect("copy_file_range")
+            .copied;
     let hwm_delta = vm_hwm_kb() - hwm_before;
 
     assert!(
@@ -405,6 +425,7 @@ async fn copy_file_range_source_read_is_bounded() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cacheless_far_write_is_bounded_and_omap() {
     let h = make(false).await;
+    warm_io_pools(&h).await;
     let ino = create(&h, "cacheless_285").await;
     let head = vec![b'i'; 2048]; // stays inline
     write_at(&h, ino, 0, &head).await;
@@ -420,7 +441,10 @@ async fn cacheless_far_write_is_bounded_and_omap() {
 
     assert_eq!(size_of(&h, ino).await, HUGE);
     let mapped = mapped_blocks(&h, ino).await;
-    assert!(mapped <= 3, "cache-less far write over-mapped: {mapped} blocks");
+    assert!(
+        mapped <= 3,
+        "cache-less far write over-mapped: {mapped} blocks"
+    );
 
     assert_eq!(read_at(&h, ino, 0, 2048).await, head, "inline head lost");
     assert_eq!(

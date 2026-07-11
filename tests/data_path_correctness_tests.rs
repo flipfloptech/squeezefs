@@ -1468,7 +1468,10 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
         grown.block_map_id
     );
 
-    // (c) read the already-indirect map back — every entry exact.
+    // (c) read the already-indirect map back — every entry exact. The blob
+    // is the versioned backend-true encoding (magic `SQFSIMAP` + LE u32
+    // version 1 + bincode `Vec<(u32, String)>` of verbatim key strings —
+    // pinned in full by the indirect_map_backend_keys suite).
     let key = grown
         .block_map_id
         .as_deref()
@@ -1480,18 +1483,25 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
         .read_block(key, K8_BLOCK_SIZE as usize)
         .await
         .expect("read indirect block");
-    let entries: Vec<(u32, u64)> = bincode::deserialize(&raw).expect("deserialize indirect map");
+    assert_eq!(&raw[..8], b"SQFSIMAP", "versioned indirect blob magic");
+    assert_eq!(
+        u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+        1,
+        "indirect blob header version"
+    );
+    let entries: Vec<(u32, String)> =
+        bincode::deserialize(&raw[12..]).expect("deserialize indirect map");
     assert_eq!(
         entries.len(),
         big_map.len(),
         "indirect map holds every entry"
     );
-    let round: std::collections::HashMap<u32, u64> = entries.into_iter().collect();
+    let round: std::collections::HashMap<u32, String> = entries.into_iter().collect();
     for (b, s) in &big_map {
         assert_eq!(
             round.get(b),
-            Some(&s.parse::<u64>().unwrap()),
-            "indirect entry {b} must round-trip"
+            Some(s),
+            "indirect entry {b} must round-trip verbatim"
         );
     }
 

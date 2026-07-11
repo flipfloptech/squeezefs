@@ -381,7 +381,11 @@ impl BlockAllocator {
                                             let indirect_idx = block_offset / self.chunk_size;
                                             let _ = self.recover_block(indirect_idx).await;
                                         }
-                                        // Read the indirect block to recover its entries
+                                        // Read the indirect block to recover its entries.
+                                        // Entries carry backend-true key strings (versioned
+                                        // v1 blob): recover ONLY the offsets THIS volume
+                                        // owns — the same alias-aware matching the inline
+                                        // branch below applies.
                                         let block_size =
                                             backend_router.block_size.load(Ordering::Relaxed)
                                                 as usize;
@@ -389,12 +393,43 @@ impl BlockAllocator {
                                             .read_block(indirect_key, block_size)
                                             .await
                                         {
-                                            if let Ok(entries) =
-                                                bincode::deserialize::<Vec<(u32, u64)>>(&raw_bytes)
-                                            {
-                                                for (_b, offset) in entries {
-                                                    let block_idx = offset / self.chunk_size;
-                                                    let _ = self.recover_block(block_idx).await;
+                                            match crate::routing::decode_indirect_block_map(
+                                                &raw_bytes,
+                                            ) {
+                                                Ok(entries) => {
+                                                    for (_b, key) in entries {
+                                                        let key =
+                                                            crate::routing::clean_block_key(&key);
+                                                        let Ok((be_id, offset)) =
+                                                            backend_router.parse_block_key(&key)
+                                                        else {
+                                                            continue;
+                                                        };
+                                                        let owned = be_id
+                                                            == self._volume_id.as_ref()
+                                                            || ((be_id == "backend_0"
+                                                                || be_id == "squeezefs")
+                                                                && (self._volume_id.as_ref()
+                                                                    == "squeezefs"
+                                                                    || self._volume_id.as_ref()
+                                                                        == backend_router
+                                                                            .default_allocator
+                                                                            .volume_id()));
+                                                        if owned {
+                                                            let block_idx =
+                                                                offset / self.chunk_size;
+                                                            let _ =
+                                                                self.recover_block(block_idx).await;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::warn!(
+                                                        "refcount recovery: undecodable indirect \
+                                                         block map at '{}': {}",
+                                                        indirect_key,
+                                                        e
+                                                    );
                                                 }
                                             }
                                         }

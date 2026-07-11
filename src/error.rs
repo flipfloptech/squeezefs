@@ -25,6 +25,12 @@ pub enum SqueezefsError {
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
 
+    #[error(
+        "indirect block map: unsupported on-disk encoding ({detail}); \
+         pre-beta or foreign blob — reformat required (no backwards compatibility)"
+    )]
+    IndirectMapFormat { detail: String },
+
     #[error("GPU Direct Storage error: {0}")]
     GdsError(String),
 
@@ -69,6 +75,7 @@ impl SqueezefsError {
                     libc::EINVAL
                 }
             }
+            SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
             SqueezefsError::GdsError(_) => libc::EIO,
             SqueezefsError::CacheOverflow => libc::ENOMEM,
             SqueezefsError::Timeout => libc::ETIMEDOUT,

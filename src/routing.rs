@@ -210,7 +210,7 @@ fn err_backend_not_found(be_id: &str) -> crate::error::SqueezefsError {
 /// [`BackendRouter::free_blocks`] expects. The map stores per-block extra
 /// (packed length / crypto framing) after the offset; the allocator only keys
 /// on the offset.
-fn clean_block_key(bk: &str) -> String {
+pub(crate) fn clean_block_key(bk: &str) -> String {
     if let Some(pos) = bk.find("://") {
         let proto = &bk[..pos];
         let rest = &bk[pos + 3..];
@@ -219,6 +219,78 @@ fn clean_block_key(bk: &str) -> String {
     } else {
         bk.split(':').next().unwrap_or(bk).to_string()
     }
+}
+
+/// On-disk header of the INDIRECT block map — the spill target for layout
+/// maps whose serialized size exceeds the per-volume inline record cap
+/// (§5.3): 8-byte magic + LE u32 version, then a bincode
+/// `Vec<(u32, String)>` payload of `(block_idx, block_key)` entries carrying
+/// the SAME backend-true key strings the inline map persists
+/// ([`BackendRouter::persist_block_key`] output, verbatim — bare offset on
+/// the default slot, `name://offset` elsewhere). The header exists so the
+/// NEXT encoding change is a version bump, not a format break.
+const INDIRECT_MAP_MAGIC: [u8; 8] = *b"SQFSIMAP";
+const INDIRECT_MAP_VERSION: u32 = 1;
+const INDIRECT_MAP_HEADER_LEN: usize = 12;
+
+/// Serialize a block map for its indirect spill block (see
+/// [`INDIRECT_MAP_MAGIC`]). Entries are sorted by block index for
+/// deterministic on-disk bytes. The retired pre-versioned shape serialized
+/// `Vec<(u32, u64)>` bare offsets, which lost the owning backend: on
+/// multi-volume mounts every over-spill file's non-first-volume blocks were
+/// read/freed from the wrong device after rehydrate (the 8380049 residual).
+fn encode_indirect_block_map(
+    block_map: &std::collections::HashMap<u32, String>,
+) -> Result<Vec<u8>> {
+    let mut entries: Vec<(u32, &str)> = block_map
+        .iter()
+        .map(|(&b, key)| (b, key.as_str()))
+        .collect();
+    entries.sort_unstable_by_key(|&(b, _)| b);
+    let payload = bincode::serialize(&entries).map_err(|e| {
+        SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to serialize indirect block map: {:?}", e),
+        ))
+    })?;
+    let mut out = Vec::with_capacity(INDIRECT_MAP_HEADER_LEN + payload.len());
+    out.extend_from_slice(&INDIRECT_MAP_MAGIC);
+    out.extend_from_slice(&INDIRECT_MAP_VERSION.to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// Decode an indirect block-map blob (see [`INDIRECT_MAP_MAGIC`]). Trailing
+/// padding past the bincode payload is ignored (blobs are written
+/// 4 KiB-aligned and read back whole-block). Anything without the versioned
+/// header — notably the retired pre-versioned bare-offset `Vec<(u32, u64)>`
+/// shape — fails LOUD with [`SqueezefsError::IndirectMapFormat`]: silently
+/// rehydrating bare keys is exactly the wrong-device corruption this format
+/// bump retired, and there is no fleet to stay compatible with (always
+/// forward).
+pub(crate) fn decode_indirect_block_map(raw: &[u8]) -> Result<Vec<(u32, String)>> {
+    if raw.len() < INDIRECT_MAP_HEADER_LEN || raw[..8] != INDIRECT_MAP_MAGIC {
+        return Err(SqueezefsError::IndirectMapFormat {
+            detail: format!(
+                "missing {} header; first bytes {:02x?}",
+                String::from_utf8_lossy(&INDIRECT_MAP_MAGIC),
+                &raw[..raw.len().min(16)]
+            ),
+        });
+    }
+    let version = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    if version != INDIRECT_MAP_VERSION {
+        return Err(SqueezefsError::IndirectMapFormat {
+            detail: format!(
+                "unsupported version {version} (this build reads version {INDIRECT_MAP_VERSION})"
+            ),
+        });
+    }
+    bincode::deserialize::<Vec<(u32, String)>>(&raw[INDIRECT_MAP_HEADER_LEN..]).map_err(|e| {
+        SqueezefsError::IndirectMapFormat {
+            detail: format!("undecodable version-{version} payload: {e:?}"),
+        }
+    })
 }
 
 impl BackendRouter {
@@ -801,26 +873,22 @@ impl DataRouter {
                                 .backend_router
                                 .read_block(block_key, block_size)
                                 .await?;
-                            let entries = bincode::deserialize::<Vec<(u32, u64)>>(&raw_bytes)
-                                .map_err(|e| {
-                                    let sample = if raw_bytes.len() >= 32 {
-                                        format!("{:x?}", &raw_bytes[..32])
-                                    } else {
-                                        format!("{:x?}", &raw_bytes[..])
-                                    };
-                                    SqueezefsError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        format!(
-                                            "Failed to deserialize indirect block map: {:?}, raw_bytes len: {}, sample: {}",
-                                            e,
-                                            raw_bytes.len(),
-                                            sample
-                                        ),
-                                    ))
-                                })?;
-                            let mut map = std::collections::HashMap::new();
-                            for (b, offset) in entries {
-                                map.insert(b, offset.to_string());
+                            // Rehydrate the persisted key strings VERBATIM:
+                            // they are backend-true (`persist_block_key`
+                            // output) and must resolve to the same device
+                            // the bytes were written on.
+                            let entries = decode_indirect_block_map(&raw_bytes).map_err(|e| {
+                                log::error!(
+                                    "ino {}: indirect block map at '{}' is unreadable: {}",
+                                    ino,
+                                    block_key,
+                                    e
+                                );
+                                e
+                            })?;
+                            let mut map = std::collections::HashMap::with_capacity(entries.len());
+                            for (b, key) in entries {
+                                map.insert(b, key);
                             }
                             block_map = Some(map);
                         }
@@ -897,18 +965,31 @@ impl DataRouter {
 
         let bytes = if needs_indirect {
             let bm = m.block_map.as_ref().unwrap();
-            let mut entries: Vec<(u32, u64)> = Vec::with_capacity(bm.len());
-            for (&b, s) in bm {
-                if let Ok(offset) = self.backend_router.parse_block_offset(s) {
-                    entries.push((b, offset));
-                }
-            }
-            let mut serialized_map = bincode::serialize(&entries).map_err(|e| {
-                SqueezefsError::Io(std::io::Error::new(
+            // Backend-true spill (versioned v1 blob): the SAME key strings
+            // the inline map persists go to disk verbatim. Reducing them to
+            // bare offsets — the retired pre-versioned shape — lost the
+            // owning volume, so every rehydrated non-first-volume block was
+            // read/freed from the wrong device.
+            let mut serialized_map = encode_indirect_block_map(bm)?;
+            // The blob lives in ONE allocator block and the fetch path reads
+            // exactly one block back. Overflow must fail LOUD here: writing
+            // past the block would silently corrupt the neighboring
+            // allocation.
+            let map_block_size =
+                self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
+            if serialized_map.len() > map_block_size {
+                return Err(SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Failed to serialize indirect block map: {:?}", e),
-                ))
-            })?;
+                    format!(
+                        "indirect block map for ino {} ({} entries, {} B serialized) exceeds \
+                         one {} B block",
+                        ino,
+                        bm.len(),
+                        serialized_map.len(),
+                        map_block_size
+                    ),
+                )));
+            }
             let aligned_len = (serialized_map.len() + 4095) & !4095;
             serialized_map.resize(aligned_len, 0);
 

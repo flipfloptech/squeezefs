@@ -1,6 +1,6 @@
 # Design Doc: MetaLV Metadata Durability — Retiring the Write-Only WAL and Making the Sector-Commit Crash Contract Explicit
 
-> **Superseded on v3 volumes** by `docs/design-cow-kv-metadata.md` (CoW KV metadata: checksummed journal + root-flip checkpoints; §7.2 there answers this document's WAL-deletion findings point-by-point). The D0/D1/D2 contract described here remains the authoritative v2-volume story.
+> **Superseded** by `docs/design-cow-kv-metadata.md` (CoW KV metadata: checksummed journal + root-flip checkpoints; §7.2 there answers this document's WAL-deletion findings point-by-point). v2 support removed `fd22b69` (user directive: always forward) — the v2 sector-commit code this document describes no longer exists in the tree; the D0/D1/D2 contract here is historical context only.
 
 | | |
 |---|---|

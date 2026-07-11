@@ -43,7 +43,7 @@ Format the backing files using SqueezeFS URIs:
   sqmeta:///tmp/squeezefs_meta.bin \
   sqdata:///tmp/squeezefs_data.bin
 ```
-> New metadata volumes format as **v3** (CoW KV metadata) by default; existing v2 volumes still mount. Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`) and the v3 durability contract are covered in section 5; converting a v2 volume is section 6.
+> Metadata volumes format as **v3** (CoW KV metadata) — the only supported metadata format (legacy v2 volumes refuse to mount: reformat required). Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`) and the v3 durability contract are covered in section 5.
 
 ### Step 4: Mount Squeezefs
 Create the mount point and staging cache directories:
@@ -177,14 +177,10 @@ sudo ./target/release/squeezefs tune
 
 ## 5. Metadata Durability Knobs
 
-The metadata crash contract (levels **D0/D1/D2**) is documented in `README.md` → *Metadata Durability* and `docs/design-wal-crash-consistency.md` §3. New volumes format as **v3** (CoW KV metadata), which makes that contract **stronger by construction** — every on-disk unit is checksummed, torn writes are detected-and-ignored (never applied), and each transaction commits atomically as one checksummed journal entry, so the D1/D2 distinction collapses for v3 metadata (`docs/design-cow-kv-metadata.md` §4.10). Operationally:
+The metadata crash contract is documented in `README.md` → *Metadata Durability*: v3 (CoW KV metadata) holds it **by construction** — every on-disk unit is checksummed, torn writes are detected-and-ignored (never applied), and each transaction commits atomically as one checksummed journal entry (`docs/design-cow-kv-metadata.md` §4.10). Operationally:
 
 ```bash
-# Refuse to mount on storage that cannot promise 4 KiB atomic sector writes
-# (v2 volumes only; below `atomic4k` fails loud — check `.stats` → meta_volume_atomicity):
-sudo ./target/release/squeezefs mount sqmeta:///dev/main-pool/meta-vol /mnt/squeezefs --strict-meta-atomicity
-
-# Strict sync-on-commit metadata durability (default is a 50 ms deferred window; v2 and v3):
+# Strict sync-on-commit metadata durability (default is a 50 ms deferred window):
 SQUEEZEFS_META_FLUSH_INTERVAL_MS=0 sudo -E ./target/release/squeezefs mount …
 
 # v3 node-cache RAM budget (default 512 MiB) and dirty-node checkpoint cap
@@ -199,27 +195,6 @@ SQUEEZEFS_RECLAIM_BATCH=128 sudo -E ./target/release/squeezefs mount …
 
 v3 **format-time** knobs (`README.md` → *Format Squeezefs Volume*): `--meta-node-kib <64|128|256|512|1024>` (node size, default `256`; below 256 the per-volume record-value cap drops to `node_size/4`) and `--meta-journal-mb <MiB>` (journal ring, default `clamp(volume/64, 8 MiB, 32 MiB)`).
 
-File-backed sandbox volumes (section 1) classify **physically** as `file-backed`. On **v2** that carries the documented D2 torn-sector exposure on power loss — use 4 KiB-LBA NVMe (or kernels ≥ 6.11 with an atomic-write unit ≥ 4 KiB) for the `atomic4k` classification in production. On **v3** the same file-backed volume is `cow-checksummed`: the physical probe still reports as `meta_volume_atomicity_physical`, but metadata integrity no longer depends on it.
+File-backed sandbox volumes (section 1) classify **physically** as `file-backed` (reported as `meta_volume_atomicity_physical` on the `.stats` inode) — purely informational: metadata integrity does not depend on it; the contract field `meta_volume_atomicity` reads `cow-checksummed`.
 
----
-
-## 6. Migrating a v2 Metadata Volume to v3 (Offline)
-
-`squeezefs migrate` converts a v2 metadata volume to v3 **in place and offline** — unmount it first (a live client refuses the migration). It builds the v3 image into the free tail past the last live v2 xattr block, `fdatasync`s it, then flips the superblock at a **single checksummed sector**; no live v2 byte is touched before the flip, so migration is **crash-safe and idempotent** — interrupt it and re-run, a finished conversion is a clean no-op. **Back up the volume first regardless.**
-
-```bash
-# Dry run: build + verify + print the round-trip digest diff WITHOUT flipping the
-# superblock (nothing is committed):
-./target/release/squeezefs migrate sqmeta:///tmp/squeezefs_meta.bin --dry-run
-
-# Convert in place:
-./target/release/squeezefs migrate sqmeta:///tmp/squeezefs_meta.bin
-
-# If the free tail is too small for the v3 image, grow a FILE-BACKED volume
-# (refused on block devices — grow those externally or migrate to a new device):
-./target/release/squeezefs migrate sqmeta:///tmp/squeezefs_meta.bin --grow 300M
-
-# Verify: mount, then confirm the .stats inode reports meta_format_version "3".
-```
-
-Migration reclaims v2's dead journal region and per-ino xattr reservation as free v3 extents. Roll a fleet one volume per maintenance window; mixed v2/v3 sets are legal, and v2 mount support stays until fleet telemetry shows no `meta_format_version == "2"` volumes remain.
+> **Legacy format v2**: support was removed entirely. A v2 superblock refuses to mount ("no longer supported; reformat required"); reformat it to v3 with `squeezefs format --force` (destroys the old contents). The offline `squeezefs migrate` converter was deleted along with v2 support.

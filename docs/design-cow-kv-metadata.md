@@ -600,5 +600,6 @@ Every PR merged `--ff-only` to `dev` per the workflow. Verify with `git log`.
 | K8 | `522c61c` | `feat(routing): lift layout-xattr inline spill to the per-volume record cap` |
 | K9 | `c25fc19` | `feat(meta): squeezefs migrate — offline v2 → v3 converter` |
 | K10 | _(this PR)_ | `docs(meta): v3 durability, migrate runbook, AGENTS/README closure (PR K10)` |
+| — | `fd22b69` | `refactor(meta)!: drop v2 metadata format support entirely — v3 is the only format` — v2 support removed `fd22b69` (user directive: always forward). Rollout 5d / resolved OQ 4's fleet-telemetry trigger was overridden pre-beta (no fleet); the v2 backend, `format_v2_for_tests`, the K9 `migrate` converter, the quarantine machinery, and `--strict-meta-atomicity` are gone. §6.2's migrate design and the dual-format sections above stand as history, not as shipped surface. |
 
 Measured evidence for the §8 gates is in `.benchmarks/2026-07-09-kv-v3-gates.md` (K7).

@@ -163,6 +163,59 @@ pub struct NvmeShard {
 }
 
 impl NvmeShard {
+    /// Return a DEAD extent's pages to the OS. Superseded/removed entries
+    /// are tombstoned but their pages otherwise stay mapped-dirty: first-fit
+    /// placement walks the segment, so a re-stage churn drags resident
+    /// memory toward the whole segment size — unreclaimable when the
+    /// staging dir sits on tmpfs (the observed ~24 MB/min fsx churn creep,
+    /// OOM-killing capped daemons). File-backed shards punch a hole
+    /// (`FALLOC_FL_PUNCH_HOLE` frees page cache AND tmpfs blocks); anonymous
+    /// shards `madvise(MADV_DONTNEED)`. Both leave the range reading zeros —
+    /// no `BLOCK_MAGIC`, so `recover_index` never resurrects the dead copy
+    /// (strictly better than the 4-byte tombstone alone).
+    ///
+    /// MUST be called with the shard write lock held: §5.5 read guards on
+    /// the dying extent hold the shard read lock, so the caller's write lock
+    /// proves no reader is inside the range.
+    fn reclaim_extent(&self, inner: &mut NvmeShardInner, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        debug_assert!(offset + len <= inner.capacity);
+        if let Some(ref file) = self._file {
+            use std::os::unix::io::AsRawFd;
+            let res = unsafe {
+                libc::fallocate(
+                    file.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset as libc::off_t,
+                    len as libc::off_t,
+                )
+            };
+            if res == 0 {
+                return;
+            }
+            // Filesystem without punch support: fall through to the
+            // tombstone + madvise path below.
+        }
+        // Zero the header so recovery can never decode the dead copy, then
+        // drop the page range (anon: frees pages; file-backed fallback:
+        // best-effort PTE drop).
+        inner.mmap[offset..offset + HEADER_SIZE.min(len)].fill(0);
+        let page = 4096usize;
+        let aligned_start = offset.div_ceil(page) * page;
+        let aligned_end = ((offset + len) / page) * page;
+        if aligned_end > aligned_start {
+            unsafe {
+                libc::madvise(
+                    inner.mmap.as_ptr().add(aligned_start) as *mut libc::c_void,
+                    aligned_end - aligned_start,
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
+    }
+
     fn new(path: &Path, capacity: usize) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -439,11 +492,14 @@ impl NvmeShard {
             };
             let val_offset = target_offset + val_delta;
 
-            // Invalidate/remove key from map if it already existed
-            let old_meta = inner.map.remove(&key);
-            if old_meta.is_some() {
-                inner.active_keys.retain(|k| k != &key);
-            }
+            // Same-key replace is ATOMIC for readers: the existing entry
+            // STAYS in the index (and in `live`, so the new placement never
+            // overlaps it) while the replacement is copied. The index flips
+            // old→new in phase 2 under the write lock — a concurrent `get`
+            // resolves one intact copy at every instant, never None (the
+            // fstests 074/127/616 transient-zeros window: a read that
+            // missed here fell into the zeros-degrade leg).
+            let old_meta = inner.map.get(&key).copied();
 
             inner.write_offset = target_offset + block_size;
             let mmap_ptr = inner.mmap.as_ptr() as *mut u8;
@@ -451,6 +507,13 @@ impl NvmeShard {
         };
 
         // Perform memory copy and disk flushing OUTSIDE of the lock!
+        //
+        // SAFETY of the unlocked copy: the target range overlaps no live
+        // extent (`fits`), including the old copy of `key` (still indexed),
+        // and concurrent placements serialize on the write lock with this
+        // range reserved via `write_offset`/`map` once phase 2 lands — see
+        // the placement comment above. Readers can only reach the range
+        // after phase 2 publishes it.
         unsafe {
             // Write magic
             std::ptr::copy_nonoverlapping(
@@ -489,17 +552,6 @@ impl NvmeShard {
             }
             std::ptr::copy_nonoverlapping(data.as_ptr(), mmap_ptr.add(cur), data.len());
 
-            // Tombstone the replaced copy only after the new one is fully
-            // written: a crash in between leaves at most one live copy.
-            if let Some(ref old) = old_meta {
-                std::ptr::write_bytes(mmap_ptr.add(old.offset), 0, 4);
-                libc::msync(
-                    mmap_ptr.add(old.offset) as *mut libc::c_void,
-                    4,
-                    libc::MS_ASYNC,
-                );
-            }
-
             libc::msync(
                 mmap_ptr.add(target_offset) as *mut libc::c_void,
                 block_size,
@@ -507,15 +559,26 @@ impl NvmeShard {
             );
         }
 
-        // Phase 2: Insert into tracking map
+        // Phase 2: flip the index to the fully-written replacement, then
+        // reclaim the superseded copy — both under the write lock, so no
+        // reader holds a guard on the old extent (guards pin the read lock)
+        // and no `get` window exists where the key is absent. Crash story
+        // unchanged: the old copy dies only after the new one is complete
+        // (a crash in between leaves duplicates; `recover_index` dedupes
+        // last-wins).
         {
             let mut inner = self.inner.write();
             let meta = BlockMeta {
                 offset: target_offset,
                 len: block_size,
             };
-            inner.map.insert(key.clone(), meta);
+            if inner.map.insert(key.clone(), meta).is_some() {
+                inner.active_keys.retain(|k| k != &key);
+            }
             inner.active_keys.push_back(key);
+            if let Some(old) = old_meta {
+                self.reclaim_extent(&mut inner, old.offset, old.len);
+            }
         }
 
         true
@@ -547,9 +610,11 @@ impl NvmeShard {
             let val_end = val_start + val_len;
             let val = Bytes::copy_from_slice(&inner.mmap[val_start..val_end]);
 
-            // Overwrite magic to invalidate on disk
+            // Overwrite magic to invalidate on disk, then return the dead
+            // extent's pages to the OS (RSS creep fix — see reclaim_extent).
             inner.mmap[meta.offset..meta.offset + 4].copy_from_slice(&0u32.to_le_bytes());
             let _ = inner.mmap.flush_range(meta.offset, 4);
+            self.reclaim_extent(&mut inner, meta.offset, meta.len);
 
             Some(val)
         } else {

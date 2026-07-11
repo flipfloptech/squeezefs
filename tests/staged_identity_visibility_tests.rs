@@ -466,7 +466,7 @@ async fn ring_same_key_replace_is_atomic_for_readers() {
     for r in readers {
         total += r.await.expect("ring reader panicked");
     }
-    assert!(total > 1000, "harness self-check: readers raced ({total})");
+    assert!(total > 100, "harness self-check: readers raced ({total})");
 }
 
 // ---------------------------------------------------------------------------

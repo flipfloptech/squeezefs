@@ -1,20 +1,18 @@
-//! PR K6a integration tests: superblock v3 + the dual-format version gate,
-//! the offline bulk image builder, and the `KvMetaBackend` read side —
-//! design `docs/design-cow-kv-metadata.md` §4.1/§4.5/§5.1/§6.1/§6.2 and the
+//! PR K6a/K6b integration tests: superblock v3 + the sector-0 version
+//! gate, the offline bulk image builder, and the `KvMetaBackend` —
+//! design `docs/design-cow-kv-metadata.md` §4.1/§4.5/§5.1/§6.1 and the
 //! pre-resolved OQ 1 (ring clamp) / OQ 2 (dual atomicity fields) decisions.
 //!
 //! Contracts pinned:
-//! - **Read-side conformance over BOTH formats** (`rstest` over the
-//!   `VolumeBackend` dispatch enum): the same population, described once,
-//!   is built on a v2 volume (the test-surface-only v2 formatter + the
-//!   `Metadata` trait) and as a builder-produced v3 image; every
-//!   lookup/getattr/readdir/getxattr/listxattr assertion runs verbatim
-//!   against both. v2 keeps its byte-identical behavior (its own suites
-//!   pin that); these cases pin that v3 *agrees* with it.
-//! - **The §6.1 version gate**: blank, v2, v3, foreign-magic, and
-//!   future-version sector 0s classify loudly and distinctly; unknown
-//!   incompat feature bits refuse naming the bits; the v3 checksum covers
-//!   the whole sector.
+//! - **Backend conformance**: one population, built as a v3 image; every
+//!   lookup/getattr/readdir/getxattr/listxattr assertion (these cases
+//!   originally ran against both formats; the v2 leg was deleted with v2
+//!   support — the assertions are unchanged).
+//! - **The §6.1 version gate**: blank, legacy-v2, v3, foreign-magic, and
+//!   future-version sector 0s classify loudly and distinctly — a v2
+//!   superblock refuses with the precise "no longer supported" message —
+//!   and unknown incompat feature bits refuse naming the bits; the v3
+//!   checksum covers the whole sector.
 //! - **Resolved OQ 1**: `journal_ring_len = clamp(volume/64, 8, 32 MiB)`;
 //!   `--meta-node-kib` validation (allowed set, 64 KiB floor, sub-256 KiB
 //!   warning naming the reduced `node_size/4` record-value cap).
@@ -26,8 +24,8 @@
 //!   into a built image are recovered at open — read-only, into the K5
 //!   cache, per-key LWW by seq — and the §4.8 `next_ino` watermark
 //!   advances over replayed inos.
-//! - **v3 format guards**: the same preflight policy as v2 (already
-//!   formatted ⇒ refused without `--force`).
+//! - **v3 format guards**: the preflight policy (already formatted ⇒
+//!   refused without `--force`).
 //!
 //! Torn-superblock (loud) and torn-newest-ledger (predecessor fallback)
 //! at the backend level live in `tests/crash_contract_tests.rs` (the
@@ -53,17 +51,15 @@ use squeezefs::meta_backend::kv::superblock::{
     SUPERBLOCK_V3_VERSION,
 };
 use squeezefs::meta_backend::kv::KvError;
-use squeezefs::meta_backend::storage::MetaLvStorage;
-use squeezefs::meta_backend::{MetaLvBackend, Metadata, VolumeBackend};
+use squeezefs::meta_backend::{open_volume_for_mount, Metadata};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 
 // ---------------------------------------------------------------------------
 // Harness: one population, two formats.
 // ---------------------------------------------------------------------------
 
-/// v2 volumes need the 72 MiB xattr region + table headroom.
-const V2_VOL_LEN: u64 = 128 * 1024 * 1024;
 /// v3 test volumes: small node size + overridden 1 MiB ring keep them tiny.
 const V3_VOL_LEN: u64 = 64 * 1024 * 1024;
 const V3_NODE_SIZE: usize = 64 * 1024;
@@ -72,14 +68,8 @@ const V3_RING_LEN: u64 = 1024 * 1024;
 const TEST_SEED: u64 = 0x5EED_CAFE_F00D_D00D;
 const TEST_UUID: [u8; 16] = *b"kv-backend-test!";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    V2,
-    V3,
-}
-
 struct Population {
-    backend: VolumeBackend,
+    backend: Arc<KvMetaBackend>,
     inos: HashMap<&'static str, u64>,
     _file: NamedTempFile,
 }
@@ -97,50 +87,10 @@ fn v3_builder_config() -> BuilderConfig {
     }
 }
 
-/// The shared description: /docs (0750 1000:1000), /docs/readme.txt (0644
-/// 1000:1000, 4096 B, two xattrs), /hello.bin (0600 0:0, 0 B), /empty
-/// (0755 0:0), /hard.lnk = hard link to hello.bin.
-async fn populate_v2(file: &NamedTempFile) -> HashMap<&'static str, u64> {
-    let storage = MetaLvStorage::open(file.path(), V2_VOL_LEN).unwrap();
-    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
-        .await
-        .unwrap();
-    let be = MetaLvBackend::new(storage);
-
-    let mut inos = HashMap::new();
-    let docs = be
-        .create(ROOT_INO, "docs", libc::S_IFDIR | 0o750, 1000, 1000)
-        .await
-        .unwrap();
-    inos.insert("docs", docs.ino);
-    let readme = be
-        .create(docs.ino, "readme.txt", libc::S_IFREG | 0o644, 1000, 1000)
-        .await
-        .unwrap();
-    inos.insert("readme.txt", readme.ino);
-    be.setattr(readme.ino, None, None, None, Some(4096), None, None, None)
-        .await
-        .unwrap();
-    be.setxattr(readme.ino, "user.color", b"blue")
-        .await
-        .unwrap();
-    be.setxattr(readme.ino, "user.big", &big_xattr())
-        .await
-        .unwrap();
-    let hello = be
-        .create(ROOT_INO, "hello.bin", libc::S_IFREG | 0o600, 0, 0)
-        .await
-        .unwrap();
-    inos.insert("hello.bin", hello.ino);
-    let empty = be
-        .create(ROOT_INO, "empty", libc::S_IFDIR | 0o755, 0, 0)
-        .await
-        .unwrap();
-    inos.insert("empty", empty.ino);
-    be.link(hello.ino, ROOT_INO, "hard.lnk").await.unwrap();
-    inos
-}
-
+/// The shared description ([`describe_v3`]): /docs (0750 1000:1000),
+/// /docs/readme.txt (0644 1000:1000, 4096 B, two xattrs), /hello.bin
+/// (0600 0:0, 0 B), /empty (0755 0:0), /hard.lnk = hard link to hello.bin.
+///
 /// Timestamps stamped on readme.txt by [`describe_v3`] (ns) — builder
 /// times default to 0 (the determinism contract) and are settable.
 const README_TIMES: (u64, u64, u64) = (11_111, 22_222, 33_333);
@@ -167,30 +117,16 @@ fn describe_v3() -> (ImageBuilder, HashMap<&'static str, u64>) {
     (b, inos)
 }
 
-async fn population(kind: Kind) -> Population {
+async fn population() -> Population {
     let file = NamedTempFile::new().expect("temp volume");
-    let inos = match kind {
-        Kind::V2 => populate_v2(&file).await,
-        Kind::V3 => {
-            file.as_file().set_len(V3_VOL_LEN).unwrap();
-            let (b, inos) = describe_v3();
-            b.build(file.path(), V3_VOL_LEN)
-                .await
-                .expect("build v3 image");
-            inos
-        }
-    };
-    let backend = VolumeBackend::open_for_mount(file.path().to_str().unwrap())
+    file.as_file().set_len(V3_VOL_LEN).unwrap();
+    let (b, inos) = describe_v3();
+    b.build(file.path(), V3_VOL_LEN)
         .await
-        .expect("open_for_mount");
-    assert_eq!(
-        backend.format_version(),
-        match kind {
-            Kind::V2 => 2,
-            Kind::V3 => 3,
-        },
-        "the version gate must dispatch by superblock version"
-    );
+        .expect("build v3 image");
+    let backend = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .expect("open_volume_for_mount");
     Population {
         backend,
         inos,
@@ -202,12 +138,9 @@ async fn population(kind: Kind) -> Population {
 // Read-side conformance: the same assertions over both backends.
 // ---------------------------------------------------------------------------
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conformance_lookup_and_getattr(#[case] kind: Kind) {
-    let p = population(kind).await;
+async fn conformance_lookup_and_getattr() {
+    let p = population().await;
     let b = &p.backend;
 
     let root = b.getattr(ROOT_INO).await.expect("root getattr");
@@ -254,12 +187,9 @@ async fn conformance_lookup_and_getattr(#[case] kind: Kind) {
     );
 }
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conformance_readdir_sets(#[case] kind: Kind) {
-    let p = population(kind).await;
+async fn conformance_readdir_sets() {
+    let p = population().await;
     let b = &p.backend;
 
     let mut root_names: Vec<(String, u64, u32)> = b
@@ -304,12 +234,9 @@ async fn conformance_readdir_sets(#[case] kind: Kind) {
     );
 }
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conformance_xattr_surface(#[case] kind: Kind) {
-    let p = population(kind).await;
+async fn conformance_xattr_surface() {
+    let p = population().await;
     let b = &p.backend;
     let readme = p.inos["readme.txt"];
 
@@ -363,12 +290,9 @@ async fn conformance_xattr_surface(#[case] kind: Kind) {
     );
 }
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conformance_hard_links(#[case] kind: Kind) {
-    let p = population(kind).await;
+async fn conformance_hard_links() {
+    let p = population().await;
     let b = &p.backend;
 
     let by_name = b
@@ -396,7 +320,7 @@ async fn version_gate_distinguishes_blank_v2_v3_foreign_future() {
             .expect("blank classifies"),
         VolumeFormat::Blank
     ));
-    let err = VolumeBackend::open_for_mount(blank.path().to_str().unwrap())
+    let err = open_volume_for_mount(blank.path().to_str().unwrap())
         .await
         .expect_err("mounting a blank volume must fail loud")
         .to_string();
@@ -405,16 +329,34 @@ async fn version_gate_distinguishes_blank_v2_v3_foreign_future() {
         "the blank-volume refusal must point at `squeezefs format`, got: {err}"
     );
 
-    // v2: classifies as V2 with the superblock parsed.
+    // Legacy v2: SqueezeFS magic + version 2 (crafted bytes — no v2
+    // writer exists anymore) classifies V2Legacy; the mount refuses with
+    // the precise "no longer supported" message, never "run format" or
+    // "foreign".
     let v2 = NamedTempFile::new().unwrap();
-    let storage = MetaLvStorage::open(v2.path(), V2_VOL_LEN).unwrap();
-    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+    v2.as_file().set_len(8 * 1024 * 1024).unwrap();
+    let mut legacy_sb = Vec::with_capacity(12);
+    legacy_sb.extend_from_slice(b"METALV01");
+    legacy_sb.extend_from_slice(&2u32.to_le_bytes());
+    squeezefs::uring_fs::write_at(v2.path(), 0, bytes::Bytes::from(legacy_sb))
         .await
         .unwrap();
-    match classify_volume(v2.path()).await.expect("v2 classifies") {
-        VolumeFormat::V2(sb) => assert_eq!(sb.version, 2),
-        other => panic!("a v2 volume must classify V2, got {other:?}"),
-    }
+    assert!(matches!(
+        classify_volume(v2.path()).await.expect("v2 classifies"),
+        VolumeFormat::V2Legacy
+    ));
+    let err = open_volume_for_mount(v2.path().to_str().unwrap())
+        .await
+        .expect_err("mounting a legacy v2 volume must refuse loud")
+        .to_string();
+    assert!(
+        err.contains("no longer supported") && err.contains("v2"),
+        "the v2 refusal must be the precise 'no longer supported' message, got: {err}"
+    );
+    assert!(
+        err.contains("reformat") || err.contains("format"),
+        "the v2 refusal must point at the reformat path, got: {err}"
+    );
 
     // v3: classifies as V3 with the geometry parsed.
     let v3 = NamedTempFile::new().unwrap();
@@ -668,11 +610,8 @@ async fn v3_plan_uses_clamp_default_and_honors_override() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v3_reports_cow_contract_class_with_physical_probe_alongside() {
-    let p = population(Kind::V3).await;
-    let be = match &p.backend {
-        VolumeBackend::V3(be) => be.clone(),
-        _ => unreachable!(),
-    };
+    let p = population().await;
+    let be = p.backend.clone();
     // The contract class is constant-by-construction on v3 (§4.10).
     assert_eq!(be.atomicity_contract(), META_VOLUME_ATOMICITY_COW);
     assert_eq!(META_VOLUME_ATOMICITY_COW, "cow-checksummed");
@@ -1082,11 +1021,10 @@ async fn v3_format_guards_match_the_preflight_contract() {
         .expect("--force reformats an idle v3 volume");
 
     // The recorded format config is readable through the mount bootstrap
-    // path (VolumeBackend read dispatch on ino 1).
-    let vol = VolumeBackend::open_for_mount(file.path().to_str().unwrap())
+    // path (ino 1 of the first volume's xattr tree).
+    let vol = open_volume_for_mount(file.path().to_str().unwrap())
         .await
         .unwrap();
-    assert_eq!(vol.format_version(), 3);
     assert_eq!(
         vol.getxattr(ROOT_INO, "user.squeezefs.format_config")
             .await
@@ -1095,28 +1033,31 @@ async fn v3_format_guards_match_the_preflight_contract() {
         "format must record the config xattr in the v3 xattr tree"
     );
 
-    // A v2 volume is protected by the same guard: refused without force,
-    // converted with it.
+    // A legacy v2 volume (crafted superblock bytes) is protected by the
+    // same guard: refused without force, REFORMATTED to v3 with it — the
+    // only path forward for v2 volumes now that v2 support is gone.
     let v2 = NamedTempFile::new().unwrap();
-    let storage = MetaLvStorage::open(v2.path(), V2_VOL_LEN).unwrap();
-    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
+    v2.as_file().set_len(V3_VOL_LEN).unwrap();
+    let mut legacy_sb = Vec::with_capacity(12);
+    legacy_sb.extend_from_slice(b"METALV01");
+    legacy_sb.extend_from_slice(&2u32.to_le_bytes());
+    squeezefs::uring_fs::write_at(v2.path(), 0, bytes::Bytes::from(legacy_sb))
         .await
         .unwrap();
     assert!(
-        format_v3(v2.path(), V2_VOL_LEN, &format_opts(false))
+        format_v3(v2.path(), V3_VOL_LEN, &format_opts(false))
             .await
             .is_err(),
-        "a formatted v2 volume must be refused without --force"
+        "a formatted (legacy v2) volume must be refused without --force"
     );
-    format_v3(v2.path(), V2_VOL_LEN, &format_opts(true))
+    format_v3(v2.path(), V3_VOL_LEN, &format_opts(true))
         .await
-        .expect("--force reformats a v2 volume to v3");
-    assert_eq!(
-        VolumeBackend::open_for_mount(v2.path().to_str().unwrap())
+        .expect("--force reformats a legacy v2 volume to v3");
+    assert!(
+        open_volume_for_mount(v2.path().to_str().unwrap())
             .await
-            .unwrap()
-            .format_version(),
-        3
+            .is_ok(),
+        "the reformatted volume mounts as v3"
     );
 }
 
@@ -1163,53 +1104,40 @@ async fn v3_mount_surfaces_ledger_and_allocator_state() {
 }
 
 // ===========================================================================
-// PR K6b — the mutating `Metadata` conformance suite (both formats), the
-// §4.4 pt 6 Δtime shared-parent contract, v3 persistence across remounts,
-// the §4.8 monotonic-ino contract, the unknown-ro write gate, and the R10
-// ring-full liveness storm (§4.4 pt 5).
-//
-// The v2 suite is the shared contract: every conformance case below runs
-// the SAME assertions against a v2 volume (`MetaLvBackend` behind the
-// dispatch) and a v3 volume (`KvMetaBackend`), per the K6b mandate.
+// PR K6b — the mutating `Metadata` conformance suite, the §4.4 pt 6
+// Δtime shared-parent contract, v3 persistence across remounts, the §4.8
+// monotonic-ino contract, the unknown-ro write gate, and the R10
+// ring-full liveness storm (§4.4 pt 5). (These cases originally ran
+// against both formats; the v2 leg was deleted with v2 support — the
+// assertions are unchanged.)
 // ===========================================================================
 
 use squeezefs::error::SqueezefsError;
 use squeezefs::meta_backend::kv::{META_KV_NODE_COMPACTIONS, META_KV_NODE_SPLITS};
-use squeezefs::meta_backend::{RoutedMetaBackend, VolumeBackend as VB};
+use squeezefs::meta_backend::RoutedMetaBackend;
 use std::sync::atomic::Ordering as AtomicOrdering;
-use std::sync::Arc;
 
-/// A fresh, EMPTY, mutable volume of the given format behind the dispatch
-/// (the mutating suite builds all content through the trait surface).
-async fn mutable_volume(kind: Kind) -> (VolumeBackend, NamedTempFile) {
+/// A fresh, EMPTY, mutable volume (the mutating suite builds all content
+/// through the trait surface).
+async fn mutable_volume() -> (Arc<KvMetaBackend>, NamedTempFile) {
     let file = NamedTempFile::new().expect("temp volume");
-    match kind {
-        Kind::V2 => {
-            let storage = MetaLvStorage::open(file.path(), V2_VOL_LEN).unwrap();
-            MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
-                .await
-                .unwrap();
-        }
-        Kind::V3 => {
-            file.as_file().set_len(V3_VOL_LEN).unwrap();
-            format_v3(
-                file.path(),
-                V3_VOL_LEN,
-                &FormatV3Options {
-                    node_size: V3_NODE_SIZE,
-                    journal_len_override: Some(V3_RING_LEN),
-                    force: false,
-                    full_wipe: false,
-                    format_config_xattr: None,
-                },
-            )
-            .await
-            .unwrap();
-        }
-    }
-    let backend = VolumeBackend::open_for_mount(file.path().to_str().unwrap())
+    file.as_file().set_len(V3_VOL_LEN).unwrap();
+    format_v3(
+        file.path(),
+        V3_VOL_LEN,
+        &FormatV3Options {
+            node_size: V3_NODE_SIZE,
+            journal_len_override: Some(V3_RING_LEN),
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .unwrap();
+    let backend = open_volume_for_mount(file.path().to_str().unwrap())
         .await
-        .expect("open_for_mount");
+        .expect("open_volume_for_mount");
     (backend, file)
 }
 
@@ -1220,12 +1148,9 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutating_create_lookup_conformance(#[case] kind: Kind) {
-    let (b, _f) = mutable_volume(kind).await;
+async fn mutating_create_lookup_conformance() {
+    let (b, _f) = mutable_volume().await;
 
     let t0 = now_ns();
     let dir = b
@@ -1316,12 +1241,9 @@ async fn mutating_create_lookup_conformance(#[case] kind: Kind) {
     );
 }
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutating_unlink_and_link_conformance(#[case] kind: Kind) {
-    let (b, _f) = mutable_volume(kind).await;
+async fn mutating_unlink_and_link_conformance() {
+    let (b, _f) = mutable_volume().await;
 
     let f = b
         .create(ROOT_INO, "a.txt", libc::S_IFREG | 0o644, 0, 0)
@@ -1375,12 +1297,9 @@ async fn mutating_unlink_and_link_conformance(#[case] kind: Kind) {
     let _ = d;
 }
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutating_rename_conformance(#[case] kind: Kind) {
-    let (b, _f) = mutable_volume(kind).await;
+async fn mutating_rename_conformance() {
+    let (b, _f) = mutable_volume().await;
 
     let d1 = b
         .create(ROOT_INO, "d1", libc::S_IFDIR | 0o755, 0, 0)
@@ -1479,12 +1398,9 @@ async fn mutating_rename_conformance(#[case] kind: Kind) {
     );
 }
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutating_setattr_conformance(#[case] kind: Kind) {
-    let (b, _f) = mutable_volume(kind).await;
+async fn mutating_setattr_conformance() {
+    let (b, _f) = mutable_volume().await;
     let f = b
         .create(ROOT_INO, "attrs", libc::S_IFREG | 0o644, 10, 20)
         .await
@@ -1546,12 +1462,9 @@ async fn mutating_setattr_conformance(#[case] kind: Kind) {
     );
 }
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutating_xattr_conformance(#[case] kind: Kind) {
-    let (b, _f) = mutable_volume(kind).await;
+async fn mutating_xattr_conformance() {
+    let (b, _f) = mutable_volume().await;
     let f = b
         .create(ROOT_INO, "x", libc::S_IFREG | 0o644, 0, 0)
         .await
@@ -1583,35 +1496,25 @@ async fn mutating_xattr_conformance(#[case] kind: Kind) {
     );
     assert_eq!(b.listxattr(f.ino).await.unwrap(), vec!["user.two"]);
 
-    // removexattr of an absent name: loud on both formats (the v2 shape).
+    // removexattr of an absent name: loud.
     assert!(
         b.removexattr(f.ino, "user.ghost").await.is_err(),
         "removexattr of an absent name must error"
     );
 
-    // The capability boundary: a 12 KiB value exceeds v2's 8 KiB block
-    // cap and sits inside v3's `node_size/4` cap (§4.2 capability lift).
+    // The capability boundary: a 12 KiB value sits inside the
+    // `node_size/4` cap (§4.2 capability lift over the retired v2
+    // format's fixed 8 KiB block).
     let big = vec![0x5A; 12 * 1024];
-    match kind {
-        Kind::V2 => assert!(
-            b.setxattr(f.ino, "user.big", &big).await.is_err(),
-            "v2 must refuse a 12 KiB xattr value"
-        ),
-        Kind::V3 => {
-            b.setxattr(f.ino, "user.big", &big)
-                .await
-                .expect("v3 accepts a 12 KiB value (cap = node_size/4)");
-            assert_eq!(b.getxattr(f.ino, "user.big").await.unwrap(), Some(big));
-        }
-    }
+    b.setxattr(f.ino, "user.big", &big)
+        .await
+        .expect("a 12 KiB value fits (cap = node_size/4)");
+    assert_eq!(b.getxattr(f.ino, "user.big").await.unwrap(), Some(big));
 }
 
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutating_destroy_and_layout_conformance(#[case] kind: Kind) {
-    let (b, _f) = mutable_volume(kind).await;
+async fn mutating_destroy_and_layout_conformance() {
+    let (b, _f) = mutable_volume().await;
     let f = b
         .create(ROOT_INO, "doomed", libc::S_IFREG | 0o644, 0, 0)
         .await
@@ -1647,10 +1550,10 @@ async fn mutating_destroy_and_layout_conformance(#[case] kind: Kind) {
 }
 
 /// §4.8: v3 inos are monotonic and never reused — destroy-then-create
-/// yields a strictly larger ino (v2 reuses; not asserted there).
+/// yields a strictly larger ino.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v3_monotonic_ino_no_reuse() {
-    let (b, _f) = mutable_volume(Kind::V3).await;
+    let (b, _f) = mutable_volume().await;
     let a = b
         .create(ROOT_INO, "first", libc::S_IFREG | 0o644, 0, 0)
         .await
@@ -1671,16 +1574,11 @@ async fn v3_monotonic_ino_no_reuse() {
 
 /// §4.4 pt 6: concurrent same-directory creates under the SHARED parent
 /// lock (the routed layer's production shape) — all succeed, parent times
-/// advance, every child resolves. Runs against BOTH formats through
-/// `RoutedMetaBackend::new_dispatch` (v2 = 16-byte staged patch, v3 =
-/// Δtime merge records).
-#[rstest::rstest]
-#[case::v2(Kind::V2)]
-#[case::v3(Kind::V3)]
+/// advance, every child resolves (Δtime merge records).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn routed_shared_parent_create_storm(#[case] kind: Kind) {
-    let (backend, _f) = mutable_volume(kind).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![backend]));
+async fn routed_shared_parent_create_storm() {
+    let (backend, _f) = mutable_volume().await;
+    let routed = Arc::new(RoutedMetaBackend::new(vec![backend]));
 
     let dir = routed
         .create(ROOT_INO, "storm", libc::S_IFDIR | 0o755, 0, 0)
@@ -1728,10 +1626,8 @@ async fn routed_shared_parent_create_storm(#[case] kind: Kind) {
 /// task drain + remount with an EMPTY replay window (tail == head).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v3_mutations_survive_clean_shutdown_remount() {
-    let (backend, file) = mutable_volume(Kind::V3).await;
-    let VolumeBackend::V3(be) = &backend else {
-        unreachable!()
-    };
+    let (backend, file) = mutable_volume().await;
+    let be = &backend;
 
     let d = backend
         .create(ROOT_INO, "keep", libc::S_IFDIR | 0o755, 0, 0)
@@ -1780,7 +1676,7 @@ async fn v3_mutations_survive_clean_shutdown_remount() {
 async fn v3_mutations_survive_remount_via_replay() {
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     let body = async {
-        let (backend, file) = mutable_volume(Kind::V3).await;
+        let (backend, file) = mutable_volume().await;
         let f = backend
             .create(ROOT_INO, "replayed", libc::S_IFREG | 0o640, 3, 4)
             .await
@@ -1813,14 +1709,12 @@ async fn v3_mutations_survive_remount_via_replay() {
 /// path must withhold mutations (§4.11) while reads keep serving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v3_unknown_ro_bit_withholds_mutations() {
-    let (backend, file) = mutable_volume(Kind::V3).await;
+    let (backend, file) = mutable_volume().await;
     backend
         .create(ROOT_INO, "pre-ro", libc::S_IFREG | 0o644, 0, 0)
         .await
         .unwrap();
-    let VolumeBackend::V3(be) = &backend else {
-        unreachable!()
-    };
+    let be = &backend;
     be.shutdown().await.unwrap();
     let sb = be.superblock().clone();
     drop(backend);
@@ -1861,7 +1755,7 @@ async fn v3_unknown_ro_bit_withholds_mutations() {
 async fn v3_strict_mode_commits_barrier_per_commit() {
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "0");
     let result = async {
-        let (backend, file) = mutable_volume(Kind::V3).await;
+        let (backend, file) = mutable_volume().await;
         let f = backend
             .create(ROOT_INO, "strict", libc::S_IFREG | 0o644, 0, 0)
             .await
@@ -1901,14 +1795,11 @@ async fn v3_ring_full_liveness_storm_drains() {
     )
     .await
     .unwrap();
-    let backend = VolumeBackend::open_for_mount(file.path().to_str().unwrap())
+    let backend = open_volume_for_mount(file.path().to_str().unwrap())
         .await
         .unwrap();
-    let stalls_probe = match &backend {
-        VB::V3(be) => be.clone(),
-        _ => unreachable!(),
-    };
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![backend]));
+    let stalls_probe = backend.clone();
+    let routed = Arc::new(RoutedMetaBackend::new(vec![backend]));
 
     let smo_before = META_KV_NODE_SPLITS.load(AtomicOrdering::Relaxed)
         + META_KV_NODE_COMPACTIONS.load(AtomicOrdering::Relaxed);

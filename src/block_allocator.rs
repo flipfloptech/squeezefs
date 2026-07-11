@@ -278,50 +278,9 @@ impl BlockAllocator {
         Ok(())
     }
 
-    pub async fn recover_active_blocks(
-        &self,
-        storage: &crate::meta_backend::storage::MetaLvStorage,
-        backend_router: &crate::routing::BackendRouter,
-    ) -> Result<()> {
-        let max_inodes = (8 * 1024 * 1024 - 4096) / 256;
-        let mut checked = 0;
-        let mut valid_inodes = 0;
-        let mut layouts_found = 0;
-        for ino in 1..=max_inodes {
-            if let Ok(inode) = crate::meta_backend::inode::read_inode(storage, ino).await {
-                checked += 1;
-                if inode.nlink > 0 {
-                    valid_inodes += 1;
-                    if let Ok(Some(bytes)) =
-                        crate::meta_backend::xattr::get_xattr(storage, ino, "layout").await
-                    {
-                        layouts_found += 1;
-                        let layout_opt: Option<crate::routing::LayoutMetadata> =
-                            if bytes.starts_with(b"{") {
-                                serde_json::from_slice(&bytes).ok()
-                            } else {
-                                bincode::deserialize(&bytes).ok()
-                            };
-                        println!(
-                            "ino: {}, mode: {}, nlink: {}, layout: {:?}",
-                            ino, inode.mode, inode.nlink, layout_opt
-                        );
-                        self.recover_from_layout(backend_router, layout_opt).await;
-                    }
-                }
-            }
-        }
-        println!(
-            "Recovery scan summary: checked={}, valid_inodes={}, layouts_found={}",
-            checked, valid_inodes, layouts_found
-        );
-        Ok(())
-    }
-
-    /// PR K6b: the same refcount recovery over a format-v3 metadata
-    /// volume — walk the live inode tree (paged range scans; no fixed
-    /// geometry to iterate) and feed each live ino's `"layout"` xattr
-    /// through the shared per-layout recovery body.
+    /// Block refcount recovery over a metadata volume — walk the live
+    /// inode tree (paged range scans) and feed each live ino's `"layout"`
+    /// xattr through the shared per-layout recovery body.
     pub async fn recover_active_blocks_v3(
         &self,
         kv: &crate::meta_backend::kv::backend::KvMetaBackend,

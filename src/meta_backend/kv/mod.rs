@@ -33,23 +33,17 @@
 //! SMO-only, writer lock-then-revalidate-then-retry ([`tree`]).
 //!
 //! PR K6a wires the mount path: [`superblock`] (SuperblockV3 + the
-//! dual-format version gate, §4.1/§6.1, resolved OQ 1 ring clamp),
+//! sector-0 version gate, §4.1/§6.1, resolved OQ 1 ring clamp),
 //! [`builder`] (the offline bulk image builder — §8 gate-volume producer
-//! and K9's migrate engine — plus the public v3 formatter and the §4.10
-//! digest walk), and [`backend`] (`KvMetaBackend`, the read side: mount =
+//! — plus the public v3 formatter and the §4.10 digest walk), and
+//! [`backend`] (`KvMetaBackend`, the read side: mount =
 //! SB → ledger → bitmap → read-only journal replay into the K5 cache;
 //! lookups/getattr/readdir/getxattr/listxattr over tree + fold). The
 //! §4.4 commit pipeline, checkpoint scheduling, and the mutating
 //! `Metadata` impl are PR K6b's.
 //!
-//! PR K9 adds [`migrate`]: the offline `squeezefs migrate` v2 → v3 converter
-//! (§6.2). It reads the whole v2 namespace via the v2 read path, drives the
-//! K6a [`builder`] engine to build a v3 image **in the free tail** of the
-//! existing volume (whole-device heap; ledger/journal/bitmap reserved at
-//! `build_start`, [`superblock::SuperblockV3::plan_migrate`]), verifies the
-//! round-trip [`builder::digest_walk`], then commits a single crash-safe,
-//! idempotent superblock flip — reclaiming the v2 tables, dead journal region,
-//! and xattr reservation as free v3 extents.
+//! (PR K9's offline v2 → v3 `migrate` converter lived here until v2
+//! support was removed entirely — v3 is the only metadata format.)
 
 pub mod alloc_ext;
 pub mod alloc_ext_core;
@@ -59,7 +53,6 @@ pub mod builder;
 pub mod checkpoint;
 pub mod journal;
 pub mod journal_core;
-pub mod migrate;
 pub mod node;
 pub mod node_cache;
 pub mod node_state_core;

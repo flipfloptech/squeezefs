@@ -3,7 +3,6 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
-use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
@@ -16,6 +15,29 @@ use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// Format + mount one v3 metadata volume for this harness.
+async fn open_v3_meta(
+    path: &std::path::Path,
+    len: u64,
+) -> std::sync::Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+    squeezefs::meta_backend::kv::builder::format_v3(
+        path,
+        len,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3 meta volume");
+    squeezefs::meta_backend::kv::backend::KvMetaBackend::open(path)
+        .await
+        .expect("open v3 meta volume")
+}
 
 #[tokio::test]
 async fn test_writeback_queue_full_deadlock() {
@@ -68,11 +90,7 @@ async fn test_writeback_queue_full_deadlock() {
 
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
-    let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
-        .await
-        .unwrap();
-    let meta_backend = Arc::new(MetaLvBackend::new(meta_storage));
+    let meta_backend = open_v3_meta(&meta_path, 256 * 1024 * 1024).await;
     let routed_meta_backend = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         meta_backend,
     ]));
@@ -190,11 +208,7 @@ async fn test_inline_file_layout_overflow() {
 
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
-    let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
-        .await
-        .unwrap();
-    let meta_backend = Arc::new(MetaLvBackend::new(meta_storage));
+    let meta_backend = open_v3_meta(&meta_path, 256 * 1024 * 1024).await;
     let routed_meta_backend = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         meta_backend,
     ]));
@@ -239,7 +253,7 @@ async fn test_inline_file_layout_overflow() {
 }
 
 #[tokio::test]
-async fn test_indirect_block_map() {
+async fn test_small_block_map_stays_inline() {
     let _serial = serial().await;
     let _ = env_logger::builder().is_test(true).try_init();
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
@@ -281,11 +295,7 @@ async fn test_indirect_block_map() {
 
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
-    let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
-        .await
-        .unwrap();
-    let meta_backend = Arc::new(MetaLvBackend::new(meta_storage));
+    let meta_backend = open_v3_meta(&meta_path, 256 * 1024 * 1024).await;
     let routed_meta_backend = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         meta_backend,
     ]));
@@ -342,22 +352,26 @@ async fn test_indirect_block_map() {
         .unwrap();
     }
 
-    // Force flush all staged data to block storage, which will write the indirect map
+    // Force flush all staged data to block storage, persisting the layout.
     fs.force_flush_all_staged_data().await.unwrap();
 
     // Remove from cache to force backend read
     let file_path = squeezefs::keys::inode_path(child_ino);
     fs.router.metadata_cache.remove(&file_path);
 
+    // §5.3 (PR K8): the spill boundary is the per-volume record cap
+    // (~60 KiB serialized at the default node size), not an entry count —
+    // a 71-entry map (~1.5 KiB) stays INLINE through the FUSE flush path.
+    // The indirect mechanism past the cap is pinned by
+    // data_path_correctness_tests::test_v3_spill_boundary_roundtrips_both_directions.
     let meta = fs.router.fetch_metadata(&file_path).await.unwrap();
     assert!(meta.block_map.is_some());
     let bm = meta.block_map.as_ref().unwrap();
     assert_eq!(bm.len(), 71);
-    assert!(meta.block_map_id.is_some());
-    let map_id = meta.block_map_id.as_ref().unwrap();
+    let map_id = meta.block_map_id.as_ref().expect("map id");
     assert!(
-        map_id.starts_with("indirect:"),
-        "Expected map_id to start with 'indirect:', got: {}",
+        !map_id.starts_with("indirect:"),
+        "a 71-entry map must stay inline under the record-cap spill rule, got: {}",
         map_id
     );
 
@@ -368,11 +382,11 @@ async fn test_indirect_block_map() {
     let read_res_69 = fs.read(req, child_ino, 0, 69 * 4096, 1).await.unwrap();
     assert_eq!(read_res_69.data.as_ref(), &[69]);
 
-    // Check used blocks count. It should be 71 data blocks + 1 block for indirect map.
+    // Check used blocks count: 71 data blocks, NO indirect-map block.
     let used_blocks = block_alloc.get_used_blocks() - start_blocks;
     assert_eq!(
-        used_blocks, 72,
-        "Expected 72 allocated blocks (71 data + 1 indirect map)"
+        used_blocks, 71,
+        "Expected 71 allocated data blocks (inline map needs no indirect block)"
     );
 
     // Delete/unlink the file
@@ -385,7 +399,7 @@ async fn test_indirect_block_map() {
         .await
         .unwrap();
 
-    // Verify all blocks, including the indirect block, are freed
+    // Verify all data blocks are freed
     let end_blocks = block_alloc.get_used_blocks();
     assert_eq!(
         end_blocks,
@@ -678,12 +692,8 @@ async fn make_flush_fs(test_id: &str) -> FlushHarness {
     let mut fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
 
     let meta = NamedTempFile::new().unwrap();
-    let meta_storage = MetaLvStorage::open(meta.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
-        .await
-        .unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
-        Arc::new(MetaLvBackend::new(meta_storage)),
+        open_v3_meta(meta.path(), 256 * 1024 * 1024).await,
     ]));
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed);
@@ -1071,11 +1081,7 @@ async fn test_block_allocator_recovery() {
 
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
-    let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
-        .await
-        .unwrap();
-    let meta_backend = Arc::new(MetaLvBackend::new(meta_storage.clone()));
+    let meta_backend = open_v3_meta(&meta_path, 256 * 1024 * 1024).await;
     let routed_meta_backend = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         meta_backend.clone(),
     ]));
@@ -1139,9 +1145,9 @@ async fn test_block_allocator_recovery() {
         .unwrap();
     assert_eq!(new_allocator.get_used_blocks(), 0);
 
-    // Run recovery
+    // Run recovery (the live-inode-tree walk).
     new_allocator
-        .recover_active_blocks(&meta_storage, &fs.router.backend_router)
+        .recover_active_blocks_v3(&meta_backend, &fs.router.backend_router)
         .await
         .unwrap();
 

@@ -879,35 +879,21 @@ impl DataRouter {
         // §5.3: spill the inline block map to an indirect block only when the
         // serialized layout value would exceed the target volume's per-ino
         // record cap (`LAYOUT_INLINE_MAX = xattr_value_cap(ino) - 4 KiB framing
-        // headroom`) — not a fixed > 32-entry count. On v3 (64 KiB default cap)
-        // a file whose block map serializes within ~60 KiB (≈ 6 GiB at 4 MiB
-        // blocks) keeps an inline map; v2's 8 KiB cap keeps its conservative
-        // early spill automatically. Beyond the cap the indirect mechanism is
-        // used unchanged.
+        // headroom`) — not a fixed entry count. At the 64 KiB default cap a
+        // file whose block map serializes within ~60 KiB (≈ 6 GiB at 4 MiB
+        // blocks) keeps an inline map. Beyond the cap the indirect mechanism
+        // is used unchanged.
         let inline_bytes = bincode::serialize(&layout).map_err(|e| {
             SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Failed to serialize binary layout: {:?}", e),
             ))
         })?;
-        let needs_indirect = m.block_map.as_ref().is_some_and(|bm| {
-            if backend.ino_routes_to_v3(ino) {
-                // v3 (§5.3): the lift — spill only when the serialized layout
-                // value would exceed the per-volume record cap (minus framing
-                // headroom), keeping a file whose block map serializes within
-                // ~60 KiB (≈ 6 GiB at 4 MiB blocks) inline.
-                inline_bytes.len()
-                    > backend
-                        .xattr_value_cap(ino)
-                        .saturating_sub(LAYOUT_INLINE_HEADROOM)
-            } else {
-                // v2 fixed geometry: the byte-identical legacy 32-entry inline
-                // ceiling the whole v2 suite pins (§6.1). A small-node v3 shares
-                // v2's 8 KiB cap value, so the format — not the cap — selects
-                // the rule; v2 keeps "today's boundary" (§5.3).
-                bm.len() > 32
-            }
-        });
+        let needs_indirect = m.block_map.is_some()
+            && inline_bytes.len()
+                > backend
+                    .xattr_value_cap(ino)
+                    .saturating_sub(LAYOUT_INLINE_HEADROOM);
 
         let bytes = if needs_indirect {
             let bm = m.block_map.as_ref().unwrap();

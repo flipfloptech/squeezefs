@@ -1,6 +1,5 @@
-//! Crash-contract tests (design-wal-crash-consistency §4.7, PR 3).
-//!
-//! Pins TODAY's crash contract (D0/D1, §3) using the deterministic
+//! Crash-contract tests for the v3 CoW KV metadata format
+//! (design-cow-kv-metadata §4.5/§4.10) over the deterministic
 //! fault-injection shim in `uring_fs` (`nvme_dev.rs` precedent):
 //!
 //! - **Torn write**: the first write intersecting an armed offset persists
@@ -10,19 +9,12 @@
 //!   reverted by `power_cut()` — modeling volatile-cache loss, which neither
 //!   kill-9 nor process exit can produce on file-backed volumes.
 //!
-//! Two tests are deliberately RED today and `#[ignore]`d with a PR 4
-//! annotation (review Issue 3): `test_strict_mode_flushes_apply` (the §2.5
-//! interval-0 fix) and `test_journal_region_never_written` (red by
-//! definition while the WAL worker journals every mutation). PR 4 flips
-//! them to enforced. Everything else is green against today's code and must
-//! stay green through PR 4–6.
+//! (The v2 D0/D1 sector-contract cases this suite grew out of — torn
+//! sector applies, the v2 strict/deferred flush barriers, journal-region
+//! hygiene — were deleted with v2 support; the v3 strict/deferred
+//! equivalents live in `kv_backend_tests.rs` and the checkpoint suite.)
 //!
-//! The fsync single-barrier accounting suites
-//! (`fsync_single_barrier_tests.rs`, `fsync_coalescing_tests.rs`) are the
-//! retained-unchanged regression guard for the PR 4 `FORCE_SYNC_TX`
-//! deletion — deliberately not duplicated here (§4.3).
-//!
-//! The trailing `PR K2` section extends the harness to the v3 CoW KV node
+//! The `PR K2` section covers the v3 CoW KV node
 //! format (design-cow-kv-metadata §4.5/§4.10): torn tail bsets, the loud
 //! positional valid-bset-after-tear classifier, and torn rewrites.
 //!
@@ -42,9 +34,6 @@
 //! checkpoint was durable), nothing double-allocated, and the full
 //! allocator state is reconstructible from the predecessor + journal.
 
-use squeezefs::meta_backend::inode::{read_inode, write_inode, DiskInode};
-use squeezefs::meta_backend::storage::MetaLvStorage;
-use squeezefs::meta_backend::{MetaLvBackend, Metadata};
 use squeezefs::uring_fs;
 use tempfile::NamedTempFile;
 
@@ -70,43 +59,12 @@ use squeezefs::meta_backend::kv::alloc_ext::{
     ALLOC_PAGE_LEN,
 };
 
-const VOL_SIZE: u64 = 256 * 1024 * 1024;
-const JOURNAL_START: u64 = 1024 * 1024 * 104;
-const JOURNAL_LEN: usize = 1024 * 1024 * 4;
-
-async fn fresh_volume() -> (NamedTempFile, MetaLvStorage) {
-    let tmp = NamedTempFile::new().unwrap();
-    let storage = MetaLvStorage::open(tmp.path(), VOL_SIZE).unwrap();
-    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
-        .await
-        .unwrap();
-    (tmp, storage)
-}
-
 /// RAII: faults never leak across tests (the shim state is process-global
 /// and the suite runs `--test-threads=1`).
 struct FaultGuard;
 impl Drop for FaultGuard {
     fn drop(&mut self) {
         uring_fs::clear_faults();
-    }
-}
-
-/// RAII env-var restore for the flush-interval knob(s). Sets BOTH today's
-/// name and the PR 4 canonical name so the test stays valid across the
-/// rename (legacy alias retained, new name wins — §4.2).
-struct StrictModeEnv;
-impl StrictModeEnv {
-    fn set() -> Self {
-        std::env::set_var("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS", "0");
-        std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "0");
-        StrictModeEnv
-    }
-}
-impl Drop for StrictModeEnv {
-    fn drop(&mut self) {
-        std::env::remove_var("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS");
-        std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
     }
 }
 
@@ -119,35 +77,33 @@ impl Drop for StrictModeEnv {
 /// and the path is dead (reads AND writes fail) until `clear_faults()`.
 #[tokio::test]
 async fn test_torn_write_poisons_path_until_cleared() {
-    let (_t, storage) = fresh_volume().await;
+    let tmp = NamedTempFile::new().unwrap();
+    tmp.as_file().set_len(96 * 1024 * 1024).unwrap();
     let _g = FaultGuard;
 
-    // A fresh (all-zero) sector far from live metadata.
+    // A fresh (all-zero) offset.
     let target = 1024 * 1024 * 64;
     let image = vec![0xABu8; 4096];
     uring_fs::arm_torn_write(target, 100);
 
-    let err = storage
-        .write_blocks_direct(target, &image)
+    let err = uring_fs::write_at(tmp.path(), target, image.clone())
         .await
         .expect_err("torn write must report EIO to the caller");
     assert_eq!(err.to_errno(), libc::EIO, "torn write maps to EIO: {err}");
 
     // Device died: subsequent I/O on the same path fails…
-    let mut buf = [0u8; 4096];
     assert!(
-        storage.read_blocks_direct(target, &mut buf).await.is_err(),
+        uring_fs::read_at(tmp.path(), target, 4096).await.is_err(),
         "reads on a poisoned path must fail"
     );
     assert!(
-        storage.write_blocks_direct(target, &image).await.is_err(),
+        uring_fs::write_at(tmp.path(), target, image).await.is_err(),
         "writes on a poisoned path must fail"
     );
 
     // …until the fault is cleared ("device replaced / remount").
     uring_fs::clear_faults();
-    storage
-        .read_blocks_direct(target, &mut buf)
+    let buf = uring_fs::read_at(tmp.path(), target, 4096)
         .await
         .expect("cleared path must serve reads again");
     assert_eq!(&buf[..100], &[0xABu8; 100][..], "torn prefix must persist");
@@ -162,306 +118,38 @@ async fn test_torn_write_poisons_path_until_cleared() {
 /// bytes vanish, fdatasync'd bytes survive.
 #[tokio::test]
 async fn test_power_cut_reverts_unsynced_writes() {
-    let (_t, storage) = fresh_volume().await;
+    let tmp = NamedTempFile::new().unwrap();
+    tmp.as_file().set_len(96 * 1024 * 1024).unwrap();
     let _g = FaultGuard;
 
     let target = 1024 * 1024 * 64;
-    uring_fs::arm_power_cut(storage.device_path());
+    uring_fs::arm_power_cut(tmp.path());
 
     // Unsynced write: lost at the cut.
-    storage
-        .write_blocks_direct(target, &[0x11u8; 4096])
+    uring_fs::write_at(tmp.path(), target, vec![0x11u8; 4096])
         .await
         .unwrap();
-    let reverted = uring_fs::power_cut(storage.device_path());
+    let reverted = uring_fs::power_cut(tmp.path());
     assert!(reverted >= 1, "the unsynced write must be reverted");
-    let mut buf = [0u8; 4096];
-    storage.read_blocks_direct(target, &mut buf).await.unwrap();
+    let buf = uring_fs::read_at(tmp.path(), target, 4096).await.unwrap();
     assert_eq!(
-        buf, [0u8; 4096],
+        &buf[..],
+        &[0u8; 4096][..],
         "unsynced bytes must not survive a power cut"
     );
 
     // Synced write: survives the cut.
-    uring_fs::arm_power_cut(storage.device_path());
-    storage
-        .write_blocks_direct(target, &[0x22u8; 4096])
+    uring_fs::arm_power_cut(tmp.path());
+    uring_fs::write_at(tmp.path(), target, vec![0x22u8; 4096])
         .await
         .unwrap();
-    uring_fs::fdatasync(storage.device_path().to_path_buf())
-        .await
-        .unwrap();
-    let _ = uring_fs::power_cut(storage.device_path());
-    storage.read_blocks_direct(target, &mut buf).await.unwrap();
+    uring_fs::fdatasync(tmp.path().to_path_buf()).await.unwrap();
+    let _ = uring_fs::power_cut(tmp.path());
+    let buf = uring_fs::read_at(tmp.path(), target, 4096).await.unwrap();
     assert_eq!(
-        buf, [0x22u8; 4096],
+        &buf[..],
+        &[0x22u8; 4096][..],
         "fdatasync'd bytes must survive a power cut"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// D1: torn-apply detection without amplification.
-// ---------------------------------------------------------------------------
-
-/// With a torn inode-table sector: victim slots read as invalid (magic
-/// zeroed ⇒ absent), fully-landed sibling slots in the SAME sector remain
-/// valid, other sectors are untouched, and mount reconciliation (allocator
-/// seed + bitmap refresh) completes — corruption does not spread (the
-/// `352d776` per-sector consistency class, across a crash).
-#[tokio::test]
-async fn test_torn_apply_detected_not_amplified() {
-    let (tmp, storage) = fresh_volume().await;
-    let _g = FaultGuard;
-
-    // Live metadata in sector 8192 (inos 0–15): root + one keeper file.
-    let backend = MetaLvBackend::new(storage);
-    let keeper = backend
-        .create(1, "keeper", libc::S_IFREG | 0o644, 0, 0)
-        .await
-        .unwrap();
-
-    // Land ino 16 normally in the fresh sector 12288 (inos 16–31)…
-    write_inode(
-        &backend.storage,
-        16,
-        &DiskInode::new(16, libc::S_IFREG | 0o644, 0, 0),
-    )
-    .await
-    .unwrap();
-
-    // …then tear ino 17's slot write after 300 bytes of the whole-sector
-    // RMW image: ino 16's slot (bytes 0..256) fully lands again, ino 17's
-    // slot gets 44 bytes (ino/size/time fields) and its magic (in-slot
-    // offset 48, absolute 304) never lands.
-    uring_fs::arm_torn_write(12288, 300);
-    let err = write_inode(
-        &backend.storage,
-        17,
-        &DiskInode::new(17, libc::S_IFREG | 0o644, 0, 0),
-    )
-    .await
-    .expect_err("the torn apply must fail loud");
-    assert_eq!(err.to_errno(), libc::EIO);
-    drop(backend);
-
-    // "Remount": fresh storage over the same bytes, faults cleared.
-    uring_fs::clear_faults();
-    let storage = MetaLvStorage::open(tmp.path(), VOL_SIZE).unwrap();
-    storage
-        .validate_superblock()
-        .await
-        .expect("superblock is outside the torn sector — must validate");
-
-    // Victim slot: detectable-absent, not garbage.
-    assert!(
-        read_inode(&storage, 17).await.is_err(),
-        "the torn slot (magic never landed) must read as invalid/absent"
-    );
-    // Sibling slot in the SAME torn sector, fully landed: valid.
-    let survivor = read_inode(&storage, 16)
-        .await
-        .expect("fully-landed sibling");
-    assert_eq!(survivor.ino, 16);
-    // Other sectors: unaffected.
-    let root = read_inode(&storage, 1).await.expect("root untouched");
-    assert_eq!(root.ino, 1);
-    let kept = read_inode(&storage, keeper.ino)
-        .await
-        .expect("keeper untouched");
-    assert_eq!(kept.ino, keeper.ino);
-
-    // Mount reconciliation completes and seeds exactly the valid slots.
-    storage.seed_inode_alloc_from_table().await.unwrap();
-    storage.refresh_bitmap_from_table().await.unwrap();
-    assert!(storage.inode_alloc.is_set(16), "landed slot seeds");
-    assert!(
-        !storage.inode_alloc.is_set(17),
-        "torn slot must NOT seed (invalid magic is skipped, never propagated)"
-    );
-    assert!(storage.inode_alloc.is_set(keeper.ino));
-}
-
-// ---------------------------------------------------------------------------
-// D0: acked durability (fsync barrier covers everything applied before it).
-// ---------------------------------------------------------------------------
-
-/// An op acked by a device barrier (the fsync path's trailing
-/// `sync_device`) survives a power cut. Green today: applies are written
-/// in-place before the coalesced barrier fires.
-#[tokio::test]
-async fn test_acked_fsync_survives_power_cut() {
-    let (tmp, storage) = fresh_volume().await;
-    let _g = FaultGuard;
-
-    uring_fs::arm_power_cut(storage.device_path());
-    let backend = MetaLvBackend::new(storage);
-    let f = backend
-        .create(1, "acked", libc::S_IFREG | 0o644, 0, 0)
-        .await
-        .unwrap();
-    // The fsync guarantee: one trailing coalesced barrier (§2.3).
-    backend.sync_device().await.expect("fsync barrier");
-
-    let reverted = uring_fs::power_cut(backend.storage.device_path());
-    assert_eq!(
-        reverted, 0,
-        "everything written before the ack barrier must already be durable"
-    );
-    drop(backend);
-    uring_fs::clear_faults();
-
-    let storage = MetaLvStorage::open(tmp.path(), VOL_SIZE).unwrap();
-    let backend = MetaLvBackend::new(storage);
-    let found = backend
-        .lookup(1, "acked")
-        .await
-        .expect("fsync-acked create must survive a power cut");
-    assert_eq!(found.ino, f.ino);
-}
-
-/// Strict mode (`…_FLUSH_INTERVAL_MS=0`, "sync-on-commit"): a returned
-/// commit implies the APPLY bytes are durable. Was RED before PR 4 (§2.5):
-/// the interval-0 barrier fired on the WAL record BEFORE the apply was
-/// issued; PR 4 moved the strict-mode barrier post-apply — enforced since.
-#[tokio::test]
-async fn test_strict_mode_flushes_apply() {
-    let _env = StrictModeEnv::set();
-    let (tmp, storage) = fresh_volume().await;
-    let _g = FaultGuard;
-
-    uring_fs::arm_power_cut(storage.device_path());
-    let backend = MetaLvBackend::new(storage);
-    backend
-        .create(1, "strict", libc::S_IFREG | 0o644, 0, 0)
-        .await
-        .expect("strict-mode commit");
-    // Commit returned ⇒ under sync-on-commit the apply must be durable NOW.
-    let _ = uring_fs::power_cut(backend.storage.device_path());
-    drop(backend);
-    uring_fs::clear_faults();
-
-    let storage = MetaLvStorage::open(tmp.path(), VOL_SIZE).unwrap();
-    let backend = MetaLvBackend::new(storage);
-    backend
-        .lookup(1, "strict")
-        .await
-        .expect("interval-0 commit returned ⇒ the op must survive a power cut");
-}
-
-/// Deferred mode (the default): commits set the flush flag and the
-/// per-volume flusher barriers the device within the interval — an op is
-/// power-cut durable once `meta_flush_deferred` shows the timer fired
-/// (§4.2). Bounded poll on the metric, no sleep-for-sync.
-#[tokio::test]
-async fn test_deferred_flush_window_barriers_applies() {
-    use std::sync::atomic::Ordering;
-
-    struct DeferredEnv;
-    impl DeferredEnv {
-        fn set() -> Self {
-            std::env::set_var("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS", "20");
-            std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "20");
-            DeferredEnv
-        }
-    }
-    impl Drop for DeferredEnv {
-        fn drop(&mut self) {
-            std::env::remove_var("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS");
-            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
-        }
-    }
-
-    let _env = DeferredEnv::set();
-    let (tmp, storage) = fresh_volume().await;
-    let _g = FaultGuard;
-
-    uring_fs::arm_power_cut(storage.device_path());
-    let backend = MetaLvBackend::new(storage);
-    let before = squeezefs::fuse_client::METRICS
-        .meta_flush_deferred
-        .load(Ordering::Relaxed);
-    backend
-        .create(1, "deferred", libc::S_IFREG | 0o644, 0, 0)
-        .await
-        .unwrap();
-
-    // Wait (bounded) for the flusher's barrier, observable via the metric.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while squeezefs::fuse_client::METRICS
-        .meta_flush_deferred
-        .load(Ordering::Relaxed)
-        == before
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "deferred flusher never barriered within the window"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-
-    let reverted = uring_fs::power_cut(backend.storage.device_path());
-    assert_eq!(
-        reverted, 0,
-        "after the deferred barrier fires, the commit's writes must be durable"
-    );
-    drop(backend);
-    uring_fs::clear_faults();
-
-    let storage = MetaLvStorage::open(tmp.path(), VOL_SIZE).unwrap();
-    let backend = MetaLvBackend::new(storage);
-    backend
-        .lookup(1, "deferred")
-        .await
-        .expect("deferred-mode op must survive a power cut after the flush window");
-}
-
-// ---------------------------------------------------------------------------
-// Journal-region hygiene.
-// ---------------------------------------------------------------------------
-
-/// A full mutation session (create / setxattr / unlink / destroy) leaves the
-/// journal region [104 MiB, 108 MiB) byte-identical. Was RED before PR 4
-/// (the WAL worker wrote a record for every mutation); the write path is
-/// deleted — the region stays declared/reserved on disk (§4.2, R1).
-/// Strengthens `test_reconciliation_does_not_touch_journal`
-/// (meta_lv_tests.rs) from "reconciliation reads don't write" to "NO code
-/// path writes" (§4.2).
-#[tokio::test]
-async fn test_journal_region_never_written() {
-    let (_t, storage) = fresh_volume().await;
-
-    let mut before = vec![0u8; JOURNAL_LEN];
-    storage
-        .read_blocks_direct(JOURNAL_START, &mut before)
-        .await
-        .unwrap();
-
-    let backend = MetaLvBackend::new(storage);
-    for i in 0..16 {
-        let name = format!("churn{i}");
-        let f = backend
-            .create(1, &name, libc::S_IFREG | 0o644, 0, 0)
-            .await
-            .unwrap();
-        squeezefs::meta_backend::xattr::set_xattr(&backend.storage, f.ino, "user.k", b"v")
-            .await
-            .unwrap();
-        if i % 2 == 0 {
-            backend.unlink(1, &name).await.unwrap();
-            backend.destroy_inode(f.ino).await.unwrap();
-        }
-    }
-    backend.sync_device().await.unwrap();
-
-    let mut after = vec![0u8; JOURNAL_LEN];
-    backend
-        .storage
-        .read_blocks_direct(JOURNAL_START, &mut after)
-        .await
-        .unwrap();
-    assert_eq!(
-        before, after,
-        "a mutation session must leave the journal region byte-identical"
     );
 }
 

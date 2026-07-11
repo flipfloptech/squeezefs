@@ -28,20 +28,12 @@ use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
-use squeezefs::meta_backend::{
-    storage::MetaLvStorage, MetaLvBackend, RoutedMetaBackend, VolumeBackend,
-};
+use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile, TempDir};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fmt {
-    V2,
-    V3,
-}
 
 /// 64 KiB block size so one harness covers all three layouts:
 /// inline (<= 4 KiB), staged (4 KiB .. 64 KiB), striped (> 64 KiB).
@@ -56,7 +48,7 @@ struct H {
     _s: TempDir,
 }
 
-async fn make(fmt: Fmt) -> H {
+async fn make() -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     let dlm = DlmClient::new("local").unwrap();
 
@@ -90,30 +82,19 @@ async fn make(fmt: Fmt) -> H {
 
     let m = NamedTempFile::new().unwrap();
     m.as_file().set_len(128 * 1024 * 1024).unwrap();
-    let routed: Arc<RoutedMetaBackend> = match fmt {
-        Fmt::V2 => {
-            let ms = MetaLvStorage::open(m.path(), 128 * 1024 * 1024).unwrap();
-            MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
-                .await
-                .unwrap();
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V2(
-                Arc::new(MetaLvBackend::new(ms)),
-            )]))
-        }
-        Fmt::V3 => {
-            ImageBuilder::new(BuilderConfig {
-                node_size: DEFAULT_NODE_SIZE,
-                journal_len_override: None,
-                hash_seed: 0xC0FF_EE00_1234_5678,
-                uuid: *b"hole-regress-v3!",
-            })
-            .unwrap()
-            .build(m.path(), 128 * 1024 * 1024)
-            .await
-            .unwrap();
-            let be = KvMetaBackend::open(m.path()).await.unwrap();
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]))
-        }
+    let routed: Arc<RoutedMetaBackend> = {
+        ImageBuilder::new(BuilderConfig {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            hash_seed: 0xC0FF_EE00_1234_5678,
+            uuid: *b"hole-regress-v3!",
+        })
+        .unwrap()
+        .build(m.path(), 128 * 1024 * 1024)
+        .await
+        .unwrap();
+        let be = KvMetaBackend::open(m.path()).await.unwrap();
+        Arc::new(RoutedMetaBackend::new(vec![be]))
     };
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed);
@@ -246,9 +227,9 @@ const LAYOUTS: [(usize, &str); 3] = [(2048, "inline"), (40_000, "staged"), (200_
 // 1. PUNCH_HOLE reads zeros (all layouts) — the writev03 / mkfs.xfs bug.
 // ---------------------------------------------------------------------------
 
-async fn punch_reads_zeros(fmt: Fmt) {
+async fn punch_reads_zeros() {
     for (idx, (size, lname)) in LAYOUTS.iter().enumerate() {
-        let h = make(fmt).await;
+        let h = make().await;
         let size = *size as u64;
         let ino = create(&h, &format!("punch{idx}")).await;
         write_at(&h, ino, 0, &vec![POISON; size as usize]).await;
@@ -258,7 +239,7 @@ async fn punch_reads_zeros(fmt: Fmt) {
         let p_len = size / 2;
         punch(&h, ino, p_off, p_len).await;
 
-        let tag = format!("{fmt:?}/{lname} punch");
+        let tag = format!("{lname} punch");
         // Size is unchanged (PUNCH_HOLE implies KEEP_SIZE).
         assert_eq!(
             size_of(&h, ino).await,
@@ -274,18 +255,13 @@ async fn punch_reads_zeros(fmt: Fmt) {
 
 #[tokio::test]
 async fn punch_reads_zeros_v3() {
-    punch_reads_zeros(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn punch_reads_zeros_v2() {
-    punch_reads_zeros(Fmt::V2).await;
+    punch_reads_zeros().await;
 }
 
 /// A block-aligned whole-block striped punch (the mkfs.xfs BLKDISCARD shape):
 /// the entire middle block is punched and must read zeros; the neighbours stay.
-async fn punch_whole_block_striped(fmt: Fmt) {
-    let h = make(fmt).await;
+async fn punch_whole_block_striped() {
+    let h = make().await;
     let size = 4 * BS; // 4 full blocks
     let ino = create(&h, "punchwb").await;
     write_at(&h, ino, 0, &vec![POISON; size as usize]).await;
@@ -293,7 +269,7 @@ async fn punch_whole_block_striped(fmt: Fmt) {
     // Punch block index 1 and 2 exactly (block-aligned).
     punch(&h, ino, BS, 2 * BS).await;
 
-    let tag = format!("{fmt:?}/striped whole-block punch");
+    let tag = "striped whole-block punch".to_string();
     assert_eq!(size_of(&h, ino).await, size, "[{tag}] size changed");
     assert_fill(&h, ino, 0, BS, POISON, &tag).await;
     assert_hole(&h, ino, BS, 2 * BS, &tag).await;
@@ -302,12 +278,7 @@ async fn punch_whole_block_striped(fmt: Fmt) {
 
 #[tokio::test]
 async fn punch_whole_block_striped_v3() {
-    punch_whole_block_striped(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn punch_whole_block_striped_v2() {
-    punch_whole_block_striped(Fmt::V2).await;
+    punch_whole_block_striped().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,9 +286,9 @@ async fn punch_whole_block_striped_v2() {
 //    residual: a striped file's surviving partial block kept a stale tail.
 // ---------------------------------------------------------------------------
 
-async fn truncate_extend_reads_zeros(fmt: Fmt) {
+async fn truncate_extend_reads_zeros() {
     for (idx, (size, lname)) in LAYOUTS.iter().enumerate() {
-        let h = make(fmt).await;
+        let h = make().await;
         let size = *size as u64;
         let ino = create(&h, &format!("trunc{idx}")).await;
         write_at(&h, ino, 0, &vec![POISON; size as usize]).await;
@@ -328,7 +299,7 @@ async fn truncate_extend_reads_zeros(fmt: Fmt) {
         truncate_to(&h, ino, small).await;
         truncate_to(&h, ino, size).await;
 
-        let tag = format!("{fmt:?}/{lname} truncate-extend");
+        let tag = format!("{lname} truncate-extend");
         assert_eq!(
             size_of(&h, ino).await,
             size,
@@ -341,21 +312,16 @@ async fn truncate_extend_reads_zeros(fmt: Fmt) {
 
 #[tokio::test]
 async fn truncate_extend_reads_zeros_v3() {
-    truncate_extend_reads_zeros(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn truncate_extend_reads_zeros_v2() {
-    truncate_extend_reads_zeros(Fmt::V2).await;
+    truncate_extend_reads_zeros().await;
 }
 
 // ---------------------------------------------------------------------------
 // 3. fallocate-extend (grow) reads zeros (all layouts).
 // ---------------------------------------------------------------------------
 
-async fn fallocate_extend_reads_zeros(fmt: Fmt) {
+async fn fallocate_extend_reads_zeros() {
     for (idx, (size, lname)) in LAYOUTS.iter().enumerate() {
-        let h = make(fmt).await;
+        let h = make().await;
         let size = *size as u64;
         let ino = create(&h, &format!("falloc{idx}")).await;
         write_at(&h, ino, 0, &vec![POISON; size as usize]).await;
@@ -365,7 +331,7 @@ async fn fallocate_extend_reads_zeros(fmt: Fmt) {
         let extra = 100_000u64;
         fallocate_extend(&h, ino, size, extra).await;
 
-        let tag = format!("{fmt:?}/{lname} fallocate-extend");
+        let tag = format!("{lname} fallocate-extend");
         assert_eq!(size_of(&h, ino).await, size + extra, "[{tag}] size wrong");
         assert_fill(&h, ino, 0, size, POISON, &tag).await;
         assert_hole(&h, ino, size, extra, &tag).await;
@@ -374,12 +340,7 @@ async fn fallocate_extend_reads_zeros(fmt: Fmt) {
 
 #[tokio::test]
 async fn fallocate_extend_reads_zeros_v3() {
-    fallocate_extend_reads_zeros(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn fallocate_extend_reads_zeros_v2() {
-    fallocate_extend_reads_zeros(Fmt::V2).await;
+    fallocate_extend_reads_zeros().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -388,8 +349,8 @@ async fn fallocate_extend_reads_zeros_v2() {
 //    as holes that must read zeros.
 // ---------------------------------------------------------------------------
 
-async fn sparse_write_hole_reads_zeros(fmt: Fmt) {
-    let h = make(fmt).await;
+async fn sparse_write_hole_reads_zeros() {
+    let h = make().await;
     let ino = create(&h, "sparse").await;
     // Seed then discard, so the freed blocks carry POISON on the device.
     write_at(&h, ino, 0, &vec![POISON; (4 * BS) as usize]).await;
@@ -400,7 +361,7 @@ async fn sparse_write_hole_reads_zeros(fmt: Fmt) {
     let woff = 2 * BS + 8192;
     write_at(&h, ino, woff, &vec![0xCD; page as usize]).await;
 
-    let tag = format!("{fmt:?}/striped sparse-write");
+    let tag = "striped sparse-write".to_string();
     assert_eq!(size_of(&h, ino).await, woff + page, "[{tag}] size wrong");
     // Earlier blocks are holes even though the same offsets once held POISON.
     assert_hole(&h, ino, 0, 2 * BS, &tag).await;
@@ -411,12 +372,7 @@ async fn sparse_write_hole_reads_zeros(fmt: Fmt) {
 
 #[tokio::test]
 async fn sparse_write_hole_reads_zeros_v3() {
-    sparse_write_hole_reads_zeros(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn sparse_write_hole_reads_zeros_v2() {
-    sparse_write_hole_reads_zeros(Fmt::V2).await;
+    sparse_write_hole_reads_zeros().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,8 +380,8 @@ async fn sparse_write_hole_reads_zeros_v2() {
 //    through a reused offset — the incarnation / block-reuse guarantee.
 // ---------------------------------------------------------------------------
 
-async fn punch_then_reuse_reads_zeros(fmt: Fmt) {
-    let h = make(fmt).await;
+async fn punch_then_reuse_reads_zeros() {
+    let h = make().await;
     let size = 4 * BS;
     let a = create(&h, "reuse_a").await;
     write_at(&h, a, 0, &vec![POISON; size as usize]).await;
@@ -438,7 +394,7 @@ async fn punch_then_reuse_reads_zeros(fmt: Fmt) {
     let b = create(&h, "reuse_b").await;
     write_at(&h, b, 0, &vec![0xCD; (2 * BS) as usize]).await;
 
-    let tag = format!("{fmt:?}/striped punch-then-reuse");
+    let tag = "striped punch-then-reuse".to_string();
     // File A's punched range still reads zeros, never B's 0xCD or the old POISON.
     assert_fill(&h, a, 0, BS, POISON, &tag).await;
     assert_hole(&h, a, BS, 2 * BS, &tag).await;
@@ -449,12 +405,7 @@ async fn punch_then_reuse_reads_zeros(fmt: Fmt) {
 
 #[tokio::test]
 async fn punch_then_reuse_reads_zeros_v3() {
-    punch_then_reuse_reads_zeros(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn punch_then_reuse_reads_zeros_v2() {
-    punch_then_reuse_reads_zeros(Fmt::V2).await;
+    punch_then_reuse_reads_zeros().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -484,14 +435,13 @@ async fn punch_then_reuse_reads_zeros_v2() {
 // ---------------------------------------------------------------------------
 
 async fn truncate_down_stale_size_reads_zeros(
-    fmt: Fmt,
     stale: u64,
     small_present: u64,
     mid: u64,
     big: u64,
     lname: &str,
 ) {
-    let h = make(fmt).await;
+    let h = make().await;
     let ino = create(&h, "wbrace").await;
 
     // Grow the file to `big` with a recognizable pattern everywhere.
@@ -509,7 +459,7 @@ async fn truncate_down_stale_size_reads_zeros(
             .fetch_metadata(&file_path)
             .await
             .expect("fetch meta");
-    assert_eq!(m.size, big, "[{fmt:?}/{lname}] setup: physical size");
+    assert_eq!(m.size, big, "[v3/{lname}] setup: physical size");
     m.size = stale;
     m.cached_at = std::time::Instant::now();
     h.fs.router.metadata_cache.insert(file_path.clone(), m);
@@ -521,7 +471,7 @@ async fn truncate_down_stale_size_reads_zeros(
     // Re-extend past the truncated region so [mid, big) is now a POSIX hole.
     truncate_to(&h, ino, big).await;
 
-    let tag = format!("{fmt:?}/{lname} truncate-down-stale-size");
+    let tag = format!("{lname} truncate-down-stale-size");
     assert_eq!(size_of(&h, ino).await, big, "[{tag}] size after re-extend");
     // The re-exposed hole MUST read zeros — never the stale POISON.
     assert_hole(&h, ino, mid, big - mid, &tag).await;
@@ -545,22 +495,17 @@ async fn truncate_down_stale_size_reads_zeros(
     }
 }
 
-async fn truncate_down_stale_size_all_layouts(fmt: Fmt) {
+async fn truncate_down_stale_size_all_layouts() {
     // inline (<= 4 KiB): stale/mid/big all inline-sized.
-    truncate_down_stale_size_reads_zeros(fmt, 512, 1024, 2048, 3500, "inline").await;
+    truncate_down_stale_size_reads_zeros(512, 1024, 2048, 3500, "inline").await;
     // staged (4 KiB .. 64 KiB): all <= BS so the file stays a single blob.
-    truncate_down_stale_size_reads_zeros(fmt, 8_000, 12_000, 24_000, 50_000, "staged").await;
+    truncate_down_stale_size_reads_zeros(8_000, 12_000, 24_000, 50_000, "staged").await;
     // striped (> 64 KiB): mid is block-aligned (2 * BS) so only whole-block
     // removal is exercised; blocks 2..=3 must be dropped by the truncate.
-    truncate_down_stale_size_reads_zeros(fmt, 80_000, 60_000, 2 * BS, 250_000, "striped").await;
+    truncate_down_stale_size_reads_zeros(80_000, 60_000, 2 * BS, 250_000, "striped").await;
 }
 
 #[tokio::test]
 async fn truncate_down_stale_size_reads_zeros_v3() {
-    truncate_down_stale_size_all_layouts(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn truncate_down_stale_size_reads_zeros_v2() {
-    truncate_down_stale_size_all_layouts(Fmt::V2).await;
+    truncate_down_stale_size_all_layouts().await;
 }

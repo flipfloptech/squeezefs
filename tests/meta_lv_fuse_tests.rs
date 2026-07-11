@@ -4,12 +4,34 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{SqueezefsFilesystem, CONFIG_INODE};
-use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile};
+
+/// Format + mount one v3 metadata volume for this harness.
+async fn open_v3_meta(
+    path: &std::path::Path,
+    len: u64,
+) -> std::sync::Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+    squeezefs::meta_backend::kv::builder::format_v3(
+        path,
+        len,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3 meta volume");
+    squeezefs::meta_backend::kv::backend::KvMetaBackend::open(path)
+        .await
+        .expect("open v3 meta volume")
+}
 
 #[tokio::test]
 async fn test_metalv_fuse_integration() {
@@ -55,21 +77,27 @@ async fn test_metalv_fuse_integration() {
 
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 
-    // Initialize MetaLV storage and backend
+    // Initialize the metadata volume and backend.
     let meta_temp = NamedTempFile::new().unwrap();
     let meta_path = meta_temp.path().to_path_buf();
-    let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
 
-    // Verify it is not formatted initially
-    assert!(meta_storage.read_superblock().await.is_err());
+    // Verify it is not formatted initially (blank classification).
+    assert!(matches!(
+        squeezefs::meta_backend::kv::superblock::classify_volume(&meta_path)
+            .await
+            .unwrap(),
+        squeezefs::meta_backend::kv::superblock::VolumeFormat::Blank
+    ));
 
-    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
-        .await
-        .unwrap();
+    let meta_backend = open_v3_meta(&meta_path, 256 * 1024 * 1024).await;
 
-    // Verify it is now formatted
-    assert!(meta_storage.read_superblock().await.is_ok());
-    let meta_backend = Arc::new(MetaLvBackend::new(meta_storage));
+    // Verify it is now formatted (v3 classification).
+    assert!(matches!(
+        squeezefs::meta_backend::kv::superblock::classify_volume(&meta_path)
+            .await
+            .unwrap(),
+        squeezefs::meta_backend::kv::superblock::VolumeFormat::V3(_)
+    ));
 
     // Register MetaLV backend
     let routed_meta_backend = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![

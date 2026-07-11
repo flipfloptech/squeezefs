@@ -133,24 +133,6 @@ enum Commands {
         /// Metadata URI (sqmeta://...)
         meta_uri: String,
     },
-    /// Convert a metadata volume from format v2 to v3 in place (offline).
-    ///
-    /// Crash-safe and idempotent: interrupt it and re-run — a completed
-    /// conversion is a clean no-op, an incomplete one restarts. The volume
-    /// must be unmounted (a live client refuses the migration).
-    Migrate {
-        /// Metadata URI (sqmeta://...) or path to the metadata volume
-        meta_uri: String,
-        /// Grow a file-backed volume to this total size (e.g. "300M") when the
-        /// free tail is too small to hold the v3 image. Refused on block
-        /// devices (grow them externally or migrate to a larger device).
-        #[arg(long)]
-        grow: Option<String>,
-        /// Build + verify the conversion and report the round-trip digest diff
-        /// WITHOUT flipping the superblock — nothing is committed.
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Mount squeezefs at a target path
     Mount {
         /// Metadata URIs (sqmeta://...) and Mountpoint path (last argument)
@@ -268,14 +250,6 @@ enum Commands {
         /// Default 1 = verify every write. Larger values reduce RAW cost under load.
         #[arg(long, default_value_t = 1)]
         write_verification_sample: u64,
-
-        /// Fail the mount unless every metadata volume classifies as
-        /// `atomic4k` (4 KiB-LBA or kernel-advertised atomic-write unit >=
-        /// 4 KiB). Default off: file-backed dev volumes carry a documented
-        /// torn-sector exposure on power loss (D2). Config-file equivalent:
-        /// `strict_meta_atomicity` in the runtime config.
-        #[arg(long)]
-        strict_meta_atomicity: bool,
     },
     /// Cleanly unmount a squeezefs mountpoint (fusermount/umount/-f; kills zombie daemon if needed)
     Umount {
@@ -1101,14 +1075,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .enable_all()
             .build()
             .unwrap();
-        // Dual-format bootstrap (PR K6a): the format config is read
-        // through the version-gated dispatch — v2 volumes via the fixed
-        // xattr region, v3 volumes via the KV xattr tree. Blank, foreign,
-        // torn, future-version, and unknown-feature superblocks all fail
-        // loud here, before any daemonization.
+        // Version-gated bootstrap (PR K6a): the format config is read off
+        // the first volume's KV xattr tree via a read-only probe mount.
+        // Blank, legacy-v2, foreign, torn, future-version, and
+        // unknown-feature superblocks all fail loud here, before any
+        // daemonization.
         let val_opt = temp_rt.block_on(async {
-            let vol =
-                squeezefs::meta_backend::VolumeBackend::open_for_mount(first_meta_path).await?;
+            let vol = squeezefs::meta_backend::open_volume_probe(first_meta_path).await?;
             vol.getxattr(1, squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
                 .await
         });
@@ -1600,11 +1573,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let parsed_block_size = parse_human_readable_size(&block_size)?;
             let config = FormatConfig {
                 name: "squeezefs".to_string(),
-                // Filesystem-generation stamp: fresh per format invocation.
-                // v2 volume sets derive their staging generation identity
-                // from this config field (v3 sets use the superblock uuid)
-                // — see `meta_backend::volume_set_generation`.
-                fs_uuid: Some(uuid::Uuid::new_v4().to_string()),
                 block_size: parsed_block_size,
                 capacity: total_capacity,
                 inodes,
@@ -1628,10 +1596,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // (staging-dir wipes, data zeroing, meta wipes): a refused format
             // must leave all volumes and caches intact.
             for path in &meta_lvs {
-                let storage =
-                    squeezefs::meta_backend::storage::MetaLvStorage::open(path, 128 * 1024 * 1024)
-                        .map_err(|e| format!("Failed to open metadata volume '{}': {}", path, e))?;
-                squeezefs::meta_backend::MetaLvBackend::format_preflight(&storage, force)
+                squeezefs::meta_backend::kv::builder::format_preflight(Path::new(path), force)
                     .await
                     .map_err(|e| format!("metadata volume '{}': {}", path, e))?;
             }
@@ -1831,84 +1796,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::set_fs_prefix("squeezefs");
             println!("No active clients connected.");
         }
-        Commands::Migrate {
-            meta_uri,
-            grow,
-            dry_run,
-        } => {
-            squeezefs::set_fs_prefix("squeezefs");
-            let path = if meta_uri.starts_with("sqmeta://") {
-                parse_block_uri(&meta_uri, "sqmeta://")?
-                    .into_iter()
-                    .next()
-                    .ok_or("Error: empty sqmeta:// URI")?
-            } else {
-                meta_uri.clone()
-            };
-            let grow_to_bytes = match grow {
-                Some(ref g) => Some(parse_human_readable_size(g)?),
-                None => None,
-            };
-            let opts = squeezefs::meta_backend::kv::migrate::MigrateOptions {
-                grow_to_bytes,
-                dry_run,
-                ..Default::default()
-            };
-            let _ctrl_c_guard = spawn_ctrl_c_handler("migrating");
-            let report =
-                squeezefs::meta_backend::kv::migrate::migrate_volume(Path::new(&path), &opts)
-                    .await?;
-            if report.already_v3 {
-                println!("{path} is already format v3 — nothing to migrate (no-op).");
-            } else {
-                if let Some(new_len) = report.grew_to {
-                    println!(
-                        "Grew {path} to {} to fit the v3 image.",
-                        format_size_human(new_len)
-                    );
-                }
-                println!(
-                    "{} v2 → v3 migration of {path}:",
-                    if report.dry_run {
-                        "DRY-RUN"
-                    } else {
-                        "Completed"
-                    }
-                );
-                println!(
-                    "  {} inodes, {} dentries, {} xattrs migrated ({} quarantined ino(s) carried \
-                     content-lost)",
-                    report.inodes_migrated,
-                    report.dentries_migrated,
-                    report.xattrs_migrated,
-                    report.quarantined_inodes
-                );
-                println!(
-                    "  round-trip digest {:#018x} (source == built: {})",
-                    report.built_digest,
-                    report.source_digest == report.built_digest
-                );
-                println!(
-                    "  build region base {} ; {} node(s) written ; next_ino {}",
-                    format_size_human(report.build_start),
-                    report.nodes_written,
-                    report.next_ino
-                );
-                println!(
-                    "  reclaimed as free v3 extents: {} (dead journal region) + {} (xattr \
-                     reservation) ; {} / {} heap extents free",
-                    report.reclaimed_journal_extents,
-                    report.reclaimed_reservation_extents,
-                    report.free_extents_after,
-                    report.total_extents
-                );
-                if report.dry_run {
-                    println!("  --dry-run: superblock NOT flipped; no changes committed.");
-                } else if report.flipped {
-                    println!("  superblock flipped to v3 (durable). Mount it to verify.");
-                }
-            }
-        }
         Commands::Mount {
             args,
             mem_cache_size,
@@ -1939,7 +1826,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             job_cpu_limit,
             write_verification: _,
             write_verification_sample: _,
-            strict_meta_atomicity,
         } => {
             let (meta_lvs, mountpoint) = if let Some(ref m_lvs) = meta_lv {
                 if args.is_empty() {
@@ -1962,12 +1848,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 (m_lvs, m_point)
             };
 
-            // Dual-format bootstrap (PR K6a): root-inode presence and the
-            // format config are read through the version-gated dispatch —
-            // v2 volumes via the fixed tables, v3 volumes via the KV trees.
+            // Version-gated bootstrap (PR K6a): root-inode presence and
+            // the format config are read off the first volume's KV trees
+            // via a read-only probe mount.
             let first_meta_path = &meta_lvs[0];
-            let boot_vol =
-                squeezefs::meta_backend::VolumeBackend::open_for_mount(first_meta_path).await?;
+            let boot_vol = squeezefs::meta_backend::open_volume_probe(first_meta_path).await?;
             let _root_inode = boot_vol.getattr(1).await?;
             let val_opt = boot_vol
                 .getxattr(1, squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
@@ -2195,71 +2080,42 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .active_write_backend
                 .store(std::sync::Arc::new(first_name));
 
-            // Strict atomicity: CLI flag OR the runtime-config equivalent
-            // (design §4.6 — operator opt-in, default off).
-            let strict_atomicity = strict_meta_atomicity
-                || squeezefs::config_ops::load_or_create_config().strict_meta_atomicity;
-
-            // Dual-format mount dispatch (design-cow-kv-metadata §6.1):
-            // every volume is routed by its superblock version through
-            // the same gate the bootstrap used. Mixed sets are legal by
-            // design (§4.9). Since PR K6b v3 volumes serve READ-WRITE:
-            // the §4.4 commit pipeline + §4.6 checkpoint task are live.
+            // Mount every volume through the sector-0 version gate
+            // (design-cow-kv-metadata §6.1): v3 mounts read-write (the
+            // §4.4 commit pipeline + §4.6 checkpoint task are live);
+            // blank and legacy-v2 volumes refuse loud.
             let mut meta_backends = Vec::new();
             for path in &meta_lvs {
-                let vol = squeezefs::meta_backend::VolumeBackend::open_for_mount(path).await?;
-                match &vol {
-                    squeezefs::meta_backend::VolumeBackend::V2(be) => {
-                        // The unchanged v2 path: superblock validated by
-                        // the gate (magic + version + checksum-iff-nonzero,
-                        // hard error before any worker/reconciliation).
-                        // Sector-atomicity probe (design §4.6): classify,
-                        // enforce the strict gate if requested — the gate
-                        // retains meaning on v2 volumes ONLY (resolved
-                        // OQ 2; v3's contract class holds by construction)
-                        // — and publish to the stats surface.
-                        let atomicity_class = squeezefs::meta_backend::atomicity::probe_meta_volume(
-                            std::path::Path::new(path),
-                        );
-                        if strict_atomicity {
-                            squeezefs::meta_backend::atomicity::enforce_strict(
-                                atomicity_class,
-                                std::path::Path::new(path),
-                            )?;
-                        }
-                        let _ = be.atomicity_class.set(atomicity_class);
-                    }
-                    squeezefs::meta_backend::VolumeBackend::V3(be) => {
-                        // §10 mount log: format version, ledger seq chosen,
-                        // replay entries/dropped/ms, free extents — plus
-                        // BOTH resolved-OQ-2 atomicity fields (the contract
-                        // class and the physical probe).
-                        let physical = squeezefs::meta_backend::atomicity::probe_meta_volume(
-                            std::path::Path::new(path),
-                        );
-                        be.set_atomicity_physical(physical);
-                        let stats = be.replay_stats();
-                        log::info!(
-                            "meta volume {}: format=3 ledger_seq={} replay_entries={} \
-                             replay_dropped_torn={} replay_ms={} free_extents={} next_ino={} \
-                             meta_volume_atomicity={} meta_volume_atomicity_physical={}",
-                            path,
-                            be.mounted_ledger().seq,
-                            stats.entries,
-                            stats.dropped_torn,
-                            stats.replay_ms,
-                            be.free_extents(),
-                            be.next_ino(),
-                            be.atomicity_contract(),
-                            physical,
-                        );
-                    }
-                }
-                meta_backends.push(vol);
+                let be = squeezefs::meta_backend::open_volume_for_mount(path).await?;
+                // §10 mount log: format version, ledger seq chosen,
+                // replay entries/dropped/ms, free extents — plus BOTH
+                // resolved-OQ-2 atomicity fields (the contract class and
+                // the physical probe; the probe is informational — the
+                // CoW contract holds by construction).
+                let physical = squeezefs::meta_backend::atomicity::probe_meta_volume(
+                    std::path::Path::new(path),
+                );
+                be.set_atomicity_physical(physical);
+                let stats = be.replay_stats();
+                log::info!(
+                    "meta volume {}: format=3 ledger_seq={} replay_entries={} \
+                     replay_dropped_torn={} replay_ms={} free_extents={} next_ino={} \
+                     meta_volume_atomicity={} meta_volume_atomicity_physical={}",
+                    path,
+                    be.mounted_ledger().seq,
+                    stats.entries,
+                    stats.dropped_torn,
+                    stats.replay_ms,
+                    be.free_extents(),
+                    be.next_ino(),
+                    be.atomicity_contract(),
+                    physical,
+                );
+                meta_backends.push(be);
             }
 
             let routed_meta_backend = std::sync::Arc::new(
-                squeezefs::meta_backend::RoutedMetaBackend::new_dispatch(meta_backends),
+                squeezefs::meta_backend::RoutedMetaBackend::new(meta_backends),
             );
 
             let resolved_uid = uid.unwrap_or_else(|| {
@@ -2280,75 +2136,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .router
                 .set_meta_backend(routed_meta_backend.clone());
 
-            // Reconcile the inode allocator + on-disk bitmap from the authoritative
-            // inode table before serving FUSE (design §3.9 / PR 2b). Seeds the
-            // in-RAM allocator (the sole allocator) and heals any crash-induced
-            // bitmap divergence so pre-PR-8 binaries can still mount this
-            // volume. WAL replay was deleted in PR 8 (unsound as the WAL stood —
-            // review Issue 15); crash recovery = in-place apply + fdatasync.
-            // Then run block-allocator recovery.
-            for meta_vol in &routed_meta_backend.volumes {
-                match meta_vol {
-                    squeezefs::meta_backend::VolumeBackend::V2(meta_be) => {
-                        let quarantined_before = squeezefs::fuse_client::METRICS
-                            .meta_quarantined_inodes
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        if let Err(e) = meta_be.storage.seed_inode_alloc_from_table().await {
-                            log::warn!("Inode allocator seed failed on mount: {:?}", e);
-                        }
-                        if let Err(e) = meta_be.storage.refresh_bitmap_from_table().await {
-                            log::warn!("Inode bitmap reconciliation failed on mount: {:?}", e);
-                        }
-                        // One structured line per volume (design §4.6/§Observability):
-                        // atomicity classification + legacy quarantine victims +
-                        // journal-region status (reserved; write path deleted, PR 4).
-                        let quarantined = squeezefs::fuse_client::METRICS
-                            .meta_quarantined_inodes
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                            - quarantined_before;
-                        log::info!(
-                            "meta volume {}: atomicity={} quarantined_legacy_inos={} journal_region=reserved(never written)",
-                            meta_be.storage.device_path().display(),
-                            meta_be
-                                .atomicity_class
-                                .get()
-                                .map(|c| c.as_str())
-                                .unwrap_or("unprobed"),
-                            quarantined,
-                        );
-                        for entry in fs_engine.router.backend_router.backends.iter() {
-                            let backend = entry.value();
-                            log::info!("Running block allocator recovery for data volume...");
-                            if let Err(e) = backend
-                                .block_allocator
-                                .recover_active_blocks(
-                                    &meta_be.storage,
-                                    &fs_engine.router.backend_router,
-                                )
-                                .await
-                            {
-                                log::error!("Failed to recover block allocator: {:?}", e);
-                            }
-                        }
-                    }
-                    squeezefs::meta_backend::VolumeBackend::V3(kv) => {
-                        // v3 needs no allocator seed / bitmap reconcile
-                        // (monotonic inos, §4.8; A/B bitmap loaded at
-                        // open). Block-allocator refcount recovery walks
-                        // the live inode tree instead of the fixed table.
-                        for entry in fs_engine.router.backend_router.backends.iter() {
-                            let backend = entry.value();
-                            log::info!(
-                                "Running block allocator recovery (v3 walk) for data volume..."
-                            );
-                            if let Err(e) = backend
-                                .block_allocator
-                                .recover_active_blocks_v3(kv, &fs_engine.router.backend_router)
-                                .await
-                            {
-                                log::error!("Failed to recover block allocator: {:?}", e);
-                            }
-                        }
+            // Block-allocator refcount recovery before serving FUSE: walk
+            // each volume's live inode tree (no allocator seed / bitmap
+            // reconcile — monotonic inos §4.8; A/B bitmap loaded at open).
+            for kv in &routed_meta_backend.volumes {
+                for entry in fs_engine.router.backend_router.backends.iter() {
+                    let backend = entry.value();
+                    log::info!("Running block allocator recovery for data volume...");
+                    if let Err(e) = backend
+                        .block_allocator
+                        .recover_active_blocks_v3(kv, &fs_engine.router.backend_router)
+                        .await
+                    {
+                        log::error!("Failed to recover block allocator: {:?}", e);
                     }
                 }
             }

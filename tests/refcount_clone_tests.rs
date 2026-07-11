@@ -20,13 +20,34 @@ use squeezefs::dlm::DlmClient;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
-use squeezefs::meta_backend::{
-    storage::MetaLvStorage, MetaLvBackend, Metadata, RoutedMetaBackend, VolumeBackend,
-};
+use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{CachedMetadata, DataRouter, LayoutMetadata};
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile};
+
+/// Format + mount one v3 metadata volume for this harness.
+async fn open_v3_meta(
+    path: &std::path::Path,
+    len: u64,
+) -> std::sync::Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+    squeezefs::meta_backend::kv::builder::format_v3(
+        path,
+        len,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3 meta volume");
+    squeezefs::meta_backend::kv::backend::KvMetaBackend::open(path)
+        .await
+        .expect("open v3 meta volume")
+}
 
 async fn make_router() -> (
     DataRouter,
@@ -65,12 +86,8 @@ async fn make_router() -> (
     let router = DataRouter::new(dlm, cache, ba.clone(), nvme);
 
     let m = NamedTempFile::new().unwrap();
-    let ms = MetaLvStorage::open(m.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
-        .await
-        .unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
-        Arc::new(MetaLvBackend::new(ms)),
+        open_v3_meta(m.path(), 256 * 1024 * 1024).await,
     ]));
     router.set_meta_backend(routed.clone());
     (router, ba, routed, b, m, s)
@@ -355,7 +372,7 @@ async fn make_router_v3() -> (
     .await
     .unwrap();
     let be = KvMetaBackend::open(m.path()).await.unwrap();
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be]));
     router.set_meta_backend(routed.clone());
     (router, ba, routed, b, m, s)
 }

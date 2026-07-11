@@ -273,10 +273,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// `flags2` bit 0: migrated quarantined ino whose v2 xattr block was presumed
-/// corrupt and not read (design §6.2).
-pub const FLAGS2_QUARANTINE_CONTENT_LOST: u32 = 1;
-
 /// Current inode value encoding version (the leading varint tag).
 pub const INODE_VALUE_VERSION: u64 = 1;
 
@@ -1173,17 +1169,15 @@ mod tests {
     #[test]
     fn inode_value_roundtrips_with_leading_version_varint() {
         let v = InodeValue {
-            flags2: FLAGS2_QUARANTINE_CONTENT_LOST,
+            // flags2 is a reserved wire field (bit 0 was the retired
+            // migrate-era quarantine flag); a nonzero value must round-trip.
+            flags2: 1,
             ..iv(7)
         };
         let bytes = v.encode();
         assert_eq!(bytes[0], 1, "leading varint version tag must be 1");
         assert_eq!(bytes.len(), 57, "varint(1) + 6×u32 + 4×u64");
         assert_eq!(InodeValue::decode(&bytes).expect("roundtrip"), v);
-        assert_eq!(
-            FLAGS2_QUARANTINE_CONTENT_LOST, 1,
-            "§6.2 quarantine flag is bit 0"
-        );
 
         // Unknown future version — refused, not misparsed.
         let mut future = bytes.clone();

@@ -28,20 +28,12 @@ use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
-use squeezefs::meta_backend::{
-    storage::MetaLvStorage, MetaLvBackend, RoutedMetaBackend, VolumeBackend,
-};
+use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile, TempDir};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fmt {
-    V2,
-    V3,
-}
 
 struct H {
     fs: SqueezefsFilesystem,
@@ -53,7 +45,7 @@ struct H {
 
 /// Block size 64 KiB so a single harness covers all three layouts:
 /// inline (<= 4 KiB), staged (4 KiB .. 64 KiB), striped (> 64 KiB).
-async fn make(fmt: Fmt) -> H {
+async fn make() -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     let dlm = DlmClient::new("local").unwrap();
 
@@ -87,30 +79,19 @@ async fn make(fmt: Fmt) -> H {
 
     let m = NamedTempFile::new().unwrap();
     m.as_file().set_len(128 * 1024 * 1024).unwrap();
-    let routed: Arc<RoutedMetaBackend> = match fmt {
-        Fmt::V2 => {
-            let ms = MetaLvStorage::open(m.path(), 128 * 1024 * 1024).unwrap();
-            MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
-                .await
-                .unwrap();
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V2(
-                Arc::new(MetaLvBackend::new(ms)),
-            )]))
-        }
-        Fmt::V3 => {
-            ImageBuilder::new(BuilderConfig {
-                node_size: DEFAULT_NODE_SIZE,
-                journal_len_override: None,
-                hash_seed: 0xC0FF_EE00_1234_5678,
-                uuid: *b"cfr-regress-v3!!",
-            })
-            .unwrap()
-            .build(m.path(), 128 * 1024 * 1024)
-            .await
-            .unwrap();
-            let be = KvMetaBackend::open(m.path()).await.unwrap();
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]))
-        }
+    let routed: Arc<RoutedMetaBackend> = {
+        ImageBuilder::new(BuilderConfig {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            hash_seed: 0xC0FF_EE00_1234_5678,
+            uuid: *b"cfr-regress-v3!!",
+        })
+        .unwrap()
+        .build(m.path(), 128 * 1024 * 1024)
+        .await
+        .unwrap();
+        let be = KvMetaBackend::open(m.path()).await.unwrap();
+        Arc::new(RoutedMetaBackend::new(vec![be]))
     };
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed);
@@ -233,8 +214,8 @@ async fn cfr_loop(
 /// Partial (sub-file) CFR across inline / staged / striped source sizes, at a
 /// non-zero source AND destination offset. Pins forward progress + byte-exact
 /// destination for the common in-bounds case.
-async fn partial_range_all_layouts(fmt: Fmt) {
-    let h = make(fmt).await;
+async fn partial_range_all_layouts() {
+    let h = make().await;
     // inline, staged, striped (64 KiB block size).
     for (idx, &size) in [2048usize, 40_000, 200_000].iter().enumerate() {
         let src = create(&h, &format!("src{idx}")).await;
@@ -245,44 +226,30 @@ async fn partial_range_all_layouts(fmt: Fmt) {
         let off_in = (size / 4) as u64;
         let off_out = 111u64; // non-zero dest offset
         let len = (size / 2) as u64;
-        let calls = cfr_loop(
-            &h,
-            src,
-            off_in,
-            dst,
-            off_out,
-            len,
-            &format!("{fmt:?} sz{size}"),
-        )
-        .await;
+        let calls = cfr_loop(&h, src, off_in, dst, off_out, len, &format!("sz{size}")).await;
         assert!(
             calls <= 4,
-            "{fmt:?} size {size}: partial CFR took {calls} calls (expected O(1))"
+            "size {size}: partial CFR took {calls} calls (expected O(1))"
         );
 
         let got = read_at(&h, dst, off_out, len as u32).await;
         assert_eq!(
             got,
             &data[off_in as usize..off_in as usize + len as usize],
-            "{fmt:?} size {size}: destination bytes mismatch after partial CFR"
+            "size {size}: destination bytes mismatch after partial CFR"
         );
     }
 }
 
 #[tokio::test]
 async fn cfr_partial_range_all_layouts_v3() {
-    partial_range_all_layouts(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn cfr_partial_range_all_layouts_v2() {
-    partial_range_all_layouts(Fmt::V2).await;
+    partial_range_all_layouts().await;
 }
 
 /// Striped range that straddles a 64 KiB block boundary — the cross-block leg
 /// the diagnosis flagged.
-async fn cross_block_range(fmt: Fmt) {
-    let h = make(fmt).await;
+async fn cross_block_range() {
+    let h = make().await;
     let size = 300_000usize; // > 4 blocks of 64 KiB
     let src = create(&h, "cbsrc").await;
     let dst = create(&h, "cbdst").await;
@@ -293,33 +260,19 @@ async fn cross_block_range(fmt: Fmt) {
     let off_in = 60_000u64;
     let off_out = 5_000u64;
     let len = 140_000u64;
-    cfr_loop(
-        &h,
-        src,
-        off_in,
-        dst,
-        off_out,
-        len,
-        &format!("{fmt:?} xblock"),
-    )
-    .await;
+    cfr_loop(&h, src, off_in, dst, off_out, len, "xblock").await;
 
     let got = read_at(&h, dst, off_out, len as u32).await;
     assert_eq!(
         got,
         &data[off_in as usize..off_in as usize + len as usize],
-        "{fmt:?}: cross-block CFR destination mismatch"
+        "v3: cross-block CFR destination mismatch"
     );
 }
 
 #[tokio::test]
 async fn cfr_cross_block_boundary_v3() {
-    cross_block_range(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn cfr_cross_block_boundary_v2() {
-    cross_block_range(Fmt::V2).await;
+    cross_block_range().await;
 }
 
 /// THE CRAWL REGRESSION (reproduces the live scenario, minimally): a staged
@@ -328,8 +281,8 @@ async fn cfr_cross_block_boundary_v2() {
 /// bytes exist (kernel `i_size` == meta.size), so the request is nonzero and
 /// in-bounds — the handler MUST advance (copying zeros for the hole), not
 /// return 0. Pre-fix this returned `copied == 0` and wedged.
-async fn cfr_from_truncate_extended_hole(fmt: Fmt) {
-    let h = make(fmt).await;
+async fn cfr_from_truncate_extended_hole() {
+    let h = make().await;
     let src = create(&h, "holesrc").await;
     let dst = create(&h, "holedst").await;
 
@@ -345,59 +298,50 @@ async fn cfr_from_truncate_extended_hole(fmt: Fmt) {
     // read of the tail is expected in-process; the kernel zero-fills to i_size
     // on a real mount.)
     let logical = h.fs.getattr(h.req, src, None, 0).await.unwrap().attr.size;
-    assert_eq!(logical, 50_000, "{fmt:?}: truncate-extend logical size");
+    assert_eq!(logical, 50_000, "v3: truncate-extend logical size");
     let head_read = read_at(&h, src, 0, 5000).await;
-    assert_eq!(head_read, head, "{fmt:?}: head data preserved");
+    assert_eq!(head_read, head, "v3: head data preserved");
 
     // Copy a range entirely inside the hole: off_in=30000 (> physical 5000, <
     // logical 50000), len=15000. Pre-fix: off_in >= src_data.len() => copied 0.
     let off_in = 30_000u64;
     let off_out = 0u64;
     let len = 15_000u64;
-    let calls = cfr_loop(&h, src, off_in, dst, off_out, len, &format!("{fmt:?} hole")).await;
+    let calls = cfr_loop(&h, src, off_in, dst, off_out, len, "hole").await;
     assert!(
         calls <= 4,
-        "{fmt:?}: hole CFR took {calls} calls (expected O(1))"
+        "v3: hole CFR took {calls} calls (expected O(1))"
     );
 
     // Destination range must be the hole's zeros.
     let got = read_at(&h, dst, off_out, len as u32).await;
-    assert_eq!(got.len(), len as usize, "{fmt:?}: short dest read");
+    assert_eq!(got.len(), len as usize, "v3: short dest read");
     assert!(
         got.iter().all(|&b| b == 0),
-        "{fmt:?}: hole must copy as zeros to the destination"
+        "v3: hole must copy as zeros to the destination"
     );
 
     // A range straddling the physical/hole boundary must copy real head bytes
     // then zeros, in one advancing sequence.
     let dst2 = create(&h, "holedst2").await;
-    cfr_loop(&h, src, 4000, dst2, 0, 4000, &format!("{fmt:?} straddle")).await;
+    cfr_loop(&h, src, 4000, dst2, 0, 4000, "straddle").await;
     let got2 = read_at(&h, dst2, 0, 4000).await;
-    assert_eq!(
-        &got2[..1000],
-        &head[4000..5000],
-        "{fmt:?}: straddle real bytes"
-    );
+    assert_eq!(&got2[..1000], &head[4000..5000], "v3: straddle real bytes");
     assert!(
         got2[1000..].iter().all(|&b| b == 0),
-        "{fmt:?}: straddle hole zeros"
+        "v3: straddle hole zeros"
     );
 }
 
 #[tokio::test]
 async fn cfr_from_truncate_extended_hole_v3() {
-    cfr_from_truncate_extended_hole(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn cfr_from_truncate_extended_hole_v2() {
-    cfr_from_truncate_extended_hole(Fmt::V2).await;
+    cfr_from_truncate_extended_hole().await;
 }
 
 /// Same-file (src == dst) non-overlapping copy — exactly how fsx exercises
 /// `copy_file_range` (it uses one fd for both ends). Must advance and be exact.
-async fn cfr_same_file_nonoverlapping(fmt: Fmt) {
-    let h = make(fmt).await;
+async fn cfr_same_file_nonoverlapping() {
+    let h = make().await;
     let ino = create(&h, "samefile").await;
     let data = pattern(200_000);
     write_at(&h, ino, 0, &data).await;
@@ -406,39 +350,25 @@ async fn cfr_same_file_nonoverlapping(fmt: Fmt) {
     let off_in = 10_000u64;
     let off_out = 120_000u64;
     let len = 30_000u64;
-    cfr_loop(
-        &h,
-        ino,
-        off_in,
-        ino,
-        off_out,
-        len,
-        &format!("{fmt:?} samefile"),
-    )
-    .await;
+    cfr_loop(&h, ino, off_in, ino, off_out, len, "samefile").await;
 
     let got = read_at(&h, ino, off_out, len as u32).await;
     assert_eq!(
         got,
         &data[off_in as usize..off_in as usize + len as usize],
-        "{fmt:?}: same-file CFR destination mismatch"
+        "v3: same-file CFR destination mismatch"
     );
 }
 
 #[tokio::test]
 async fn cfr_same_file_nonoverlapping_v3() {
-    cfr_same_file_nonoverlapping(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn cfr_same_file_nonoverlapping_v2() {
-    cfr_same_file_nonoverlapping(Fmt::V2).await;
+    cfr_same_file_nonoverlapping().await;
 }
 
 /// The whole-file reflink/clone fast path must be preserved: copying an entire
 /// source into an empty destination should reproduce it byte-for-byte.
-async fn cfr_whole_file_clone(fmt: Fmt) {
-    let h = make(fmt).await;
+async fn cfr_whole_file_clone() {
+    let h = make().await;
     for (idx, &size) in [2048usize, 40_000, 200_000].iter().enumerate() {
         let src = create(&h, &format!("wsrc{idx}")).await;
         let dst = create(&h, &format!("wdst{idx}")).await;
@@ -450,22 +380,14 @@ async fn cfr_whole_file_clone(fmt: Fmt) {
                 .await
                 .unwrap()
                 .copied;
-        assert_eq!(
-            copied, size as u64,
-            "{fmt:?} size {size}: whole-file copy count"
-        );
+        assert_eq!(copied, size as u64, "size {size}: whole-file copy count");
 
         let got = read_at(&h, dst, 0, size as u32).await;
-        assert_eq!(got, data, "{fmt:?} size {size}: whole-file clone mismatch");
+        assert_eq!(got, data, "size {size}: whole-file clone mismatch");
     }
 }
 
 #[tokio::test]
 async fn cfr_whole_file_clone_v3() {
-    cfr_whole_file_clone(Fmt::V3).await;
-}
-
-#[tokio::test]
-async fn cfr_whole_file_clone_v2() {
-    cfr_whole_file_clone(Fmt::V2).await;
+    cfr_whole_file_clone().await;
 }

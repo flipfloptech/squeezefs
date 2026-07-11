@@ -12,78 +12,18 @@ use squeezefs::meta_backend::kv::record::{
     TREE_INODES,
 };
 use squeezefs::meta_backend::kv::tree::{KvTree, SmoContext};
-use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend, Metadata};
+use squeezefs::meta_backend::Metadata;
 use std::hint::black_box;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 
-fn bench_metalv_metadata(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let meta_temp = NamedTempFile::new().unwrap();
-    let meta_path = meta_temp.path().to_path_buf();
-    let meta_storage = MetaLvStorage::open(&meta_path, 256 * 1024 * 1024).unwrap();
-    rt.block_on(async {
-        MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None).await
-    })
-    .unwrap();
-    let backend = MetaLvBackend::new(meta_storage);
-
-    let mut group = c.benchmark_group("meta_lv_metadata");
-
-    group.bench_function("create_unlink_file", |b| {
-        b.to_async(&rt).iter(|| {
-            let name = format!("file_{}", rand::random::<u64>());
-            let backend_ref = &backend;
-            async move {
-                let ino = backend_ref.create(1, &name, 0o644, 0, 0).await.unwrap().ino;
-                backend_ref.unlink(1, &name).await.unwrap();
-                // Reclaim the slot: unlink only drops the dentry/nlink, and a
-                // leaked slot per iteration fills the inode table mid-warmup
-                // once iterations get fast enough.
-                backend_ref.destroy_inode(ino).await.unwrap();
-            }
-        });
-    });
-
-    group.bench_function("lookup_file", |b| {
-        let _ = rt.block_on(async { backend.create(1, "lookup_target", 0o644, 0, 0).await });
-        b.to_async(&rt).iter(|| {
-            let backend_ref = &backend;
-            async move {
-                backend_ref.lookup(1, "lookup_target").await.unwrap();
-            }
-        });
-    });
-
-    group.bench_function("set_get_xattr", |b| {
-        let _ = rt.block_on(async { backend.create(1, "xattr_target", 0o644, 0, 0).await });
-        let ino = rt.block_on(async { backend.lookup(1, "xattr_target").await.unwrap().ino });
-        let val = b"benchmark_value";
-        b.to_async(&rt).iter(|| {
-            let backend_ref = &backend;
-            async move {
-                backend_ref.setxattr(ino, "user.bench", val).await.unwrap();
-                let res = backend_ref
-                    .getxattr(ino, "user.bench")
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(res.len(), val.len());
-            }
-        });
-    });
-
-    group.finish();
-}
-
-/// PR K7 (§8 micro gate): the KV-path (v3) equivalents of the v2
-/// `meta_lv_metadata` trait benches — the same op shapes against a
-/// `KvMetaBackend` behind the `Metadata` trait, so criterion medians
-/// compare like-for-like (`lookup_file` ≤ v2 + 10 %; `create_unlink_file`
-/// ≤ v2, improvement expected — no sector RMW round-trip). Plus the K7
-/// streaming surface: one cookie-paged `readdir_page` step.
+/// PR K7 (§8 micro gate): the metadata trait benches against a
+/// `KvMetaBackend` behind the `Metadata` trait (baseline names unchanged
+/// — `kv_meta_metadata/*` — so criterion history stays comparable). Plus
+/// the K7 streaming surface: one cookie-paged `readdir_page` step. (The
+/// retired v2 `meta_lv_metadata` group was deleted with v2 support.)
 fn bench_kv_meta_metadata(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let file = NamedTempFile::new().unwrap();
@@ -114,9 +54,8 @@ fn bench_kv_meta_metadata(c: &mut Criterion) {
             async move {
                 let ino = backend_ref.create(1, &name, 0o644, 0, 0).await.unwrap().ino;
                 backend_ref.unlink(1, &name).await.unwrap();
-                // Same 3-op sequence as the v2 row (there it reclaims the
-                // fixed-geometry slot; here it reaps the inode record —
-                // monotonic inos never reuse, §4.8).
+                // 3-op sequence: the destroy reaps the inode record —
+                // monotonic inos never reuse (§4.8).
                 backend_ref.destroy_inode(ino).await.unwrap();
             }
         });
@@ -442,7 +381,6 @@ fn bench_kv_tree(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_metalv_metadata,
     bench_kv_meta_metadata,
     bench_kv_bset,
     bench_kv_tree

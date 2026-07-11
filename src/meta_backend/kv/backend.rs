@@ -24,10 +24,9 @@
 //!    `max(ledger.next_ino, max replayed ino + 1)` (§4.8).
 //!
 //! Reads (`lookup` / `getattr` / `readdir` / `getxattr` / `listxattr`)
-//! serve from the K5 latch-free snapshots + THE K1 fold. Mutating
-//! `Metadata` ops do not exist here yet — `KvMetaBackend` implements the
-//! trait in K6b; K6a routes reads through
-//! [`crate::meta_backend::VolumeBackend`]'s static dispatch.
+//! serve from the K5 latch-free snapshots + THE K1 fold; the mutating
+//! `Metadata` trait impl (K6b) and the routed `routed_*` arms complete
+//! the surface [`crate::meta_backend::RoutedMetaBackend`] drives.
 //!
 //! ## Readdir offset contract (§5.1, backend half)
 //!
@@ -48,9 +47,8 @@ use super::node_cache::{
 use super::record::{
     decode_dentry_key, decode_inode_key, decode_readdir_cookie, dentry_key, dentry_name_hash54,
     encode_readdir_cookie, first_free_coll_seq, inode_key, xattr_key, xattr_name_hash56,
-    DentryValue, InodeDelta, InodeValue, ReaddirPos, Record, RecordKind, XattrValue,
-    FLAGS2_QUARANTINE_CONTENT_LOST, HASH54_MAX, HASH56_MAX, TREE_ALLOC_RESERVED, TREE_DENTRIES,
-    TREE_INODES, TREE_XATTRS,
+    DentryValue, InodeDelta, InodeValue, ReaddirPos, Record, RecordKind, XattrValue, HASH54_MAX,
+    HASH56_MAX, TREE_ALLOC_RESERVED, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
 };
 use super::superblock::{classify_volume, SuperblockV3, VolumeFormat};
 use super::tree::{decode_interior_value, KvTree, RootPtr, SmoContext, SmoJournal};
@@ -204,6 +202,16 @@ impl KvMetaBackend {
         Ok(be)
     }
 
+    /// Open for a **read-only probe** (the format-preflight guard and
+    /// volume-status reads): the full mount bootstrap — SB → ledger →
+    /// bitmap → RAM journal replay — but NO checkpoint/writeback task is
+    /// spawned, so nothing is ever written. Probing a volume another
+    /// process has live-mounted therefore cannot corrupt it. Dropping the
+    /// returned backend releases everything (there is no task to join).
+    pub async fn open_probe(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
+        Ok(Arc::new(Self::open_inner(path).await?))
+    }
+
     async fn open_inner(path: &Path) -> std::result::Result<Self, KvError> {
         let t0 = std::time::Instant::now();
 
@@ -216,9 +224,9 @@ impl KvMetaBackend {
                     path.display()
                 )))
             }
-            VolumeFormat::V2(_) => {
+            VolumeFormat::V2Legacy => {
                 return Err(KvError::Corrupt(format!(
-                    "{} is a format-v2 volume routed to the v3 backend (dispatch bug)",
+                    "{} is a legacy format-v2 volume — v2 support was removed; reformat required",
                     path.display()
                 )))
             }
@@ -462,13 +470,6 @@ impl KvMetaBackend {
         self.alloc.pending_count()
     }
 
-    /// Whether heap `extent` is allocated (or pending-free). Used by the
-    /// migrate reclaim-accounting tests to assert that the v2 dead journal
-    /// region + xattr reservation came back as *free* v3 extents (§6.2).
-    pub fn extent_allocated(&self, extent: u64) -> bool {
-        self.alloc.is_allocated(extent)
-    }
-
     /// The volume path.
     pub fn device_path(&self) -> &Path {
         &self.path
@@ -594,14 +595,6 @@ impl KvMetaBackend {
         })
     }
 
-    /// The full packed [`InodeValue`] of `ino` (or `None` if absent) —
-    /// exposes `flags`/`flags2`/`nlink` that the FUSE-facing [`Inode`] drops.
-    /// Used by the migrate verification path and its tests to assert the §6.2
-    /// `QUARANTINE_CONTENT_LOST` flag carryover.
-    pub async fn inode_value(&self, ino: Ino) -> Result<Option<InodeValue>> {
-        Ok(self.read_inode_value(ino).await?)
-    }
-
     /// List `dir` per the module-docs offset contract; at most `max`
     /// entries, hash order (legal POSIX readdir order, risk R8). An ino
     /// with no dentries lists empty — the v2 contract (no existence
@@ -667,29 +660,10 @@ impl KvMetaBackend {
     }
 
     /// One xattr value; `Ok(None)` for absent names and inos alike (the
-    /// v2 degrade contract).
-    ///
-    /// Quarantine carryover (design §6.2): a migrated quarantined **symlink**
-    /// (`flags2` `QUARANTINE_CONTENT_LOST`, mode `S_IFLNK`) whose target was
-    /// never migrated returns `EIO` on the `system.symlink` read — preserving
-    /// v2's degrade (`xattr.rs` quarantine branch). Regular quarantined inos
-    /// keep no xattrs, so their reads already fold to `Ok(None)` (empty) with
-    /// no extra check.
+    /// historical degrade contract).
     pub async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         if name.len() > 255 {
             return Ok(None);
-        }
-        if name == "system.symlink" {
-            if let Some(v) = self.read_inode_value(ino).await? {
-                if v.flags2 & FLAGS2_QUARANTINE_CONTENT_LOST != 0
-                    && (v.mode & libc::S_IFMT) == libc::S_IFLNK
-                {
-                    return Err(self.eio(&format!(
-                        "symlink-target read on quarantined ino {ino}: content lost at migration \
-                         (§6.2), readlink degrades to EIO"
-                    )));
-                }
-            }
         }
         let hash = xattr_name_hash56(name.as_bytes(), self.sb.hash_seed);
         let start = xattr_key(ino, hash, 0);
@@ -764,7 +738,7 @@ impl KvMetaBackend {
     }
 
     /// Coalesced durability barrier for this volume (the v2
-    /// `MetaLvBackend::sync_device` shape, riding the same
+    /// retired v2 `sync_device` shape, riding the same
     /// `SyncCoalescer` group-commit discipline — §4.6 pt 4). After the
     /// barrier, ledger records written before it are known durable: the
     /// §4.6 pt 3 pending-reclaim watermark drains here too.
@@ -1671,7 +1645,7 @@ impl KvMetaBackend {
     // paths (global child inos in dentries, `nlink = 2` directories,
     // parent nlink bumps, Δtime merge records under SHARED parents),
     // which differ deliberately from the single-volume trait impl above
-    // (that mirrors `MetaLvBackend`'s trait behavior — the conformance
+    // (that mirrors the retired v2 trait behavior — the conformance
     // surface).
     // -----------------------------------------------------------------
 
@@ -2296,7 +2270,7 @@ impl KvMetaBackend {
 /// admission, ascending-NodeId leaf locks with revalidate/retry, in-lock
 /// reservation, out-of-lock entry write, seq-conditional rollback.
 ///
-/// Error shapes and semantics mirror `MetaLvBackend`'s trait impl (the
+/// Error shapes and semantics mirror the retired v2 trait impl (the
 /// dual-format conformance suite runs the same assertions against both).
 #[async_trait::async_trait]
 impl Metadata for KvMetaBackend {
@@ -2305,7 +2279,7 @@ impl Metadata for KvMetaBackend {
         KvMetaBackend::lookup(self, parent, name).await
     }
 
-    /// Mirrors `MetaLvBackend::create`: exclusive parent, EEXIST check,
+    /// Mirrors the retired v2 `create`: exclusive parent, EEXIST check,
     /// setgid inheritance, full parent-time update — one whole-tx journal
     /// entry (inode + dentry + parent).
     async fn create(
@@ -2371,7 +2345,7 @@ impl Metadata for KvMetaBackend {
         Ok(Self::to_inode(ino, &child))
     }
 
-    /// Mirrors `MetaLvBackend::unlink`: two-phase child discovery with
+    /// Mirrors the retired v2 `unlink`: two-phase child discovery with
     /// revalidation, shared parent for regular files (Δtime merge record,
     /// §4.4 pt 6), exclusive for directories/self-references — one
     /// whole-tx entry.
@@ -2431,7 +2405,7 @@ impl Metadata for KvMetaBackend {
         }
     }
 
-    /// Mirrors `MetaLvBackend::link`: whole set locked upfront, EEXIST
+    /// Mirrors the retired v2 `link`: whole set locked upfront, EEXIST
     /// check, nlink+1 + ctime, parent-time full update — one entry.
     async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode> {
         self.write_gate()?;
@@ -2478,7 +2452,7 @@ impl Metadata for KvMetaBackend {
         Ok(Self::to_inode(ino, &child))
     }
 
-    /// Mirrors `MetaLvBackend::rename`: pure dentry surgery (EXCHANGE
+    /// Mirrors the retired v2 `rename`: pure dentry surgery (EXCHANGE
     /// swap / NOREPLACE guard / replace) — one whole-tx entry, so a
     /// rename can never be half-visible after a crash (§4.10).
     async fn rename(
@@ -2585,7 +2559,7 @@ impl Metadata for KvMetaBackend {
         KvMetaBackend::getattr(self, ino).await
     }
 
-    /// Mirrors `MetaLvBackend::setattr` field-for-field, including the
+    /// Mirrors the retired v2 `setattr` field-for-field, including the
     /// ctime auto-bump rule.
     #[allow(clippy::too_many_arguments)] // the trait's signature
     async fn setattr(

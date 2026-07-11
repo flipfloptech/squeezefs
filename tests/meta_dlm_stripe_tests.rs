@@ -16,22 +16,41 @@
 //! acquire) or ABBA-deadlocks (I-after-D acquisition orders).
 
 use squeezefs::meta_backend::dlm::DlmLockManager;
-use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend, Metadata, RoutedMetaBackend};
+use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
+
+/// Format + mount one v3 metadata volume for this harness.
+async fn open_v3_meta(
+    path: &std::path::Path,
+    len: u64,
+) -> std::sync::Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+    squeezefs::meta_backend::kv::builder::format_v3(
+        path,
+        len,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3 meta volume");
+    squeezefs::meta_backend::kv::backend::KvMetaBackend::open(path)
+        .await
+        .expect("open v3 meta volume")
+}
 
 const ROOT: u64 = 1;
 
 async fn backend() -> (Arc<RoutedMetaBackend>, NamedTempFile) {
     let f = NamedTempFile::new().unwrap();
-    let ms = MetaLvStorage::open(f.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
-        .await
-        .unwrap();
-    let routed = Arc::new(RoutedMetaBackend::new(vec![Arc::new(MetaLvBackend::new(
-        ms,
-    ))]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![
+        open_v3_meta(f.path(), 256 * 1024 * 1024).await,
+    ]));
     (routed, f)
 }
 

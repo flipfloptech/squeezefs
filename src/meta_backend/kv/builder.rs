@@ -1,5 +1,5 @@
 //! Offline bulk v3 image builder (PR K6a; design §5.2 `builder.rs`, §8
-//! "gate-volume producer", §6.2 "the engine `migrate` reuses").
+//! "gate-volume producer").
 //!
 //! Produces **complete, valid, checkpointed** v3 volume images from an
 //! in-memory description (dirs / files / hard links / xattrs — layouts are
@@ -20,8 +20,7 @@
 //! collision `coll_seq`s are assigned in sorted-name order within a
 //! `(parent, hash)` group, and builder timestamps default to 0 unless
 //! set. Determinism is what lets the §8 mount-time gates measure real
-//! images and lets K9's migrate dry-run diff a digest walk before
-//! flipping the superblock.
+//! images.
 //!
 //! ## Fresh-volume hygiene
 //!
@@ -55,8 +54,7 @@ use std::sync::atomic::Ordering;
 pub const ROOT_INO: u64 = 1;
 
 /// The root-ino xattr recording the volume-set format configuration; the
-/// mount bootstrap reads it back through the dispatch (`main.rs`). On v2
-/// volumes the same name lives in the fixed xattr region.
+/// mount bootstrap reads it back off the first volume (`main.rs`).
 pub const FORMAT_CONFIG_XATTR: &str = "user.squeezefs.format_config";
 
 /// Pending-free FIFO capacity for builder-internal allocators (never
@@ -301,8 +299,8 @@ impl ImageBuilder {
         Ok(())
     }
 
-    /// Override an inode's owner (the `format_v3` root-stamping surface —
-    /// v2 format parity; deterministic images keep the 0:0 default).
+    /// Override an inode's owner (the `format_v3` root-stamping surface;
+    /// deterministic images keep the 0:0 default).
     pub fn set_owner(&mut self, ino: u64, uid: u32, gid: u32) -> Result<(), KvError> {
         let spec = self
             .inodes
@@ -484,8 +482,8 @@ impl ImageBuilder {
 }
 
 /// `d_type`-style byte for a mode's `S_IFMT` bits (`DentryValue`'s u8
-/// field); the read side reconstructs the v2 `file_type = mode & S_IFMT`
-/// convention by shifting back.
+/// field); the read side reconstructs the historical
+/// `file_type = mode & S_IFMT` convention by shifting back.
 fn dt_of(mode: u32) -> u8 {
     ((mode & libc::S_IFMT) >> 12) as u8
 }
@@ -655,165 +653,11 @@ pub struct BuiltImage {
     pub extents_allocated: u64,
 }
 
-/// Records for the three trees of a migrated image, each **key-ascending**
-/// (the `TreeWriter` packing contract). Assembled by
-/// [`crate::meta_backend::kv::migrate`] from the v2 namespace.
-pub struct MigrateImageInput {
-    pub inode_records: Vec<Record>,
-    pub dentry_records: Vec<Record>,
-    pub xattr_records: Vec<Record>,
-    pub next_ino: u64,
-}
-
-/// Write a v3 image **in place into the free tail** of an existing v2 volume
-/// (design §6.2), driving the same node/bitmap/ledger engine as
-/// [`ImageBuilder::build`] but
-/// **never touching a live v2 byte and never flipping the superblock** — the
-/// caller ([`crate::meta_backend::kv::migrate`]) verifies the round-trip
-/// digest and only then stamps sector 0.
-///
-/// `sb` must come from [`SuperblockV3::plan_migrate`]: a whole-device heap from
-/// offset 0 with the ledger|journal|bitmap triple reserved at `build_start` in
-/// the tail. Steps:
-///
-/// 1. **Zero** the reserved-triple region fully (a clean ring/ledger/bitmap
-///    scaffold) and the 32 KiB xattr-block header sectors across the rest of
-///    the build region (§6.2 defense-in-depth: kill any stale v2 xattr magic a
-///    prior torn run left, so a v2 remount between a torn migrate and its
-///    re-run degrades cleanly).
-/// 2. Seed the allocator with extent 0 (the superblock sector) plus the whole
-///    `[1, first_node_extent)` prefix marked **allocated** — steering the
-///    lowest-first `TreeWriter` into the tail so no live v2 extent is written.
-/// 3. Pack the three trees bottom-up into the tail via `TreeWriter`.
-/// 4. **Release** the reclaimed low region `[1, build_start_extent)` back to
-///    free — the v2 tables + dead journal region + used xattr blocks become
-///    free v3 extents (§6.2) — leaving only the superblock, the reserved
-///    triple, and the built nodes allocated.
-/// 5. Persist the bitmap (generation 1) and the bootstrap ledger record, then
-///    `fdatasync` — the barrier the caller's flip rides behind.
-pub async fn build_migrated_image(
-    path: &Path,
-    device_len: u64,
-    sb: &SuperblockV3,
-    input: &MigrateImageInput,
-) -> Result<BuiltImage, KvError> {
-    let layout = NodeLayout::new(sb.node_size as usize)?;
-    let build_start = sb.root_ledger.start;
-    let first_node_off = sb.first_node_offset();
-
-    // (1) Clean scaffold + defense-in-depth header wipe (§6.2).
-    zero_range(path, build_start, first_node_off - build_start).await?;
-    zero_block_header_sectors(path, first_node_off, device_len).await?;
-
-    // (2) Allocator steering: reserve extent 0 (superblock) + everything below
-    // the first node extent, so the lowest-first claimer lands in the tail.
-    let total_extents = sb.total_extents();
-    let build_start_extent = sb.extent_of_offset(build_start);
-    let first_node_extent = sb.extent_of_offset(first_node_off);
-    let mut alloc = ExtentAllocator::format(
-        total_extents,
-        compaction_reserve_extents(total_extents),
-        BUILDER_PENDING_CAP,
-    );
-    for extent in 0..first_node_extent {
-        alloc.mark_allocated(extent);
-    }
-
-    // (3) Pack the trees into the tail.
-    let mut tree_roots = Vec::with_capacity(3);
-    let nodes_written;
-    {
-        let mut writer = TreeWriter {
-            path,
-            layout: &layout,
-            heap_base: sb.heap.start,
-            alloc: &alloc,
-            // Generation-namespaced, same reasoning as `ImageBuilder::build`
-            // — a migrated volume's heap is the whole reclaimed device, full
-            // of v2-era (and torn-migrate) residue.
-            next_node_seq: node_seq_base(sb.uuid),
-            nodes_written: 0,
-        };
-        for (tree_id, records) in [
-            (TREE_INODES, input.inode_records.clone()),
-            (TREE_DENTRIES, input.dentry_records.clone()),
-            (TREE_XATTRS, input.xattr_records.clone()),
-        ] {
-            let (addr, seq) = writer.write_tree(tree_id, records).await?;
-            tree_roots.push(TreeRoot {
-                tree_id,
-                node_addr: addr,
-                node_seq: seq,
-            });
-        }
-        nodes_written = writer.nodes_written;
-    }
-
-    // (4) Reclaim the low region [1, build_start_extent) as free v3 extents.
-    for extent in 1..build_start_extent {
-        alloc.release_unpublished(extent);
-    }
-
-    // (5) Persist bitmap + bootstrap ledger, then barrier.
-    alloc
-        .write_dirty_pages(path, sb.alloc_bitmap.start, 1)
-        .await?;
-    let ledger = LedgerRecord {
-        seq: 1,
-        tree_roots,
-        journal_tail_seq: 0,
-        next_ino: input.next_ino,
-        alloc_bitmap_generation: 1,
-    };
-    write_ledger_slot(path, sb.root_ledger.start, &ledger).await?;
-    crate::uring_fs::fdatasync(path.to_path_buf()).await?;
-
-    Ok(BuiltImage {
-        superblock: sb.clone(),
-        ledger_seq: ledger.seq,
-        next_ino: input.next_ino,
-        nodes_written,
-        extents_allocated: nodes_written,
-    })
-}
-
-/// Zero the first `SECTOR_SIZE` bytes of every 32 KiB xattr-block boundary in
-/// `[start, end)` (§6.2 quick-format ghost-kill precedent), batched. Kills any
-/// stale v2 xattr magic (`0x58415452`) a prior torn migrate left in the build
-/// region, so a v2 remount between a torn run and its re-run degrades cleanly.
-async fn zero_block_header_sectors(path: &Path, start: u64, end: u64) -> Result<(), KvError> {
-    use crate::meta_backend::storage::SECTOR_SIZE;
-    use crate::meta_backend::xattr::XATTR_BLOCK_SIZE;
-    let stride = XATTR_BLOCK_SIZE as u64;
-    let header = bytes::Bytes::from(vec![0u8; SECTOR_SIZE]);
-    // v2 xattr blocks sit at 72 MiB + ino·32 KiB; build_start is node-size
-    // (≥ 256 KiB) aligned, already on the 32 KiB grid — round up defensively.
-    let mut off = start.div_ceil(stride) * stride;
-    let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
-    while off < end {
-        ops.push((off, header.clone()));
-        if ops.len() == 128 {
-            crate::uring_fs::write_at_batch(path, std::mem::take(&mut ops)).await?;
-        }
-        off += stride;
-    }
-    match ops.len() {
-        0 => {}
-        1 => {
-            let (o, d) = ops.pop().expect("len 1");
-            crate::uring_fs::write_at(path, o, d).await?;
-        }
-        _ => crate::uring_fs::write_at_batch(path, ops).await?,
-    }
-    Ok(())
-}
-
 /// The §4.10 post-fold digest walk: xxh3 over every **live** record of
 /// the given trees — `(tree_id, key, folded value)` in tree-id-then-key
 /// order; tombstones and unfolded deltas excluded — so two states compare
 /// by user-visible content, not physical encoding. Used by the builder
-/// determinism tests, the torn-ledger fallback crash case, and (in K9)
-/// migrate's dry-run diff.
+/// determinism tests and the torn-ledger fallback crash case.
 pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
     const WALK_PAGE: usize = 1024;
     let mut h = xxhash_rust::xxh3::Xxh3::new();
@@ -842,26 +686,6 @@ pub async fn digest_backend(backend: &KvMetaBackend) -> Result<u64, KvError> {
     digest_walk(&backend.trees()).await
 }
 
-/// The [`digest_walk`] hash over an in-memory record set (all `Put`s, one per
-/// key, each tree's records **key-ascending**) — byte-identical to
-/// [`digest_walk`] on the trees those records build. Migrate compares the
-/// source records against the read-back v3 image with it (the §6.2 round-trip
-/// self-check and `--dry-run` diff), so a build/write/read defect is caught
-/// before the superblock flip.
-pub fn digest_record_set(trees: &[(u8, &[Record])]) -> u64 {
-    let mut h = xxhash_rust::xxh3::Xxh3::new();
-    for (tree_id, records) in trees {
-        h.update(&[*tree_id]);
-        for rec in *records {
-            h.update(&(rec.key.len() as u64).to_le_bytes());
-            h.update(&rec.key);
-            h.update(&(rec.value.len() as u64).to_le_bytes());
-            h.update(&rec.value);
-        }
-    }
-    h.digest()
-}
-
 /// `squeezefs format` options for one metadata volume (the CLI arm's
 /// contract, §5.1).
 #[derive(Debug, Clone)]
@@ -880,25 +704,98 @@ pub struct FormatV3Options {
     pub format_config_xattr: Option<Vec<u8>>,
 }
 
-/// The public v3 formatter (what `squeezefs format` calls from K6a on;
-/// the v2 formatter is test-surface-only — §6.2, resolved OQ 4): runs the
-/// same preflight policy as v2 (`format_preflight` — already-formatted
-/// volumes refused without `force`, live clients refuse even with it),
-/// grows regular files to `volume_len` (the v2 open parity), optionally
-/// full-wipes, then builds an empty (plus optional config xattr) image
-/// via [`ImageBuilder`].
+/// Parse the unix-seconds heartbeat timestamp from a `client:{id}`
+/// registration value (`{"ts":<secs>,"pid":<pid>}`). Returns `None` for
+/// legacy/unparseable values, which callers treat as stale.
+fn parse_client_registration_ts(val: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(val).ok()?;
+    v.get("ts")?.as_u64()
+}
+
+/// No-side-effect format gate (run standalone by the CLI across ALL
+/// volumes before ANY volume is wiped, so a refused multi-volume format
+/// leaves everything intact; also the first step of [`format_v3`]).
+///
+/// Policy (pinned by `tests/format_guard_tests.rs` /
+/// `tests/mount_registration_tests.rs`):
+/// - blank / never-formatted volume: formatting allowed;
+/// - already-formatted volume (any SqueezeFS superblock — v3 or a legacy
+///   v2 one): refused without `force` — even idle — so a fat-fingered
+///   format cannot silently destroy a filesystem;
+/// - **live** client registrations (fresh heartbeat, read from the v3
+///   xattr tree of the root ino via a task-free probe mount) refuse
+///   format even WITH `force`: reformatting under an active mount is
+///   never safe. Stale registrations (heartbeat older than
+///   [`crate::fuse_client::CLIENT_STALE_TTL_SECS`], i.e. crashed clients)
+///   never block. Legacy-v2 volumes cannot be probed (no v2 reader
+///   exists) and cannot be live-mounted by this binary — `force` is the
+///   gate there.
+///
+/// The probe is **read-only**: no checkpoint task is spawned and nothing
+/// is written, so preflighting a volume another process has live-mounted
+/// can never corrupt it (the whole point of the check). A v3 volume whose
+/// probe mount fails (corrupt) degrades to the plain `force` gate — a
+/// broken volume must stay reformattable.
+pub async fn format_preflight(
+    path: &Path,
+    force: bool,
+) -> Result<(), crate::error::SqueezefsError> {
+    use super::superblock::{classify_volume, VolumeFormat};
+    match classify_volume(path).await? {
+        VolumeFormat::Blank => return Ok(()), // never formatted: nothing to protect
+        VolumeFormat::V2Legacy => {}
+        VolumeFormat::V3(_) => {
+            if let Ok(be) = KvMetaBackend::open_probe(path).await {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let ttl = crate::fuse_client::CLIENT_STALE_TTL_SECS;
+                let mut live = Vec::new();
+                if let Ok(attrs) = be.listxattr(ROOT_INO).await {
+                    for k in attrs.iter().filter(|k| k.starts_with("client:")) {
+                        let fresh = match be.getxattr(ROOT_INO, k).await {
+                            Ok(Some(val)) => parse_client_registration_ts(&val)
+                                .map(|ts| now.saturating_sub(ts) <= ttl)
+                                .unwrap_or(false),
+                            _ => false,
+                        };
+                        if fresh {
+                            live.push(k.clone());
+                        }
+                    }
+                }
+                if !live.is_empty() {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                        "Cannot format: metadata volume is actively mounted by clients: {:?}",
+                        live
+                    )));
+                }
+            }
+        }
+    }
+
+    if !force {
+        return Err(crate::error::SqueezefsError::InvalidOperation(
+            "Metadata volume is already formatted as SqueezeFS; refusing to destroy it. \
+             Pass --force to reformat."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The public v3 formatter (what `squeezefs format` calls): runs
+/// [`format_preflight`] (already-formatted volumes refused without
+/// `force`, live clients refuse even with it), grows regular files to
+/// `volume_len`, optionally full-wipes, then builds an empty (plus
+/// optional config xattr) image via [`ImageBuilder`].
 pub async fn format_v3(
     path: &Path,
     volume_len: u64,
     opts: &FormatV3Options,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    // The shared guard policy (pinned by format_guard_tests /
-    // mount_registration_tests on the v2 surface): a valid superblock —
-    // v2 OR v3, both carry the magic — refuses without force; live client
-    // registrations refuse even with it. size_limit 0 ⇒ the v2 plumbing
-    // never grows the file here.
-    let storage = crate::meta_backend::storage::MetaLvStorage::open(path, 0)?;
-    crate::meta_backend::MetaLvBackend::format_preflight(&storage, opts.force).await?;
+    format_preflight(path, opts.force).await?;
 
     // Regular files grow to the requested volume length (control-path
     // one-shot; ftruncate has no uring opcode).
@@ -921,11 +818,10 @@ pub async fn format_v3(
         journal_len_override: opts.journal_len_override,
         ..BuilderConfig::new(opts.node_size)
     })?;
-    // The v2 format parity (`format_with_options` root stamping): the
-    // root directory belongs to the formatting user, or an unprivileged
-    // mount cannot create anything under it. The BUILDER default stays
-    // 0:0 (its determinism contract); the public formatter is the
-    // user-facing surface and mirrors v2.
+    // Root stamping: the root directory belongs to the formatting user,
+    // or an unprivileged mount cannot create anything under it. The
+    // BUILDER default stays 0:0 (its determinism contract); the public
+    // formatter is the user-facing surface.
     let root_uid = unsafe { libc::getuid() };
     let root_gid = unsafe { libc::getgid() };
     builder.set_owner(ROOT_INO, root_uid, root_gid)?;

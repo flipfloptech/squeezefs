@@ -33,20 +33,12 @@ use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
-use squeezefs::meta_backend::{
-    storage::MetaLvStorage, MetaLvBackend, RoutedMetaBackend, VolumeBackend,
-};
+use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile, TempDir};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fmt {
-    V2,
-    V3,
-}
 
 /// 64 KiB block size so one harness covers all three layouts:
 /// inline (<= 4 KiB), staged (4 KiB .. 64 KiB), striped (> 64 KiB).
@@ -60,7 +52,7 @@ struct H {
     _s: TempDir,
 }
 
-async fn make(fmt: Fmt) -> H {
+async fn make() -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     let dlm = DlmClient::new("local").unwrap();
 
@@ -94,30 +86,19 @@ async fn make(fmt: Fmt) -> H {
 
     let m = NamedTempFile::new().unwrap();
     m.as_file().set_len(128 * 1024 * 1024).unwrap();
-    let routed: Arc<RoutedMetaBackend> = match fmt {
-        Fmt::V2 => {
-            let ms = MetaLvStorage::open(m.path(), 128 * 1024 * 1024).unwrap();
-            MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
-                .await
-                .unwrap();
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V2(
-                Arc::new(MetaLvBackend::new(ms)),
-            )]))
-        }
-        Fmt::V3 => {
-            ImageBuilder::new(BuilderConfig {
-                node_size: DEFAULT_NODE_SIZE,
-                journal_len_override: None,
-                hash_seed: 0xC0FF_EE00_1234_5678,
-                uuid: *b"wvis-regress-v3!",
-            })
-            .unwrap()
-            .build(m.path(), 128 * 1024 * 1024)
-            .await
-            .unwrap();
-            let be = KvMetaBackend::open(m.path()).await.unwrap();
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]))
-        }
+    let routed: Arc<RoutedMetaBackend> = {
+        ImageBuilder::new(BuilderConfig {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            hash_seed: 0xC0FF_EE00_1234_5678,
+            uuid: *b"wvis-regress-v3!",
+        })
+        .unwrap()
+        .build(m.path(), 128 * 1024 * 1024)
+        .await
+        .unwrap();
+        let be = KvMetaBackend::open(m.path()).await.unwrap();
+        Arc::new(RoutedMetaBackend::new(vec![be]))
     };
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed);
@@ -242,8 +223,8 @@ async fn assert_hole(h: &H, ino: u64, off: u64, len: u64, tag: &str) {
 //    interior fallocate, read the second write back.
 // ---------------------------------------------------------------------------
 
-async fn falloc_interior_stale_durable_size(fmt: Fmt, full: u64, tag: &str) {
-    let h = make(fmt).await;
+async fn falloc_interior_stale_durable_size(full: u64, tag: &str) {
+    let h = make().await;
     let ino = create(&h, tag).await;
 
     // Grow to `full`, then truncate down: the truncate persists the small
@@ -278,33 +259,18 @@ async fn falloc_interior_stale_durable_size(fmt: Fmt, full: u64, tag: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn falloc_interior_stale_size_inline_v2() {
-    falloc_interior_stale_durable_size(Fmt::V2, 4096, "inline-v2").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn falloc_interior_stale_size_inline_v3() {
-    falloc_interior_stale_durable_size(Fmt::V3, 4096, "inline-v3").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn falloc_interior_stale_size_staged_v2() {
-    falloc_interior_stale_durable_size(Fmt::V2, 48_000, "staged-v2").await;
+    falloc_interior_stale_durable_size(4096, "inline-v3").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn falloc_interior_stale_size_staged_v3() {
-    falloc_interior_stale_durable_size(Fmt::V3, 48_000, "staged-v3").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn falloc_interior_stale_size_striped_v2() {
-    falloc_interior_stale_durable_size(Fmt::V2, 4 * BS, "striped-v2").await;
+    falloc_interior_stale_durable_size(48_000, "staged-v3").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn falloc_interior_stale_size_striped_v3() {
-    falloc_interior_stale_durable_size(Fmt::V3, 4 * BS, "striped-v3").await;
+    falloc_interior_stale_durable_size(4 * BS, "striped-v3").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,9 +280,9 @@ async fn falloc_interior_stale_size_striped_v3() {
 //    reads nor seed the next partial write after the block became a hole.
 // ---------------------------------------------------------------------------
 
-async fn truncate_drops_parked_active_blocks(fmt: Fmt) {
-    let tag = format!("{fmt:?}/parked-truncate");
-    let h = make(fmt).await;
+async fn truncate_drops_parked_active_blocks() {
+    let tag = "parked-truncate".to_string();
+    let h = make().await;
     let ino = create(&h, "parked").await;
 
     // Striped file covering blocks 0..2 (3 * BS).
@@ -354,13 +320,8 @@ async fn truncate_drops_parked_active_blocks(fmt: Fmt) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn truncate_drops_parked_active_blocks_v2() {
-    truncate_drops_parked_active_blocks(Fmt::V2).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn truncate_drops_parked_active_blocks_v3() {
-    truncate_drops_parked_active_blocks(Fmt::V3).await;
+    truncate_drops_parked_active_blocks().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -370,9 +331,9 @@ async fn truncate_drops_parked_active_blocks_v3() {
 //    (the pre-zero gate must use the freshest size, not the durable one).
 // ---------------------------------------------------------------------------
 
-async fn truncate_straddle_tail_stale_durable_size(fmt: Fmt) {
-    let tag = format!("{fmt:?}/straddle-stale-size");
-    let h = make(fmt).await;
+async fn truncate_straddle_tail_stale_durable_size() {
+    let tag = "straddle-stale-size".to_string();
+    let h = make().await;
     let ino = create(&h, "straddle").await;
 
     // Grow striped, then truncate tiny: durable size = 0x800. (Complete-block
@@ -404,13 +365,8 @@ async fn truncate_straddle_tail_stale_durable_size(fmt: Fmt) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn truncate_straddle_tail_stale_durable_size_v2() {
-    truncate_straddle_tail_stale_durable_size(Fmt::V2).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn truncate_straddle_tail_stale_durable_size_v3() {
-    truncate_straddle_tail_stale_durable_size(Fmt::V3).await;
+    truncate_straddle_tail_stale_durable_size().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -429,9 +385,9 @@ async fn cfr(h: &H, ino: u64, off_in: u64, ino_out: u64, off_out: u64, len: u64)
         .copied
 }
 
-async fn copy_file_range_sees_parked_overlays(fmt: Fmt) {
-    let tag = format!("{fmt:?}/cfr-parked");
-    let h = make(fmt).await;
+async fn copy_file_range_sees_parked_overlays() {
+    let tag = "cfr-parked".to_string();
+    let h = make().await;
     let ino = create(&h, "cfrsrc").await;
 
     // Striped file covering blocks 0..2.
@@ -462,13 +418,8 @@ async fn copy_file_range_sees_parked_overlays(fmt: Fmt) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn copy_file_range_sees_parked_overlays_v2() {
-    copy_file_range_sees_parked_overlays(Fmt::V2).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copy_file_range_sees_parked_overlays_v3() {
-    copy_file_range_sees_parked_overlays(Fmt::V3).await;
+    copy_file_range_sees_parked_overlays().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -480,9 +431,9 @@ async fn copy_file_range_sees_parked_overlays_v3() {
 //    generic/075.2 empty-good/bad-diff failure shape).
 // ---------------------------------------------------------------------------
 
-async fn multiblock_read_zeroes_hole_into_reused_dest(fmt: Fmt) {
-    let tag = format!("{fmt:?}/multiblock-hole-dest");
-    let h = make(fmt).await;
+async fn multiblock_read_zeroes_hole_into_reused_dest() {
+    let tag = "multiblock-hole-dest".to_string();
+    let h = make().await;
     let ino = create(&h, "mbhole").await;
     let file_path = format!("inode_{ino}");
 
@@ -540,13 +491,8 @@ async fn multiblock_read_zeroes_hole_into_reused_dest(fmt: Fmt) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multiblock_read_zeroes_hole_into_reused_dest_v2() {
-    multiblock_read_zeroes_hole_into_reused_dest(Fmt::V2).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multiblock_read_zeroes_hole_into_reused_dest_v3() {
-    multiblock_read_zeroes_hole_into_reused_dest(Fmt::V3).await;
+    multiblock_read_zeroes_hole_into_reused_dest().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -559,9 +505,9 @@ async fn multiblock_read_zeroes_hole_into_reused_dest_v3() {
 //    merge with a stale capture returns None and applies nothing.
 // ---------------------------------------------------------------------------
 
-async fn prune_epoch_refuses_stale_delayed_merge(fmt: Fmt) {
-    let tag = format!("{fmt:?}/prune-epoch");
-    let h = make(fmt).await;
+async fn prune_epoch_refuses_stale_delayed_merge() {
+    let tag = "prune-epoch".to_string();
+    let h = make().await;
     let ino = create(&h, "epoch").await;
     let file_path = format!("inode_{ino}");
 
@@ -623,13 +569,8 @@ async fn prune_epoch_refuses_stale_delayed_merge(fmt: Fmt) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prune_epoch_refuses_stale_delayed_merge_v2() {
-    prune_epoch_refuses_stale_delayed_merge(Fmt::V2).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prune_epoch_refuses_stale_delayed_merge_v3() {
-    prune_epoch_refuses_stale_delayed_merge(Fmt::V3).await;
+    prune_epoch_refuses_stale_delayed_merge().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +582,7 @@ async fn prune_epoch_refuses_stale_delayed_merge_v3() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_file_purges_staged_active_blocks() {
-    let h = make(Fmt::V3).await;
+    let h = make().await;
     let ino = create(&h, "del").await;
 
     write_at(&h, ino, 0, &vec![0x55u8; (2 * BS) as usize]).await;

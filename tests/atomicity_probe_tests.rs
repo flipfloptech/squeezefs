@@ -1,12 +1,12 @@
-//! Sector-atomicity probe + strict mount mode (design-wal-crash-consistency
-//! §4.6, PR 6, Key Decision 2).
+//! Sector-atomicity probe (design-wal-crash-consistency §4.6, PR 6, Key
+//! Decision 2).
 //!
-//! D1's guarantee ("per-sector consistency under power loss") is only as
-//! good as the storage stack, so stop assuming and start probing: classify
-//! each meta volume at mount from sysfs block attributes, surface the
-//! classification on the stats inode, and let operators fail the mount
-//! loud (`--strict-meta-atomicity`) when the volume cannot promise 4 KiB
-//! atomic writes.
+//! Stop assuming and start probing: classify each meta volume at mount
+//! from sysfs block attributes and surface the classification on the
+//! stats inode as `meta_volume_atomicity_physical`. Informational only —
+//! the v3 metadata contract (`cow-checksummed`) holds by construction,
+//! which is why the retired `--strict-meta-atomicity` gate (v2-only by
+//! design) was deleted with v2 support.
 //!
 //! Probe scope is sysfs-only (resolved Open Question 5): the NVMe identify
 //! (AWUPF) ioctl needs CAP_SYS_ADMIN paths this daemon otherwise avoids;
@@ -14,7 +14,7 @@
 //! honestly tops out at `likely`.
 
 use squeezefs::meta_backend::atomicity::{
-    classify_block_attrs, enforce_strict, probe_meta_volume, AtomicityClass,
+    classify_block_attrs, probe_meta_volume, AtomicityClass, META_VOLUME_ATOMICITY_COW,
 };
 use tempfile::NamedTempFile;
 
@@ -79,33 +79,8 @@ fn test_probe_missing_path_is_unknown() {
     );
 }
 
-/// Strict mode: classification below `atomic4k` fails loud, naming the
-/// classification and the flag; `atomic4k` passes. Default-off behavior is
-/// the caller's (mount) concern — the gate itself is absolute.
-#[test]
-fn test_enforce_strict_rejects_below_atomic4k() {
-    let path = std::path::Path::new("/tmp/meta.bin");
-    enforce_strict(AtomicityClass::Atomic4k, path).expect("atomic4k must pass strict mode");
-    for class in [
-        AtomicityClass::Likely,
-        AtomicityClass::Unknown,
-        AtomicityClass::FileBacked,
-    ] {
-        let err = enforce_strict(class, path)
-            .expect_err("below-atomic4k classification must fail strict mode");
-        let msg = err.to_string();
-        assert!(
-            msg.contains(class.as_str()),
-            "strict error must name the classification, got: {msg}"
-        );
-        assert!(
-            msg.contains("strict-meta-atomicity"),
-            "strict error must name the flag, got: {msg}"
-        );
-    }
-}
-
-/// Display strings are the stats-surface contract (§Observability).
+/// Display strings are the stats-surface contract (§Observability) — the
+/// physical probe classes plus the constant v3 contract class.
 #[test]
 fn test_classification_strings_are_stable() {
     assert_eq!(AtomicityClass::Atomic4k.as_str(), "atomic4k");
@@ -113,4 +88,5 @@ fn test_classification_strings_are_stable() {
     assert_eq!(AtomicityClass::Unknown.as_str(), "unknown");
     assert_eq!(AtomicityClass::FileBacked.as_str(), "file-backed");
     assert_eq!(format!("{}", AtomicityClass::Likely), "likely");
+    assert_eq!(META_VOLUME_ATOMICITY_COW, "cow-checksummed");
 }

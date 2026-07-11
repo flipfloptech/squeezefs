@@ -17,7 +17,7 @@
 //!
 //! The fix binds staging to the mounted volume set's **filesystem
 //! generation** (`meta_backend::volume_set_generation` — v3 superblock
-//! uuid / v2 config `fs_uuid`): mount stamps it into a marker at every
+//! uuid): mount stamps it into a marker at every
 //! staging-dir root; a mismatching (or missing/unreadable) marker over
 //! NONEMPTY staging discards the content loudly BEFORE any recovery or
 //! budget seeding runs.
@@ -31,7 +31,7 @@
 //! 2. **Same-generation warm remount keeps staging** (the staging-budget
 //!    remount-seeding path behind a MATCHING gate): no discard.
 //! 3. **Identity derivation**: v3 identity tracks the superblock uuid
-//!    across reformats; v2 identity prefers config `fs_uuid`, falls back
+//!    across reformats; the retired v2 identity legs were deleted with
 //!    to a config content hash, then the unstamped sentinel; the set
 //!    identity is order-dependent.
 //! 4. **Upgrade + corruption paths**: unstamped (pre-fix) nonempty
@@ -46,12 +46,10 @@ use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{SqueezefsFilesystem, METRICS};
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
-use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options, FORMAT_CONFIG_XATTR};
+use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
 use squeezefs::meta_backend::volume_set_generation;
-use squeezefs::meta_backend::{
-    storage::MetaLvStorage, xattr, MetaLvBackend, RoutedMetaBackend, VolumeBackend,
-};
+use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
@@ -67,12 +65,6 @@ const STAGED_LEN: usize = 60 * 1024;
 /// Per-entry metadata overhead allowance (staged header + serialized meta).
 const SLACK: u64 = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fmt {
-    V2,
-    V3,
-}
-
 fn discards() -> u64 {
     METRICS.staging_generation_discards.load(Ordering::Relaxed)
 }
@@ -81,12 +73,10 @@ fn marker_content(staging: &Path) -> Option<String> {
     std::fs::read_to_string(staging.join(STAGING_GENERATION_MARKER)).ok()
 }
 
-/// The volume-set format config the CLI records on the first volume, with
-/// a caller-chosen generation `fs_uuid` (random per real format run).
-fn format_config_json(fs_uuid: Option<&str>) -> Vec<u8> {
+/// The volume-set format config the CLI records on the first volume.
+fn format_config_json() -> Vec<u8> {
     let cfg = squeezefs::FormatConfig {
         name: "squeezefs".to_string(),
-        fs_uuid: fs_uuid.map(str::to_string),
         block_size: BS,
         capacity: 256 * 1024 * 1024,
         inodes: 1000,
@@ -109,54 +99,29 @@ fn format_config_json(fs_uuid: Option<&str>) -> Vec<u8> {
 }
 
 /// Format (or REformat, `force`) one metadata volume at `path` the way the
-/// CLI arm does for that format generation — config xattr (with a fresh
-/// generation `fs_uuid`) included, as `squeezefs format` always records it
-/// on the first volume.
-async fn format_meta(fmt: Fmt, path: &Path, force: bool) {
-    let cfg = format_config_json(Some(&uuid::Uuid::new_v4().to_string()));
-    match fmt {
-        Fmt::V3 => {
-            format_v3(
-                path,
-                128 * 1024 * 1024,
-                &FormatV3Options {
-                    node_size: DEFAULT_NODE_SIZE,
-                    journal_len_override: None,
-                    force,
-                    full_wipe: false,
-                    format_config_xattr: Some(cfg),
-                },
-            )
-            .await
-            .expect("format v3 failed");
-        }
-        Fmt::V2 => {
-            let ms = MetaLvStorage::open(path, 128 * 1024 * 1024).expect("open v2 storage");
-            MetaLvBackend::format_v2_for_tests(&ms, true, force, None)
-                .await
-                .expect("format v2 failed");
-            xattr::set_xattr(&ms, 1, FORMAT_CONFIG_XATTR, &cfg)
-                .await
-                .expect("record v2 format config");
-        }
-    }
+/// CLI arm does for that format generation — config xattr included, as
+/// `squeezefs format` always records it on the first volume.
+async fn format_meta(path: &Path, force: bool) {
+    let cfg = format_config_json();
+    format_v3(
+        path,
+        128 * 1024 * 1024,
+        &FormatV3Options {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force,
+            full_wipe: false,
+            format_config_xattr: Some(cfg),
+        },
+    )
+    .await
+    .expect("format v3 failed");
 }
 
 /// Open the (already formatted) volume as the mount's metadata backend.
-async fn open_meta(fmt: Fmt, path: &Path) -> Arc<RoutedMetaBackend> {
-    match fmt {
-        Fmt::V2 => {
-            let ms = MetaLvStorage::open(path, 128 * 1024 * 1024).expect("open v2 storage");
-            ms.validate_superblock().await.expect("v2 superblock");
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V2(
-                Arc::new(MetaLvBackend::new(ms)),
-            )]))
-        }
-        Fmt::V3 => {
-            let be = KvMetaBackend::open(path).await.expect("open v3 backend");
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]))
-        }
-    }
+async fn open_meta(path: &Path) -> Arc<RoutedMetaBackend> {
+    let be = KvMetaBackend::open(path).await.expect("open v3 backend");
+    Arc::new(RoutedMetaBackend::new(vec![be]))
 }
 
 /// A bare staging cache over `staging`/`data` bound to `fs_generation`
@@ -200,7 +165,7 @@ struct H {
 /// The full mount-shaped stack over an existing staging dir + formatted
 /// metadata volume: derives the filesystem generation from the volume set
 /// and binds staging to it, exactly as `squeezefs mount` does.
-async fn mount_stack(fmt: Fmt, meta: &Path, staging: &Path, data: &Path, alloc_name: &str) -> H {
+async fn mount_stack(meta: &Path, staging: &Path, data: &Path, alloc_name: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
     let fs_generation = volume_set_generation(&[meta.to_string_lossy().into_owned()])
         .await
@@ -229,7 +194,7 @@ async fn mount_stack(fmt: Fmt, meta: &Path, staging: &Path, data: &Path, alloc_n
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme_dev);
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 
-    let routed = open_meta(fmt, meta).await;
+    let routed = open_meta(meta).await;
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed);
 
@@ -315,7 +280,7 @@ async fn poison_staging(
 /// (no staging wipe) → mount over the old staging. The mount must discard
 /// the dead generation's staging (loud counter + marker replaced) and
 /// serve bench-shaped writes cleanly.
-async fn reformat_over_stale_staging(fmt: Fmt) {
+async fn reformat_over_stale_staging() {
     let meta = NamedTempFile::new().unwrap();
     let data = NamedTempFile::new().unwrap();
     std::fs::File::create(data.path())
@@ -323,10 +288,10 @@ async fn reformat_over_stale_staging(fmt: Fmt) {
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let staging: TempDir = tempdir().unwrap();
-    let alloc = format!("staging_gen_reformat_{fmt:?}");
+    let alloc = "staging_gen_reformat_v3".to_string();
 
     // Generation 1: format, stamp staging, leave staged residue, "crash".
-    format_meta(fmt, meta.path(), false).await;
+    format_meta(meta.path(), false).await;
     let gen1 = volume_set_generation(&[meta.path().to_string_lossy().into_owned()])
         .await
         .expect("gen1 identity");
@@ -340,18 +305,18 @@ async fn reformat_over_stale_staging(fmt: Fmt) {
 
     // Generation 2: REFORMAT the metadata volume — staging dir untouched
     // (format was not given --disk-cache-paths).
-    format_meta(fmt, meta.path(), true).await;
+    format_meta(meta.path(), true).await;
     let gen2 = volume_set_generation(&[meta.path().to_string_lossy().into_owned()])
         .await
         .expect("gen2 identity");
     assert_ne!(
         gen1, gen2,
-        "{fmt:?}: reformat must change the filesystem generation identity"
+        "reformat must change the filesystem generation identity"
     );
 
     // Mount generation 2 over generation 1's staging dir.
     let before = discards();
-    let h = mount_stack(fmt, meta.path(), staging.path(), data.path(), &alloc).await;
+    let h = mount_stack(meta.path(), staging.path(), data.path(), &alloc).await;
 
     // The dead generation's ring state must NOT have been admitted…
     assert_eq!(
@@ -408,19 +373,14 @@ async fn reformat_over_stale_staging(fmt: Fmt) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reformat_over_stale_staging_discards_dead_generation_v3() {
-    reformat_over_stale_staging(Fmt::V3).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reformat_over_stale_staging_discards_dead_generation_v2() {
-    reformat_over_stale_staging(Fmt::V2).await;
+    reformat_over_stale_staging().await;
 }
 
 /// Contract 2 — the keep direction: a warm remount of the SAME filesystem
 /// generation must keep recovered staging (budget seeded, entries
 /// creditable, NO discard). This is the staging-budget remount-seeding
 /// path running behind a MATCHING generation gate.
-async fn same_generation_warm_remount_keeps_staging(fmt: Fmt) {
+async fn same_generation_warm_remount_keeps_staging() {
     let meta = NamedTempFile::new().unwrap();
     let data = NamedTempFile::new().unwrap();
     std::fs::File::create(data.path())
@@ -428,9 +388,9 @@ async fn same_generation_warm_remount_keeps_staging(fmt: Fmt) {
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let staging: TempDir = tempdir().unwrap();
-    let alloc = format!("staging_gen_warm_{fmt:?}");
+    let alloc = "staging_gen_warm_v3".to_string();
 
-    format_meta(fmt, meta.path(), false).await;
+    format_meta(meta.path(), false).await;
     let gen = volume_set_generation(&[meta.path().to_string_lossy().into_owned()])
         .await
         .expect("generation identity");
@@ -450,7 +410,7 @@ async fn same_generation_warm_remount_keeps_staging(fmt: Fmt) {
 
     // Warm remount of the SAME generation: staging must survive, silently.
     let before = discards();
-    let h = mount_stack(fmt, meta.path(), staging.path(), data.path(), &alloc).await;
+    let h = mount_stack(meta.path(), staging.path(), data.path(), &alloc).await;
     assert_eq!(
         discards(),
         before,
@@ -479,12 +439,7 @@ async fn same_generation_warm_remount_keeps_staging(fmt: Fmt) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_generation_warm_remount_keeps_staging_v3() {
-    same_generation_warm_remount_keeps_staging(Fmt::V3).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn same_generation_warm_remount_keeps_staging_v2() {
-    same_generation_warm_remount_keeps_staging(Fmt::V2).await;
+    same_generation_warm_remount_keeps_staging().await;
 }
 
 /// Contract 3 — identity derivation per format and volume-set shape.
@@ -493,7 +448,7 @@ async fn volume_set_generation_identity_contracts() {
     // v3: identity is the superblock uuid — stable across reads, changed
     // by a reformat.
     let v3 = NamedTempFile::new().unwrap();
-    format_meta(Fmt::V3, v3.path(), false).await;
+    format_meta(v3.path(), false).await;
     let v3_path = v3.path().to_string_lossy().into_owned();
     let a = volume_set_generation(std::slice::from_ref(&v3_path))
         .await
@@ -506,70 +461,47 @@ async fn volume_set_generation_identity_contracts() {
         a.starts_with("v3:"),
         "v3 identity must be superblock-derived: {a}"
     );
-    format_meta(Fmt::V3, v3.path(), true).await;
+    format_meta(v3.path(), true).await;
     let b = volume_set_generation(std::slice::from_ref(&v3_path))
         .await
         .unwrap();
     assert_ne!(a, b, "v3 reformat must change the identity (fresh uuid)");
 
-    // v2 with config fs_uuid: identity is the config's generation uuid.
+    // Legacy v2 superblock (crafted bytes — no v2 writer exists): no
+    // generation can be derived; the loud "no longer supported" refusal
+    // surfaces before any staging decision.
     let v2 = NamedTempFile::new().unwrap();
+    v2.as_file().set_len(8 * 1024 * 1024).unwrap();
+    let mut legacy_sb = Vec::with_capacity(12);
+    legacy_sb.extend_from_slice(b"METALV01");
+    legacy_sb.extend_from_slice(&2u32.to_le_bytes());
+    squeezefs::uring_fs::write_at(v2.path(), 0, bytes::Bytes::from(legacy_sb))
+        .await
+        .unwrap();
     let v2_path = v2.path().to_string_lossy().into_owned();
-    let ms = MetaLvStorage::open(v2.path(), 128 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&ms, true, false, None)
+    let err = volume_set_generation(std::slice::from_ref(&v2_path))
         .await
-        .unwrap();
-    xattr::set_xattr(
-        &ms,
-        1,
-        FORMAT_CONFIG_XATTR,
-        &format_config_json(Some("gen-uuid-A")),
-    )
-    .await
-    .unwrap();
-    let ga = volume_set_generation(std::slice::from_ref(&v2_path))
-        .await
-        .unwrap();
-    assert_eq!(
-        ga, "v2:gen-uuid-A",
-        "v2 identity must prefer config fs_uuid"
-    );
-
-    // v2 without fs_uuid (pre-fix config): content-hash fallback — stable
-    // for identical bytes, different for different bytes.
-    xattr::set_xattr(&ms, 1, FORMAT_CONFIG_XATTR, &format_config_json(None))
-        .await
-        .unwrap();
-    let h1 = volume_set_generation(std::slice::from_ref(&v2_path))
-        .await
-        .unwrap();
+        .expect_err("a legacy v2 volume must refuse generation derivation")
+        .to_string();
     assert!(
-        h1.starts_with("v2:cfg-"),
-        "pre-fix v2 config must fall back to a content hash: {h1}"
+        err.contains("no longer supported"),
+        "the v2 refusal must be the precise 'no longer supported' message: {err}"
     );
-    let h1_again = volume_set_generation(std::slice::from_ref(&v2_path))
-        .await
-        .unwrap();
-    assert_eq!(h1, h1_again, "cfg-hash identity must be stable");
-
-    // v2 with no config at all (never CLI-formatted): the sentinel.
-    let bare = NamedTempFile::new().unwrap();
-    let bare_path = bare.path().to_string_lossy().into_owned();
-    let bare_ms = MetaLvStorage::open(bare.path(), 128 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&bare_ms, true, false, None)
-        .await
-        .unwrap();
-    let s = volume_set_generation(std::slice::from_ref(&bare_path))
-        .await
-        .unwrap();
-    assert_eq!(s, "v2:unstamped", "config-less v2 volume sentinel");
 
     // Volume-set identity is the ORDERED join (route_ino stripes by
     // order: a reordered set is a different metadata view).
-    let ab = volume_set_generation(&[v3_path.clone(), bare_path.clone()])
+    let second = NamedTempFile::new().unwrap();
+    format_meta(second.path(), false).await;
+    let second_path = second.path().to_string_lossy().into_owned();
+    let s = volume_set_generation(std::slice::from_ref(&second_path))
         .await
         .unwrap();
-    let ba = volume_set_generation(&[bare_path, v3_path]).await.unwrap();
+    let ab = volume_set_generation(&[v3_path.clone(), second_path.clone()])
+        .await
+        .unwrap();
+    let ba = volume_set_generation(&[second_path, v3_path])
+        .await
+        .unwrap();
     assert_eq!(ab, format!("{b}|{s}"), "set identity joins per-volume ids");
     assert_ne!(ab, ba, "volume order is part of the identity");
 }
@@ -588,7 +520,7 @@ async fn unstamped_nonempty_staging_is_discarded_once() {
     let staging: TempDir = tempdir().unwrap();
     let alloc = "staging_gen_unstamped";
 
-    format_meta(Fmt::V3, meta.path(), false).await;
+    format_meta(meta.path(), false).await;
     // Pre-fix binary: stages content, stamps nothing.
     poison_staging(staging.path(), data.path(), alloc, None).await;
     assert!(
@@ -597,7 +529,7 @@ async fn unstamped_nonempty_staging_is_discarded_once() {
     );
 
     let before = discards();
-    let h = mount_stack(Fmt::V3, meta.path(), staging.path(), data.path(), alloc).await;
+    let h = mount_stack(meta.path(), staging.path(), data.path(), alloc).await;
     assert_eq!(
         h.nvme.current_staged_write_bytes(),
         0,
@@ -612,7 +544,7 @@ async fn unstamped_nonempty_staging_is_discarded_once() {
 
     // Second mount of the same generation: marker matches — no discard.
     let before2 = discards();
-    let _h2 = mount_stack(Fmt::V3, meta.path(), staging.path(), data.path(), alloc).await;
+    let _h2 = mount_stack(meta.path(), staging.path(), data.path(), alloc).await;
     assert_eq!(
         discards(),
         before2,
@@ -633,7 +565,7 @@ async fn garbage_marker_with_nonempty_staging_is_discarded() {
     let staging: TempDir = tempdir().unwrap();
     let alloc = "staging_gen_garbage_marker";
 
-    format_meta(Fmt::V3, meta.path(), false).await;
+    format_meta(meta.path(), false).await;
     poison_staging(staging.path(), data.path(), alloc, None).await;
     std::fs::write(
         staging.path().join(STAGING_GENERATION_MARKER),
@@ -642,7 +574,7 @@ async fn garbage_marker_with_nonempty_staging_is_discarded() {
     .unwrap();
 
     let before = discards();
-    let h = mount_stack(Fmt::V3, meta.path(), staging.path(), data.path(), alloc).await;
+    let h = mount_stack(meta.path(), staging.path(), data.path(), alloc).await;
     assert_eq!(
         h.nvme.current_staged_write_bytes(),
         0,
@@ -673,13 +605,13 @@ async fn empty_staging_dir_is_stamped_without_discard() {
     let staging: TempDir = tempdir().unwrap();
     let alloc = "staging_gen_empty_stamp";
 
-    format_meta(Fmt::V2, meta.path(), false).await;
+    format_meta(meta.path(), false).await;
     let gen = volume_set_generation(&[meta.path().to_string_lossy().into_owned()])
         .await
         .unwrap();
 
     let before = discards();
-    let _h = mount_stack(Fmt::V2, meta.path(), staging.path(), data.path(), alloc).await;
+    let _h = mount_stack(meta.path(), staging.path(), data.path(), alloc).await;
     assert_eq!(discards(), before, "empty dir must not count as a discard");
     assert!(
         marker_content(staging.path())

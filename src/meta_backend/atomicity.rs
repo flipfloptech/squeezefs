@@ -1,12 +1,15 @@
 //! Mount-time sector-atomicity probe (design-wal-crash-consistency §4.6,
 //! PR 6, Key Decision 2).
 //!
-//! The crash contract's D1 row ("per-sector consistency under power loss")
-//! holds only if the storage stack writes 4 KiB sectors atomically. This
-//! module classifies each metadata volume at mount from sysfs block
-//! attributes so the guarantee is *probed*, not assumed: the result is
-//! logged, surfaced on the stats inode (`meta_volume_atomicity`), and —
-//! with `--strict-meta-atomicity` — enforced as a hard mount gate.
+//! Sector atomicity is *probed*, not assumed: this module classifies each
+//! metadata volume at mount from sysfs block attributes; the result is
+//! logged and surfaced on the stats inode as
+//! `meta_volume_atomicity_physical` (operator hardware visibility). The
+//! metadata **contract** does not depend on it — v3 volumes are
+//! copy-on-write and checksummed by construction
+//! ([`META_VOLUME_ATOMICITY_COW`]), which is why the retired
+//! `--strict-meta-atomicity` gate (it only ever gated v2 volumes) was
+//! deleted with v2 support.
 //!
 //! **Probe I/O mechanism**: one-shot `std::fs::read_to_string` of sysfs
 //! attributes, deliberately *not* routed through `uring_fs` — these are
@@ -22,17 +25,14 @@
 //! tops out at [`AtomicityClass::Likely`]; the surface can be extended
 //! later without format or contract change.
 
-use crate::error::{Result, SqueezefsError};
 use std::path::Path;
 
-/// The v3 volumes' `meta_volume_atomicity` **contract class** (resolved
-/// OQ 2, design-cow-kv-metadata §4.10): torn-write immunity holds by
+/// The `meta_volume_atomicity` **contract class** (resolved OQ 2,
+/// design-cow-kv-metadata §4.10): torn-write immunity holds by
 /// construction (every unit checksummed, never-overwrite-live), so the
 /// contract field reports `cow-checksummed` regardless of hardware; the
 /// physical probe classification is surfaced alongside as
 /// `meta_volume_atomicity_physical` for operator hardware visibility.
-/// `--strict-meta-atomicity` retains its gating meaning on **v2 volumes
-/// only** — on v3 it has nothing left to gate.
 pub const META_VOLUME_ATOMICITY_COW: &str = "cow-checksummed";
 
 /// Classification of a metadata volume's 4 KiB write-atomicity evidence.
@@ -78,7 +78,7 @@ pub fn classify_block_attrs(
     physical_block_size: Option<u64>,
     atomic_write_unit_max: Option<u64>,
 ) -> AtomicityClass {
-    let sector = crate::meta_backend::storage::SECTOR_SIZE as u64;
+    let sector = crate::meta_backend::kv::superblock::SECTOR_SIZE as u64;
     if logical_block_size.is_some_and(|l| l >= sector)
         || atomic_write_unit_max.is_some_and(|a| a >= sector)
     {
@@ -116,8 +116,9 @@ fn queue_dir_for(rdev: u64) -> Option<std::path::PathBuf> {
 
 /// Probe a metadata volume path's atomicity classification (§4.6):
 /// regular file ⇒ `file-backed`; block device ⇒ classify from sysfs;
-/// anything unreadable ⇒ `unknown` — the probe never fails a mount by
-/// itself (that is [`enforce_strict`]'s job, operator opt-in).
+/// anything unreadable ⇒ `unknown`. Purely informational — the probe
+/// never fails a mount (the v3 contract holds by construction,
+/// [`META_VOLUME_ATOMICITY_COW`]).
 pub fn probe_meta_volume(path: &Path) -> AtomicityClass {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
@@ -141,19 +142,4 @@ pub fn probe_meta_volume(path: &Path) -> AtomicityClass {
         // `likely` there — resolved Open Question 5).
         read_sysfs_u64(&queue.join("atomic_write_unit_max_bytes")),
     )
-}
-
-/// The `--strict-meta-atomicity` gate: classification below `atomic4k` ⇒
-/// mount fails loud with the classification in the error. Default off —
-/// dev file-backed volumes are the test substrate (§4.6).
-pub fn enforce_strict(class: AtomicityClass, path: &Path) -> Result<()> {
-    if class == AtomicityClass::Atomic4k {
-        return Ok(());
-    }
-    Err(SqueezefsError::InvalidOperation(format!(
-        "Metadata volume {} classifies as '{class}' — below the 'atomic4k' bar required by \
-         --strict-meta-atomicity. Use a 4 KiB-LBA / atomic-write-capable device, or drop the \
-         strict flag to accept the documented D1/D2 torn-sector exposure.",
-        path.display()
-    )))
 }

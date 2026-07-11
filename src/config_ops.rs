@@ -11,12 +11,6 @@ pub struct ConfigList {
     pub metadata_volumes: HashMap<String, String>,
     pub metadata_volume_statuses: HashMap<String, String>,
     pub metadata_volume_redirections: HashMap<String, String>,
-    /// Config-file equivalent of the `--strict-meta-atomicity` mount flag
-    /// (design §4.6): mount fails unless every metadata volume classifies
-    /// as `atomic4k`. `serde(default)` keeps pre-existing runtime configs
-    /// parseable (they read as `false` — the default-off behavior).
-    #[serde(default)]
-    pub strict_meta_atomicity: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -56,7 +50,6 @@ pub fn load_or_create_config() -> ConfigList {
         metadata_volumes,
         metadata_volume_statuses,
         metadata_volume_redirections: HashMap::new(),
-        strict_meta_atomicity: false,
     }
 }
 
@@ -229,34 +222,15 @@ pub async fn migrate_metadata_volume(
     from_volume: &str,
     to_volume: &str,
 ) -> Result<()> {
-    let cfg = load_or_create_config();
-    let from_path = cfg
-        .metadata_volumes
-        .get(from_volume)
-        .cloned()
-        .unwrap_or_else(|| from_volume.to_string());
-    let to_path = cfg
-        .metadata_volumes
-        .get(to_volume)
-        .cloned()
-        .unwrap_or_else(|| to_volume.to_string());
-
+    // Route-config bookkeeping only: point the ino-routing redirection at
+    // the new volume and flip the statuses. (The retired v2 backend used
+    // to also best-effort copy fixed-geometry inode slots here — a
+    // half-measure that never carried dentries/xattrs; no data movement
+    // is performed.)
     println!(
-        "Migrating metadata volumes: copy inodes from {} to {}...",
-        from_path, to_path
+        "Redirecting metadata volume {} to {} in the runtime config (no data is moved).",
+        from_volume, to_volume
     );
-
-    if let (Ok(from_storage), Ok(to_storage)) = (
-        crate::meta_backend::storage::MetaLvStorage::open(&from_path, 64 * 1024 * 1024),
-        crate::meta_backend::storage::MetaLvStorage::open(&to_path, 64 * 1024 * 1024),
-    ) {
-        for i in 2..20000 {
-            if let Ok(inode) = crate::meta_backend::inode::read_inode(&from_storage, i).await {
-                let _ = crate::meta_backend::inode::write_inode(&to_storage, i, &inode).await;
-            }
-        }
-    }
-
     let mut cfg = load_or_create_config();
     cfg.metadata_volume_redirections
         .insert(from_volume.to_string(), to_volume.to_string());

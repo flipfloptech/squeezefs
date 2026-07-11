@@ -12,9 +12,7 @@ use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
-use squeezefs::meta_backend::{
-    storage::MetaLvStorage, MetaLvBackend, Metadata, RoutedMetaBackend, VolumeBackend,
-};
+use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{CachedMetadata, DataRouter, LayoutMetadata};
 use std::ffi::OsStr;
@@ -27,6 +25,26 @@ struct H {
     _b: NamedTempFile,
     _m: NamedTempFile,
     _s: TempDir,
+}
+
+/// Format + mount one v3 metadata volume for this harness.
+async fn open_v3_meta(path: &std::path::Path, len: u64) -> Arc<KvMetaBackend> {
+    squeezefs::meta_backend::kv::builder::format_v3(
+        path,
+        len,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3 meta volume");
+    KvMetaBackend::open(path)
+        .await
+        .expect("open v3 meta volume")
 }
 
 async fn make() -> H {
@@ -64,12 +82,8 @@ async fn make() -> H {
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 
     let m = NamedTempFile::new().unwrap();
-    let ms = MetaLvStorage::open(m.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
-        .await
-        .unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
-        Arc::new(MetaLvBackend::new(ms)),
+        open_v3_meta(m.path(), 256 * 1024 * 1024).await,
     ]));
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed);
@@ -436,7 +450,7 @@ async fn test_concurrent_write_read_striped_no_stale_zeros() {
 /// PR 7 (§Observability): the stats inode JSON must expose the sector-lock /
 /// allocator / WAL metrics used for rollout gating and live regression alerts.
 #[tokio::test]
-async fn test_stats_json_exposes_sector_commit_metrics() {
+async fn test_stats_json_exposes_meta_metrics() {
     let h = make().await;
     // Drive one write so the surface reflects a living filesystem.
     let ino = create(&h, "statsprobe").await;
@@ -446,50 +460,41 @@ async fn test_stats_json_exposes_sector_commit_metrics() {
     let v: serde_json::Value = serde_json::from_str(&json).expect("stats JSON must parse");
     let metrics = &v["metrics"];
     for key in [
-        "meta_sector_lock_wait_ns",
-        "meta_sector_lock_contended",
-        "meta_tx_concurrency",
-        "meta_tx_concurrency_peak",
-        "meta_inode_alloc_cas_retries",
-        "meta_inode_alloc_reconciled",
-        "meta_quarantined_inodes",
-        "meta_commit_sectors",
         "meta_flush_deferred",
         "meta_reclaim_batch_size",
         "meta_volume_atomicity",
         "meta_volume_atomicity_physical",
+        "meta_format_version",
+        "meta_kv_journal_entries",
     ] {
         assert!(!metrics[key].is_null(), "stats JSON missing metrics.{key}");
     }
 
-    // Per-volume atomicity classification (design §4.6): one string per
-    // meta volume; "unprobed" for harness-constructed backends that never
-    // ran the mount probe, the probed class otherwise.
+    // Per-volume atomicity fields (resolved OQ 2, design-cow-kv-metadata
+    // §4.10): the CONTRACT class is "cow-checksummed" by construction; the
+    // PHYSICAL probe is its own field — "unprobed" for harness-constructed
+    // backends that never ran the mount probe, the probed class otherwise.
     let atomicity = metrics["meta_volume_atomicity"]
         .as_array()
         .expect("meta_volume_atomicity must be an array (one entry per volume)");
     assert_eq!(atomicity.len(), 1, "harness mounts exactly one meta volume");
-    assert_eq!(atomicity[0], "unprobed");
-    h.fs.meta_backend
-        .as_ref()
-        .unwrap()
-        .v2_volume(0)
-        .atomicity_class
-        .set(squeezefs::meta_backend::atomicity::AtomicityClass::FileBacked)
-        .expect("probe result set once");
+    assert_eq!(atomicity[0], "cow-checksummed");
+    assert_eq!(metrics["meta_volume_atomicity_physical"][0], "unprobed");
+    assert_eq!(
+        metrics["meta_format_version"][0], "3",
+        "meta_format_version reports the constant \"3\" per volume"
+    );
+    h.fs.meta_backend.as_ref().unwrap().volumes[0]
+        .set_atomicity_physical(squeezefs::meta_backend::atomicity::AtomicityClass::FileBacked);
     let json = h.fs.generate_stats_json().await;
     let v: serde_json::Value = serde_json::from_str(&json).expect("stats JSON must parse");
     assert_eq!(
-        v["metrics"]["meta_volume_atomicity"][0], "file-backed",
-        "the probed classification must surface on the stats inode"
-    );
-    // Resolved OQ 2 (design-cow-kv-metadata §4.10): the physical probe is
-    // its own field alongside the contract class. On a v2 volume the two
-    // coincide by definition; v3 volumes report "cow-checksummed" in the
-    // contract field once K6b lets them serve FUSE.
-    assert_eq!(
         v["metrics"]["meta_volume_atomicity_physical"][0], "file-backed",
         "the physical probe must surface alongside the contract class"
+    );
+    assert_eq!(
+        v["metrics"]["meta_volume_atomicity"][0], "cow-checksummed",
+        "the contract class holds by construction regardless of the probe"
     );
 }
 
@@ -1335,7 +1340,7 @@ async fn v3_spill_router(
         .await
         .unwrap();
     let be = KvMetaBackend::open(meta.path()).await.unwrap();
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be]));
     router.set_meta_backend(routed.clone());
     (router, routed, dlm, backing, meta, staging)
 }
@@ -1501,11 +1506,13 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
     );
 }
 
-/// §5.3 per-volume behavior: one v2 + one v3 volume in the same routed mount;
-/// the SAME block-map shape spills on v2 (8 KiB cap) but stays inline on v3
-/// (64 KiB cap). Routing is pinned via `route_ino`/`make_global_ino`.
+/// §5.3 per-volume behavior: two v3 volumes with DIFFERENT node sizes in
+/// the same routed mount; the SAME block-map shape spills on the small-node
+/// volume (64 KiB node ⇒ 16 KiB cap) but stays inline on the default-node
+/// volume (256 KiB node ⇒ 64 KiB cap). Routing is pinned via
+/// `route_ino`/`make_global_ino`.
 #[tokio::test]
-async fn test_mixed_v2_v3_volumes_spill_per_volume() {
+async fn test_mixed_node_size_volumes_spill_per_volume() {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", K8_BLOCK_SIZE.to_string());
     let dlm = DlmClient::new("local").unwrap();
     let backing = NamedTempFile::new().unwrap();
@@ -1535,14 +1542,23 @@ async fn test_mixed_v2_v3_volumes_spill_per_volume() {
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
 
-    // Volume 0 = v2 (8 KiB xattr-value cap); volume 1 = v3 (default 64 KiB cap).
-    let v2f = NamedTempFile::new().unwrap();
-    let v2s = MetaLvStorage::open(v2f.path(), 128 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&v2s, true, true, None)
-        .await
-        .unwrap();
-    let v3f = NamedTempFile::new().unwrap();
-    v3f.as_file().set_len(128 * 1024 * 1024).unwrap();
+    // Volume 0 = 64 KiB nodes (16 KiB record-value cap); volume 1 =
+    // default 256 KiB nodes (64 KiB cap).
+    let smallf = NamedTempFile::new().unwrap();
+    smallf.as_file().set_len(128 * 1024 * 1024).unwrap();
+    ImageBuilder::new(BuilderConfig {
+        node_size: 64 * 1024,
+        journal_len_override: None,
+        hash_seed: K8_SEED,
+        uuid: *b"k8-small-node!!!",
+    })
+    .unwrap()
+    .build(smallf.path(), 128 * 1024 * 1024)
+    .await
+    .unwrap();
+    let small_be = KvMetaBackend::open(smallf.path()).await.unwrap();
+    let bigf = NamedTempFile::new().unwrap();
+    bigf.as_file().set_len(128 * 1024 * 1024).unwrap();
     ImageBuilder::new(BuilderConfig {
         node_size: DEFAULT_NODE_SIZE,
         journal_len_override: None,
@@ -1550,61 +1566,55 @@ async fn test_mixed_v2_v3_volumes_spill_per_volume() {
         uuid: K8_UUID,
     })
     .unwrap()
-    .build(v3f.path(), 128 * 1024 * 1024)
+    .build(bigf.path(), 128 * 1024 * 1024)
     .await
     .unwrap();
-    let v3be = KvMetaBackend::open(v3f.path()).await.unwrap();
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![
-        VolumeBackend::V2(Arc::new(MetaLvBackend::new(v2s))),
-        VolumeBackend::V3(v3be),
-    ]));
+    let big_be = KvMetaBackend::open(bigf.path()).await.unwrap();
+    let routed = Arc::new(RoutedMetaBackend::new(vec![small_be, big_be]));
     router.set_meta_backend(routed.clone());
 
-    assert_eq!(routed.volumes[0].format_version(), 2, "volume 0 is v2");
-    assert_eq!(routed.volumes[1].format_version(), 3, "volume 1 is v3");
-
     // One inode on each arm; compute the routed global ino and pin routing.
-    let v2_local = routed.volumes[0]
-        .create(1, "on_v2", libc::S_IFREG | 0o644, 1000, 1000)
+    let small_local = routed.volumes[0]
+        .create(1, "on_small", libc::S_IFREG | 0o644, 1000, 1000)
         .await
         .unwrap()
         .ino;
-    let v3_local = routed.volumes[1]
-        .create(1, "on_v3", libc::S_IFREG | 0o644, 1000, 1000)
+    let big_local = routed.volumes[1]
+        .create(1, "on_big", libc::S_IFREG | 0o644, 1000, 1000)
         .await
         .unwrap()
         .ino;
-    let v2_ino = routed.make_global_ino(v2_local, 0);
-    let v3_ino = routed.make_global_ino(v3_local, 1);
+    let small_ino = routed.make_global_ino(small_local, 0);
+    let big_ino = routed.make_global_ino(big_local, 1);
     assert_eq!(
-        routed.route_ino(v2_ino),
-        (0, v2_local),
-        "v2 ino routes to volume 0"
+        routed.route_ino(small_ino),
+        (0, small_local),
+        "small-node ino routes to volume 0"
     );
     assert_eq!(
-        routed.route_ino(v3_ino),
-        (1, v3_local),
-        "v3 ino routes to volume 1"
+        routed.route_ino(big_ino),
+        (1, big_local),
+        "default-node ino routes to volume 1"
     );
 
-    // §5.3 per-ino cap contract, pinned directly: v2 → 8 KiB fixed slot; v3 →
-    // min(65_536, node_size/4) = 64 KiB at the default node.
+    // §5.3 per-ino cap contract, pinned directly: min(65_536, node_size/4)
+    // per volume.
     assert_eq!(
-        routed.xattr_value_cap(v2_ino),
-        8192,
-        "v2 per-ino xattr value cap is the fixed 8 KiB slot"
+        routed.xattr_value_cap(small_ino),
+        16384,
+        "64 KiB-node per-ino xattr value cap is node_size/4"
     );
     assert_eq!(
-        routed.xattr_value_cap(v3_ino),
+        routed.xattr_value_cap(big_ino),
         65536,
-        "v3 per-ino xattr value cap is min(65536, node_size/4) at the default node"
+        "default-node per-ino xattr value cap is min(65536, node_size/4)"
     );
 
-    // The SAME 1000-entry shape: v2 keeps the legacy 32-entry ceiling so 1000
-    // spills at its old boundary; v3 lifts the boundary to its 64 KiB record
-    // cap (≈20 KiB serialized ≪ 60 KiB) so it stays inline — §5.3 per volume.
+    // The SAME 1000-entry shape (≈20 KiB serialized): spills on the
+    // 16 KiB-cap volume, stays inline under the 64 KiB cap — §5.3 per
+    // volume.
     let n = 1000usize;
-    for ino in [v2_ino, v3_ino] {
+    for ino in [small_ino, big_ino] {
         let path = format!("inode_{ino}");
         router
             .metadata_cache
@@ -1612,19 +1622,19 @@ async fn test_mixed_v2_v3_volumes_spill_per_volume() {
         persist_under_lease(&router, &dlm, &path).await;
     }
 
-    let v2_layout = persisted_layout(&routed, v2_ino).await;
-    let v3_layout = persisted_layout(&routed, v3_ino).await;
+    let small_layout = persisted_layout(&routed, small_ino).await;
+    let big_layout = persisted_layout(&routed, big_ino).await;
     assert!(
-        is_indirect(&v2_layout),
-        "v2 file must spill at the legacy 32-entry boundary (id={:?})",
-        v2_layout.block_map_id
+        is_indirect(&small_layout),
+        "small-node file must spill past its 16 KiB record cap (id={:?})",
+        small_layout.block_map_id
     );
     assert!(
-        is_inline(&v3_layout),
-        "v3 file must stay INLINE to its larger (64 KiB) record cap (id={:?})",
-        v3_layout.block_map_id
+        is_inline(&big_layout),
+        "default-node file must stay INLINE to its larger (64 KiB) record cap (id={:?})",
+        big_layout.block_map_id
     );
 
     // Keep temp backing/volumes alive to end of scope.
-    let _keep = (backing, v2f, v3f, staging);
+    let _keep = (backing, smallf, bigf, staging);
 }

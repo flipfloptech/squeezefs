@@ -1,5 +1,5 @@
 //! PR K7 scale & gate tests: big directories, the §5.1 readdir cookie
-//! contract end-to-end through FUSE, the `dir_entry_cache` ≤ 10 K policy,
+//! contract end-to-end through FUSE, the `dir_entry_cache_v3` ≤ 10 K policy,
 //! the builder-built mount-time bound, metadata write amplification, and
 //! the per-format stats-JSON scoping (design `docs/design-cow-kv-metadata.md`
 //! §5.1, §8 rows 5–7, §10).
@@ -19,10 +19,9 @@
 //! - **v3 readdir streams**: big directories page through
 //!   `readdir(dir, offset, max)` range scans (offset/max honored through
 //!   the routed trait), never materialize behind the legacy 100 K cap, and
-//!   never populate `dir_entry_cache` / `open_dir_streams`. v2 keeps its
-//!   positional-offset behavior byte-for-byte (pinned green here).
-//! - **`dir_entry_cache` policy (§4.5)**: only directories ≤ 10 K entries
-//!   are cached; larger listings bypass the cache on every format.
+//!   never populate a whole-directory snapshot.
+//! - **`dir_entry_cache_v3` policy (§4.5)**: only directories ≤ 10 K
+//!   entries are cached; larger listings bypass the cache.
 //! - **§8 row 6**: the 1 M-entry single-directory trait-path storm —
 //!   create / lookup-p50-within-2×-small-dir / streamed readdir / rmdir.
 //!   `SQUEEZEFS_SCALE_DIR_ENTRIES` overrides the population for local
@@ -32,13 +31,11 @@
 //!   cold-mounts within 500 ms in the serial gate; the 10 M / 100 M
 //!   variants are `#[ignore]`d nightly cases driven by
 //!   `tests/long_validation.py --mount-scale`.
-//! - **§8 row 7**: paired create/unlink storms — v3 device bytes
-//!   (`meta_kv_journal_bytes` + node writeback byte counters) vs v2
-//!   (`meta_commit_sectors` × 4 KiB, conservatively lower-bounded per
-//!   histogram bucket) show ≥ 10× reduction.
-//! - **§10 scoping**: `meta_kv_*` stats emitted only when a v3 volume is
-//!   mounted; the v2-only trio (`meta_commit_sectors`, `meta_inode_alloc_*`,
-//!   `meta_sector_lock_*`) only when a v2 volume is — no misleading zeros.
+//! - **§10 scoping**: `meta_kv_*` stats emitted for mounted volumes; the
+//!   retired v2-only counters never reappear. (The §8 row 7 paired
+//!   v2-vs-v3 write-amp storm and the paired-bench v2 reformat utility
+//!   were deleted with v2 support — their acceptance evidence lives in
+//!   `.benchmarks/2026-07-09-kv-v3-gates.md`.)
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -46,8 +43,8 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{
-    SqueezefsFilesystem, CONFIG_INODE, DIR_ENTRY_CACHE_MAX_ENTRIES, METRICS,
-    READDIR_VIRTUAL_CONFIG_COOKIE, READDIR_VIRTUAL_STATS_COOKIE, STATS_INODE,
+    SqueezefsFilesystem, CONFIG_INODE, DIR_ENTRY_CACHE_MAX_ENTRIES, READDIR_VIRTUAL_CONFIG_COOKIE,
+    READDIR_VIRTUAL_STATS_COOKIE, STATS_INODE,
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{digest_backend, BuilderConfig, ImageBuilder, ROOT_INO};
@@ -56,12 +53,8 @@ use squeezefs::meta_backend::kv::record::{
     decode_readdir_cookie, dentry_key_suffix, dentry_name_hash54, ReaddirPos, HASH54_MAX,
     READDIR_COOKIE_BIAS,
 };
-use squeezefs::meta_backend::kv::{
-    META_KV_JOURNAL_BYTES, META_KV_JOURNAL_ENTRIES, META_KV_NODE_APPENDS,
-    META_KV_NODE_APPEND_BYTES, META_KV_NODE_REWRITE_BYTES,
-};
-use squeezefs::meta_backend::storage::MetaLvStorage;
-use squeezefs::meta_backend::{MetaLvBackend, Metadata, RoutedMetaBackend, VolumeBackend};
+use squeezefs::meta_backend::kv::META_KV_NODE_APPENDS;
+use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::collections::HashSet;
@@ -78,9 +71,6 @@ use tempfile::{tempdir, NamedTempFile};
 /// convention).
 const TEST_SEED: u64 = 0x5CA1_AB1E_0DDB_A110;
 const TEST_UUID: [u8; 16] = *b"kv-scale-test!!!";
-
-/// v2 volumes need the fixed-geometry floor.
-const V2_VOL_LEN: u64 = 128 * 1024 * 1024;
 
 /// §8 row 6 population. Optimized builds (the K7 gate run, nightly,
 /// anything `--release`) default to the full million; debug builds
@@ -127,18 +117,6 @@ async fn v3_volume_with_seed(seed: u64, vol_len: u64) -> (Arc<KvMetaBackend>, Na
         .expect("build empty v3 image");
     let be = KvMetaBackend::open(file.path()).await.expect("mount v3");
     (be, file)
-}
-
-/// A fresh empty v2 volume behind the dispatch. `vol_len` bounds the v2
-/// ino cap (`min(20000, (len − 72 MiB) / 32 KiB)`): 128 MiB ⇒ ~1.8 K
-/// inos; the > 10 K-dir cache-policy case needs 512 MiB (~14 K inos).
-async fn v2_volume(vol_len: u64) -> (Arc<MetaLvBackend>, NamedTempFile) {
-    let file = NamedTempFile::new().expect("temp volume");
-    let storage = MetaLvStorage::open(file.path(), vol_len).unwrap();
-    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
-        .await
-        .unwrap();
-    (Arc::new(MetaLvBackend::new(storage)), file)
 }
 
 // ---------------------------------------------------------------------------
@@ -403,9 +381,7 @@ async fn walk_fuse_readdirplus(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routed_readdir_pages_honor_offset_and_max_on_v3() {
     let (be, _file) = v3_volume_with_seed(TEST_SEED, 64 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        be.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
     let dir = routed
         .create(ROOT_INO, "paged", libc::S_IFDIR | 0o755, 0, 0)
         .await
@@ -463,9 +439,7 @@ async fn forced_hash54_zero_cookie_resumes_exactly_once() {
     const FORCED: &str = "cookie-l";
     let seed = xxh3_seed::seed_forcing_hash54(FORCED, 0);
     let (be, _file) = v3_volume_with_seed(seed, 64 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        be.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
 
     let dir = routed
         .create(ROOT_INO, "forced-lo", libc::S_IFDIR | 0o755, 0, 0)
@@ -522,9 +496,7 @@ async fn forced_top_of_range_cookie_is_terminal() {
     const FORCED: &str = "cookie-h";
     let seed = xxh3_seed::seed_forcing_hash54(FORCED, HASH54_MAX);
     let (be, _file) = v3_volume_with_seed(seed, 64 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        be.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
 
     let dir = routed
         .create(ROOT_INO, "forced-hi", libc::S_IFDIR | 0o755, 0, 0)
@@ -583,14 +555,12 @@ async fn forced_top_of_range_cookie_is_terminal() {
 /// v3 readdir through the FUSE layer: `.`/`..` at offsets 1/2, every real
 /// entry at its key cookie (computed independently from the seeded hash),
 /// root virtuals `.config`/`.stats` ABOVE the real-cookie space, exact
-/// once-each enumeration under mid-stream resume, and no
-/// `dir_entry_cache` / `open_dir_streams` population (v3 streams).
+/// once-each enumeration under mid-stream resume, and no whole-directory
+/// snapshot (v3 streams).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fuse_readdir_v3_emits_key_cookies_and_streams() {
     let (be, _file) = v3_volume_with_seed(TEST_SEED, 64 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        be.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
     let h = fuse_fs(routed.clone(), "kv_scale_fuse_v3").await;
 
     let mut expect = HashSet::new();
@@ -654,11 +624,6 @@ async fn fuse_readdir_v3_emits_key_cookies_and_streams() {
         h.fs.dir_entry_cache_v3.get(&1).is_some(),
         "a small v3 directory must be cached (with cookies) after a listing start — §4.5"
     );
-    h.fs.dir_entry_cache.run_pending_tasks();
-    assert!(
-        h.fs.dir_entry_cache.get(&1).is_none(),
-        "v3 listings must never enter the positional v2 cache"
-    );
     let walked_again = walk_fuse_readdir(&h.fs, 1, 0, 7).await;
     assert_eq!(
         walked, walked_again,
@@ -685,12 +650,8 @@ async fn fuse_readdir_v3_emits_key_cookies_and_streams() {
         "cache refresh must keep §5.1 cookies"
     );
 
-    // opendir on v3 must not materialize a whole-dir snapshot.
+    // opendir mints an fh without materializing a whole-dir snapshot.
     let opened = h.fs.opendir(req(), 1, 0).await.expect("opendir");
-    assert!(
-        h.fs.open_dir_streams.get(&opened.fh).is_none(),
-        "v3 opendir must not snapshot the directory into open_dir_streams"
-    );
     // ... and readdir through that fh serves the same listing.
     let walked_fh = walk_fuse_readdir(&h.fs, 1, opened.fh, 1000).await;
     assert_eq!(
@@ -714,9 +675,7 @@ async fn fuse_readdir_v3_emits_key_cookies_and_streams() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fuse_readdirplus_v3_streams_with_attrs() {
     let (be, _file) = v3_volume_with_seed(TEST_SEED, 64 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        be.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
     let h = fuse_fs(routed.clone(), "kv_scale_fuse_v3_plus").await;
 
     let dir = routed
@@ -763,122 +722,9 @@ async fn fuse_readdirplus_v3_streams_with_attrs() {
     be.shutdown().await.unwrap();
 }
 
-/// v2 through the same FUSE surface keeps its positional-offset behavior
-/// (offsets 1, 2, 3, … with the root virtuals FIRST) and keeps populating
-/// `dir_entry_cache` for small directories — the v2-unchanged pin.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fuse_readdir_v2_positional_offsets_unchanged() {
-    let (be, _file) = v2_volume(V2_VOL_LEN).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V2(be)]));
-    let h = fuse_fs(routed.clone(), "kv_scale_fuse_v2").await;
-
-    let mut expect = HashSet::new();
-    for i in 0..9u32 {
-        let name = format!("v2-entry-{i}");
-        routed
-            .create(ROOT_INO, &name, libc::S_IFREG | 0o644, 0, 0)
-            .await
-            .unwrap();
-        expect.insert(name);
-    }
-
-    let walked = walk_fuse_readdir(&h.fs, 1, 0, 4).await;
-    // Positional: 1, 2, 3, … in emission order, virtuals before reals.
-    for (i, (_, _, off)) in walked.iter().enumerate() {
-        assert_eq!(
-            *off,
-            i as i64 + 1,
-            "v2 offsets stay positional (entry {i} at {off})"
-        );
-    }
-    assert_eq!(walked[0].0, ".");
-    assert_eq!(walked[1].0, "..");
-    assert_eq!(walked[2].0, ".config", "v2 root virtuals stay first");
-    assert_eq!(walked[3].0, ".stats");
-    let reals: HashSet<String> = walked[4..].iter().map(|(n, _, _)| n.clone()).collect();
-    assert_eq!(reals, expect);
-
-    // Small v2 directory: the fh-less fallback path still caches.
-    h.fs.dir_entry_cache.run_pending_tasks();
-    assert!(
-        h.fs.dir_entry_cache.get(&1).is_some(),
-        "small v2 directories keep using dir_entry_cache"
-    );
-}
-
 // ---------------------------------------------------------------------------
-// dir_entry_cache policy (§4.5): ≤ 10 K entries cached, larger bypassed.
+// dir_entry_cache_v3 policy (§4.5): ≤ 10 K entries cached, larger bypassed.
 // ---------------------------------------------------------------------------
-
-/// The cache policy is format-generic: a > 10 K-entry v2 directory must
-/// bypass `dir_entry_cache` (an `Arc<[…]>` of a huge listing is exactly
-/// the OOM the §4.5 policy exists to prevent), while ≤ 10 K keeps caching.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dir_entry_cache_caps_at_10k_entries() {
-    assert_eq!(
-        DIR_ENTRY_CACHE_MAX_ENTRIES, 10_000,
-        "the §4.5 policy constant"
-    );
-    let (be, _file) = v2_volume(512 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V2(be)]));
-    let h = fuse_fs(routed.clone(), "kv_scale_cache_policy").await;
-
-    // A > 10 K-entry v2 directory (concurrent creates — v2's shared-parent
-    // path keeps this fast enough for the serial gate).
-    let dir = routed
-        .create(ROOT_INO, "big-v2", libc::S_IFDIR | 0o755, 0, 0)
-        .await
-        .unwrap();
-    let total = DIR_ENTRY_CACHE_MAX_ENTRIES + 50;
-    let mut tasks = Vec::new();
-    for t in 0..5usize {
-        let r = routed.clone();
-        let dir_ino = dir.ino;
-        tasks.push(tokio::spawn(async move {
-            let per = total / 5 + usize::from(t < total % 5);
-            for i in 0..per {
-                r.create(
-                    dir_ino,
-                    &format!("f-{t}-{i:05}"),
-                    libc::S_IFREG | 0o644,
-                    0,
-                    0,
-                )
-                .await
-                .expect("create");
-            }
-        }));
-    }
-    for t in tasks {
-        t.await.unwrap();
-    }
-
-    let walked = walk_fuse_readdir(&h.fs, dir.ino, 0, usize::MAX).await;
-    assert_eq!(walked.len(), total + 2, "all entries + . + ..");
-    h.fs.dir_entry_cache.run_pending_tasks();
-    assert!(
-        h.fs.dir_entry_cache.get(&dir.ino).is_none(),
-        "a {total}-entry directory must bypass dir_entry_cache (≤ 10 K policy)"
-    );
-
-    // A small sibling still caches through the same path.
-    let small = routed
-        .create(ROOT_INO, "small-v2", libc::S_IFDIR | 0o755, 0, 0)
-        .await
-        .unwrap();
-    for i in 0..12u32 {
-        routed
-            .create(small.ino, &format!("s-{i}"), libc::S_IFREG | 0o644, 0, 0)
-            .await
-            .unwrap();
-    }
-    let _ = walk_fuse_readdir(&h.fs, small.ino, 0, usize::MAX).await;
-    h.fs.dir_entry_cache.run_pending_tasks();
-    assert!(
-        h.fs.dir_entry_cache.get(&small.ino).is_some(),
-        "≤ 10 K directories keep caching"
-    );
-}
 
 /// A v3 directory larger than the legacy 100 K materialization cap must
 /// enumerate completely through FUSE (the pre-K7 snapshot path silently
@@ -888,9 +734,7 @@ async fn dir_entry_cache_caps_at_10k_entries() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuse_readdir_v3_big_dir_streams_exactly_once() {
     let (be, _file) = v3_volume_with_seed(TEST_SEED, 256 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        be.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
     let h = fuse_fs(routed.clone(), "kv_scale_fuse_v3_big").await;
 
     let dir = routed
@@ -932,11 +776,10 @@ async fn fuse_readdir_v3_big_dir_streams_exactly_once() {
         total,
         "every entry of a {total}-entry v3 dir must stream through FUSE exactly once"
     );
-    h.fs.dir_entry_cache.run_pending_tasks();
     h.fs.dir_entry_cache_v3.run_pending_tasks();
-    assert!(
-        h.fs.dir_entry_cache.get(&dir.ino).is_none(),
-        "big v3 directories must never enter dir_entry_cache"
+    assert_eq!(
+        DIR_ENTRY_CACHE_MAX_ENTRIES, 10_000,
+        "the §4.5 policy constant"
     );
     assert!(
         h.fs.dir_entry_cache_v3.get(&dir.ino).is_none(),
@@ -997,9 +840,7 @@ async fn million_entry_directory_storm_create_lookup_readdir_rmdir() {
         .await
         .expect("build v3 image");
     let be = KvMetaBackend::open(file.path()).await.expect("mount");
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        be.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
 
     // A small reference directory for the lookup-p50 comparison.
     let small = routed
@@ -1218,7 +1059,7 @@ async fn builder_image_digest_matches_trait_built_state() {
     // empty image with the same seed, times pinned last (creates stamp
     // real clocks; the description's times are explicit).
     let (be, _file) = v3_volume_with_seed(TEST_SEED, 64 * 1024 * 1024).await;
-    let routed = RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be.clone())]);
+    let routed = RoutedMetaBackend::new(vec![be.clone()]);
     let mut trait_inos = Vec::new();
     for i in 0..FILES {
         let ino = routed
@@ -1511,9 +1352,7 @@ async fn threshold_writeback_drains_without_cadence() {
     let _cleanup = Cleanup;
 
     let (be, _f) = v3_volume_with_seed(TEST_SEED, 128 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        be.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
 
     let appends0 = META_KV_NODE_APPENDS.load(Ordering::Relaxed);
     let checkpoints0 = squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed);
@@ -1561,9 +1400,7 @@ async fn threshold_writeback_drains_without_cadence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn descend_survives_sustained_smo_churn() {
     let (be, _f) = v3_volume_with_seed(TEST_SEED, 256 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        be.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
     routed
         .create(ROOT_INO, "anchor", libc::S_IFREG | 0o644, 0, 0)
         .await
@@ -1709,184 +1546,11 @@ async fn rightmost_separator_pointer_record_replays_clean() {
 }
 
 // ---------------------------------------------------------------------------
-// §8 paired-run tooling: rebuild a CLI-formatted meta volume as v2.
-// ---------------------------------------------------------------------------
-
-/// Utility for the §8 paired mount benches (not a test): the CLI formats
-/// only v3 from K6a on (resolved OQ 4 — v2 formatting is
-/// test-surface-only), but every §8 gate row is a paired v2-vs-v3
-/// comparison over REAL CLI mounts. This target rebuilds the meta volume
-/// at `SQUEEZEFS_V2_REFORMAT_META` as v2 with the §6.2 test-scoped
-/// formatter, carrying over the format-config xattr the CLI recorded —
-/// the exact shim shape the pre-K6b transport suite used. Invocation:
-///
-/// ```text
-/// SQUEEZEFS_V2_REFORMAT_META=/path/to/meta.bin \
-///   cargo test --release --test kv_scale_tests -- --ignored \
-///   --exact util_reformat_meta_volume_v2 --test-threads=1
-/// ```
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "paired-bench tooling — set SQUEEZEFS_V2_REFORMAT_META and run explicitly"]
-async fn util_reformat_meta_volume_v2() {
-    use squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR;
-    let meta = std::env::var("SQUEEZEFS_V2_REFORMAT_META")
-        .expect("set SQUEEZEFS_V2_REFORMAT_META to the CLI-formatted meta volume path");
-    let len = std::env::var("SQUEEZEFS_V2_REFORMAT_LEN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256 * 1024 * 1024);
-    let meta = std::path::PathBuf::from(meta);
-
-    let cfg = KvMetaBackend::open(&meta)
-        .await
-        .expect("open the CLI-formatted v3 meta volume")
-        .getxattr(ROOT_INO, FORMAT_CONFIG_XATTR)
-        .await
-        .expect("read the recorded format config")
-        .expect("format must record the config xattr");
-    let storage = MetaLvStorage::open(&meta, len).expect("reopen meta volume");
-    MetaLvBackend::format_v2_for_tests(&storage, true, true, None)
-        .await
-        .expect("v2 reformat");
-    squeezefs::meta_backend::xattr::set_xattr(&storage, 1, FORMAT_CONFIG_XATTR, &cfg)
-        .await
-        .expect("carry the format config onto the v2 volume");
-    eprintln!(
-        "[v2-reformat] {} is now format v2 ({} B)",
-        meta.display(),
-        len
-    );
-}
-
-// ---------------------------------------------------------------------------
-// §8 row 7: metadata write amplification — paired create/unlink storms.
-// ---------------------------------------------------------------------------
-
-/// Conservative lower bound of total sectors recorded in the
-/// `meta_commit_sectors` histogram delta (each bucket counted at its
-/// smallest representable depth — understating v2 makes the ≥ 10× gate
-/// strictly harder to pass).
-fn sectors_lower_bound(before: &[u64; 15], after: &[u64; 15]) -> u64 {
-    const LOWER: [u64; 15] = [
-        0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513, 1025, 2049, 4097,
-    ];
-    let mut total = 0u64;
-    for i in 0..15 {
-        total += (after[i] - before[i]) * LOWER[i];
-    }
-    total
-}
-
-fn commit_sector_buckets() -> [u64; 15] {
-    let mut out = [0u64; 15];
-    for (i, b) in METRICS.meta_commit_sectors.buckets.iter().enumerate() {
-        out[i] = b.load(Ordering::Relaxed);
-    }
-    out
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn write_amp_create_unlink_storm_v3_ge_10x_reduction() {
-    const OPS: usize = 4_096;
-    /// A storm, not a trickle: the §4.4 write-amp arithmetic (and the
-    /// §8 row 7 gate built on it) is about storm-rate commits, where a
-    /// flush tick's 4 KiB bset frame amortizes over the tick's whole
-    /// record batch — exactly the shared-parent concurrency the routed
-    /// create path is built for (§4.4 pt 6). A serial await-loop pays a
-    /// full frame per handful of records and measures the harness's own
-    /// slowness, not the design.
-    const WRITERS: usize = 8;
-
-    // ---- v3 storm: device bytes = journal entry bytes + node writeback
-    // (bset appends + CoW rewrites), §8 row 7's stated accounting.
-    let (v3, _f3) = v3_volume_with_seed(TEST_SEED, 256 * 1024 * 1024).await;
-    let routed3 = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        v3.clone(),
-    )]));
-    let j0 = META_KV_JOURNAL_BYTES.load(Ordering::Relaxed);
-    let e0 = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
-    let a0 = META_KV_NODE_APPEND_BYTES.load(Ordering::Relaxed);
-    let r0 = META_KV_NODE_REWRITE_BYTES.load(Ordering::Relaxed);
-    let n0 = META_KV_NODE_APPENDS.load(Ordering::Relaxed);
-    let mut tasks = Vec::new();
-    for w in 0..WRITERS {
-        let r = routed3.clone();
-        tasks.push(tokio::spawn(async move {
-            let mut i = w;
-            while i < OPS {
-                let name = format!("wa{i:05}");
-                r.create(ROOT_INO, &name, libc::S_IFREG | 0o644, 0, 0)
-                    .await
-                    .expect("storm create");
-                r.unlink(ROOT_INO, &name).await.expect("storm unlink");
-                i += WRITERS;
-            }
-        }));
-    }
-    for t in tasks {
-        t.await.unwrap();
-    }
-    // Shutdown runs the final checkpoint: every dirty bset lands, so the
-    // append/rewrite deltas are complete, not clocked mid-cadence.
-    v3.shutdown().await.unwrap();
-    let v3_journal = META_KV_JOURNAL_BYTES.load(Ordering::Relaxed) - j0;
-    let v3_entries = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed) - e0;
-    let v3_appends = META_KV_NODE_APPENDS.load(Ordering::Relaxed) - n0;
-    let v3_append_bytes = META_KV_NODE_APPEND_BYTES.load(Ordering::Relaxed) - a0;
-    let v3_rewrite_bytes = META_KV_NODE_REWRITE_BYTES.load(Ordering::Relaxed) - r0;
-    let v3_bytes = v3_journal + v3_append_bytes + v3_rewrite_bytes;
-    assert!(
-        v3_entries >= (2 * OPS) as u64,
-        "every create/unlink must journal one whole-tx entry (got {v3_entries})"
-    );
-    assert!(v3_journal > 0 && v3_bytes > 0, "v3 byte counters must move");
-
-    // ---- v2 storm: the same op mix at the same concurrency through the
-    // v2 trait surface (its per-commit sector cost is rate-independent,
-    // so symmetry here only removes doubt, it does not tilt the gate).
-    let (v2, _f2) = v2_volume(512 * 1024 * 1024).await;
-    let s0 = commit_sector_buckets();
-    let mut tasks = Vec::new();
-    for w in 0..WRITERS {
-        let v2 = v2.clone();
-        tasks.push(tokio::spawn(async move {
-            let mut i = w;
-            while i < OPS {
-                let name = format!("wa{i:05}");
-                v2.create(1, &name, libc::S_IFREG | 0o644, 0, 0)
-                    .await
-                    .expect("v2 storm create");
-                v2.unlink(1, &name).await.expect("v2 storm unlink");
-                i += WRITERS;
-            }
-        }));
-    }
-    for t in tasks {
-        t.await.unwrap();
-    }
-    let s1 = commit_sector_buckets();
-    let v2_sectors = sectors_lower_bound(&s0, &s1);
-    let v2_bytes = v2_sectors * 4096;
-    assert!(v2_sectors > 0, "v2 storm must record commit sectors");
-
-    let ratio = v2_bytes as f64 / v3_bytes as f64;
-    eprintln!(
-        "[write-amp] {OPS} create/unlink pairs — v2: {v2_bytes} B ({v2_sectors} sectors, \
-         lower-bounded), v3: {v3_bytes} B (journal {v3_journal} B / {v3_entries} entries, \
-         appends {v3_appends} = {v3_append_bytes} B, rewrites {v3_rewrite_bytes} B) ⇒ \
-         reduction {ratio:.1}×"
-    );
-    assert!(
-        ratio >= 10.0,
-        "§8 row 7: metadata write amplification must fall ≥ 10× (measured {ratio:.2}×; \
-         v2 {v2_bytes} B vs v3 {v3_bytes} B)"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // §10: per-format stats scoping on the stats-inode JSON.
 // ---------------------------------------------------------------------------
 
+/// Keys of the retired v2-only metric family — deleted with v2 support;
+/// they must never reappear in the stats JSON.
 const V2_ONLY_KEYS: [&str; 5] = [
     "meta_commit_sectors",
     "meta_inode_alloc_cas_retries",
@@ -1920,26 +1584,22 @@ async fn stats_metrics_object(
         .clone()
 }
 
-/// A v3-only mount emits the `meta_kv_*` family and none of the v2-only
-/// counters; a v2-only mount emits the inverse; a mixed set emits both
-/// (design §10: "emitted only for v2 volumes … don't emit misleading
-/// zeros").
+/// A mounted volume set emits the `meta_kv_*` family, reports
+/// `meta_format_version` as the constant "3" per volume (operators key on
+/// the field), and never emits the retired v2-only counters (design §10).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stats_json_scopes_v2_and_v3_metrics_per_volume() {
-    // v3-only.
+async fn stats_json_scopes_kv_metrics_per_volume() {
     let (v3, _f3) = v3_volume_with_seed(TEST_SEED, 64 * 1024 * 1024).await;
-    let routed = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(
-        v3.clone(),
-    )]));
+    let routed = Arc::new(RoutedMetaBackend::new(vec![v3.clone()]));
     let h = fuse_fs(routed, "kv_scale_stats_v3").await;
     let m = stats_metrics_object(&h.fs).await;
     for key in V3_KEYS {
-        assert!(m.contains_key(key), "v3 mount must emit {key}");
+        assert!(m.contains_key(key), "a mounted volume must emit {key}");
     }
     for key in V2_ONLY_KEYS {
         assert!(
             !m.contains_key(key),
-            "v3-only mount must NOT emit the v2-only {key} (misleading zeros)"
+            "the retired v2-only {key} must never be emitted"
         );
     }
     assert_eq!(
@@ -1947,35 +1607,4 @@ async fn stats_json_scopes_v2_and_v3_metrics_per_volume() {
         Some(&vec![serde_json::Value::String("3".into())]),
     );
     v3.shutdown().await.unwrap();
-
-    // v2-only.
-    let (v2be, _f2) = v2_volume(V2_VOL_LEN).await;
-    let routed2 = Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V2(
-        v2be,
-    )]));
-    let h2 = fuse_fs(routed2, "kv_scale_stats_v2").await;
-    let m2 = stats_metrics_object(&h2.fs).await;
-    for key in V2_ONLY_KEYS {
-        assert!(m2.contains_key(key), "v2 mount must keep emitting {key}");
-    }
-    for key in V3_KEYS {
-        assert!(
-            !m2.contains_key(key),
-            "v2-only mount must NOT emit {key} (misleading zeros)"
-        );
-    }
-
-    // Mixed set: both families.
-    let (v3m, _f3m) = v3_volume_with_seed(TEST_SEED, 64 * 1024 * 1024).await;
-    let (v2m, _f2m) = v2_volume(V2_VOL_LEN).await;
-    let routed_mixed = Arc::new(RoutedMetaBackend::new_dispatch(vec![
-        VolumeBackend::V2(v2m),
-        VolumeBackend::V3(v3m.clone()),
-    ]));
-    let hm = fuse_fs(routed_mixed, "kv_scale_stats_mixed").await;
-    let mm = stats_metrics_object(&hm.fs).await;
-    for key in V2_ONLY_KEYS.iter().chain(V3_KEYS.iter()) {
-        assert!(mm.contains_key(*key), "mixed mount must emit {key}");
-    }
-    v3m.shutdown().await.unwrap();
 }

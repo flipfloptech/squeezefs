@@ -275,14 +275,6 @@ pub mod keys {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct FormatConfig {
     pub name: String,
-    /// Filesystem-generation uuid, random per `format` invocation. On v2
-    /// volume sets (whose superblock carries no identity) this is the
-    /// generation stamp `meta_backend::volume_set_generation` binds local
-    /// staging to; v3 volumes use their superblock uuid instead. Optional
-    /// (absent on pre-fix configs; serde ignores it on older binaries), so
-    /// adding it changes no on-disk format.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fs_uuid: Option<String>,
     pub block_size: u64,
     pub capacity: u64,
     pub inodes: u64,

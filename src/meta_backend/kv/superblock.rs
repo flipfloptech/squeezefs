@@ -1,11 +1,12 @@
-//! Superblock v3 and the dual-format version gate (PR K6a; design §4.1
+//! Superblock v3 and the sector-0 version gate (PR K6a; design §4.1
 //! "Superblock v3", §5.1, §6.1, resolved OQ 1).
 //!
-//! Sector 0 keeps the v2 wire prefix — `magic: [u8; 8]` at `[0..8)` and
-//! `version: u32` at `[8..12)` — so every pre-v3 binary reads a v3 volume's
-//! version as 3 and refuses loud ("upgrade squeezefs",
-//! `storage.rs:validate_superblock`): the downgrade story the WAL design
-//! bought is exactly what makes the format bump safe (§4.1).
+//! Sector 0 keeps the historical v2 wire prefix — `magic: [u8; 8]` at
+//! `[0..8)` and `version: u32` at `[8..12)` — so any binary (old or new)
+//! can classify any SqueezeFS volume: pre-v3 binaries read a v3 volume's
+//! version as 3 and refuse loud ("upgrade squeezefs"); this binary reads a
+//! legacy v2 volume's version as ≤ 2 and refuses loud (v2 support removed
+//! — reformat required, [`VolumeFormat::V2Legacy`]).
 //!
 //! ## Sector layout (little-endian, one 4 KiB sector)
 //!
@@ -25,8 +26,8 @@
 //! [128..4096) zero padding    covered by the checksum
 //! ```
 //!
-//! The checksum covers the whole sector (not just the struct bytes, the v2
-//! convention) so a torn superblock write is detected no matter which bytes
+//! The checksum covers the whole sector (not just the struct bytes, the
+//! retired v2 convention) so a torn superblock write is detected no matter which bytes
 //! the tear scrambled — the SB is a **durable-coverage unit** (§4.1): unlike
 //! journal contents, a bad superblock fails the mount loud (§4.10 torn-SB
 //! crash case).
@@ -44,9 +45,17 @@ use super::checkpoint::ROOT_LEDGER_LEN;
 use super::journal::{JOURNAL_PAGE_LEN, MAX_ENTRY_LEN};
 use super::node::{record_value_cap, NodeLayout, NODE_PAGE};
 use super::KvError;
-use crate::meta_backend::storage::{Superblock, MAGIC_VALUE, SECTOR_SIZE};
 use std::path::Path;
-use zerocopy::IntoBytes;
+
+/// The metadata-volume magic at sector-0 offset 0 — shared with the
+/// retired v2 format by design (the version field discriminates), so a
+/// legacy volume still classifies as "SqueezeFS, unsupported version"
+/// rather than "foreign".
+pub const MAGIC_VALUE: &[u8; 8] = b"METALV01";
+
+/// The 4 KiB metadata sector: the superblock's durable-coverage unit and
+/// the journal ring's page size.
+pub const SECTOR_SIZE: usize = 4096;
 
 /// Byte offsets of the sector-0 wire layout (module docs). `magic` and
 /// `version` sit at the v2 offsets by design — the downgrade gate.
@@ -214,122 +223,6 @@ impl SuperblockV3 {
         })
     }
 
-    /// Plan a **migrated** volume's geometry (design §6.2 in-place tail
-    /// build): the v3 heap spans the whole reclaimed device from offset 0
-    /// (extent 0 holds the sector-0 superblock and stays reserved), while the
-    /// fixed ledger | journal | bitmap triple is written into *reserved
-    /// extents* at `build_start` — the free tail beyond the highest live v2
-    /// xattr block, so no live v2 byte is touched before the single-sector
-    /// flip. Everything below `build_start` (v2 tables, the dead journal
-    /// region, the whole xattr reservation) becomes free heap extents once the
-    /// bitmap marks only the reserved triple + built nodes allocated.
-    ///
-    /// `build_start` must be node-size aligned. The journal ring is clamped on
-    /// the *whole device* (resolved OQ 1). Fails loud if the reserved triple
-    /// plus the §4.7 compaction reserve cannot fit before the device end — the
-    /// structural half of the §6.2 deficit refusal (the node-count half lives
-    /// in [`crate::meta_backend::kv::migrate`]).
-    pub fn plan_migrate(
-        device_len: u64,
-        build_start: u64,
-        node_size: usize,
-        journal_len_override: Option<u64>,
-        uuid: [u8; 16],
-        hash_seed: u64,
-    ) -> Result<Self, KvError> {
-        let layout = NodeLayout::new(node_size)?;
-        let node_size = layout.node_size() as u64;
-        if build_start == 0 || build_start % node_size != 0 {
-            return Err(KvError::Corrupt(format!(
-                "migrate build_start {build_start} must be a nonzero multiple of the node size \
-                 {node_size}"
-            )));
-        }
-
-        // Whole-device heap from offset 0; extent 0 carries the superblock and
-        // is reserved by the builder.
-        let total_extents = device_len / node_size;
-        let heap = ExtentRef {
-            start: 0,
-            len: total_extents * node_size,
-        };
-
-        let root_ledger = ExtentRef {
-            start: build_start,
-            len: ROOT_LEDGER_LEN,
-        };
-        let journal_len = match journal_len_override {
-            Some(len) => {
-                let floor = 256 * 1024 + MAX_ENTRY_LEN;
-                if len % JOURNAL_PAGE_LEN != 0 || len < floor {
-                    return Err(KvError::Corrupt(format!(
-                        "journal ring override {len} bytes is invalid: must be a 4 KiB multiple \
-                         of at least {floor} bytes (reserve + one max entry)"
-                    )));
-                }
-                len
-            }
-            None => journal_ring_len(device_len),
-        };
-        let journal = ExtentRef {
-            start: root_ledger.end(),
-            len: journal_len,
-        };
-        let alloc_bitmap = ExtentRef {
-            start: journal.end(),
-            len: bitmap_region_len(total_extents),
-        };
-
-        // The reserved triple + at least the compaction reserve and the three
-        // tree roots must fit before the heap (device) end.
-        let first_node_off = alloc_bitmap.end().div_ceil(node_size) * node_size;
-        let min_tail = (compaction_reserve_extents(total_extents) + 4) * node_size;
-        if first_node_off + min_tail > heap.end() {
-            return Err(KvError::Corrupt(format!(
-                "metadata volume too small to migrate in place: the v3 fixed structures end at \
-                 {first_node_off} and need at least {min_tail} more bytes for the compaction \
-                 reserve and tree roots, but the heap ends at {} — grow the volume (--grow) or \
-                 migrate to a larger device",
-                heap.end()
-            )));
-        }
-
-        let sb = Self {
-            node_size: node_size as u32,
-            features_incompat: FEATURE_INCOMPAT_KV_V3,
-            features_ro: 0,
-            root_ledger,
-            journal,
-            alloc_bitmap,
-            heap,
-            uuid,
-            hash_seed,
-        };
-        sb.validate_geometry()?;
-        Ok(sb)
-    }
-
-    /// The heap extent whose first byte is at `offset` (or that contains
-    /// `offset`): `(offset - heap.start) / node_size`. Panics if `offset` is
-    /// below the heap. The migrate builder uses it to map the reserved-triple
-    /// and first-node byte offsets onto extent indices.
-    pub fn extent_of_offset(&self, offset: u64) -> u64 {
-        (offset - self.heap.start) / u64::from(self.node_size)
-    }
-
-    /// Physical byte offset of the first node extent (the extent just past the
-    /// reserved ledger|journal|bitmap triple, rounded up to an extent
-    /// boundary). For a fresh image this equals `heap.start`; for a migrated
-    /// image it is the first extent above the in-tail reserved triple.
-    pub fn first_node_offset(&self) -> u64 {
-        let ns = u64::from(self.node_size);
-        if self.alloc_bitmap.end() <= self.heap.start {
-            self.heap.start
-        } else {
-            self.alloc_bitmap.end().div_ceil(ns) * ns
-        }
-    }
-
     /// Heap extent count (`heap.len / node_size`).
     pub fn total_extents(&self) -> u64 {
         self.heap.len / u64::from(self.node_size)
@@ -407,8 +300,7 @@ impl SuperblockV3 {
         let computed = sector_checksum(buf);
         if stored != computed {
             // Not the bare ChecksumMismatch variant: its display names
-            // bsets, and a torn superblock deserves its own words (the
-            // storage.rs v2 message shape).
+            // bsets, and a torn superblock deserves its own words.
             return Err(KvError::Corrupt(format!(
                 "superblock checksum mismatch: stored {stored:#018x}, computed {computed:#018x} \
                  — corrupted superblock"
@@ -474,17 +366,17 @@ impl SuperblockV3 {
     ///
     /// * **fresh format** ([`SuperblockV3::plan`]) — `SB | ledger | journal
     ///   | bitmap | heap`, the triple entirely *below* `heap.start`;
-    /// * **migrated volume** ([`SuperblockV3::plan_migrate`], §6.2 in-place
-    ///   tail build) — the heap spans the whole reclaimed device and the
-    ///   fixed triple lives in *reserved extents inside it* (the bitmap
-    ///   marks those extents allocated so the allocator never hands them
-    ///   out; that is the builder's contract, not something this structural
-    ///   check can see). Then the triple is entirely within
-    ///   `[heap.start, heap.end)` and `heap.start ≤ ledger.start`.
+    /// * **in-heap triple** (historically produced by the retired v2→v3
+    ///   in-place migrator; still a legal v3 geometry — the on-disk format
+    ///   is unchanged by the migrator's removal) — the heap spans the whole
+    ///   device and the fixed triple lives in *reserved extents inside it*
+    ///   (the bitmap marks those extents allocated so the allocator never
+    ///   hands them out; that is the image producer's contract, not
+    ///   something this structural check can see). Then the triple is
+    ///   entirely within `[heap.start, heap.end)` and
+    ///   `heap.start ≤ ledger.start`.
     ///
-    /// Both are accepted; anything else is corruption. This is a strict
-    /// superset of the pre-migrate rule (the fresh arm is unchanged), so no
-    /// fresh-format volume that validated before validates differently now.
+    /// Both are accepted; anything else is corruption.
     fn validate_geometry(&self) -> Result<(), KvError> {
         let layout = NodeLayout::new(self.node_size as usize)?;
         let node_size = layout.node_size() as u64;
@@ -612,17 +504,18 @@ pub fn validate_node_kib(kib: u32) -> Result<(usize, Option<String>), KvError> {
     Ok((bytes, warning))
 }
 
-/// Sector-0 classification for the dual-format mount dispatch (§6.1) —
-/// the storage.rs pattern (blank distinguished from garbage so the
-/// operator error is actionable) extended with the v3 arm.
+/// Sector-0 classification for the mount/format version gate (§6.1) —
+/// blank distinguished from garbage so the operator error is actionable.
 #[derive(Debug, Clone)]
 pub enum VolumeFormat {
     /// All-zero magic: never formatted. Callers decide loudness (mount:
     /// "run `squeezefs format` first"; format: proceed).
     Blank,
-    /// A validated v2 superblock (magic + version ≤ 2 + checksum-iff-
-    /// nonzero — byte-identical policy to `storage.rs`).
-    V2(Superblock),
+    /// SqueezeFS magic with version ≤ 2: the retired fixed-geometry
+    /// format. **No longer mountable or readable** — mount and generation
+    /// derivation refuse loud ("reformat required"); `format` treats it
+    /// as an already-formatted volume (`--force` reformats it to v3).
+    V2Legacy,
     /// A validated v3 superblock.
     V3(SuperblockV3),
 }
@@ -630,9 +523,9 @@ pub enum VolumeFormat {
 /// Classify a sector-0 image (pure): [`VolumeFormat::Blank`] for zeroed
 /// magic; loud errors for foreign magic, versions above 3 ("upgrade
 /// squeezefs"), checksum mismatches, and v3 structural/feature-gate
-/// failures. The version check precedes checksum verification on both
-/// arms — an unknown version must be reported as such, never as a
-/// checksum mismatch (the storage.rs discipline).
+/// failures. The version check precedes checksum verification — an
+/// unknown version must be reported as such, never as a checksum
+/// mismatch.
 pub fn classify_sector0(sector: &[u8]) -> Result<VolumeFormat, KvError> {
     if sector.len() != SUPERBLOCK_V3_LEN {
         return Err(KvError::Corrupt(format!(
@@ -650,30 +543,16 @@ pub fn classify_sector0(sector: &[u8]) -> Result<VolumeFormat, KvError> {
              foreign volume"
         )));
     }
-    // The version check precedes checksum verification on both arms: a
-    // future format may change checksum semantics, so an unknown version
-    // must be reported as such (the storage.rs discipline).
+    // The version check precedes checksum verification: a future format
+    // may change checksum semantics, so an unknown version must be
+    // reported as such, never as a checksum mismatch.
     let version = u32::from_le_bytes(sector[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap());
     match version {
-        v if v <= 2 => {
-            // Byte-identical v2 policy (`storage.rs::validate_superblock`):
-            // verify the struct checksum iff nonzero (legacy volumes wrote
-            // 0, which skips the check).
-            let mut sb = Superblock::new_zeroed();
-            let sb_len = sb.as_bytes().len();
-            sb.as_mut_bytes().copy_from_slice(&sector[..sb_len]);
-            if sb.checksum != 0 {
-                let computed = sb.compute_checksum();
-                if computed != sb.checksum {
-                    return Err(KvError::Corrupt(format!(
-                        "superblock checksum mismatch: stored {:#018x}, computed \
-                         {computed:#018x} — corrupted superblock",
-                        sb.checksum
-                    )));
-                }
-            }
-            Ok(VolumeFormat::V2(sb))
-        }
+        // Retired v2 format: recognized (SqueezeFS magic), never decoded —
+        // there is no v2 reader left. The classification alone lets the
+        // mount refuse with the precise "no longer supported" message and
+        // lets `format --force` reformat the volume.
+        v if v <= 2 => Ok(VolumeFormat::V2Legacy),
         SUPERBLOCK_V3_VERSION => Ok(VolumeFormat::V3(SuperblockV3::decode_sector(sector)?)),
         v => Err(KvError::Corrupt(format!(
             "unsupported metadata format version {v} (this binary supports <= \
@@ -684,8 +563,7 @@ pub fn classify_sector0(sector: &[u8]) -> Result<VolumeFormat, KvError> {
 
 /// Read sector 0 of `path` via `crate::uring_fs` (io_uring-only,
 /// AGENTS.md) and [`classify_sector0`] it. Never grows or mutates the
-/// volume (unlike `MetaLvStorage::open`, which `set_len`s small files —
-/// a v3 volume must not be touched by v2 plumbing).
+/// volume.
 pub async fn classify_volume(path: &Path) -> Result<VolumeFormat, KvError> {
     let got = crate::uring_fs::read_at(path, 0, SUPERBLOCK_V3_LEN).await?;
     // A short read (file smaller than one sector) zero-extends: zeros
@@ -707,8 +585,7 @@ pub async fn classify_volume(path: &Path) -> Result<VolumeFormat, KvError> {
 }
 
 /// Write `sb` to sector 0 of `path` (one checksummed whole-sector
-/// `uring_fs::write_at` — the same single-sector commit-point class as
-/// every v2 superblock write).
+/// `uring_fs::write_at` — the single-sector commit-point class).
 pub async fn write_superblock_v3(path: &Path, sb: &SuperblockV3) -> Result<(), KvError> {
     let img = sb.encode_sector()?;
     crate::uring_fs::write_at(path, 0, img).await?;

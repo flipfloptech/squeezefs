@@ -33,20 +33,12 @@ use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
-use squeezefs::meta_backend::{
-    storage::MetaLvStorage, MetaLvBackend, RoutedMetaBackend, VolumeBackend,
-};
+use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile, TempDir};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fmt {
-    V2,
-    V3,
-}
 
 /// 64 KiB blocks: small enough that multi-block striped files are cheap,
 /// matching the write_visibility harness geometry.
@@ -60,7 +52,7 @@ struct H {
     _s: TempDir,
 }
 
-async fn make(fmt: Fmt) -> H {
+async fn make() -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     let dlm = DlmClient::new("local").unwrap();
 
@@ -94,30 +86,19 @@ async fn make(fmt: Fmt) -> H {
 
     let m = NamedTempFile::new().unwrap();
     m.as_file().set_len(128 * 1024 * 1024).unwrap();
-    let routed: Arc<RoutedMetaBackend> = match fmt {
-        Fmt::V2 => {
-            let ms = MetaLvStorage::open(m.path(), 128 * 1024 * 1024).unwrap();
-            MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
-                .await
-                .unwrap();
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V2(
-                Arc::new(MetaLvBackend::new(ms)),
-            )]))
-        }
-        Fmt::V3 => {
-            ImageBuilder::new(BuilderConfig {
-                node_size: DEFAULT_NODE_SIZE,
-                journal_len_override: None,
-                hash_seed: 0xC0FF_EE00_1234_5678,
-                uuid: *b"stalefill-regrv3",
-            })
-            .unwrap()
-            .build(m.path(), 128 * 1024 * 1024)
-            .await
-            .unwrap();
-            let be = KvMetaBackend::open(m.path()).await.unwrap();
-            Arc::new(RoutedMetaBackend::new_dispatch(vec![VolumeBackend::V3(be)]))
-        }
+    let routed: Arc<RoutedMetaBackend> = {
+        ImageBuilder::new(BuilderConfig {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            hash_seed: 0xC0FF_EE00_1234_5678,
+            uuid: *b"stalefill-regrv3",
+        })
+        .unwrap()
+        .build(m.path(), 128 * 1024 * 1024)
+        .await
+        .unwrap();
+        let be = KvMetaBackend::open(m.path()).await.unwrap();
+        Arc::new(RoutedMetaBackend::new(vec![be]))
     };
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed);
@@ -213,9 +194,9 @@ fn drain_striped_io_permits() -> Vec<tokio::sync::OwnedSemaphorePermit> {
 //    (b1's data one block over) and never W's punched range (zeros).
 // ---------------------------------------------------------------------------
 
-async fn parked_read_never_serves_reused_or_freed_key(fmt: Fmt) {
-    let tag = format!("{fmt:?}/parked-read-aba");
-    let h = make(fmt).await;
+async fn parked_read_never_serves_reused_or_freed_key() {
+    let tag = "parked-read-aba".to_string();
+    let h = make().await;
     let ino = create(&h, "aba").await;
 
     // Striped 2-block file: b0 = 0xA0, b1 = 0xB0 (full-block write-through).
@@ -318,13 +299,8 @@ async fn parked_read_never_serves_reused_or_freed_key(fmt: Fmt) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn parked_read_never_serves_reused_or_freed_key_v2() {
-    parked_read_never_serves_reused_or_freed_key(Fmt::V2).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parked_read_never_serves_reused_or_freed_key_v3() {
-    parked_read_never_serves_reused_or_freed_key(Fmt::V3).await;
+    parked_read_never_serves_reused_or_freed_key().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -347,9 +323,9 @@ async fn parked_read_never_serves_reused_or_freed_key_v3() {
 //    deterministic reds for the family are tests 1 and 3.)
 // ---------------------------------------------------------------------------
 
-async fn size_bump_never_reverts_merged_map(fmt: Fmt) {
-    let tag = format!("{fmt:?}/size-bump-revert");
-    let h = Arc::new(make(fmt).await);
+async fn size_bump_never_reverts_merged_map() {
+    let tag = "size-bump-revert".to_string();
+    let h = Arc::new(make().await);
     let ino = create(&h, "revert").await;
     let path = squeezefs::keys::inode_path(ino);
 
@@ -413,13 +389,8 @@ async fn size_bump_never_reverts_merged_map(fmt: Fmt) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn size_bump_never_reverts_merged_map_v2() {
-    size_bump_never_reverts_merged_map(Fmt::V2).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn size_bump_never_reverts_merged_map_v3() {
-    size_bump_never_reverts_merged_map(Fmt::V3).await;
+    size_bump_never_reverts_merged_map().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -468,9 +439,9 @@ fn check_stamps(data: &[u8], file_off: u64, tag: &str) {
     }
 }
 
-async fn stress_recycled_keys(fmt: Fmt) {
-    let tag = format!("{fmt:?}/stress-recycle");
-    let h = Arc::new(make(fmt).await);
+async fn stress_recycled_keys() {
+    let tag = "stress-recycle".to_string();
+    let h = Arc::new(make().await);
     let ino = create(&h, "stress").await;
 
     // Seed all blocks (striped, write-through).
@@ -574,11 +545,6 @@ async fn stress_recycled_keys(fmt: Fmt) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn stress_recycled_keys_v2() {
-    stress_recycled_keys(Fmt::V2).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn stress_recycled_keys_v3() {
-    stress_recycled_keys(Fmt::V3).await;
+    stress_recycled_keys().await;
 }

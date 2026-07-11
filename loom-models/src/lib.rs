@@ -4,9 +4,6 @@
 //! check the exact shipped code, not a copy. Each protocol was extracted
 //! into a dependency-free core module for this purpose:
 //!
-//! - [`alloc_core`]: the inode-bitmap allocator (`fetch_or` claim,
-//!   `fetch_and` release, scan hint) — invariant: an inode is never handed
-//!   to two concurrent callers, and occupancy popcount matches live claims.
 //! - [`incarnation_core`]: the block-key incarnation seqlock (retire /
 //!   publish / snapshot / validate) — invariant: a *validated* cache fill
 //!   never publishes bytes from a different incarnation of a reused block
@@ -56,8 +53,6 @@
 //! `cargo test` here compiles the cores against std atomics and runs
 //! nothing.
 
-#[path = "../../src/meta_backend/alloc_core.rs"]
-pub mod alloc_core;
 #[path = "../../src/meta_backend/kv/alloc_ext_core.rs"]
 pub mod alloc_ext_core;
 #[path = "../../src/cow_core.rs"]
@@ -78,148 +73,11 @@ pub mod refcount_core;
 #[cfg(all(test, loom))]
 mod models {
     use crate::{
-        alloc_core, alloc_ext_core, gauge_core, incarnation_core, journal_core, lease_core,
-        node_state_core,
+        alloc_ext_core, gauge_core, incarnation_core, journal_core, lease_core, node_state_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
     use loom::thread;
-
-    /// Allocator invariant #1: two threads racing `alloc` on a small table
-    /// never receive the same inode, and the final popcount equals the
-    /// number of successful claims.
-    #[test]
-    fn alloc_never_double_allocates() {
-        loom::model(|| {
-            // limit 6 -> allocatable {2,3,4,5}.
-            let a = Arc::new(alloc_core::AllocCore::new(6));
-
-            let t1 = {
-                let a = a.clone();
-                thread::spawn(move || {
-                    let x = a.alloc().ok().map(|o| o.ino);
-                    let y = a.alloc().ok().map(|o| o.ino);
-                    (x, y)
-                })
-            };
-            let (x2, y2) = {
-                let x = a.alloc().ok().map(|o| o.ino);
-                let y = a.alloc().ok().map(|o| o.ino);
-                (x, y)
-            };
-            let (x1, y1) = t1.join().unwrap();
-
-            let claimed: Vec<u64> = [x1, y1, x2, y2].into_iter().flatten().collect();
-            let mut dedup = claimed.clone();
-            dedup.sort_unstable();
-            dedup.dedup();
-            assert_eq!(
-                claimed.len(),
-                dedup.len(),
-                "an inode was handed to two threads: {claimed:?}"
-            );
-            assert_eq!(
-                a.allocated_count(),
-                claimed.len() as u64,
-                "popcount diverged from live claims"
-            );
-        });
-    }
-
-    /// Allocator invariant #2: a `free` racing concurrent `alloc`s hands the
-    /// slot to at most one new claimant; occupancy stays exact.
-    #[test]
-    fn alloc_free_reuse_is_exclusive() {
-        loom::model(|| {
-            // limit 4 -> allocatable {2,3}.
-            let a = Arc::new(alloc_core::AllocCore::new(4));
-            let first = a.alloc().expect("seed claim").ino;
-
-            let t = {
-                let a = a.clone();
-                thread::spawn(move || {
-                    let m = a.alloc().ok().map(|o| o.ino);
-                    let n = a.alloc().ok().map(|o| o.ino);
-                    (m, n)
-                })
-            };
-            a.free(first);
-            let (m, n) = t.join().unwrap();
-
-            let mut live: Vec<u64> = [m, n].into_iter().flatten().collect();
-            live.sort_unstable();
-            let mut dedup = live.clone();
-            dedup.dedup();
-            assert_eq!(
-                live.len(),
-                dedup.len(),
-                "freed slot double-claimed: {live:?}"
-            );
-            assert_eq!(
-                a.allocated_count(),
-                live.len() as u64,
-                "popcount diverged after free/alloc race"
-            );
-        });
-    }
-
-    /// Allocator invariant #3 (PR 2 quarantine): a reserved range is never
-    /// handed out under alloc races, `free` inside it is a no-op even racing
-    /// concurrent claims, and `allocated_count` stays exactly the number of
-    /// live (non-reserved) claims — claim-vs-reserved non-interference.
-    #[test]
-    fn alloc_reserved_range_never_handed_out() {
-        loom::model(|| {
-            // limit 8 -> allocatable {2..8}; reserve {4,5} -> claimable {2,3,6,7}.
-            let mut core = alloc_core::AllocCore::new(8);
-            core.reserve_range(4, 6);
-            let a = Arc::new(core);
-
-            let t = {
-                let a = a.clone();
-                thread::spawn(move || {
-                    // Racing free()s of reserved inos must release nothing.
-                    a.free(4);
-                    let m = a.alloc().ok().map(|o| o.ino);
-                    a.free(5);
-                    let n = a.alloc().ok().map(|o| o.ino);
-                    (m, n)
-                })
-            };
-            let (x, y) = {
-                let x = a.alloc().ok().map(|o| o.ino);
-                let y = a.alloc().ok().map(|o| o.ino);
-                (x, y)
-            };
-            let (m, n) = t.join().unwrap();
-
-            let claimed: Vec<u64> = [x, y, m, n].into_iter().flatten().collect();
-            for ino in &claimed {
-                assert!(
-                    *ino != 4 && *ino != 5,
-                    "reserved ino handed out under race: {claimed:?}"
-                );
-            }
-            let mut dedup = claimed.clone();
-            dedup.sort_unstable();
-            dedup.dedup();
-            assert_eq!(
-                claimed.len(),
-                dedup.len(),
-                "an inode was handed to two threads: {claimed:?}"
-            );
-            assert_eq!(claimed.len(), 4, "exactly {{2,3,6,7}} must be claimable");
-            assert_eq!(
-                a.allocated_count(),
-                4,
-                "popcount must exclude reserved bits and racing frees of them"
-            );
-            assert!(
-                a.is_set(4) && a.is_set(5),
-                "reserved bits must survive free()"
-            );
-        });
-    }
 
     /// Seqlock invariant: a fill that passes snapshot+validate never returns
     /// bytes from a different incarnation. The payload cell is modeled as an

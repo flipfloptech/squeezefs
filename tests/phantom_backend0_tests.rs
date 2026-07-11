@@ -29,13 +29,35 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{SqueezefsFilesystem, CONFIG_INODE};
-use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{DataRouter, StorageBackend};
 use std::ffi::OsStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tempfile::{tempdir, NamedTempFile, TempDir};
+
+/// Format + mount one v3 metadata volume for this harness.
+async fn open_v3_meta(
+    path: &std::path::Path,
+    len: u64,
+) -> std::sync::Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+    squeezefs::meta_backend::kv::builder::format_v3(
+        path,
+        len,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3 meta volume");
+    squeezefs::meta_backend::kv::backend::KvMetaBackend::open(path)
+        .await
+        .expect("open v3 meta volume")
+}
 
 static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -131,11 +153,7 @@ async fn harness(volume_names: &[&str]) -> H {
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 
     let meta_temp = NamedTempFile::new().unwrap();
-    let meta_storage = MetaLvStorage::open(meta_temp.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&meta_storage, true, true, None)
-        .await
-        .unwrap();
-    let meta_backend = Arc::new(MetaLvBackend::new(meta_storage));
+    let meta_backend = open_v3_meta(meta_temp.path(), 256 * 1024 * 1024).await;
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         meta_backend,
     ]));

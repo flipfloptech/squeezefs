@@ -22,11 +22,33 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
-use squeezefs::meta_backend::{storage::MetaLvStorage, MetaLvBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile};
+
+/// Format + mount one v3 metadata volume for this harness.
+async fn open_v3_meta(
+    path: &std::path::Path,
+    len: u64,
+) -> std::sync::Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+    squeezefs::meta_backend::kv::builder::format_v3(
+        path,
+        len,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3 meta volume");
+    squeezefs::meta_backend::kv::backend::KvMetaBackend::open(path)
+        .await
+        .expect("open v3 meta volume")
+}
 
 async fn make() -> (SqueezefsFilesystem, Request, NamedTempFile, NamedTempFile) {
     let dlm = DlmClient::new("local").unwrap();
@@ -59,12 +81,9 @@ async fn make() -> (SqueezefsFilesystem, Request, NamedTempFile, NamedTempFile) 
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 
     let m = NamedTempFile::new().unwrap();
-    let ms = MetaLvStorage::open(m.path(), 256 * 1024 * 1024).unwrap();
-    MetaLvBackend::format_v2_for_tests(&ms, true, true, None)
-        .await
-        .unwrap();
+
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
-        Arc::new(MetaLvBackend::new(ms)),
+        open_v3_meta(m.path(), 256 * 1024 * 1024).await,
     ]));
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed);

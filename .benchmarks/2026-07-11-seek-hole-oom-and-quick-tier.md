@@ -67,9 +67,9 @@ notrun {009, 316}.
 | 003 | **platform — expected-fail** | atime/relatime/strictatime + ctime-across-remount semantics under FUSE attr caching + writeback-cache mount. 10 deterministic ERROR lines; not a data-path bug. |
 | 213 | **platform — expected-fail** | thin provisioning: `fallocate(mode=0)` never reserves physical blocks and statfs is virtual, so the golden "fallocate: No space left on device" line never appears (single-line diff; all other legs pass). |
 | 009 / 316 | **platform — expected-notrun** | `_require_xfs_io_command fiemap`; FUSE has no FIEMAP ioctl. Canaries for a future FIEMAP-capable stack. |
-| 074 / 127 / 616 | **REAL, PRE-EXISTING — stopped with analysis** | see below (127 joined the family on the final QUICK run: identical READ-BAD-DATA-zeros signature on its fsx_std_mmap_flush leg; its exact fsx line fails 1/3 on the pristine 6a69952 baseline too) |
+| 074 / 127 / 616 (+075 rarely) | **REAL, PRE-EXISTING — stopped with analysis** | see below. 127 joined on the final QUICK run (identical zeros signature, fsx_std_mmap_flush leg; its exact fsx line fails 1/3 on the pristine 6a69952 baseline too); 075 tripped once in 5 harness runs (fsx.2 -d leg, .bad dump = literal zeros vs .good). Measured per-run failure rates: 616 ~2/3, 074 ~2/3, 127 ~1/3, 075 ~1/5; 091 never observed. |
 
-### 074/127/616 analysis (stop point — distinct effort)
+### 074/127/616 (+075) analysis (stop point — distinct effort)
 
 Signature: transient stale/zeros reads under buffered write+read churn; file
 durably correct afterward. generic/074 `fstest -n 3 -F -l 2 -f 3 -s 30M
@@ -101,12 +101,24 @@ expected-fail pair in the QUICK provenance.
 
 ## Expected QUICK-tier result (deterministic; deviation = regression)
 
-* PASS: 001 008 013 069 075 091 112 263 **285** 469 **617** 618
+* PASS: 001 008 013 069 091 112 263 **285** 469 **617** 618
 * NOTRUN (platform): 009 316
 * FAIL (platform, deterministic diff): 003 213
-* FAIL (real pre-existing, nondeterministic — 074/127/616 family watch):
-  074 127 616 (each passes some runs — 616 ~1/3, 127 ~2/3; a pass is not a
-  signal the family is fixed)
+* FAIL (real pre-existing, nondeterministic — transient-zeros family watch):
+  074 127 616 (+075 rarely). Each passes some runs; a pass is not a signal
+  the family is fixed, and a failure with the documented zeros signature is
+  not a regression. Any OTHER signature on these tests IS a regression.
+
+### Trio acceptance rolls (616/075/091, 3 harness runs)
+
+| roll | 075 | 091 | 616 |
+|---|---|---|---|
+| 1 | pass | pass | FAIL (family) |
+| 2 | FAIL (family) | pass | pass |
+| 3 | pass | pass | FAIL (family) |
+
+091: 3/3 green (its pinned write-visibility contracts hold). 075/616 carry
+the pre-existing transient-zeros family at the measured rates above.
 
 ## Gate
 

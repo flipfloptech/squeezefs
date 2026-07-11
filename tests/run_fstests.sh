@@ -341,7 +341,7 @@ EOF
 #
 # DETERMINISTIC EXPECTED RESULT of this tier (2026-07-11, post 285/617
 # fixes). Anything deviating from this table is a REGRESSION:
-#   PASS (deterministic): 001 008 013 069 075 091 112 263 285 469 617 618
+#   PASS (deterministic): 001 008 013 069 091 112 263 285 469 617 618
 #   NOTRUN (deterministic, platform): 009 316 — both _require xfs_io fiemap;
 #                     FUSE has no FIEMAP ioctl. Kept as canaries: they start
 #                     RUNNING (and their punch/prealloc coverage arms) the
@@ -359,10 +359,13 @@ EOF
 #           appears. All other 213 legs pass; exactly that one missing
 #           line is the expected diff.
 #   FAIL (nondeterministic, REAL pre-existing bug — under fix-family watch):
-#     074/127/616 = transient stale/zeros reads under buffered write+read churn
-#           (fstest child corruption at 512 B blocks; fsx READ BAD DATA of
-#           zeros for recently-written ranges, file durably correct after;
-#           127 = the same signature on its fsx_std_mmap_flush leg).
+#     074/127/616 (+075 rarely) = transient stale/zeros reads under buffered
+#           write+read churn: ANY of the buffered fsx/fstest soakers can
+#           trip the race; measured per-run failure rates 2026-07-11:
+#           616 ~2/3, 074 ~2/3, 127 ~1/3, 075 ~1/5 (091 never observed).
+#           Signature: fstest child corruption at 512 B blocks / fsx READ
+#           BAD DATA of zeros for recently-written ranges, file durably
+#           correct afterward (transient read-side, not lost durability).
 #           Verified ZERO-DELTA vs dev@6a69952 (identical failures on the
 #           pristine baseline: seeded fsx ~1-2/3 either side, incl. 127's
 #           exact fsx line 1/3 on the baseline).

@@ -164,10 +164,7 @@ fn test_phase_selection_fixed_order(
 #[test]
 fn test_shape_rejects_zero_threads_and_files() {
     let mut sh = shape(0, 1, 4096, 4096);
-    assert!(matches!(
-        validate_shape(&sh),
-        Err(BenchError::Shape(_))
-    ));
+    assert!(matches!(validate_shape(&sh), Err(BenchError::Shape(_))));
     sh = shape(1, 0, 4096, 4096);
     assert!(matches!(validate_shape(&sh), Err(BenchError::Shape(_))));
 }
@@ -182,10 +179,11 @@ fn test_shape_rejects_zero_size_and_block() {
 
 #[test]
 fn test_direct_requires_block_multiple_of_4096() {
-    // -b 100k = 102400 bytes: NOT a multiple of 4096 => loud refusal.
-    let mut sh = shape(1, 1, 1024 * 1024, 100 * 1024);
+    // -b 10k = 10240 bytes: NOT a multiple of 4096 => loud refusal.
+    // (size is a multiple of block so only the 4096 rule can fire.)
+    let mut sh = shape(1, 1, 100 * 1024, 10 * 1024);
     sh.direct = true;
-    let err = validate_shape(&sh).expect_err("--direct with -b 100k must be refused");
+    let err = validate_shape(&sh).expect_err("--direct with -b 10k must be refused");
     let msg = err.to_string();
     assert!(
         msg.contains("4096"),
@@ -194,6 +192,23 @@ fn test_direct_requires_block_multiple_of_4096() {
     // Same block size without --direct is fine (partial tail allowed).
     sh.direct = false;
     validate_shape(&sh).expect("non-direct unaligned block is allowed");
+}
+
+#[test]
+fn test_direct_100k_block_rejected_via_size_multiple_rule() {
+    // The user-facing "-b 100k" refusal: 100k = 102400 bytes IS 4096-aligned
+    // (25 * 4096), so the rejection comes from -s % -b != 0 (O_DIRECT EOF
+    // tail trap) for any size that is not a 100k multiple — e.g. -s 1g.
+    let mut sh = shape(1, 1, 1024 * 1024 * 1024, 100 * 1024);
+    sh.direct = true;
+    let err = validate_shape(&sh).expect_err("--direct -b 100k -s 1g must be refused");
+    assert!(
+        err.to_string().contains("multiple"),
+        "error must explain the size-multiple-of-block requirement, got: {err}"
+    );
+    // --direct -b 128k -s 1g is the accepted counterpart.
+    sh.block = 128 * 1024;
+    validate_shape(&sh).expect("--direct -b 128k -s 1g must validate");
 }
 
 #[test]
@@ -589,7 +604,12 @@ async fn test_eof_partial_block_write_and_read() {
             .await
             .unwrap_or_else(|e| panic!("partial-tail run (rand={rand}) must work: {e}"));
         for res in &report.phases {
-            assert_eq!(res.bytes, 2 * 20 * 1024, "rand={rand} {:?} bytes", res.phase);
+            assert_eq!(
+                res.bytes,
+                2 * 20 * 1024,
+                "rand={rand} {:?} bytes",
+                res.phase
+            );
             assert_eq!(res.ops, 2 * 2, "rand={rand} {:?} ops", res.phase);
         }
         for fid in 0..2 {
@@ -793,6 +813,8 @@ fn test_cli_read_without_dataset_fails_loud_nonzero() {
 #[test]
 fn test_cli_direct_unaligned_block_rejected() {
     let base = scratch("cli_direct");
+    // Acceptance scenario: `--direct -b 100k` refused. 100k is 4096-aligned,
+    // so with -s 1m (not a 100k multiple) the -s % -b rule fires.
     let out = Command::new(bin())
         .arg("bench")
         .arg(&base)
@@ -809,10 +831,32 @@ fn test_cli_direct_unaligned_block_rejected() {
         "--direct -b 100k must be rejected.\noutput: {combined}"
     );
     assert!(
+        combined.contains("multiple"),
+        "error must explain the alignment/multiple requirement.\noutput: {combined}"
+    );
+    assert!(!dataset_root(&base).exists());
+    cleanup(&base);
+
+    // And the truly-unaligned block case trips the 4096 rule.
+    let out = Command::new(bin())
+        .arg("bench")
+        .arg(&base)
+        .args(["-w", "--direct", "-s", "100k", "-b", "10k"])
+        .output()
+        .expect("spawn squeezefs bench");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "--direct -b 10k must be rejected.\noutput: {combined}"
+    );
+    assert!(
         combined.contains("4096"),
         "error must mention 4096 alignment.\noutput: {combined}"
     );
-    assert!(!dataset_root(&base).exists());
     cleanup(&base);
 }
 

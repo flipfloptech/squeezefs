@@ -427,9 +427,22 @@ async fn tick(
     if final_cycle {
         // New mutations are already refused (`write_gate`); wait out the
         // in-flight ones so the final flush pass sees every applied
-        // record and the tail lands exactly on the head.
-        let head = be.journal_ring().core().head();
-        be.journal_ring().wait_completed_upto(head).await;
+        // record and the tail lands exactly on the head. Drain UNTIL THE
+        // HEAD IS STABLE, not one sampled head: a commit that passed the
+        // gate before the flag can reserve ring space after a one-shot
+        // sample, and its entry then sits past the final checkpoint's
+        // tail — the next mount replays it (kill-9 soak, "clean shutdown
+        // must leave an empty replay window", ~1/200 deep-churn rounds).
+        // Gated writers are finite, so the head converges; the iteration
+        // bound is a belt against a pathological writer, after which the
+        // final cycle proceeds with the freshest head it saw.
+        for _ in 0..64 {
+            let head = be.journal_ring().core().head();
+            be.journal_ring().wait_completed_upto(head).await;
+            if be.journal_ring().core().head() == head {
+                break;
+            }
+        }
     }
 
     // 1. Threshold maintenance (appends + SMOs, serialized here — §4.6).

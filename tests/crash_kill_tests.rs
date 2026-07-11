@@ -282,13 +282,33 @@ async fn test_kill9_remount_soak_v3() {
             .spawn()
             .expect("spawn v3 crash child");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !ledger.exists() && std::time::Instant::now() < deadline {
+        // Wait for the FIRST ACKED op, then kill inside a jittered window.
+        // The kill must land mid-churn, but "child acked something within
+        // 50 ms of its first ledger line" is a load-sensitive wall-clock
+        // assumption, not a crash-consistency invariant: under full-suite
+        // load (this binary is serial, but the box is not idle) the first
+        // create+fdatasync can take hundreds of ms, the SIGKILL landed
+        // before any ack, and the ≥1-ack sanity assert below flaked —
+        // 4/4 green isolated, red once per full-suite run. Anchoring the
+        // jitter on the first ack keeps every invariant (the kill still
+        // interrupts live churn; the ack floor is guaranteed) without the
+        // wall-clock bet.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut acked_seen = false;
+        while std::time::Instant::now() < deadline {
+            if ledger.exists()
+                && std::fs::read_to_string(&ledger)
+                    .map(|s| s.lines().any(|l| l.starts_with("ack ")))
+                    .unwrap_or(false)
+            {
+                acked_seen = true;
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         assert!(
-            ledger.exists(),
-            "round {round}: v3 child never started churning"
+            acked_seen,
+            "round {round}: the v3 child never acked a single op in 60 s — commit pipeline dead"
         );
         let jitter: u64 = {
             use rand::Rng;
@@ -302,7 +322,7 @@ async fn test_kill9_remount_soak_v3() {
         let m = parse_ledger(&ledger);
         assert!(
             m.lines.iter().any(|l| l.starts_with("ack ")),
-            "round {round}: the v3 child never acked a single op — commit pipeline dead"
+            "round {round}: acked line vanished from the ledger between kill and parse"
         );
 
         // Mount #1: superblock → ledger → bitmap → replay. NEVER loud for

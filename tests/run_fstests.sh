@@ -307,7 +307,7 @@ EOF
 # Provenance (2026-07-09/10 v3 bring-up):
 #   112/616/617/618 = copy_file_range crawl (fix 97e2ed4)
 #   616             = hole-read family: PUNCH_HOLE/truncate coherence
-#                     (fixes 37fe5eb + 49286ee stale-size truncate) — GREEN
+#                     (fixes 37fe5eb + 49286ee stale-size truncate)
 #   075/091         = write-visibility family: fallocate size clobber under
 #                     a lagging durable size, truncate leaving parked/staged
 #                     active-block overlays alive, overlay-blind
@@ -321,8 +321,55 @@ EOF
 #                     tests/reused_key_stale_fill_tests.rs and averted
 #                     serves surface as stale_binding_rebinds on .stats
 #   008/009/285/316 = fallocate / zero-range / SEEK_HOLE / punch coverage
-#   003/069/469     = pre-existing FUSE-class failures tracked for delta
+#   285             = daemon OOM (~108 GB RSS): staged->striped promotion
+#                     materialized the whole logical span for a 64 KiB write
+#                     at a ~8/16 TiB offset (seek_sanity huge_file_test).
+#                     FIXED (sparse O(map) promotion; pins in
+#                     tests/sparse_write_bounded_tests.rs) — GREEN. NOTE:
+#                     SEEK_HOLE/SEEK_DATA are intentionally kernel-default
+#                     (no FUSE_LSEEK): 285 runs in seek_sanity's accepted
+#                     "default behavior" mode; a layout-granularity native
+#                     lseek would FAIL its st_blksize-granularity probes.
+#   617             = O_DIRECT short read below EOF ("uring read bad io
+#                     length"): reads spanning a staged/inline implicit-zero
+#                     hole tail returned only the physically-backed prefix
+#                     (page cache masked it; fsx -Z exposed it). FIXED
+#                     (full-length below-EOF zero-fill in
+#                     read_file_range_zero_copy; pins in
+#                     tests/read_full_length_tests.rs) — GREEN.
 #   001/013/074/127/213/263 = mount-cycle + fsx/fsstress core soak
+#
+# DETERMINISTIC EXPECTED RESULT of this tier (2026-07-11, post 285/617
+# fixes). Anything deviating from this table is a REGRESSION:
+#   PASS (deterministic): 001 008 013 069 075 091 112 127 263 285 469 618
+#   NOTRUN (deterministic, platform): 009 316 — both _require xfs_io fiemap;
+#                     FUSE has no FIEMAP ioctl. Kept as canaries: they start
+#                     RUNNING (and their punch/prealloc coverage arms) the
+#                     day a FIEMAP-capable kernel/fuse lands.
+#   FAIL (deterministic, platform-class — expected-fail, kept as canaries):
+#     003 = atime semantics: FUSE attr caching + writeback-cache mount keep
+#           relatime/strictatime updates kernel-side and remount-unstable
+#           (atime not updated on read; ctime jitter across remount). Not a
+#           data-path bug; revisit only if we adopt FOPEN_KEEP/attr-timeout
+#           rework. A DIFFERENT diff than the 10 known atime/ctime ERROR
+#           lines = regression.
+#     213 = thin provisioning: fallocate(mode=0) never reserves physical
+#           blocks (sparse/dynamic backend by design; statfs is virtual),
+#           so the "fallocate: No space left on device" golden line never
+#           appears. All other 213 legs pass; exactly that one missing
+#           line is the expected diff.
+#   FAIL (nondeterministic, REAL pre-existing bug — under fix-family watch):
+#     074/616 = transient stale/zeros reads under buffered write+read churn
+#           (fstest child corruption at 512 B blocks; fsx READ BAD DATA of
+#           zeros for recently-written ranges, file durably correct after).
+#           Verified ZERO-DELTA vs dev@6a69952 (identical failures on the
+#           pristine baseline, ~2/3 fsx seed reproduction either side).
+#           Correlates with .stats staged_payload_lost_reads > 0 on a
+#           healthy mount: reads race a staged-identity transition
+#           (re-stage/promote/release window) and hit the zeros-degrade
+#           leg. Fix = staged-identity lifecycle work (read-side identity
+#           seqlock or drain-before-release), tracked as its own effort —
+#           see .benchmarks/2026-07-11-seek-hole-oom-and-quick-tier.md.
 SQUEEZEFS_FSTESTS_QUICK=(
     generic/001 generic/003 generic/008 generic/009 generic/013
     generic/069 generic/074 generic/075 generic/091 generic/112

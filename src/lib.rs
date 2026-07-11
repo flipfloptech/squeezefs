@@ -5,6 +5,7 @@
 pub mod nvme_dev;
 pub mod tiering;
 
+pub mod bench;
 pub mod bg_admit;
 pub mod cache;
 pub mod config_ops;

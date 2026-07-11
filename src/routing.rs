@@ -185,6 +185,18 @@ pub struct BackendRouter {
     /// P1-11: lock-free active backend id (hot path read).
     pub active_write_backend: std::sync::Arc<arc_swap::ArcSwap<String>>,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Read-tier purge hook, run inside every TERMINAL `free_block`
+    /// (`begin_free` → purge → punch → `finish_free`). Closes the
+    /// straggler-publish poison (the generic/074 fstest.3 stale-fill): a
+    /// validated fill's detached publish can land AFTER the displacement
+    /// purge yet PASS its incarnation after-check, because the key's
+    /// incarnation retires only here — so the free itself must sweep the
+    /// read tiers. Any publish that lands after this purge necessarily
+    /// runs its after-check after the retire and undoes itself; any
+    /// publish before it is removed here. Wired by `DataRouter::new`
+    /// (`OnceCell`: the tiers outlive the router; bare routers in tests
+    /// simply have no tiers to purge).
+    read_tier_purge: once_cell::sync::OnceCell<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 #[cold]
@@ -317,7 +329,14 @@ impl BackendRouter {
                 "backend_0".to_string(),
             )),
             block_size,
+            read_tier_purge: once_cell::sync::OnceCell::new(),
         }
+    }
+
+    /// Wire the terminal-free read-tier purge (see the field doc). Called
+    /// once by `DataRouter::new`; later calls are no-ops.
+    pub fn set_read_tier_purge(&self, purge: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
+        let _ = self.read_tier_purge.set(purge);
     }
 
     pub fn is_backend_healthy(&self, be_id: &str) -> bool {
@@ -648,6 +667,18 @@ impl BackendRouter {
         };
 
         if allocator.begin_free(offset) {
+            // Terminal release: `begin_free` has retired the incarnation, so
+            // sweep the read tiers HERE — after the retire, before the
+            // offset becomes reallocatable. A straggler validated-fill
+            // publish (detached put delayed past the displacement purge —
+            // the generic/074 fstest.3 stale-fill) either landed before
+            // this purge (removed now) or lands after it, in which case its
+            // own incarnation after-check runs after the retire and undoes
+            // it. Either way the key's next owner can never tier-hit the
+            // dead incarnation's bytes.
+            if let Some(purge) = self.read_tier_purge.get() {
+                purge(block_key);
+            }
             let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
             Self::punch_hole_sync(&device_path, offset, block_size);
             allocator.finish_free(offset);
@@ -1125,6 +1156,20 @@ impl DataRouter {
             .cache
             .nvme
             .set_data_router(std::sync::Arc::downgrade(&router.inner));
+        // Terminal-free read-tier purge (the generic/074 fstest.3
+        // stale-fill fix — see BackendRouter::read_tier_purge). The
+        // closure owns tier handles (Arc'd inners), not the router: no
+        // cycle.
+        {
+            let read_lru = router.cache.read_lru.clone();
+            let nvme = router.cache.nvme.clone();
+            router
+                .backend_router
+                .set_read_tier_purge(std::sync::Arc::new(move |block_key: &str| {
+                    read_lru.remove(block_key);
+                    nvme.remove_cached_read_block(block_key);
+                }));
+        }
         router
     }
 

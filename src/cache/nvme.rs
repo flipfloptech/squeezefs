@@ -1253,6 +1253,52 @@ impl NvmeStaging {
         Ok(())
     }
 
+    /// INCARNATION-VALIDATED read-cache publish — the only legal route for
+    /// non-owner publishes (RAM-LRU dehydration, p2p peer stores). Their
+    /// payloads can be arbitrarily stale (an evicted entry parked in the
+    /// dehydration channel, a peer store in flight), so an unconditional
+    /// `cache_read_block` could stick a DEAD incarnation's bytes under a
+    /// freed-and-reallocated key — served for the key's next owner (the
+    /// generic/074 fstest.3 stale-fill family). Same discipline as the
+    /// routing validated fill: snapshot the key's incarnation, publish only
+    /// while it is stable, and undo if it moved across the put. Untracked
+    /// legacy keys (never freed/reallocated) are vacuously valid.
+    ///
+    /// Returns whether the entry is (still) published.
+    pub fn cache_read_block_validated(
+        &self,
+        block_key: &str,
+        data: Bytes,
+        backend_router: &crate::routing::BackendRouter,
+    ) -> bool {
+        if !backend_router.key_incarnation_tracked(block_key) {
+            return self.cache_read_block(block_key, data).is_ok();
+        }
+        let Some(before) = backend_router.fill_incarnation(block_key) else {
+            // Unstable (mid-write or retired): never publish.
+            return false;
+        };
+        if self.cache_read_block(block_key, data).is_err() {
+            return false;
+        }
+        if !backend_router.fill_incarnation_still(block_key, before) {
+            self.remove_cached_read_block(block_key);
+            return false;
+        }
+        true
+    }
+
+    /// [`Self::cache_read_block_validated`] against this staging's own wired
+    /// router (dehydration worker / p2p store call sites). Unwired routers
+    /// (bare tooling) refuse the publish — a cache entry is never worth an
+    /// unvalidated stick.
+    pub fn cache_read_block_validated_self(&self, block_key: &str, data: Bytes) -> bool {
+        match self.backend_router.get() {
+            Some(router) => self.cache_read_block_validated(block_key, data, router),
+            None => false,
+        }
+    }
+
     pub fn current_staged_write_bytes(&self) -> u64 {
         self.current_staged_write_bytes
             .load(std::sync::atomic::Ordering::Relaxed)

@@ -117,11 +117,17 @@ impl TieredCache {
                             let nvme_clone_inner = nvme_clone.clone();
                             let key_clone = key.clone();
                             let data_clone = data.clone();
+                            // Dehydration is a non-owner publish of a payload
+                            // that parked in this channel for arbitrarily
+                            // long: incarnation-validated or not at all
+                            // (generic/074 stale-fill family).
                             if data_clone.len() < 64 * 1024 {
-                                let _ = nvme_clone_inner.cache_read_block(&key_clone, data_clone);
+                                let _ = nvme_clone_inner
+                                    .cache_read_block_validated_self(&key_clone, data_clone);
                             } else {
                                 let _ = tokio::task::spawn_blocking(move || {
-                                    nvme_clone_inner.cache_read_block(&key_clone, data_clone)
+                                    nvme_clone_inner
+                                        .cache_read_block_validated_self(&key_clone, data_clone)
                                 })
                                 .await;
                             }

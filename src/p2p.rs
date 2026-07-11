@@ -36,7 +36,12 @@ impl crate::tiering::dht::LocalCacheReader for SqueezefsLocalCacheReader {
 
     fn put_local(&self, key: Bytes, value: Bytes) {
         let block_key = String::from_utf8_lossy(&key).to_string();
-        let _ = self.cache.nvme.cache_read_block(&block_key, value);
+        // Peer stores are non-owner publishes and can be arbitrarily stale:
+        // incarnation-validated or not at all (generic/074 stale-fill family).
+        let _ = self
+            .cache
+            .nvme
+            .cache_read_block_validated_self(&block_key, value);
     }
 }
 

@@ -47,45 +47,43 @@ impl NvmeShardInner {
         w_end: usize,
         evicted: &mut Vec<(Bytes, Bytes)>,
     ) {
-        while let Some(front_key) = self.active_keys.front() {
-            let meta = match self.map.get(front_key) {
-                Some(m) => *m,
-                None => {
-                    self.active_keys.pop_front();
-                    continue;
-                }
+        // GEOMETRY-COMPLETE eviction: remove EVERY live entry overlapping
+        // the placement range. The historical front-run walk over
+        // `active_keys` assumed queue order == ring-position order; a
+        // same-key replace (remove + push_back) and out-of-order concurrent
+        // placements both break that, so the walk stopped at the first
+        // non-overlapping FRONT entry while an overlapping live entry sat
+        // deeper in the queue — the caller's memcpy then CLOBBERED the
+        // still-indexed entry's bytes, and readers served another block's
+        // content under a perfectly valid key + incarnation + binding (the
+        // generic/074 fstest.3 stale-fill corruption; budget-dependent
+        // because only wrapping shards evict). The map is the authority;
+        // the queue is bookkeeping.
+        let victims: Vec<Bytes> = self
+            .map
+            .iter()
+            .filter(|(_, m)| Self::overlaps(w_start, w_end, m.offset, m.offset + m.len))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in victims {
+            let Some(meta) = self.map.remove(&key) else {
+                continue;
             };
+            self.active_keys.retain(|k| k != &key);
+
             let b_start = meta.offset;
-            let b_end = meta.offset + meta.len;
-
-            if Self::overlaps(w_start, w_end, b_start, b_end) {
-                let val_len = self.get_val_len_at(b_start);
-                let k_start = b_start + HEADER_SIZE;
-                if meta.len < HEADER_SIZE + val_len {
-                    self.map.remove(front_key);
-                    self.active_keys.pop_front();
-                    continue;
-                }
-                let k_end = k_start + (meta.len - HEADER_SIZE - val_len);
-
-                if k_end > self.mmap.len() || b_start + meta.len > self.mmap.len() {
-                    self.map.remove(front_key);
-                    self.active_keys.pop_front();
-                    continue;
-                }
-
-                let key_bytes = front_key.clone();
-                let v_start = k_end;
-                let v_end = b_start + meta.len;
-                let val_bytes = Bytes::copy_from_slice(&self.mmap[v_start..v_end]);
-
-                evicted.push((key_bytes.clone(), val_bytes));
-
-                self.map.remove(&key_bytes);
-                self.active_keys.pop_front();
-            } else {
-                break;
+            let val_len = self.get_val_len_at(b_start);
+            if meta.len < HEADER_SIZE + val_len {
+                continue;
             }
+            let k_end = b_start + HEADER_SIZE + (meta.len - HEADER_SIZE - val_len);
+            if k_end > self.mmap.len() || b_start + meta.len > self.mmap.len() {
+                continue;
+            }
+            let v_start = k_end;
+            let v_end = b_start + meta.len;
+            let val_bytes = Bytes::copy_from_slice(&self.mmap[v_start..v_end]);
+            evicted.push((key, val_bytes));
         }
     }
 

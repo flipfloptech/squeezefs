@@ -176,6 +176,13 @@ LAUNCH=()
 if [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
     LAUNCH=(systemd-run --quiet --collect --scope \
         --unit "squeezefs-fstests-${TAG}-$$-$(date +%s%N)")
+    # Safety rail (opt-in): cap the daemon so an unbounded-allocation
+    # regression (the generic/285 ~108 GB RSS family) OOM-kills the leaking
+    # daemon's scope, never the box. Export SQUEEZEFS_FSTESTS_MEMMAX=8G on
+    # runs chasing memory bugs; unset = unchanged behavior.
+    if [ -n "${SQUEEZEFS_FSTESTS_MEMMAX:-}" ]; then
+        LAUNCH+=(-p "MemoryMax=${SQUEEZEFS_FSTESTS_MEMMAX}" -p "MemorySwapMax=0")
+    fi
 fi
 
 # Cache-path policy: staging dirs are declared at FORMAT (see the mkfs

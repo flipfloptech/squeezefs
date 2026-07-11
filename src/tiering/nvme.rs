@@ -1326,6 +1326,80 @@ mod tests {
         );
     }
 
+    /// The read-cache hot path (`cache_read_block`) discards `put`'s evicted
+    /// vec, yet the ring still materialized every victim payload — a 4 MiB
+    /// mmap page-in + memcpy per eviction, INSIDE the shard write lock
+    /// (readers of that shard stall behind it; measured 44% daemon CPU in
+    /// memcpy + ~100 GiB/16 GiB spurious device reads on the elbencho
+    /// O_DIRECT read row). `put_discard_evicted` must keep the exact same
+    /// index/eviction semantics as `put` while never touching victim bytes.
+    #[test]
+    fn test_put_discard_evicted_same_eviction_semantics_no_materialize() {
+        let dir = tempdir().unwrap();
+        // 200 bytes capacity, 1 shard: FIFO ring identical to
+        // test_nvme_cache_eviction_ring so semantics stay comparable.
+        let cache = NvmeCache::new(&[dir.path()], &[200], 1).unwrap();
+
+        let k1 = Bytes::from("block1");
+        let v1 = Bytes::from(vec![1u8; 80]);
+        let k2 = Bytes::from("block2");
+        let v2 = Bytes::from(vec![2u8; 80]);
+        let k3 = Bytes::from("block3");
+        let v3 = Bytes::from(vec![3u8; 80]);
+
+        cache.put_discard_evicted(k1.clone(), v1.clone());
+        cache.put_discard_evicted(k2.clone(), v2.clone());
+        // Third put wraps and must evict block1 from the index — without
+        // returning (or reading) its payload.
+        cache.put_discard_evicted(k3.clone(), v3.clone());
+
+        assert!(
+            cache.get(&k1).is_none(),
+            "victim must leave the index exactly as with materializing put"
+        );
+        let g2 = cache.get(&k2).expect("survivor entry must stay readable");
+        assert_eq!(&g2.guard.mmap[g2.offset..g2.offset + g2.len], v2.as_ref());
+        let g3 = cache.get(&k3).expect("new entry must be readable");
+        assert_eq!(&g3.guard.mmap[g3.offset..g3.offset + g3.len], v3.as_ref());
+    }
+
+    /// Device affinity must be identical between the two put flavors: a
+    /// re-put of a resident key through `put_discard_evicted` replaces the
+    /// copy on its OWN device (no divergent stale duplicate on another
+    /// rail), and `remove` purges it everywhere.
+    #[test]
+    fn test_put_discard_evicted_keeps_key_affinity_no_stale_duplicate() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let cache = NvmeCache::new(&[dir1.path(), dir2.path()], &[2048, 2048], 1).unwrap();
+
+        let key = Bytes::from("block_dup");
+        let v1 = Bytes::from(vec![0x11u8; 64]);
+        let v2 = Bytes::from(vec![0x22u8; 64]);
+
+        // Interleave so the round-robin counter would point elsewhere for
+        // the re-put (same shape as the materializing-put affinity test).
+        cache.put_discard_evicted(key.clone(), v1.clone());
+        cache.put_discard_evicted(Bytes::from("filler_a"), Bytes::from(vec![0u8; 16]));
+        cache.put_discard_evicted(Bytes::from("filler_b"), Bytes::from(vec![0u8; 16]));
+        cache.put_discard_evicted(key.clone(), v2.clone());
+
+        {
+            let g = cache.get(&key).expect("key must be resident");
+            assert_eq!(
+                &g.guard.mmap[g.offset..g.offset + g.len],
+                v2.as_ref(),
+                "get served a stale duplicate from another device"
+            );
+        }
+
+        assert!(cache.remove(&key).is_some());
+        assert!(
+            cache.get(&key).is_none(),
+            "a stale duplicate survived remove() on another device"
+        );
+    }
+
     #[tokio::test]
     async fn test_nvme_cache_multi_rail_migration() {
         let dir1 = tempdir().unwrap();

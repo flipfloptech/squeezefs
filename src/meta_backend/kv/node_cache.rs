@@ -402,6 +402,38 @@ impl NodeSnapshot {
         lo..hi
     }
 
+    /// The newest seq this node holds for `key` across every source —
+    /// overlay runs AND the on-disk base bsets — or `None` when the key is
+    /// unknown here. Order-independent by construction (max per group), so
+    /// it is safe to consult even mid-replay, before the fold-order
+    /// invariant is re-established. Used by mount replay's per-key LWW
+    /// gate: a replayed window record whose seq is ≤ this is ALREADY
+    /// materialized in the node (an old-ledger mount after a mid-checkpoint
+    /// kill reads bsets that cover part of the replay window) and must not
+    /// be re-applied — appending it would sort the overlay BELOW the base
+    /// for that key and break the newest-first fold order (stale-value
+    /// LWW).
+    pub fn newest_seq_of(&self, key: &[u8]) -> Option<u64> {
+        let mut newest: Option<u64> = None;
+        let tg = Self::run_group(&self.tail, key);
+        if !tg.is_empty() {
+            // Runs are (key, seq) ascending: the group's last is its newest.
+            newest = Some(self.tail[tg.end - 1].seq);
+        }
+        let sg = Self::run_group(&self.stable, key);
+        if !sg.is_empty() {
+            let s = self.stable[sg.end - 1].seq;
+            newest = Some(newest.map_or(s, |n| n.max(s)));
+        }
+        let bg = self.base.group_bounds(key);
+        if !bg.is_empty() {
+            // Base groups are (seq desc): the group's first is its newest.
+            let b = self.base.record_ref(bg.start).seq;
+            newest = Some(newest.map_or(b, |n| n.max(b)));
+        }
+        newest
+    }
+
     /// Fold one key with the single K1 algebra: overlay runs newest-first
     /// (tail, then stable — see the run ordering invariant on the struct),
     /// then base group (already `(seq desc)`), zero-copy value return.

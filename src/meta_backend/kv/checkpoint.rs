@@ -479,6 +479,39 @@ async fn tick(
             .await?;
         *last_checkpoint = std::time::Instant::now();
     }
+    if final_cycle {
+        // Shutdown guarantee (`KvMetaBackend::shutdown`: "tail == head ⇒
+        // an empty replay window"): a cycle's flush pass may itself
+        // journal — a node whose log area filled compacts through the SMO
+        // path, whose claim/free records land at positions PAST the `H`
+        // that cycle's tail was computed from, and an SMO's parent-pointer
+        // apply re-dirties an already-visited node. On the cadence path
+        // the NEXT cycle covers them ("reclamation lags one cycle"), but
+        // at shutdown there is no next cycle — the residue would replay at
+        // the next mount. Iterate to the fixpoint: every extra cycle
+        // flushes what the previous one dirtied and covers what it
+        // journaled; a cycle only journals when it rewrites a full node
+        // log (strictly consumed), so this converges within the SMO
+        // cascade height. The bound is defensive.
+        for _ in 0..16 {
+            let core = be.journal_ring().core();
+            if core.head() == core.reusable_upto() {
+                return Ok(());
+            }
+            be.checkpoint_cycle(&mut smo, true).await?;
+            *last_checkpoint = std::time::Instant::now();
+        }
+        let core = be.journal_ring().core();
+        if core.head() != core.reusable_upto() {
+            log::warn!(
+                "shutdown checkpoint did not converge to an empty replay window \
+                 (head={}, reusable_upto={}): the next mount will replay the residue \
+                 (sound, but the shutdown tail==head guarantee was missed)",
+                core.head(),
+                core.reusable_upto()
+            );
+        }
+    }
     Ok(())
 }
 

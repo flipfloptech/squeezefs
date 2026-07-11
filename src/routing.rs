@@ -221,6 +221,13 @@ pub(crate) fn clean_block_key(bk: &str) -> String {
     }
 }
 
+/// Byte length of the zeros served for a range read of a staged file whose
+/// payload was lost by a crash (the D0 degrade contract): the requested
+/// range clamped to the inode's size — identical bounds to a hole read.
+fn lost_staged_range_len(meta_size: u64, offset: u64, size: u32) -> usize {
+    (offset + size as u64).min(meta_size).saturating_sub(offset) as usize
+}
+
 /// On-disk header of the INDIRECT block map — the spill target for layout
 /// maps whose serialized size exceeds the per-volume inline record cap
 /// (§5.3): 8-byte magic + LE u32 version, then a bincode
@@ -1645,6 +1652,23 @@ impl DataRouter {
     /// concurrent promotion/spill commit, so fall back to the freshest cached
     /// entry and finally the authoritative backend before declaring the
     /// payload unreachable.
+    /// Loud marker for a staged file whose payload is GONE — no ring entry
+    /// (crash-torn → discarded by segment recovery, or lost before it ever
+    /// hit the segment) and no promoted mapping. Per the D0 staging degrade
+    /// contract the read path serves size-consistent zeros; this records
+    /// the loss once per read in the log and the stats surface
+    /// (`staged_payload_lost_reads`).
+    fn note_lost_staged_payload(&self, file_path: &str, file_id: &str) {
+        crate::fuse_client::METRICS
+            .staged_payload_lost_reads
+            .fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "staged payload for {file_path} (file id {file_id}) is gone from local staging \
+             and was never promoted — a crash discarded acked-unfsynced data; serving \
+             size-consistent zeros (D0 degrade contract)"
+        );
+    }
+
     async fn staged_block_mapping(&self, file_path: &str, meta: &CachedMetadata) -> Option<String> {
         let map0 = |m: &CachedMetadata| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned());
         if let Some(mapping) = map0(meta) {
@@ -2817,10 +2841,10 @@ impl DataRouter {
                             .await?
                             .to_vec()
                     } else {
-                        return Err(SqueezefsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("Staged file ID {} mapping not found in metadata", file_id),
-                        )));
+                        // Lost staged payload (see read_file_range_zero_copy):
+                        // degrade to size-consistent zeros, never an error.
+                        self.note_lost_staged_payload(file_path, file_id);
+                        vec![0u8; meta.size as usize]
                     }
                 }
             }
@@ -2993,10 +3017,16 @@ impl DataRouter {
                         let data = bytes::Bytes::from(decompressed[start..end].to_vec());
                         Ok((data, None))
                     } else {
-                        Err(SqueezefsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("Staged file ID {} mapping not found in metadata", file_id),
-                        )))
+                        // Ring entry gone (crash-torn → discarded by segment
+                        // recovery, or never flushed before a kill) and no
+                        // promoted mapping: the payload is LOST. D0 degrade
+                        // contract — acked-unfsynced staged data MAY be lost
+                        // but must never error: serve size-consistent zeros
+                        // (the file exists at meta.size with no backing
+                        // bytes — hole semantics), loudly.
+                        let len = lost_staged_range_len(meta.size, offset, size);
+                        self.note_lost_staged_payload(file_path, file_id);
+                        Ok((bytes::Bytes::from(vec![0u8; len]), None))
                     }
                 }
             }

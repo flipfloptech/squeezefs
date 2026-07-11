@@ -430,6 +430,13 @@ pub struct Metrics {
     /// bind_staging_generation`). One increment per discarded dir; exactly
     /// once per dir after a reformat, 0 on every warm restart.
     pub staging_generation_discards: Align64<AtomicU64>,
+    /// Reads of a `staged` file whose payload is GONE — no staging-ring
+    /// entry (crash-torn → discarded by segment index recovery, or lost
+    /// before a kill) and no promoted mapping. Served as size-consistent
+    /// zeros per the D0 staging degrade contract (acked-unfsynced staged
+    /// data MAY be lost, must never error). Nonzero after a crash remount
+    /// = data loss happened and was degraded, not errored.
+    pub staged_payload_lost_reads: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -1050,6 +1057,7 @@ impl SqueezefsFilesystem {
                 "bg_spawn_rejected": METRICS.bg_spawn_rejected.load(Ordering::Relaxed),
                 "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),
                 "staging_generation_discards": METRICS.staging_generation_discards.load(Ordering::Relaxed),
+                "staged_payload_lost_reads": METRICS.staged_payload_lost_reads.load(Ordering::Relaxed),
                 "nvme_unaligned_write_fallbacks": METRICS.nvme_unaligned_write_fallbacks.load(Ordering::Relaxed),
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),

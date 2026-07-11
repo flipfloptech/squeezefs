@@ -473,7 +473,25 @@ impl KvTree {
             return Ok(ApplyOutcome::Stale);
         }
         let seq = match replay_seq {
-            Some(seq) => seq,
+            Some(seq) => {
+                // Per-key LWW replay gate (§4.2 "replay fold"): an
+                // old-ledger mount (mid-checkpoint kill) reads node bsets
+                // that already MATERIALIZED part of the replay window —
+                // writeback appends and SMO rewrites land in extents the
+                // previous ledger still references. Re-applying such a
+                // record would append an overlay record that sorts BELOW
+                // the base for its key, breaking the newest-first fold
+                // order (positionally-newer-but-seq-older = stale-value
+                // LWW). A record whose seq is ≤ the node's newest for the
+                // key is already folded in — skip it; the outcome is
+                // identical by the fold theorem. Mount replay is
+                // single-threaded and the checkpoint task is not running,
+                // so the snapshot is exact under this lock.
+                if leaf.snapshot().newest_seq_of(key).is_some_and(|n| n >= seq) {
+                    return Ok(ApplyOutcome::Applied);
+                }
+                seq
+            }
             None => self.seq.fetch_add(1, Ordering::AcqRel) + 1,
         };
         leaf.apply_locked(

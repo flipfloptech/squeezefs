@@ -575,67 +575,99 @@ impl NvmeShard {
             .sum()
     }
 
+    /// Rebuild the in-RAM index from the mmapped segment after a crash
+    /// remount, using the WRITERS' true block geometry ([`Self::put`] /
+    /// [`Self::reserve_and_write`]): blocks start at alignment boundaries,
+    /// the value starts at the next alignment boundary past header+key,
+    /// and the footprint includes that gap. Two crash-consistency rules:
+    ///
+    /// - **Aligned candidates only.** Writers only ever place headers at
+    ///   alignment boundaries, and a recovered entry's whole footprint is
+    ///   skipped, so value interiors (arbitrary payload bytes that can
+    ///   alias `BLOCK_MAGIC`) are never interpreted as headers. The
+    ///   historical byte-wise crawl fabricated entries from payload bytes
+    ///   and then skipped REAL entries — a lost staged payload (EIO class).
+    /// - **True footprints.** The historical scan recorded
+    ///   `header+key+value` without the alignment gap, so first-fit
+    ///   placement after recovery landed new writes INSIDE recovered
+    ///   values, clobbering the sole copy of staged data.
+    ///
+    /// Undecodable headers (torn appends, stale bytes aliasing the magic)
+    /// are discarded loudly and the scan resyncs at the next candidate —
+    /// per the D0 staging contract: recover what is intact, discard-and-log
+    /// what is not, never fail the mount.
     pub fn recover_index(&self) {
         let mut inner = self.inner.write();
-        let mut offset = 0;
         let capacity = inner.capacity;
+        let alignment = if capacity >= 4096 { 4096 } else { 1 };
 
         inner.map.clear();
         inner.active_keys.clear();
 
+        let mut recovered = 0u64;
+        let mut duplicates = 0u64;
+        let mut dropped = 0u64;
+        let mut max_end = 0usize;
+        let mut offset = 0usize;
         while offset + HEADER_SIZE <= capacity {
             let magic = u32::from_le_bytes(inner.mmap[offset..offset + 4].try_into().unwrap());
-            if magic == BLOCK_MAGIC {
-                let key_len =
-                    u32::from_le_bytes(inner.mmap[offset + 4..offset + 8].try_into().unwrap())
-                        as usize;
-                let val_len =
-                    u32::from_le_bytes(inner.mmap[offset + 8..offset + 12].try_into().unwrap())
-                        as usize;
-                let block_size = HEADER_SIZE + key_len + val_len;
-                if block_size > HEADER_SIZE && offset + block_size <= capacity {
-                    let key_start = offset + HEADER_SIZE;
-                    let key_end = key_start + key_len;
-                    let key = Bytes::copy_from_slice(&inner.mmap[key_start..key_end]);
-
-                    let meta = BlockMeta {
-                        offset,
-                        len: block_size,
-                    };
-                    inner.map.insert(key.clone(), meta);
-                    inner.active_keys.push_back(key);
-
-                    offset += block_size;
-                } else {
-                    offset += 1;
-                }
-            } else {
-                let mut skipped = false;
-                if offset + 128 <= capacity
-                    && inner.mmap[offset..offset + 128].iter().all(|&x| x == 0)
-                {
-                    offset += 128;
-                    skipped = true;
-                }
-                if !skipped && offset + 8 <= capacity {
-                    let chunk =
-                        u64::from_ne_bytes(inner.mmap[offset..offset + 8].try_into().unwrap());
-                    if chunk == 0 {
-                        offset += 8;
-                        skipped = true;
-                    }
-                }
-                if !skipped {
-                    offset += 1;
-                }
+            if magic != BLOCK_MAGIC {
+                offset += alignment;
+                continue;
             }
+            let key_len =
+                u32::from_le_bytes(inner.mmap[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let val_len =
+                u32::from_le_bytes(inner.mmap[offset + 8..offset + 12].try_into().unwrap())
+                    as usize;
+            // Writers' geometry: value at the next alignment boundary past
+            // header+key; footprint spans the gap.
+            let val_delta = (HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+            let block_size = val_delta.saturating_add(val_len);
+            let sane = key_len > 0
+                && key_len <= capacity.saturating_sub(offset + HEADER_SIZE)
+                && offset + block_size <= capacity;
+            if !sane {
+                dropped += 1;
+                log::warn!(
+                    "segment index recovery: dropping undecodable block header at offset \
+                     {offset} (key_len={key_len}, val_len={val_len}, capacity={capacity}) — \
+                     crash-torn or stale bytes; resyncing at the next candidate"
+                );
+                offset += alignment;
+                continue;
+            }
+            let key_start = offset + HEADER_SIZE;
+            let key = Bytes::copy_from_slice(&inner.mmap[key_start..key_start + key_len]);
+            let meta = BlockMeta {
+                offset,
+                len: block_size,
+            };
+            if inner.map.insert(key.clone(), meta).is_some() {
+                // Crash window between a replacement's full write and the
+                // old copy's tombstone: both images verify. Keep the later
+                // scan position deterministically (last-wins, matching the
+                // historical index behavior); the value-shape parse at read
+                // time arbitrates a torn survivor.
+                duplicates += 1;
+                inner.active_keys.retain(|k| k != &key);
+            }
+            inner.active_keys.push_back(key);
+            recovered += 1;
+            max_end = max_end.max(offset + block_size);
+            // Skip the WHOLE footprint (aligned): value interiors are never
+            // scanned for headers.
+            offset = (offset + block_size + alignment - 1) & !(alignment - 1);
         }
 
-        // Update write_offset to the end of the last active key, or 0 if empty
-        if let Some(last_key) = inner.active_keys.back() {
-            if let Some(meta) = inner.map.get(last_key) {
-                inner.write_offset = meta.offset + meta.len;
-            }
+        inner.write_offset = max_end;
+        if dropped > 0 || duplicates > 0 {
+            log::warn!(
+                "segment index recovery: recovered {recovered} entries, dropped {dropped} \
+                 undecodable headers, {duplicates} crash-window duplicate keys (last-wins)"
+            );
+        } else {
+            log::debug!("segment index recovery: recovered {recovered} entries");
         }
     }
 

@@ -69,12 +69,13 @@ if [ -z "${USE_EXISTING_MOUNT:-}" ]; then
         --disk-cache-paths "$STAGING_DIR" \
         --force
 
+    # Cache-path policy: staging dirs were declared at format above and are
+    # read from the format config — mount rejects the flag.
     echo "Mounting squeezefs..."
     RUST_LOG=info "$SQUEEZEFS_BIN" mount \
         sqmeta:///dev/shm/squeezefs_ltp_meta \
         "$MOUNT_DIR" \
         --daemon \
-        --disk-cache-paths "$STAGING_DIR" \
         --disk-cache-size 500MB \
         --log-file /tmp/squeezefs_ltp.log \
         --allow-other

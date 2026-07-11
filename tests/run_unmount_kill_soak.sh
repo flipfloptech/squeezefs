@@ -61,7 +61,10 @@ rm -rf "$STAGING" "$MNT" "$LOG"
 mkdir -p "$MNT" "$STAGING"
 truncate -s 1G "$TEST_DEV"
 truncate -s 4G "$DATA_DEV"
-"$BIN" format "sqmeta://$TEST_DEV" "sqdata://$DATA_DEV" --force >/dev/null 2>&1 || {
+# Cache-path policy: staging dirs are declared at FORMAT; mount reads them
+# from the format config and rejects the flag.
+"$BIN" format "sqmeta://$TEST_DEV" "sqdata://$DATA_DEV" \
+    --disk-cache-paths "$STAGING" --force >/dev/null 2>&1 || {
     echo "FORMAT FAILED"; exit 1; }
 
 START_TS="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -87,7 +90,7 @@ for c in $(seq 1 "$CYCLES"); do
     if ! mountpoint -q "$MNT" 2>/dev/null; then find "$MNT" -mindepth 1 -delete 2>/dev/null; fi
 
     if ! "$BIN" mount "sqmeta://$TEST_DEV" "$MNT" --daemon \
-        --disk-cache-paths "$STAGING" --disk-cache-size 500MB \
+        --disk-cache-size 500MB \
         --allow-other -o "fsname=$TEST_DEV" --log-file "$LOG" >>"$LOG" 2>&1; then
         note "cycle $c: MOUNT FAILED (see $LOG)"; fail=1; break
     fi

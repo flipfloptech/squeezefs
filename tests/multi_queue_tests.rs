@@ -547,10 +547,15 @@ mod storm {
             .set_len(4 * 1024 * 1024 * 1024)
             .unwrap();
 
+        // Cache-path policy: staging dirs are DECLARED AT FORMAT (recorded
+        // in the format config); mount reads them from there and rejects
+        // the flag.
         let fmt = Command::new(bin)
             .arg("format")
             .arg(format!("sqmeta://{}", meta.display()))
             .arg(format!("sqdata://{}", data.display()))
+            .arg("--disk-cache-paths")
+            .arg(&staging)
             .output()
             .expect("run squeezefs format");
         assert!(
@@ -570,8 +575,6 @@ mod storm {
             .arg("mount")
             .arg(format!("sqmeta://{}", meta.display()))
             .arg(&mnt)
-            .arg("--disk-cache-paths")
-            .arg(&staging)
             .arg("--uid")
             .arg(unsafe { libc::getuid() }.to_string())
             .arg("--gid")

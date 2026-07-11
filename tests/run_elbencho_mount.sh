@@ -50,13 +50,13 @@ truncate -s 2G /dev/shm/squeezefs_elbencho_backend || true
     --disk-cache-paths "$CACHE_DIR" \
     --force
 
-# 2. Mount SqueezeFS as a daemon
+# 2. Mount SqueezeFS as a daemon (cache paths come from the format config;
+#    mount rejects the flag — cache-path policy)
 echo "Mounting SqueezeFS at $MOUNT_DIR..."
 ./target/release/squeezefs mount \
     sqmeta:///dev/shm/squeezefs_elbencho_meta \
     "$MOUNT_DIR" \
     --daemon \
-    --disk-cache-paths "$CACHE_DIR" \
     --allow-other
 
 # 3. Wait for the FUSE mount to be ready

@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Result, SqueezefsError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,103 @@ pub fn save_config(cfg: &ConfigList) {
 
 pub async fn list_config(_redis_url: &str, _fs_name: &str) -> Result<ConfigList> {
     Ok(load_or_create_config())
+}
+
+/// Read the format-recorded volume-set config off the FIRST metadata
+/// volume via a read-only probe mount (nothing written, safe against a
+/// volume another process has live-mounted). Fails loud on blank /
+/// legacy-v2 / unformatted volumes.
+async fn read_format_config(first_meta: &str) -> Result<crate::FormatConfig> {
+    let vol = crate::meta_backend::open_volume_probe(first_meta).await?;
+    let val = vol
+        .getxattr(1, crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+        .await?
+        .ok_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "format configuration not found on metadata volume {first_meta}; \
+                 is this volume formatted?"
+            ))
+        })?;
+    serde_json::from_slice(&val).map_err(|e| {
+        SqueezefsError::InvalidOperation(format!(
+            "failed to parse the format configuration on {first_meta}: {e}"
+        ))
+    })
+}
+
+/// `squeezefs config get-cache-paths`: the staging/cache directories the
+/// filesystem was formatted with (`None`/empty ⇒ permanently cache-less).
+pub async fn get_cache_paths(meta_lvs: &[String]) -> Result<Option<Vec<PathBuf>>> {
+    let first = meta_lvs.first().ok_or_else(|| {
+        SqueezefsError::InvalidOperation("at least one metadata volume is required".to_string())
+    })?;
+    Ok(read_format_config(first).await?.disk_cache_paths)
+}
+
+/// `squeezefs config set-cache-paths`: the ONLY way to change a
+/// filesystem's staging/cache directories after format (mount rejects the
+/// flag — cache-path policy).
+///
+/// Guarded like `format` itself:
+/// - every metadata volume runs the [`format_preflight`] live-client gate
+///   (`force` semantics: an already-formatted volume is fine, a volume any
+///   client has LIVE-mounted refuses — changing cache paths under an
+///   active mount is never safe);
+/// - the volume set must be formatted (the config read fails loud
+///   otherwise) — checked BEFORE any directory is touched;
+/// - the NEW directories are wiped + recreated (the same cleanliness
+///   `format --disk-cache-paths` applies), so the next mount stamps a
+///   fresh staging generation into empty dirs (no discard noise). Content
+///   safety does not depend on the wipe: staging generation-binding
+///   discards foreign content at mount anyway.
+///
+/// The rewrite itself is one setxattr transaction on the FIRST volume's
+/// root inode (where format recorded it), made durable by the v3 journal
+/// and closed with a clean checkpoint shutdown.
+///
+/// [`format_preflight`]: crate::meta_backend::kv::builder::format_preflight
+pub async fn set_cache_paths(meta_lvs: &[String], paths: &[PathBuf]) -> Result<()> {
+    let first = meta_lvs.first().ok_or_else(|| {
+        SqueezefsError::InvalidOperation("at least one metadata volume is required".to_string())
+    })?;
+    if paths.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "at least one cache path is required".to_string(),
+        ));
+    }
+
+    // 1. Live-client gate on EVERY volume before anything is touched.
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true).await?;
+    }
+
+    // 2. The volume set must be formatted; read the config to rewrite.
+    let mut cfg = read_format_config(first).await?;
+
+    // 3. Wipe + recreate the NEW dirs (format-grade cleanliness).
+    for dir in paths {
+        if dir.exists() {
+            tokio::fs::remove_dir_all(dir).await?;
+        }
+        tokio::fs::create_dir_all(dir).await?;
+    }
+
+    // 4. Rewrite the format config on the first volume (journal-durable
+    //    commit + clean checkpoint shutdown).
+    cfg.disk_cache_paths = Some(paths.to_vec());
+    let bytes = serde_json::to_vec(&cfg).map_err(|e| {
+        SqueezefsError::InvalidOperation(format!("failed to serialize the format config: {e}"))
+    })?;
+    let vol = crate::meta_backend::open_volume_for_mount(first).await?;
+    crate::meta_backend::Metadata::setxattr(
+        vol.as_ref(),
+        1,
+        crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+        &bytes,
+    )
+    .await?;
+    vol.shutdown().await.map_err(SqueezefsError::from)?;
+    Ok(())
 }
 
 pub async fn set_config_quota(

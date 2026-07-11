@@ -540,6 +540,7 @@ Use coz/dhat **after** a known-good cargo test gate, against a representative mo
 
 ## Repo-specific conventions
 
+- **Cache-path policy (mount can never override):** staging/cache directories (`--disk-cache-paths`) are declared at **format** and recorded in the format config — the single source of truth. `mount` reads them from the config and **rejects** the flag with a loud error; format without the flag ⇒ a permanently **cache-less** filesystem (RAM tiers + direct block I/O; beyond-inline writes route striped — no staged layout, no conjured default staging dir). Changing paths is the admin op `squeezefs config set-cache-paths <sqmeta-uri> <paths...>` (format-grade live-client refusal; wipes the new dirs so generation stamping starts clean) with `get-cache-paths` for reads. Contracts pinned in `tests/cache_path_policy_tests.rs`.
 - Metadata keys are namespaced via the `fs_key!("suffix")` macro and the global `FS_PREFIX` (`src/lib.rs`). Code that touches metadata keys must go through the macro, not hardcode prefixes.
 - `WRITE_VERIFICATION` is a process-global `AtomicBool` toggled by `--write-verification` on mount; read-after-write checksum verification uses it. Library code should call `write_verification_enabled()` rather than reading CLI args.
 - The architecture uses the **NVMe / NVMe-oF block** backend as the sole primary data path.

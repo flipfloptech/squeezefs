@@ -72,6 +72,7 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   - `--block-size <bytes>`: Block size in bytes (e.g. `4M`, `1M`, default: `4M`).
   - `--capacity <bytes>`: Maximum capacity of the volume (default: auto-detected or 1PB).
   - `--inodes <count>`: Hard quota limit for number of inodes (default: `1000000`).
+  - `--disk-cache-paths <paths>`: Comma-separated paths to NVMe cache staging directories. **Declared here, at format** — recorded in the format config as the single source of truth. Omit it and the filesystem is **permanently cache-less**: mounts run with RAM tiers + direct block I/O only (no NVMe staging/read-cache tier). Change later with `squeezefs config set-cache-paths`.
   - `--full`: Performs full block-aligned zero-wiping of the backing device capacity with a progress bar (default is quick-format).
   - `--meta-node-kib <64|128|256|512|1024>`: v3 metadata btree node size in KiB (default `256`). Below `256` prints a warning — the per-volume record-value cap drops to `node_size/4`, so large xattrs / layout maps spill to the indirect mechanism sooner.
   - `--meta-journal-mb <MiB>`: v3 metadata journal ring size, overriding the default `clamp(volume/64, 8 MiB, 32 MiB)`.
@@ -80,13 +81,20 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   ```bash
   squeezefs mount sqmeta://<meta_dev> [sqmeta://...] <mountpoint> [options]
   ```
+  Cache/staging paths come from the format config; passing `--disk-cache-paths` at mount is a loud error (use `squeezefs config set-cache-paths` to change them).
   *Options:*
-  - `--disk-cache-paths <paths>`: Comma-separated paths to NVMe cache staging directories.
   - `--local-ips <ips>`: Comma-separated list of local source IP interfaces for multi-rail load balancing.
   - `--mem-cache-size <size>`: System RAM cache size (e.g. `16GB` or `20%`).
   - `--daemon`: Run FUSE daemon in the background (changes its working directory to `/` to avoid locking paths).
   - `--allow-others` (or `--allow-other`): Allow other users/root to access the mount (required for `sudo umount`).
   - `--log-file <path>`: Path to write daemon logs to when running in background.
+
+* **Change cache/staging directories (admin op):**
+  Guarded like `format` (refused while any client has the volume mounted); rewrites the format config and wipes the new directories so the next mount stamps a fresh staging generation.
+  ```bash
+  squeezefs config set-cache-paths sqmeta://<meta_dev> <path> [<path>...]
+  squeezefs config get-cache-paths sqmeta://<meta_dev>
+  ```
 
 * **Show filesystem Status:**
   Prints a detailed formatted configuration and volume health status summary:

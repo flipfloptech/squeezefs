@@ -37,25 +37,25 @@ truncate -s 1G /tmp/squeezefs_data.bin
 ```
 
 ### Step 3: Format the Filesystem
-Format the backing files using SqueezeFS URIs:
+Create the staging cache directory and format the backing files using SqueezeFS URIs (cache/staging paths are **declared at format** and recorded in the format config — omit `--disk-cache-paths` for a permanently cache-less filesystem):
 ```bash
+mkdir -p /tmp/squeezefs_staging
 ./target/release/squeezefs format \
   sqmeta:///tmp/squeezefs_meta.bin \
-  sqdata:///tmp/squeezefs_data.bin
+  sqdata:///tmp/squeezefs_data.bin \
+  --disk-cache-paths /tmp/squeezefs_staging
 ```
 > Metadata volumes format as **v3** (CoW KV metadata) — the only supported metadata format (legacy v2 volumes refuse to mount: reformat required). Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`) and the v3 durability contract are covered in section 5.
 
 ### Step 4: Mount Squeezefs
-Create the mount point and staging cache directories:
+Create the mount point; the mount reads its cache/staging paths from the format config (passing `--disk-cache-paths` at mount is refused — change paths with `squeezefs config set-cache-paths`):
 ```bash
 sudo mkdir -p /mnt/squeezefs
-sudo mkdir -p /tmp/squeezefs_staging
 
 # Mount Squeezefs in the background
 sudo ./target/release/squeezefs mount \
   sqmeta:///tmp/squeezefs_meta.bin \
   /mnt/squeezefs \
-  --disk-cache-paths /tmp/squeezefs_staging \
   --daemon \
   --log-file /tmp/squeezefs.log \
   --allow-others \
@@ -101,15 +101,16 @@ Format the logical volumes. Pass `--full` if you want a complete block-aligned z
 ./target/release/squeezefs format \
   sqmeta:///dev/main-pool/meta-vol \
   sqdata:///dev/main-pool/data-vol \
+  --disk-cache-paths /tmp/squeezefs_staging \
   --full
 ```
 
 ### Step 3: Mount and Run
+Cache/staging paths come from the format config (mount rejects `--disk-cache-paths`):
 ```bash
 sudo ./target/release/squeezefs mount \
   sqmeta:///dev/main-pool/meta-vol \
   /mnt/squeezefs \
-  --disk-cache-paths /tmp/squeezefs_staging \
   --daemon \
   --allow-others
 ```

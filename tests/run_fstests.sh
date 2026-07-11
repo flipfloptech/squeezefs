@@ -133,8 +133,6 @@ fi
 
 TAG="$(basename "$MNT")"
 LOG="/tmp/squeezefs_fstests_${TAG}.log"
-STAGING_DIR="/tmp/squeezefs_fstests_staging_${TAG}"
-mkdir -p "$STAGING_DIR"
 
 # xfstests' `umount` returns while the previous daemon is still draining
 # staged writes to this same meta volume + staging dir. Mounting a second
@@ -180,11 +178,12 @@ if [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
         --unit "squeezefs-fstests-${TAG}-$$-$(date +%s%N)")
 fi
 
+# Cache-path policy: staging dirs are declared at FORMAT (see the mkfs
+# helper) and read from the format config — mount rejects the flag.
 "${LAUNCH[@]}" "$SQUEEZEFS_BIN" mount \
     "sqmeta://$DEV" \
     "$MNT" \
     --daemon \
-    --disk-cache-paths "$STAGING_DIR" \
     --disk-cache-size 500MB \
     --allow-other \
     -o "$ALL_OPTS" \
@@ -216,10 +215,17 @@ if [ ! -b "$DEV" ]; then
     truncate -s "$DATA_SIZE" "$DATA_DEV"
 fi
 
+# Cache-path policy: staging dirs are DECLARED AT FORMAT (recorded in the
+# format config; mount rejects the flag). Key the dir by device so both
+# harness filesystems keep disjoint staging.
+STAGING_DIR="/tmp/squeezefs_fstests_staging_$(basename "$DEV")"
+mkdir -p "$STAGING_DIR"
+
 # Format
 exec "$SQUEEZEFS_BIN" format \
     "sqmeta://$DEV" \
     "sqdata://$DATA_DEV" \
+    --disk-cache-paths "$STAGING_DIR" \
     --force
 EOF
 chmod +x /sbin/mkfs.fuse.squeezefs

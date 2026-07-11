@@ -229,7 +229,7 @@ def kill_old_squeezefs_daemon(mount_dir):
     except Exception as e:
         print(f"Error checking/killing squeezefs process: {e}")
 
-def remount_squeezefs(squeezefs_bin, meta_uri, mount_dir, disk_cache_paths, log_file):
+def remount_squeezefs(squeezefs_bin, meta_uri, mount_dir, log_file):
     print("Dismounting Squeezefs...")
     # Lazy unmount
     subprocess.run(["fusermount", "-z", "-u", mount_dir])
@@ -238,6 +238,8 @@ def remount_squeezefs(squeezefs_bin, meta_uri, mount_dir, disk_cache_paths, log_
     # Forcefully terminate any lingering daemon process for this mount point
     kill_old_squeezefs_daemon(mount_dir)
     
+    # Cache-path policy: staging dirs come from the format config; mount
+    # rejects --disk-cache-paths.
     print("Remounting Squeezefs...")
     cmd = [
         squeezefs_bin,
@@ -245,8 +247,6 @@ def remount_squeezefs(squeezefs_bin, meta_uri, mount_dir, disk_cache_paths, log_
         meta_uri,
         mount_dir,
         "--daemon",
-        "--disk-cache-paths",
-        disk_cache_paths,
         "--log-file",
         log_file,
         "--allow-others"
@@ -324,10 +324,10 @@ def main():
     parser.add_argument("--loops", type=int, default=0, help="Number of loops to run (0 for infinite)")
     parser.add_argument("--threads", type=int, default=4, help="Number of worker threads to run validation tasks")
     
-    # Remount options
+    # Remount options (cache paths come from the format config; mount
+    # rejects --disk-cache-paths)
     parser.add_argument("--squeezefs-bin", help="Squeezefs binary path for remount testing")
     parser.add_argument("--meta-uri", help="Metadata volume URI for remount testing")
-    parser.add_argument("--disk-cache-paths", help="Disk cache paths for remount testing")
     parser.add_argument("--log-file", help="Log file path for remount testing")
     parser.add_argument("--remount-frequency", type=int, default=1, help="Frequency of remounts (every N loops)")
     
@@ -446,14 +446,13 @@ def main():
                     print("🟢 Target download test complete.")
                 
             # Phase 3: Dismount & Remount scenario
-            can_remount = all([args.squeezefs_bin, args.meta_uri, args.disk_cache_paths, args.log_file])
+            can_remount = all([args.squeezefs_bin, args.meta_uri, args.log_file])
             if can_remount and loop_count % args.remount_frequency == 0:
                 print(f"\nTriggering periodic remount scenario (iteration {loop_count})...")
                 if not remount_squeezefs(
                     squeezefs_bin=args.squeezefs_bin,
                     meta_uri=args.meta_uri,
                     mount_dir=args.dir,
-                    disk_cache_paths=args.disk_cache_paths,
                     log_file=args.log_file
                 ):
                     print("🔴 Remount scenario FAILED! Halting execution.")

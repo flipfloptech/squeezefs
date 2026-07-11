@@ -432,6 +432,19 @@ impl NvmeStaging {
         redis_client: std::sync::Arc<crate::dlm::MetaClient>,
         fs_generation: Option<&str>,
     ) -> Result<Self> {
+        // Cache-less filesystem (format declared NO --disk-cache-paths):
+        // the ring objects still exist (anonymous memory shards) so every
+        // hot-path type stays non-optional, but nothing is ever admitted —
+        // `stage_write` fails loud, `put_active_block` refuses, and
+        // `cache_read_block` is a no-op (see those methods). Clamp the
+        // never-used anonymous maps to one tiny shard instead of letting
+        // the disk-sized budgets reserve gigabytes of address space.
+        let (max_write_bytes, max_read_bytes) = if staging_dirs.is_empty() {
+            (1024 * 1024, 1024 * 1024)
+        } else {
+            (max_write_bytes, max_read_bytes)
+        };
+
         // Generation gate (reformat-over-stale-staging fix): validate the
         // marker and discard dead-generation content BEFORE any segment is
         // scanned, mapped, or recovered.
@@ -661,7 +674,7 @@ impl NvmeStaging {
         let target_dir = self.staging_dirs.first().ok_or_else(|| {
             SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
-                "No staging directories configured (memory mode)",
+                "no staging directories declared at format (cache-less filesystem)",
             ))
         })?;
 
@@ -917,6 +930,13 @@ impl NvmeStaging {
     /// or upload it durably — never drop it.
     #[must_use]
     pub fn put_active_block(&self, key: &str, data: &[u8], fencing_token: u64) -> bool {
+        // Cache-less filesystem: refuse admission. Every caller already
+        // implements the never-lossy `admitted == false` path (keep the
+        // RAM buffer / escalate to a durable upload), which IS the
+        // cache-less design: RAM tiers + direct block I/O only.
+        if self.staging_dirs.is_empty() {
+            return false;
+        }
         let meta = StagedMetadata {
             fencing_token,
             original_size: data.len() as u64,
@@ -1203,6 +1223,12 @@ impl NvmeStaging {
 
     /// Cache a block of read data on local NVMe using read_nvme_cache.
     pub fn cache_read_block(&self, block_key: &str, data: Bytes) -> Result<()> {
+        // Cache-less filesystem: no NVMe read-cache tier — dehydration of
+        // RAM-LRU evictions is a clean no-op (the block stays readable
+        // from the backend; only the local cache tier is absent).
+        if self.staging_dirs.is_empty() {
+            return Ok(());
+        }
         let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
         let val_bytes = data;
         self.read_nvme_cache

@@ -167,7 +167,10 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         meta_lv: Option<Vec<String>>,
 
-        /// Comma-separated paths to local staging/cache directories
+        /// REFUSED: cache paths are fixed at format (recorded in the
+        /// format config); use `squeezefs config set-cache-paths` to
+        /// change them. Passing this flag is a loud error, never a
+        /// silent ignore.
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
 
@@ -569,6 +572,22 @@ enum ConfigActions {
         /// New value (e.g. "100G", "2T" or numeric value/0)
         value: String,
     },
+    /// Replace the staging/cache directories recorded at format. Guarded
+    /// like format: refused while any client has the volume mounted. The
+    /// new directories are wiped so the next mount stamps a fresh staging
+    /// generation into them.
+    SetCachePaths {
+        /// Metadata URI (sqmeta://...) of the filesystem to change
+        uri: String,
+        /// New staging/cache directory paths (replaces the recorded set)
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Show the staging/cache directories recorded at format
+    GetCachePaths {
+        /// Metadata URI (sqmeta://...) of the filesystem to inspect
+        uri: String,
+    },
     /// List current configuration (diskcaches, volumes, active volume)
     List,
     /// Consistency check on metadata and block references
@@ -778,6 +797,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cli = Cli::parse();
 
+    // Cache-path policy: staging/cache directories are DECLARED AT FORMAT
+    // and recorded in the format config — the single source of truth. A
+    // mount-time override is exactly how the stale-staging poisoning
+    // incident happened (mount conjured/reused caches format never
+    // declared), so it is a LOUD error, never a silent ignore. Checked
+    // before daemonizing and before any volume is touched: instant.
+    if let Commands::Mount {
+        disk_cache_paths: Some(_),
+        ..
+    } = &cli.command
+    {
+        eprintln!(
+            "Error: cache paths are fixed at format; use `squeezefs config set-cache-paths` \
+             to change them (mount does not accept --disk-cache-paths)"
+        );
+        std::process::exit(1);
+    }
+
     #[cfg(unix)]
     if let Commands::Mount {
         ref args,
@@ -985,7 +1022,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args,
         mem_cache_size,
         disk_cache_size,
-        disk_cache_paths,
+        disk_cache_paths: _,
         daemon: _,
         no_writeback,
         allow_other,
@@ -1117,17 +1154,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_deref()
             .unwrap_or_else(|| format_config.disk_cache_size.as_deref().unwrap_or("10GB"));
 
-        let staging_dirs = if let Some(dirs) = disk_cache_paths {
-            if dirs.is_empty() {
-                vec![get_default_staging_dir()]
-            } else {
-                dirs.clone()
-            }
-        } else if let Some(ref paths) = format_config.disk_cache_paths {
-            paths.clone()
-        } else {
-            vec![get_default_staging_dir()]
-        };
+        // Cache paths come from the format config ONLY (mount overrides
+        // were rejected above). No paths declared at format ⇒ the
+        // filesystem is permanently cache-less: no default dir is
+        // conjured, no staging/read-cache tier exists.
+        let staging_dirs = format_config.disk_cache_paths.clone().unwrap_or_default();
 
         let data_lvs = format_config.data_lv.clone().unwrap_or_default();
         let writeback = !no_writeback;
@@ -1313,7 +1344,7 @@ fn print_squeezefs_summary(
         "  {:<20} {}",
         "Staging Paths:",
         if paths_str.is_empty() {
-            "none".normal()
+            "none (cache-less)".yellow()
         } else {
             paths_str.normal()
         }
@@ -1737,9 +1768,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             log::info!("Successfully formatted (v3) and recorded config on metadata volume.");
             let resolved_mem = mem_cache_size.as_deref().unwrap_or("1GB");
             let resolved_disk = disk_cache_size.as_deref().unwrap_or("10GB");
-            let resolved_paths = disk_cache_paths
-                .clone()
-                .unwrap_or_else(|| vec![get_default_staging_dir()]);
+            // No `--disk-cache-paths` ⇒ the filesystem is permanently
+            // cache-less (the summary prints "none (cache-less)"); mounts
+            // never conjure a default staging dir.
+            let resolved_paths = disk_cache_paths.clone().unwrap_or_default();
 
             print_squeezefs_summary(
                 true,
@@ -1800,7 +1832,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             args,
             mem_cache_size,
             disk_cache_size,
-            disk_cache_paths,
+            disk_cache_paths: _,
             data_lv: backing_dev,
             ip: _,
             port: _,
@@ -1925,17 +1957,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let resolved_fuse_io_uring_sqpoll_cpu =
                 resolve_local_sqpoll_cpu(fuse_io_uring_sqpoll_cpu);
 
-            let staging_dirs = if let Some(dirs) = disk_cache_paths {
-                if dirs.is_empty() {
-                    vec![get_default_staging_dir()]
-                } else {
-                    dirs
-                }
-            } else if let Some(ref paths) = format_config.disk_cache_paths {
-                paths.clone()
-            } else {
-                vec![get_default_staging_dir()]
-            };
+            // Cache paths come from the format config ONLY — the mount
+            // flag was rejected at CLI parse (cache-path policy). A format
+            // that declared no paths runs permanently cache-less: the
+            // isolation loop below is a no-op, `TieredCache` comes up with
+            // no staging dirs, and the routing layer's layout gates
+            // (`staging_dirs().is_empty()`) send every beyond-inline write
+            // down the striped/inline paths instead of the staged tier.
+            let staging_dirs = format_config.disk_cache_paths.clone().unwrap_or_default();
 
             let mut active_staging_dirs = staging_dirs;
             let fs_name = "squeezefs".to_string();
@@ -2528,6 +2557,37 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ConfigActions::Set { key, value } => {
                     squeezefs::config_ops::set_config_quota(&garnet_url, &fs_name, &key, &value)
                         .await?;
+                }
+                ConfigActions::SetCachePaths { uri, paths } => {
+                    let meta_lvs = parse_block_uri(&uri, "sqmeta://")?;
+                    squeezefs::config_ops::set_cache_paths(&meta_lvs, &paths)
+                        .await
+                        .map_err(|e| format!("cannot change cache paths: {}", e))?;
+                    println!(
+                        "Cache paths set to {} (new directories wiped; the next mount \
+                         stamps a fresh staging generation).",
+                        paths
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                ConfigActions::GetCachePaths { uri } => {
+                    let meta_lvs = parse_block_uri(&uri, "sqmeta://")?;
+                    match squeezefs::config_ops::get_cache_paths(&meta_lvs).await? {
+                        Some(paths) if !paths.is_empty() => {
+                            println!(
+                                "{}",
+                                paths
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
+                        _ => println!("none (cache-less)"),
+                    }
                 }
                 ConfigActions::DiskCache(action) => match action {
                     DiskCacheActions::Add { path } => {

@@ -703,10 +703,15 @@ mod cli {
             data_uris.push(data.display().to_string());
         }
 
+        // Cache-path policy: staging dirs are DECLARED AT FORMAT (recorded
+        // in the format config); mount reads them from there and rejects
+        // the flag.
         let fmt = Command::new(bin)
             .arg("format")
             .arg(format!("sqmeta://{}", meta_uris.join(",")))
             .arg(format!("sqdata://{}", data_uris.join(",")))
+            .arg("--disk-cache-paths")
+            .arg(&staging)
             .output()
             .expect("run squeezefs format");
         assert!(
@@ -721,8 +726,6 @@ mod cli {
             .arg("mount")
             .arg(format!("sqmeta://{}", meta_uris.join(",")))
             .arg(&mnt)
-            .arg("--disk-cache-paths")
-            .arg(&staging)
             .arg("--uid")
             .arg(unsafe { libc::getuid() }.to_string())
             .arg("--gid")

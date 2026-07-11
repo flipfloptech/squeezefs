@@ -2818,17 +2818,30 @@ impl DataRouter {
         // caches / hole map (striped).
         let meta = self.fetch_metadata(file_path).await?;
 
+        // POSIX full-length below-EOF contract (the generic/617 short-read
+        // family): every leg below returns EXACTLY
+        // `min(size, logical_size - offset)` bytes for an in-bounds read.
+        // Physical layouts legitimately under-cover the logical size (a
+        // staged blob / inline data_key left short by truncate-up, an
+        // extending far write, or a striped hole) — the uncovered remainder
+        // is an implicit-zero hole that must be FILLED here, bounded by the
+        // request length. The page cache masked short replies for buffered
+        // reads; O_DIRECT (fsx -Z) hands them to userspace as short reads.
         match meta.file_type.as_str() {
             "inline" => {
-                let decompressed = if let Some(ref data) = meta.data_key {
-                    data.to_vec()
-                } else {
-                    Vec::new()
-                };
-                let start = std::cmp::min(offset as usize, decompressed.len());
-                let end = std::cmp::min((offset + size as u64) as usize, decompressed.len());
-                let data = bytes::Bytes::from(decompressed[start..end].to_vec());
-                Ok((data, None))
+                if offset >= meta.size {
+                    return Ok((bytes::Bytes::new(), None));
+                }
+                let want = (std::cmp::min(offset + size as u64, meta.size) - offset) as usize;
+                let dlen = meta.data_key.as_ref().map(|d| d.len()).unwrap_or(0);
+                let start = std::cmp::min(offset as usize, dlen);
+                let end = std::cmp::min(offset as usize + want, dlen);
+                let mut out = vec![0u8; want];
+                if start < end {
+                    out[..end - start]
+                        .copy_from_slice(&meta.data_key.as_ref().expect("dlen > 0")[start..end]);
+                }
+                Ok((bytes::Bytes::from(out), None))
             }
             "staged" => {
                 let file_id = meta.file_id.as_ref().ok_or_else(|| {
@@ -2837,47 +2850,69 @@ impl DataRouter {
 
                 if let Some(guard) = self.cache.nvme.read_staged_zero_copy(file_id) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    if offset >= meta.size {
+                        return Ok((bytes::Bytes::new(), None));
+                    }
+                    // Full below-EOF length; the blob may be shorter than the
+                    // logical size (truncate-up hole tail) — pad with zeros.
+                    let want = (std::cmp::min(offset + size as u64, meta.size) - offset) as usize;
                     let start = std::cmp::min(offset as usize, guard.len);
-                    let end = std::cmp::min((offset + size as u64) as usize, guard.len);
-                    let len = end - start;
+                    let end = std::cmp::min(offset as usize + want, guard.len);
+                    let phys = end - start;
                     let (data, backing) = if let Some(dest) = dest_addr {
                         let dest_ptr = dest as *mut u8;
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 guard[start..end].as_ptr(),
                                 dest_ptr,
-                                len,
+                                phys,
                             );
+                            if want > phys {
+                                std::ptr::write_bytes(dest_ptr.add(phys), 0, want - phys);
+                            }
                             let d = bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
                                 ptr: dest_ptr,
-                                len,
+                                len: want,
                             });
                             (d, None)
                         }
-                    } else {
+                    } else if phys == want {
                         let mut sliced_guard = guard;
                         sliced_guard.offset += start;
-                        sliced_guard.len = len;
+                        sliced_guard.len = phys;
                         let d = bytes::Bytes::copy_from_slice(&sliced_guard);
                         (d, None)
+                    } else {
+                        let mut out = vec![0u8; want];
+                        out[..phys].copy_from_slice(&guard[start..end]);
+                        (bytes::Bytes::from(out), None)
                     };
                     Ok((data, backing))
                 } else {
                     let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
                     if let Some(bk) = mapping_opt {
+                        if offset >= meta.size {
+                            return Ok((bytes::Bytes::new(), None));
+                        }
                         let offset_u64 = self.backend_router.parse_block_offset(&bk)?;
                         let sz = self.block_size.load(Ordering::Acquire) as usize;
                         let packed_bytes = self.nvme_writer.read_block(offset_u64, sz).await?;
                         let decompressed =
                             self.get_crypto().process_read_async(packed_bytes).await?;
-                        if offset >= decompressed.len() as u64 {
-                            return Ok((bytes::Bytes::new(), None));
+                        // Full below-EOF length: the promoted block may be
+                        // shorter than the logical size — its tail (and any
+                        // in-bounds offset past the physical end) is an
+                        // implicit-zero hole.
+                        let want =
+                            (std::cmp::min(offset + size as u64, meta.size) - offset) as usize;
+                        let dlen = decompressed.len();
+                        let start = std::cmp::min(offset as usize, dlen);
+                        let end = std::cmp::min(offset as usize + want, dlen);
+                        let mut out = vec![0u8; want];
+                        if start < end {
+                            out[..end - start].copy_from_slice(&decompressed[start..end]);
                         }
-                        let start = offset as usize;
-                        let end =
-                            std::cmp::min((offset + size as u64) as usize, decompressed.len());
-                        let data = bytes::Bytes::from(decompressed[start..end].to_vec());
-                        Ok((data, None))
+                        Ok((bytes::Bytes::from(out), None))
                     } else {
                         // Ring entry gone (crash-torn → discarded by segment
                         // recovery, or never flushed before a kill) and no

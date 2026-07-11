@@ -14,6 +14,7 @@
 //!     at a far offset (its tail is an implicit-zero hole),
 //!   - a striped map leaves interior holes unmapped and its tail block short,
 //!   - an inline `data_key` can be shorter than a truncate-up size.
+//!
 //! The read handler must zero-pad every such gap up to the below-EOF request
 //! length — a bounded O(read_len) fill, never a whole-file materialization.
 
@@ -162,13 +163,12 @@ async fn assert_full_read(
     tag: &str,
 ) {
     let want_len = std::cmp::min(size as u64, file_size - off) as usize;
-    let got = h
-        .fs
-        .read(h.req, ino, 0, off, size)
-        .await
-        .unwrap_or_else(|e| panic!("[{tag}] read failed: {e:?}"))
-        .data
-        .to_vec();
+    let got =
+        h.fs.read(h.req, ino, 0, off, size)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] read failed: {e:?}"))
+            .data
+            .to_vec();
     assert_eq!(
         got.len(),
         want_len,

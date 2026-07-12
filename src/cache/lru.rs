@@ -26,6 +26,22 @@ pub struct LruCache {
     max_bytes: u64,
     evict_tx: tokio::sync::mpsc::Sender<(String, Bytes, EvictClass)>,
     evict_rx: Arc<std::sync::Mutex<Option<EvictReceiver>>>,
+    /// LIVE payload bytes parked in the eviction channel (R5): the send
+    /// side adds, the dehydration worker subtracts per message. The QUICK
+    /// cage-OOM class was exactly this queue holding up to 16,384 full
+    /// payloads of live `Bytes` — multi-GiB, ungauged, invisible to the
+    /// authority (measured: RSS 2.1 → 7.5 GiB in < 30 s at Green).
+    evict_channel_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Victims dropped at the send side because the channel held
+    /// [`Self::EVICT_CHANNEL_BYTE_BOUND`] live bytes (or the slot count
+    /// filled). Dehydration is best-effort warmth — dropping is the PR 4
+    /// source-drop precedent, never a durability event.
+    evict_channel_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// True once a dehydration worker took the receiver. Caches without a
+    /// worker (write_lru) must never park victims in an unconsumed
+    /// channel — pre-R5 that queue silently held up to 16,384 live
+    /// payloads with no drain path at all.
+    evict_rx_taken: Arc<std::sync::atomic::AtomicBool>,
     /// R1b: drop Probation victims at the eviction source (count only —
     /// no channel traffic). Set for the hot-block tier; read_lru keeps
     /// full-channel behavior (its inserts are all protected anyway).
@@ -83,8 +99,36 @@ impl LruCache {
             max_bytes: actual_bytes,
             evict_tx,
             evict_rx: Arc::new(std::sync::Mutex::new(Some(evict_rx))),
+            evict_channel_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            evict_channel_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            evict_rx_taken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drop_probation_evictions: false,
         }
+    }
+
+    /// R5: byte bound on LIVE payloads parked in the eviction channel.
+    pub const EVICT_CHANNEL_BYTE_BOUND: u64 = 256 * 1024 * 1024;
+
+    /// Current live payload bytes parked in the channel (R5 gauge).
+    pub fn evict_channel_bytes(&self) -> u64 {
+        self.evict_channel_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Victims dropped at the send side by the byte/slot bound.
+    pub fn evict_channel_drops(&self) -> u64 {
+        self.evict_channel_drops
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Receiver-side credit: the dehydration worker calls this once per
+    /// handled message with the payload length.
+    pub fn evict_channel_sub(&self, len: u64) {
+        let _ = self.evict_channel_bytes.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| Some(v.saturating_sub(len)),
+        );
     }
 
     /// Builder toggle for the hot-block tier (source-drop of probation
@@ -94,9 +138,16 @@ impl LruCache {
         self
     }
 
-    /// Retrieve the eviction receiver. Can only be taken once.
+    /// Retrieve the eviction receiver. Can only be taken once; taking it
+    /// is what ARMS the send side (victims of worker-less caches drop at
+    /// the source instead of parking in an unconsumed channel).
     pub fn take_evict_rx(&self) -> Option<EvictReceiver> {
-        self.evict_rx.lock().ok()?.take()
+        let rx = self.evict_rx.lock().ok()?.take();
+        if rx.is_some() {
+            self.evict_rx_taken
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        rx
     }
 
     /// Retrieve an entry from the cache, updating its clock status and
@@ -194,12 +245,31 @@ impl LruCache {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
+                // R5 byte bound: past it the victim is DROPPED here — a
+                // full channel of live multi-MiB Bytes is the cage-OOM
+                // shape, and dehydration is best-effort warmth.
+                let len = ev.len() as u64;
+                if !self
+                    .evict_rx_taken
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    || self.evict_channel_bytes() + len > Self::EVICT_CHANNEL_BYTE_BOUND
+                {
+                    self.evict_channel_drops
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
                 // Keys inserted via this API are always valid UTF-8 path/block ids.
                 let k_str = match String::from_utf8(ek.to_vec()) {
                     Ok(s) => s,
                     Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
                 };
-                let _ = self.evict_tx.try_send((k_str, ev, class));
+                if self.evict_tx.try_send((k_str, ev, class)).is_ok() {
+                    self.evict_channel_bytes
+                        .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    self.evict_channel_drops
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         } else {
             // Do not leave a smaller stale entry under this key when the new

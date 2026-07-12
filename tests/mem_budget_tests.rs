@@ -229,6 +229,58 @@ fn level_read_is_lock_free_and_immediately_visible() {
 }
 
 #[test]
+fn dehydration_channel_is_byte_bounded_at_the_send_side() {
+    // The QUICK cage-OOM class, root-caused (p7_quick_trace2): the
+    // dehydration channel held up to 16,384 full payloads of LIVE Bytes
+    // (multi-GiB anon in <30 s during the 617 fsx soak) — ungauged, so
+    // the authority sat Green while RSS ramped 2.1 -> 7.5 GiB. The
+    // channel must be BYTE-bounded at the send side: past the bound,
+    // victims are dropped (dehydration is best-effort warmth — the PR 4
+    // source-drop precedent), the parked-bytes gauge never exceeds the
+    // bound, and draining restores admission.
+    use squeezefs::cache::lru::LruCache;
+    let cache = LruCache::with_capacity(8 * 1024 * 1024);
+    let payload = bytes::Bytes::from(vec![7u8; 1024 * 1024]);
+    // Take the receiver FIRST (arming the send side — un-taken channels
+    // drop at the source by construction) but do not drain: the flood
+    // must hit the BYTE bound, not the arming gate.
+    let mut rx = cache.take_evict_rx().expect("rx");
+    for i in 0..600 {
+        cache.put(&format!("k{i}"), payload.clone());
+    }
+    let parked = cache.evict_channel_bytes();
+    assert!(
+        parked <= LruCache::EVICT_CHANNEL_BYTE_BOUND,
+        "channel payload bytes must stay <= the bound (got {parked})"
+    );
+    assert!(
+        cache.evict_channel_drops() > 0,
+        "past the bound, victims are dropped at the send side (counted)"
+    );
+
+    assert!(
+        cache.evict_channel_bytes() > 0,
+        "armed channel must actually park victims below the bound"
+    );
+
+    // Drain half the channel; admission resumes.
+    let mut drained = 0u64;
+    while drained < LruCache::EVICT_CHANNEL_BYTE_BOUND / 2 {
+        let Ok((_k, v, _c)) = rx.try_recv() else {
+            break;
+        };
+        drained += v.len() as u64;
+        cache.evict_channel_sub(v.len() as u64);
+    }
+    let before = cache.evict_channel_bytes();
+    cache.put("post-drain", payload.clone());
+    assert!(
+        cache.evict_channel_bytes() >= before,
+        "after a drain, victims are admitted to the channel again"
+    );
+}
+
+#[test]
 fn parked_cap_halves_under_red() {
     assert_eq!(mem_budget::effective_parked_cap(256, Level::Green), 256);
     assert_eq!(mem_budget::effective_parked_cap(256, Level::Yellow), 256);

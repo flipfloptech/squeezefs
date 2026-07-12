@@ -149,8 +149,11 @@ impl TieredCache {
         if let Some(mut evict_rx) = read_lru.take_evict_rx() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let nvme_clone = nvme.clone();
+                let channel_gauge = read_lru.clone();
                 handle.spawn(async move {
                     while let Some((key, data, _class)) = evict_rx.recv().await {
+                        // R5: credit the channel byte gauge per message.
+                        channel_gauge.evict_channel_sub(data.len() as u64);
                         // R5 Yellow+ (§5.7): dehydration paused ENTIRELY —
                         // drop the victim (its Bytes ref dies here instead
                         // of parking through a blocking write). Disk-tier
@@ -187,8 +190,11 @@ impl TieredCache {
         if let Some(mut evict_rx) = hot_block.take_evict_rx() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let nvme_clone = nvme.clone();
+                let channel_gauge = hot_block.clone();
                 handle.spawn(async move {
                     while let Some((key, data, class)) = evict_rx.recv().await {
+                        // R5: credit the channel byte gauge per message.
+                        channel_gauge.evict_channel_sub(data.len() as u64);
                         crate::fuse_client::METRICS
                             .hot_block_evictions
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

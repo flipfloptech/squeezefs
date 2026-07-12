@@ -10,11 +10,12 @@
 use rstest::rstest;
 use squeezefs::bench::{
     auto_file_size, auto_total_bytes, bench_file_path, block_count, block_order, block_seed,
-    clamp_auto_threads, dataset_root, fill_block, mount_free_bytes, parse_size, phase_passes,
-    resolve_shape, resolve_time_box, run_invocation, run_passes, run_phases, select_mode,
-    suite_passes, validate_dataset, validate_shape, BenchError, BenchInvocation, BenchMode, Pass,
-    Phase, PhaseResult, Shape, AUTO_MIN_TOTAL_BYTES, AUTO_PER_THREAD_BYTES, AUTO_TOTAL_FLOOR_BYTES,
-    DEFAULT_BLOCK, DEFAULT_RAND_TIME_BOX_SECS, SUITE_RAND_BLOCK, SUITE_SEQ_BLOCK,
+    clamp_auto_threads, dataset_bytes, dataset_root, fill_block, mount_free_bytes, parse_size,
+    phase_passes, resolve_shape, resolve_time_box, run_invocation, run_passes, run_phases,
+    select_mode, sizing_free_bytes, suite_passes, validate_dataset, validate_shape, BenchError,
+    BenchInvocation, BenchMode, Pass, Phase, PhaseResult, Shape, AUTO_MIN_TOTAL_BYTES,
+    AUTO_PER_THREAD_BYTES, AUTO_TOTAL_FLOOR_BYTES, DEFAULT_BLOCK, DEFAULT_RAND_TIME_BOX_SECS,
+    SUITE_RAND_BLOCK, SUITE_SEQ_BLOCK,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -265,6 +266,34 @@ fn test_resolve_shape_explicit_flags_always_override() {
         !r.threads_auto && !r.files_auto && !r.size_auto && !r.block_auto,
         "explicit flags must be marked explicit for the header"
     );
+    cleanup(&base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_auto_sizing_counts_existing_dataset_as_free() {
+    // Consistency rule under a binding 25% cap: the dataset written by a
+    // bare -w consumes statfs free space, so a follow-up single-phase
+    // auto-sized run must add the existing dataset's bytes back when
+    // deriving the cap — otherwise the re-derived shape shrinks and
+    // validation refuses the very dataset -w just built.
+    let base = scratch("sizing_free");
+    let sh = shape(2, 2, 4 * MIB, MIB);
+    run_phases(&base, &[Phase::Write], &sh)
+        .await
+        .expect("write dataset");
+    assert_eq!(
+        dataset_bytes(&base),
+        2 * 2 * 4 * MIB,
+        "dataset_bytes must sum the persistent dataset's file sizes"
+    );
+    let statfs_free = mount_free_bytes(&base).expect("statfs");
+    let sizing_free = sizing_free_bytes(&base).expect("sizing free");
+    assert!(
+        sizing_free >= statfs_free,
+        "sizing free space must never be below raw statfs free"
+    );
+    // resolve_shape with an existing dataset present must not error.
+    resolve_shape(&base, Some(2), Some(2), Some(4 * MIB), None).expect("resolve with dataset");
     cleanup(&base);
 }
 

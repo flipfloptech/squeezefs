@@ -846,6 +846,37 @@ pub fn auto_file_size(total: u64, threads: usize, files: usize) -> Result<u64, B
     Ok(per_file)
 }
 
+/// Total bytes of an existing bench dataset under `mount` (0 when none).
+/// Sums logical file sizes of everything under `squeezefs-bench/`.
+pub fn dataset_bytes(mount: &Path) -> u64 {
+    fn walk(dir: &Path) -> u64 {
+        let mut sum = 0;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(ftype) = entry.file_type() {
+                    if ftype.is_dir() {
+                        sum += walk(&entry.path());
+                    } else if let Ok(meta) = entry.metadata() {
+                        sum += meta.len();
+                    }
+                }
+            }
+        }
+        sum
+    }
+    walk(&dataset_root(mount))
+}
+
+/// Free space used for AUTO-SIZING: statvfs free plus the bytes of any
+/// existing bench dataset. The dataset a previous `-w` wrote consumes
+/// statfs free space; without adding it back, a cap-bound follow-up
+/// single-phase run would re-derive a SMALLER shape than the dataset it
+/// is supposed to reuse and refuse it — breaking the consistency rule
+/// (same auto shape for every invocation over one dataset).
+pub fn sizing_free_bytes(mount: &Path) -> Result<u64, BenchError> {
+    Ok(mount_free_bytes(mount)?.saturating_add(dataset_bytes(mount)))
+}
+
 /// Free space (bytes available to unprivileged users) on the filesystem
 /// holding `path`, via statvfs.
 pub fn mount_free_bytes(path: &Path) -> Result<u64, BenchError> {
@@ -892,7 +923,10 @@ pub fn resolve_shape(
     let resolved_size = match size {
         Some(s) => s,
         None => {
-            let free = mount_free_bytes(mount)?;
+            // Sizing free = statvfs free + any existing dataset's bytes:
+            // re-deriving the auto shape over a dataset a previous -w
+            // already wrote must reproduce that shape, not shrink it.
+            let free = sizing_free_bytes(mount)?;
             let total = auto_total_bytes(resolved_threads, free)?;
             auto_file_size(total, resolved_threads, resolved_files)?
         }

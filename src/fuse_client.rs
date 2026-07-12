@@ -359,6 +359,11 @@ pub struct Metrics {
     /// follow-up). Each increment is an averted wrong-block serve — the live
     /// detector for the free→reallocate ABA window.
     pub stale_binding_rebinds: Align64<AtomicU64>,
+    /// Single-flight waiters served directly from their cohort's carried
+    /// `FillResult` (R1a, docs/design-read-path.md §5.2) — the adoption
+    /// signal that waiter correctness is publish-independent. Replaces the
+    /// old probe-after-publish tier-recheck hits for cohort members.
+    pub singleflight_waiter_result_serves: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -1074,6 +1079,7 @@ impl SqueezefsFilesystem {
                 "cache_misses": misses,
                 "cache_hit_ratio": ratio,
                 "stale_binding_rebinds": METRICS.stale_binding_rebinds.load(Ordering::Relaxed),
+                "singleflight_waiter_result_serves": METRICS.singleflight_waiter_result_serves.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),

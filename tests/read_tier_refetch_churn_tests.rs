@@ -391,7 +391,10 @@ async fn result_carrying_single_flight_decouples_waiters_from_publish() {
          carried FillResult (not a tier probe) — publish-independent \
          waiter correctness is R1a's whole point"
     );
-    assert!(tier_has(&h, &k0), "phase E: publish still lands (PR 2 keeps it)");
+    assert!(
+        tier_has(&h, &k0),
+        "phase E: publish still lands (PR 2 keeps it)"
+    );
 
     // ---- Phase F: post-cohort reader = cache re-check serve, no fetch,
     // no result-serve.
@@ -423,7 +426,10 @@ async fn result_carrying_single_flight_decouples_waiters_from_publish() {
     let fetches = (0..4).map(|_| h.fs.router.get_cached_or_fetch_block("unknownbe://42"));
     let results = futures::future::join_all(fetches).await;
     for (i, r) in results.iter().enumerate() {
-        assert!(r.is_err(), "phase G resolver {i} must surface the fetch error");
+        assert!(
+            r.is_err(),
+            "phase G resolver {i} must surface the fetch error"
+        );
     }
     assert!(
         t0.elapsed() < std::time::Duration::from_secs(10),
@@ -457,7 +463,11 @@ async fn result_carrying_single_flight_decouples_waiters_from_publish() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     primary.abort();
     let _ = primary.await; // JoinError(cancelled) expected
-    for (i, w) in futures::future::join_all(waiters).await.into_iter().enumerate() {
+    for (i, w) in futures::future::join_all(waiters)
+        .await
+        .into_iter()
+        .enumerate()
+    {
         let val = w
             .expect("phase H waiter task must not panic")
             .unwrap_or_else(|e| panic!("phase H waiter {i} must recover after the abort: {e:?}"));
@@ -479,10 +489,20 @@ async fn result_carrying_single_flight_decouples_waiters_from_publish() {
          refetch — waiters must neither all refetch (leak) nor serve a \
          cancelled cohort's missing result (hang)"
     );
-    assert_eq!(
-        w_h - w_h0,
-        2,
-        "phase H: the second cohort's two non-primaries are served from \
-         its carried result"
+    // Serve SOURCE for the second cohort's non-primaries is legitimately
+    // nondeterministic: the aborted primary's publish closure keeps running
+    // on the blocking pool (spawn_blocking is not cancelled by task abort —
+    // §5.2's future-drop case cancels the AWAIT, not the closure) and its
+    // incarnation-checked put may land first, so waiters can be served by
+    // the cache re-check (tier hit) instead of the second cohort's carried
+    // result. Both routes are refetch-free — the get_obj == 2 assert above
+    // is the leak detector; phases E–G already pin the result-serve path
+    // when the tier cannot serve. Never MORE result-serves than
+    // non-primaries exist:
+    assert!(
+        w_h - w_h0 <= 2,
+        "phase H: at most the two non-primaries can be result-served \
+         (got {})",
+        w_h - w_h0
     );
 }

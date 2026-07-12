@@ -831,7 +831,7 @@ pub struct DataRouterInner {
     pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
     pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
     pub(crate) inflight_block_reads:
-        std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<()>>>,
+        std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
     pub(crate) sequential_read_state: moka::sync::Cache<String, (u32, std::time::Instant)>,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
@@ -851,18 +851,54 @@ impl std::ops::Deref for DataRouter {
     }
 }
 
+/// One cold-block fill, shared by its single-flight cohort (R1a,
+/// docs/design-read-path.md §5.2). `Bytes` clone = refcount bump; waiters
+/// never copy, never refetch.
+#[derive(Clone)]
+pub(crate) struct FillResult {
+    pub bytes: bytes::Bytes,
+    /// The primary's serve-validity verdict (incarnation stable across the
+    /// device read and the publish window). Waiters apply exactly the same
+    /// downstream rule as the primary: get_block_for_index rechecks the
+    /// binding; `false` forces re-resolve (unchanged semantics).
+    pub serve_valid: bool,
+}
+
+/// Test seam (§5.2, the `FAIL_NEXT_WRITES` / `SIMULATE_CORRUPTION` shim
+/// precedent): artificial delay, in milliseconds, injected inside the
+/// awaited ≥ 64 KiB tier-publish closure — one relaxed load per publish,
+/// zero-cost when unset; no `#[cfg(test)]` fork of the production path.
+/// Lets the churn suite hold a single-flight cohort open long enough to
+/// prove waiters are served from the carried result, not the tier.
+pub static TEST_TIER_PUBLISH_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Single-flight registry guard. Three-case drop semantics (§5.2, exact):
+/// on the SUCCESS path the primary has already broadcast `Some(FillResult)`
+/// and marked the guard `completed` — the drop is CLOSE-ONLY (no second
+/// value; a late subscriber that raced between the send and the drop sees
+/// `Err(Closed)`/`Err(Lagged)` and falls into the cache re-check loop). On
+/// the FAILURE path (fetch error return) and on FUTURE-DROP mid-fetch
+/// (caller cancelled), the un-`completed` guard sends `None` before
+/// closing, so live waiters fail fast into the re-check loop (one becomes
+/// the new primary) instead of waiting out a 50 ms slice.
 struct InflightBlockReadGuard {
     key: String,
     inflight_block_reads:
-        std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<()>>>,
-    tx: tokio::sync::broadcast::Sender<()>,
+        std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
+    tx: tokio::sync::broadcast::Sender<Option<FillResult>>,
+    /// Set by the primary after a successful `send(Some(..))` — flips the
+    /// drop from `None`-then-close to close-only.
+    completed: std::cell::Cell<bool>,
 }
 
 impl Drop for InflightBlockReadGuard {
     fn drop(&mut self) {
         self.inflight_block_reads
             .remove_if_sync(&self.key, |current| current.same_channel(&self.tx));
-        let _ = self.tx.send(());
+        if !self.completed.get() {
+            let _ = self.tx.send(None);
+        }
     }
 }
 
@@ -1313,25 +1349,47 @@ impl DataRouter {
                     continue;
                 }
                 match tokio::time::timeout(WAIT_SLICE, rx.recv()).await {
-                    Ok(Ok(())) | Ok(Err(_)) | Err(_) => {
-                        // Woken, lagged, closed, or slice timeout — recheck caches.
+                    Ok(Ok(Some(res))) => {
+                        // R1a (§5.2): served from the cohort's carried fill —
+                        // no tier probe stands between a waiter and its
+                        // bytes, so PR 4's publish-skipping classes cannot
+                        // reintroduce the refetch churn. Same downstream
+                        // rule as the primary: serve_valid=false makes the
+                        // caller re-resolve the binding.
+                        METRICS
+                            .singleflight_waiter_result_serves
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok((
+                            crate::cache::pool::ReadBlockValue::Bytes(res.bytes),
+                            res.serve_valid,
+                        ));
+                    }
+                    Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                        // Primary failed/cancelled (None), lagged, closed,
+                        // or slice timeout — recheck caches; one waiter
+                        // becomes the new primary.
                         continue;
                     }
                 }
             }
 
-            // Try to become the primary fetcher.
-            let (tx, _rx) = tokio::sync::broadcast::channel(64);
+            // Try to become the primary fetcher. Capacity 4 (design R-2):
+            // exactly one terminal value is ever sent, so any capacity ≥ 1
+            // suffices — the small bound caps per-receiver retained `Bytes`
+            // clones (the old 64 was sized for repeated `()` wakeups that
+            // no longer exist).
+            let (tx, _rx) = tokio::sync::broadcast::channel(4);
             match self
                 .inflight_block_reads
                 .insert_sync(block_key.to_string(), tx.clone())
             {
                 Ok(_) => {
                     METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
-                    let _guard = InflightBlockReadGuard {
+                    let guard = InflightBlockReadGuard {
                         key: block_key.to_string(),
                         inflight_block_reads: self.inflight_block_reads.clone(),
                         tx,
+                        completed: std::cell::Cell::new(false),
                     };
 
                     // Validated fill (block-key incarnation seqlock): block keys
@@ -1399,6 +1457,15 @@ impl DataRouter {
                             // read refetches — the pre-fix behavior, never
                             // a correctness loss.
                             let _ = tokio::task::spawn_blocking(move || {
+                                // §5.2 test seam: one relaxed load per
+                                // publish, zero-cost when unset — lets the
+                                // churn suite hold a cohort open to prove
+                                // waiter serves are publish-independent.
+                                let delay_ms = TEST_TIER_PUBLISH_DELAY_MS
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                if delay_ms > 0 {
+                                    std::thread::sleep(Duration::from_millis(delay_ms));
+                                }
                                 if !backend_router.fill_incarnation_still(&bk_clone, before) {
                                     return;
                                 }
@@ -1437,6 +1504,18 @@ impl DataRouter {
                             self.cache.nvme.remove_cached_read_block(block_key);
                         }
                     }
+                    // R1a (§5.2): hand the cohort its fill — after the
+                    // publishes and the final still-check, so waiters
+                    // receive exactly the primary's serve-validity verdict.
+                    // `Bytes` clone = refcount bump. Then flip the guard to
+                    // close-only: the success drop must never send a second
+                    // value (a late subscriber that raced the send sees
+                    // Closed/Lagged and is served by the cache re-check).
+                    let _ = guard.tx.send(Some(FillResult {
+                        bytes: downloaded_bytes.clone(),
+                        serve_valid,
+                    }));
+                    guard.completed.set(true);
                     return Ok((
                         crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes),
                         serve_valid,

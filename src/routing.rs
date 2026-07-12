@@ -839,11 +839,21 @@ pub struct DataRouterInner {
     /// HashMap removal drops the Sender (and its ring) synchronously.
     pub(crate) inflight_block_reads:
         std::sync::Arc<scc::HashMap<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
-    pub(crate) sequential_read_state: moka::sync::Cache<String, (u32, std::time::Instant)>,
-    /// R1b (§5.3): per-file K=4 offset-lane stream classifier state.
-    /// Coexists with `sequential_read_state` (the legacy prefetcher's
-    /// cursor) until PR 5 merges the pipeline into these lanes.
-    pub(crate) stream_lanes: moka::sync::Cache<String, std::sync::Arc<StreamLanes>>,
+    /// R1b/R2 (§5.3/§5.5): per-file K=4 offset-lane classifier + pipeline
+    /// state (PR 5 merged the legacy prefetch cursor into these lanes).
+    /// `pub` so the pipeline suite can simulate silent moka eviction (the
+    /// lane-leak self-repair phase).
+    pub stream_lanes: moka::sync::Cache<String, std::sync::Arc<StreamLanes>>,
+    /// §5.5 window cap (`SQUEEZEFS_READ_PREFETCH_WINDOW`, default 16;
+    /// 0 disables the pipeline outright).
+    pub(crate) prefetch_window_cap: u32,
+    /// §5.5 contention scaling: prefetch's share of the hot-tier budget
+    /// (`SQUEEZEFS_READ_PREFETCH_SHARE_PCT`, default 50).
+    pub(crate) prefetch_share_pct: u64,
+    /// §5.5 `active_streams` two-epoch activity gauge (leak-proof by
+    /// construction: increment-only per epoch, aged by the roll — lanes
+    /// die silently inside moka, so a dec path would leak upward).
+    pub(crate) stream_gauge: StreamActivityGauge,
     /// R1b ghost table — second-touch admission memory for >256 KiB fills.
     pub(crate) ghost: std::sync::Arc<GhostTable>,
     /// R1b disk-tier admission mode (env-resolved once; hot-budget-0
@@ -971,21 +981,120 @@ impl GhostTable {
     }
 }
 
-/// One classifier offset lane (§5.3): racy-tolerant atomics — moka races
-/// and lost updates cost a later classification, never wrongness.
-pub(crate) struct StreamLane {
+/// One classifier offset lane (§5.3) grown into the R2 pipeline owner
+/// (§5.5): racy-tolerant atomics throughout — moka races and lost updates
+/// cost a later classification or a slightly mis-sized window, never
+/// wrongness, and never a lock on the read path.
+pub struct StreamLane {
     next_expected_offset: std::sync::atomic::AtomicU64,
     run_reads: std::sync::atomic::AtomicU32,
     last_seen_ms: std::sync::atomic::AtomicU64,
     classified: std::sync::atomic::AtomicBool,
+    /// §5.5 pipeline plan: the next block index to ISSUE (exclusive upper
+    /// edge of the issued span). Reset with the lane.
+    next_prefetch_block: std::sync::atomic::AtomicU32,
+    /// Adaptive window: starts at 2, ×2 on foreground-wait, halved (AIMD)
+    /// on consumer-detected evicted-unconsumed, capped by the env knob.
+    window: std::sync::atomic::AtomicU32,
+    /// Issued-but-not-completed fills.
+    inflight: std::sync::atomic::AtomicU32,
+    /// Completed fills not yet foreground-consumed — the resident-
+    /// unconsumed bound (§5.5 mechanism i).
+    unconsumed: std::sync::atomic::AtomicU32,
+    /// Abandonment fence: bumped on lane reset; tasks check it at
+    /// admission and before landing their fill accounting.
+    generation: std::sync::atomic::AtomicU64,
+    /// `active_streams` gauge stamp: this lane counted itself in this
+    /// epoch (one relaxed compare per issue-path touch).
+    last_counted_epoch: std::sync::atomic::AtomicU64,
+    /// AIMD quiescence arm: after a consumer-detected evicted-unconsumed
+    /// fill, issue pauses until this wall-clock ms — under sustained
+    /// budget starvation the pipeline goes QUIESCENT (fetch ratio
+    /// converges to ~1.0x) instead of feeding the evict→refetch cycle at
+    /// its window floor.
+    suppressed_until_ms: std::sync::atomic::AtomicU64,
+}
+
+/// §5.5 `active_streams` — a two-epoch activity gauge (the same sliding
+/// pattern as the ghost table), leak-proof by construction: classified
+/// lanes increment the CURRENT epoch's counter at most once per epoch
+/// (per-lane `last_counted_epoch` stamp); `active = max(cur, prev)`; on
+/// epoch roll `prev ← cur, cur ← 0`. Deliberately NO decrement path:
+/// lanes live inside per-path moka entries that evict silently, so an
+/// inc/dec counter would only leak upward. Epoch length = the 2 s
+/// staleness constant. Single-word Relaxed atomics, racy-tolerant (a
+/// double roll narrows one window; a lost increment undercounts one
+/// epoch) — no loom model required.
+pub(crate) struct StreamActivityGauge {
+    epoch: std::sync::atomic::AtomicU64,
+    cur: std::sync::atomic::AtomicU32,
+    prev: std::sync::atomic::AtomicU32,
+}
+
+impl StreamActivityGauge {
+    fn new() -> Self {
+        Self {
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            cur: std::sync::atomic::AtomicU32::new(0),
+            prev: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn now_epoch() -> u64 {
+        StreamLanes::now_ms() / 2_000
+    }
+
+    /// Count `lane` for the current epoch (idempotent per epoch per lane)
+    /// and return the current `active_streams` estimate (≥ 1).
+    fn touch(&self, lane: &StreamLane) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = Self::now_epoch();
+        let seen = self.epoch.load(Relaxed);
+        if seen != now
+            && self
+                .epoch
+                .compare_exchange(seen, now, Relaxed, Relaxed)
+                .is_ok()
+        {
+            // Roll: one full missed epoch (or more) ages everything out.
+            let cur = self.cur.swap(0, Relaxed);
+            self.prev
+                .store(if now == seen + 1 { cur } else { 0 }, Relaxed);
+        }
+        if lane.last_counted_epoch.swap(now, Relaxed) != now {
+            self.cur.fetch_add(1, Relaxed);
+        }
+        let active = std::cmp::max(self.cur.load(Relaxed), self.prev.load(Relaxed)).max(1);
+        crate::fuse_client::METRICS
+            .prefetch_active_streams
+            .store(active as u64, Relaxed);
+        active
+    }
 }
 
 /// K = 4 offset lanes per file, so concurrent sequential readers of one
 /// file do not mutually reset each other. More than K concurrent readers
-/// degrade the excess to the random class — a later pipeline start under
-/// PR 5, never wrongness.
-pub(crate) struct StreamLanes {
+/// degrade the excess to the random class — a later pipeline start,
+/// never wrongness.
+pub struct StreamLanes {
     lanes: [StreamLane; 4],
+}
+
+/// The classifier verdict handed back to the read path: which lane (if
+/// any) this request rides, and whether that lane is classified streaming.
+pub(crate) struct LaneRef<'a> {
+    pub(crate) lane: &'a StreamLane,
+    pub(crate) streaming: bool,
+}
+
+/// Owned pipeline context threaded from `pipeline_touch` to the serve
+/// exits, so the consumer-side spiral detector can attribute a device
+/// fetch to its lane without re-resolving anything.
+pub(crate) struct PipelineCtx {
+    lanes: std::sync::Arc<StreamLanes>,
+    lane_idx: usize,
+    generation: u64,
+    covered: bool,
 }
 
 impl StreamLanes {
@@ -995,6 +1104,13 @@ impl StreamLanes {
             run_reads: std::sync::atomic::AtomicU32::new(0),
             last_seen_ms: std::sync::atomic::AtomicU64::new(0),
             classified: std::sync::atomic::AtomicBool::new(false),
+            next_prefetch_block: std::sync::atomic::AtomicU32::new(0),
+            window: std::sync::atomic::AtomicU32::new(2),
+            inflight: std::sync::atomic::AtomicU32::new(0),
+            unconsumed: std::sync::atomic::AtomicU32::new(0),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            last_counted_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
+            suppressed_until_ms: std::sync::atomic::AtomicU64::new(0),
         };
         Self {
             lanes: [mk(), mk(), mk(), mk()],
@@ -1011,10 +1127,10 @@ impl StreamLanes {
     /// Classification unit (§5.3, one definition): `run_reads ≥ 4`
     /// contiguous requests — each starting where the previous ended —
     /// classifies the lane Streaming. A non-matching offset claims the
-    /// stalest idle lane (resetting its run), else the read is Random.
-    /// Returns `true` when this request rides (or just created) a
-    /// classified-streaming lane.
-    pub(crate) fn observe(&self, offset: u64, len: u64) -> bool {
+    /// stalest idle lane (resetting its run AND abandoning its pipeline:
+    /// generation bump, plan cleared, window collapsed — §5.5
+    /// cancellation), else the read is Random.
+    pub(crate) fn observe(&self, offset: u64, len: u64) -> Option<LaneRef<'_>> {
         use std::sync::atomic::Ordering::Relaxed;
         let now = Self::now_ms();
         // Lane match: continue the run.
@@ -1029,9 +1145,15 @@ impl StreamLanes {
                             .read_streams_classified
                             .fetch_add(1, Relaxed);
                     }
-                    return true;
+                    return Some(LaneRef {
+                        lane,
+                        streaming: true,
+                    });
                 }
-                return false;
+                return Some(LaneRef {
+                    lane,
+                    streaming: false,
+                });
             }
         }
         // Claim the stalest lane (2 s staleness — the existing constant).
@@ -1046,12 +1168,22 @@ impl StreamLanes {
         }
         if now.saturating_sub(stalest_ms) >= 2_000 {
             let lane = &self.lanes[stalest];
+            // Abandon the previous stream on this lane (§5.5): tasks in
+            // flight land as wasted; the plan restarts from scratch.
+            lane.generation.fetch_add(1, Relaxed);
             lane.next_expected_offset.store(offset + len, Relaxed);
             lane.run_reads.store(1, Relaxed);
             lane.classified.store(false, Relaxed);
+            lane.next_prefetch_block.store(0, Relaxed);
+            lane.window.store(2, Relaxed);
+            lane.unconsumed.store(0, Relaxed);
             lane.last_seen_ms.store(now, Relaxed);
+            return Some(LaneRef {
+                lane,
+                streaming: false,
+            });
         }
-        false
+        None
     }
 }
 
@@ -1334,22 +1466,15 @@ impl DataRouter {
         // hot-tier budget auto-degrades SecondTouch to Always: without the
         // RAM landing zone, skipping publishes would refetch every sub-read.
         //
-        // DEFAULT = `always` (today's publish behavior verbatim) until
-        // PR 5 lands its evict-before-consume control: measured on the
-        // committed sandbox, `second-touch` under the LEGACY 9-ahead
-        // prefetcher x 8 streams overruns the hot budget, probation fills
-        // evict before their own sub-reads, the refetches ghost-hit as
-        // spurious "second touches" (515 of 1024 unique on a single cold
-        // pass at t=2), and the resulting publish storm + protected-victim
-        // dehydration floods OOM an 8 GiB cage — exactly the §5.5 R-5
-        // spiral the design assigns to PR 5's per-lane accounting. The
-        // machinery, counters, and knob all land here; the default flips
-        // with PR 5 (`never` already delivers the row-2 tax kill for
-        // operators who want it now: 3.3-3.5 GiB/s vs the 787 MiB/s
-        // baseline on the committed sandbox).
+        // DEFAULT = `second-touch` (the §5.3 policy) as of PR 5: the R-5
+        // evict-before-consume spiral that forced PR 4's temporary `always`
+        // default is closed by this PR's per-lane resident-unconsumed
+        // accounting + contention-scaled windows + AIMD collapse (pinned in
+        // tests/read_prefetch_pipeline_tests.rs phase C/D — the spiral
+        // shape stays bounded < 2x unique fetches by construction).
         let tier_admission = match std::env::var("SQUEEZEFS_READ_TIER_ADMISSION")
             .as_deref()
-            .unwrap_or("always")
+            .unwrap_or("second-touch")
         {
             "always" => TierAdmission::Always,
             "second-touch" => TierAdmission::SecondTouch,
@@ -1369,6 +1494,23 @@ impl DataRouter {
             } else {
                 tier_admission
             };
+
+        // §5.5 pipeline knobs (env-resolved once; unrecognized values
+        // refuse loud, forward-only).
+        let prefetch_window_cap = match std::env::var("SQUEEZEFS_READ_PREFETCH_WINDOW") {
+            Ok(v) => v.trim().parse::<u32>().unwrap_or_else(|e| {
+                panic!("SQUEEZEFS_READ_PREFETCH_WINDOW must be an integer: {e}")
+            }),
+            Err(_) => 16,
+        }
+        .min(16);
+        let prefetch_share_pct = match std::env::var("SQUEEZEFS_READ_PREFETCH_SHARE_PCT") {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|e| {
+                panic!("SQUEEZEFS_READ_PREFETCH_SHARE_PCT must be an integer percent: {e}")
+            }),
+            Err(_) => 50,
+        }
+        .clamp(1, 100);
 
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
@@ -1400,16 +1542,15 @@ impl DataRouter {
                     .time_to_live(std::time::Duration::from_secs(300))
                     .build(),
                 inflight_block_reads: std::sync::Arc::new(scc::HashMap::new()),
-                sequential_read_state: moka::sync::Cache::builder()
-                    .max_capacity(100000)
-                    .time_to_live(std::time::Duration::from_secs(5))
-                    .build(),
                 stream_lanes: moka::sync::Cache::builder()
                     .max_capacity(100000)
                     .time_to_live(std::time::Duration::from_secs(30))
                     .build(),
                 ghost: std::sync::Arc::new(GhostTable::new()),
                 tier_admission,
+                prefetch_window_cap,
+                prefetch_share_pct,
+                stream_gauge: StreamActivityGauge::new(),
                 crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
                 prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
                 stripe_write_semaphore,
@@ -1848,16 +1989,278 @@ impl DataRouter {
         }
     }
 
-    /// R1b classifier hook (§5.3): feed one read request through the file's
-    /// K=4 offset lanes; returns whether it rides a classified-streaming
-    /// lane. Latch-free (moka get + relaxed atomics); racy-tolerant by
-    /// design. PR 4 uses the classification for observability and the
-    /// PR 5 pipeline builds its issue path on it.
-    pub fn observe_stream(&self, file_path: &str, offset: u64, len: u64) -> bool {
+    /// R2 pipeline driver (§5.5), called at the top of every striped read:
+    /// classifies the request through the file's K=4 offset lanes, does
+    /// the lane's consume bookkeeping, records foreground-waits (window ×2
+    /// growth), and tops the pipeline up to the contention-scaled
+    /// effective window — every fetch through the result-carrying
+    /// single-flight (dedupe with the foreground), fills landing hot-tier
+    /// probation. Latch-free throughout (moka get + relaxed atomics +
+    /// admitted spawns); racy-tolerant by design.
+    ///
+    /// `will_wait_inflight`: the caller observed this request's block key
+    /// already in the single-flight registry — the reader caught the
+    /// pipeline (§5.5's growth trigger: pipeline too shallow).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pipeline_touch(
+        &self,
+        file_path: &str,
+        meta: &CachedMetadata,
+        block_size: u64,
+        offset: u64,
+        len: u64,
+        start_block: u32,
+        end_block: u32,
+        will_wait_inflight: bool,
+    ) -> Option<PipelineCtx> {
+        if self.prefetch_window_cap == 0 || meta.file_type != "striped" {
+            return None;
+        }
         let lanes = self.stream_lanes.get_with(file_path.to_string(), || {
             std::sync::Arc::new(StreamLanes::new())
         });
-        lanes.observe(offset, len)
+        let (lane_idx, streaming) = {
+            let lane_ref = lanes.observe(offset, len)?;
+            let idx = lanes
+                .lanes
+                .iter()
+                .position(|l| std::ptr::eq(l, lane_ref.lane))
+                .unwrap_or(0);
+            (idx, lane_ref.streaming)
+        };
+        let lane = &lanes.lanes[lane_idx];
+        use std::sync::atomic::Ordering::Relaxed;
+        let generation = lane.generation.load(Relaxed);
+
+        // Consume bookkeeping: this request is about to be served; every
+        // pipeline-covered block it spans counts as consumed.
+        let issued_edge = lane.next_prefetch_block.load(Relaxed);
+        let covered = issued_edge > 0 && start_block < issued_edge;
+        if covered {
+            let span = (end_block.min(issued_edge - 1).max(start_block) - start_block) + 1;
+            for _ in 0..span {
+                let _ = lane
+                    .unconsumed
+                    .fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+            }
+        }
+
+        if !streaming {
+            return Some(PipelineCtx {
+                lanes: lanes.clone(),
+                lane_idx,
+                generation,
+                covered,
+            });
+        }
+
+        // Foreground caught the pipeline: window ×2 (capped).
+        if will_wait_inflight {
+            METRICS.prefetch_foreground_waits.fetch_add(1, Relaxed);
+            let _ = lane.window.fetch_update(Relaxed, Relaxed, |w| {
+                Some((w.saturating_mul(2)).min(self.prefetch_window_cap))
+            });
+        }
+
+        // Contention-scaled effective window (§5.5 mechanism ii).
+        let active = self.stream_gauge.touch(lane) as u64;
+        let hot_budget = self.cache.hot_block.max_bytes();
+        let share_blocks =
+            (self.prefetch_share_pct * hot_budget / 100 / block_size.max(1) / active).max(1);
+        let window = lane.window.load(Relaxed).min(self.prefetch_window_cap);
+        let effective = (window as u64).min(share_blocks) as u32;
+        let hwm = METRICS.prefetch_window_hwm.load(Relaxed);
+        if (effective as u64) > hwm {
+            METRICS.prefetch_window_hwm.store(effective as u64, Relaxed);
+        }
+
+        // Initialize/advance the plan base: issue starts past this request
+        // (pre-classification blocks are never "covered").
+        let _ = lane
+            .next_prefetch_block
+            .fetch_update(Relaxed, Relaxed, |v| {
+                if v <= end_block {
+                    Some(end_block + 1)
+                } else {
+                    None
+                }
+            });
+
+        // Top up: resident-unconsumed + in-flight bounded by the window
+        // (§5.5 mechanism i — issue stops; the spiral cannot start), and
+        // gated by the AIMD quiescence arm (sustained starvation pauses
+        // issue for an epoch instead of re-feeding the evict cycle).
+        if StreamLanes::now_ms() < lane.suppressed_until_ms.load(Relaxed) {
+            return Some(PipelineCtx {
+                lanes: lanes.clone(),
+                lane_idx,
+                generation,
+                covered,
+            });
+        }
+        let total_blocks = meta.size.div_ceil(block_size) as u32;
+        loop {
+            let in_flight = lane.inflight.load(Relaxed);
+            let unconsumed = lane.unconsumed.load(Relaxed);
+            if in_flight.saturating_add(unconsumed) >= effective {
+                break;
+            }
+            let next = lane.next_prefetch_block.load(Relaxed);
+            if next >= total_blocks {
+                break;
+            }
+            if lane
+                .next_prefetch_block
+                .compare_exchange(next, next + 1, Relaxed, Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            lane.inflight.fetch_add(1, Relaxed);
+            METRICS.prefetch_issued.fetch_add(1, Relaxed);
+            METRICS
+                .prefetch_inflight_bytes
+                .fetch_add(block_size, Relaxed);
+            self.spawn_prefetch_task(
+                file_path.to_string(),
+                meta.clone(),
+                next,
+                block_size,
+                lanes.clone(),
+                lane_idx,
+                generation,
+            );
+        }
+
+        Some(PipelineCtx {
+            lanes,
+            lane_idx,
+            generation,
+            covered,
+        })
+    }
+
+    /// One §5.5 pipeline fetch: through the single-flight (dedupes with
+    /// the foreground — R1a's guarantee), fills landing hot-tier probation
+    /// via the admission table's first-touch row. The GDS local-cache arm
+    /// and the tier-resident MADV_WILLNEED arm of the legacy prefetcher
+    /// are preserved verbatim. Stale-generation completions land as
+    /// `prefetch_wasted` (their probationary put is refcount-cheap and
+    /// first in eviction line — §5.5 deliberately skips io_uring cancel
+    /// plumbing).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_prefetch_task(
+        &self,
+        file_path: String,
+        meta: CachedMetadata,
+        block: u32,
+        block_size: u64,
+        lanes: std::sync::Arc<StreamLanes>,
+        lane_idx: usize,
+        generation: u64,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let router = self.clone();
+        crate::bg_admit::spawn_bg(async move {
+            let lane = &lanes.lanes[lane_idx];
+            let settle = |completed: bool| {
+                lane.inflight.fetch_sub(1, Relaxed);
+                METRICS
+                    .prefetch_inflight_bytes
+                    .fetch_sub(block_size, Relaxed);
+                let live = lane.generation.load(Relaxed) == generation;
+                if completed && live {
+                    METRICS.prefetch_completed.fetch_add(1, Relaxed);
+                    lane.unconsumed.fetch_add(1, Relaxed);
+                } else {
+                    METRICS.prefetch_wasted.fetch_add(1, Relaxed);
+                }
+            };
+            if lane.generation.load(Relaxed) != generation {
+                settle(false);
+                return;
+            }
+            let key = match router
+                .load_striped_block_keys(&file_path, &meta, block, block)
+                .await
+            {
+                Ok(mut keys) => match keys.pop().and_then(|(_, k)| k) {
+                    Some(k) => k,
+                    None => {
+                        // Hole in the current map: nothing to warm.
+                        settle(true);
+                        return;
+                    }
+                },
+                Err(err) => {
+                    debug!("Prefetch: failed to resolve block key: {err:?}");
+                    settle(false);
+                    return;
+                }
+            };
+
+            if router.cache.gds.is_available() {
+                if let Some(local_path) = router.cache.gds.get_gds_path(&key) {
+                    if !local_path.exists() {
+                        debug!("Prefetch (GDS): scheduling download for block {key}");
+                        if let Ok(downloaded) = router.fetch_block_from_remote(&key).await {
+                            // P2-8: path-based cache write via the process
+                            // io_uring file worker.
+                            if let Err(e) =
+                                crate::uring_fs::write_all(&local_path, downloaded.clone()).await
+                            {
+                                debug!("Prefetch (GDS): failed to write block {key}: {e:?}");
+                            }
+                        }
+                        settle(true);
+                        return;
+                    }
+                }
+            }
+
+            if let Some(guard) =
+                router
+                    .cache
+                    .nvme
+                    .get_cached_read_block_range_zero_copy(&key, 0, u32::MAX)
+            {
+                debug!("Prefetch (io_uring): page prefetch for block {key}");
+                let addr = guard.as_ptr() as u64;
+                let len = guard.len();
+                router.prefetcher.prefetch(addr, len);
+                settle(true);
+                return;
+            }
+
+            match router.get_cached_or_fetch_block(&key).await {
+                Ok(_) => settle(true),
+                Err(err) => {
+                    debug!("Prefetch: failed to fetch block {key}: {err:?}");
+                    settle(false);
+                }
+            }
+        });
+    }
+
+    /// Consumer-side spiral detector (§5.5 / observability): the foreground
+    /// paid a DEVICE fetch for a block the pipeline had already covered —
+    /// its fill was evicted before consumption. AIMD: halve the lane
+    /// window (floor 2) and count it.
+    pub(crate) fn pipeline_on_device_fetch(&self, ctx: &PipelineCtx) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !ctx.covered {
+            return;
+        }
+        let lane = &ctx.lanes.lanes[ctx.lane_idx];
+        if lane.generation.load(Relaxed) != ctx.generation {
+            return;
+        }
+        METRICS.prefetch_evicted_unconsumed.fetch_add(1, Relaxed);
+        let _ = lane
+            .window
+            .fetch_update(Relaxed, Relaxed, |w| Some((w / 2).max(2)));
+        lane.suppressed_until_ms
+            .store(StreamLanes::now_ms() + 2_000, Relaxed);
     }
 
     /// The CURRENT block-index→key binding of `(file_path, b)`, as fresh as
@@ -2438,132 +2841,6 @@ impl DataRouter {
 
         block_keys.sort_by_key(|(block_idx, _)| *block_idx);
         Ok(block_keys)
-    }
-
-    fn should_prefetch_after_striped_read(
-        &self,
-        file_path: &str,
-        start_block: u32,
-        end_block: u32,
-    ) -> bool {
-        // Prefetch is best-effort only. Under multi-thread large sequential reads
-        // it previously stampeded get_cached_or_fetch_block and could wedge the
-        // daemon; require free admission permits before even scheduling.
-        if crate::bg_admit::BG_TASK_SEM.available_permits() < 4 {
-            return false;
-        }
-
-        let now = std::time::Instant::now();
-        let mut should_prefetch = end_block > start_block;
-
-        if !should_prefetch {
-            if let Some(previous) = self.sequential_read_state.get(file_path) {
-                let (prev_end_block, prev_seen_at) = previous;
-                should_prefetch = prev_seen_at.elapsed() < Duration::from_secs(2)
-                    && start_block == prev_end_block.saturating_add(1);
-            }
-        }
-
-        self.sequential_read_state
-            .insert(file_path.to_string(), (end_block, now));
-        should_prefetch
-    }
-
-    fn schedule_striped_prefetch(
-        &self,
-        file_path: String,
-        meta: CachedMetadata,
-        next_block: u32,
-        block_size: u64,
-    ) {
-        const PREFETCH_BLOCK_COUNT: u32 = 9;
-
-        let total_blocks = meta.size.div_ceil(block_size) as u32;
-        if next_block >= total_blocks {
-            return;
-        }
-
-        let prefetch_end = std::cmp::min(
-            next_block.saturating_add(PREFETCH_BLOCK_COUNT - 1),
-            total_blocks.saturating_sub(1),
-        );
-        let router = self.clone();
-
-        // P1-5: single admitted outer job; inner fetches limited by buffer_unordered.
-        crate::bg_admit::spawn_bg(async move {
-            let block_keys = match router
-                .load_striped_block_keys(&file_path, &meta, next_block, prefetch_end)
-                .await
-            {
-                Ok(block_keys) => block_keys,
-                Err(err) => {
-                    debug!("Prefetch: Failed to resolve striped block keys: {:?}", err);
-                    return;
-                }
-            };
-
-            use futures::stream::{self, StreamExt};
-            let fetches = stream::iter(block_keys.into_iter().filter_map(|(_, block_key_opt)| {
-                block_key_opt.map(|block_key| {
-                    let router_clone = router.clone();
-                    async move {
-                        if router_clone.cache.gds.is_available() {
-                            if let Some(local_path) =
-                                router_clone.cache.gds.get_gds_path(&block_key)
-                            {
-                                if !local_path.exists() {
-                                    debug!(
-                                        "Prefetch (GDS): Scheduling download for block {}",
-                                        block_key
-                                    );
-                                    if let Ok(downloaded) =
-                                        router_clone.fetch_block_from_remote(&block_key).await
-                                    {
-                                        // P2-8: path-based cache write via process io_uring worker.
-                                        if let Err(e) = crate::uring_fs::write_all(
-                                            &local_path,
-                                            downloaded.clone(),
-                                        )
-                                        .await
-                                        {
-                                            debug!(
-                                                "Prefetch (GDS): Failed to write block {}: {:?}",
-                                                block_key, e
-                                            );
-                                        }
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-
-                        if let Some(guard) = router_clone
-                            .cache
-                            .nvme
-                            .get_cached_read_block_range_zero_copy(&block_key, 0, u32::MAX)
-                        {
-                            debug!(
-                                "Prefetch (io_uring): Scheduling page prefetch for block {}",
-                                block_key
-                            );
-                            let addr = guard.as_ptr() as u64;
-                            let len = guard.len();
-                            router_clone.prefetcher.prefetch(addr, len);
-                        } else {
-                            debug!("Prefetch: Scheduling remote fetch for block {}", block_key);
-                            if let Err(err) =
-                                router_clone.get_cached_or_fetch_block(&block_key).await
-                            {
-                                debug!("Prefetch: Failed to fetch block {}: {:?}", block_key, err);
-                            }
-                        }
-                    }
-                })
-            }))
-            .buffer_unordered(crate::bg_admit::PREFETCH_BLOCK_CONCURRENCY);
-
-            fetches.for_each(|_| async {}).await;
-        });
     }
 
     /// Write file data using progressive data layout routing with offset support (POSIX random-access RMW).
@@ -3585,6 +3862,29 @@ impl DataRouter {
                         let block_keys = self
                             .load_striped_block_keys(file_path, &meta, start_block, end_block)
                             .await?;
+                        // §5.5 pipeline driver — once per request, before
+                        // the serve probes: consume bookkeeping, growth on
+                        // foreground-wait (key already in the single-
+                        // flight = the reader caught the pipeline), and
+                        // the windowed top-up.
+                        let pipeline_ctx = {
+                            let will_wait = block_keys
+                                .first()
+                                .and_then(|(_, k)| k.as_deref())
+                                .is_some_and(|k| {
+                                    self.inflight_block_reads.read_sync(k, |_, _| ()).is_some()
+                                });
+                            self.pipeline_touch(
+                                file_path,
+                                &meta,
+                                block_size,
+                                offset,
+                                (end_offset - offset).max(1),
+                                start_block,
+                                end_block,
+                                will_wait,
+                            )
+                        };
                         if let Some((_, b_key_opt)) = block_keys.first() {
                             // R4 hot-block fast path (§5.4): a hot hit takes
                             // the SAME binding recheck as the NVMe-tier hit
@@ -3821,17 +4121,10 @@ impl DataRouter {
 
                             match downloaded {
                                 Some(downloaded) => {
-                                    if self.should_prefetch_after_striped_read(
-                                        file_path,
-                                        start_block,
-                                        end_block,
-                                    ) {
-                                        self.schedule_striped_prefetch(
-                                            file_path.to_string(),
-                                            meta.clone(),
-                                            end_block.saturating_add(1),
-                                            block_size,
-                                        );
+                                    // §5.5 consumer-side spiral detector:
+                                    // this serve paid a DEVICE fetch.
+                                    if let Some(ref ctx) = pipeline_ctx {
+                                        self.pipeline_on_device_fetch(ctx);
                                     }
 
                                     if let Some(dest) = dest_addr {
@@ -3885,6 +4178,21 @@ impl DataRouter {
                     let block_keys = self
                         .load_striped_block_keys(file_path, &meta, start_block, end_block)
                         .await?;
+                    // §5.5: multi-block reads advance the pipeline past
+                    // end_block (consume span + top-up); the per-block
+                    // device-fetch attribution is deliberately coarse here
+                    // (the fan-out serves via get_block_for_index), so the
+                    // ctx is not threaded further.
+                    let _ = self.pipeline_touch(
+                        file_path,
+                        &meta,
+                        block_size,
+                        offset,
+                        (end_offset - offset).max(1),
+                        start_block,
+                        end_block,
+                        false,
+                    );
 
                     let final_len = (end_offset - offset) as usize;
                     let (raw_ptr, final_buf_opt) = if let Some(dest) = dest_addr {
@@ -3999,15 +4307,6 @@ impl DataRouter {
 
                     for res in results {
                         res?;
-                    }
-
-                    if self.should_prefetch_after_striped_read(file_path, start_block, end_block) {
-                        self.schedule_striped_prefetch(
-                            file_path.to_string(),
-                            meta.clone(),
-                            end_block.saturating_add(1),
-                            block_size,
-                        );
                     }
 
                     if let Some(final_buf) = final_buf_opt {

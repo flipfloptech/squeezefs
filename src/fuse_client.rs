@@ -385,6 +385,21 @@ pub struct Metrics {
     pub read_tier_admission_ghost_hits: Align64<AtomicU64>,
     pub read_streams_classified: Align64<AtomicU64>,
     pub read_odirect_requests: Align64<AtomicU64>,
+    /// R2 pipeline (docs/design-read-path.md §5.5): issued/completed/
+    /// wasted account every prefetch task (wasted >> 0 = abandonment or
+    /// mis-detection); inflight_bytes is the live gauge; window_hwm the
+    /// growth witness; foreground_waits drive window growth and should
+    /// decay in steady state; evicted_unconsumed is THE refetch-spiral
+    /// detector (AIMD collapse trigger); active_streams exposes the
+    /// contention-scaling denominator (two-epoch activity gauge).
+    pub prefetch_issued: Align64<AtomicU64>,
+    pub prefetch_completed: Align64<AtomicU64>,
+    pub prefetch_wasted: Align64<AtomicU64>,
+    pub prefetch_inflight_bytes: Align64<AtomicU64>,
+    pub prefetch_window_hwm: Align64<AtomicU64>,
+    pub prefetch_foreground_waits: Align64<AtomicU64>,
+    pub prefetch_evicted_unconsumed: Align64<AtomicU64>,
+    pub prefetch_active_streams: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -1113,6 +1128,14 @@ impl SqueezefsFilesystem {
                 "read_streams_classified": METRICS.read_streams_classified.load(Ordering::Relaxed),
                 "read_odirect_requests": METRICS.read_odirect_requests.load(Ordering::Relaxed),
                 "read_tier_admission_mode": format!("{:?}", self.router.tier_admission),
+                "prefetch_issued": METRICS.prefetch_issued.load(Ordering::Relaxed),
+                "prefetch_completed": METRICS.prefetch_completed.load(Ordering::Relaxed),
+                "prefetch_wasted": METRICS.prefetch_wasted.load(Ordering::Relaxed),
+                "prefetch_inflight_bytes": METRICS.prefetch_inflight_bytes.load(Ordering::Relaxed),
+                "prefetch_window_hwm": METRICS.prefetch_window_hwm.load(Ordering::Relaxed),
+                "prefetch_foreground_waits": METRICS.prefetch_foreground_waits.load(Ordering::Relaxed),
+                "prefetch_evicted_unconsumed": METRICS.prefetch_evicted_unconsumed.load(Ordering::Relaxed),
+                "prefetch_active_streams": METRICS.prefetch_active_streams.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
@@ -3379,11 +3402,6 @@ impl Filesystem for SqueezefsFilesystem {
             METRICS
                 .read_odirect_requests
                 .fetch_add(1, Ordering::Relaxed);
-        }
-        if ino != CONFIG_INODE && ino != STATS_INODE {
-            let _streaming =
-                self.router
-                    .observe_stream(&crate::keys::inode_path(ino), offset, size as u64);
         }
 
         if ino == CONFIG_INODE {

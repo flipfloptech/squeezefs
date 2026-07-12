@@ -60,6 +60,13 @@ struct H {
 
 async fn make() -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "524288");
+    // The churn contracts count DEVICE FETCHES PER REQUEST; the R2
+    // pipeline (PR 5) legitimately fetches ahead of the request stream,
+    // which would shift phase counts without violating any contract.
+    // Pin the suite to the request-driven shape (assertions byte-
+    // identical); the pipeline's own counting discipline lives in
+    // tests/read_prefetch_pipeline_tests.rs.
+    std::env::set_var("SQUEEZEFS_READ_PREFETCH_WINDOW", "0");
     let dlm = DlmClient::new("local").unwrap();
 
     let b = NamedTempFile::new().unwrap();

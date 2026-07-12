@@ -36,7 +36,6 @@ static STRIPED_BLOCK_CONCURRENCY_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 pub const STRIPED_READ_CONCURRENCY: usize = 16;
 
 /// Max concurrent block tasks inside a single prefetch job.
-pub const PREFETCH_BLOCK_CONCURRENCY: usize = 8;
 
 /// Cores-based concurrency for striped block I/O (reads and writes).
 ///

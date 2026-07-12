@@ -53,7 +53,7 @@ struct H {
     _s: Option<TempDir>,
 }
 
-async fn make_with(uuid: [u8; 16]) -> H {
+async fn make_with(uuid: [u8; 16], alloc_ns: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "524288");
     let dlm = DlmClient::new("local").unwrap();
 
@@ -64,7 +64,7 @@ async fn make_with(uuid: [u8; 16]) -> H {
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
     let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "pipeline_test")
+        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
             .await
             .unwrap(),
     );
@@ -158,18 +158,23 @@ async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
 async fn make_cold_file(h: &H, name: &str, blocks: u64, fill_base: u8) -> u64 {
     let ino = create(h, name).await;
     for b in 0..blocks {
-        write_at(h, ino, b * BS, &vec![fill_base.wrapping_add(b as u8); BS as usize]).await;
+        write_at(
+            h,
+            ino,
+            b * BS,
+            &vec![fill_base.wrapping_add(b as u8); BS as usize],
+        )
+        .await;
     }
     h.fs.fsync(h.req, ino, 0, false).await.unwrap();
     let path = squeezefs::keys::inode_path(ino);
-    let map = h
-        .fs
-        .router
-        .fetch_metadata(&path)
-        .await
-        .unwrap()
-        .block_map
-        .unwrap_or_default();
+    let map =
+        h.fs.router
+            .fetch_metadata(&path)
+            .await
+            .unwrap()
+            .block_map
+            .unwrap_or_default();
     assert_eq!(map.len() as u64, blocks, "fixture map for {name}");
     for key in map.values() {
         h.fs.router.cache.purge_block_key(key);
@@ -217,7 +222,7 @@ async fn settle_pipeline() {
 async fn pipeline_phases() {
     // ---- Phase A: clean single stream — dedupe, zero waste, zero
     // evicted-unconsumed, full task accounting.
-    let h = make_with(*b"pipeline-a-pr5v3").await;
+    let h = make_with(*b"pipeline-a-pr5v3", "pipe_ns_a").await;
     let ino = make_cold_file(&h, "pipe_a", 16, 1).await;
 
     let g0 = METRICS.get_obj.load(Ordering::Relaxed);
@@ -283,12 +288,14 @@ async fn pipeline_phases() {
         issued_after - issued_snapshot
     );
 
+    drop(h);
+
     // ---- Phase C: evict-before-consume control (the PR 4 R-5 spiral,
     // pinned bounded). Tiny hot budget: fills evict before consumption;
     // the consumer detects it, AIMD collapses the window, and total device
     // fetches stay < 2x unique — never the runaway spiral.
     std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1");
-    let h2 = make_with(*b"pipeline-c-pr5v3").await;
+    let h2 = make_with(*b"pipeline-c-pr5v3", "pipe_ns_c").await;
     std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
     let ino_c = make_cold_file(&h2, "pipe_c", 24, 100).await;
 
@@ -323,17 +330,20 @@ async fn pipeline_phases() {
         let fs = h2.fs.clone();
         let req = h2.req;
         tasks.push(tokio::spawn(async move {
+            // Contiguous sub-reads: the classification unit (§5.3).
             for b in 0..12u64 {
-                let d = fs
-                    .read(req, ino, 0, b * BS + 128 * 1024, 262_144, 0)
-                    .await
-                    .unwrap()
-                    .data
-                    .to_vec();
-                assert!(
-                    d.iter().all(|&x| x == base.wrapping_add(b as u8)),
-                    "stream base {base} block {b}"
-                );
+                for half in 0..2u64 {
+                    let d = fs
+                        .read(req, ino, 0, b * BS + half * 262_144, 262_144, 0)
+                        .await
+                        .unwrap()
+                        .data
+                        .to_vec();
+                    assert!(
+                        d.iter().all(|&x| x == base.wrapping_add(b as u8)),
+                        "stream base {base} block {b} half {half}"
+                    );
+                }
             }
         }));
     }
@@ -348,9 +358,11 @@ async fn pipeline_phases() {
          for 48 unique blocks"
     );
 
+    drop(h2);
+
     // ---- Phase E: window cap + kill switch.
     std::env::set_var("SQUEEZEFS_READ_PREFETCH_WINDOW", "0");
-    let h3 = make_with(*b"pipeline-e-pr5v3").await;
+    let h3 = make_with(*b"pipeline-e-pr5v3", "pipe_ns_e").await;
     std::env::remove_var("SQUEEZEFS_READ_PREFETCH_WINDOW");
     let ino_e = make_cold_file(&h3, "pipe_e", 8, 200).await;
     let issued0 = METRICS.prefetch_issued.load(Ordering::Relaxed);
@@ -362,15 +374,18 @@ async fn pipeline_phases() {
         "SQUEEZEFS_READ_PREFETCH_WINDOW=0 must disable the pipeline outright"
     );
 
+    drop(h3);
+
     // ---- Phase F: lane-leak self-repair — the two-epoch active_streams
     // gauge ages out a silently-evicted lane within <= 2 epochs.
-    let h4 = make_with(*b"pipeline-f-pr5v3").await;
+    let h4 = make_with(*b"pipeline-f-pr5v3", "pipe_ns_f").await;
     let ino_f1 = make_cold_file(&h4, "pipe_f1", 16, 10).await;
     let ino_f2 = make_cold_file(&h4, "pipe_f2", 16, 30).await;
-    // Classify both (interleaved starts).
-    for b in 0..5u64 {
-        let _ = read_at(&h4, ino_f1, b * BS, 262_144).await;
-        let _ = read_at(&h4, ino_f2, b * BS, 262_144).await;
+    // Classify both (interleaved CONTIGUOUS sub-reads — the §5.3 unit).
+    for step in 0..10u64 {
+        let off = (step / 2) * BS + (step % 2) * 262_144;
+        let _ = read_at(&h4, ino_f1, off, 262_144).await;
+        let _ = read_at(&h4, ino_f2, off, 262_144).await;
     }
     assert!(
         METRICS.prefetch_active_streams.load(Ordering::Relaxed) >= 2,
@@ -382,11 +397,12 @@ async fn pipeline_phases() {
         .router
         .stream_lanes
         .invalidate(&squeezefs::keys::inode_path(ino_f1));
-    let mut b = 5u64;
+    let mut step = 10u64;
     let t0 = std::time::Instant::now();
     while t0.elapsed() < std::time::Duration::from_millis(5200) {
-        let _ = read_at(&h4, ino_f2, (b % 16) * BS, 262_144).await;
-        b += 1;
+        let off = ((step / 2) % 16) * BS + (step % 2) * 262_144;
+        let _ = read_at(&h4, ino_f2, off, 262_144).await;
+        step += 1;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     let gauge = METRICS.prefetch_active_streams.load(Ordering::Relaxed);

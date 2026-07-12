@@ -449,21 +449,18 @@ async fn dehydration_gate_drops_untouched_probation_and_dehydrates_protected() {
     );
 }
 
-/// The DEFAULT admission mode is `always` — today's publish behavior
-/// verbatim — until PR 5 lands the evict-before-consume control (§5.5):
-/// measured on the committed sandbox, defaulting to second-touch under
-/// the legacy 9-ahead prefetcher turns probation-evict refetches into
-/// spurious ghost hits (515/1024 unique on one cold pass) whose publish
-/// storm + protected-victim dehydration floods OOM an 8 GiB cage. This
-/// pin is the flip point: PR 5 changes it to SecondTouch together with
-/// its per-lane resident-unconsumed accounting.
+/// The DEFAULT admission mode is `second-touch` — the §5.3 policy — as of
+/// PR 5: the R-5 evict-before-consume spiral that forced PR 4's temporary
+/// `always` default is closed by the pipeline's per-lane resident-
+/// unconsumed accounting + AIMD (pinned in
+/// tests/read_prefetch_pipeline_tests.rs phases C/D).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn default_admission_is_always_until_pr5() {
+async fn default_admission_is_second_touch() {
     std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
     let h = make_bs("524288", *b"admission-df4-v3").await;
     assert_eq!(
         h.fs.router.tier_admission,
-        squeezefs::routing::TierAdmission::Always,
-        "default must stay `always` until PR 5's spiral control lands"
+        squeezefs::routing::TierAdmission::SecondTouch,
+        "the default flipped to the design's second-touch policy with PR 5"
     );
 }

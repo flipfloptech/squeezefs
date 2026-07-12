@@ -58,7 +58,6 @@ async fn test_spawn_bg_rejects_when_saturated() {
 #[test]
 fn test_striped_read_concurrency_constant() {
     assert_eq!(bg_admit::STRIPED_READ_CONCURRENCY, 16);
-    assert_eq!(bg_admit::PREFETCH_BLOCK_CONCURRENCY, 8);
 }
 
 /// P2-6: auto policy is cores-based and clamped; override is sticky until reset.

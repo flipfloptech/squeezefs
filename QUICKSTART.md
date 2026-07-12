@@ -64,7 +64,12 @@ sudo ./target/release/squeezefs mount \
 ```
 
 ### Step 5: Run the Benchmark
-Run the SqueezeFS bench: explicit phases (`-w` write / `-r` read / `--stat` / `--del`) over a persistent dataset, with a user-settable I/O block size:
+A bare invocation runs the **full saturation suite** over one auto-sized dataset (threads = `min(CPUs, 16)`; total = `max(16 GiB, 2 GiB × threads)` capped at 25% of free space): write seq 1m → read seq 1m → read rand 4k (30 s) → write rand 4k (30 s) → stat → del, all I/O passes O_DIRECT, mount left clean:
+```bash
+./target/release/squeezefs bench /mnt/squeezefs
+```
+
+Explicit phases inherit the same auto defaults (comparable numbers) and reuse the persistent dataset:
 ```bash
 # Write then read back 1 GiB per thread at 1 MiB ops across 4 threads
 ./target/release/squeezefs bench /mnt/squeezefs -t 4 -w -r -s 1g -b 1m
@@ -74,7 +79,7 @@ Run the SqueezeFS bench: explicit phases (`-w` write / `-r` read / `--stat` / `-
 ./target/release/squeezefs bench /mnt/squeezefs -t 4 --del -s 1g
 ```
 
-Committed reference numbers (large-seq writes ~1.8 GB/s on the reference box via the zero-copy write path) live in `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`; that table's large-seq row was produced by the old bench's default workload — the equivalent new invocation is `squeezefs bench /mnt/squeezefs -w -s 128m -b 1m`. Compare your rows against it when validating a setup.
+Committed reference numbers (large-seq writes ~1.8 GB/s on the reference box via the zero-copy write path) live in `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`; that table's large-seq row maps to `squeezefs bench /mnt/squeezefs -w -s 128m -b 1m`, or just compare the suite's `Write seq 1m` row. Compare your rows against it when validating a setup.
 
 ### Step 6: Unmount Safely
 Use SqueezeFS unmount to drain staging writes and cleanly shut down:

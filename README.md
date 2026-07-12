@@ -114,28 +114,36 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   ```
 
 * **Benchmark Mountpoint:**
-  Simplified-elbencho model: explicit phases over a **persistent, reusable dataset** at `<mountpoint>/squeezefs-bench/t{tid}/f{fid}.bin`, one shape vocabulary, per-phase THROUGHPUT / IOPS / latency (min/avg/p99/max) rows, audited against the daemon's `.stats` metrics delta.
+  A **bare invocation is the full saturation suite**: over one auto-sized dataset it runs write seq `1m` `--direct` → read seq `1m` `--direct` → read rand `4k` `--direct` (30 s box) → write rand `4k` `--direct` (30 s box) → stat → del (timed; leaves the mount clean), and prints one table with a row per pass (THROUGHPUT / IOPS / coverage / latency min/avg/p99/max) plus the daemon's `.stats` metrics delta.
   ```bash
-  squeezefs bench <mountpoint> [phases] [shape]
-  # e.g. write then read 1 GiB/file across 4 threads at 1 MiB ops:
+  squeezefs bench /mnt/squeezefs
+  ```
+  Auto-sizing (the default for `-t`/`-n`/`-s` everywhere; explicit flags always override): threads = `min(CPUs, 16)`, 1 file per thread, total = `max(16 GiB, 2 GiB × threads)` capped at 25% of the mountpoint's free space (loud error if even 4 GiB does not fit), per-file rounded down to 1 MiB. The computed shape — with `(auto)`/`(explicit)` provenance per value — is printed loudly in the header of **every** run.
+
+  *Explicit phases* run over the same **persistent, reusable dataset** at `<mountpoint>/squeezefs-bench/t{tid}/f{fid}.bin` and inherit the identical auto defaults, so single-phase numbers are directly comparable to the matching suite pass:
+  ```bash
+  # reproduce the suite's rand-4k read pass against an existing dataset:
+  squeezefs bench /mnt/squeezefs -r --rand -b 4k --direct
+  # write then read 1 GiB/file across 4 threads at 1 MiB ops:
   squeezefs bench /mnt/squeezefs -t 4 -w -r -s 1g -b 1m
   # re-read the SAME dataset later at a different I/O size (no rewrite):
   squeezefs bench /mnt/squeezefs -t 4 -r -s 1g -b 128k
   ```
-  *Phases* (any combination, always executed in this fixed order; none given ⇒ `write+read`):
+  *Phases* (any combination, always executed in this fixed order; none given ⇒ the full suite):
   - `-w, --write`: create/overwrite the dataset, timed (includes create/open; each file is fsync'd before the clock stops — durable write numbers).
   - `-r, --read`: read it back, timed (reuses the dataset from an earlier `-w`; loud shape-mismatch error otherwise — never silently creates files).
   - `--stat`: stat every file, timed.
   - `--del`: delete the dataset, timed (doubles as cleanup).
 
-  *Shape* (applies to all phases):
-  - `-t, --threads <N>`: workers (default: 1).
-  - `-n, --files <N>`: files per thread (default: 1).
-  - `-s, --size <SZ>`: file size, human units `4k`/`128k`/`4m`/`10g` or plain bytes (default: `1g`).
-  - `-b, --block <SZ>`: I/O size per operation, same units (default: `1m`).
-  - `--rand`: random offsets (shuffled full-coverage block list — every block exactly once).
-  - `--direct`: O_DIRECT (`-b` must be a multiple of 4096 and `-s` a multiple of `-b`).
-  - `-i, --iterations <N>`: repeat the selected phase set (default: 1).
+  *Shape* (applies to all phases; `-t`/`-n`/`-s` auto-size when omitted):
+  - `-t, --threads <N>`: workers (default: auto = `min(CPUs, 16)`).
+  - `-n, --files <N>`: files per thread (default: auto = 1).
+  - `-s, --size <SZ>`: file size, human units `4k`/`128k`/`4m`/`10g` or plain bytes (default: auto-sized from free space, see above).
+  - `-b, --block <SZ>`: I/O size per operation, same units (default: `1m`; explicit phase runs only — the suite fixes `1m` seq / `4k` rand).
+  - `--rand`: random offsets (shuffled full-coverage block list — every block exactly once; explicit phase runs only).
+  - `--direct`: O_DIRECT (`-b` must be a multiple of 4096 and `-s` a multiple of `-b`); the suite's I/O passes are always O_DIRECT.
+  - `--time <SECS>`: wall-clock box for rand read/write passes (default: 30 for `--rand`, unlimited for sequential; `0` forces full coverage). Partial coverage is honest — reported over actual elapsed/bytes and stated in the row.
+  - `-i, --iterations <N>`: repeat the selected pass set (default: 1).
 
   Write phases fill blocks with a deterministic non-zero pattern seeded per `(thread, file, block)`, so transparent compression cannot fake throughput numbers.
 

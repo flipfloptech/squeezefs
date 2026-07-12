@@ -5,3 +5,4 @@
 tests/ltp_repro.sh
 ltp_syscalls.results
 loom-models/target/
+dhat-heap.json

@@ -339,6 +339,33 @@ impl BackendRouter {
         let _ = self.read_tier_purge.set(purge);
     }
 
+    /// Bytes currently allocated on the striped block backends, summed
+    /// over every distinct allocator (the default allocator is usually
+    /// also registered in `backends` under its volume name — dedup by
+    /// allocator identity so it counts once). Served entirely from the
+    /// allocators' maintained in-RAM state (monotonic high-water atomic
+    /// minus the recycled-free set) — no metadata transactions, no device
+    /// I/O — so it is safe on the statfs hot path.
+    pub fn allocated_bytes(&self) -> u64 {
+        let mut seen: Vec<*const crate::block_allocator::BlockAllocator> = Vec::new();
+        let mut sum = 0u64;
+        let default_ptr = std::sync::Arc::as_ptr(&self.default_allocator);
+        seen.push(default_ptr);
+        sum += self
+            .default_allocator
+            .get_used_blocks()
+            .saturating_mul(self.default_allocator.chunk_size());
+        for entry in self.backends.iter() {
+            let alloc = &entry.value().block_allocator;
+            let ptr = std::sync::Arc::as_ptr(alloc);
+            if !seen.contains(&ptr) {
+                seen.push(ptr);
+                sum += alloc.get_used_blocks().saturating_mul(alloc.chunk_size());
+            }
+        }
+        sum
+    }
+
     pub fn is_backend_healthy(&self, be_id: &str) -> bool {
         if self.unhealthy_backends.contains_key(be_id) {
             false

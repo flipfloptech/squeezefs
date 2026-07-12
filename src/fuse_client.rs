@@ -678,6 +678,11 @@ pub struct SqueezefsFilesystem {
     pub latest_stats_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
     pub latest_config_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
     pub inodes_limit: std::sync::Arc<std::sync::OnceLock<u64>>,
+    /// Formatted capacity in bytes (`FormatConfig.capacity`: the summed
+    /// data-backend size, or the lower explicit `--capacity` quota) — the
+    /// statfs `f_blocks` source. Set once at FUSE init from the format
+    /// config, shared across clones like `inodes_limit`.
+    pub capacity_limit: std::sync::Arc<std::sync::OnceLock<u64>>,
     /// Shared across every `SqueezefsFilesystem` clone. `start_mount` publishes
     /// the live `FuseConnection` here *after* `session.mount(fs.clone(), …)` has
     /// already consumed the clone the request handlers run on, so the cell must
@@ -727,6 +732,7 @@ impl Clone for SqueezefsFilesystem {
             latest_stats_json: arc_swap::ArcSwap::new(self.latest_stats_json.load_full()),
             latest_config_json: arc_swap::ArcSwap::new(self.latest_config_json.load_full()),
             inodes_limit: self.inodes_limit.clone(),
+            capacity_limit: self.capacity_limit.clone(),
             // Share the one cell — never split it per clone, or the mounted
             // handler clone would not observe the connection start_mount
             // publishes after mount (re-enables the read zero-copy dest).
@@ -809,6 +815,7 @@ impl SqueezefsFilesystem {
             latest_stats_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
             latest_config_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
             inodes_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
+            capacity_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
             session_connection: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
                 None,
             ))),
@@ -3064,6 +3071,7 @@ impl Filesystem for SqueezefsFilesystem {
                     );
                     self.router.set_crypto(crypto_state);
                     let _ = self.inodes_limit.set(config.inodes);
+                    let _ = self.capacity_limit.set(config.capacity);
                 }
             }
 
@@ -5200,18 +5208,55 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn statfs(&self, _req: Request, _ino: u64) -> FuseResult<ReplyStatFs> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        let bsize = 4096;
-        let capacity = 1024 * 1024 * 1024 * 1024 * 1024; // 1PB
-        let total_inodes = 1_000_000_000;
-        let total_blocks = capacity / bsize as u64;
-        let bfree = total_blocks;
+        // Honest numbers, served entirely from maintained in-RAM state —
+        // statfs is called constantly, so no metadata transactions and no
+        // device I/O here.
+        //
+        // total  = the formatted capacity (FormatConfig.capacity: the
+        //          summed data-backend size, or the lower explicit
+        //          --capacity quota — the effective limit the user
+        //          experiences). Set once at FUSE init.
+        // free   = total − striped-block bytes allocated right now
+        //          (allocator high-water atomic minus the recycled-free
+        //          set, per distinct backend allocator). Inline payloads
+        //          live in the metadata volume and staged-but-unpromoted
+        //          writes in the local staging dirs; both promote into
+        //          accounted blocks via writeback, so free converges on
+        //          durability rather than tracking transient staging.
+        // files  = the format inode quota; ffree = quota minus the v3
+        //          monotonic (no-reuse) ino watermark progression.
+        let bsize: u32 = 4096;
+        let used_bytes = self.router.backend_router.allocated_bytes();
+        // The capacity cell is set during FUSE init (the kernel sends
+        // INIT before any statfs); if a non-standard harness asks
+        // earlier, degrade to "everything used" rather than invent
+        // capacity.
+        let total_bytes = self.capacity_limit.get().copied().unwrap_or(used_bytes);
+        let free_bytes = total_bytes.saturating_sub(used_bytes);
+
+        let total_inodes = self.inodes_limit.get().copied().unwrap_or(0);
+        // §4.8 monotonic ino allocation (no reuse): allocated-ever per
+        // volume is the watermark minus the reserved base (ino 1 = root,
+        // watermark starts at 2 on a fresh volume).
+        let used_inodes: u64 = self
+            .meta_backend
+            .as_ref()
+            .map(|backend| {
+                backend
+                    .volumes
+                    .iter()
+                    .map(|v| v.next_ino().saturating_sub(2))
+                    .sum::<u64>()
+                    .saturating_add(1) // the root inode itself
+            })
+            .unwrap_or(0);
 
         Ok(ReplyStatFs {
-            blocks: total_blocks,
-            bfree,
-            bavail: bfree,
+            blocks: total_bytes / bsize as u64,
+            bfree: free_bytes / bsize as u64,
+            bavail: free_bytes / bsize as u64,
             files: total_inodes,
-            ffree: total_inodes,
+            ffree: total_inodes.saturating_sub(used_inodes),
             bsize,
             namelen: 255,
             frsize: bsize,

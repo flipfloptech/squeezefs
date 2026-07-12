@@ -93,6 +93,7 @@ pub(crate) fn check_component_name_len(name: &std::ffi::OsStr) -> Result<(), Err
         Ok(())
     }
 }
+
 pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
     Lazy::new(|| StripeLocks::new());
 
@@ -2379,6 +2380,55 @@ impl SqueezefsFilesystem {
         Some((ino_str.parse().ok()?, block_str.parse().ok()?))
     }
 
+    /// R5 gauge: bytes parked in RAM as active block buffers (count ×
+    /// block size — buffers are block-sized by construction).
+    pub fn parked_buffer_bytes(&self) -> u64 {
+        self.active_block_buffers.len() as u64 * self.router.block_size.load(Ordering::Relaxed)
+    }
+
+    /// §5.7 Red drain — "early `flush_memory_buffers_*`, the existing
+    /// never-lossy staging path, just earlier": flush parked buffers
+    /// inode-by-inode through the durable upload/staging path until the
+    /// parked gauge is ≤ `target` bytes. The row-5 trace proved
+    /// cap-halving alone cannot hold the line: it only gates INSERTS,
+    /// while the backlog itself kept growing (spill-to-staging ran 42 %
+    /// refused — a 4 MiB entry every ~10 MiB shard — and the rand-write
+    /// revisit carousel pulled spilled entries straight back to RAM).
+    /// Durability semantics untouched: every buffer goes through
+    /// `flush_memory_buffers_for_inode` — upload or staged, never
+    /// dropped.
+    pub async fn drain_parked_toward(&self, target: u64) {
+        let mut last_len = usize::MAX;
+        while self.parked_buffer_bytes() > target {
+            let len = self.active_block_buffers.len();
+            if len == 0 || len >= last_len {
+                // No forward progress (writers re-parking as fast as the
+                // drain flushes): stop — the sampler re-fires next tick.
+                break;
+            }
+            last_len = len;
+            let mut inos: Vec<u64> = self
+                .active_block_buffers
+                .iter()
+                .take(64)
+                .filter_map(|r| Self::parse_active_block_key(r.key()).map(|(ino, _)| ino))
+                .collect();
+            inos.sort_unstable();
+            inos.dedup();
+            for ino in inos {
+                let Ok(fencing_token) = self.get_or_acquire_lease(ino).await else {
+                    continue;
+                };
+                let _ = self
+                    .flush_memory_buffers_for_inode(ino, fencing_token)
+                    .await;
+                if self.parked_buffer_bytes() <= target {
+                    break;
+                }
+            }
+        }
+    }
+
     async fn insert_active_block_buffer(
         &self,
         cache_key: String,
@@ -3018,16 +3068,37 @@ impl Filesystem for SqueezefsFilesystem {
                 const MIB: u64 = 1024 * 1024;
                 let bufs = self.active_block_buffers.clone();
                 let bs_atomic = self.router.block_size.clone();
+                // §5.7 Red parked shed: cap-halving at admission gates NEW
+                // parks; the DRAIN below flushes the existing backlog
+                // through the durable path (the "early
+                // flush_memory_buffers_*" mechanism — measured necessary:
+                // the row-5 trace grew 250 → 1,750 parked buffers with the
+                // cap alone). Shed closures are sync, the flush is async:
+                // the closure posts the target and wakes a drain worker.
+                let drain_target = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+                let drain_notify = Arc::new(tokio::sync::Notify::new());
+                {
+                    let fs = self.clone();
+                    let target = drain_target.clone();
+                    let notify = drain_notify.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            notify.notified().await;
+                            let t = target.load(Ordering::Relaxed);
+                            fs.drain_parked_toward(t).await;
+                        }
+                    });
+                }
+                let shed_target = drain_target.clone();
                 MEM_BUDGET.register(Component::new(
                     "parked_write_buffers",
                     32 * 4 * MIB, // 32 parked blocks at the default 4 MiB
                     4,
                     Arc::new(move || bufs.len() as u64 * bs_atomic.load(Ordering::Relaxed)),
-                    // Shed mechanism = the Red cap-halving at admission
-                    // (insert_active_block_buffer): parked dirty bytes reach
-                    // the existing never-lossy staging spill at half the
-                    // count. Nothing to do from the sampler side.
-                    Arc::new(|_| {}),
+                    Arc::new(move |target| {
+                        shed_target.store(target, Ordering::Relaxed);
+                        drain_notify.notify_one();
+                    }),
                 ));
                 let hot = self.router.cache.hot_block.clone();
                 let hot_shed = self.router.cache.hot_block.clone();

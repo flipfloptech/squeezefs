@@ -532,4 +532,46 @@ async fn advisory_integration_phases() {
         "Yellow freezes window growth: the high-water mark must not move"
     );
     force_level(Level::Green);
+
+    // ---- Phase D: the parked-buffer DRAIN (§5.7 Red row: "early
+    // flush_memory_buffers_* — the existing never-lossy staging path,
+    // just earlier"). Cap-halving alone only gates INSERTS; the row-5
+    // trace showed the backlog itself must drain (spill-to-staging
+    // 42%-refused under 4 MiB entries + the revisit carousel pulls
+    // entries straight back). The drain uploads parked partials through
+    // the durable path: parked bytes fall to ~0 and the data stays
+    // byte-exact.
+    let ino_d = h2
+        .fs
+        .create(h2.req, 1, OsStr::new("mb_d"), libc::S_IFREG | 0o644, 0)
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    // Striped file first (the row-5 shape), then sub-block overwrites:
+    // each RMW parks its 512 KiB block buffer.
+    for b in 0..6u64 {
+        write_at(&h2, ino_d, b * BS, &vec![0u8; BS as usize]).await;
+    }
+    h2.fs.fsync(h2.req, ino_d, 0, false).await.unwrap();
+    for b in 0..6u64 {
+        write_at(&h2, ino_d, b * BS, &vec![b as u8 + 50; 4096]).await;
+    }
+    assert!(
+        h2.fs.parked_buffer_bytes() >= 6 * BS,
+        "fixture: six parked partial blocks"
+    );
+    h2.fs.drain_parked_toward(0).await;
+    assert_eq!(
+        h2.fs.parked_buffer_bytes(),
+        0,
+        "the drain must flush every parked buffer through the durable path"
+    );
+    for b in 0..6u64 {
+        let d = read_at(&h2, ino_d, b * BS, 4096).await;
+        assert!(
+            d.iter().all(|&x| x == b as u8 + 50),
+            "drained block {b} must stay byte-exact (never-lossy)"
+        );
+    }
 }

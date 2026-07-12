@@ -196,7 +196,9 @@ fn hot_has(h: &H, key: &str) -> bool {
 /// tier. The tax kill and its warmth-recovery path in one contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn second_touch_admission_first_skip_then_publish() {
+    std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
     let h = make().await;
+    std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
     let ino = create(&h, "adm_second_touch").await;
     write_at(&h, ino, 0, &vec![0xA1u8; BS as usize]).await;
     write_at(&h, ino, BS, &vec![0xA2u8; BS as usize]).await;
@@ -272,7 +274,9 @@ async fn small_block_volume_keeps_first_touch_publish() {
 /// (first touch) skips the publish.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn o_direct_flag_reaches_the_classifier() {
+    std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
     let h = make_bs("524288", *b"admission-od4-v3").await;
+    std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
     let ino = create(&h, "adm_odirect").await;
     write_at(&h, ino, 0, &vec![0xC1u8; BS as usize]).await;
     write_at(&h, ino, BS, &vec![0xC2u8; BS as usize]).await;
@@ -349,9 +353,11 @@ async fn admission_always_restores_first_touch_publish() {
 /// sub-read a device refetch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hot_budget_zero_auto_degrades_to_always() {
+    std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
     std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "0");
     let h = make_bs("524288", *b"admission-hz4-v3").await;
     std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
+    std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
 
     let ino = create(&h, "adm_hotzero").await;
     write_at(&h, ino, 0, &vec![0xE1u8; BS as usize]).await;
@@ -379,9 +385,11 @@ async fn hot_budget_zero_auto_degrades_to_always() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dehydration_gate_drops_untouched_probation_and_dehydrates_protected() {
     // Tiny hot budget: 1 MiB = two 512 KiB entries per the whole tier.
+    std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
     std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1");
     let h = make_bs("524288", *b"admission-dh4-v3").await;
     std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
+    std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
 
     let ino = create(&h, "adm_dehy").await;
     for b in 0..6u64 {
@@ -438,5 +446,24 @@ async fn dehydration_gate_drops_untouched_probation_and_dehydrates_protected() {
         dehydrated,
         "a protected (read-promoted) victim must dehydrate to the NVMe \
          tier — warmth is preserved for entries something actually re-read"
+    );
+}
+
+/// The DEFAULT admission mode is `always` — today's publish behavior
+/// verbatim — until PR 5 lands the evict-before-consume control (§5.5):
+/// measured on the committed sandbox, defaulting to second-touch under
+/// the legacy 9-ahead prefetcher turns probation-evict refetches into
+/// spurious ghost hits (515/1024 unique on one cold pass) whose publish
+/// storm + protected-victim dehydration floods OOM an 8 GiB cage. This
+/// pin is the flip point: PR 5 changes it to SecondTouch together with
+/// its per-lane resident-unconsumed accounting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_admission_is_always_until_pr5() {
+    std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
+    let h = make_bs("524288", *b"admission-df4-v3").await;
+    assert_eq!(
+        h.fs.router.tier_admission,
+        squeezefs::routing::TierAdmission::Always,
+        "default must stay `always` until PR 5's spiral control lands"
     );
 }

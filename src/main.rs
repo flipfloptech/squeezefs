@@ -738,6 +738,20 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// jemalloc dirty-page decay, bounded (R1b liveness, measured): the hot
+/// tier's 4 MiB `Bytes` insert→evict churn under a cold stream retains
+/// freed-but-dirty pages for the default 10 s decay — at a ~4 GiB/s fill
+/// rate that is multi-GiB of dead anon RSS charged to the cgroup (the
+/// PR 4 row-2 8 GiB cage kill; pre-R4 the same allocations died in
+/// microseconds and reused one arena chunk). 1 s decay returns dirty
+/// pages fast enough for cage-sized deployments while keeping reuse
+/// batching; muzzy stays 0 (default). R5's budget authority (PR 7)
+/// subsumes this with real backpressure; the decay bound stays correct
+/// regardless.
+#[cfg(all(target_os = "linux", not(feature = "dhat-on")))]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 #[cfg(unix)]
 static DAEMON_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 

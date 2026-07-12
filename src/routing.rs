@@ -830,8 +830,15 @@ pub struct DataRouterInner {
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
     pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
+    /// Single-flight registry. `scc::HashMap`, NOT `HashIndex` (a measured
+    /// deviation from the design doc's "container stays" note): HashIndex
+    /// defers value drops through epoch reclamation, and since R1a the
+    /// value's broadcast ring owns the cohort's multi-MiB `FillResult` —
+    /// under a cold stream, thousands of dead flights' deferred rings
+    /// retained gigabytes of dead payloads (the PR 4 row-2 cage kill).
+    /// HashMap removal drops the Sender (and its ring) synchronously.
     pub(crate) inflight_block_reads:
-        std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
+        std::sync::Arc<scc::HashMap<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
     pub(crate) sequential_read_state: moka::sync::Cache<String, (u32, std::time::Instant)>,
     /// R1b (§5.3): per-file K=4 offset-lane stream classifier state.
     /// Coexists with `sequential_read_state` (the legacy prefetcher's
@@ -1060,7 +1067,7 @@ impl StreamLanes {
 struct InflightBlockReadGuard {
     key: String,
     inflight_block_reads:
-        std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
+        std::sync::Arc<scc::HashMap<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
     tx: tokio::sync::broadcast::Sender<Option<FillResult>>,
     /// Set by the primary after a successful `send(Some(..))` — flips the
     /// drop from `None`-then-close to close-only.
@@ -1326,9 +1333,23 @@ impl DataRouter {
         // refuse loud at mount (forward-only — no silent fallback). A zero
         // hot-tier budget auto-degrades SecondTouch to Always: without the
         // RAM landing zone, skipping publishes would refetch every sub-read.
+        //
+        // DEFAULT = `always` (today's publish behavior verbatim) until
+        // PR 5 lands its evict-before-consume control: measured on the
+        // committed sandbox, `second-touch` under the LEGACY 9-ahead
+        // prefetcher x 8 streams overruns the hot budget, probation fills
+        // evict before their own sub-reads, the refetches ghost-hit as
+        // spurious "second touches" (515 of 1024 unique on a single cold
+        // pass at t=2), and the resulting publish storm + protected-victim
+        // dehydration floods OOM an 8 GiB cage — exactly the §5.5 R-5
+        // spiral the design assigns to PR 5's per-lane accounting. The
+        // machinery, counters, and knob all land here; the default flips
+        // with PR 5 (`never` already delivers the row-2 tax kill for
+        // operators who want it now: 3.3-3.5 GiB/s vs the 787 MiB/s
+        // baseline on the committed sandbox).
         let tier_admission = match std::env::var("SQUEEZEFS_READ_TIER_ADMISSION")
             .as_deref()
-            .unwrap_or("second-touch")
+            .unwrap_or("always")
         {
             "always" => TierAdmission::Always,
             "second-touch" => TierAdmission::SecondTouch,
@@ -1378,7 +1399,7 @@ impl DataRouter {
                     .max_capacity(block_map_capacity)
                     .time_to_live(std::time::Duration::from_secs(300))
                     .build(),
-                inflight_block_reads: std::sync::Arc::new(scc::HashIndex::new()),
+                inflight_block_reads: std::sync::Arc::new(scc::HashMap::new()),
                 sequential_read_state: moka::sync::Cache::builder()
                     .max_capacity(100000)
                     .time_to_live(std::time::Duration::from_secs(5))
@@ -1513,7 +1534,14 @@ impl DataRouter {
             // unified purge on every free), so a hit is serve-valid here;
             // block-serving callers additionally recheck the binding
             // exactly as for NVMe-tier hits.
-            if let Some(cached_block) = self.cache.hot_block.get(block_key) {
+            if let Some(cached_block) = self.cache.hot_block.get_no_promote(block_key) {
+                // No-promote (R1b liveness, measured): this loop serves a
+                // fill's own sub-read/waiter consumption — promotion here
+                // manufactured protected victims out of one-pass streams,
+                // whose dehydrations parked multi-MiB payloads in the
+                // eviction channel (the PR 4 row-2 cage kill's third
+                // head). Keep-worthiness evidence is ghost admission and
+                // block-level re-access, never self-consumption.
                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                 METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok((
@@ -1563,7 +1591,7 @@ impl DataRouter {
                 if let Some(cached_block) = self
                     .cache
                     .hot_block
-                    .get(block_key)
+                    .get_no_promote(block_key)
                     .or_else(|| self.cache.read_lru.get(block_key))
                 {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);

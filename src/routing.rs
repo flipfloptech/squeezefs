@@ -1023,12 +1023,21 @@ pub struct StreamLane {
     /// `active_streams` gauge stamp: this lane counted itself in this
     /// epoch (one relaxed compare per issue-path touch).
     last_counted_epoch: std::sync::atomic::AtomicU64,
-    /// AIMD quiescence arm: after a consumer-detected evicted-unconsumed
-    /// fill, issue pauses until this wall-clock ms — under sustained
-    /// budget starvation the pipeline goes QUIESCENT (fetch ratio
-    /// converges to ~1.0x) instead of feeding the evict→refetch cycle at
-    /// its window floor.
-    suppressed_until_ms: std::sync::atomic::AtomicU64,
+    /// AIMD quiescence arm, PROGRESS-clocked: after a consumer-detected
+    /// evicted-unconsumed fill, issue pauses until the CONSUME EDGE
+    /// reaches this block index — the suppression span doubles with each
+    /// consecutive detection (`detect_streak`) and a clean consume resets
+    /// it. Self-clocked by the stream: a healthy lane's transient
+    /// detection costs milliseconds of lookahead; a genuinely starved
+    /// lane re-detects on resume, the span grows geometrically, and the
+    /// fetch ratio converges to ~1.0x. (A 2 s WALL-clock arm tried first
+    /// froze healthy lanes wholesale — measured on the bench row-2 shape
+    /// as issue starvation: 283 of 4 096 blocks pipelined, row 2 at
+    /// 0.64x row 1.)
+    suppress_until_edge: std::sync::atomic::AtomicU32,
+    /// Consecutive evicted-unconsumed detections without an intervening
+    /// clean consume — exponent for the suppression span (capped).
+    detect_streak: std::sync::atomic::AtomicU32,
 }
 
 /// §5.5 `active_streams` — a two-epoch activity gauge (the same sliding
@@ -1118,7 +1127,8 @@ impl StreamLanes {
             issued_base: std::sync::atomic::AtomicU32::new(0),
             generation: std::sync::atomic::AtomicU64::new(0),
             last_counted_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
-            suppressed_until_ms: std::sync::atomic::AtomicU64::new(0),
+            suppress_until_edge: std::sync::atomic::AtomicU32::new(0),
+            detect_streak: std::sync::atomic::AtomicU32::new(0),
         };
         Self {
             lanes: [mk(), mk(), mk(), mk()],
@@ -1187,6 +1197,8 @@ impl StreamLanes {
             lane.unconsumed.store(0, Relaxed);
             lane.consumed_edge.store(0, Relaxed);
             lane.issued_base.store(0, Relaxed);
+            lane.suppress_until_edge.store(0, Relaxed);
+            lane.detect_streak.store(0, Relaxed);
             lane.last_seen_ms.store(now, Relaxed);
             return Some(LaneRef {
                 lane,
@@ -1651,7 +1663,10 @@ impl DataRouter {
         &self,
         block_key: &str,
     ) -> Result<crate::cache::pool::ReadBlockValue> {
-        Ok(self.get_cached_or_fetch_block_traced(block_key).await?.0)
+        Ok(self
+            .get_cached_or_fetch_block_traced(block_key, false)
+            .await?
+            .0)
     }
 
     /// [`Self::get_cached_or_fetch_block`] plus the fill's INCARNATION
@@ -1665,9 +1680,22 @@ impl DataRouter {
     /// device read: the bytes may be a dead incarnation's and the caller must
     /// re-resolve — serving them for a resolved block index is exactly the
     /// reused-key stale-fill corruption.
+    ///
+    /// `speculative`: the fill is a §5.5 pipeline prefetch, not a consumer
+    /// reference — under second-touch admission it takes the design's
+    /// prefetch row verbatim (§5.3 table: hot-tier **probation** put,
+    /// disk-tier **skip**, and — unlike the random row — **no
+    /// ghost-record**). Ghost heat must count consumer references only:
+    /// letting speculative fills stamp the table turned the pipeline's own
+    /// evict→foreground-refetch cycles into fake "re-read heat" (measured
+    /// live on the bench row-2 shape: 614 fake ghost hits ⇒ 4.5 GiB of
+    /// protected/NVMe publishes competing with the stream they were meant
+    /// to serve). `always`/`never` are unaffected (operator escape
+    /// semantics: verbatim today's behavior).
     async fn get_cached_or_fetch_block_traced(
         &self,
         block_key: &str,
+        speculative: bool,
     ) -> Result<(crate::cache::pool::ReadBlockValue, bool)> {
         // Single-flight block fetch. Waiters must not hang if they miss the
         // completion broadcast (subscribe-after-send race under multi-thread
@@ -1844,6 +1872,10 @@ impl DataRouter {
                             match self.tier_admission {
                                 TierAdmission::Always => true,
                                 TierAdmission::Never => false,
+                                // §5.3 prefetch row: speculative fills skip
+                                // AND leave the ghost table untouched (see
+                                // the fn doc — consumer references only).
+                                TierAdmission::SecondTouch if speculative => false,
                                 TierAdmission::SecondTouch => {
                                     let hit = self.ghost.check_and_record(block_key);
                                     if hit {
@@ -2094,8 +2126,22 @@ impl DataRouter {
                         let _ = lane
                             .window
                             .fetch_update(Relaxed, Relaxed, |w| Some((w / 2).max(2)));
-                        lane.suppressed_until_ms
-                            .store(StreamLanes::now_ms() + 2_000, Relaxed);
+                        // Progress-clocked quiescence: pause issue until
+                        // the consumer advances 2^(streak+1) blocks past
+                        // this one (cap 64). Geometric growth is what
+                        // separates a transient budget wobble (one short
+                        // gap, streak resets on the next clean consume)
+                        // from sustained starvation (spans double until
+                        // the pipeline is effectively quiescent and the
+                        // fetch ratio converges to ~1.0x).
+                        let streak = lane.detect_streak.fetch_add(1, Relaxed).min(5);
+                        let span = 2u32 << streak;
+                        lane.suppress_until_edge
+                            .store(end_block.saturating_add(1 + span), Relaxed);
+                    } else {
+                        // Clean consume of a pipelined block: starvation
+                        // (if any) has cleared — re-arm fast response.
+                        lane.detect_streak.store(0, Relaxed);
                     }
                 }
             }
@@ -2113,16 +2159,24 @@ impl DataRouter {
             });
         }
 
-        // Contention-scaled effective window (§5.5 mechanism ii).
+        // Contention-scaled effective window (§5.5 mechanism ii). NO floor:
+        // the doc's formula truncating to 0 is a signal, not an edge case —
+        // when the per-lane share of the hot budget cannot retain even ONE
+        // block, every speculative fill is guaranteed evicted-before-
+        // consume, so the only non-wasteful window is empty (a .max(1)
+        // floor here kept 4 contention-phase lanes thrashing a 2-block
+        // budget: 104 fetches for 48 unique — measured).
         let active = self.stream_gauge.touch(lane) as u64;
         let hot_budget = self.cache.hot_block.max_bytes();
-        let share_blocks =
-            (self.prefetch_share_pct * hot_budget / 100 / block_size.max(1) / active).max(1);
+        let share_blocks = self.prefetch_share_pct * hot_budget / 100 / block_size.max(1) / active;
         let window = lane.window.load(Relaxed).min(self.prefetch_window_cap);
         let effective = (window as u64).min(share_blocks) as u32;
         let hwm = METRICS.prefetch_window_hwm.load(Relaxed);
         if (effective as u64) > hwm {
             METRICS.prefetch_window_hwm.store(effective as u64, Relaxed);
+        }
+        if effective == 0 {
+            return;
         }
 
         // (Re)base the plan when it is uninitialized or fell behind the
@@ -2135,9 +2189,9 @@ impl DataRouter {
 
         // Top up: resident-unconsumed + in-flight bounded by the window
         // (§5.5 mechanism i — issue stops; the spiral cannot start), and
-        // gated by the AIMD quiescence arm (sustained starvation pauses
-        // issue for an epoch instead of re-feeding the evict cycle).
-        if StreamLanes::now_ms() < lane.suppressed_until_ms.load(Relaxed) {
+        // gated by the progress-clocked quiescence arm (sustained
+        // starvation pauses issue instead of re-feeding the evict cycle).
+        if lane.consumed_edge.load(Relaxed) < lane.suppress_until_edge.load(Relaxed) {
             return;
         }
         let total_blocks = meta.size.div_ceil(block_size) as u32;
@@ -2163,7 +2217,7 @@ impl DataRouter {
             METRICS
                 .prefetch_inflight_bytes
                 .fetch_add(block_size, Relaxed);
-            self.spawn_prefetch_task(
+            if !self.spawn_prefetch_task(
                 file_path.to_string(),
                 meta.clone(),
                 next,
@@ -2171,18 +2225,36 @@ impl DataRouter {
                 lanes.clone(),
                 lane_idx,
                 generation,
-            );
+            ) {
+                // Admission shed the task un-run (P1-5: foreground always
+                // wins): roll the issue-side accounting back HERE — the
+                // task's own settle path never executes, and a leaked
+                // `inflight` never drains (the lane would stall at
+                // `in_flight + unconsumed >= effective` forever). The
+                // block was not fetched: it stays foreground-served;
+                // `prefetch_wasted` balances the task ledger so
+                // `issued == completed + wasted` still converges.
+                lane.inflight.fetch_sub(1, Relaxed);
+                METRICS
+                    .prefetch_inflight_bytes
+                    .fetch_sub(block_size, Relaxed);
+                METRICS.prefetch_wasted.fetch_add(1, Relaxed);
+                break;
+            }
         }
     }
 
     /// One §5.5 pipeline fetch: through the single-flight (dedupes with
     /// the foreground — R1a's guarantee), fills landing hot-tier probation
-    /// via the admission table's first-touch row. The GDS local-cache arm
-    /// and the tier-resident MADV_WILLNEED arm of the legacy prefetcher
-    /// are preserved verbatim. Stale-generation completions land as
-    /// `prefetch_wasted` (their probationary put is refcount-cheap and
-    /// first in eviction line — §5.5 deliberately skips io_uring cancel
-    /// plumbing).
+    /// via the admission table's prefetch row (ghost-bypassed —
+    /// speculative). The GDS local-cache arm and the tier-resident
+    /// MADV_WILLNEED arm of the legacy prefetcher are preserved verbatim.
+    /// Stale-generation completions land as `prefetch_wasted` (their
+    /// probationary put is refcount-cheap and first in eviction line —
+    /// §5.5 deliberately skips io_uring cancel plumbing).
+    ///
+    /// Returns `spawn_bg`'s admission verdict: `false` = the task was
+    /// shed un-run and the CALLER must roll back its issue accounting.
     #[allow(clippy::too_many_arguments)]
     fn spawn_prefetch_task(
         &self,
@@ -2193,7 +2265,7 @@ impl DataRouter {
         lanes: std::sync::Arc<StreamLanes>,
         lane_idx: usize,
         generation: u64,
-    ) {
+    ) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let router = self.clone();
         crate::bg_admit::spawn_bg(async move {
@@ -2274,14 +2346,16 @@ impl DataRouter {
                 return;
             }
 
-            match router.get_cached_or_fetch_block(&key).await {
+            // Speculative: §5.3's prefetch admission row — probation put,
+            // no disk publish, no ghost stamp (consumer references only).
+            match router.get_cached_or_fetch_block_traced(&key, true).await {
                 Ok(_) => settle(true),
                 Err(err) => {
                     debug!("Prefetch: failed to fetch block {key}: {err:?}");
                     settle(false);
                 }
             }
-        });
+        })
     }
 
     /// The CURRENT block-index→key binding of `(file_path, b)`, as fresh as
@@ -2347,7 +2421,9 @@ impl DataRouter {
             let Some(cur_key) = key else {
                 return Ok(None);
             };
-            let (val, incarnation_valid) = self.get_cached_or_fetch_block_traced(&cur_key).await?;
+            let (val, incarnation_valid) = self
+                .get_cached_or_fetch_block_traced(&cur_key, false)
+                .await?;
             // Recheck the binding only AFTER the bytes are in hand: the
             // proof needs (movement between snapshot and serve) ⇒ (word
             // changed), which only holds when the recheck follows the read.

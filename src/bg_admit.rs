@@ -69,7 +69,12 @@ pub static STRIPED_IO_SEM: Lazy<Arc<Semaphore>> =
 
 /// Spawn a best-effort background task. If no permit is available immediately,
 /// the work is skipped (logged at debug) rather than queued unboundedly.
-pub fn spawn_bg<F>(fut: F)
+/// Returns whether the task was ADMITTED (`false` = shed, the future was
+/// dropped un-run). Callers that account issue-side state before spawning
+/// (the §5.5 prefetch pipeline) must roll it back on `false` — a shed
+/// task never reaches its own settle path. Best-effort callers may ignore
+/// the verdict.
+pub fn spawn_bg<F>(fut: F) -> bool
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -83,12 +88,14 @@ where
                 let _permit = permit;
                 fut.await;
             });
+            true
         }
         Err(_) => {
             crate::fuse_client::METRICS
                 .bg_spawn_rejected
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::debug!("bg_admit: rejected background task (admission full)");
+            false
         }
     }
 }

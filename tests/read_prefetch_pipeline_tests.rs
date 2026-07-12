@@ -263,6 +263,44 @@ async fn pipeline_phases() {
         "in-flight gauge returns to zero at settle"
     );
 
+    // ---- Phase A2: prefetch fills bypass the ghost table (§5.3 admission
+    // table, "Prefetch fills: put probation, skip" — NO ghost-record,
+    // unlike the Random row). If speculative fills stamp/check the ghost,
+    // a re-streamed file reads back as "re-read heat" fetched by the
+    // pipeline itself: protected-hot + NVMe-tier publishes land mid-read
+    // — measured live on the bench row-2 shape as 614 fake ghost hits =>
+    // 4.5 GiB of tier writes competing with the stream they were meant to
+    // serve. Consumer (foreground) fetches keep full ghost semantics: the
+    // pre-classification foreground fills may record + later hit (<= 2).
+    {
+        let map =
+            h.fs.router
+                .fetch_metadata(&squeezefs::keys::inode_path(ino))
+                .await
+                .unwrap()
+                .block_map
+                .unwrap_or_default();
+        for key in map.values() {
+            h.fs.router.cache.purge_block_key(key);
+        }
+    }
+    let g0 = METRICS.get_obj.load(Ordering::Relaxed);
+    let admit0 = METRICS.read_tier_admissions.load(Ordering::Relaxed);
+    stream_file(&h, ino, 16, 1).await;
+    settle_pipeline().await;
+    assert_eq!(
+        METRICS.get_obj.load(Ordering::Relaxed) - g0,
+        16,
+        "re-stream after purge: still one device fetch per unique block"
+    );
+    let admitted = METRICS.read_tier_admissions.load(Ordering::Relaxed) - admit0;
+    assert!(
+        admitted <= 2,
+        "pipeline fills must SKIP the ghost table (admission-table prefetch \
+         row): a purged re-stream admitted {admitted} blocks to the disk \
+         tier — speculative fills are manufacturing re-read heat"
+    );
+
     // ---- Phase B: abandonment — a non-sequential read stops issue within
     // one window; nothing leaks.
     let ino_b = make_cold_file(&h, "pipe_b", 24, 40).await;
@@ -412,4 +450,39 @@ async fn pipeline_phases() {
          (gauge = {gauge}) — an inc/dec counter would leak here"
     );
     settle_pipeline().await;
+
+    drop(h4);
+
+    // ---- Phase G: spawn-admission rejection accounting. `spawn_bg`
+    // SHEDS work when the global pool is saturated (P1-5) — a shed
+    // prefetch task never runs, so its issue-side accounting (lane
+    // inflight, `prefetch_inflight_bytes`) must be rolled back at the
+    // rejection site. Otherwise the lane's inflight never drains, issue
+    // stops forever (in_flight + unconsumed >= effective eternally — a
+    // silent lane stall), and `issued == completed + wasted` never
+    // converges.
+    let h5 = make_with(*b"pipeline-g-pr5v3", "pipe_ns_g").await;
+    let ino_g = make_cold_file(&h5, "pipe_g", 16, 70).await;
+    let mut held = Vec::new();
+    for _ in 0..squeezefs::bg_admit::capacity() {
+        held.push(
+            squeezefs::bg_admit::BG_TASK_SEM
+                .clone()
+                .try_acquire_owned()
+                .expect("acquire up to capacity"),
+        );
+    }
+    // Stream under saturation: every pipeline spawn is shed. Foreground
+    // reads are unaffected (fills are foreground work, not spawn_bg).
+    stream_file(&h5, ino_g, 8, 70).await;
+    settle_pipeline().await; // hangs (then panics) if rejection leaks
+    drop(held);
+    // Pool released: the stream's tail pipelines normally and settles.
+    stream_file(&h5, ino_g, 16, 70).await;
+    settle_pipeline().await;
+    assert_eq!(
+        METRICS.prefetch_inflight_bytes.load(Ordering::Relaxed),
+        0,
+        "in-flight gauge must return to zero after shed + resumed issue"
+    );
 }

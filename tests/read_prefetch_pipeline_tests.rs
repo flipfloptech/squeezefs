@@ -55,6 +55,14 @@ struct H {
 
 async fn make_with(uuid: [u8; 16], alloc_ns: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "524288");
+    // R3 (PR 6) fixture pin: this suite's contracts exercise the
+    // WHOLE-BLOCK fill/admission/hot-tier machinery with sub-block reads;
+    // on passthrough volumes those reads now legitimately take the ranged
+    // path (§5.6 granularity policy) and never fill hot/tier at all.
+    // Disable ranged dispatch here; the ranged path's own contracts —
+    // including its ghost-convergence interplay with admission — live in
+    // tests/ranged_read_tests.rs.
+    std::env::set_var("SQUEEZEFS_READ_RANGED_THRESHOLD", "0");
     let dlm = DlmClient::new("local").unwrap();
 
     let b = NamedTempFile::new().unwrap();

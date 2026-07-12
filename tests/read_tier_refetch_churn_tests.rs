@@ -67,6 +67,13 @@ async fn make() -> H {
     // identical); the pipeline's own counting discipline lives in
     // tests/read_prefetch_pipeline_tests.rs.
     std::env::set_var("SQUEEZEFS_READ_PREFETCH_WINDOW", "0");
+    // Likewise R3 (PR 6): sub-block reads on passthrough volumes now
+    // legitimately fetch 4 KiB windows instead of whole blocks — the
+    // doc's granularity policy (§5.6: "get_obj/unique ≈ 1.0 framings
+    // apply to whole-block workloads ... where ranged never fires").
+    // This suite pins the WHOLE-BLOCK fetch/dedupe machinery; the ranged
+    // path's own contracts live in tests/ranged_read_tests.rs.
+    std::env::set_var("SQUEEZEFS_READ_RANGED_THRESHOLD", "0");
     let dlm = DlmClient::new("local").unwrap();
 
     let b = NamedTempFile::new().unwrap();

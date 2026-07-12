@@ -11,9 +11,10 @@
 //!     lands inside the tag check and every padded open fails.
 //!
 //! The fix frames every non-passthrough image as `[u32 LE image_len]`
-//! + image. FORWARD-ONLY (standing directive 2026-07-12): unframed
-//! legacy blobs refuse loud — no sniffing shim; cold reads of such
-//! volumes never worked, so there is nothing behavioral to preserve.
+//! plus the image. FORWARD-ONLY (standing directive 2026-07-12):
+//! unframed legacy blobs refuse loud — no sniffing shim; cold reads of
+//! such volumes never worked, so there is nothing behavioral to
+//! preserve.
 //!
 //! Passthrough volumes are byte-identical (no frame — the passthrough
 //! contract is zero transform, and R3 ranged reads depend on it).

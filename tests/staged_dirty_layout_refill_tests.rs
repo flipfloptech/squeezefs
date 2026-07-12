@@ -272,26 +272,24 @@ async fn staged_growth_survives_ttl_refill_after_promotion() {
 
     let pat1 = pattern(L1);
     write_at(&h, ino, 0, &pat1).await;
-    let file_id = h
-        .fs
-        .router
-        .fetch_metadata(&path)
-        .await
-        .unwrap()
-        .file_id
-        .expect("staged file_id");
+    let file_id =
+        h.fs.router
+            .fetch_metadata(&path)
+            .await
+            .unwrap()
+            .file_id
+            .expect("staged file_id");
 
     // Wait until the merge worker promotes (publishes block_map[0], persists
     // the promotion-era layout, releases the ring entry).
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let promoted = h
-                .fs
-                .router
-                .metadata_cache
-                .get(&path)
-                .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()))
-                .is_some();
+            let promoted =
+                h.fs.router
+                    .metadata_cache
+                    .get(&path)
+                    .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()))
+                    .is_some();
             if promoted && h.fs.router.cache.nvme.read_staged(&file_id).is_none() {
                 return;
             }

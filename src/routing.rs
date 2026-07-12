@@ -1709,9 +1709,17 @@ impl DataRouter {
                 nvme_writer,
                 backend_router,
                 block_size,
+                // time_to_IDLE, not time_to_live: a `layout_dirty` entry is
+                // the ONLY authority for its layout until the persist cadence
+                // cleans it (see fetch_metadata) — expiry keyed on last WRITE
+                // let an actively-READ dirty entry idle out and strand acked
+                // payload behind a stale backend refill. Access-refreshed
+                // expiry keeps any observed entry resident; staleness is
+                // governed by `cached_at` (the 1 s freshness horizon), not by
+                // residency.
                 metadata_cache: moka::sync::Cache::builder()
                     .max_capacity(metadata_capacity)
-                    .time_to_live(std::time::Duration::from_secs(300))
+                    .time_to_idle(std::time::Duration::from_secs(300))
                     .build(),
                 block_map_cache: moka::sync::Cache::builder()
                     .max_capacity(block_map_capacity)
@@ -2823,8 +2831,27 @@ impl DataRouter {
 
     pub async fn fetch_metadata(&self, file_path: &str) -> Result<CachedMetadata> {
         use std::time::Duration;
+        // A DIRTY layout is the LOCAL AUTHORITY, never re-validated from the
+        // backend: a staged/inline write's layout+size live only in RAM (+
+        // the staging ring) until the fsync/flush/promotion cadence persists
+        // them (`layout_dirty`), so the TTL refill below would replace the
+        // only pointer to acked payload with a stale backend snapshot — or
+        // with the default empty entry when the backend never saw a layout.
+        // On an aged daemon (merge queue saturated, persists deferred for
+        // seconds) any >1 s op gap then made acked staged bytes read back as
+        // ZEROS and turned the follow-up fsync into a hard failure (the
+        // aged-fsx loss class, tests/staged_dirty_layout_refill_tests.rs).
+        // Dirty entries are cleaned only under INODE_META_LOCKS by the paths
+        // that persist them (persist_dirty_layout_if_needed, promotion,
+        // spill), which insert the fresh CLEAN entry themselves; a held DLM
+        // lease means no remote writer can legitimately outrun a dirty
+        // entry, and lease-loss staleness is governed by fencing at persist
+        // time — not by serving a snapshot that predates acked writes.
+        let fresh_or_dirty = |entry: &CachedMetadata| {
+            entry.layout_dirty || entry.cached_at.elapsed() < Duration::from_secs(1)
+        };
         if let Some(entry) = self.metadata_cache.get(file_path) {
-            if entry.cached_at.elapsed() < Duration::from_secs(1) {
+            if fresh_or_dirty(&entry) {
                 return Ok(entry.clone());
             }
         }
@@ -2834,10 +2861,10 @@ impl DataRouter {
         // Refill under the per-inode metadata lock so a stale backend snapshot
         // can never clobber a concurrent writer's fresh cache entry (see
         // INODE_META_LOCKS). Double-check after acquiring: a writer or racing
-        // filler may have refreshed the entry while we waited.
+        // filler may have refreshed (or dirtied) the entry while we waited.
         let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
         if let Some(entry) = self.metadata_cache.get(file_path) {
-            if entry.cached_at.elapsed() < Duration::from_secs(1) {
+            if fresh_or_dirty(&entry) {
                 return Ok(entry.clone());
             }
         }

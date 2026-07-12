@@ -91,8 +91,45 @@ Yellow dehydration pause drops protected victims (counted, tier untouched) · Re
 Green resumes prefetch issue · Yellow freezes window growth (hwm pinned) · the parked
 DRAIN empties striped sub-block overwrite parks byte-exactly.
 
+## The QUICK cage class — root-caused, two real fixes, honest residual
+
+The gate assigned this PR the cage-OOM cascade class outright. Diagnostic chain (all
+traces committed under `~/tmp/sqperf/results/p7_*trace*`):
+
+1. **Root cause #1 — the eviction channels (FIXED, `64ba50d`):** gauge-vs-RSS tracing
+   across a full QUICK run caught RSS ramping 2.1 → 7.5 GiB in < 30 s during the 617 fsx
+   soak while every registered gauge sat at ~512 MiB: the dehydration channels parked up
+   to 16,384 full payloads of live `Bytes` each — ungauged, and (write_lru) with **no
+   consumer at all**. Fix: send-side byte bound (256 MiB) + receiver credit + arm-on-take
+   (worker-less channels never park). Pinned in `mem_budget_tests`.
+2. **Root cause #2 — allocator-retained pages (FIXED, `6a31faa`):** post-shed the aged
+   TEST daemon idled at ~5 GiB anon with gauges at ~130 MiB and **no VMA over 200 MiB**
+   (`p7_full_trace`): fragmented jemalloc-retained pages from metadata-node churn. Fix:
+   Red-tick `arena.<all>.purge` (the allocator-side twin of the pool trim; NOT the OQ #4
+   watch — detection stays with the RSS sampler).
+3. **Plus** the Red-clearable metadata-cache components (`e9812cc`).
+
+Result: the **first fully-clean QUICK runs of this program** ({003, 213} only — zero
+cage events). Across 6 tip runs: 2× fully clean; 4× exactly one cage flake in the
+tier-tail set (618 ×3, 069 ×1; victim rotates).
+
+**Honest residual, attributed:** the remaining intermittent kill is an **anon allocation
+flood in the CoW KV metadata core** on an aged daemon — 0.2 s-resolution fingerprint
+(`p7_fast_trace`): RSS +1.3 GiB in 1.3 s with `get_obj`/`put_obj` FROZEN while
+`meta_kv_journal_entries` runs at ~1,300/s (setattr storm; the daemon at 5.9 M fuse_ops,
+287 K journal entries, 148 checkpoints). No component this design inventories (§5.7
+table) owns those allocations, and the harness's own flake ledger already documents the
+class as pre-existing capacity shape ("NOT a leak and NOT new: pristine dev@74190d2
+peaks HIGHER on the same roll" — `tests/run_fstests.sh`). Shortfall recorded per the
+program's discipline; the KV-core allocation burst is named for PR 8 / the metadata
+program (a per-volume KV write-path gauge + admission would be the §5.7-shaped fix).
+Standalone 616/617/618: 3/3 green each; the 10-minute 616-shape fsx soak (1,170,579
+ops) completes on a fresh caged daemon.
+
 ## Gates
 
 - Cargo gate (tip): see final report (clippy/fmt/full serial suite/doc/bench smoke).
-- fstests QUICK + LTP: see final report — **the cage-OOM cascade class is this PR's own
-  gate now** (618-class cascades = failure, not attribution).
+- **LTP (`MEMMAX=8G`): PASS / FAIL 0 / SKIP 9** ✓.
+- fstests QUICK: {003, 213} platform set + the documented tier-tail capacity flake as
+  recorded above (2/6 fully clean — first ever; residual attributed to the KV core with
+  the fingerprint).

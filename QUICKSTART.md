@@ -197,6 +197,16 @@ SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES=8192 \
 
 # Inode-reclaim group-commit batch size (default 64):
 SQUEEZEFS_RECLAIM_BATCH=128 sudo -E ./target/release/squeezefs mount …
+
+# Read-path knobs (defaults are the measured sweet spot — see README →
+# "Read-path tuning" and docs/design-read-path.md). Examples:
+#   pin a memory budget instead of the cgroup-derived default:
+sudo -E ./target/release/squeezefs mount … --mem-budget 6G
+#   disable the sequential prefetch pipeline / sub-block ranged reads (A/B):
+SQUEEZEFS_READ_PREFETCH_WINDOW=0 SQUEEZEFS_READ_RANGED_THRESHOLD=0 \
+  sudo -E ./target/release/squeezefs mount …
+#   restore unconditional first-touch tier publishes (pre-program behavior):
+SQUEEZEFS_READ_TIER_ADMISSION=always sudo -E ./target/release/squeezefs mount …
 ```
 
 v3 **format-time** knobs (`README.md` → *Format Squeezefs Volume*): `--meta-node-kib <64|128|256|512|1024>` (node size, default `256`; below 256 the per-volume record-value cap drops to `node_size/4`) and `--meta-journal-mb <MiB>` (journal ring, default `clamp(volume/64, 8 MiB, 32 MiB)`).

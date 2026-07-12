@@ -5,7 +5,7 @@
 | **Title** | Read-path performance program: scan-resistant tier admission, result-carrying single-flight, sequential prefetch pipeline, sub-block ranged reads, hot-block RAM tier, and a joint memory budget — make reads faster than writes |
 | **Author** | Justin (data-path owner) — reviewer sign-off pending |
 | **Date** | 2026-07-11 |
-| **Status** | **Approved** (2026-07-12 — 3 review rounds, 15/15 review issues resolved, all five Open Question defaults user-approved verbatim; next lifecycle step per Intended home: → Implemented with a landed-SHA table) |
+| **Status** | **Implemented** (2026-07-12 — PRs 1–8 landed on `dev`, per-PR SHAs below; closing gate evidence `.benchmarks/2026-07-12-read-path-closing.md`: row 2 cold reads 6,512 vs same-session row 1 writes 3,441 MiB/s = **1.89× inverted**, rand-4k 59,545 IOPS at 0.98× amplification. Approved 2026-07-12 after 3 review rounds, 15/15 issues resolved, all five Open Question defaults user-approved verbatim) |
 | **Repo** | `/home/justin/Source/squeezefs`, branch `dev` @ `4f1c897` |
 | **Intended home** | `docs/design-read-path.md` (committed by PR 1 of the plan; lifecycle mirrors `docs/design-zero-copy-write-path.md`: Draft → Implemented with a landed-SHA table) |
 | **Reviewers** | FUSE / data-path owners |
@@ -13,18 +13,16 @@
 
 ## Landed (per-PR SHAs on `dev`)
 
-_To be filled as PRs merge — same table shape as the zero-copy write doc._
-
 | PR | Landed as (tests-first + implementation) | Gate evidence |
 |---|---|---|
-| PR 1 — design + baseline | _pending_ | — |
-| PR 2 — result-carrying single-flight (R1a) | _pending_ | — |
-| PR 3 — hot-block RAM tier (R4) | _pending_ | — |
-| PR 4 — scan-resistant admission + O_DIRECT no-publish (R1b) | _pending_ | — |
-| PR 5 — sequential prefetch pipeline (R2) | _pending_ | — |
-| PR 6 — sub-block ranged reads (R3) | _pending_ | — |
-| PR 7 — joint memory budget (R5) | _pending_ | — |
-| PR 8 — closing report + docs | _pending_ | — |
+| PR 1 — design + baseline | `5c5e97d` (this document, approved) · `8c3f585` (committed baseline) | `.benchmarks/2026-07-11-read-path-baseline.md` |
+| PR 2 — result-carrying single-flight (R1a) | `8a882bd` (tests) · `cdbfab6` (impl) · `77cfb4f` (evidence) | `.benchmarks/2026-07-12-read-path-pr2-result-carrying-single-flight.md` |
+| PR 3 — hot-block RAM tier + unified purge (R4) | `0afbd89` (tests) · `ee7f1d1` (impl) · `2e188b8` (evidence) | `.benchmarks/2026-07-12-read-path-pr3-hot-block-tier.md` |
+| PR 4 — scan-resistant admission + O_DIRECT no-publish (R1b) | `bfd1656` (tests) · `b5f3d8d` (impl) · `1737fbf` (liveness correction) · `3a5c576` (triage: default deferred to PR 5, EBR retention fixes) · `59dadae` (evidence) · `299eb98` (chore) | `.benchmarks/2026-07-12-read-path-pr4-tier-admission.md` |
+| PR 5 — sequential prefetch pipeline (R2; admission default → `second-touch`) | `2643391` (tests) · `df7f3a8` (impl) · `ff0b14e` (consume-time residency detection) · `8d553ce` (progress-clocked quiescence, shed rollback) · `61d0644` (one-lap clock grace) · `e42b8dd` (ghost-semantics correction) · `82af5e8` (dehydration dedupe) · `8b1bd1a` (evidence) | `.benchmarks/2026-07-12-read-path-pr5-prefetch-pipeline-inversion.md` — **the inversion: 1.71× / 1.10×** |
+| PR 6 — sub-block ranged reads (R3) | `c19bbb3` (tests) · `f9edc1f` (framing tests) · `9ff64c2` (transform-frame fix — pre-existing decode bug) · `f628c35` (impl) · `ae052b2` (evidence) | `.benchmarks/2026-07-12-read-path-pr6-ranged-reads.md` — rand-4k 37 k IOPS, 0.98× amp |
+| PR 7 — joint memory budget (R5) | `3947394` (tests) · `f6a209e` (authority) · `7d94f5c` (parked drain) · `3fb6591` (idle-only pool gauges) · `64ba50d` (eviction-channel byte-bound/arm-on-take) · `6a31faa` (Red allocator purge) · `e9812cc` (metadata-cache components) · `3c89cd7` (evidence) | `.benchmarks/2026-07-12-read-path-pr7-mem-budget.md` — row-5 cage survives; 3G-probe collapse gone (25×) |
+| PR 8 — closing report + docs | this PR (docs + closing measurements) | `.benchmarks/2026-07-12-read-path-closing.md` — **program acceptance: gates A/B verdicts, R-10 cumulative judgment, follow-up dispositions** |
 
 ---
 

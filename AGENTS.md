@@ -549,6 +549,8 @@ Use coz/dhat **after** a known-good cargo test gate, against a representative mo
 
 Mounted volumes expose process metrics under the virtual **stats** inode (JSON), including layout mix, bg admission, uring queue-full, and lease acquire outcomes. Prefer these for live regression signals over ad-hoc logging. Per-volume metadata format + durability fields (`meta_format_version`, `meta_volume_atomicity[_physical]`) and the `meta_kv_*` family are listed under **Metadata format: v3 CoW KV (the only format)**.
 
+**Read-path program families** (`docs/design-read-path.md` §Observability — semantics + regression thresholds there): `singleflight_waiter_result_serves` (R1a cohort serves); `hot_block_{hits,misses,evictions,probation_drops,dehydrate_skips,current_bytes}` (R4 RAM tier); `read_fill_publishes_skipped` / `read_tier_admissions` / `read_tier_admission_ghost_hits` / `read_tier_admission_mode` (R1b second-touch admission — skipped ≈ streamed cold blocks); `prefetch_{issued,completed,wasted,inflight_bytes,window_hwm,foreground_waits,evicted_unconsumed,active_streams}` (R2 pipeline — `evicted_unconsumed` is the refetch-spiral detector); `ranged_{reads,read_bytes,read_unaligned_bounces,read_rebinds}` (R3 — `ranged_read_bytes` vs user bytes is the rand-4k amplification bound; `get_obj` counts ranged ops by design); `mem_budget_{bytes,pressure_bytes,gauge_sum_bytes,level,yellow_events,red_events,floors_clamped,dehydrate_paused,components{…}}` (R5 authority — red_events with no OOM is the designed outcome under pressure).
+
 ---
 
 ## Branch & Commit Workflow

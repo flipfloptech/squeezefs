@@ -318,3 +318,171 @@ async fn fetched_blocks_are_tier_visible_and_never_refetched() {
         );
     }
 }
+
+/// R1a (docs/design-read-path.md §5.2) — the result-carrying single-flight.
+/// Waiter correctness must come from the CARRIED FILL RESULT, not from the
+/// tier publish: PR 4 will skip publishes for streaming fills, so a waiter
+/// that needs the tier to hit would refetch — the exact churn this suite
+/// exists to pin out. Phases (one test fn — get_obj and the new
+/// singleflight_waiter_result_serves counter are process-global, same
+/// counter-isolation discipline as the phase A–D fn):
+///
+/// - E (waiter-serves-from-result): with the tier put artificially delayed
+///   via `routing::TEST_TIER_PUBLISH_DELAY_MS` (the §5.2 named seam,
+///   FAIL_NEXT_WRITES precedent), N concurrent cold resolvers of one block
+///   dedupe to ONE device fetch and every non-primary is served from the
+///   broadcast FillResult (`singleflight_waiter_result_serves == N-1`) —
+///   bytes correct, no tier probe needed for correctness.
+/// - F (late subscriber): a reader arriving after the cohort completed is
+///   served by the cache re-check (tier hit while resident) — zero device
+///   fetches, zero result-serves (the §5.2 close-only guard-drop case).
+/// - G (primary failure): every member of a cohort whose primary's device
+///   fetch fails gets an error promptly (the un-completed guard's Drop
+///   sends `None` before closing — waiters fail fast into the re-check
+///   loop, never park out the 60 s deadline); no device-read counter
+///   movement (failed reads never count).
+/// - H (primary cancelled mid-publish): aborting the primary's future while
+///   it awaits the delayed publish drops the un-completed guard ⇒ `None` ⇒
+///   live waiters re-check, ONE becomes the new primary and refetches
+///   (device fetches == 2 total), the rest are served from the second
+///   cohort's result (`singleflight_waiter_result_serves == cohort-1`) —
+///   no fill leak, no hang, correct bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn result_carrying_single_flight_decouples_waiters_from_publish() {
+    use squeezefs::routing::TEST_TIER_PUBLISH_DELAY_MS;
+
+    let h = make().await;
+
+    // Fixture: two fresh striped blocks (block 1 is the phase-H probe,
+    // block 0 the phase-E/F probe), made cold exactly like phases A–D.
+    let ino = create(&h, "r1a_probe").await;
+    write_at(&h, ino, 0, &vec![0xE1u8; BS as usize]).await;
+    write_at(&h, ino, BS, &vec![0xF2u8; BS as usize]).await;
+    let map = make_cold(&h, ino).await;
+    let k0 = map.get(&0).expect("block 0 mapped").clone();
+    let k1 = map.get(&1).expect("block 1 mapped").clone();
+
+    // ---- Phase E: delayed publish, 4 concurrent resolvers, 1 fetch,
+    // waiters served from the carried result.
+    TEST_TIER_PUBLISH_DELAY_MS.store(400, Ordering::Relaxed);
+    let g_e0 = METRICS.get_obj.load(Ordering::Relaxed);
+    let w_e0 = METRICS
+        .singleflight_waiter_result_serves
+        .load(Ordering::Relaxed);
+    let reads = (0..4u64).map(|i| read_at(&h, ino, i * 128 * 1024, 128 * 1024));
+    let results = futures::future::join_all(reads).await;
+    TEST_TIER_PUBLISH_DELAY_MS.store(0, Ordering::Relaxed);
+    for (i, d) in results.iter().enumerate() {
+        assert_eq!(d.len(), 128 * 1024, "phase E slice {i} length");
+        assert!(
+            d.iter().all(|&x| x == 0xE1),
+            "phase E slice {i} content — waiters must serve the fill's real bytes"
+        );
+    }
+    let g_e = METRICS.get_obj.load(Ordering::Relaxed);
+    let w_e = METRICS
+        .singleflight_waiter_result_serves
+        .load(Ordering::Relaxed);
+    assert_eq!(g_e - g_e0, 1, "phase E: one device fetch for the cohort");
+    assert_eq!(
+        w_e - w_e0,
+        3,
+        "phase E: every non-primary cohort member must be served from the \
+         carried FillResult (not a tier probe) — publish-independent \
+         waiter correctness is R1a's whole point"
+    );
+    assert!(tier_has(&h, &k0), "phase E: publish still lands (PR 2 keeps it)");
+
+    // ---- Phase F: post-cohort reader = cache re-check serve, no fetch,
+    // no result-serve.
+    let g_f0 = METRICS.get_obj.load(Ordering::Relaxed);
+    let w_f0 = METRICS
+        .singleflight_waiter_result_serves
+        .load(Ordering::Relaxed);
+    let d = read_at(&h, ino, 3 * 128 * 1024, 128 * 1024).await;
+    assert!(d.iter().all(|&x| x == 0xE1), "phase F content");
+    assert_eq!(
+        METRICS.get_obj.load(Ordering::Relaxed) - g_f0,
+        0,
+        "phase F: late reader must be a cache hit"
+    );
+    assert_eq!(
+        METRICS
+            .singleflight_waiter_result_serves
+            .load(Ordering::Relaxed)
+            - w_f0,
+        0,
+        "phase F: late reader is served by the re-check loop, not the \
+         (closed) broadcast"
+    );
+
+    // ---- Phase G: failing primary — whole cohort errors promptly, no
+    // 60 s deadline park, no device-read counter movement.
+    let g_g0 = METRICS.get_obj.load(Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    let fetches = (0..4).map(|_| h.fs.router.get_cached_or_fetch_block("unknownbe://42"));
+    let results = futures::future::join_all(fetches).await;
+    for (i, r) in results.iter().enumerate() {
+        assert!(r.is_err(), "phase G resolver {i} must surface the fetch error");
+    }
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(10),
+        "phase G: cohort failure must resolve promptly (None-on-drop), \
+         never park toward the 60 s deadline"
+    );
+    assert_eq!(
+        METRICS.get_obj.load(Ordering::Relaxed) - g_g0,
+        0,
+        "phase G: failed fetches never count device reads"
+    );
+
+    // ---- Phase H: primary aborted mid-publish — waiters recover through
+    // a second cohort; exactly one refetch; no leak, no hang.
+    TEST_TIER_PUBLISH_DELAY_MS.store(800, Ordering::Relaxed);
+    let g_h0 = METRICS.get_obj.load(Ordering::Relaxed);
+    let w_h0 = METRICS
+        .singleflight_waiter_result_serves
+        .load(Ordering::Relaxed);
+    let router = h.fs.router.clone();
+    let k1c = k1.clone();
+    let primary = tokio::spawn(async move { router.get_cached_or_fetch_block(&k1c).await });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let waiters: Vec<_> = (0..3)
+        .map(|_| {
+            let router = h.fs.router.clone();
+            let k = k1.clone();
+            tokio::spawn(async move { router.get_cached_or_fetch_block(&k).await })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    primary.abort();
+    let _ = primary.await; // JoinError(cancelled) expected
+    for (i, w) in futures::future::join_all(waiters).await.into_iter().enumerate() {
+        let val = w
+            .expect("phase H waiter task must not panic")
+            .unwrap_or_else(|e| panic!("phase H waiter {i} must recover after the abort: {e:?}"));
+        assert_eq!(val.len(), BS as usize, "phase H waiter {i} length");
+        assert!(
+            val.iter().all(|&x| x == 0xF2),
+            "phase H waiter {i} content — recovery must serve block 1's real bytes"
+        );
+    }
+    TEST_TIER_PUBLISH_DELAY_MS.store(0, Ordering::Relaxed);
+    let g_h = METRICS.get_obj.load(Ordering::Relaxed);
+    let w_h = METRICS
+        .singleflight_waiter_result_serves
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        g_h - g_h0,
+        2,
+        "phase H: the aborted primary's fetch plus exactly one recovery \
+         refetch — waiters must neither all refetch (leak) nor serve a \
+         cancelled cohort's missing result (hang)"
+    );
+    assert_eq!(
+        w_h - w_h0,
+        2,
+        "phase H: the second cohort's two non-primaries are served from \
+         its carried result"
+    );
+}

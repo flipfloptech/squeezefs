@@ -302,6 +302,7 @@ impl MemBudget {
 
         if next == Level::Red {
             self.shed_to_weights(budget, pressure, &reg);
+            purge_allocator_retained();
         }
     }
 
@@ -465,6 +466,35 @@ fn system_ram_bytes() -> u64 {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     sys.total_memory()
+}
+
+/// Red-tick allocator purge: force jemalloc to return retained dirty
+/// pages to the OS NOW (`arena.<all>.purge` via mallctl). The QUICK
+/// cage-OOM residual was exactly this shape — after the component sheds,
+/// the daemon sat at ~5 GiB anon with every registered gauge at ~130 MiB
+/// and NO VMA over 200 MiB: fragmented allocator-retained pages from
+/// metadata-node churn (11 M+ node-cache hits), which the 1 s decay only
+/// trickles back while the cage kills in one burst. Purging is the
+/// allocator-side twin of the pool trim; a no-op off-Linux/dhat. This is
+/// NOT the OQ #4 jemalloc *watch* (still out — the RSS sampler covers
+/// detection); it is a shed lever, fired only in Red.
+fn purge_allocator_retained() {
+    #[cfg(all(target_os = "linux", not(feature = "dhat-on")))]
+    {
+        // SAFETY: mallctl with a null oldp/newp and a static name string is
+        // the documented no-argument command form; "arena.4096.purge"
+        // (MALLCTL_ARENAS_ALL = 4096) purges every arena.
+        unsafe {
+            let name = b"arena.4096.purge\0";
+            let _ = tikv_jemalloc_sys::mallctl(
+                name.as_ptr() as *const _,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            );
+        }
+    }
 }
 
 /// Spawn the 1 Hz sampler (mount-time; one task per process — idempotent

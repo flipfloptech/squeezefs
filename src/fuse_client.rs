@@ -3153,6 +3153,29 @@ impl Filesystem for SqueezefsFilesystem {
                     Arc::new(move || tier.current_read_cache_bytes()),
                     Arc::new(|_| {}),
                 ));
+                // RAM metadata caches (refill-from-backend caches — a Red
+                // clear is always correctness-safe). Gauges are
+                // conservative per-entry estimates: the VALUE here is the
+                // shed (an aged daemon's metadata churn was the QUICK
+                // cage class's live-set driver), not byte-exact billing.
+                let meta_cache = self.router.metadata_cache.clone();
+                let meta_cache_shed = self.router.metadata_cache.clone();
+                MEM_BUDGET.register(Component::new(
+                    "metadata_cache",
+                    0,
+                    1,
+                    Arc::new(move || meta_cache.entry_count() * 1024),
+                    Arc::new(move |_| meta_cache_shed.invalidate_all()),
+                ));
+                let bmap_cache = self.router.block_map_cache.clone();
+                let bmap_cache_shed = self.router.block_map_cache.clone();
+                MEM_BUDGET.register(Component::new(
+                    "block_map_cache",
+                    0,
+                    1,
+                    Arc::new(move || bmap_cache.entry_count() * 256),
+                    Arc::new(move |_| bmap_cache_shed.invalidate_all()),
+                ));
                 MEM_BUDGET.register(Component::new(
                     "buffer_pool",
                     16 * 4 * MIB,

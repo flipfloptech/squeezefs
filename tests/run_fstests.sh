@@ -367,10 +367,13 @@ EOF
 #           rework. A DIFFERENT diff than the 10 known atime/ctime ERROR
 #           lines = regression.
 #     213 = thin provisioning: fallocate(mode=0) never reserves physical
-#           blocks (sparse/dynamic backend by design; statfs is virtual),
-#           so the "fallocate: No space left on device" golden line never
-#           appears. All other 213 legs pass; exactly that one missing
-#           line is the expected diff.
+#           blocks (sparse/dynamic backend by design — statfs now reports
+#           honest capacity/allocated numbers per fix/real-statfs, but
+#           fallocate still reserves nothing), so the "fallocate: No
+#           space left on device" golden line never appears. All other
+#           213 legs pass; exactly that one missing line is the expected
+#           diff (re-verified 2026-07-12 on the honest-statfs branch:
+#           identical diff shape, 2x rolls).
 #   127/616 (+074 fstest.2, 075) transient-ZEROS family = FIXED
 #           (fix/staged-identity-transient-zeros; ring atomic same-key
 #           replace f924085 + staged-identity read revalidation 0a184f3).

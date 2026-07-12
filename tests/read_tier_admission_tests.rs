@@ -449,6 +449,67 @@ async fn dehydration_gate_drops_untouched_probation_and_dehydrates_protected() {
     );
 }
 
+/// Dehydration DEDUPE: a protected victim whose bytes are ALREADY
+/// tier-resident is dropped at the channel mouth — never a duplicate
+/// write. Under second-touch every ghost-admitted fill publishes at fetch
+/// time AND lands protected in hot, so without this probe every one of
+/// its hot evictions re-wrote the same 4 MiB the tier already held
+/// (measured on the bench rand-4k row: ~100% protected evictions,
+/// duplicate-write churn + multi-MiB payloads parked in the channel under
+/// the cage — 37 IOPS vs the 326-lineage).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dehydration_skips_tier_resident_protected_victims() {
+    std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
+    std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1");
+    let h = make_bs("524288", *b"admission-dd5-v3").await;
+    std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
+    std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
+
+    let ino = create(&h, "adm_dedupe").await;
+    for b in 0..6u64 {
+        write_at(&h, ino, b * BS, &vec![b as u8 + 1; BS as usize]).await;
+    }
+    let map = make_cold(&h, ino).await;
+
+    // Block 0 → protected via ghost-admitted second miss; its publish
+    // leaves the tier copy IN PLACE (unlike the matrix test above, which
+    // removes it to observe the dehydrate arm).
+    let d = read_at(&h, ino, 0, 64 * 1024).await; // touch 1: record
+    assert!(d.iter().all(|&x| x == 1));
+    h.fs.router.cache.hot_block.remove(map.get(&0).unwrap());
+    let d = read_at(&h, ino, 128 * 1024, 64 * 1024).await; // touch 2: admit+publish
+    assert!(d.iter().all(|&x| x == 1));
+    assert!(
+        tier_has(&h, map.get(&0).unwrap()),
+        "fixture: the admitted fill must be tier-resident"
+    );
+
+    let skips0 = METRICS.hot_block_dehydrate_skips.load(Ordering::Relaxed);
+    // Evict block 0 from hot via probation churn.
+    for b in 1..6u64 {
+        let d = read_at(&h, ino, b * BS, 64 * 1024).await;
+        assert!(d.iter().all(|&x| x == b as u8 + 1), "block {b}");
+    }
+    let mut skipped = false;
+    for _ in 0..30 {
+        if METRICS.hot_block_dehydrate_skips.load(Ordering::Relaxed) > skips0 {
+            skipped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        skipped,
+        "a tier-resident protected victim must be SKIPPED at the \
+         dehydration channel mouth (counter unchanged) — re-writing bytes \
+         the tier already holds is duplicate-write churn"
+    );
+    assert!(
+        tier_has(&h, map.get(&0).unwrap()),
+        "the tier copy survives untouched"
+    );
+}
+
 /// The DEFAULT admission mode is `second-touch` — the §5.3 policy — as of
 /// PR 5: the R-5 evict-before-consume spiral that forced PR 4's temporary
 /// `always` default is closed by the pipeline's per-lane resident-

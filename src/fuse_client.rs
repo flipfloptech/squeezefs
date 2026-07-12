@@ -374,6 +374,10 @@ pub struct Metrics {
     pub hot_block_misses: Align64<AtomicU64>,
     pub hot_block_evictions: Align64<AtomicU64>,
     pub hot_block_probation_drops: Align64<AtomicU64>,
+    /// Protected hot-tier victims dropped at the dehydration channel mouth
+    /// because their bytes were already NVMe-tier-resident (duplicate-write
+    /// dedupe, §5.3/§5.5).
+    pub hot_block_dehydrate_skips: Align64<AtomicU64>,
     /// R1b admission (docs/design-read-path.md §5.3): skipped ≈ streamed
     /// cold blocks (the tax kill's adoption signal — ≈ 0 on a streaming
     /// workload means the classifier/admission is broken); admissions ≈
@@ -1120,6 +1124,7 @@ impl SqueezefsFilesystem {
                 "hot_block_misses": METRICS.hot_block_misses.load(Ordering::Relaxed),
                 "hot_block_evictions": METRICS.hot_block_evictions.load(Ordering::Relaxed),
                 "hot_block_probation_drops": METRICS.hot_block_probation_drops.load(Ordering::Relaxed),
+                "hot_block_dehydrate_skips": METRICS.hot_block_dehydrate_skips.load(Ordering::Relaxed),
                 "hot_block_current_bytes": self.router.cache.hot_block.current_bytes(),
                 "hot_block_max_bytes": self.router.cache.hot_block.max_bytes(),
                 "read_fill_publishes_skipped": METRICS.read_fill_publishes_skipped.load(Ordering::Relaxed),

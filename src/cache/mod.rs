@@ -200,12 +200,32 @@ impl TieredCache {
                             // keys are offset strings; the filter belongs
                             // to the read_lru worker's historical
                             // population only.
+                            //
+                            // DEDUPE at the channel mouth: under
+                            // second-touch, every ghost-admitted fill
+                            // published at fetch time AND landed protected
+                            // in hot — its warmth is already tier-durable,
+                            // and re-writing it here per hot eviction is
+                            // duplicate-write churn (measured on the
+                            // rand-4k bench row: ~100% protected
+                            // evictions, each a redundant multi-MiB
+                            // spawn_blocking write competing with the
+                            // reads). Index-membership probe only; a
+                            // racing tier eviction after the probe just
+                            // re-cools one block — the always-true device
+                            // fallback, never wrongness.
                             crate::tiering::memory::EvictClass::Protected => {
-                                let nvme_inner = nvme_clone.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    nvme_inner.cache_read_block_validated_self(&key, data)
-                                })
-                                .await;
+                                if nvme_clone.has_cached_read_block(&key) {
+                                    crate::fuse_client::METRICS
+                                        .hot_block_dehydrate_skips
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                } else {
+                                    let nvme_inner = nvme_clone.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        nvme_inner.cache_read_block_validated_self(&key, data)
+                                    })
+                                    .await;
+                                }
                             }
                         }
                     }

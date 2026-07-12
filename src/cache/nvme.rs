@@ -195,6 +195,24 @@ fn check_disk_free_safeguard(path: &std::path::Path) -> bool {
     true
 }
 
+/// Process-global stage-generation source. Every assignment is unique for
+/// the life of the process, so a generation captured under one ring-entry
+/// INCARNATION can never match a later one: `remove_staged_if_generation`
+/// (the promotion commit/release guard) previously compared per-entry
+/// counters that RESTARTED when a removal deleted the ledger entry and a
+/// re-stage re-created it — a queued/slow promotion that read the old
+/// incarnation's image then passed its commit check against the new
+/// incarnation's recycled generation, published the stale image as the
+/// durable mapping, and destroyed the ring's only copy of the newer acked
+/// bytes (the aged zeros-LOSS class, tests/staged_generation_aba_tests.rs).
+/// Starts at 1: generation 0 is reserved for mount-recovered entries, which
+/// no new assignment can forge.
+static STAGE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_stage_generation() -> u64 {
+    STAGE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Binary header for staged / active-block payloads on local NVMe staging.
 /// Shared with crash recovery (`recovery::recover_staging`) — must stay stable.
 #[derive(Clone, Debug)]
@@ -763,8 +781,8 @@ impl NvmeStaging {
                     None,
                 );
                 if admitted {
-                    let (cost, gen) = *entry.get();
-                    *entry.get_mut() = (padded_size, gen.wrapping_add(1));
+                    let (cost, _) = *entry.get();
+                    *entry.get_mut() = (padded_size, next_stage_generation());
                     (true, cost, is_new)
                 } else {
                     // Drop a placeholder created for this refused stage.
@@ -950,10 +968,10 @@ impl NvmeStaging {
             if !staging.shrink_staged_value(&key_bytes, new_size) {
                 return false;
             }
-            let (cost, gen) = *entry.get();
+            let (cost, _) = *entry.get();
             // Cost stays the extent's charge (the slot doesn't move);
             // conservative in the safe direction for the admission gate.
-            *entry.get_mut() = (cost, gen.wrapping_add(1));
+            *entry.get_mut() = (cost, next_stage_generation());
             true
         })
         .await

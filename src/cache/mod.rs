@@ -14,6 +14,14 @@ pub struct TieredCache {
     pub gds: gds::GdsCache,
     pub read_lru: lru::LruCache,
     pub write_lru: lru::LruCache,
+    /// R4 (docs/design-read-path.md §5.4): budgeted RAM tier for the
+    /// > 256 KiB striped-block population the `read_lru` gate excludes.
+    /// Values are `Bytes` refcount clones — a put/hit never memcpys.
+    /// Filled ONLY by device-validated fills (never re-promoted from the
+    /// NVMe tier, never owner-put from the write path); budget carved
+    /// BESIDE `--read-mem-cache-size`, not from it
+    /// (`SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB`; 0 short-circuits the tier).
+    pub hot_block: lru::LruCache,
     pub nvme: nvme::NvmeStaging,
 }
 
@@ -63,6 +71,25 @@ impl TieredCache {
         let read_lru = lru::LruCache::with_capacity(read_mem_limit);
         let write_lru = lru::LruCache::with_capacity(write_mem_limit);
 
+        // R4 hot-block budget: env override wins (0 disables); default
+        // max(2 × block_size, 25 % of the read-mem limit) — the 2-block
+        // floor is the minimum for one stream's consume-behind window.
+        // Block size is a mount-time router knob; the 4 MiB default shape
+        // is used for the floor (a smaller configured block only lowers
+        // the need, never the floor's safety).
+        let hot_budget = match std::env::var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB") {
+            Ok(v) => {
+                v.trim().parse::<u64>().map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB must be an integer MiB count: {e}"
+                    ))
+                })? * 1024
+                    * 1024
+            }
+            Err(_) => std::cmp::max(2 * 4 * 1024 * 1024, read_mem_limit / 4),
+        };
+        let hot_block = lru::LruCache::with_capacity(hot_budget);
+
         // 2. Get disk size limit
         let aggregate_capacity = get_aggregate_disk_capacity(&staging_dirs);
 
@@ -107,12 +134,23 @@ impl TieredCache {
         )
         .await?;
 
-        // Spawn background dehydration task to move evicted RAM blocks to NVMe
+        // Spawn background dehydration tasks to move evicted RAM blocks to
+        // NVMe. PR 3 plumbs the victim CLASS through the channel
+        // BEHAVIOR-NEUTRAL: every class still dehydrates (`read_lru`'s
+        // plain-put inserts are all protected-class by definition, so the
+        // ≤ 256 KiB population's dehydration is bit-identical to today,
+        // key-filter included); the protected-only gate flip is PR 4
+        // policy. The hot tier gets its own worker so evictions are
+        // observable (`hot_block_evictions`); its victims carry offset-
+        // string keys that the historical `blocks/` filter never matches,
+        // so in PR 3 hot victims are dropped after counting — harmless,
+        // because every hot fill also published to the NVMe tier in this
+        // PR (admission is PR 4, which owns the dehydration policy).
         if let Some(mut evict_rx) = read_lru.take_evict_rx() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let nvme_clone = nvme.clone();
                 handle.spawn(async move {
-                    while let Some((key, data)) = evict_rx.recv().await {
+                    while let Some((key, data, _class)) = evict_rx.recv().await {
                         if key.contains("blocks/") {
                             let nvme_clone_inner = nvme_clone.clone();
                             let key_clone = key.clone();
@@ -136,13 +174,50 @@ impl TieredCache {
                 });
             }
         }
+        if let Some(mut evict_rx) = hot_block.take_evict_rx() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    while let Some((_key, _data, _class)) = evict_rx.recv().await {
+                        crate::fuse_client::METRICS
+                            .hot_block_evictions
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+        }
 
         Ok(Self {
             gds,
             read_lru,
             write_lru,
+            hot_block,
             nvme,
         })
+    }
+
+    /// Purge every block-key-addressed cache tier for a block key — ALL
+    /// FOUR: RAM LRU, hot-block tier, NVMe disk tier, and the GDS file
+    /// cache. The ONLY legal way to drop a block key from the caches —
+    /// displaced-key frees, fill undos, incarnation purges and the
+    /// read_tier_purge callback all route here, so a tier (present or
+    /// future) cannot be forgotten by one call site (the 074 family's
+    /// lesson; pinned by the census grep-guard in
+    /// tests/hot_block_tier_tests.rs). Latch-free on the RAM/index arms;
+    /// the GDS arm is an unlink syscall (ENOENT ignored) — cheap because
+    /// `.gds_cache` files exist only on GDS-warmed mounts.
+    pub fn purge_block_key(&self, block_key: &str) {
+        self.read_lru.remove(block_key);
+        self.hot_block.remove(block_key);
+        self.nvme.remove_cached_read_block(block_key);
+        // The 4th block-key tier: `.gds_cache` files are keyed by block
+        // key, written by the prefetch GDS arm and read_direct, and served
+        // by the GDS ioctl behind a `!path.exists()` check that never
+        // refreshes — within a mount, a freed-and-reallocated key would
+        // serve the dead incarnation's file forever (cross-mount is closed
+        // by wipe_gds_cache_files). Name construction is unified through
+        // `get_gds_path` (PR 3), so this unlink covers every producer by
+        // construction, not by enumeration.
+        self.gds.remove_cached(block_key);
     }
 }
 

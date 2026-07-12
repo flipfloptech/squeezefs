@@ -1,14 +1,18 @@
 use crate::error::Result;
+use crate::tiering::memory::EvictClass;
 use bytes::Bytes;
 use std::sync::Arc;
 
-type EvictReceiver = tokio::sync::mpsc::Receiver<(String, Bytes)>;
+/// Dehydration channel, typed with the victim's sticky class (R4 / §5.3):
+/// plumbed BEHAVIOR-NEUTRAL in PR 3 (the worker still dehydrates every
+/// class); PR 4 flips the protected-only gate on this information.
+type EvictReceiver = tokio::sync::mpsc::Receiver<(String, Bytes, EvictClass)>;
 
 #[derive(Clone)]
 pub struct LruCache {
     inner: Arc<crate::tiering::memory::MemoryCache>,
     max_bytes: u64,
-    evict_tx: tokio::sync::mpsc::Sender<(String, Bytes)>,
+    evict_tx: tokio::sync::mpsc::Sender<(String, Bytes, EvictClass)>,
     evict_rx: Arc<std::sync::Mutex<Option<EvictReceiver>>>,
 }
 
@@ -76,24 +80,41 @@ impl LruCache {
         self.inner.get(key.as_bytes())
     }
 
-    /// Insert an entry into the cache, executing Clock eviction if maximum capacity is exceeded.
+    /// Insert an entry as PROTECTED (the pre-R4 semantics — every put via
+    /// this API is a keep-worthy entry by definition), executing Clock
+    /// eviction if maximum capacity is exceeded.
     ///
     /// P2-7: dehydration `try_send` runs **only** when Clock actually evicts
     /// entries (empty eviction vector is a pure no-op — no channel traffic).
     pub fn put(&self, key: &str, data: Bytes) {
+        self.put_with(key, data, true);
+    }
+
+    /// Insert as PROBATION (R4 §5.4): first in eviction line, promoted in
+    /// place (sticky) by any `get`. Streaming/one-pass fills use this so a
+    /// scan cannot displace protected warmth.
+    pub fn put_probationary(&self, key: &str, data: Bytes) {
+        self.put_with(key, data, false);
+    }
+
+    fn put_with(&self, key: &str, data: Bytes, protected: bool) {
         if (data.len() as u64) <= self.max_bytes {
             let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-            let evicted = self.inner.put(key_bytes, data);
+            let evicted = if protected {
+                self.inner.put(key_bytes, data)
+            } else {
+                self.inner.put_probationary(key_bytes, data)
+            };
             if evicted.is_empty() {
                 return;
             }
-            for (ek, ev) in evicted {
+            for (ek, ev, class) in evicted {
                 // Keys inserted via this API are always valid UTF-8 path/block ids.
                 let k_str = match String::from_utf8(ek.to_vec()) {
                     Ok(s) => s,
                     Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
                 };
-                let _ = self.evict_tx.try_send((k_str, ev));
+                let _ = self.evict_tx.try_send((k_str, ev, class));
             }
         } else {
             // Do not leave a smaller stale entry under this key when the new

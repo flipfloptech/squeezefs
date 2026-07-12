@@ -364,6 +364,16 @@ pub struct Metrics {
     /// signal that waiter correctness is publish-independent. Replaces the
     /// old probe-after-publish tier-recheck hits for cohort members.
     pub singleflight_waiter_result_serves: Align64<AtomicU64>,
+    /// R4 hot-block RAM tier (docs/design-read-path.md §5.4): hits are the
+    /// warm-read adoption signal for the > 256 KiB block population;
+    /// misses count device-validated fills entering probation; evictions
+    /// count victims leaving the clock ring; probation_drops counts
+    /// never-read probation victims DROPPED by the dehydration gate —
+    /// stays 0 until PR 4 flips the protected-only policy.
+    pub hot_block_hits: Align64<AtomicU64>,
+    pub hot_block_misses: Align64<AtomicU64>,
+    pub hot_block_evictions: Align64<AtomicU64>,
+    pub hot_block_probation_drops: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -1080,6 +1090,12 @@ impl SqueezefsFilesystem {
                 "cache_hit_ratio": ratio,
                 "stale_binding_rebinds": METRICS.stale_binding_rebinds.load(Ordering::Relaxed),
                 "singleflight_waiter_result_serves": METRICS.singleflight_waiter_result_serves.load(Ordering::Relaxed),
+                "hot_block_hits": METRICS.hot_block_hits.load(Ordering::Relaxed),
+                "hot_block_misses": METRICS.hot_block_misses.load(Ordering::Relaxed),
+                "hot_block_evictions": METRICS.hot_block_evictions.load(Ordering::Relaxed),
+                "hot_block_probation_drops": METRICS.hot_block_probation_drops.load(Ordering::Relaxed),
+                "hot_block_current_bytes": self.router.cache.hot_block.current_bytes(),
+                "hot_block_max_bytes": self.router.cache.hot_block.max_bytes(),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
@@ -2089,8 +2105,7 @@ impl SqueezefsFilesystem {
         // so purging here, after the DMA and before the map names the key,
         // leaves no interleaving that can serve the dead incarnation's
         // bytes for this block.
-        self.router.cache.read_lru.remove(&new_key);
-        self.router.cache.nvme.remove_cached_read_block(&new_key);
+        self.router.cache.purge_block_key(&new_key);
 
         // Block-map merge via the shared primitive (§5.3 one merge
         // discipline) under INODE_META_LOCKS: current-map RMW, fencing
@@ -6338,20 +6353,13 @@ async fn flush_one_active_block(
                 // published there before our allocate, and it would serve
                 // dead bytes once the RAM entry evicts (same
                 // dead-incarnation shielding as `upload_full_block`, PR 6).
+                router.cache.purge_block_key(&stored_block_key);
                 router.cache.read_lru.put(&stored_block_key, copy);
-                router
-                    .cache
-                    .nvme
-                    .remove_cached_read_block(&stored_block_key);
             }
             None => {
                 // No-put owner of a possibly-reused key: purge instead (same
                 // dead-incarnation shielding as `upload_full_block`, PR 6).
-                router.cache.read_lru.remove(&stored_block_key);
-                router
-                    .cache
-                    .nvme
-                    .remove_cached_read_block(&stored_block_key);
+                router.cache.purge_block_key(&stored_block_key);
             }
         }
 

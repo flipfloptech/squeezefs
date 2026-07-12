@@ -2,9 +2,42 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use xxhash_rust::xxh3::xxh3_64;
 
+/// The victim's sticky classification at eviction time, read from the
+/// `protected` bit — the value the dehydration worker routes on
+/// (docs/design-read-path.md §5.3 table): `Protected` ⇒ eligible to
+/// dehydrate to the NVMe tier; `Probation` (inserted probationary, never
+/// read) ⇒ dropped. NOTE: PR 3 plumbs this behavior-neutral (all classes
+/// still dehydrate); the gate flip is PR 4 policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictClass {
+    Probation,
+    Protected,
+}
+
+/// Entry state: the shard value grows ONE sticky class bit beside the
+/// clock bit (§5.4).
+///
+/// `referenced` stays the CONSUMABLE second-chance bit — the clock scan
+/// clears it, so every victim has it false at eviction time by
+/// construction and it can never classify victims. `protected` is STICKY:
+/// set at protected insert or by any `get` on a probation entry, never
+/// cleared by the clock, and read at eviction to route the dehydration
+/// decision. Two bits because they answer different questions: "spare
+/// this entry one more lap?" vs "was this entry ever worth keeping?".
+///
+/// Concurrency: both bits are single-word `Relaxed` atomics with no
+/// cross-word invariant — a racy lost update is a heuristic miss (an
+/// entry evicted one lap early / classified probation once too often),
+/// never a correctness event ⇒ no loom model required (the design's
+/// stated mandate for this type).
+struct EntryState {
+    referenced: AtomicBool,
+    protected: AtomicBool,
+}
+
 /// A single thread-safe shard of the Clock cache.
 struct MemoryCacheShard {
-    map: scc::HashIndex<Bytes, (Bytes, AtomicBool)>,
+    map: scc::HashIndex<Bytes, (Bytes, EntryState)>,
     eviction_queue: crossbeam::queue::SegQueue<Bytes>,
     eviction_lock: parking_lot::Mutex<()>,
     current_bytes: AtomicUsize,
@@ -24,12 +57,21 @@ impl MemoryCacheShard {
 
     fn get(&self, key: &[u8]) -> Option<Bytes> {
         let entry = self.map.get_sync(key)?;
-        let (value, referenced) = entry.get();
-        referenced.store(true, Ordering::Relaxed);
+        let (value, state) = entry.get();
+        state.referenced.store(true, Ordering::Relaxed);
+        // Sticky promotion (§5.4): any read of a probation entry marks it
+        // worth keeping — never cleared by the clock scan.
+        state.protected.store(true, Ordering::Relaxed);
         Some(value.clone())
     }
 
-    fn put(&self, key: Bytes, value: Bytes, evicted: &mut Vec<(Bytes, Bytes)>) {
+    fn put(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        protected: bool,
+        evicted: &mut Vec<(Bytes, Bytes, EvictClass)>,
+    ) {
         let val_len = value.len();
         // Oversized values cannot live in this shard. Remove any smaller stale
         // entry under the same key so readers never observe a truncated prior write.
@@ -42,16 +84,31 @@ impl MemoryCacheShard {
         let _ = unsafe {
             self.map
                 .entry_sync(key.clone())
-                .and_modify(|(old_val, ref_ok)| {
+                .and_modify(|(old_val, state)| {
                     let old = std::mem::replace(old_val, value.clone());
-                    ref_ok.store(true, Ordering::Relaxed);
+                    state.referenced.store(true, Ordering::Relaxed);
+                    if protected {
+                        // A protected re-put promotes; a probationary
+                        // re-put never DEMOTES an entry something already
+                        // read (sticky).
+                        state.protected.store(true, Ordering::Relaxed);
+                    }
                     old_len = Some(old.len());
                 })
         }
         .or_insert_with(|| {
             self.eviction_queue.push(key.clone());
             self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
-            (value, AtomicBool::new(true))
+            (
+                value,
+                EntryState {
+                    // Probationary inserts start with NO second chance and
+                    // NO keep-worthiness: first in eviction line, cannot
+                    // displace a protected entry that still has its lap.
+                    referenced: AtomicBool::new(protected),
+                    protected: AtomicBool::new(protected),
+                },
+            )
         });
 
         if let Some(old) = old_len {
@@ -64,7 +121,7 @@ impl MemoryCacheShard {
         }
     }
 
-    fn try_evict(&self, evicted: &mut Vec<(Bytes, Bytes)>) {
+    fn try_evict(&self, evicted: &mut Vec<(Bytes, Bytes, EvictClass)>) {
         if let Some(_guard) = self.eviction_lock.try_lock() {
             let approx_len = self.eviction_queue.len();
             let max_loops = std::cmp::max(approx_len * 2, 512);
@@ -76,18 +133,28 @@ impl MemoryCacheShard {
                     let mut should_evict = false;
                     let mut len = 0;
                     let mut val = None;
+                    let mut class = EvictClass::Probation;
 
                     let inspect_res = self.map.entry_sync(evict_key.clone());
                     match inspect_res {
                         scc::hash_index::Entry::Occupied(mut entry) => {
-                            let (val_ref, ref_ok) = unsafe { entry.get_mut() };
-                            if ref_ok.load(Ordering::Relaxed) {
-                                ref_ok.store(false, Ordering::Relaxed);
+                            let (val_ref, state) = unsafe { entry.get_mut() };
+                            if state.referenced.load(Ordering::Relaxed) {
+                                state.referenced.store(false, Ordering::Relaxed);
                                 self.eviction_queue.push(evict_key.clone());
                             } else {
                                 should_evict = true;
                                 len = val_ref.len();
                                 val = Some(val_ref.clone());
+                                // The STICKY bit classifies the victim —
+                                // the clock consumed `referenced`, so it
+                                // is false for every victim by
+                                // construction and could never classify.
+                                class = if state.protected.load(Ordering::Relaxed) {
+                                    EvictClass::Protected
+                                } else {
+                                    EvictClass::Probation
+                                };
                                 entry.remove_entry();
                             }
                         }
@@ -97,7 +164,7 @@ impl MemoryCacheShard {
                     if should_evict {
                         self.current_bytes.fetch_sub(len, Ordering::Relaxed);
                         if let Some(v) = val {
-                            evicted.push((evict_key, v));
+                            evicted.push((evict_key, v, class));
                         }
                     }
                 } else {
@@ -159,20 +226,39 @@ impl MemoryCache {
         self.shards[idx].get(key)
     }
 
-    /// Inserts an item into the cache. Returns any items evicted from the cache.
+    /// Inserts an item as PROTECTED (referenced=true, protected=true) —
+    /// the pre-R4 insert semantics; the ≤256 KiB `read_lru` population is
+    /// all-protected by definition. Returns evicted items with their class.
     ///
     /// P2-7: reuse a thread-local eviction buffer so the common no-eviction
     /// path does not allocate a fresh `Vec` on every put.
-    pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes)> {
+    pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes, EvictClass)> {
+        self.put_with_class(key, value, true)
+    }
+
+    /// Insert with referenced=false AND protected=false (§5.4): a one-pass
+    /// (streaming/probation) entry is first in line for clock eviction and
+    /// cannot displace a protected entry that still has its second chance.
+    /// Any `get` promotes it in place (sticky `protected`).
+    pub fn put_probationary(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes, EvictClass)> {
+        self.put_with_class(key, value, false)
+    }
+
+    fn put_with_class(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        protected: bool,
+    ) -> Vec<(Bytes, Bytes, EvictClass)> {
         let idx = self.get_shard_idx(&key);
         thread_local! {
-            static EVICT_BUF: std::cell::RefCell<Vec<(Bytes, Bytes)>> =
+            static EVICT_BUF: std::cell::RefCell<Vec<(Bytes, Bytes, EvictClass)>> =
                 const { std::cell::RefCell::new(Vec::new()) };
         }
         EVICT_BUF.with(|cell| {
             let mut evicted = cell.borrow_mut();
             evicted.clear();
-            self.shards[idx].put(key, value, &mut evicted);
+            self.shards[idx].put(key, value, protected, &mut evicted);
             if evicted.is_empty() {
                 Vec::new()
             } else {

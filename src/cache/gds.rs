@@ -1,5 +1,5 @@
 use crate::error::{Result, SqueezefsError};
-use log::info;
+use log::{info, warn};
 use std::path::{Path, PathBuf};
 
 #[cfg(all(feature = "gds", unix))]
@@ -227,13 +227,18 @@ impl GdsCache {
         {
             let lib = self.cufile_lib.as_ref().unwrap();
 
-            // 1. Locate or download block locally on NVMe
-            let staging_dir = self.staging_dirs.first().ok_or_else(|| {
+            // 1. Locate or download block locally on NVMe.
+            // One construction function for `.gds_cache` names (PR 3, R4
+            // §5.4): the historical inline sanitizer here diverged from
+            // `get_gds_path` on PREFIXED keys (`be_id://offset` →
+            // `be_id:__offset` vs `be_id___offset`), so a purge of the
+            // canonical name missed the copy this path wrote AND served.
+            // Pre-unification files under the old scheme need no
+            // migration: the mount-time `wipe_gds_cache_files` sweep
+            // matches the `.gds_cache` suffix and catches both.
+            let local_path = self.get_gds_path(object_key).ok_or_else(|| {
                 SqueezefsError::GdsError("No staging directories configured".to_string())
             })?;
-
-            let safe_filename = object_key.replace(['/', ':'], "_");
-            let local_path = staging_dir.join(format!("{}.gds_cache", safe_filename));
 
             if !local_path.exists() {
                 // Fetch the block using the router (handles decompression, decryption, and caching layers)
@@ -309,6 +314,27 @@ impl GdsCache {
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             Ok(())
+        }
+    }
+
+    /// Drop the `.gds_cache` file for a freed/displaced block key —
+    /// called ONLY from `TieredCache::purge_block_key` (the unified
+    /// four-tier purge, §5.4). Unlink-if-exists; `ENOENT` ignored (most
+    /// keys never had a GDS copy). Complete by construction: every
+    /// producer builds its name through `get_gds_path` (PR 3 unification).
+    pub fn remove_cached(&self, object_key: &str) {
+        if let Some(path) = self.get_gds_path(object_key) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(
+                        "GDS cache purge of {} failed (stale file may persist \
+                         until the next mount-time wipe): {e}",
+                        path.display()
+                    );
+                }
+            }
         }
     }
 

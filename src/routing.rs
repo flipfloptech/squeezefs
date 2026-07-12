@@ -1197,13 +1197,12 @@ impl DataRouter {
         // closure owns tier handles (Arc'd inners), not the router: no
         // cycle.
         {
-            let read_lru = router.cache.read_lru.clone();
-            let nvme = router.cache.nvme.clone();
+            let cache = router.cache.clone();
             router
                 .backend_router
                 .set_read_tier_purge(std::sync::Arc::new(move |block_key: &str| {
-                    read_lru.remove(block_key);
-                    nvme.remove_cached_read_block(block_key);
+                    // ALL FOUR block-key tiers (R4 §5.4) — the unified purge.
+                    cache.purge_block_key(block_key);
                 }));
         }
         router
@@ -1299,6 +1298,22 @@ impl DataRouter {
         let deadline = std::time::Instant::now() + MAX_WAIT;
 
         loop {
+            // R4 hot-block tier first (§5.4 probe order: overlay → hot →
+            // read_lru → NVMe → device): `Bytes` refcount hit, zero copy.
+            // Hot entries hold current-incarnation bytes by the same
+            // argument as tier entries (device-validated fills + the
+            // unified purge on every free), so a hit is serve-valid here;
+            // block-serving callers additionally recheck the binding
+            // exactly as for NVMe-tier hits.
+            if let Some(cached_block) = self.cache.hot_block.get(block_key) {
+                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok((
+                    crate::cache::pool::ReadBlockValue::Bytes(cached_block),
+                    true,
+                ));
+            }
+
             if let Some(cached_block) = self.cache.read_lru.get(block_key) {
                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok((
@@ -1337,7 +1352,12 @@ impl DataRouter {
                 drop(entry);
                 let mut rx = tx.subscribe();
                 // Completion may have raced between get_sync and subscribe — recheck.
-                if let Some(cached_block) = self.cache.read_lru.get(block_key) {
+                if let Some(cached_block) = self
+                    .cache
+                    .hot_block
+                    .get(block_key)
+                    .or_else(|| self.cache.read_lru.get(block_key))
+                {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok((
                         crate::cache::pool::ReadBlockValue::Bytes(cached_block),
@@ -1480,6 +1500,21 @@ impl DataRouter {
                         // multi-GB sequential reads. Small blocks still cache.
                         if downloaded_bytes.len() <= 256 * 1024 {
                             self.cache.read_lru.put(block_key, downloaded_bytes.clone());
+                        } else {
+                            // R4 (§5.4): the > 256 KiB population finally
+                            // gets a RAM tier — probationary (first in
+                            // eviction line; any read promotes in place,
+                            // sticky), a `Bytes` refcount clone, never a
+                            // copy. Device-validated fills ONLY: this put
+                            // sits inside the publishable window and the
+                            // undo below removes it on incarnation
+                            // movement. NVMe-tier hits are never
+                            // re-promoted here (same provenance argument
+                            // as the read_lru no-repromote rule).
+                            METRICS.hot_block_misses.fetch_add(1, Ordering::Relaxed);
+                            self.cache
+                                .hot_block
+                                .put_probationary(block_key, downloaded_bytes.clone());
                         }
                         // Seqlock completion (publish-then-revalidate): the
                         // pre-publish check alone is check-then-act — this
@@ -1500,8 +1535,10 @@ impl DataRouter {
                             .backend_router
                             .fill_incarnation_still(block_key, before);
                         if !serve_valid {
-                            self.cache.read_lru.remove(block_key);
-                            self.cache.nvme.remove_cached_read_block(block_key);
+                            // Undo across every tier this fill (or a racing
+                            // sibling) could have published to — the
+                            // unified purge (R4 §5.4).
+                            self.cache.purge_block_key(block_key);
                         }
                     }
                     // R1a (§5.2): hand the cohort its fill — after the
@@ -1764,8 +1801,7 @@ impl DataRouter {
             if let Some(prev) = displaced {
                 if prev != block_key {
                     // Re-promotion over an older durable copy: purge + free it.
-                    self.cache.read_lru.remove(&prev);
-                    self.cache.nvme.remove_cached_read_block(&prev);
+                    self.cache.purge_block_key(&prev);
                     let _ = self.backend_router.free_block(&prev).await;
                 }
             }
@@ -1880,8 +1916,7 @@ impl DataRouter {
                 if keep_block_key == Some(bk.as_str()) || !freed.insert(bk.clone()) {
                     continue;
                 }
-                self.cache.read_lru.remove(bk);
-                self.cache.nvme.remove_cached_read_block(bk);
+                self.cache.purge_block_key(bk);
                 let _ = self.backend_router.free_block(bk).await;
             }
         }
@@ -1966,8 +2001,7 @@ impl DataRouter {
             // Purge every cache tier for a displaced/removed key: its offset
             // will be reallocated under the SAME key string once freed, and
             // a stale tier hit would serve the dead incarnation's bytes.
-            self.cache.read_lru.remove(bk);
-            self.cache.nvme.remove_cached_read_block(bk);
+            self.cache.purge_block_key(bk);
         };
         match op {
             BlockMapOp::Merge(entries) => {
@@ -2734,8 +2768,8 @@ impl DataRouter {
             // read tier like the no-put owners do (`upload_full_block`) — a
             // validated fill of this key's dying incarnation may have
             // published there before our allocate.
+            self.cache.purge_block_key(&stored_block_key);
             self.cache.read_lru.put(&stored_block_key, chunk);
-            self.cache.nvme.remove_cached_read_block(&stored_block_key);
             block_allocator.publish_block(offset);
 
             block_mappings.push((block_idx, stored_block_key));
@@ -2911,11 +2945,8 @@ impl DataRouter {
                 // our allocate, and a put-owner that only overwrites RAM
                 // leaves that entry to serve dead bytes once the RAM entry
                 // evicts.
+                router_clone.cache.purge_block_key(&stored_new_block_key);
                 read_lru.put(&stored_new_block_key, block_bytes);
-                router_clone
-                    .cache
-                    .nvme
-                    .remove_cached_read_block(&stored_new_block_key);
                 block_allocator.publish_block(offset);
 
                 Ok::<_, SqueezefsError>((b, stored_new_block_key))
@@ -3256,11 +3287,63 @@ impl DataRouter {
                             return Ok((data, backing));
                         }
 
-                        // Check NVMe read block cache next
+                        // Check the RAM tiers, then the NVMe read block cache
                         let block_keys = self
                             .load_striped_block_keys(file_path, &meta, start_block, end_block)
                             .await?;
                         if let Some((_, b_key_opt)) = block_keys.first() {
+                            // R4 hot-block fast path (§5.4): a hot hit takes
+                            // the SAME binding recheck as the NVMe-tier hit
+                            // below — hot entries hold current-incarnation
+                            // bytes (device-validated fills + unified purge
+                            // on free), so binding currency alone validates
+                            // the serve. `Bytes` refcount hit; the reply
+                            // slice is the only copy.
+                            if let Some(ref b_key) = b_key_opt {
+                                if let Some(hot) = self.cache.hot_block.get(b_key) {
+                                    let start = std::cmp::min(slice_start as usize, hot.len());
+                                    let end = std::cmp::min(
+                                        (slice_start + slice_len as u64) as usize,
+                                        hot.len(),
+                                    );
+                                    let data = if let Some(dest) = dest_addr {
+                                        let len = end - start;
+                                        let dest_ptr = dest as *mut u8;
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                hot[start..end].as_ptr(),
+                                                dest_ptr,
+                                                len,
+                                            );
+                                        }
+                                        bytes::Bytes::from_owner(
+                                            crate::cache::pool::UringBufOwner {
+                                                ptr: dest_ptr,
+                                                len,
+                                            },
+                                        )
+                                    } else {
+                                        hot.slice(start..end)
+                                    };
+                                    if self
+                                        .current_block_binding(file_path, start_block)
+                                        .await?
+                                        .as_deref()
+                                        == Some(b_key.as_str())
+                                    {
+                                        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                        METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
+                                        return Ok((data, None));
+                                    }
+                                    METRICS
+                                        .stale_binding_rebinds
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    debug!(
+                                        "stale-binding rebind (hot-tier hit): file={} block={} key={}",
+                                        file_path, start_block, b_key
+                                    );
+                                }
+                            }
                             // Tier fast path with binding recheck (reused-key
                             // stale-fill family): a zero-copy NVMe read-cache hit
                             // is copied out first — the mmap shard guard never
@@ -3855,7 +3938,7 @@ impl DataRouter {
             block_map.retain(|&b, bk| {
                 let block_start = b as u64 * block_size;
                 if block_start >= new_size {
-                    self.cache.read_lru.remove(bk);
+                    self.cache.purge_block_key(bk);
                     blocks_to_free.push(clean_block_key(bk));
                     false // Remove from block_map
                 } else {
@@ -3973,7 +4056,7 @@ impl DataRouter {
 
         if let Some(ref block_map) = meta.block_map {
             for bk in block_map.values() {
-                self.cache.read_lru.remove(bk);
+                self.cache.purge_block_key(bk);
                 blocks_to_free.push(clean_block_key(bk));
             }
         }

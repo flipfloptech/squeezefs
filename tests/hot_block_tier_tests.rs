@@ -2,7 +2,7 @@
 //! (docs/design-read-path.md §5.4 / PR 3).
 //!
 //! Contracts pinned here:
-//! - >256 KiB device-validated fills land in the hot tier (probation) as
+//! - Fills larger than 256 KiB land in the hot tier (probation) as
 //!   `Bytes` refcount clones; NVMe-tier hits are NEVER re-promoted into RAM
 //!   (the no-RAM-repromote rationale applies to the new tier identically).
 //! - Clock shard: sticky `protected` bit beside the consumable `referenced`
@@ -195,7 +195,7 @@ async fn make_cold(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
 /// class out.
 #[test]
 fn probation_evicts_before_protected_and_classes_are_carried() {
-    let cache = MemoryCache::new(48, 1);
+    let cache = MemoryCache::new(40, 1);
 
     let kp = bytes::Bytes::from("prot");
     let vp = bytes::Bytes::from(vec![0xAAu8; 16]);
@@ -228,39 +228,60 @@ fn probation_evicts_before_protected_and_classes_are_carried() {
 /// consumed its referenced bit on the way out.
 #[test]
 fn probation_get_promotes_sticky_protected() {
-    let cache = MemoryCache::new(48, 1);
+    let cache = MemoryCache::new(40, 1);
 
     let ka = bytes::Bytes::from("aa");
     let va = bytes::Bytes::from(vec![0x11u8; 16]);
     cache.put_probationary(ka.clone(), va.clone());
     assert_eq!(cache.get(&ka), Some(va.clone()), "probation entry readable");
 
-    // Two fresh probation entries force the shard over budget twice; the
-    // promoted entry outlives the never-read one, and when it finally
-    // goes, its class is Protected (sticky survived the clock scan).
+    // Fill to budget, then two pressure puts: the promoted entry outlives
+    // the never-read one, and when it finally goes, its class is
+    // Protected (sticky survived the clock scan).
     let kb = bytes::Bytes::from("bb");
     let vb = bytes::Bytes::from(vec![0x22u8; 16]);
     let kc = bytes::Bytes::from("cc");
     let vc = bytes::Bytes::from(vec![0x33u8; 16]);
+    let kd = bytes::Bytes::from("dd");
+    let vd = bytes::Bytes::from(vec![0x44u8; 16]);
 
-    let ev1 = cache.put_probationary(kb.clone(), vb.clone());
+    assert!(cache.put_probationary(kb.clone(), vb.clone()).is_empty());
+
+    let ev1 = cache.put_probationary(kc.clone(), vc.clone());
     assert_eq!(ev1.len(), 1);
     assert_eq!(
         ev1[0].0, kb,
-        "never-read probation newcomer loses to the promoted entry \
+        "never-read probation entry loses to the promoted entry \
          (clock: promoted has referenced=true second chance)"
     );
+    assert!(matches!(ev1[0].2, EvictClass::Probation));
 
-    let ev2 = cache.put_probationary(kc.clone(), vc.clone());
+    // Round 2: ka's second chance was consumed in round 1, but the
+    // never-read probation entry kc sits at the clock hand first.
+    let ev2 = cache.put_probationary(kd.clone(), vd.clone());
     assert_eq!(ev2.len(), 1);
     assert_eq!(
-        ev2[0].0, ka,
-        "promoted entry evicts only after its second chance is consumed"
+        ev2[0].0, kc,
+        "never-read probation goes before the promoted entry"
+    );
+    assert!(matches!(ev2[0].2, EvictClass::Probation));
+
+    // Round 3: ka finally pops with its chance spent — and its CLASS must
+    // read Protected: the sticky bit survived the clock scan that consumed
+    // `referenced` (the dehydration router reads THIS bit; the consumable
+    // bit is false for every victim by construction).
+    let ke = bytes::Bytes::from("ee");
+    let ve = bytes::Bytes::from(vec![0x55u8; 16]);
+    let ev3 = cache.put_probationary(ke.clone(), ve.clone());
+    assert_eq!(ev3.len(), 1);
+    assert_eq!(
+        ev3[0].0, ka,
+        "promoted entry evicts after its second chance"
     );
     assert!(
-        matches!(ev2[0].2, EvictClass::Protected),
+        matches!(ev3[0].2, EvictClass::Protected),
         "sticky protected must survive the clock scan's referenced-bit \
-         consumption — the dehydration router reads THIS bit"
+         consumption"
     );
 }
 
@@ -270,7 +291,7 @@ fn probation_get_promotes_sticky_protected() {
 /// ≤256 KiB read_lru population's dehydration is bit-identical to today).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eviction_channel_is_typed_but_gate_is_not_flipped() {
-    let lru = LruCache::with_capacity(48);
+    let lru = LruCache::with_capacity(40);
     let mut rx = lru.take_evict_rx().expect("first take");
 
     lru.put("k1", bytes::Bytes::from(vec![1u8; 16])); // protected by definition
@@ -289,7 +310,8 @@ async fn eviction_channel_is_typed_but_gate_is_not_flipped() {
         seen.len()
     );
     assert!(
-        seen.iter().any(|(_, _, c)| matches!(c, EvictClass::Probation)),
+        seen.iter()
+            .any(|(_, _, c)| matches!(c, EvictClass::Probation)),
         "a probation victim must be visible on the channel WITH its class \
          — PR 4 flips the gate on this information; PR 3 only records it"
     );
@@ -365,6 +387,7 @@ async fn displaced_key_purges_hot_tier_and_reads_serve_new_bytes() {
     let h = make().await;
     let ino = create(&h, "hot_displace").await;
     write_at(&h, ino, 0, &vec![0x0Au8; BS as usize]).await;
+    write_at(&h, ino, BS, &vec![0x0Fu8; BS as usize]).await; // striped layout
     let map = make_cold(&h, ino).await;
     let k_old = map.get(&0).unwrap().clone();
 
@@ -400,6 +423,7 @@ async fn stale_hot_entry_under_dead_key_is_never_served() {
     let h = make().await;
     let ino = create(&h, "hot_stale").await;
     write_at(&h, ino, 0, &vec![0x21u8; BS as usize]).await;
+    write_at(&h, ino, BS, &vec![0x2Fu8; BS as usize]).await; // striped layout
     let map = make_cold(&h, ino).await;
     let k_old = map.get(&0).unwrap().clone();
 
@@ -410,10 +434,7 @@ async fn stale_hot_entry_under_dead_key_is_never_served() {
     assert_ne!(k_old, k_new, "overwrite must displace the key");
 
     // Adversarial: park stale bytes in the hot tier under the DEAD key.
-    h.fs.router
-        .cache
-        .hot_block
-        .put("", bytes::Bytes::new()); // no-op guard: API sanity
+    h.fs.router.cache.hot_block.put("", bytes::Bytes::new()); // no-op guard: API sanity
     h.fs.router
         .cache
         .hot_block
@@ -466,6 +487,7 @@ async fn hot_budget_zero_short_circuits() {
 
     let ino = create(&h, "hot_zero").await;
     write_at(&h, ino, 0, &vec![0x41u8; BS as usize]).await;
+    write_at(&h, ino, BS, &vec![0x4Fu8; BS as usize]).await; // striped layout
     let map = make_cold(&h, ino).await;
     let k0 = map.get(&0).unwrap().clone();
 

@@ -294,9 +294,11 @@ async fn ranged_phases() {
     // whole physical block; the dispatch collapses at is_passthrough().
     drop(h2);
     let h3 = make_with("524288", *b"ranged-d-pr6-v30", "rng_ns_d").await;
-    h3.fs
-        .router
-        .set_crypto(CryptoCompressState::new("lz4".to_string(), "none".to_string(), None));
+    h3.fs.router.set_crypto(CryptoCompressState::new(
+        "lz4".to_string(),
+        "none".to_string(),
+        None,
+    ));
     let ino_d = create(&h3, "rng_d").await;
     // Compressible content, still position-dependent enough to catch
     // wrong-window serves.
@@ -507,12 +509,11 @@ async fn raw_dest_leg_refuses_transform_configs() {
 
     // Full-block read WITH a payload dest — the raw dest leg's exact
     // trigger shape (slice_start == 0 && slice_len == block_size && dest).
-    let (data, _backing) = h
-        .fs
-        .router
-        .read_file_range_zero_copy(&path, 2 * block, block as u32, Some(dest_ptr as u64))
-        .await
-        .unwrap();
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy(&path, 2 * block, block as u32, Some(dest_ptr as u64))
+            .await
+            .unwrap();
     assert_eq!(data.len(), block as usize);
     assert!(
         data.iter().all(|&x| x == 0x42),
@@ -551,7 +552,7 @@ async fn rebind_under_movement_never_foreign_bytes() {
             let mut i = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let b = (i + r) % blocks;
-                let off = b * BS + ((i * 7919 + r * 4096) % (BS - 4096) & !4095);
+                let off = b * BS + (((i * 7919 + r * 4096) % (BS - 4096)) & !4095);
                 let d = h.fs.read(h.req, ino, 0, off, 4096, 0).await.unwrap().data;
                 let allowed = [100 + b as u8, 150 + b as u8, 200 + b as u8];
                 for (j, &x) in d.iter().enumerate() {
@@ -563,7 +564,7 @@ async fn rebind_under_movement_never_foreign_bytes() {
                     );
                 }
                 i += 1;
-                if i % 16 == 0 {
+                if i.is_multiple_of(16) {
                     tokio::task::yield_now().await;
                 }
             }

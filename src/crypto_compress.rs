@@ -6,6 +6,18 @@ use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::RsaPrivateKey;
 use std::sync::Arc;
 
+/// Self-delimiting transform frame: every non-passthrough `process_write`
+/// image is prefixed `[u32 LE image_len]`. Block reads return the full
+/// `block_size` window — stored image + trailing device bytes — and
+/// neither decoder tolerates the padding (lz4's
+/// `decompress_size_prepended` rejects trailing bytes with `OffsetZero`;
+/// AEAD opens `data[header..]`, so padding lands inside the tag check).
+/// Passthrough images carry NO frame (byte-identity is the passthrough
+/// contract — §5.6 ranged reads depend on it). Forward-only: unframed
+/// legacy blobs refuse loud in `process_read` (their cold device reads
+/// never worked, so there is no behavior to preserve).
+const FRAME_LEN_BYTES: usize = 4;
+
 /// On-disk AEAD header prefix: `[2B wrapped_key_len][1B nonce_len]`.
 const ENCRYPT_HEADER_PREFIX_LEN: usize = 3;
 
@@ -192,9 +204,10 @@ impl CryptoCompressState {
     }
 
     /// Worst-case transform output for `input_len` bytes (§5.7) — the
-    /// pooled path's fit check against the pool's buffer size.
+    /// pooled path's fit check against the pool's buffer size. Includes
+    /// the self-delimiting frame prefix.
     fn worst_case_scratch_len(&self, input_len: usize) -> usize {
-        Self::scratch_compress_term(input_len) + self.scratch_encrypt_overhead()
+        FRAME_LEN_BYTES + Self::scratch_compress_term(input_len) + self.scratch_encrypt_overhead()
     }
 
     /// Initialize the §5.7 CRYPTO_SCRATCH_POOL for `block_size`-byte writes:
@@ -486,29 +499,35 @@ impl CryptoCompressState {
     /// returned as `Bytes` over the 4096-aligned backing (recycles when the
     /// last handle drops; the DMA takes `WriteData::Aligned` whenever the
     /// ciphertext lands on a 4 KiB multiple). The input is never mutated.
+    ///
+    /// The image is emitted INSIDE the self-delimiting frame (see
+    /// `FRAME_LEN_BYTES`): everything transform-related lands at
+    /// `out[FRAME_LEN_BYTES..]`, and the length prefix is written last.
     fn process_write_pooled(
         &self,
         pool: &Arc<BufferPool>,
         data: &[u8],
     ) -> Result<bytes::Bytes, SqueezefsError> {
+        const F: usize = FRAME_LEN_BYTES;
         let mut scratch = pool.alloc();
-        let total = if self.encrypt_mode != EncryptMode::None {
+        let image_len = if self.encrypt_mode != EncryptMode::None {
             let (wrapped_key, less_safe_key) = self.resolve_encrypt_key()?;
             let wrapped_len = wrapped_key.len();
             let header_len = ENCRYPT_HEADER_PREFIX_LEN + wrapped_len + NONCE_LEN;
             let out = scratch.backing_mut();
 
-            let plain_len = self.compress_into_scratch(data, &mut out[header_len..])?;
+            let plain_len = self.compress_into_scratch(data, &mut out[F + header_len..])?;
 
             // The exact on-disk header `encrypt` emits:
             // [2B wrapped_key_len][1B nonce_len][wrapped_key][nonce].
-            out[0] = (wrapped_len >> 8) as u8;
-            out[1] = (wrapped_len & 0xFF) as u8;
-            out[2] = NONCE_LEN as u8;
-            out[ENCRYPT_HEADER_PREFIX_LEN..ENCRYPT_HEADER_PREFIX_LEN + wrapped_len]
+            out[F] = (wrapped_len >> 8) as u8;
+            out[F + 1] = (wrapped_len & 0xFF) as u8;
+            out[F + 2] = NONCE_LEN as u8;
+            out[F + ENCRYPT_HEADER_PREFIX_LEN..F + ENCRYPT_HEADER_PREFIX_LEN + wrapped_len]
                 .copy_from_slice(&wrapped_key);
             let nonce_bytes = self.next_nonce_bytes();
-            out[ENCRYPT_HEADER_PREFIX_LEN + wrapped_len..header_len].copy_from_slice(&nonce_bytes);
+            out[F + ENCRYPT_HEADER_PREFIX_LEN + wrapped_len..F + header_len]
+                .copy_from_slice(&nonce_bytes);
             let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| {
                 SqueezefsError::InvalidOperation("Failed to construct nonce".to_string())
             })?;
@@ -517,17 +536,19 @@ impl CryptoCompressState {
                 .seal_in_place_separate_tag(
                     nonce,
                     ring::aead::Aad::empty(),
-                    &mut out[header_len..header_len + plain_len],
+                    &mut out[F + header_len..F + header_len + plain_len],
                 )
                 .map_err(|_| SqueezefsError::InvalidOperation("AEAD seal failed".to_string()))?;
             let tag_bytes = tag.as_ref();
-            out[header_len + plain_len..header_len + plain_len + tag_bytes.len()]
+            out[F + header_len + plain_len..F + header_len + plain_len + tag_bytes.len()]
                 .copy_from_slice(tag_bytes);
             header_len + plain_len + tag_bytes.len()
         } else {
-            self.compress_into_scratch(data, scratch.backing_mut())?
+            let out = scratch.backing_mut();
+            self.compress_into_scratch(data, &mut out[F..])?
         };
-        scratch.set_written_len(total);
+        scratch.backing_mut()[..F].copy_from_slice(&(image_len as u32).to_le_bytes());
+        scratch.set_written_len(F + image_len);
         Ok(scratch.into_bytes())
     }
 
@@ -547,12 +568,16 @@ impl CryptoCompressState {
             }
         }
         let compressed = self.compress(&data)?;
-        if self.encrypt_mode != EncryptMode::None {
-            let encrypted = self.encrypt(&compressed)?;
-            Ok(bytes::Bytes::from(encrypted))
+        let image: Vec<u8> = if self.encrypt_mode != EncryptMode::None {
+            self.encrypt(&compressed)?
         } else {
-            Ok(bytes::Bytes::from(compressed.into_owned()))
-        }
+            compressed.into_owned()
+        };
+        // Self-delimiting frame (heap leg — see `FRAME_LEN_BYTES`).
+        let mut framed = Vec::with_capacity(FRAME_LEN_BYTES + image.len());
+        framed.extend_from_slice(&(image.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&image);
+        Ok(bytes::Bytes::from(framed))
     }
 
     pub fn process_read<'a>(
@@ -562,8 +587,32 @@ impl CryptoCompressState {
         if self.is_passthrough() {
             return Ok(std::borrow::Cow::Borrowed(data));
         }
+        // Frame parse: block reads return the full block_size WINDOW —
+        // the stored image plus whatever trailing bytes the device holds.
+        // Neither decoder tolerates the padding (lz4's
+        // `decompress_size_prepended` rejects trailing bytes; AEAD opens
+        // `data[header..]`, so padding lands inside the tag check), which
+        // is exactly why every image is written self-delimiting. Unframed
+        // legacy blobs refuse LOUD (forward-only): cold device reads of
+        // such volumes never worked, so there is no behavior to preserve
+        // — rewrite/reformat is the remedy, never a sniffing shim.
+        if data.len() < FRAME_LEN_BYTES {
+            return Err(SqueezefsError::InvalidOperation(
+                "transform image shorter than its frame header".to_string(),
+            ));
+        }
+        let image_len = u32::from_le_bytes(data[..FRAME_LEN_BYTES].try_into().unwrap()) as usize;
+        let image = data
+            .get(FRAME_LEN_BYTES..FRAME_LEN_BYTES + image_len)
+            .ok_or_else(|| {
+                SqueezefsError::InvalidOperation(format!(
+                    "malformed transform frame: claims {image_len} image bytes, {} available \
+                     — unframed legacy volume or corrupt block (reformat/rewrite required)",
+                    data.len() - FRAME_LEN_BYTES
+                ))
+            })?;
         let decrypted = if self.encrypt_mode != EncryptMode::None {
-            Some(self.decrypt(data)?)
+            Some(self.decrypt(image)?)
         } else {
             None
         };
@@ -573,7 +622,9 @@ impl CryptoCompressState {
                 let decompressed = self.decompress(&v)?;
                 Ok(std::borrow::Cow::Owned(decompressed.into_owned()))
             }
-            None => self.decompress(data),
+            None => Ok(std::borrow::Cow::Owned(
+                self.decompress(image)?.into_owned(),
+            )),
         }
     }
 
@@ -618,6 +669,14 @@ impl CryptoCompressState {
 mod tests {
     use super::*;
     use rsa::pkcs1::EncodeRsaPrivateKey;
+
+    /// Frame an image the way the writers do (test-side reference).
+    fn framed(image: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + image.len());
+        v.extend_from_slice(&(image.len() as u32).to_le_bytes());
+        v.extend_from_slice(image);
+        v
+    }
 
     #[test]
     fn test_crypto_unwrap_caching() {
@@ -897,7 +956,7 @@ mod tests {
         assert_eq!(pool_len(&state), cap0 - 1, "deep write must be pooled");
         assert_eq!(
             deep_out.as_ref(),
-            lz4_flex::compress_prepend_size(&deep).as_slice()
+            framed(&lz4_flex::compress_prepend_size(&deep)).as_slice()
         );
         drop(deep_out);
         assert_eq!(pool_len(&state), cap0);
@@ -905,7 +964,7 @@ mod tests {
         // Then cycle short writes through every pooled buffer: stale bytes
         // from the deep write must never leak past the written length.
         let short = mixed_payload(32 * 1024);
-        let expected = lz4_flex::compress_prepend_size(&short);
+        let expected = framed(&lz4_flex::compress_prepend_size(&short));
         for _ in 0..cap0 {
             let out = state
                 .process_write(bytes::Bytes::from(short.clone()))
@@ -914,7 +973,7 @@ mod tests {
             assert_eq!(
                 out.as_ref(),
                 expected.as_slice(),
-                "pooled lz4 image must be byte-identical to compress_prepend_size"
+                "pooled lz4 image must be the framed compress_prepend_size image"
             );
             assert_eq!(state.process_read(&out).unwrap().as_ref(), short.as_slice());
         }
@@ -923,7 +982,7 @@ mod tests {
         let empty_out = state.process_write(bytes::Bytes::new()).unwrap();
         assert_eq!(
             empty_out.as_ref(),
-            lz4_flex::compress_prepend_size(&[]).as_slice()
+            framed(&lz4_flex::compress_prepend_size(&[])).as_slice()
         );
         assert!(state.process_read(&empty_out).unwrap().is_empty());
     }
@@ -936,11 +995,12 @@ mod tests {
     #[case::lz4_aes("lz4", "aes256gcm-rsa")]
     #[case::zstd_chacha("zstd", "chacha20-rsa")]
     fn test_pre_scratch_volume_read_back_parity(#[case] comp: &str, #[case] enc: &str) {
-        // A volume written before the scratch sub-commit holds blocks
-        // produced by `compress_prepend_size` / `encode_all` / heap
-        // `encrypt`. Both directions must hold through the untouched read
-        // path: pre-scratch blocks decode on a pool-enabled state, and
-        // pooled blocks decode exactly like pre-scratch ones.
+        // Heap-vs-pooled writer parity through the framed read path, plus
+        // the forward-only legacy rule: an UNFRAMED pre-framing blob (the
+        // exact primitives the old writers used) must refuse LOUD — its
+        // cold device reads never worked (padding broke both decoders),
+        // and a sniffing shim is exactly what the standing directive
+        // forbids.
         let bs = 128 * 1024;
         let pem = if enc == "none" {
             None
@@ -951,8 +1011,8 @@ mod tests {
         state.init_scratch_pool(bs);
         let payload = mixed_payload(96 * 1024);
 
-        // Pre-scratch writer image (the exact primitives the old
-        // `process_write` used).
+        // Pre-framing writer image (the exact primitives the old
+        // `process_write` used) — refuses loud today.
         let compressed: Vec<u8> = match comp {
             "lz4" => lz4_flex::compress_prepend_size(&payload),
             "zstd" => zstd::encode_all(std::io::Cursor::new(&payload[..]), 3).unwrap(),
@@ -961,15 +1021,14 @@ mod tests {
         let old_blob: Vec<u8> = if enc != "none" {
             state.encrypt(&compressed).unwrap()
         } else {
-            compressed
+            compressed.clone()
         };
-        assert_eq!(
-            state.process_read(&old_blob).unwrap().as_ref(),
-            payload.as_slice(),
-            "pre-scratch volume block must decode through the untouched read path"
+        assert!(
+            state.process_read(&old_blob).is_err(),
+            "unframed legacy blob must refuse loud (forward-only)"
         );
 
-        // Pooled writer image, decoded by the same untouched read path.
+        // Pooled writer image, decoded by the framed read path.
         let cap0 = pool_len(&state);
         let new_blob = state
             .process_write(bytes::Bytes::from(payload.clone()))
@@ -978,10 +1037,18 @@ mod tests {
         assert_eq!(
             state.process_read(&new_blob).unwrap().as_ref(),
             payload.as_slice(),
-            "pooled block must decode through the untouched read path"
+            "pooled block must decode through the framed read path"
+        );
+        // Padded to a device window: still decodes (the frame's purpose).
+        let mut padded = new_blob.to_vec();
+        padded.resize(bs, 0xEE);
+        assert_eq!(
+            state.process_read(&padded).unwrap().as_ref(),
+            payload.as_slice(),
+            "device-window padding must be ignored by the frame parse"
         );
         if enc == "none" && comp == "lz4" {
-            assert_eq!(new_blob.as_ref(), old_blob.as_slice());
+            assert_eq!(new_blob[FRAME_LEN_BYTES..], old_blob[..]);
         }
     }
 
@@ -1087,7 +1154,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             out.as_ref(),
-            lz4_flex::compress_prepend_size(&payload).as_slice()
+            framed(&lz4_flex::compress_prepend_size(&payload)).as_slice()
         );
         assert_eq!(
             state.process_read(&out).unwrap().as_ref(),
@@ -1160,11 +1227,14 @@ mod tests {
         state.init_scratch_pool(bs);
         let payload = mixed_payload(64 * 1024);
 
-        let pooled = state
+        let framed_pooled = state
             .process_write(bytes::Bytes::from(payload.clone()))
             .unwrap();
         let compressed = state.compress(&payload).unwrap();
         let heap = state.encrypt(&compressed).unwrap();
+        // The AEAD IMAGE sits inside the frame; `encrypt` emits the raw
+        // (unframed) image — compare the layouts at the image level.
+        let pooled = &framed_pooled[FRAME_LEN_BYTES..];
 
         // Identical header framing and (session) wrapped-key bytes.
         let wkl = ((pooled[0] as usize) << 8) + (pooled[1] as usize);
@@ -1184,16 +1254,17 @@ mod tests {
             3 + wkl + 12 + compressed_len + state.aead_tag_len
         );
 
-        // The sealed body opens to the compressed image; the full read
-        // path recovers the plaintext for both writers.
-        assert_eq!(state.decrypt(&pooled).unwrap().as_slice(), &*compressed);
+        // The sealed image opens to the compressed bytes; the framed read
+        // path recovers the plaintext; the raw (unframed) heap image
+        // refuses loud (forward-only).
+        assert_eq!(state.decrypt(pooled).unwrap().as_slice(), &*compressed);
         assert_eq!(
-            state.process_read(&pooled).unwrap().as_ref(),
+            state.process_read(&framed_pooled).unwrap().as_ref(),
             payload.as_slice()
         );
-        assert_eq!(
-            state.process_read(&heap).unwrap().as_ref(),
-            payload.as_slice()
+        assert!(
+            state.process_read(&heap).is_err(),
+            "unframed image must refuse loud through the framed read path"
         );
     }
 }

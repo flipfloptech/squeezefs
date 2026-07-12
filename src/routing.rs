@@ -529,6 +529,58 @@ impl BackendRouter {
         self.read_block_with_dest(block_key, size, None).await
     }
 
+    /// R3 (§5.6) ranged device leg: read `len` bytes at `rel_start` WITHIN
+    /// the block behind `block_key` — `read_block_with_dest` at
+    /// `offset + rel_start` (the uring worker already takes arbitrary
+    /// offsets). The device fd is O_DIRECT, so callers pass a window
+    /// rounded outward to the conservative 4096-byte LBA (approved OQ #1:
+    /// no per-device probe until `ranged_read_unaligned_bounces` shows
+    /// real 512-native waste) and, on the zero-copy leg, a 4 KiB-aligned
+    /// registered dest. Raw bytes only — no decode, no cache publish, no
+    /// single-flight: the caller (`get_block_range_for_index`) owns the
+    /// full fill discipline.
+    pub async fn read_block_range(
+        &self,
+        block_key: &str,
+        rel_start: u64,
+        len: usize,
+        dest_addr: Option<u64>,
+    ) -> Result<bytes::Bytes> {
+        debug_assert_eq!(
+            rel_start % 4096,
+            0,
+            "ranged window start must be LBA-aligned"
+        );
+        debug_assert_eq!(len % 4096, 0, "ranged window length must be LBA-aligned");
+        debug_assert!(
+            dest_addr.is_none_or(|d| d % 4096 == 0),
+            "ranged O_DIRECT dest must be 4 KiB-aligned"
+        );
+        let (be_id, offset) = self.parse_block_key(block_key)?;
+
+        if !self.is_backend_healthy(&be_id) {
+            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("Storage volume '{}' is disabled/offline", be_id),
+            )));
+        }
+
+        if be_id == "backend_0" {
+            self.default_device
+                .read_block_with_dest(offset + rel_start, len, dest_addr)
+                .await
+        } else if let Some(be) = self.backends.get(&be_id) {
+            be.device
+                .read_block_with_dest(offset + rel_start, len, dest_addr)
+                .await
+        } else {
+            Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "Storage backend '{}' not found",
+                be_id
+            )))
+        }
+    }
+
     pub async fn read_block_with_dest(
         &self,
         block_key: &str,
@@ -859,6 +911,11 @@ pub struct DataRouterInner {
     /// R1b disk-tier admission mode (env-resolved once; hot-budget-0
     /// auto-degrades SecondTouch to Always).
     pub tier_admission: TierAdmission,
+    /// R3 (§5.6) ranged-read dispatch bound: requests ≤ this many bytes
+    /// on passthrough, non-streaming, cache-missed striped reads fetch
+    /// only their 4 KiB-aligned window (`SQUEEZEFS_READ_RANGED_THRESHOLD`,
+    /// default 262144; 0 = kill switch).
+    pub(crate) ranged_threshold: u64,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
     pub prefetcher: std::sync::Arc<IoUringPrefetcher>,
@@ -1105,6 +1162,25 @@ pub struct StreamLanes {
     lanes: [StreamLane; 4],
 }
 
+/// §5.6 zero-copy ranged destination, one definition: a 4 KiB-aligned
+/// pointer into the registered uring payload region
+/// (`get_payload_buffer`), offered ONLY on the zero-copy leg
+/// (window == request). The callee DMAs the full served length at offset
+/// 0 and zeroes `served..requested` (the reused-payload replay rule); the
+/// bounce leg never sees it.
+pub struct RangedDest {
+    pub ptr: *mut u8,
+    pub cap: usize,
+}
+
+// SAFETY: `ptr` addresses registered uring payload memory (or a test's
+// private aligned allocation) whose access is exclusive to this request
+// for the lease's lifetime — the §5.4 payload-lease protocol serializes
+// kernel/worker access, and the ranged serve is the request's only
+// writer. Sending the pointer across the executor's threads moves that
+// exclusive access, never shares it.
+unsafe impl Send for RangedDest {}
+
 /// The classifier verdict handed back to the read path: which lane (if
 /// any) this request rides, and whether that lane is classified streaming.
 pub(crate) struct LaneRef<'a> {
@@ -1140,6 +1216,18 @@ impl StreamLanes {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
+    }
+
+    /// §5.6 dispatch probe: does any lane hold a FRESH streaming
+    /// classification (within the 2 s staleness constant)? Streams keep
+    /// whole-block fetches (1.0× amplification + the pipeline); a stale
+    /// classified lane must not deny a now-random file the ranged path.
+    pub(crate) fn any_streaming_fresh(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = Self::now_ms();
+        self.lanes.iter().any(|l| {
+            l.classified.load(Relaxed) && now.saturating_sub(l.last_seen_ms.load(Relaxed)) < 2_000
+        })
     }
 
     /// Classification unit (§5.3, one definition): `run_reads ≥ 4`
@@ -1533,6 +1621,13 @@ impl DataRouter {
             Err(_) => 50,
         }
         .clamp(1, 100);
+        // §5.6 ranged-read threshold (0 disables — the kill switch).
+        let ranged_threshold = match std::env::var("SQUEEZEFS_READ_RANGED_THRESHOLD") {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|e| {
+                panic!("SQUEEZEFS_READ_RANGED_THRESHOLD must be an integer byte count: {e}")
+            }),
+            Err(_) => 262_144,
+        };
 
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
@@ -1570,6 +1665,7 @@ impl DataRouter {
                     .build(),
                 ghost: std::sync::Arc::new(GhostTable::new()),
                 tier_admission,
+                ranged_threshold,
                 prefetch_window_cap,
                 prefetch_share_pct,
                 stream_gauge: StreamActivityGauge::new(),
@@ -2458,6 +2554,203 @@ impl DataRouter {
         Err(SqueezefsError::Io(std::io::Error::other(format!(
             "block {b} of {file_path} did not settle after {MAX_REBINDS} binding rebinds"
         ))))
+    }
+
+    /// §5.6 dispatch rule (fetch granularity policy): sub-block ranged
+    /// device reads fire only for passthrough volumes (decode needs the
+    /// whole physical block otherwise — the check is static per mount),
+    /// requests at or under the threshold (`SQUEEZEFS_READ_RANGED_THRESHOLD`,
+    /// 0 = kill switch), NON-streaming files (streams want whole blocks:
+    /// 1.0× amplification + the pipeline; the freshness-gated classifier
+    /// probe costs one moka get), and blocks larger than the threshold
+    /// (small-block volumes keep the whole-block path — their fetch is
+    /// already request-sized and stays RAM-LRU-cacheable). Callers invoke
+    /// this strictly AFTER the overlay/hot/tier probes missed.
+    pub(crate) fn ranged_eligible(&self, file_path: &str, request_len: u64) -> bool {
+        self.ranged_threshold != 0
+            && request_len <= self.ranged_threshold
+            && self.block_size.load(Ordering::Relaxed) > self.ranged_threshold
+            && self.get_crypto().is_passthrough()
+            && !self
+                .stream_lanes
+                .get(file_path)
+                .is_some_and(|lanes| lanes.any_streaming_fresh())
+    }
+
+    /// BINDING-VALIDATED ranged striped serve (R3, §5.6). Identical proof
+    /// obligation to [`Self::get_block_for_index`]: bytes for key K serve
+    /// block `b` only if (a) the fill was incarnation-valid — snapshot
+    /// before the device read, unchanged after (the raw-dest leg's own
+    /// discipline) — AND (b) the CURRENT map still binds b → K once the
+    /// bytes are in hand. On movement: re-resolve and retry
+    /// (`MAX_REBINDS`), falling back to the whole-block validated loop on
+    /// exhaustion pressure. `Ok(None)` = the block is a hole in the
+    /// current map (the caller serves zeros).
+    ///
+    /// NEVER PUBLISHED: a partial payload must not exist under a
+    /// whole-block tier key (tier/hot entries are whole-block by contract
+    /// — a short entry would serve truncated bytes to a larger read).
+    /// Ranged fills serve their caller only; re-read heat is RECORDED in
+    /// the ghost table (never consulted for ranged dispatch — the pinned
+    /// N-disjoint-reads amplification contract forbids self-escalation),
+    /// so a subsequent whole-block fetch ghost-admits per §5.3 and
+    /// genuinely hot ranges converge to cached whole blocks.
+    ///
+    /// Device windows are rounded outward to the conservative 4096-byte
+    /// LBA (approved OQ #1). `dest` is offered only on the zero-copy leg
+    /// (window == request, 4 KiB-aligned): the served value is then
+    /// backed by the dest region itself. Unaligned edges take the bounce
+    /// leg (window DMA into a pooled aligned buffer, request slice out —
+    /// bounded ≤ request + 8 KiB); window padding is never served.
+    ///
+    /// NOT single-flighted by design (§5.6): deduping 4 KiB fetches under
+    /// a 4 MiB block key would serialize independent sub-reads for no
+    /// byte savings.
+    pub async fn get_block_range_for_index(
+        &self,
+        file_path: &str,
+        b: u32,
+        rel_range: std::ops::Range<u64>,
+        resolved_key: Option<&str>,
+        dest: Option<RangedDest>,
+    ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
+        const MAX_REBINDS: usize = 8;
+        const LBA: u64 = 4096;
+        let block_size = self.block_size.load(Ordering::Relaxed);
+        let req_len = (rel_range.end - rel_range.start) as usize;
+        debug_assert!(req_len > 0, "empty ranged request");
+        debug_assert!(
+            rel_range.end <= block_size,
+            "ranged request escapes its block"
+        );
+        debug_assert_eq!(
+            block_size % LBA,
+            0,
+            "ranged dispatch requires LBA-multiple block sizes"
+        );
+        let aligned_start = rel_range.start & !(LBA - 1);
+        let aligned_end = std::cmp::min(rel_range.end.div_ceil(LBA) * LBA, block_size);
+        let window = (aligned_end - aligned_start) as usize;
+        let bounced = window != req_len;
+        // The zero-copy leg's contract: window == request and the dest is
+        // 4 KiB-aligned registered memory — callers offer `dest` only
+        // then. A dest on a bounced shape is a caller bug.
+        debug_assert!(
+            dest.is_none() || !bounced,
+            "RangedDest offered off the zero-copy leg"
+        );
+
+        let mut key: Option<String> = resolved_key.map(str::to_string);
+        for _ in 0..MAX_REBINDS {
+            let Some(cur_key) = key else {
+                return Ok(None);
+            };
+            let tracked = self.backend_router.key_incarnation_tracked(&cur_key);
+            let before = self.backend_router.fill_incarnation(&cur_key);
+
+            METRICS.ranged_reads.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .ranged_read_bytes
+                .fetch_add(window as u64, Ordering::Relaxed);
+            if bounced {
+                METRICS
+                    .ranged_read_unaligned_bounces
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let window_bytes = match &dest {
+                Some(d) => {
+                    // DMA straight into the registered payload dest; the
+                    // value below is constructed only after validation.
+                    self.backend_router
+                        .read_block_range(&cur_key, aligned_start, window, Some(d.ptr as u64))
+                        .await?
+                }
+                None => {
+                    self.backend_router
+                        .read_block_range(&cur_key, aligned_start, window, None)
+                        .await?
+                }
+            };
+
+            // Fill discipline, then serve rule — bytes in hand FIRST.
+            let incarnation_ok = !tracked
+                || before
+                    .is_some_and(|bf| self.backend_router.fill_incarnation_still(&cur_key, bf));
+            let current = self.current_block_binding(file_path, b).await?;
+            if incarnation_ok && current.as_deref() == Some(cur_key.as_str()) {
+                // §5.6 heat capture: record-only (see doc comment). Only
+                // meaningful under second-touch; always/never keep their
+                // verbatim escape-hatch semantics.
+                if self.tier_admission == TierAdmission::SecondTouch {
+                    let _ = self.ghost.check_and_record(&cur_key);
+                }
+                let value = match &dest {
+                    Some(d) => {
+                        // Served == window == request; the dest region is
+                        // fully DMA-covered — nothing to zero (the
+                        // reused-payload replay rule is satisfied by full
+                        // coverage).
+                        crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from_owner(
+                            crate::cache::pool::UringBufOwner {
+                                ptr: d.ptr,
+                                len: req_len,
+                            },
+                        ))
+                    }
+                    None => {
+                        let from = (rel_range.start - aligned_start) as usize;
+                        crate::cache::pool::ReadBlockValue::Bytes(
+                            window_bytes.slice(from..from + req_len),
+                        )
+                    }
+                };
+                return Ok(Some(value));
+            }
+            METRICS
+                .stale_binding_rebinds
+                .fetch_add(1, Ordering::Relaxed);
+            METRICS.ranged_read_rebinds.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "stale-binding rebind (ranged read): file={} block={} key={} current={:?} fill_valid={}",
+                file_path, b, cur_key, current, incarnation_ok
+            );
+            key = current;
+        }
+
+        // Exhaustion pressure (§5.6): fall back to the whole-block
+        // validated loop — single-flighted, decode-correct, and immune to
+        // per-window churn — and slice the request out. With a dest the
+        // slice is copied in and the tail zeroed (reused-payload replay
+        // rule at the copy site).
+        let whole = self
+            .get_block_for_index(file_path, b, key.as_deref())
+            .await?;
+        Ok(whole.map(|val| {
+            let start = std::cmp::min(rel_range.start as usize, val.len());
+            let end = std::cmp::min(rel_range.end as usize, val.len());
+            match &dest {
+                Some(d) => {
+                    let len = end - start;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(val[start..end].as_ptr(), d.ptr, len);
+                        if len < req_len {
+                            std::ptr::write_bytes(d.ptr.add(len), 0, req_len - len);
+                        }
+                    }
+                    crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from_owner(
+                        crate::cache::pool::UringBufOwner {
+                            ptr: d.ptr,
+                            len: req_len,
+                        },
+                    ))
+                }
+                None => {
+                    let mut out = vec![0u8; req_len];
+                    out[..end - start].copy_from_slice(&val[start..end]);
+                    crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from(out))
+                }
+            }
+        }))
     }
 
     pub async fn fetch_metadata(&self, file_path: &str) -> Result<CachedMetadata> {
@@ -4105,6 +4398,110 @@ impl DataRouter {
                                 }
                             }
 
+                            // R3 ranged dispatch (§5.6) — strictly after the
+                            // overlay/hot/tier probes missed: passthrough,
+                            // small, non-streaming requests fetch only their
+                            // 4 KiB-aligned window. Never published, never
+                            // single-flighted; full fill discipline inside
+                            // the primitive. Hole ⇒ zeros, same as the
+                            // whole-block arm below.
+                            if b_key_opt.is_some()
+                                && self.ranged_eligible(file_path, slice_len as u64)
+                            {
+                                let rel = slice_start..slice_start + slice_len as u64;
+                                let aligned = slice_start % 4096 == 0
+                                    && (slice_len as u64) % 4096 == 0
+                                    && rel.end <= block_size;
+                                let rdest = match dest_addr {
+                                    // The payload arena is 4 KiB-aligned by
+                                    // construction; offer the dest only on
+                                    // the zero-copy leg (window == request).
+                                    Some(d) if aligned => Some(RangedDest {
+                                        ptr: d as *mut u8,
+                                        cap: slice_len as usize,
+                                    }),
+                                    _ => None,
+                                };
+                                let served = self
+                                    .get_block_range_for_index(
+                                        file_path,
+                                        start_block,
+                                        rel,
+                                        b_key_opt.as_deref(),
+                                        rdest,
+                                    )
+                                    .await?;
+                                match served {
+                                    Some(val) => {
+                                        let data = match dest_addr {
+                                            Some(dest) if aligned => {
+                                                // Value already backs the dest
+                                                // region (zero-copy leg).
+                                                let _ = dest;
+                                                match val {
+                                                    crate::cache::pool::ReadBlockValue::Bytes(
+                                                        b,
+                                                    ) => b,
+                                                    other => bytes::Bytes::copy_from_slice(&other),
+                                                }
+                                            }
+                                            Some(dest) => {
+                                                // Bounce with a payload dest:
+                                                // copy the request in; full
+                                                // coverage (val.len() ==
+                                                // slice_len), nothing to zero.
+                                                let len = val.len();
+                                                let dest_ptr = dest as *mut u8;
+                                                unsafe {
+                                                    std::ptr::copy_nonoverlapping(
+                                                        val.as_ptr(),
+                                                        dest_ptr,
+                                                        len,
+                                                    );
+                                                    if len < slice_len as usize {
+                                                        std::ptr::write_bytes(
+                                                            dest_ptr.add(len),
+                                                            0,
+                                                            slice_len as usize - len,
+                                                        );
+                                                    }
+                                                }
+                                                bytes::Bytes::from_owner(
+                                                    crate::cache::pool::UringBufOwner {
+                                                        ptr: dest_ptr,
+                                                        len: slice_len as usize,
+                                                    },
+                                                )
+                                            }
+                                            None => match val {
+                                                crate::cache::pool::ReadBlockValue::Bytes(b) => b,
+                                                other => bytes::Bytes::copy_from_slice(&other),
+                                            },
+                                        };
+                                        return Ok((data, None));
+                                    }
+                                    None => {
+                                        // Hole in the current map: zeros.
+                                        let len = slice_len as usize;
+                                        let data = if let Some(dest) = dest_addr {
+                                            let dest_ptr = dest as *mut u8;
+                                            unsafe {
+                                                std::ptr::write_bytes(dest_ptr, 0, len);
+                                                bytes::Bytes::from_owner(
+                                                    crate::cache::pool::UringBufOwner {
+                                                        ptr: dest_ptr,
+                                                        len,
+                                                    },
+                                                )
+                                            }
+                                        } else {
+                                            bytes::Bytes::from(vec![0u8; len])
+                                        };
+                                        return Ok((data, None));
+                                    }
+                                }
+                            }
+
                             // Validated resolve: raw full-block DMA into the uring
                             // payload dest when possible (revalidated afterwards),
                             // else the binding-validated fetch loop. `None` = the
@@ -4114,7 +4511,21 @@ impl DataRouter {
                                     Some(b_key) => {
                                         let mut resolved = None;
                                         if let Some(dest) = dest_addr {
-                                            if slice_start == 0 && slice_len as u64 == block_size {
+                                            // §5.6 sibling-leg hygiene: this raw
+                                            // leg DMAs DEVICE bytes into the
+                                            // payload dest without process_read
+                                            // — on a transform (compressed/
+                                            // encrypted) volume those are
+                                            // ciphertext/frame bytes, and its
+                                            // revalidation proves identity, not
+                                            // transform correctness. Transform
+                                            // configs fall through to the
+                                            // validated whole-block loop, which
+                                            // decodes.
+                                            if slice_start == 0
+                                                && slice_len as u64 == block_size
+                                                && self.get_crypto().is_passthrough()
+                                            {
                                                 // Zero-copy device→payload DMA. The raw read
                                                 // bypasses the single-flight fill, so it
                                                 // carries the fill discipline itself:
@@ -4362,6 +4773,42 @@ impl DataRouter {
                                     }
                                 }
                                 actual_copy
+                            } else if b_key_opt.is_some()
+                                && router.ranged_eligible(&file_path_clone, copy_len as u64)
+                            {
+                                // R3 (§5.6), multi-block per-block leg: this
+                                // block's slice is small/passthrough/non-
+                                // streaming — fetch only its window (bounce
+                                // shape: the assembled dest region is not
+                                // guaranteed 4 KiB-aligned per block). Same
+                                // fill discipline inside the primitive;
+                                // Ok(None) = hole ⇒ the zero-fill below.
+                                match router
+                                    .get_block_range_for_index(
+                                        &file_path_clone,
+                                        b_idx,
+                                        rel_start as u64..(rel_start + copy_len) as u64,
+                                        b_key_opt.as_deref(),
+                                        None,
+                                    )
+                                    .await?
+                                {
+                                    Some(ranged) => {
+                                        let actual_copy = std::cmp::min(ranged.len(), copy_len);
+                                        if actual_copy > 0 {
+                                            unsafe {
+                                                let dest = (raw_ptr + dest_start) as *mut u8;
+                                                std::ptr::copy_nonoverlapping(
+                                                    ranged.as_ptr(),
+                                                    dest,
+                                                    actual_copy,
+                                                );
+                                            }
+                                        }
+                                        actual_copy
+                                    }
+                                    None => 0,
+                                }
                             } else if let Some(downloaded) = router
                                 .get_block_for_index(&file_path_clone, b_idx, b_key_opt.as_deref())
                                 .await?

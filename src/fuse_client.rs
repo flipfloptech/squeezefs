@@ -378,6 +378,20 @@ pub struct Metrics {
     /// because their bytes were already NVMe-tier-resident (duplicate-write
     /// dedupe, §5.3/§5.5).
     pub hot_block_dehydrate_skips: Align64<AtomicU64>,
+    /// R3 ranged reads (docs/design-read-path.md §5.6): adoption counter —
+    /// sub-block device reads served by `get_block_range_for_index`.
+    pub ranged_reads: Align64<AtomicU64>,
+    /// R3 amplification numerator: DEVICE bytes read by ranged ops (window
+    /// bytes, ≥ the requested bytes only by 4 KiB rounding). Compare
+    /// against user bytes for the random-row amplification bound.
+    pub ranged_read_bytes: Align64<AtomicU64>,
+    /// Ranged requests whose 4 KiB window rounding widened the request
+    /// (unaligned edges) — ≫ 0 on O_DIRECT means the LBA assumption is
+    /// wrong for the workload (§5.6 open-question follow-up trigger).
+    pub ranged_read_unaligned_bounces: Align64<AtomicU64>,
+    /// Ranged serves that hit binding/incarnation movement and re-resolved
+    /// (the 074-family discipline on the ranged path).
+    pub ranged_read_rebinds: Align64<AtomicU64>,
     /// R1b admission (docs/design-read-path.md §5.3): skipped ≈ streamed
     /// cold blocks (the tax kill's adoption signal — ≈ 0 on a streaming
     /// workload means the classifier/admission is broken); admissions ≈
@@ -1125,6 +1139,10 @@ impl SqueezefsFilesystem {
                 "hot_block_evictions": METRICS.hot_block_evictions.load(Ordering::Relaxed),
                 "hot_block_probation_drops": METRICS.hot_block_probation_drops.load(Ordering::Relaxed),
                 "hot_block_dehydrate_skips": METRICS.hot_block_dehydrate_skips.load(Ordering::Relaxed),
+                "ranged_reads": METRICS.ranged_reads.load(Ordering::Relaxed),
+                "ranged_read_bytes": METRICS.ranged_read_bytes.load(Ordering::Relaxed),
+                "ranged_read_unaligned_bounces": METRICS.ranged_read_unaligned_bounces.load(Ordering::Relaxed),
+                "ranged_read_rebinds": METRICS.ranged_read_rebinds.load(Ordering::Relaxed),
                 "hot_block_current_bytes": self.router.cache.hot_block.current_bytes(),
                 "hot_block_max_bytes": self.router.cache.hot_block.max_bytes(),
                 "read_fill_publishes_skipped": METRICS.read_fill_publishes_skipped.load(Ordering::Relaxed),

@@ -222,6 +222,65 @@ fn probation_evicts_before_protected_and_classes_are_carried() {
     assert!(cache.get(&kp).is_some(), "protected entry survives");
 }
 
+/// §5.5 pipeline fills: probation CLASS (source-droppable, never sticky)
+/// but WITH the clock's one-lap second chance. An unconsumed speculative
+/// fill must not lose the clock race to already-consumed stream residue,
+/// whose own sub-read serves re-arm `referenced` — under plain
+/// probationary insert (referenced=false) the clock evicts the pipeline's
+/// FUTURE to keep the stream's PAST (measured on the bench row-2 shape:
+/// 595 hot-evict refetches, 1.145x device overshoot, row 2 at 0.90x
+/// row 1 with every other counter clean).
+#[test]
+fn probationary_referenced_fill_survives_one_lap_but_stays_probation_class() {
+    let cache = MemoryCache::new(40, 1);
+
+    // Consumed stream residue: probationary insert, then a non-promoting
+    // serve (sub-read consumption) — referenced re-armed, never sticky.
+    let ka = bytes::Bytes::from("resi");
+    let va = bytes::Bytes::from(vec![0xAAu8; 16]);
+    assert!(cache.put_probationary(ka.clone(), va.clone()).is_empty());
+    assert_eq!(cache.get_no_promote(&ka), Some(va));
+
+    // Unconsumed pipeline fill: probation class WITH the second chance.
+    let kb = bytes::Bytes::from("fill");
+    let vb = bytes::Bytes::from(vec![0xBBu8; 16]);
+    assert!(cache
+        .put_probationary_referenced(kb.clone(), vb.clone())
+        .is_empty());
+
+    // Pressure with a plain (referenced=false) probationary entry: BOTH
+    // graced entries survive their lap; the ungraced newcomer is the
+    // victim. Under plain probationary fills, kb would be evicted here —
+    // the evict-before-consume shape.
+    let kc = bytes::Bytes::from("newc");
+    let vc = bytes::Bytes::from(vec![0xCCu8; 16]);
+    let ev1 = cache.put_probationary(kc.clone(), vc.clone());
+    assert_eq!(ev1.len(), 1, "exactly one victim under pressure");
+    assert_eq!(
+        ev1[0].0, kc,
+        "the graced fill must survive the lap; the ungraced newcomer goes"
+    );
+
+    // Second pressure wave: graces are consumed, oldest-first order rules
+    // — the residue (ka) is the victim, the fill (kb) is still resident,
+    // and the victim's class is Probation (grace is NOT keep-worthiness:
+    // source-drop semantics stay intact).
+    let kd = bytes::Bytes::from("new2");
+    let vd = bytes::Bytes::from(vec![0xDDu8; 16]);
+    let ev2 = cache.put_probationary(kd.clone(), vd.clone());
+    assert_eq!(ev2.len(), 1);
+    assert_eq!(ev2[0].0, ka, "consumed residue evicts before the fill");
+    assert!(
+        matches!(ev2[0].2, EvictClass::Probation),
+        "the second chance must not manufacture Protected victims — \
+         dehydration still drops these at the source"
+    );
+    assert!(
+        cache.get_no_promote(&kb).is_some(),
+        "the unconsumed fill outlives consumed residue"
+    );
+}
+
 /// A `get` on a probation entry promotes it IN PLACE (sticky `protected`),
 /// distinct from the clock's consumable `referenced` bit: the promoted
 /// entry's eventual eviction reports Protected even though the clock scan

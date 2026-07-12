@@ -85,6 +85,7 @@ impl MemoryCacheShard {
         key: Bytes,
         value: Bytes,
         protected: bool,
+        referenced: bool,
         evicted: &mut Vec<(Bytes, Bytes, EvictClass)>,
     ) {
         let val_len = value.len();
@@ -116,10 +117,14 @@ impl MemoryCacheShard {
                 (
                     value,
                     EntryState {
-                        // Probationary inserts start with NO second chance
-                        // and NO keep-worthiness: first in eviction line,
-                        // cannot displace a protected entry with its lap.
-                        referenced: AtomicBool::new(protected),
+                        // Plain probationary inserts start with NO second
+                        // chance and NO keep-worthiness: first in eviction
+                        // line, cannot displace a protected entry with its
+                        // lap. Pipeline fills (§5.5) arrive probation-class
+                        // WITH the second chance (`referenced` alone) —
+                        // clock parity with consumed stream residue, never
+                        // stickiness.
+                        referenced: AtomicBool::new(referenced),
                         protected: AtomicBool::new(protected),
                     },
                 )
@@ -262,7 +267,7 @@ impl MemoryCache {
     /// P2-7: reuse a thread-local eviction buffer so the common no-eviction
     /// path does not allocate a fresh `Vec` on every put.
     pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes, EvictClass)> {
-        self.put_with_class(key, value, true)
+        self.put_with_class(key, value, true, true)
     }
 
     /// Insert with referenced=false AND protected=false (§5.4): a one-pass
@@ -270,7 +275,23 @@ impl MemoryCache {
     /// cannot displace a protected entry that still has its second chance.
     /// Any `get` promotes it in place (sticky `protected`).
     pub fn put_probationary(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes, EvictClass)> {
-        self.put_with_class(key, value, false)
+        self.put_with_class(key, value, false, false)
+    }
+
+    /// Probation CLASS with the one-lap second chance (referenced=true,
+    /// protected=false) — §5.5 pipeline fills. Consumed stream residue
+    /// re-arms `referenced` at every sub-read serve; an unconsumed
+    /// speculative fill inserted without it systematically loses the clock
+    /// race to the very bytes the reader has already finished with
+    /// (measured on the bench row-2 shape: 595 hot-evict refetches).
+    /// Grace is NOT keep-worthiness: victims still classify Probation and
+    /// drop at the eviction source.
+    pub fn put_probationary_referenced(
+        &self,
+        key: Bytes,
+        value: Bytes,
+    ) -> Vec<(Bytes, Bytes, EvictClass)> {
+        self.put_with_class(key, value, false, true)
     }
 
     fn put_with_class(
@@ -278,6 +299,7 @@ impl MemoryCache {
         key: Bytes,
         value: Bytes,
         protected: bool,
+        referenced: bool,
     ) -> Vec<(Bytes, Bytes, EvictClass)> {
         let idx = self.get_shard_idx(&key);
         thread_local! {
@@ -287,7 +309,7 @@ impl MemoryCache {
         EVICT_BUF.with(|cell| {
             let mut evicted = cell.borrow_mut();
             evicted.clear();
-            self.shards[idx].put(key, value, protected, &mut evicted);
+            self.shards[idx].put(key, value, protected, referenced, &mut evicted);
             if evicted.is_empty() {
                 Vec::new()
             } else {

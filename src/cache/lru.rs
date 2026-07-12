@@ -8,6 +8,18 @@ use std::sync::Arc;
 /// class); PR 4 flips the protected-only gate on this information.
 type EvictReceiver = tokio::sync::mpsc::Receiver<(String, Bytes, EvictClass)>;
 
+/// Insert flavor: the (protected, referenced) bit pairs the clock shard
+/// distinguishes (§5.4/§5.5).
+enum PutClass {
+    /// referenced=true, protected=true — keep-worthy by definition.
+    Protected,
+    /// referenced=false, protected=false — one-pass residue, first in line.
+    Probation,
+    /// referenced=true, protected=false — §5.5 pipeline fill: one-lap
+    /// grace, never sticky.
+    ProbationReferenced,
+}
+
 #[derive(Clone)]
 pub struct LruCache {
     inner: Arc<crate::tiering::memory::MemoryCache>,
@@ -107,23 +119,32 @@ impl LruCache {
     /// P2-7: dehydration `try_send` runs **only** when Clock actually evicts
     /// entries (empty eviction vector is a pure no-op — no channel traffic).
     pub fn put(&self, key: &str, data: Bytes) {
-        self.put_with(key, data, true);
+        self.put_with(key, data, PutClass::Protected);
     }
 
     /// Insert as PROBATION (R4 §5.4): first in eviction line, promoted in
     /// place (sticky) by any `get`. Streaming/one-pass fills use this so a
     /// scan cannot displace protected warmth.
     pub fn put_probationary(&self, key: &str, data: Bytes) {
-        self.put_with(key, data, false);
+        self.put_with(key, data, PutClass::Probation);
     }
 
-    fn put_with(&self, key: &str, data: Bytes, protected: bool) {
+    /// Probation class WITH the one-lap clock grace (§5.5 pipeline fills):
+    /// clock parity with consumed stream residue — see
+    /// [`crate::tiering::memory::MemoryCache::put_probationary_referenced`].
+    pub fn put_probationary_referenced(&self, key: &str, data: Bytes) {
+        self.put_with(key, data, PutClass::ProbationReferenced);
+    }
+
+    fn put_with(&self, key: &str, data: Bytes, class: PutClass) {
         if (data.len() as u64) <= self.max_bytes {
             let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-            let evicted = if protected {
-                self.inner.put(key_bytes, data)
-            } else {
-                self.inner.put_probationary(key_bytes, data)
+            let evicted = match class {
+                PutClass::Protected => self.inner.put(key_bytes, data),
+                PutClass::Probation => self.inner.put_probationary(key_bytes, data),
+                PutClass::ProbationReferenced => {
+                    self.inner.put_probationary_referenced(key_bytes, data)
+                }
             };
             if evicted.is_empty() {
                 return;

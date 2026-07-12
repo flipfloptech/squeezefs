@@ -329,23 +329,46 @@ async fn pipeline_phases() {
     drop(h);
 
     // ---- Phase C: evict-before-consume control (the PR 4 R-5 spiral,
-    // pinned bounded). Tiny hot budget: fills evict before consumption;
-    // the consumer detects it, AIMD collapses the window, and total device
-    // fetches stay < 2x unique — never the runaway spiral.
+    // pinned bounded). Tiny hot budget + concurrent PROTECTED pressure
+    // (the post-grace starvation class: an admitted/re-read population
+    // displacing speculative fills — the fills' one-lap clock grace covers
+    // the stream's own residue, so pure self-pressure no longer evicts
+    // unconsumed fills; that prevention IS the control working). The
+    // consumer must DETECT the genuinely-starved fills, AIMD collapses
+    // the window + the progress-clocked arm quiesces issue, and total
+    // device fetches stay < 2x unique — never the runaway spiral.
     std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1");
     let h2 = make_with(*b"pipeline-c-pr5v3", "pipe_ns_c").await;
     std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
     let ino_c = make_cold_file(&h2, "pipe_c", 24, 100).await;
 
     let g0 = METRICS.get_obj.load(Ordering::Relaxed);
-    stream_file(&h2, ino_c, 24, 100).await;
+    for b in 0..24u64 {
+        for half in 0..2u64 {
+            let d = read_at(&h2, ino_c, b * BS + half * 262_144, 262_144).await;
+            assert!(
+                d.iter().all(|&x| x == 100u8.wrapping_add(b as u8)),
+                "content block {b} half {half}"
+            );
+        }
+        // Protected pressure between consume steps: two keep-worthy
+        // inserts displace every probation entry (grace consumed on the
+        // first scan lap, evicted on the second) — any unconsumed fill
+        // ahead of the reader is gone before its consumer arrives.
+        for j in 0..2 {
+            h2.fs.router.cache.hot_block.put(
+                &format!("pollute_{b}_{j}"),
+                bytes::Bytes::from(vec![0u8; 262_144]),
+            );
+        }
+    }
     settle_pipeline().await;
     let g = METRICS.get_obj.load(Ordering::Relaxed) - g0;
     assert!(
         g < 48,
-        "evict-before-consume must stay BOUNDED (AIMD): {g} device fetches \
-         for 24 unique blocks — >= 2x is the spiral this control exists \
-         to prevent"
+        "evict-before-consume must stay BOUNDED (AIMD + quiescence): {g} \
+         device fetches for 24 unique blocks — >= 2x is the spiral this \
+         control exists to prevent"
     );
     assert!(
         METRICS.prefetch_evicted_unconsumed.load(Ordering::Relaxed) > 0,

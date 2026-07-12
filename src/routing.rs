@@ -1975,6 +1975,18 @@ impl DataRouter {
                                 self.cache
                                     .hot_block
                                     .put(block_key, downloaded_bytes.clone());
+                            } else if speculative {
+                                // §5.5 pipeline fill: probation class WITH
+                                // the one-lap clock grace — parity with
+                                // consumed residue whose serves re-arm
+                                // `referenced`; without it the clock evicts
+                                // the pipeline's future to keep the
+                                // stream's past (595 refetches on the
+                                // row-2 shape, measured).
+                                self.cache.hot_block.put_probationary_referenced(
+                                    block_key,
+                                    downloaded_bytes.clone(),
+                                );
                             } else {
                                 self.cache
                                     .hot_block

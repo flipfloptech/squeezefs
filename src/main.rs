@@ -158,6 +158,11 @@ enum Commands {
         /// Memory write cache size limit
         #[arg(long)]
         write_mem_cache_size: Option<String>,
+        /// R5 joint memory budget for the daemon (e.g. "6G"); overrides
+        /// SQUEEZEFS_MEM_BUDGET_MB and the cgroup-derived default
+        /// (docs/design-read-path.md §5.7)
+        #[arg(long)]
+        mem_budget: Option<String>,
 
         /// Custom Shared-Block Metadata Backend ("MetaLV") paths
         #[arg(long, value_delimiter = ',')]
@@ -1238,12 +1243,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_cache_size: _,
         read_mem_cache_size: _,
         write_mem_cache_size: _,
+        mem_budget,
         fuse_io_uring_sqpoll_idle_ms: _,
         fuse_io_uring_sqpoll_cpu: _,
         meta_lv,
         ..
     } = &cli.command
     {
+        // R5 (§5.7): the flag wins the budget resolution order. Parsed
+        // before mount so the sampler's first tick already sees it.
+        if let Some(ref mb) = mem_budget {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            match squeezefs::cache::parse_size_string(mb, sys.total_memory()) {
+                Ok(bytes) => squeezefs::mem_budget::MEM_BUDGET.set_flag_budget(bytes),
+                Err(e) => mount_bootstrap_fail(&format!("invalid --mem-budget: {e}")),
+            }
+        }
         // NOTE: failures below may run in the daemonized CHILD (stderr →
         // /dev/null or the log file): `mount_bootstrap_fail` also reports
         // them over the handshake pipe so the parent prints the reason.
@@ -2055,6 +2071,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             write_cache_size,
             read_mem_cache_size,
             write_mem_cache_size,
+            mem_budget: _,
             meta_lv,
             dismount_wait,
             upload_delay,

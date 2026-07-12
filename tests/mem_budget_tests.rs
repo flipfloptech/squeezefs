@@ -109,7 +109,7 @@ fn level_transitions_hysteresis_and_entry_events() {
     let t = Arc::new(Mutex::new(Vec::new()));
     b.register(comp("g", g.clone(), 0, 1, t));
 
-    let mut step = |pressure: u64, expect: Level| {
+    let step = |pressure: u64, expect: Level| {
         g.store(pressure, Ordering::Relaxed);
         b.tick_inner(1000, 0);
         assert_eq!(b.level(), expect, "pressure {pressure}");

@@ -2261,8 +2261,17 @@ impl DataRouter {
             return;
         }
 
+        // R5 advisory-at-admission (§5.7 — one relaxed load): Red stops
+        // issue outright (the shed callback clears the plans; foreground
+        // serves keep working); Yellow freezes window GROWTH but keeps
+        // the pipeline alive at its current depth.
+        let mem_level = crate::mem_budget::level();
+        if mem_level == crate::mem_budget::Level::Red {
+            return;
+        }
+
         // Foreground caught the pipeline: window ×2 (capped).
-        if will_wait_inflight {
+        if will_wait_inflight && mem_level == crate::mem_budget::Level::Green {
             METRICS.prefetch_foreground_waits.fetch_add(1, Relaxed);
             let _ = lane.window.fetch_update(Relaxed, Relaxed, |w| {
                 Some((w.saturating_mul(2)).min(self.prefetch_window_cap))

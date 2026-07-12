@@ -70,6 +70,10 @@ unsafe fn dealloc_pooled(ptr: *mut u8, size: usize) {
 pub struct BufferPool {
     queue: ArrayQueue<*mut u8>,
     buf_size: usize,
+    /// Live backings this pool is responsible for (queued + handed out) —
+    /// the R5 gauge; grows on empty-pool allocs, shrinks on over-capacity
+    /// recycles and Red trims.
+    allocated: std::sync::atomic::AtomicUsize,
 }
 
 // SAFETY: the queue holds uniquely-owned allocations (no aliases exist while
@@ -84,17 +88,40 @@ impl BufferPool {
         for _ in 0..capacity {
             let _ = queue.push(alloc_pooled(buf_size));
         }
-        Self { queue, buf_size }
+        Self {
+            queue,
+            buf_size,
+            allocated: std::sync::atomic::AtomicUsize::new(capacity),
+        }
+    }
+
+    /// R5 gauge: bytes of live pool backings (queued + handed out).
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated.load(std::sync::atomic::Ordering::Relaxed) as u64 * self.buf_size as u64
+    }
+
+    /// R5 Red trim (§5.7): free QUEUED (idle) backings until the pool's
+    /// live bytes are ≤ `target` — handed-out buffers are untouched (they
+    /// recycle or free later through the same accounting).
+    pub fn trim_to(&self, target: u64) {
+        while self.allocated_bytes() > target {
+            let Some(ptr) = self.queue.pop() else { break };
+            // SAFETY: every queued pointer came from `alloc_pooled(self.buf_size)`.
+            unsafe { dealloc_pooled(ptr, self.buf_size) };
+            self.allocated
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Take a buffer from the pool (or allocate a fresh aligned one when the
     /// pool is empty). The handout is logically empty — call
     /// [`PooledBuf::resize`] to expose initialized bytes.
     pub fn alloc(self: &Arc<Self>) -> PooledBuf {
-        let ptr = self
-            .queue
-            .pop()
-            .unwrap_or_else(|| alloc_pooled(self.buf_size));
+        let ptr = self.queue.pop().unwrap_or_else(|| {
+            self.allocated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            alloc_pooled(self.buf_size)
+        });
         debug_assert_eq!(
             ptr as usize % POOLED_BUF_ALIGN,
             0,
@@ -120,6 +147,8 @@ impl BufferPool {
             // SAFETY: `ptr` was produced by `alloc_pooled(self.buf_size)`
             // (only pool-sized backings reach `recycle_ptr`).
             unsafe { dealloc_pooled(ptr, self.buf_size) };
+            self.allocated
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -321,6 +350,8 @@ impl AsRef<[u8]> for ReadBlockValue {
 pub struct AlignedBufPool {
     queue: ArrayQueue<*mut u8>,
     buf_size: usize,
+    /// R5 gauge (see [`BufferPool::allocated_bytes`]).
+    allocated: std::sync::atomic::AtomicUsize,
 }
 
 unsafe impl Send for AlignedBufPool {}
@@ -373,7 +404,27 @@ impl AlignedBufPool {
         for _ in 0..capacity {
             let _ = queue.push(alloc_pooled(buf_size));
         }
-        Self { queue, buf_size }
+        Self {
+            queue,
+            buf_size,
+            allocated: std::sync::atomic::AtomicUsize::new(capacity),
+        }
+    }
+
+    /// R5 gauge: bytes of live pool backings (queued + handed out).
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated.load(std::sync::atomic::Ordering::Relaxed) as u64 * self.buf_size as u64
+    }
+
+    /// R5 Red trim (§5.7): free queued (idle) backings toward `target`.
+    pub fn trim_to(&self, target: u64) {
+        while self.allocated_bytes() > target {
+            let Some(ptr) = self.queue.pop() else { break };
+            // SAFETY: every queued pointer came from `alloc_pooled(self.buf_size)`.
+            unsafe { dealloc_pooled(ptr, self.buf_size) };
+            self.allocated
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub fn alloc(self: &Arc<Self>) -> (*mut u8, bytes::Bytes) {
@@ -390,10 +441,11 @@ impl AlignedBufPool {
     /// Take a 4096-aligned buffer of [`Self::buf_size`] without wrapping in
     /// `Bytes` (P2-4: nvme unaligned write path recycles via [`Self::recycle`]).
     pub fn alloc_raw(self: &Arc<Self>) -> *mut u8 {
-        let ptr = self
-            .queue
-            .pop()
-            .unwrap_or_else(|| alloc_pooled(self.buf_size));
+        let ptr = self.queue.pop().unwrap_or_else(|| {
+            self.allocated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            alloc_pooled(self.buf_size)
+        });
         debug_assert_eq!(
             ptr as usize % POOLED_BUF_ALIGN,
             0,
@@ -417,6 +469,8 @@ impl AlignedBufPool {
             // SAFETY: every buffer recycled here was produced by
             // `alloc_pooled(self.buf_size)`.
             unsafe { dealloc_pooled(ptr, self.buf_size) };
+            self.allocated
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

@@ -151,6 +151,16 @@ impl TieredCache {
                 let nvme_clone = nvme.clone();
                 handle.spawn(async move {
                     while let Some((key, data, _class)) = evict_rx.recv().await {
+                        // R5 Yellow+ (§5.7): dehydration paused ENTIRELY —
+                        // drop the victim (its Bytes ref dies here instead
+                        // of parking through a blocking write). Disk-tier
+                        // warmth is the cheapest sacrifice under pressure.
+                        if crate::mem_budget::level() >= crate::mem_budget::Level::Yellow {
+                            crate::fuse_client::METRICS
+                                .mem_budget_dehydrate_paused
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
                         if key.contains("blocks/") {
                             let nvme_clone_inner = nvme_clone.clone();
                             let key_clone = key.clone();
@@ -215,7 +225,16 @@ impl TieredCache {
                             // re-cools one block — the always-true device
                             // fallback, never wrongness.
                             crate::tiering::memory::EvictClass::Protected => {
-                                if nvme_clone.has_cached_read_block(&key) {
+                                // R5 Yellow+ (§5.7): dehydration paused
+                                // entirely — protected victims INCLUDED
+                                // (an escalation over the steady-state
+                                // probation-drop policy; frees the queued
+                                // Bytes and stops tier-mmap dirty growth).
+                                if crate::mem_budget::level() >= crate::mem_budget::Level::Yellow {
+                                    crate::fuse_client::METRICS
+                                        .mem_budget_dehydrate_paused
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                } else if nvme_clone.has_cached_read_block(&key) {
                                     crate::fuse_client::METRICS
                                         .hot_block_dehydrate_skips
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -392,6 +392,10 @@ pub struct Metrics {
     /// Ranged serves that hit binding/incarnation movement and re-resolved
     /// (the 074-family discipline on the ranged path).
     pub ranged_read_rebinds: Align64<AtomicU64>,
+    /// R5 (§5.7 Yellow row): dehydration-worker victims dropped because the
+    /// memory authority paused dehydration entirely (protected included —
+    /// disk-tier warmth is the cheapest sacrifice under memory pressure).
+    pub mem_budget_dehydrate_paused: Align64<AtomicU64>,
     /// R1b admission (docs/design-read-path.md §5.3): skipped ≈ streamed
     /// cold blocks (the tax kill's adoption signal — ≈ 0 on a streaming
     /// workload means the classifier/admission is broken); admissions ≈
@@ -1143,6 +1147,29 @@ impl SqueezefsFilesystem {
                 "ranged_read_bytes": METRICS.ranged_read_bytes.load(Ordering::Relaxed),
                 "ranged_read_unaligned_bounces": METRICS.ranged_read_unaligned_bounces.load(Ordering::Relaxed),
                 "ranged_read_rebinds": METRICS.ranged_read_rebinds.load(Ordering::Relaxed),
+                "mem_budget_bytes": crate::mem_budget::MEM_BUDGET.budget_bytes(),
+                "mem_budget_pressure_bytes": crate::mem_budget::MEM_BUDGET.pressure_bytes(),
+                "mem_budget_gauge_sum_bytes": crate::mem_budget::MEM_BUDGET.gauge_sum_bytes(),
+                "mem_budget_level": crate::mem_budget::MEM_BUDGET.level() as u8,
+                "mem_budget_yellow_events": crate::mem_budget::MEM_BUDGET.yellow_events(),
+                "mem_budget_red_events": crate::mem_budget::MEM_BUDGET.red_events(),
+                "mem_budget_floors_clamped": crate::mem_budget::MEM_BUDGET.floors_clamped(),
+                "mem_budget_dehydrate_paused": METRICS.mem_budget_dehydrate_paused.load(Ordering::Relaxed),
+                "mem_budget_components": crate::mem_budget::MEM_BUDGET
+                    .stats_components()
+                    .into_iter()
+                    .map(|(name, current, floor, weight, sheds)| {
+                        (
+                            name.to_string(),
+                            serde_json::json!({
+                                "current": current,
+                                "floor": floor,
+                                "weight": weight,
+                                "sheds": sheds,
+                            }),
+                        )
+                    })
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
                 "hot_block_current_bytes": self.router.cache.hot_block.current_bytes(),
                 "hot_block_max_bytes": self.router.cache.hot_block.max_bytes(),
                 "read_fill_publishes_skipped": METRICS.read_fill_publishes_skipped.load(Ordering::Relaxed),
@@ -2358,7 +2385,14 @@ impl SqueezefsFilesystem {
         block_data: crate::cache::active_block::ActiveBlockBuf,
         fencing_token: u64,
     ) {
-        'spill: while self.active_block_buffers.len() >= MAX_ACTIVE_BLOCK_BUFFERS {
+        // R5 Red (§5.7): the spill threshold halves — parked dirty bytes
+        // reach the existing never-lossy staging path at half the count
+        // (the fast, guaranteed RSS reducer of the row-5 cage shape).
+        let parked_cap = crate::mem_budget::effective_parked_cap(
+            MAX_ACTIVE_BLOCK_BUFFERS,
+            crate::mem_budget::level(),
+        );
+        'spill: while self.active_block_buffers.len() >= parked_cap {
             // Spill a partial buffer to local NVMe staging to free RAM —
             // under the victim's block lock via try_lock, MANDATORY (§5.3):
             // the caller already holds the lock of the block being inserted,
@@ -2969,6 +3003,101 @@ impl Filesystem for SqueezefsFilesystem {
             // Register this client as an active mount (heartbeat-timestamped so a
             // crashed client's entry expires instead of blocking format forever).
             self.refresh_client_registration().await;
+        }
+
+        // R5 (§5.7): register the RAM consumers with the joint memory
+        // authority and start its 1 Hz sampler. Registration is guarded
+        // (one registry per process) — remounts in-process must not
+        // duplicate components.
+        {
+            use crate::mem_budget::{Component, MEM_BUDGET};
+            use std::sync::Arc;
+            static REGISTERED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REGISTERED.swap(true, Ordering::Relaxed) {
+                const MIB: u64 = 1024 * 1024;
+                let bufs = self.active_block_buffers.clone();
+                let bs_atomic = self.router.block_size.clone();
+                MEM_BUDGET.register(Component::new(
+                    "parked_write_buffers",
+                    32 * 4 * MIB, // 32 parked blocks at the default 4 MiB
+                    4,
+                    Arc::new(move || bufs.len() as u64 * bs_atomic.load(Ordering::Relaxed)),
+                    // Shed mechanism = the Red cap-halving at admission
+                    // (insert_active_block_buffer): parked dirty bytes reach
+                    // the existing never-lossy staging spill at half the
+                    // count. Nothing to do from the sampler side.
+                    Arc::new(|_| {}),
+                ));
+                let hot = self.router.cache.hot_block.clone();
+                let hot_shed = self.router.cache.hot_block.clone();
+                MEM_BUDGET.register(Component::new(
+                    "hot_block_tier",
+                    64 * MIB,
+                    4,
+                    Arc::new(move || hot.current_bytes()),
+                    Arc::new(move |target| hot_shed.shed_to(target)),
+                ));
+                let rl = self.router.cache.read_lru.clone();
+                let rl_shed = self.router.cache.read_lru.clone();
+                MEM_BUDGET.register(Component::new(
+                    "read_lru",
+                    32 * MIB,
+                    2,
+                    Arc::new(move || rl.current_bytes()),
+                    Arc::new(move |target| rl_shed.shed_to(target)),
+                ));
+                let wl = self.router.cache.write_lru.clone();
+                let wl_shed = self.router.cache.write_lru.clone();
+                MEM_BUDGET.register(Component::new(
+                    "write_lru",
+                    32 * MIB,
+                    2,
+                    Arc::new(move || wl.current_bytes()),
+                    Arc::new(move |target| wl_shed.shed_to(target)),
+                ));
+                let lanes = self.router.stream_lanes.clone();
+                MEM_BUDGET.register(Component::new(
+                    "prefetch_inflight",
+                    0,
+                    1,
+                    Arc::new(|| METRICS.prefetch_inflight_bytes.load(Ordering::Relaxed)),
+                    // Red: plans cleared — lane invalidation is the existing
+                    // abandonment semantics (in-flight fills settle wasted).
+                    Arc::new(move |_| lanes.invalidate_all()),
+                ));
+                let staging = self.router.cache.nvme.clone();
+                MEM_BUDGET.register(Component::new(
+                    "staging_mmap",
+                    0,
+                    0, // weight 0: staging keeps its existing refusal behavior
+                    Arc::new(move || staging.current_staged_write_bytes()),
+                    Arc::new(|_| {}),
+                ));
+                let tier = self.router.cache.nvme.clone();
+                MEM_BUDGET.register(Component::new(
+                    "read_tier_mmap",
+                    0,
+                    0, // mmap residency is kernel-owned; reclaim_extent is churn-driven (§5.7)
+                    Arc::new(move || tier.current_read_cache_bytes()),
+                    Arc::new(|_| {}),
+                ));
+                MEM_BUDGET.register(Component::new(
+                    "buffer_pool",
+                    16 * 4 * MIB,
+                    2,
+                    Arc::new(|| crate::cache::pool::BUFFER_POOL.allocated_bytes()),
+                    Arc::new(|target| crate::cache::pool::BUFFER_POOL.trim_to(target)),
+                ));
+                MEM_BUDGET.register(Component::new(
+                    "aligned_buf_pool",
+                    16 * 4 * MIB,
+                    2,
+                    Arc::new(|| crate::cache::pool::ALIGNED_BUF_POOL.allocated_bytes()),
+                    Arc::new(|target| crate::cache::pool::ALIGNED_BUF_POOL.trim_to(target)),
+                ));
+            }
+            crate::mem_budget::spawn_sampler();
         }
 
         // Start background active writes flusher task

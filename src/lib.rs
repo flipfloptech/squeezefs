@@ -2,6 +2,7 @@
 // The stats-inode `serde_json::json!` literal exceeds the default macro
 // recursion limit (128) — compile-time only, no runtime effect.
 #![recursion_limit = "512"]
+pub mod mem_budget;
 pub mod nvme_dev;
 pub mod tiering;
 

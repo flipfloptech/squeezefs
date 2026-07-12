@@ -140,6 +140,35 @@ impl MemoryCacheShard {
         }
     }
 
+    /// R5 clamp (§5.7 Red row): force-evict — second chances IGNORED, the
+    /// clamp is an order, not a scan — until this shard holds ≤ `target`
+    /// bytes. Victims are returned for the caller's drop/count policy
+    /// (under Red the dehydration pause is already active, so they die).
+    fn shed_to(&self, target: usize, evicted: &mut Vec<(Bytes, Bytes, EvictClass)>) {
+        if let Some(_guard) = self.eviction_lock.try_lock() {
+            let max_loops = std::cmp::max(self.eviction_queue.len() * 2, 64);
+            let mut loops = 0;
+            while self.current_bytes.load(Ordering::Relaxed) > target && loops < max_loops {
+                loops += 1;
+                let Some(evict_key) = self.eviction_queue.pop() else {
+                    break;
+                };
+                if let scc::hash_map::Entry::Occupied(entry) =
+                    self.map.entry_sync(evict_key.clone())
+                {
+                    let (value, state) = entry.remove();
+                    self.current_bytes.fetch_sub(value.len(), Ordering::Relaxed);
+                    let class = if state.protected.load(Ordering::Relaxed) {
+                        EvictClass::Protected
+                    } else {
+                        EvictClass::Probation
+                    };
+                    evicted.push((evict_key, value, class));
+                }
+            }
+        }
+    }
+
     fn try_evict(&self, evicted: &mut Vec<(Bytes, Bytes, EvictClass)>) {
         if let Some(_guard) = self.eviction_lock.try_lock() {
             let approx_len = self.eviction_queue.len();
@@ -322,6 +351,18 @@ impl MemoryCache {
     pub fn remove(&self, key: &[u8]) -> Option<Bytes> {
         let idx = self.get_shard_idx(key);
         self.shards[idx].remove(key)
+    }
+
+    /// R5 clamp (§5.7): force-evict across shards until total bytes ≤
+    /// `target` (proportional per-shard targets). Victims returned for the
+    /// caller's drop/count policy.
+    pub fn shed_to(&self, target: usize) -> Vec<(Bytes, Bytes, EvictClass)> {
+        let mut evicted = Vec::new();
+        let per_shard = target / self.shards.len();
+        for shard in &self.shards {
+            shard.shed_to(per_shard, &mut evicted);
+        }
+        evicted
     }
 
     /// Get current total memory usage in bytes.

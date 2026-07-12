@@ -136,16 +136,44 @@ impl LruCache {
         self.put_with(key, data, PutClass::ProbationReferenced);
     }
 
+    /// R5 Red clamp (§5.7): force-evict toward `target` bytes. Victims are
+    /// DROPPED at the source (counted) — never dehydrated: the Yellow
+    /// dehydration pause is already active below Red, and a clamp that
+    /// queued multi-MiB payloads would re-create the pressure it sheds.
+    pub fn shed_to(&self, target: u64) {
+        for (_k, _v, class) in self.inner.shed_to(target as usize) {
+            crate::fuse_client::METRICS
+                .hot_block_evictions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if matches!(class, crate::tiering::memory::EvictClass::Probation) {
+                crate::fuse_client::METRICS
+                    .hot_block_probation_drops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     fn put_with(&self, key: &str, data: Bytes, class: PutClass) {
         if (data.len() as u64) <= self.max_bytes {
+            // R5 Yellow+ (§5.7 "stop growth: hot-tier inserts evict-first"):
+            // net-zero growth — after the insert, clamp back to the
+            // pre-insert size (one relaxed level load on the put path).
+            let freeze_at = if crate::mem_budget::level() >= crate::mem_budget::Level::Yellow {
+                Some(self.inner.current_bytes() as u64)
+            } else {
+                None
+            };
             let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-            let evicted = match class {
+            let mut evicted = match class {
                 PutClass::Protected => self.inner.put(key_bytes, data),
                 PutClass::Probation => self.inner.put_probationary(key_bytes, data),
                 PutClass::ProbationReferenced => {
                     self.inner.put_probationary_referenced(key_bytes, data)
                 }
             };
+            if let Some(pre) = freeze_at {
+                evicted.extend(self.inner.shed_to(pre as usize));
+            }
             if evicted.is_empty() {
                 return;
             }

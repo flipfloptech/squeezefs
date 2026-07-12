@@ -128,13 +128,12 @@ async fn staged_rmw_storm_is_pool_backed_recycling_and_byte_exact() {
     const IMG: usize = 2 * 1024 * 1024;
     const OPS: u64 = 200;
     let h = make(*b"stagedrmw-c-fu01", "srmw_ns_a").await;
-    let ino = h
-        .fs
-        .create(h.req, 1, OsStr::new("srmw"), libc::S_IFREG | 0o644, 0)
-        .await
-        .unwrap()
-        .attr
-        .ino;
+    let ino =
+        h.fs.create(h.req, 1, OsStr::new("srmw"), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
 
     // Model of the file for byte-exactness.
     let mut model = vec![0u8; IMG];
@@ -154,7 +153,9 @@ async fn staged_rmw_storm_is_pool_backed_recycling_and_byte_exact() {
 
     let mut x = 0x9E37_79B9u64;
     for i in 0..OPS {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let off = (x % (IMG as u64 - 4096)) & !7;
         let val = (i % 251) as u8;
         let buf = vec![val; 4096];
@@ -182,13 +183,12 @@ async fn staged_rmw_storm_is_pool_backed_recycling_and_byte_exact() {
     );
 
     // 3) Byte-exactness across the whole image after the storm.
-    let got = h
-        .fs
-        .read(h.req, ino, 0, 0, IMG as u32, 0)
-        .await
-        .unwrap()
-        .data
-        .to_vec();
+    let got =
+        h.fs.read(h.req, ino, 0, 0, IMG as u32, 0)
+            .await
+            .unwrap()
+            .data
+            .to_vec();
     assert_eq!(got.len(), IMG);
     assert_eq!(got, model, "staged RMW storm must stay byte-exact");
 }

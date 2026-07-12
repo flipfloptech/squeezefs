@@ -1049,6 +1049,43 @@ impl NvmeStaging {
             .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))
     }
 
+    /// [`Self::read_staged`] into a caller-provided pooled buffer — the
+    /// staged-RMW seed path (follow-up C): the whole-image copy lands in a
+    /// recycled `BUFFER_POOL` backing instead of a fresh `Vec` per
+    /// sub-block write (dhat-measured as the aged-daemon allocation flood:
+    /// ~4 MiB malloc/free per op at storm rates). Same guard discipline as
+    /// `read_staged`; returns whether the image was found (the buffer is
+    /// resized to the image length on success, contents exact).
+    pub fn read_staged_into(&self, file_id: &str, buf: &mut crate::cache::pool::PooledBuf) -> bool {
+        let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
+        let Some(guard) = self.staging_nvme_cache.get(&key_bytes) else {
+            return false;
+        };
+        let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+        if bytes.len() < 8 {
+            return false;
+        }
+        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+        if bytes.len() < 8 + meta_len {
+            return false;
+        }
+        let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) else {
+            return false;
+        };
+        let data_start = if file_id.starts_with("active_block:") {
+            4096
+        } else {
+            8 + meta_len
+        };
+        let data_end = data_start + meta.original_size as usize;
+        if bytes.len() < data_end {
+            return false;
+        }
+        buf.resize(meta.original_size as usize, 0);
+        buf.copy_from_slice(&bytes[data_start..data_end]);
+        true
+    }
+
     /// Read staged data directly from staging_nvme_cache memory-mapped segments.
     pub fn read_staged(&self, file_id: &str) -> Option<Vec<u8>> {
         let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());

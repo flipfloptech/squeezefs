@@ -3328,24 +3328,43 @@ impl DataRouter {
         // bytes and revert a just-punched/written range (the generic/616
         // residual). Staged reads its authoritative base from the staging ring
         // (or the promoted durable block), which tracks every mutation.
-        let mut existing_data = if full_overwrite_empty {
-            Vec::new()
+        // Follow-up C (the staged-RMW allocation flood, dhat-attributed):
+        // the whole-image RMW seed lives in a recycled `BUFFER_POOL`
+        // backing, never a fresh ~image-sized `Vec` per sub-block write —
+        // at fsx storm rates the old path churned ~21 GB of 4 MiB-class
+        // heap per 30 k ops, and its jemalloc retention was the
+        // aged-daemon cage-kill class. Transient by construction on the
+        // hot (staged) shape: the ring stays authoritative and the staged
+        // arm removes both LRU entries, so the buffer recycles at drop /
+        // `into_bytes` release. The inline arm re-materializes an
+        // exact-size copy before RETAINING (see below) so a ≤ 4 KiB
+        // inline payload never pins a pooled 4 MiB backing.
+        let mut existing_data = BUFFER_POOL.alloc();
+        if full_overwrite_empty {
+            // empty seed
         } else if meta.file_type == "inline" {
-            if let Some(cached) = self.cache.write_lru.get(file_path) {
-                cached.to_vec()
-            } else if let Some(cached) = self.cache.read_lru.get(file_path) {
-                cached.to_vec()
-            } else if let Some(ref d) = meta.data_key {
-                d.to_vec()
-            } else {
-                Vec::new()
+            let src: Option<bytes::Bytes> = self
+                .cache
+                .write_lru
+                .get(file_path)
+                .or_else(|| self.cache.read_lru.get(file_path))
+                .or_else(|| meta.data_key.clone());
+            if let Some(src) = src {
+                existing_data.resize(src.len(), 0);
+                existing_data.copy_from_slice(&src);
             }
         } else {
             match meta.file_type.as_str() {
                 "staged" => {
                     if let Some(ref file_id) = meta.file_id {
-                        if let Some(staged_data) = self.cache.nvme.read_staged(file_id) {
-                            staged_data
+                        if self
+                            .cache
+                            .nvme
+                            .read_staged_into(file_id, &mut existing_data)
+                        {
+                            crate::fuse_client::METRICS
+                                .staged_rmw_pooled_seeds
+                                .fetch_add(1, Ordering::Relaxed);
                         } else {
                             // Ring miss under the inode write lock +
                             // BLOCK_FLUSH_LOCKS: the only racer that can move
@@ -3363,19 +3382,15 @@ impl DataRouter {
                                     self.parse_block_mapping(&mapping_str)?;
                                 let packed_bytes =
                                     self.nvme_writer.read_block(offset_u64 + off, sz).await?;
-                                self.get_crypto()
-                                    .process_read_async(packed_bytes)
-                                    .await?
-                                    .to_vec()
-                            } else {
-                                Vec::new()
+                                let plain =
+                                    self.get_crypto().process_read_async(packed_bytes).await?;
+                                existing_data.resize(plain.len(), 0);
+                                existing_data.copy_from_slice(&plain);
                             }
                         }
-                    } else {
-                        Vec::new()
                     }
                 }
-                _ => Vec::new(),
+                _ => {}
             }
         };
 
@@ -3498,7 +3513,21 @@ impl DataRouter {
                 existing_data.resize(end_offset, 0);
             }
             existing_data[offset as usize..end_offset].copy_from_slice(&data);
-            bytes::Bytes::from(existing_data)
+            if new_size <= MAX_INLINE_SIZE {
+                // The inline arm RETAINS its payload (meta.data_key + both
+                // RAM LRUs): re-materialize exact-size so a tiny inline
+                // file never pins the pooled 4 MiB backing (the flood in
+                // retention clothes). ≤ MAX_INLINE bytes — trivial.
+                let exact = bytes::Bytes::copy_from_slice(&existing_data);
+                drop(existing_data); // recycle the pooled backing now
+                exact
+            } else {
+                // Staged/spill shapes are transient consumers (staging
+                // copies into the mmap ring; the staged arm removes both
+                // LRU entries): the pooled backing recycles when the last
+                // `Bytes` handle drops.
+                existing_data.into_bytes()
+            }
         };
 
         if new_size <= MAX_INLINE_SIZE {

@@ -397,6 +397,11 @@ pub struct Metrics {
     /// memory authority paused dehydration entirely (protected included —
     /// disk-tier warmth is the cheapest sacrifice under memory pressure).
     pub mem_budget_dehydrate_paused: Align64<AtomicU64>,
+    /// Staged-file RMW seeds served through the bounded `BUFFER_POOL`
+    /// (follow-up C): the whole-image read_staged seed recycles instead of
+    /// mallocing ~4 MiB per sub-block write — the allocation flood behind
+    /// the aged-daemon cage kills (dhat: ~21 GB churn / 30 k-op storm).
+    pub staged_rmw_pooled_seeds: Align64<AtomicU64>,
     /// R1b admission (docs/design-read-path.md §5.3): skipped ≈ streamed
     /// cold blocks (the tax kill's adoption signal — ≈ 0 on a streaming
     /// workload means the classifier/admission is broken); admissions ≈
@@ -1156,6 +1161,7 @@ impl SqueezefsFilesystem {
                 "mem_budget_red_events": crate::mem_budget::MEM_BUDGET.red_events(),
                 "mem_budget_floors_clamped": crate::mem_budget::MEM_BUDGET.floors_clamped(),
                 "mem_budget_dehydrate_paused": METRICS.mem_budget_dehydrate_paused.load(Ordering::Relaxed),
+                "staged_rmw_pooled_seeds": METRICS.staged_rmw_pooled_seeds.load(Ordering::Relaxed),
                 "mem_budget_components": crate::mem_budget::MEM_BUDGET
                     .stats_components()
                     .into_iter()

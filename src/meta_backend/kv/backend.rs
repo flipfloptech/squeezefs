@@ -834,6 +834,33 @@ impl KvMetaBackend {
         *self.ckpt_alive.lock().unwrap() = alive;
     }
 
+    /// R5 defense-in-depth gauge (follow-up C): the node cache's RAM
+    /// estimate at its budget-accounting basis (cached nodes × node size)
+    /// plus the dirty-node count — registered with the mem-budget
+    /// authority so metadata RAM is visible to pressure accounting. The
+    /// dhat attribution showed the KV core was NOT the flood, but "no
+    /// per-component cap can see the sum" (§5.7) applies to it like every
+    /// other consumer.
+    pub fn node_cache_gauge(&self) -> (u64, u64) {
+        let node_size = self.cache.config().layout.node_size() as u64;
+        let mut nodes = 0u64;
+        let mut dirty = 0u64;
+        self.node_cache().for_each_node(|n| {
+            nodes += 1;
+            if n.dirty_floor() != u64::MAX {
+                dirty += 1;
+            }
+        });
+        (nodes * node_size, dirty)
+    }
+
+    /// R5 shed lever (never-lossy by construction): wake the checkpoint
+    /// task NOW — an early flush/checkpoint tick, exactly the drain the
+    /// cadence would run anyway. Never drops dirty state.
+    pub fn kick_checkpoint(&self) {
+        self.checkpoint_wake().notify_one();
+    }
+
     pub(super) fn checkpoint_wake(&self) -> Arc<tokio::sync::Notify> {
         self.ckpt_wake.clone()
     }

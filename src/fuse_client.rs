@@ -3182,6 +3182,26 @@ impl Filesystem for SqueezefsFilesystem {
                     Arc::new(move || bmap_cache.entry_count() * 256),
                     Arc::new(move |_| bmap_cache_shed.invalidate_all()),
                 ));
+                // KV metadata node cache (follow-up C defense-in-depth):
+                // gauge at the budget-accounting basis (nodes × node
+                // size); the shed is a checkpoint KICK — an early run of
+                // the exact drain the cadence performs anyway (never-lossy
+                // by construction; dirty state is flushed, never dropped).
+                if let Some(ref routed) = self.meta_backend {
+                    let vols = routed.volumes.clone();
+                    let vols_shed = routed.volumes.clone();
+                    MEM_BUDGET.register(Component::new(
+                        "kv_node_cache",
+                        64 * MIB,
+                        1,
+                        Arc::new(move || vols.iter().map(|v| v.node_cache_gauge().0).sum()),
+                        Arc::new(move |_| {
+                            for v in &vols_shed {
+                                v.kick_checkpoint();
+                            }
+                        }),
+                    ));
+                }
                 MEM_BUDGET.register(Component::new(
                     "buffer_pool",
                     16 * 4 * MIB,

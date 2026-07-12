@@ -3566,7 +3566,7 @@ impl DataRouter {
                             // the serve. `Bytes` refcount hit; the reply
                             // slice is the only copy.
                             if let Some(ref b_key) = b_key_opt {
-                                if let Some(hot) = self.cache.hot_block.get(b_key) {
+                                if let Some(hot) = self.cache.hot_block.get_no_promote(b_key) {
                                     let start = std::cmp::min(slice_start as usize, hot.len());
                                     let end = std::cmp::min(
                                         (slice_start + slice_len as u64) as usize,

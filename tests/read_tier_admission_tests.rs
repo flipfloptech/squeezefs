@@ -389,15 +389,25 @@ async fn dehydration_gate_drops_untouched_probation_and_dehydrates_protected() {
     }
     let map = make_cold(&h, ino).await;
 
-    // Touch block 0 twice (fill + re-read ⇒ promoted sticky-protected in
-    // hot), then stream blocks 1..6 once each: probation churn evicts both
-    // the promoted entry (dehydrates) and never-read probation victims
-    // (dropped + counted).
+    // Make block 0 PROTECTED via a block-level re-access (ghost-admitted
+    // second miss ⇒ protected insert + publish); stream sub-read
+    // consumption deliberately does NOT promote (the R1b liveness
+    // correction — promoting consumption re-taxed streams through
+    // protected-victim dehydration; the PR 4 bench OOM). Then clear the
+    // tier copy so the eventual dehydration is observable, and stream
+    // blocks 1..6: probation churn evicts both the protected entry
+    // (dehydrates) and never-read probation victims (dropped + counted).
     let drops0 = METRICS.hot_block_probation_drops.load(Ordering::Relaxed);
-    let d = read_at(&h, ino, 0, 64 * 1024).await;
+    let d = read_at(&h, ino, 0, 64 * 1024).await; // touch 1: probation
     assert!(d.iter().all(|&x| x == 1));
-    let d = read_at(&h, ino, 128 * 1024, 64 * 1024).await; // promote block 0
+    h.fs.router.cache.hot_block.remove(map.get(&0).unwrap());
+    let d = read_at(&h, ino, 128 * 1024, 64 * 1024).await; // touch 2: ghost-admit
     assert!(d.iter().all(|&x| x == 1));
+    // Tier now holds the admitted copy; drop it so dehydration is visible.
+    h.fs.router
+        .cache
+        .nvme
+        .remove_cached_read_block(map.get(&0).unwrap());
     for b in 1..6u64 {
         let d = read_at(&h, ino, b * BS, 64 * 1024).await;
         assert!(d.iter().all(|&x| x == b as u8 + 1), "block {b}");

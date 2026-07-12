@@ -88,7 +88,7 @@ impl TieredCache {
             }
             Err(_) => std::cmp::max(2 * 4 * 1024 * 1024, read_mem_limit / 4),
         };
-        let hot_block = lru::LruCache::with_capacity(hot_budget);
+        let hot_block = lru::LruCache::with_capacity(hot_budget).with_drop_probation_evictions();
 
         // 2. Get disk size limit
         let aggregate_capacity = get_aggregate_disk_capacity(&staging_dirs);

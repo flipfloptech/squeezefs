@@ -36,8 +36,15 @@ struct EntryState {
 }
 
 /// A single thread-safe shard of the Clock cache.
+///
+/// `scc::HashMap` (not `HashIndex`): removals MOVE the value out, so a
+/// multi-MiB `Bytes` payload is freed the moment its entry is evicted.
+/// HashIndex defers value drops through epoch-based reclamation, which
+/// under a cold-stream's 4 MiB-value churn parked gigabytes of dead
+/// payloads past the cgroup cap (the PR 4 row-2 OOM — latent since PR 3,
+/// first exercised by a full-length cold stream through the hot tier).
 struct MemoryCacheShard {
-    map: scc::HashIndex<Bytes, (Bytes, EntryState)>,
+    map: scc::HashMap<Bytes, (Bytes, EntryState)>,
     eviction_queue: crossbeam::queue::SegQueue<Bytes>,
     eviction_lock: parking_lot::Mutex<()>,
     current_bytes: AtomicUsize,
@@ -47,7 +54,7 @@ struct MemoryCacheShard {
 impl MemoryCacheShard {
     fn new(max_bytes: usize) -> Self {
         Self {
-            map: scc::HashIndex::default(),
+            map: scc::HashMap::new(),
             eviction_queue: crossbeam::queue::SegQueue::new(),
             eviction_lock: parking_lot::Mutex::new(()),
             current_bytes: AtomicUsize::new(0),
@@ -55,13 +62,21 @@ impl MemoryCacheShard {
         }
     }
 
-    fn get(&self, key: &[u8]) -> Option<Bytes> {
+    fn get(&self, key: &[u8], promote: bool) -> Option<Bytes> {
         let entry = self.map.get_sync(key)?;
         let (value, state) = entry.get();
         state.referenced.store(true, Ordering::Relaxed);
-        // Sticky promotion (§5.4): any read of a probation entry marks it
-        // worth keeping — never cleared by the clock scan.
-        state.protected.store(true, Ordering::Relaxed);
+        if promote {
+            // Sticky promotion (§5.4): a block-level re-access marks the
+            // entry worth keeping — never cleared by the clock scan.
+            state.protected.store(true, Ordering::Relaxed);
+        }
+        // Non-promoting gets (stream sub-read CONSUMPTION, the R1b row-2
+        // measured correction): the entry still earns its clock second
+        // chance for the pass, but consuming a fill's own sub-ranges is
+        // not evidence it will ever be needed again — promotion here
+        // re-taxed streams through protected-victim dehydration and
+        // parked gigabytes in the eviction channel (the PR 4 bench OOM).
         Some(value.clone())
     }
 
@@ -81,35 +96,34 @@ impl MemoryCacheShard {
         }
 
         let mut old_len = None;
-        let _ = unsafe {
-            self.map
-                .entry_sync(key.clone())
-                .and_modify(|(old_val, state)| {
-                    let old = std::mem::replace(old_val, value.clone());
-                    state.referenced.store(true, Ordering::Relaxed);
-                    if protected {
-                        // A protected re-put promotes; a probationary
-                        // re-put never DEMOTES an entry something already
-                        // read (sticky).
-                        state.protected.store(true, Ordering::Relaxed);
-                    }
-                    old_len = Some(old.len());
-                })
-        }
-        .or_insert_with(|| {
-            self.eviction_queue.push(key.clone());
-            self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
-            (
-                value,
-                EntryState {
-                    // Probationary inserts start with NO second chance and
-                    // NO keep-worthiness: first in eviction line, cannot
-                    // displace a protected entry that still has its lap.
-                    referenced: AtomicBool::new(protected),
-                    protected: AtomicBool::new(protected),
-                },
-            )
-        });
+        let _ = self
+            .map
+            .entry_sync(key.clone())
+            .and_modify(|(old_val, state)| {
+                let old = std::mem::replace(old_val, value.clone());
+                state.referenced.store(true, Ordering::Relaxed);
+                if protected {
+                    // A protected re-put promotes; a probationary
+                    // re-put never DEMOTES an entry something already
+                    // read (sticky).
+                    state.protected.store(true, Ordering::Relaxed);
+                }
+                old_len = Some(old.len());
+            })
+            .or_insert_with(|| {
+                self.eviction_queue.push(key.clone());
+                self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
+                (
+                    value,
+                    EntryState {
+                        // Probationary inserts start with NO second chance
+                        // and NO keep-worthiness: first in eviction line,
+                        // cannot displace a protected entry with its lap.
+                        referenced: AtomicBool::new(protected),
+                        protected: AtomicBool::new(protected),
+                    },
+                )
+            });
 
         if let Some(old) = old_len {
             self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
@@ -137,15 +151,23 @@ impl MemoryCacheShard {
 
                     let inspect_res = self.map.entry_sync(evict_key.clone());
                     match inspect_res {
-                        scc::hash_index::Entry::Occupied(mut entry) => {
-                            let (val_ref, state) = unsafe { entry.get_mut() };
-                            if state.referenced.load(Ordering::Relaxed) {
+                        scc::hash_map::Entry::Occupied(mut entry) => {
+                            let needs_second_chance = {
+                                let (_, state) = entry.get();
+                                state.referenced.load(Ordering::Relaxed)
+                            };
+                            if needs_second_chance {
+                                let (_, state) = entry.get_mut();
                                 state.referenced.store(false, Ordering::Relaxed);
                                 self.eviction_queue.push(evict_key.clone());
                             } else {
+                                // HashMap removal MOVES the value out: the
+                                // payload is freed (or handed to the
+                                // caller) immediately — no epoch-deferred
+                                // multi-MiB garbage under churn.
+                                let (value, state) = entry.remove();
                                 should_evict = true;
-                                len = val_ref.len();
-                                val = Some(val_ref.clone());
+                                len = value.len();
                                 // The STICKY bit classifies the victim —
                                 // the clock consumed `referenced`, so it
                                 // is false for every victim by
@@ -155,10 +177,10 @@ impl MemoryCacheShard {
                                 } else {
                                     EvictClass::Probation
                                 };
-                                entry.remove_entry();
+                                val = Some(value);
                             }
                         }
-                        scc::hash_index::Entry::Vacant(_) => {}
+                        scc::hash_map::Entry::Vacant(_) => {}
                     }
 
                     if should_evict {
@@ -177,15 +199,13 @@ impl MemoryCacheShard {
     fn remove(&self, key: &[u8]) -> Option<Bytes> {
         let entry = self.map.entry_sync(Bytes::copy_from_slice(key));
         match entry {
-            scc::hash_index::Entry::Occupied(entry) => {
-                let (val, _) = entry.get();
-                let val_clone = val.clone();
+            scc::hash_map::Entry::Occupied(entry) => {
+                let (val, _) = entry.remove();
                 let len = val.len();
-                entry.remove_entry();
                 self.current_bytes.fetch_sub(len, Ordering::Relaxed);
-                Some(val_clone)
+                Some(val)
             }
-            scc::hash_index::Entry::Vacant(_) => None,
+            scc::hash_map::Entry::Vacant(_) => None,
         }
     }
 }
@@ -221,9 +241,18 @@ impl MemoryCache {
     }
 
     /// Retrieves an item from the cache. Clones the `Bytes` pointer (O(1), zero-copy).
+    /// Promotes probation entries to sticky-protected (block-level re-access).
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         let idx = self.get_shard_idx(key);
-        self.shards[idx].get(key)
+        self.shards[idx].get(key, true)
+    }
+
+    /// [`Self::get`] WITHOUT sticky promotion — stream sub-read
+    /// consumption (§5.3/§5.5): serves and refreshes the clock bit, but
+    /// consuming a fill's own sub-ranges never marks it keep-worthy.
+    pub fn get_no_promote(&self, key: &[u8]) -> Option<Bytes> {
+        let idx = self.get_shard_idx(key);
+        self.shards[idx].get(key, false)
     }
 
     /// Inserts an item as PROTECTED (referenced=true, protected=true) —
@@ -285,7 +314,7 @@ impl MemoryCache {
     pub fn keys(&self) -> Vec<Bytes> {
         let mut keys = Vec::new();
         for shard in &self.shards {
-            shard.map.iter_sync(|k, _| {
+            shard.map.retain_sync(|k, _| {
                 keys.push(k.clone());
                 true
             });

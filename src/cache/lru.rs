@@ -14,6 +14,10 @@ pub struct LruCache {
     max_bytes: u64,
     evict_tx: tokio::sync::mpsc::Sender<(String, Bytes, EvictClass)>,
     evict_rx: Arc<std::sync::Mutex<Option<EvictReceiver>>>,
+    /// R1b: drop Probation victims at the eviction source (count only —
+    /// no channel traffic). Set for the hot-block tier; read_lru keeps
+    /// full-channel behavior (its inserts are all protected anyway).
+    drop_probation_evictions: bool,
 }
 
 impl LruCache {
@@ -67,7 +71,15 @@ impl LruCache {
             max_bytes: actual_bytes,
             evict_tx,
             evict_rx: Arc::new(std::sync::Mutex::new(Some(evict_rx))),
+            drop_probation_evictions: false,
         }
+    }
+
+    /// Builder toggle for the hot-block tier (source-drop of probation
+    /// victims — see `drop_probation_evictions`).
+    pub fn with_drop_probation_evictions(mut self) -> Self {
+        self.drop_probation_evictions = true;
+        self
     }
 
     /// Retrieve the eviction receiver. Can only be taken once.
@@ -75,9 +87,17 @@ impl LruCache {
         self.evict_rx.lock().ok()?.take()
     }
 
-    /// Retrieve an entry from the cache, updating its clock status.
+    /// Retrieve an entry from the cache, updating its clock status and
+    /// promoting probation entries (block-level re-access).
     pub fn get(&self, key: &str) -> Option<Bytes> {
         self.inner.get(key.as_bytes())
+    }
+
+    /// Non-promoting get — stream sub-read consumption (§5.3): the entry
+    /// keeps its clock second chance but is never marked keep-worthy by
+    /// consuming its own sub-ranges.
+    pub fn get_no_promote(&self, key: &str) -> Option<Bytes> {
+        self.inner.get_no_promote(key.as_bytes())
     }
 
     /// Insert an entry as PROTECTED (the pre-R4 semantics — every put via
@@ -109,6 +129,22 @@ impl LruCache {
                 return;
             }
             for (ek, ev, class) in evicted {
+                // R1b liveness (the PR 4 bench OOM): probation victims of a
+                // drop-probation cache are one-pass residue — dropping them
+                // AT THE SOURCE keeps multi-MiB `Bytes` from ever parking
+                // in the eviction channel (16384 slots × 4 MiB blocks was
+                // an 8 GiB cgroup kill under a cold stream).
+                if self.drop_probation_evictions
+                    && matches!(class, crate::tiering::memory::EvictClass::Probation)
+                {
+                    crate::fuse_client::METRICS
+                        .hot_block_evictions
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::fuse_client::METRICS
+                        .hot_block_probation_drops
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
                 // Keys inserted via this API are always valid UTF-8 path/block ids.
                 let k_str = match String::from_utf8(ek.to_vec()) {
                     Ok(s) => s,

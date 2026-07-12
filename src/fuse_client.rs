@@ -402,6 +402,15 @@ pub struct Metrics {
     /// mallocing ~4 MiB per sub-block write — the allocation flood behind
     /// the aged-daemon cage kills (dhat: ~21 GB churn / 30 k-op storm).
     pub staged_rmw_pooled_seeds: Align64<AtomicU64>,
+    /// Truncate-shrinks of a staged blob applied as an IN-PLACE ring header
+    /// patch (never a re-stage that ring pressure can refuse) — the fix for
+    /// the aged-fsx stale-resurrection corruption
+    /// (`tests/staged_truncate_stale_tests.rs`).
+    pub staged_truncate_inplace_shrinks: Align64<AtomicU64>,
+    /// Truncate-shrinks that clip-rewrote a promoted/spilled durable staged
+    /// image (`block_map[0]`) longer than the new size — the ring-miss leg
+    /// of the same corruption class.
+    pub staged_truncate_durable_clips: Align64<AtomicU64>,
     /// R1b admission (docs/design-read-path.md §5.3): skipped ≈ streamed
     /// cold blocks (the tax kill's adoption signal — ≈ 0 on a streaming
     /// workload means the classifier/admission is broken); admissions ≈
@@ -1162,6 +1171,8 @@ impl SqueezefsFilesystem {
                 "mem_budget_floors_clamped": crate::mem_budget::MEM_BUDGET.floors_clamped(),
                 "mem_budget_dehydrate_paused": METRICS.mem_budget_dehydrate_paused.load(Ordering::Relaxed),
                 "staged_rmw_pooled_seeds": METRICS.staged_rmw_pooled_seeds.load(Ordering::Relaxed),
+                "staged_truncate_inplace_shrinks": METRICS.staged_truncate_inplace_shrinks.load(Ordering::Relaxed),
+                "staged_truncate_durable_clips": METRICS.staged_truncate_durable_clips.load(Ordering::Relaxed),
                 "mem_budget_components": crate::mem_budget::MEM_BUDGET
                     .stats_components()
                     .into_iter()

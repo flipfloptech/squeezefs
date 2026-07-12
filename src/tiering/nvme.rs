@@ -679,6 +679,79 @@ impl NvmeShard {
         self.inner.read_recursive().map.contains_key(key)
     }
 
+    /// In-place logical shrink of a STAGED-framed value (`[meta_len:u64 BE]
+    /// [StagedMetadata][payload…]`): rewrite the fixed-width `original_size`
+    /// field — value bytes `[16, 24)` — under the shard WRITE lock, so every
+    /// reader decodes the clipped length from then on.
+    ///
+    /// This exists because a truncate-shrink must be able to clip a staged
+    /// blob WITHOUT ring admission: `reserve_and_write`'s same-key replace
+    /// needs a fresh non-overlapping extent (the old copy stays live for
+    /// crash-torn protection), so under a full/fragmented segment a plain
+    /// re-stage of the clipped image REFUSES — and a logical shrink that can
+    /// fail for lack of space is how pre-truncate bytes survived to be
+    /// re-exposed by the next truncate-up (the aged-fsx stale-resurrection
+    /// corruption, `tests/staged_truncate_stale_tests.rs`). An 8-byte patch
+    /// of an existing extent needs no placement and cannot be refused.
+    ///
+    /// Crash safety: the field is 8 contiguous bytes inside one sector of an
+    /// already-durable extent — a crash leaves either the old or the new
+    /// length. Old = pre-shrink status quo, safe because the caller commits
+    /// the transactional metadata size AFTER this patch and clips again on
+    /// re-extend (`min(new_size, pre_size)` — see `truncate_layout`); new =
+    /// the intended clip. Shrink-only by contract: growing would expose
+    /// bytes beyond the written payload.
+    ///
+    /// Returns `false` when the key is absent, the frame is malformed, or
+    /// `new_original_size` is not a strict shrink (equal = benign no-op,
+    /// returns `true`).
+    pub fn shrink_staged_value(&self, key: &Bytes, new_original_size: u64) -> bool {
+        let mut inner = self.inner.write();
+        let Some(&meta) = inner.map.get(key) else {
+            return false;
+        };
+        let magic =
+            u32::from_le_bytes(inner.mmap[meta.offset..meta.offset + 4].try_into().unwrap());
+        if magic != BLOCK_MAGIC {
+            return false;
+        }
+        let key_len = u32::from_le_bytes(
+            inner.mmap[meta.offset + 4..meta.offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let val_len = u32::from_le_bytes(
+            inner.mmap[meta.offset + 8..meta.offset + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
+        let val_start = (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+        if val_len < 24 || val_start + val_len > inner.mmap.len() {
+            return false;
+        }
+        // Staged frame: [meta_len:u64 BE][fencing:u64 BE][original_size:u64 BE]…
+        let meta_len = u64::from_be_bytes(
+            inner.mmap[val_start..val_start + 8]
+                .try_into()
+                .unwrap_or([0; 8]),
+        ) as usize;
+        if meta_len < 20 || 8 + meta_len > val_len {
+            return false;
+        }
+        let os_off = val_start + 16;
+        let old = u64::from_be_bytes(inner.mmap[os_off..os_off + 8].try_into().unwrap());
+        if new_original_size > old {
+            return false;
+        }
+        if new_original_size == old {
+            return true;
+        }
+        inner.mmap[os_off..os_off + 8].copy_from_slice(&new_original_size.to_be_bytes());
+        let _ = inner.mmap.flush_range(os_off, 8);
+        true
+    }
+
     pub fn remove(&self, key: &Bytes) -> Option<Bytes> {
         let mut inner = self.inner.write();
         if let Some(meta) = inner.map.remove(key) {
@@ -1097,6 +1170,23 @@ impl NvmeCache {
             }
         }
         false
+    }
+
+    /// In-place logical shrink of a staged value on EVERY device holding a
+    /// copy (pre-affinity rings can hold duplicates — a shrink must not
+    /// leave a stale-long survivor for readers that scan devices in order).
+    /// Returns `true` when at least one live copy was clipped. See
+    /// [`NvmeShard::shrink_staged_value`] for the framing/crash contract.
+    pub fn shrink_staged_value(&self, key: &Bytes, new_original_size: u64) -> bool {
+        let devices = self.devices.read();
+        let mut any = false;
+        for dev in devices.iter() {
+            let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
+            if dev.shards[shard_idx].shrink_staged_value(key, new_original_size) {
+                any = true;
+            }
+        }
+        any
     }
 
     /// Remove `key` from EVERY device (pre-affinity rings can hold

@@ -906,6 +906,60 @@ impl NvmeStaging {
         true
     }
 
+    /// Payload length of `file_id`'s ring entry, if resident — a header
+    /// peek (no image copy), for truncate's shrink decision.
+    pub fn staged_len(&self, file_id: &str) -> Option<u64> {
+        let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
+        let guard = self.staging_nvme_cache.get(&key_bytes)?;
+        let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+        if bytes.len() < 8 {
+            return None;
+        }
+        let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+        if bytes.len() < 8 + meta_len {
+            return None;
+        }
+        StagedMetadata::deserialize(&bytes[8..8 + meta_len]).map(|m| m.original_size)
+    }
+
+    /// Logically shrink `file_id`'s ring blob to `new_size` IN PLACE — the
+    /// truncate-shrink path. Unlike a `stage_write` re-stage this needs no
+    /// segment placement (an 8-byte header patch of the live extent, see
+    /// `NvmeShard::shrink_staged_value`), so ring pressure can never refuse
+    /// it — refusal is exactly how pre-truncate bytes used to survive and
+    /// resurface through the next truncate-up.
+    ///
+    /// Runs under this file_id's ledger entry lock and bumps the stage
+    /// generation, so an IN-FLIGHT promotion that read the pre-shrink image
+    /// fails its commit-time generation check (`remove_staged_if_generation`
+    /// / `promote_staged_file`) instead of publishing a stale-long durable
+    /// copy over the clip. Blocking-pool hop: the shard patch takes the
+    /// staging shard WRITE lock (shard-lock invariant rule 2).
+    ///
+    /// Returns whether a live ring entry was clipped (`false` = no entry —
+    /// the promoted/spilled case, handled by the caller's durable clip).
+    pub async fn shrink_staged(&self, file_id: &str, new_size: u64) -> bool {
+        let ledger = self.staged_ledger.clone();
+        let staging = self.staging_nvme_cache.clone();
+        let file_id_owned = file_id.to_string();
+        let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
+        tokio::task::spawn_blocking(move || {
+            let scc::hash_map::Entry::Occupied(mut entry) = ledger.entry_sync(file_id_owned) else {
+                return false;
+            };
+            if !staging.shrink_staged_value(&key_bytes, new_size) {
+                return false;
+            }
+            let (cost, gen) = *entry.get();
+            // Cost stays the extent's charge (the slot doesn't move);
+            // conservative in the safe direction for the admission gate.
+            *entry.get_mut() = (cost, gen.wrapping_add(1));
+            true
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Ask the background merge worker to promote a staged file_id (best-effort).
     pub fn try_enqueue_staged_merge(
         &self,

@@ -3394,6 +3394,16 @@ impl DataRouter {
             }
         };
 
+        // NOTE deliberately NO `meta.size` clamp on the seed: the physical
+        // blob/durable image is authoritative when the cached logical size
+        // lags LOW (hot-entry eviction + deferred layout persist — the
+        // pinned `truncate_down_stale_size` contract). Stale-LONG images
+        // (the aged-fsx resurrection) are killed at the source instead:
+        // `truncate_layout` clips every physical tier in-place/durably, and
+        // orders the ring patch (msync) before the KV size commit, so a
+        // committed truncate is always physically effective
+        // (`tests/staged_truncate_stale_tests.rs`).
+
         // Logical size after this write. Folding `meta.size` in preserves a
         // truncate-up / fallocate-extend hole (logical size beyond the
         // physical payload): without it a small write regressed the file to
@@ -5110,27 +5120,34 @@ impl DataRouter {
         }
 
         // inline / staged: authoritatively drop everything beyond new_size.
-        meta.size = new_size;
-
-        let mut blocks_to_free = Vec::new();
-
-        // A staged file may carry a promoted/spilled block map alongside its
-        // ring blob: prune any block that starts at/after new_size.
-        if let Some(ref mut block_map) = meta.block_map {
-            let block_size = self.block_size.load(Ordering::Relaxed);
-            block_map.retain(|&b, bk| {
-                let block_start = b as u64 * block_size;
-                if block_start >= new_size {
-                    self.cache.purge_block_key(bk);
-                    blocks_to_free.push(clean_block_key(bk));
-                    false // Remove from block_map
-                } else {
-                    true
-                }
-            });
-        }
+        //
+        // Staged files carry the payload on up to TWO physical tiers — the
+        // staging-ring blob and/or a promoted/spilled durable whole image
+        // (`block_map[0]`) — and BOTH must be clipped, because a later
+        // truncate-up re-raises `meta.size` over whatever physical tail
+        // survives: every consumer clamps to `meta.size`, so surviving
+        // pre-truncate bytes become servable content (the aged-fsx stale
+        // resurrection, `tests/staged_truncate_stale_tests.rs`). The old
+        // shrink re-staged the clipped image through `stage_write`, whose
+        // same-key replace needs a FRESH segment extent — under a
+        // full/fragmented ring it REFUSED and the error was swallowed; a
+        // promoted blob (ring miss) skipped the shrink entirely.
+        //
+        // Clip target: `new_size`, gated on the ACTUAL physical length —
+        // never the laggable `meta.size`. The cached logical size can lag
+        // LOW (hot-entry eviction + deferred layout persist), and the
+        // pinned contract (`tests/hole_read_zeros_tests.rs`
+        // truncate_down_stale_size) is that a lagging size must never
+        // destroy real payload below the truncate point: the blob/durable
+        // image is authoritative for `[0, new_size)`. The crash-window
+        // guard is ORDERING, not a size comparison: the ring header patch
+        // is msync'd before the KV size commit (see
+        // `NvmeShard::shrink_staged_value`), so "clipped logical size
+        // committed but stale-long blob survived" cannot arise.
+        let pre_size = meta.size;
 
         if meta.file_type == "inline" {
+            meta.size = new_size;
             if let Some(ref mut data) = meta.data_key {
                 // `Bytes::truncate` is shrink-only (no-op when already shorter),
                 // so this is safe on the grow path too.
@@ -5138,50 +5155,182 @@ impl DataRouter {
                     data.truncate(new_size as usize);
                 }
             }
-        } else if meta.file_type == "staged" {
-            if let Some(ref file_id) = meta.file_id {
-                // Physically shrink the staging-ring blob to new_size. Keyed on
-                // the ACTUAL blob length, never the laggable `meta.size`, so a
-                // blob left longer than the logical size by a stale-size grow
-                // misclassification is corrected here. Re-stage only when it
-                // actually shrinks (a grow leaves the blob short — its tail is
-                // an implicit-zero hole the read/RMW paths already honor).
-                if let Some(data) = self.cache.nvme.read_staged(file_id) {
-                    if data.len() as u64 > new_size {
-                        let mut updated_data = data;
-                        updated_data.truncate(new_size as usize);
-                        let _ = self
-                            .cache
-                            .nvme
-                            .stage_write(
-                                &file_path,
-                                file_id,
-                                bytes::Bytes::from(updated_data),
-                                fencing_token,
-                            )
-                            .await;
+            self.save_metadata_to_backend(ino, &meta, fencing_token)
+                .await?;
+            self.metadata_cache.insert(file_path.clone(), meta);
+            self.cache.write_lru.remove(&file_path);
+            self.cache.read_lru.remove(&file_path);
+            return Ok(());
+        }
+
+        // Staged. Phase 1 (unlocked): clip the ring blob IN PLACE. An 8-byte
+        // header patch of the live extent needs no segment placement, so
+        // ring pressure can never refuse it (the flaw that let stale blobs
+        // survive). The patch bumps the stage generation under the ledger
+        // entry lock, so an in-flight promotion that read the pre-clip image
+        // fails its commit-time generation check instead of publishing a
+        // stale-long durable copy.
+        let snapshot_file_id = meta.file_id.clone();
+        if let Some(ref file_id) = snapshot_file_id {
+            if let Some(blob_len) = self.cache.nvme.staged_len(file_id) {
+                if blob_len > new_size && self.cache.nvme.shrink_staged(file_id, new_size).await {
+                    crate::fuse_client::METRICS
+                        .staged_truncate_inplace_shrinks
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                // A `false` shrink means the entry vanished between the peek
+                // and the patch (a promotion won the race and REMOVED it
+                // after committing its mapping) — the durable leg below
+                // resolves that mapping through all sources and clips it.
+            }
+        }
+
+        // Phase 2 (unlocked, data I/O before the meta flip — P0 layout
+        // atomicity): on a genuine shrink, a promoted/spilled durable whole
+        // image longer than new_size must be clip-rewritten. Failure is
+        // LOUD (`?`): a truncate that cannot prove the durable tail is gone
+        // must fail the SETATTR, never silently leave resurrection bait.
+        // (`new_size == 0` needs no clip: the commit's prune drops
+        // `block_map[0]` entirely — block start 0 >= 0.)
+        let mut clipped_bk: Option<(String, String)> = None; // (old, new)
+        if new_size < pre_size && new_size > 0 {
+            if let Some(old_bk) = self.staged_block_mapping(&file_path, &meta).await {
+                // The mapping can be displaced under our feet by a racing
+                // re-promotion (merge worker — not FUSE-serialized) freeing
+                // `old_bk`: a failed read re-resolves the freshest binding
+                // once and retries; an error on a STABLE binding is real.
+                let mut old_bk = old_bk;
+                let img = match self.read_promoted_staged_block(&old_bk).await {
+                    Ok(img) => Some(img),
+                    Err(e) => {
+                        let fresh = self.freshest_layout_identity(&file_path).await;
+                        let fresh_bk = match fresh {
+                            Some(ref f) if f.file_type == "staged" => {
+                                f.block_map.as_ref().and_then(|bm| bm.get(&0).cloned())
+                            }
+                            _ => None,
+                        };
+                        match fresh_bk {
+                            Some(bk) if bk != old_bk => {
+                                old_bk = bk;
+                                Some(self.read_promoted_staged_block(&old_bk).await?)
+                            }
+                            Some(_) => return Err(e),
+                            None => None,
+                        }
+                    }
+                };
+                if let Some(img) = img {
+                    if img.len() as u64 > new_size {
+                        let clipped = img.slice(0..new_size as usize);
+                        let processed = self.get_crypto().process_write_async(clipped).await?;
+                        let (be_id, allocator, writer) =
+                            self.backend_router.get_active_backend()?;
+                        let offset = allocator.allocate_block().await?;
+                        let new_bk = self.backend_router.persist_block_key(&be_id, offset);
+                        if let Err(e) = writer.write_block(offset, processed).await {
+                            let _ = allocator.free_block(offset).await;
+                            return Err(e);
+                        }
+                        allocator.publish_block(offset);
+                        crate::fuse_client::METRICS
+                            .staged_truncate_durable_clips
+                            .fetch_add(1, Ordering::Relaxed);
+                        clipped_bk = Some((old_bk, new_bk));
                     }
                 }
             }
         }
 
-        // Save updated metadata
-        self.save_metadata_to_backend(ino, &meta, fencing_token)
-            .await?;
-        self.metadata_cache.insert(file_path.clone(), meta);
+        // Phase 3: commit under the per-inode metadata lock against the
+        // FRESHEST meta (the promote-commit discipline — a promotion/spill
+        // that committed since our snapshot must not be clobbered with a
+        // pre-commit block_map).
+        let commit = async {
+            let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+            // NOTE: `fetch_metadata` would retake this lock.
+            let current = match self.metadata_cache.get(&file_path) {
+                Some(m) => Some(m),
+                None => self.fetch_metadata_from_backend(ino).await?,
+            };
+            let mut updated = current.unwrap_or(meta);
+            let mut blocks_to_free: Vec<String> = Vec::new();
+            // Published = our clipped block took `block_map[0]`. A racing
+            // promotion that re-published the mapping since our snapshot
+            // wins (its image was read post-clip, hence ≤ clip ≤ new_size —
+            // never stale-long); our clip block is then discarded below.
+            let mut published = false;
+            if updated.file_type == "staged" && updated.file_id == snapshot_file_id {
+                if let Some((ref old_bk, ref new_bk)) = clipped_bk {
+                    if let Some(ref mut bm) = updated.block_map {
+                        if bm.get(&0) == Some(old_bk) {
+                            bm.insert(0, new_bk.clone());
+                            blocks_to_free.push(old_bk.clone());
+                            published = true;
+                        }
+                    }
+                }
+                // Prune whole blocks at/after new_size (drops `block_map[0]`
+                // itself on truncate-to-zero).
+                if let Some(ref mut bm) = updated.block_map {
+                    let block_size = self.block_size.load(Ordering::Relaxed);
+                    bm.retain(|&b, bk| {
+                        let block_start = b as u64 * block_size;
+                        if block_start >= new_size {
+                            blocks_to_free.push(bk.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+            }
+            updated.size = new_size;
+            updated.cached_at = std::time::Instant::now();
+            self.save_metadata_to_backend(ino, &updated, fencing_token)
+                .await?;
+            self.metadata_cache.insert(file_path.clone(), updated);
 
-        // The truncated tail is gone: drop any whole-file RAM snapshot so a
-        // later re-extend reads zeros instead of a stale full-length copy.
-        self.cache.write_lru.remove(&file_path);
-        self.cache.read_lru.remove(&file_path);
+            // The truncated tail is gone: drop any whole-file RAM snapshot so
+            // a later re-extend reads zeros instead of a stale copy.
+            self.cache.write_lru.remove(&file_path);
+            self.cache.read_lru.remove(&file_path);
 
-        // Free the shrunken blocks
-        if !blocks_to_free.is_empty() {
-            let free_refs: Vec<&str> = blocks_to_free.iter().map(|s| s.as_str()).collect();
-            let _ = self.backend_router.free_blocks(&free_refs).await;
+            // Displaced/pruned durable copies die only AFTER the publish
+            // (release-superseded order): purge read tiers, then free.
+            for bk in &blocks_to_free {
+                self.cache.purge_block_key(bk);
+            }
+            if !blocks_to_free.is_empty() {
+                let cleaned: Vec<String> = blocks_to_free
+                    .iter()
+                    .map(|bk| clean_block_key(bk))
+                    .collect();
+                let refs: Vec<&str> = cleaned.iter().map(|s| s.as_str()).collect();
+                let _ = self.backend_router.free_blocks(&refs).await;
+            }
+            Ok::<bool, SqueezefsError>(published)
         }
+        .await;
 
-        Ok(())
+        match commit {
+            Ok(published) => {
+                if !published {
+                    // The clipped block never took the mapping (racing
+                    // promotion won, or the mapping was pruned): free it.
+                    if let Some((_, new_bk)) = clipped_bk {
+                        let _ = self.backend_router.free_block(&new_bk).await;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some((_, new_bk)) = clipped_bk {
+                    let _ = self.backend_router.free_block(&new_bk).await;
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Hole-punch a set of WHOLE striped block indices: remove them from the

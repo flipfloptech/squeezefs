@@ -258,13 +258,12 @@ async fn trunc_cycle_reads_zeros_after_promotion() {
     // the ring entry is released (the ring-miss truncate shape).
     await_condition(
         || {
-            let promoted = h
-                .fs
-                .router
-                .metadata_cache
-                .get(&path)
-                .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()))
-                .is_some();
+            let promoted =
+                h.fs.router
+                    .metadata_cache
+                    .get(&path)
+                    .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()))
+                    .is_some();
             promoted && h.fs.router.cache.nvme.read_staged(&file_id).is_none()
         },
         "staged blob promoted to a durable block and released from the ring",
@@ -281,6 +280,58 @@ async fn trunc_cycle_reads_zeros_after_promotion() {
     let mut want = pat[..DOWN as usize].to_vec();
     want.resize(UP as usize, 0);
     assert_bytes(&got, &want, "leg B (promoted durable image) truncate cycle");
+}
+
+/// The in-place shrink primitive itself: patches `original_size` under the
+/// shard write lock without moving the extent (readers decode the clipped
+/// length; payload prefix intact), refuses growth and absent keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ring_in_place_shrink_clips_reads_and_refuses_growth() {
+    use squeezefs::tiering::nvme::NvmeCache;
+
+    let dir = tempdir().unwrap();
+    let cache = Arc::new(NvmeCache::new(&[dir.path()], &[4 * 1024 * 1024], 1).unwrap());
+    let key = bytes::Bytes::from_static(b"staged-shrink-target");
+
+    // Staged frame: value = [meta_len u64 BE][fencing u64][original_size u64]
+    // [path_len u32][path][payload].
+    let payload = pattern(128 * 1024);
+    let path = b"inode_42";
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&7u64.to_be_bytes()); // fencing token
+    meta.extend_from_slice(&(payload.len() as u64).to_be_bytes()); // original_size
+    meta.extend_from_slice(&(path.len() as u32).to_be_bytes());
+    meta.extend_from_slice(path);
+    assert!(cache.reserve_and_write(key.clone(), meta.len() as u64, &meta, &payload, None));
+
+    let read_original_size = |cache: &Arc<NvmeCache>, key: &bytes::Bytes| -> u64 {
+        let guard = cache.get(key).expect("entry resident");
+        let val = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+        u64::from_be_bytes(val[16..24].try_into().unwrap())
+    };
+    assert_eq!(read_original_size(&cache, &key), payload.len() as u64);
+
+    // Shrink: readers decode the clipped length; prefix bytes intact.
+    assert!(cache.shrink_staged_value(&key, 64 * 1024));
+    assert_eq!(read_original_size(&cache, &key), 64 * 1024);
+    {
+        let guard = cache.get(&key).expect("entry resident");
+        let val = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
+        let data_start = 8 + meta.len();
+        assert_eq!(
+            &val[data_start..data_start + 64 * 1024],
+            &payload[..64 * 1024],
+            "clip must not disturb the surviving payload prefix"
+        );
+    }
+
+    // Equal = benign no-op; growth = refused; absent key = refused.
+    assert!(cache.shrink_staged_value(&key, 64 * 1024));
+    assert!(
+        !cache.shrink_staged_value(&key, 128 * 1024),
+        "growing would expose bytes beyond the written payload"
+    );
+    assert!(!cache.shrink_staged_value(&bytes::Bytes::from_static(b"absent"), 0));
 }
 
 /// The fsx shape end-to-end: a sub-block RMW write AFTER the truncate cycle

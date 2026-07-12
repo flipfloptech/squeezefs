@@ -2889,6 +2889,45 @@ impl DataRouter {
         Ok(m)
     }
 
+    /// Grow a non-striped layout's logical size to at least `target_size`
+    /// (never shrinks; no-op when already large enough) — the
+    /// fallocate/ZERO_RANGE extend commit. Runs under `INODE_META_LOCKS`
+    /// against the FRESHEST entry (RAM cache, then backend), the same
+    /// discipline as the promote/spill/truncate commits: an unlocked save of
+    /// a pre-promotion snapshot erased a just-published `block_map[0]` right
+    /// after the ring entry was released, stranding the payload (the aged
+    /// zeros-LOSS / EIO-wedge leg).
+    pub async fn grow_layout_size(
+        &self,
+        ino: u64,
+        target_size: u64,
+        fencing_token: u64,
+    ) -> Result<()> {
+        let file_path = crate::keys::inode_path(ino);
+        let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+        // NOTE: `fetch_metadata` would retake this lock.
+        let current = match self.metadata_cache.get(&file_path) {
+            Some(m) => Some(m),
+            None => self.fetch_metadata_from_backend(ino).await?,
+        };
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if current.size >= target_size || current.file_type == "striped" {
+            return Ok(());
+        }
+        let mut updated = current;
+        updated.size = target_size;
+        // The save persists the whole layout — including a dirty RAM-only
+        // one — so the entry is clean afterwards.
+        updated.layout_dirty = false;
+        updated.cached_at = std::time::Instant::now();
+        self.save_metadata_to_backend(ino, &updated, fencing_token)
+            .await?;
+        self.metadata_cache.insert(file_path, updated);
+        Ok(())
+    }
+
     /// Persist layout/size if the hot cache marked it dirty (writeback path).
     ///
     /// Runs under the per-inode metadata lock: a concurrent staged-promotion

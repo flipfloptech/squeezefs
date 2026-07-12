@@ -2127,12 +2127,23 @@ impl SqueezefsFilesystem {
         // Update layout size. Striped files go through the §5.3 degenerate
         // size-only merge: the old whole-meta save of a stale snapshot under NO
         // lock could rewrite the block map "without mutating it", dropping
-        // mappings a concurrent write-through just published. Inline/staged
-        // files keep the whole-meta save — their RAM meta (dirty inline payload
-        // / staged identity) is the truth a backend re-read cannot carry, and
-        // they have no striped map to lose.
+        // mappings a concurrent write-through just published.
+        //
+        // Inline/staged files take the SAME discipline for the same reason:
+        // the whole-meta save of an unlocked pre-promotion snapshot raced the
+        // merge worker's promotion commit — the commit publishes
+        // `block_map[0]` (RAM cache + backend) and releases the ring entry,
+        // then the stale save (map=None) erased the mapping from BOTH,
+        // stranding the sole copy of the payload: reads wedged re-resolving a
+        // moving identity (EIO after the retry bound) or served the D0
+        // zeros-degrade for LIVE data, and the next RMW codified the zeros
+        // durably (the aged fsx GOOD→0x0000 loss;
+        // tests/staged_multifile_ring_pressure_tests.rs
+        // extend_vs_promotion_never_strands_payload). Re-resolve the FRESHEST
+        // entry and grow its size under INODE_META_LOCKS — the promote/spill
+        // commit lock — so the save can never carry a pre-commit layout.
         let file_path = crate::keys::inode_path(ino);
-        if let Ok(mut meta) = self.router.fetch_metadata(&file_path).await {
+        if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
             if meta.file_type == "striped" {
                 let _ = self
                     .router
@@ -2144,11 +2155,10 @@ impl SqueezefsFilesystem {
                         fencing_token,
                     )
                     .await;
-            } else if meta.size < target_size {
-                meta.size = target_size;
+            } else {
                 let _ = self
                     .router
-                    .save_metadata_to_backend(ino, &meta, fencing_token)
+                    .grow_layout_size(ino, target_size, fencing_token)
                     .await;
             }
         }

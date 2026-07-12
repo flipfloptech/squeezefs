@@ -197,8 +197,26 @@ async fn run_worker(h: Arc<H>, ino: u64, seed: u64, rounds: usize, tag: String) 
                     &mut history,
                 );
             }
+            // Extending fallocate / zero_range-grow — the extend_file_size
+            // path, racing the merge worker's promotion commits (the aged
+            // EIO-wedge + payload-stranding leg: an unlocked stale-snapshot
+            // whole-meta save erased a just-published block_map[0] right
+            // after the ring entry was released).
+            70..=74 => {
+                let off = model.len() as u64;
+                let len = 4096 + rng.next() % (64 * 1024);
+                if off + len > MAXLEN {
+                    continue;
+                }
+                h.fs.fallocate(h.req, ino, 0, off, len, 0).await.unwrap();
+                model.resize((off + len) as usize, 0);
+                note(
+                    format!("op{opn} falloc-extend -> {:#x}", off + len),
+                    &mut history,
+                );
+            }
             // Zero range (keep size).
-            70..=79 => {
+            75..=79 => {
                 if model.is_empty() {
                     continue;
                 }
@@ -311,6 +329,92 @@ async fn multifile_pressure(seed: u64, files: usize, rounds: usize, uuid: [u8; 1
             rounds,
             tag,
         )));
+    }
+    for t in tasks {
+        t.await.expect("worker panicked");
+    }
+}
+
+/// Directed hammer for the extend-vs-promotion race: tight
+/// write → fallocate-extend → verify loops while the tiny ring keeps a
+/// promotion of the same file perpetually in flight. The unlocked
+/// stale-snapshot save in the extend path lands in the µs window right
+/// after a promotion commit publishes block_map[0] and releases the ring
+/// entry — erasing the mapping and stranding the payload (aged signature:
+/// 65-re-resolve EIO reads / staged_payload_lost_reads, or durable zeros
+/// once an RMW codifies the empty seed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn extend_vs_promotion_never_strands_payload() {
+    const FILES: usize = 8;
+    const ROUNDS: usize = 150;
+    let h = Arc::new(make(*b"szl-mfp-extend01", "mfp_ns_x", "1MB").await);
+    let mut tasks = Vec::new();
+    for i in 0..FILES {
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            let ino =
+                h.fs.create(
+                    h.req,
+                    1,
+                    OsStr::new(&format!("ext_{i}")),
+                    libc::S_IFREG | 0o644,
+                    0,
+                )
+                .await
+                .unwrap()
+                .attr
+                .ino;
+            let mut rng = Lcg(0x00E0_0000 + i as u64);
+            for round in 0..ROUNDS {
+                // Body write large enough to cross the ring high-water mark
+                // => promotion of THIS file is enqueued while we extend.
+                let body = 192 * 1024 + (rng.next() % (64 * 1024)) as usize;
+                let val = (round % 249) as u8 | 1;
+                let w =
+                    h.fs.write(h.req, ino, 0, 0, bytes::Bytes::from(vec![val; body]), 0, 0)
+                        .await
+                        .unwrap();
+                assert_eq!(w.written as usize, body);
+                // Truncate down to re-arm (next round's write is a fresh image).
+                let ext = body as u64 + 4096 + rng.next() % (32 * 1024);
+                h.fs.fallocate(h.req, ino, 0, 0, ext, 0).await.unwrap();
+
+                let got =
+                    h.fs.read(h.req, ino, 0, 0, ext as u32, 0)
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "file{i} round {round}: read failed {e:?} — the stranded-payload \
+                             wedge (ring entry gone AND mapping erased)"
+                            )
+                        })
+                        .data
+                        .to_vec();
+                assert_eq!(got.len(), ext as usize, "file{i} round {round}: short read");
+                if let Some(p) = got[..body].iter().position(|&b| b != val) {
+                    panic!(
+                        "file{i} round {round}: acked byte at {p} reads {:#04x} (want {val:#04x}) \
+                         — extend-vs-promotion stranding/zeros",
+                        got[p]
+                    );
+                }
+                assert!(
+                    got[body..].iter().all(|&b| b == 0),
+                    "file{i} round {round}: extend tail must read zeros"
+                );
+                h.fs.setattr(
+                    h.req,
+                    ino,
+                    None,
+                    fuse3::SetAttr {
+                        size: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }));
     }
     for t in tasks {
         t.await.expect("worker panicked");

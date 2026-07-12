@@ -176,11 +176,38 @@ impl TieredCache {
         }
         if let Some(mut evict_rx) = hot_block.take_evict_rx() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let nvme_clone = nvme.clone();
                 handle.spawn(async move {
-                    while let Some((_key, _data, _class)) = evict_rx.recv().await {
+                    while let Some((key, data, class)) = evict_rx.recv().await {
                         crate::fuse_client::METRICS
                             .hot_block_evictions
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match class {
+                            // R1b gate flip (§5.3, PR 4): a probation
+                            // victim nothing ever read is a one-pass
+                            // stream's residue — dehydrating it is the
+                            // publish tax in RAM-eviction form. Drop it.
+                            crate::tiering::memory::EvictClass::Probation => {
+                                crate::fuse_client::METRICS
+                                    .hot_block_probation_drops
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            // A protected victim was worth keeping (read-
+                            // promoted or ghost-admitted): preserve its
+                            // warmth on the NVMe tier via the validated
+                            // non-owner publish (074 discipline). No
+                            // legacy `blocks/` key filter here — hot-tier
+                            // keys are offset strings; the filter belongs
+                            // to the read_lru worker's historical
+                            // population only.
+                            crate::tiering::memory::EvictClass::Protected => {
+                                let nvme_inner = nvme_clone.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    nvme_inner.cache_read_block_validated_self(&key, data)
+                                })
+                                .await;
+                            }
+                        }
                     }
                 });
             }

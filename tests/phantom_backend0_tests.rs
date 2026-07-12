@@ -186,7 +186,7 @@ async fn read_config_json(h: &H) -> serde_json::Value {
     let attr = h.fs.getattr(h.req, CONFIG_INODE, None, 0).await.unwrap();
     let len = attr.attr.size;
     let reply =
-        h.fs.read(h.req, CONFIG_INODE, 0, 0, len as u32)
+        h.fs.read(h.req, CONFIG_INODE, 0, 0, len as u32, 0)
             .await
             .unwrap();
     serde_json::from_slice(&reply.data).expect(".config must be valid JSON")
@@ -362,7 +362,7 @@ async fn test_multi_volume_striped_burst_reads_back_and_frees_cleanly() {
 
     for b in 0..nblocks {
         let reply =
-            h.fs.read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32)
+            h.fs.read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32, 0)
                 .await
                 .unwrap_or_else(|e| {
                     panic!("read of block {b} errored (EIO/ENOENT surfaced to the app): {e:?}")
@@ -502,7 +502,7 @@ async fn test_single_volume_persisted_keys_stay_unprefixed_and_read_back() {
     purge_read_tiers(&h);
     for b in 0..nblocks {
         let reply =
-            h.fs.read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32)
+            h.fs.read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32, 0)
                 .await
                 .unwrap();
         assert_eq!(

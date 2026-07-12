@@ -417,7 +417,7 @@ async fn test_multi_volume_spilled_map_survives_cold_remount_byte_exact() {
     for b in 0..SPILL_BLOCKS {
         let reply = h2
             .fs
-            .read(h2.req, ino2, 0, (b * BLOCK) as u64, BLOCK as u32)
+            .read(h2.req, ino2, 0, (b * BLOCK) as u64, BLOCK as u32, 0)
             .await
             .unwrap_or_else(|e| {
                 panic!("read of block {b} after remount errored (EIO to the app): {e:?}")
@@ -742,7 +742,7 @@ async fn test_single_volume_spilled_map_keys_stay_bare_and_roundtrip() {
     purge_read_tiers(&h);
     for b in (0..SPILL_BLOCKS).step_by(97) {
         let reply =
-            h.fs.read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32)
+            h.fs.read(h.req, ino, 0, (b * BLOCK) as u64, BLOCK as u32, 0)
                 .await
                 .unwrap_or_else(|e| panic!("single-volume read of block {b} errored: {e:?}"));
         assert_block_bytes(b, &reply.data);

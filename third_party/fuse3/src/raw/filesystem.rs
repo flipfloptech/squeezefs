@@ -157,6 +157,9 @@ pub trait Filesystem {
     /// when the file has been opened in `direct_io` mode, in which case the return value of the
     /// read system call will reflect the return value of this operation. `fh` will contain the
     /// value set by the open method, or will be undefined if the open method didn't set any value.
+    /// `flags` carries the file's open flags (`fuse_read_in.flags` —
+    /// O_DIRECT et al.), sent by the kernel on every READ.
+    #[allow(clippy::too_many_arguments)]
     async fn read(
         &self,
         req: Request,
@@ -164,7 +167,9 @@ pub trait Filesystem {
         fh: u64,
         offset: u64,
         size: u32,
+        flags: u32,
     ) -> Result<ReplyData> {
+        let _ = flags;
         Err(libc::ENOSYS.into())
     }
 

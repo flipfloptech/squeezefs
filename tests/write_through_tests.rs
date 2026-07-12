@@ -187,7 +187,7 @@ async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
 }
 
 async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
-    h.fs.read(h.req, ino, 0, off, size)
+    h.fs.read(h.req, ino, 0, off, size, 0)
         .await
         .unwrap_or_else(|e| panic!("read ino {ino} off {off} failed: {e:?}"))
         .data

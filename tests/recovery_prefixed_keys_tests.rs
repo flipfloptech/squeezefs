@@ -516,7 +516,7 @@ async fn test_multi_volume_inline_map_remount_recovery_smoke() {
     for b in 0..INLINE_BLOCKS {
         let reply = h2
             .fs
-            .read(h2.req, ino2, 0, (b * BLOCK) as u64, BLOCK as u32)
+            .read(h2.req, ino2, 0, (b * BLOCK) as u64, BLOCK as u32, 0)
             .await
             .unwrap_or_else(|e| panic!("read of block {b} after remount errored: {e:?}"));
         assert_block_bytes(1, b, &reply.data, "after remount+recovery");
@@ -530,7 +530,7 @@ async fn test_multi_volume_inline_map_remount_recovery_smoke() {
     for b in 0..INLINE_BLOCKS {
         let reply = h2
             .fs
-            .read(h2.req, ino2, 0, (b * BLOCK) as u64, BLOCK as u32)
+            .read(h2.req, ino2, 0, (b * BLOCK) as u64, BLOCK as u32, 0)
             .await
             .unwrap_or_else(|e| panic!("re-read of block {b} errored: {e:?}"));
         assert_block_bytes(

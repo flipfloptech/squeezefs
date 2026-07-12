@@ -161,6 +161,8 @@ pub trait PathFilesystem {
     /// read system call will reflect the return value of this operation. `fh` will contain the
     /// value set by the open method, or will be undefined if the open method didn't set any value.
     /// when `path` is None, it means the path may be deleted.
+    /// `flags` carries the file's open flags (`fuse_read_in.flags`).
+    #[allow(clippy::too_many_arguments)]
     async fn read(
         &self,
         req: Request,
@@ -168,7 +170,9 @@ pub trait PathFilesystem {
         fh: u64,
         offset: u64,
         size: u32,
+        flags: u32,
     ) -> Result<ReplyData> {
+        let _ = flags;
         Err(libc::ENOSYS.into())
     }
 

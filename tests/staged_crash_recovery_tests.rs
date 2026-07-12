@@ -564,7 +564,7 @@ async fn test_staged_meta_with_lost_ring_entry_reads_zeros_not_error() {
 
     // Contract 4: reads degrade to size-consistent zeros — never an error.
     let reply =
-        h.fs.read(h.req, ino, 0, 0, STAGED_LEN as u32)
+        h.fs.read(h.req, ino, 0, 0, STAGED_LEN as u32, 0)
             .await
             .unwrap_or_else(|e| {
                 panic!(
@@ -584,7 +584,7 @@ async fn test_staged_meta_with_lost_ring_entry_reads_zeros_not_error() {
 
     // Consistency: a second read (and a sub-range read) see the same zeros.
     let again =
-        h.fs.read(h.req, ino, 0, 4096, 1024)
+        h.fs.read(h.req, ino, 0, 4096, 1024, 0)
             .await
             .expect("second degraded read must also succeed");
     assert_eq!(again.data.len(), 1024);
@@ -780,7 +780,7 @@ async fn test_staged_ring_survives_kill9_remount_and_post_recovery_writes() {
             .unwrap();
         let want = pattern(7, idx, *len);
         let reply =
-            h.fs.read(h.req, *ino, 0, 0, *len as u32)
+            h.fs.read(h.req, *ino, 0, 0, *len as u32, 0)
                 .await
                 .unwrap_or_else(|e| {
                     panic!(
@@ -826,7 +826,7 @@ async fn test_staged_ring_survives_kill9_remount_and_post_recovery_writes() {
             .unwrap();
         let want = pattern(7, idx, *len);
         let reply =
-            h.fs.read(h.req, *ino, 0, 0, *len as u32)
+            h.fs.read(h.req, *ino, 0, 0, *len as u32, 0)
                 .await
                 .unwrap_or_else(|e| panic!("re-read of {name} after post-recovery burst: {e:?}"));
         assert_bytes_exact(

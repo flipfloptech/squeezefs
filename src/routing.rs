@@ -833,6 +833,15 @@ pub struct DataRouterInner {
     pub(crate) inflight_block_reads:
         std::sync::Arc<scc::HashIndex<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
     pub(crate) sequential_read_state: moka::sync::Cache<String, (u32, std::time::Instant)>,
+    /// R1b (§5.3): per-file K=4 offset-lane stream classifier state.
+    /// Coexists with `sequential_read_state` (the legacy prefetcher's
+    /// cursor) until PR 5 merges the pipeline into these lanes.
+    pub(crate) stream_lanes: moka::sync::Cache<String, std::sync::Arc<StreamLanes>>,
+    /// R1b ghost table — second-touch admission memory for >256 KiB fills.
+    pub(crate) ghost: std::sync::Arc<GhostTable>,
+    /// R1b disk-tier admission mode (env-resolved once; hot-budget-0
+    /// auto-degrades SecondTouch to Always).
+    pub tier_admission: TierAdmission,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
     pub prefetcher: std::sync::Arc<IoUringPrefetcher>,
@@ -872,6 +881,172 @@ pub(crate) struct FillResult {
 /// prove waiters are served from the carried result, not the tier.
 pub static TEST_TIER_PUBLISH_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// R1b disk-tier admission mode (docs/design-read-path.md §5.3), resolved
+/// once per router from `SQUEEZEFS_READ_TIER_ADMISSION`
+/// (`always|second-touch|never`, default `second-touch`; unrecognized
+/// values refuse loud). A zero hot-tier budget auto-degrades `SecondTouch`
+/// to `Always`: with no RAM landing zone, skipping the publish would turn
+/// every sub-read of a streamed block into a device refetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierAdmission {
+    Always,
+    SecondTouch,
+    Never,
+}
+
+/// R1b ghost table (§5.3): a fixed 2¹⁶-slot direct-mapped array of
+/// `AtomicU32` tags (~256 KiB, allocated once per router). Slot =
+/// `xxh3(block_key)` low 16 bits; tag = hash high bits ⊕ the fill-count
+/// epoch (bumped every 2¹⁵ recorded misses). A key "ghost-hits" when its
+/// slot holds its CURRENT-or-PREVIOUS-epoch tag — the window slides one
+/// epoch at a time instead of globally invalidating at each bump.
+///
+/// Concurrency: single-word `Relaxed` loads/stores, deliberately
+/// racy-tolerant — a lost update is a missed admission *hint* (a delayed
+/// publish), never a correctness event; no cross-word invariant ⇒ no loom
+/// model required (the design's stated mandate for this type). Collision
+/// model: direct-mapped single-tag — an interleaved cold scan can
+/// overwrite a warm key's record before its second touch; the cost is a
+/// third-touch admission, absorbed meanwhile by the hot tier (R-1).
+pub(crate) struct GhostTable {
+    slots: Box<[std::sync::atomic::AtomicU32]>,
+    epoch: std::sync::atomic::AtomicU32,
+    misses: std::sync::atomic::AtomicU32,
+}
+
+impl GhostTable {
+    const SLOTS: usize = 1 << 16;
+    const EPOCH_MISSES: u32 = 1 << 15;
+
+    fn new() -> Self {
+        let mut v = Vec::with_capacity(Self::SLOTS);
+        v.resize_with(Self::SLOTS, || std::sync::atomic::AtomicU32::new(0));
+        Self {
+            slots: v.into_boxed_slice(),
+            epoch: std::sync::atomic::AtomicU32::new(1),
+            misses: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn tag(hash: u64, epoch: u32) -> u32 {
+        // 0 is the empty sentinel; fold the high hash bits with the epoch
+        // and never emit 0.
+        let t = ((hash >> 16) as u32) ^ epoch.wrapping_mul(0x9E37_79B9);
+        if t == 0 {
+            1
+        } else {
+            t
+        }
+    }
+
+    /// True iff the key was recorded within the current-or-previous epoch;
+    /// records the key (current epoch) either way.
+    pub(crate) fn check_and_record(&self, block_key: &str) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let hash = xxhash_rust::xxh3::xxh3_64(block_key.as_bytes());
+        let slot = (hash as usize) & (Self::SLOTS - 1);
+        let epoch = self.epoch.load(Relaxed);
+        let cur = Self::tag(hash, epoch);
+        let prev = Self::tag(hash, epoch.wrapping_sub(1));
+        let seen = self.slots[slot].load(Relaxed);
+        let hit = seen == cur || seen == prev;
+        self.slots[slot].store(cur, Relaxed);
+        if !hit {
+            // Epoch roll every 2¹⁵ recorded misses (racy-tolerant: a
+            // double-roll under contention just narrows the window once).
+            if self.misses.fetch_add(1, Relaxed) + 1 >= Self::EPOCH_MISSES {
+                self.misses.store(0, Relaxed);
+                self.epoch.fetch_add(1, Relaxed);
+            }
+        }
+        hit
+    }
+}
+
+/// One classifier offset lane (§5.3): racy-tolerant atomics — moka races
+/// and lost updates cost a later classification, never wrongness.
+pub(crate) struct StreamLane {
+    next_expected_offset: std::sync::atomic::AtomicU64,
+    run_reads: std::sync::atomic::AtomicU32,
+    last_seen_ms: std::sync::atomic::AtomicU64,
+    classified: std::sync::atomic::AtomicBool,
+}
+
+/// K = 4 offset lanes per file, so concurrent sequential readers of one
+/// file do not mutually reset each other. More than K concurrent readers
+/// degrade the excess to the random class — a later pipeline start under
+/// PR 5, never wrongness.
+pub(crate) struct StreamLanes {
+    lanes: [StreamLane; 4],
+}
+
+impl StreamLanes {
+    fn new() -> Self {
+        let mk = || StreamLane {
+            next_expected_offset: std::sync::atomic::AtomicU64::new(u64::MAX),
+            run_reads: std::sync::atomic::AtomicU32::new(0),
+            last_seen_ms: std::sync::atomic::AtomicU64::new(0),
+            classified: std::sync::atomic::AtomicBool::new(false),
+        };
+        Self {
+            lanes: [mk(), mk(), mk(), mk()],
+        }
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// Classification unit (§5.3, one definition): `run_reads ≥ 4`
+    /// contiguous requests — each starting where the previous ended —
+    /// classifies the lane Streaming. A non-matching offset claims the
+    /// stalest idle lane (resetting its run), else the read is Random.
+    /// Returns `true` when this request rides (or just created) a
+    /// classified-streaming lane.
+    pub(crate) fn observe(&self, offset: u64, len: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = Self::now_ms();
+        // Lane match: continue the run.
+        for lane in &self.lanes {
+            if lane.next_expected_offset.load(Relaxed) == offset {
+                lane.next_expected_offset.store(offset + len, Relaxed);
+                let run = lane.run_reads.fetch_add(1, Relaxed) + 1;
+                lane.last_seen_ms.store(now, Relaxed);
+                if run >= 4 {
+                    if !lane.classified.swap(true, Relaxed) {
+                        crate::fuse_client::METRICS
+                            .read_streams_classified
+                            .fetch_add(1, Relaxed);
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+        // Claim the stalest lane (2 s staleness — the existing constant).
+        let mut stalest = 0usize;
+        let mut stalest_ms = u64::MAX;
+        for (i, lane) in self.lanes.iter().enumerate() {
+            let seen = lane.last_seen_ms.load(Relaxed);
+            if seen < stalest_ms {
+                stalest_ms = seen;
+                stalest = i;
+            }
+        }
+        if now.saturating_sub(stalest_ms) >= 2_000 {
+            let lane = &self.lanes[stalest];
+            lane.next_expected_offset.store(offset + len, Relaxed);
+            lane.run_reads.store(1, Relaxed);
+            lane.classified.store(false, Relaxed);
+            lane.last_seen_ms.store(now, Relaxed);
+        }
+        false
+    }
+}
 
 /// Single-flight registry guard. Three-case drop semantics (§5.2, exact):
 /// on the SUCCESS path the primary has already broadcast `Some(FillResult)`
@@ -1147,6 +1322,33 @@ impl DataRouter {
         let redis_url = dlm.redis_url().to_string();
         backend_router.start_health_check_worker(redis_url, fs_name.to_string());
 
+        // R1b admission mode (§5.3): env-resolved once; unrecognized values
+        // refuse loud at mount (forward-only — no silent fallback). A zero
+        // hot-tier budget auto-degrades SecondTouch to Always: without the
+        // RAM landing zone, skipping publishes would refetch every sub-read.
+        let tier_admission = match std::env::var("SQUEEZEFS_READ_TIER_ADMISSION")
+            .as_deref()
+            .unwrap_or("second-touch")
+        {
+            "always" => TierAdmission::Always,
+            "second-touch" => TierAdmission::SecondTouch,
+            "never" => TierAdmission::Never,
+            other => panic!(
+                "SQUEEZEFS_READ_TIER_ADMISSION must be one of \
+                 always|second-touch|never (got {other:?})"
+            ),
+        };
+        let tier_admission =
+            if tier_admission == TierAdmission::SecondTouch && cache.hot_block.max_bytes() == 0 {
+                log::warn!(
+                    "hot-block tier budget is 0: read-tier admission auto-degrades \
+                 second-touch -> always (no RAM landing zone for skipped fills)"
+                );
+                TierAdmission::Always
+            } else {
+                tier_admission
+            };
+
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_memory = sys.total_memory();
@@ -1181,6 +1383,12 @@ impl DataRouter {
                     .max_capacity(100000)
                     .time_to_live(std::time::Duration::from_secs(5))
                     .build(),
+                stream_lanes: moka::sync::Cache::builder()
+                    .max_capacity(100000)
+                    .time_to_live(std::time::Duration::from_secs(30))
+                    .build(),
+                ghost: std::sync::Arc::new(GhostTable::new()),
+                tier_admission,
                 crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
                 prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
                 stripe_write_semaphore,
@@ -1439,7 +1647,45 @@ impl DataRouter {
                             .fill_incarnation_still(block_key, before)
                     });
                     if let Some(before) = publishable {
-                        if downloaded_bytes.len() < 64 * 1024 {
+                        // R1b admission (§5.3): the disk-tier publish
+                        // decision for the > 256 KiB population. FIRST
+                        // touch skips (the 16.5 GiB-per-16 GiB tax kill —
+                        // the fill still lands hot-tier probation below);
+                        // a SECOND miss within the two-epoch ghost window
+                        // publishes, so re-read heat converges to the
+                        // tier. ≤ 256 KiB fills keep today's behavior
+                        // verbatim (small-config population; their publish
+                        // cost is noise). Skipping is always
+                        // correctness-safe: absence ⇒ the next reader goes
+                        // to the device; every RETAINED publish keeps the
+                        // full validated-fill discipline untouched.
+                        let ghost_admit = if downloaded_bytes.len() <= 256 * 1024 {
+                            true
+                        } else {
+                            match self.tier_admission {
+                                TierAdmission::Always => true,
+                                TierAdmission::Never => false,
+                                TierAdmission::SecondTouch => {
+                                    let hit = self.ghost.check_and_record(block_key);
+                                    if hit {
+                                        METRICS
+                                            .read_tier_admission_ghost_hits
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    hit
+                                }
+                            }
+                        };
+                        if !ghost_admit {
+                            METRICS
+                                .read_fill_publishes_skipped
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else if downloaded_bytes.len() >= 64 * 1024 {
+                            METRICS.read_tier_admissions.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if !ghost_admit {
+                            // no disk publish
+                        } else if downloaded_bytes.len() < 64 * 1024 {
                             let _ = self
                                 .cache
                                 .nvme
@@ -1502,19 +1748,27 @@ impl DataRouter {
                             self.cache.read_lru.put(block_key, downloaded_bytes.clone());
                         } else {
                             // R4 (§5.4): the > 256 KiB population finally
-                            // gets a RAM tier — probationary (first in
-                            // eviction line; any read promotes in place,
-                            // sticky), a `Bytes` refcount clone, never a
-                            // copy. Device-validated fills ONLY: this put
-                            // sits inside the publishable window and the
-                            // undo below removes it on incarnation
+                            // gets a RAM tier — a `Bytes` refcount clone,
+                            // never a copy. Device-validated fills ONLY:
+                            // this put sits inside the publishable window
+                            // and the undo below removes it on incarnation
                             // movement. NVMe-tier hits are never
                             // re-promoted here (same provenance argument
-                            // as the read_lru no-repromote rule).
+                            // as the read_lru no-repromote rule). Class
+                            // (R1b): a ghost-admitted (re-read) fill
+                            // enters PROTECTED — proven warmth; first-touch
+                            // fills enter probation (first in eviction
+                            // line; any read promotes in place, sticky).
                             METRICS.hot_block_misses.fetch_add(1, Ordering::Relaxed);
-                            self.cache
-                                .hot_block
-                                .put_probationary(block_key, downloaded_bytes.clone());
+                            if ghost_admit && self.tier_admission == TierAdmission::SecondTouch {
+                                self.cache
+                                    .hot_block
+                                    .put(block_key, downloaded_bytes.clone());
+                            } else {
+                                self.cache
+                                    .hot_block
+                                    .put_probationary(block_key, downloaded_bytes.clone());
+                            }
                         }
                         // Seqlock completion (publish-then-revalidate): the
                         // pre-publish check alone is check-then-act — this
@@ -1564,6 +1818,18 @@ impl DataRouter {
                 }
             }
         }
+    }
+
+    /// R1b classifier hook (§5.3): feed one read request through the file's
+    /// K=4 offset lanes; returns whether it rides a classified-streaming
+    /// lane. Latch-free (moka get + relaxed atomics); racy-tolerant by
+    /// design. PR 4 uses the classification for observability and the
+    /// PR 5 pipeline builds its issue path on it.
+    pub fn observe_stream(&self, file_path: &str, offset: u64, len: u64) -> bool {
+        let lanes = self.stream_lanes.get_with(file_path.to_string(), || {
+            std::sync::Arc::new(StreamLanes::new())
+        });
+        lanes.observe(offset, len)
     }
 
     /// The CURRENT block-index→key binding of `(file_path, b)`, as fresh as

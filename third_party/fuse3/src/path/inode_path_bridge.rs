@@ -547,6 +547,7 @@ where
         fh: u64,
         offset: u64,
         size: u32,
+        flags: u32,
     ) -> Result<ReplyData> {
         let path = self
             .inode_name_manager
@@ -561,6 +562,7 @@ where
                 fh,
                 offset,
                 size,
+                flags,
             )
             .await
     }

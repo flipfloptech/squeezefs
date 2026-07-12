@@ -211,7 +211,10 @@ async fn second_touch_admission_first_skip_then_publish() {
         "FIRST touch of a >256 KiB fill must skip the disk-tier publish — \
          this is the 16.5 GiB-per-16 GiB tax being killed"
     );
-    assert!(hot_has(&h, &k0), "the fill still lands in hot probation (PR 3)");
+    assert!(
+        hot_has(&h, &k0),
+        "the fill still lands in hot probation (PR 3)"
+    );
     assert!(
         METRICS.read_fill_publishes_skipped.load(Ordering::Relaxed) > skipped0,
         "skip counter is the adoption signal"

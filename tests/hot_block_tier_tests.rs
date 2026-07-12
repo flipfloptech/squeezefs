@@ -148,7 +148,7 @@ async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
 }
 
 async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
-    h.fs.read(h.req, ino, 0, off, size)
+    h.fs.read(h.req, ino, 0, off, size, 0)
         .await
         .unwrap()
         .data
@@ -285,12 +285,13 @@ fn probation_get_promotes_sticky_protected() {
     );
 }
 
-/// PR 3 plumbs the eviction channel typed but does NOT flip the gate:
-/// probation and protected victims BOTH still dehydrate (behavior-neutral),
-/// and `LruCache::put` inserts are protected-class by definition (the
-/// ≤256 KiB read_lru population's dehydration is bit-identical to today).
+/// The typed eviction channel carries victim classes faithfully at the
+/// LruCache layer (PR 3 plumbing; PR 4 flips the WORKER-side gate —
+/// pinned in read_tier_admission_tests): `LruCache::put` inserts are
+/// protected-class by definition (the ≤256 KiB read_lru population's
+/// dehydration behavior is unchanged).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn eviction_channel_is_typed_but_gate_is_not_flipped() {
+async fn eviction_channel_carries_victim_classes() {
     let lru = LruCache::with_capacity(40);
     let mut rx = lru.take_evict_rx().expect("first take");
 
@@ -313,7 +314,7 @@ async fn eviction_channel_is_typed_but_gate_is_not_flipped() {
         seen.iter()
             .any(|(_, _, c)| matches!(c, EvictClass::Probation)),
         "a probation victim must be visible on the channel WITH its class \
-         — PR 4 flips the gate on this information; PR 3 only records it"
+         — the worker-side gate routes on exactly this information"
     );
     for (k, v, _) in &seen {
         assert!(!k.is_empty() && !v.is_empty());
@@ -364,10 +365,16 @@ async fn validated_fills_land_hot_and_nvme_hits_never_repromote() {
         "hot_block_hits is the adoption signal"
     );
 
-    // No-repromote: block 1 present ONLY in the NVMe tier (seed it there
-    // directly), then read — served from the tier, hot stays empty.
-    let block1 = read_at(&h, ino, BS, BS as u32).await; // fills hot+tier
-    h.fs.router.cache.hot_block.remove(&k1); // leave only the NVMe copy
+    // No-repromote: block 1 present ONLY in the NVMe tier — seed the tier
+    // directly (under R1b a first-touch fill no longer publishes), then
+    // read: served from the tier, hot stays empty.
+    let block1 = read_at(&h, ino, BS, BS as u32).await; // fills hot
+    h.fs.router.cache.hot_block.remove(&k1); // leave no RAM copy
+    let _ =
+        h.fs.router
+            .cache
+            .nvme
+            .cache_read_block(&k1, bytes::Bytes::from(block1.clone()));
     assert!(h.fs.router.cache.nvme.get_cached_read_block(&k1).is_some());
     let d = read_at(&h, ino, BS + 64 * 1024, 64 * 1024).await;
     assert_eq!(&d[..], &block1[64 * 1024..128 * 1024]);

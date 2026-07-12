@@ -701,7 +701,10 @@ pub struct fuse_read_in {
     pub size: u32,
     pub(crate) _read_flags: u32,
     pub lock_owner: u64,
-    pub(crate) _flags: u32,
+    /// The file's open flags (O_DIRECT et al.) — the kernel sends them on
+    /// every READ; exposed for per-request read classification
+    /// (SqueezeFS R1b, docs/design-read-path.md §5.3).
+    pub flags: u32,
     _padding: u32,
 }
 

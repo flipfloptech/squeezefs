@@ -376,10 +376,10 @@ async fn test_small_block_map_stays_inline() {
     );
 
     // Verify we can read back from block 35 and block 69 correctly
-    let read_res_35 = fs.read(req, child_ino, 0, 35 * 4096, 1).await.unwrap();
+    let read_res_35 = fs.read(req, child_ino, 0, 35 * 4096, 1, 0).await.unwrap();
     assert_eq!(read_res_35.data.as_ref(), &[35]);
 
-    let read_res_69 = fs.read(req, child_ino, 0, 69 * 4096, 1).await.unwrap();
+    let read_res_69 = fs.read(req, child_ino, 0, 69 * 4096, 1, 0).await.unwrap();
     assert_eq!(read_res_69.data.as_ref(), &[69]);
 
     // Check used blocks count: 71 data blocks, NO indirect-map block.
@@ -730,7 +730,7 @@ async fn harness_write(h: &FlushHarness, ino: u64, off: u64, data: &[u8]) {
 }
 
 async fn harness_read(h: &FlushHarness, ino: u64, off: u64, len: u32) -> Vec<u8> {
-    h.fs.read(h.req, ino, 0, off, len)
+    h.fs.read(h.req, ino, 0, off, len, 0)
         .await
         .unwrap_or_else(|e| panic!("read ino {ino} failed: {e:?}"))
         .data

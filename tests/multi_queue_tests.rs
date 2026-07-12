@@ -194,7 +194,7 @@ async fn write_canary(h: &Harness, ino: u64, offset: u64, payload: &[u8]) -> Arc
 }
 
 async fn read_back(h: &Harness, ino: u64, offset: u64, len: u32) -> Vec<u8> {
-    h.fs.read(h.req, ino, 0, offset, len)
+    h.fs.read(h.req, ino, 0, offset, len, 0)
         .await
         .unwrap()
         .data

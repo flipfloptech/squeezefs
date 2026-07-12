@@ -164,7 +164,7 @@ async fn assert_full_read(
 ) {
     let want_len = std::cmp::min(size as u64, file_size - off) as usize;
     let got =
-        h.fs.read(h.req, ino, 0, off, size)
+        h.fs.read(h.req, ino, 0, off, size, 0)
             .await
             .unwrap_or_else(|e| panic!("[{tag}] read failed: {e:?}"))
             .data
@@ -282,7 +282,7 @@ async fn read_at_and_past_eof_stays_empty() {
     write_at(&h, ino, 0, &data).await;
 
     for off in [12345u64, 20000u64] {
-        let got = h.fs.read(h.req, ino, 0, off, 4096).await.unwrap().data;
+        let got = h.fs.read(h.req, ino, 0, off, 4096, 0).await.unwrap().data;
         assert!(
             got.is_empty(),
             "read at/past EOF (off {off}) must be empty, got {} bytes",

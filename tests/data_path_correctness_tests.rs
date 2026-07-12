@@ -128,7 +128,7 @@ async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
 }
 
 async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
-    h.fs.read(h.req, ino, 0, off, size)
+    h.fs.read(h.req, ino, 0, off, size, 0)
         .await
         .unwrap()
         .data
@@ -392,7 +392,7 @@ async fn test_concurrent_write_read_striped_no_stale_zeros() {
             let fs = h.fs.clone();
             readers.push(tokio::spawn(async move {
                 for _ in 0..30 {
-                    let _ = fs.read(req, ino, 0, 0, size as u32).await;
+                    let _ = fs.read(req, ino, 0, 0, size as u32, 0).await;
                     tokio::task::yield_now().await;
                 }
             }));
@@ -540,6 +540,7 @@ async fn test_virtual_inodes_open_direct_io() {
             stats.fh,
             4096,
             1 << 20,
+            0,
         )
         .await
         .expect("read .stats tail");
@@ -596,7 +597,7 @@ async fn test_active_block_read_snapshot_stable_across_overwrite() {
 
     // Hold the zero-copy reply for a range of the dirty block.
     let held =
-        h.fs.read(h.req, ino, 0, 196_608, 2048)
+        h.fs.read(h.req, ino, 0, 196_608, 2048, 0)
             .await
             .expect("read of dirty active block")
             .data;
@@ -671,7 +672,7 @@ async fn test_active_block_snapshots_stable_under_concurrent_writers(
         let mut done_rx = done_rx.clone();
         tasks.spawn(async move {
             let held =
-                h.fs.read(h.req, ino, 0, tail_off, tail_len as u32)
+                h.fs.read(h.req, ino, 0, tail_off, tail_len as u32, 0)
                     .await
                     .expect("read of dirty active block")
                     .data;

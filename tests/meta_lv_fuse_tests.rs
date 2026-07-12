@@ -259,7 +259,7 @@ async fn test_metalv_fuse_integration() {
     let config_sz_attr = fs.getattr(req, CONFIG_INODE, None, 0).await.unwrap();
     let config_len = config_sz_attr.attr.size;
     let config_read = fs
-        .read(req, CONFIG_INODE, 0, 0, config_len as u32)
+        .read(req, CONFIG_INODE, 0, 0, config_len as u32, 0)
         .await
         .unwrap();
     let config_str = std::str::from_utf8(&config_read.data).unwrap();

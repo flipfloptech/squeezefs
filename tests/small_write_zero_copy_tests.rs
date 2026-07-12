@@ -119,7 +119,7 @@ async fn create_file(h: &Harness, name: &str) -> u64 {
 }
 
 async fn read_all(h: &Harness, ino: u64, len: u32) -> Vec<u8> {
-    h.fs.read(h.req, ino, 0, 0, len)
+    h.fs.read(h.req, ino, 0, 0, len, 0)
         .await
         .unwrap()
         .data

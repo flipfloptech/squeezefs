@@ -2411,6 +2411,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     read_in.fh,
                     read_in.offset,
                     read_in.size,
+                    read_in.flags,
                 )
                 .await
             {

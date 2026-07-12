@@ -149,7 +149,7 @@ async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
 }
 
 async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
-    h.fs.read(h.req, ino, 0, off, size)
+    h.fs.read(h.req, ino, 0, off, size, 0)
         .await
         .unwrap()
         .data
@@ -167,8 +167,14 @@ async fn block_map_of(h: &H, ino: u64) -> std::collections::HashMap<u32, String>
         .unwrap_or_default()
 }
 
-fn tier_has(h: &H, key: &str) -> bool {
-    h.fs.router.cache.nvme.get_cached_read_block(key).is_some()
+/// RAM-or-disk visibility (docs/design-read-path.md §5.2/§5.3): under R1b
+/// a first-touch fill's landing zone is the HOT tier (the disk publish is
+/// second-touch-admitted), so the churn contract's visibility obligation
+/// generalizes — the get_obj deltas below stay byte-identical, they are
+/// the actual churn detectors.
+fn hot_or_tier_has(h: &H, key: &str) -> bool {
+    h.fs.router.cache.hot_block.get(key).is_some()
+        || h.fs.router.cache.nvme.get_cached_read_block(key).is_some()
 }
 
 /// Make every mapped block of `ino` COLD: fsync (parks/flushes any RAM or
@@ -181,13 +187,12 @@ async fn make_cold(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
     // Map AFTER the flush: flush merges can displace keys.
     let map = block_map_of(h, ino).await;
     for key in map.values() {
-        h.fs.router.cache.read_lru.remove(key);
-        h.fs.router.cache.nvme.remove_cached_read_block(key);
+        h.fs.router.cache.purge_block_key(key);
     }
     for (b, key) in &map {
         assert!(
-            !tier_has(h, key),
-            "fixture: block {b} must start cold in the read tier"
+            !hot_or_tier_has(h, key),
+            "fixture: block {b} must start cold in every read tier"
         );
         assert!(
             h.fs.router.cache.read_lru.get(key).is_none(),
@@ -234,9 +239,9 @@ async fn fetched_blocks_are_tier_visible_and_never_refetched() {
         "cold sub-block read must fetch its block exactly once"
     );
     assert!(
-        tier_has(&h, &k0),
-        "a completed publishable fill must be tier-visible when the \
-         single-flight fetch returns — a detached (late) publish is exactly \
+        hot_or_tier_has(&h, &k0),
+        "a completed publishable fill must be RAM-or-disk visible when the \
+         single-flight fetch returns — a detached (late) landing is exactly \
          the refetch-churn window"
     );
 
@@ -274,8 +279,8 @@ async fn fetched_blocks_are_tier_visible_and_never_refetched() {
          backend fetch (single-flight + publish-before-guard-drop)"
     );
     assert!(
-        tier_has(&h, &k2),
-        "phase C block tier-visible at completion"
+        hot_or_tier_has(&h, &k2),
+        "phase C block RAM-or-disk visible at completion"
     );
 
     // ---- Phase D: sequential pass over an 8-block working set (4 MiB —
@@ -312,9 +317,10 @@ async fn fetched_blocks_are_tier_visible_and_never_refetched() {
     );
     for (b, key) in map2.iter() {
         assert!(
-            tier_has(&h, key),
-            "single-pass retention: block {b} of a tier-fitting working \
-             set must still be resident at end of pass"
+            hot_or_tier_has(&h, key),
+            "single-pass retention: block {b} of a hot-tier-fitting working \
+             set must still be resident at end of pass (under R1b the \
+             landing zone is the hot tier)"
         );
     }
 }
@@ -392,8 +398,8 @@ async fn result_carrying_single_flight_decouples_waiters_from_publish() {
          waiter correctness is R1a's whole point"
     );
     assert!(
-        tier_has(&h, &k0),
-        "phase E: publish still lands (PR 2 keeps it)"
+        hot_or_tier_has(&h, &k0),
+        "phase E: the fill still lands RAM-or-disk (hot probation under R1b)"
     );
 
     // ---- Phase F: post-cohort reader = cache re-check serve, no fetch,
@@ -444,6 +450,13 @@ async fn result_carrying_single_flight_decouples_waiters_from_publish() {
 
     // ---- Phase H: primary aborted mid-publish — waiters recover through
     // a second cohort; exactly one refetch; no leak, no hang.
+    //
+    // R1b prerequisite: abort-MID-PUBLISH requires a publish to exist, and
+    // under second-touch admission a first-touch fill skips it. Prime the
+    // ghost with one fetch of block 1, then purge every tier so the phase
+    // fill is a genuine ghost-admitted (publishing) miss.
+    let _ = read_at(&h, ino, BS, 64 * 1024).await;
+    h.fs.router.cache.purge_block_key(&k1);
     TEST_TIER_PUBLISH_DELAY_MS.store(800, Ordering::Relaxed);
     let g_h0 = METRICS.get_obj.load(Ordering::Relaxed);
     let w_h0 = METRICS

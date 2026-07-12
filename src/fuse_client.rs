@@ -374,6 +374,17 @@ pub struct Metrics {
     pub hot_block_misses: Align64<AtomicU64>,
     pub hot_block_evictions: Align64<AtomicU64>,
     pub hot_block_probation_drops: Align64<AtomicU64>,
+    /// R1b admission (docs/design-read-path.md §5.3): skipped ≈ streamed
+    /// cold blocks (the tax kill's adoption signal — ≈ 0 on a streaming
+    /// workload means the classifier/admission is broken); admissions ≈
+    /// re-read blocks reaching the disk tier; ghost_hits = second-touch
+    /// detections; streams_classified / odirect_requests are the
+    /// classifier inputs made observable.
+    pub read_fill_publishes_skipped: Align64<AtomicU64>,
+    pub read_tier_admissions: Align64<AtomicU64>,
+    pub read_tier_admission_ghost_hits: Align64<AtomicU64>,
+    pub read_streams_classified: Align64<AtomicU64>,
+    pub read_odirect_requests: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -1096,6 +1107,12 @@ impl SqueezefsFilesystem {
                 "hot_block_probation_drops": METRICS.hot_block_probation_drops.load(Ordering::Relaxed),
                 "hot_block_current_bytes": self.router.cache.hot_block.current_bytes(),
                 "hot_block_max_bytes": self.router.cache.hot_block.max_bytes(),
+                "read_fill_publishes_skipped": METRICS.read_fill_publishes_skipped.load(Ordering::Relaxed),
+                "read_tier_admissions": METRICS.read_tier_admissions.load(Ordering::Relaxed),
+                "read_tier_admission_ghost_hits": METRICS.read_tier_admission_ghost_hits.load(Ordering::Relaxed),
+                "read_streams_classified": METRICS.read_streams_classified.load(Ordering::Relaxed),
+                "read_odirect_requests": METRICS.read_odirect_requests.load(Ordering::Relaxed),
+                "read_tier_admission_mode": format!("{:?}", self.router.tier_admission),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
@@ -3345,13 +3362,29 @@ impl Filesystem for SqueezefsFilesystem {
         fh: u64,
         offset: u64,
         size: u32,
+        flags: u32,
     ) -> FuseResult<ReplyData> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_read");
         debug!(
-            "FUSE Read: ino = {}, fh = {}, offset = {}, size = {}",
-            ino, fh, offset, size
+            "FUSE Read: ino = {}, fh = {}, offset = {}, size = {}, flags = {:#x}",
+            ino, fh, offset, size, flags
         );
+        // R1b classifier inputs (§5.3): the kernel sends the file's open
+        // flags on every READ; O_DIRECT is counted here, and the request
+        // feeds the file's offset lanes. Both are advisory/observability
+        // in PR 4 (the publish decision is ghost-driven at the fill site);
+        // PR 5's pipeline and PR 6's ranged dispatch build on them.
+        if flags & (libc::O_DIRECT as u32) != 0 {
+            METRICS
+                .read_odirect_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if ino != CONFIG_INODE && ino != STATS_INODE {
+            let _streaming =
+                self.router
+                    .observe_stream(&crate::keys::inode_path(ino), offset, size as u64);
+        }
 
         if ino == CONFIG_INODE {
             let bytes = if let Some(cached) = self.open_virtual_files.get(&fh) {

@@ -143,7 +143,7 @@ async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
 }
 
 async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
-    h.fs.read(h.req, ino, 0, off, size)
+    h.fs.read(h.req, ino, 0, off, size, 0)
         .await
         .unwrap()
         .data
@@ -221,7 +221,7 @@ async fn parked_read_never_serves_reused_or_freed_key() {
     let read_task = tokio::spawn({
         let fs = h.fs.clone();
         let req = h.req;
-        async move { fs.read(req, ino, 0, 0, (BS + 16) as u32).await }
+        async move { fs.read(req, ino, 0, 0, (BS + 16) as u32, 0).await }
     });
     // Let the read run to its park point (resolution is RAM-only; the first
     // await that can suspend it for long is the permit acquire).

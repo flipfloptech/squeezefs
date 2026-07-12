@@ -1681,17 +1681,19 @@ impl DataRouter {
     /// re-resolve — serving them for a resolved block index is exactly the
     /// reused-key stale-fill corruption.
     ///
-    /// `speculative`: the fill is a §5.5 pipeline prefetch, not a consumer
-    /// reference — under second-touch admission it takes the design's
-    /// prefetch row verbatim (§5.3 table: hot-tier **probation** put,
-    /// disk-tier **skip**, and — unlike the random row — **no
-    /// ghost-record**). Ghost heat must count consumer references only:
-    /// letting speculative fills stamp the table turned the pipeline's own
-    /// evict→foreground-refetch cycles into fake "re-read heat" (measured
-    /// live on the bench row-2 shape: 614 fake ghost hits ⇒ 4.5 GiB of
-    /// protected/NVMe publishes competing with the stream they were meant
-    /// to serve). `always`/`never` are unaffected (operator escape
-    /// semantics: verbatim today's behavior).
+    /// `speculative`: the fill is a §5.5 pipeline prefetch. It keeps FULL
+    /// ghost semantics (record + hit): with the pipeline fetching every
+    /// block of every classified pass, a ghost BYPASS (tried first) meant
+    /// a genuinely re-read stream never admitted to the disk tier — warm
+    /// re-reads stayed device-bound forever (measured: 9.2 GiB/s vs the
+    /// 16.6 lineage; R-1's mitigation stack broken). Same-pass fake heat
+    /// is prevented MECHANICALLY instead: the one-lap clock grace + the
+    /// progress-clocked quiescence keep one pass ≈ one miss per key
+    /// (`prefetch_evicted_unconsumed` ≈ 0), so a second recorded miss is
+    /// real cross-pass re-read heat regardless of which agent fetched.
+    /// What `speculative` DOES change: a non-admitted fill's hot put
+    /// carries the one-lap grace (`put_probationary_referenced`) — clock
+    /// parity with the consumed residue it races (never stickiness).
     async fn get_cached_or_fetch_block_traced(
         &self,
         block_key: &str,
@@ -1872,10 +1874,10 @@ impl DataRouter {
                             match self.tier_admission {
                                 TierAdmission::Always => true,
                                 TierAdmission::Never => false,
-                                // §5.3 prefetch row: speculative fills skip
-                                // AND leave the ghost table untouched (see
-                                // the fn doc — consumer references only).
-                                TierAdmission::SecondTouch if speculative => false,
+                                // Speculative fills INCLUDED (see fn doc):
+                                // a second recorded miss is real cross-pass
+                                // heat; same-pass double-misses are
+                                // prevented mechanically, not filtered.
                                 TierAdmission::SecondTouch => {
                                     let hit = self.ghost.check_and_record(block_key);
                                     if hit {
@@ -2358,8 +2360,9 @@ impl DataRouter {
                 return;
             }
 
-            // Speculative: §5.3's prefetch admission row — probation put,
-            // no disk publish, no ghost stamp (consumer references only).
+            // Speculative: full ghost semantics + the graced probation put
+            // — see the get_cached_or_fetch_block_traced doc for why the
+            // ghost bypass was rejected (warm-re-read convergence).
             match router.get_cached_or_fetch_block_traced(&key, true).await {
                 Ok(_) => settle(true),
                 Err(err) => {

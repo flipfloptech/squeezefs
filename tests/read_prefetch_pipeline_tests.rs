@@ -229,6 +229,9 @@ async fn pipeline_phases() {
     let issued0 = METRICS.prefetch_issued.load(Ordering::Relaxed);
     let wasted0 = METRICS.prefetch_wasted.load(Ordering::Relaxed);
     let evicted0 = METRICS.prefetch_evicted_unconsumed.load(Ordering::Relaxed);
+    let ghost0 = METRICS
+        .read_tier_admission_ghost_hits
+        .load(Ordering::Relaxed);
 
     stream_file(&h, ino, 16, 1).await;
     settle_pipeline().await;
@@ -238,6 +241,19 @@ async fn pipeline_phases() {
         g, 16,
         "clean stream: foreground + pipeline must dedupe through the \
          single-flight to exactly one device fetch per unique block"
+    );
+    // Clean-pass PURITY: one pass = one miss per key = zero ghost hits.
+    // A ghost hit here means the same pass touched a key twice — the
+    // evict→refetch fake-heat shape the grace + quiescence controls
+    // exist to prevent (measured live pre-control: 614 fake hits =>
+    // 4.5 GiB of mid-read tier publishes on the bench row-2 shape).
+    assert_eq!(
+        METRICS
+            .read_tier_admission_ghost_hits
+            .load(Ordering::Relaxed)
+            - ghost0,
+        0,
+        "a single clean stream pass must not manufacture re-read heat"
     );
     assert!(
         METRICS.prefetch_issued.load(Ordering::Relaxed) > issued0,
@@ -263,15 +279,19 @@ async fn pipeline_phases() {
         "in-flight gauge returns to zero at settle"
     );
 
-    // ---- Phase A2: prefetch fills bypass the ghost table (§5.3 admission
-    // table, "Prefetch fills: put probation, skip" — NO ghost-record,
-    // unlike the Random row). If speculative fills stamp/check the ghost,
-    // a re-streamed file reads back as "re-read heat" fetched by the
-    // pipeline itself: protected-hot + NVMe-tier publishes land mid-read
-    // — measured live on the bench row-2 shape as 614 fake ghost hits =>
-    // 4.5 GiB of tier writes competing with the stream they were meant to
-    // serve. Consumer (foreground) fetches keep full ghost semantics: the
-    // pre-classification foreground fills may record + later hit (<= 2).
+    // ---- Phase A2: cross-pass warmth CONVERGES for pipelined streams —
+    // speculative fills keep FULL ghost semantics (record + hit). The
+    // bypass tried first (an admission-table reading: "prefetch row, no
+    // ghost-record") overcorrected: with the pipeline fetching every
+    // block of every pass, a genuinely re-read stream never produced a
+    // consumer device fetch, so it NEVER admitted to the disk tier and
+    // warm re-reads stayed device-bound forever (measured: warm-re-read
+    // 9.2 GiB/s vs the 16.6 lineage, device re-reading the full slice
+    // every pass — R-1's mitigation stack broken). Same-pass fake heat
+    // is prevented MECHANICALLY (grace + quiescence keep one pass = one
+    // miss per key; phase A's zero-ghost-hit assertion is the purity
+    // pin), so a cross-pass hit is real re-read heat regardless of which
+    // agent fetched.
     {
         let map =
             h.fs.router
@@ -295,10 +315,10 @@ async fn pipeline_phases() {
     );
     let admitted = METRICS.read_tier_admissions.load(Ordering::Relaxed) - admit0;
     assert!(
-        admitted <= 2,
-        "pipeline fills must SKIP the ghost table (admission-table prefetch \
-         row): a purged re-stream admitted {admitted} blocks to the disk \
-         tier — speculative fills are manufacturing re-read heat"
+        admitted >= 14,
+        "a purged re-stream is REAL re-read heat: second-touch admission \
+         must converge it to the disk tier ({admitted}/16 admitted) — \
+         losing this breaks the warm-re-read row (R-1's mitigation stack)"
     );
 
     // ---- Phase B: abandonment — a non-sequential read stops issue within

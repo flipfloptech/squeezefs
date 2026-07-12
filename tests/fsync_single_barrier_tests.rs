@@ -52,6 +52,11 @@ struct Harness {
 
 async fn make_fs(test_id: &str) -> Harness {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
+    // Quiesce the KV checkpoint cadence: its background tick issues a real
+    // device barrier (`meta_device_syncs`) and can land inside the exact
+    // one-fsync-one-barrier window this test pins (the loaded full-gate
+    // flake). The test measures the fsync path, not the cadence.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "3600000");
     let dlm = DlmClient::new("local").unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();

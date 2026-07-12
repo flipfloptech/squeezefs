@@ -55,6 +55,12 @@ struct Harness {
 
 async fn make_fs(test_id: &str) -> Harness {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
+    // Quiesce the KV checkpoint cadence: its background tick issues a real
+    // device barrier (`meta_device_syncs`), and on a loaded full-gate run
+    // one landing inside the measurement window broke the exact
+    // requests→barriers accounting these tests pin (observed: 65 barriers
+    // for 64 requests). The tests measure the COALESCER, not the cadence.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "3600000");
     let dlm = DlmClient::new("local").unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();

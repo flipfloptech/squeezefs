@@ -282,6 +282,60 @@ async fn trunc_cycle_reads_zeros_after_promotion() {
     assert_bytes(&got, &want, "leg B (promoted durable image) truncate cycle");
 }
 
+/// The aged-storm interleave: a staged file under CONSTANT background
+/// promotion churn (tiny ring — every stage crosses the high-water mark and
+/// self-enqueues promotion; the merge worker races every op) while the
+/// foreground runs fsx-shaped truncate-down / extend / RMW cycles. Every
+/// cycle verifies the re-exposed range reads zeros and the prefix survives —
+/// the daemon-side corruption reproduced by the aged fsx storm entered
+/// through exactly this promote-vs-truncate window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn trunc_cycles_under_promotion_churn_never_resurrect() {
+    const FULL: usize = 800 * 1024; // > high water (768 KiB of 1 MiB budget)
+    const ROUNDS: usize = 60;
+
+    let h = make(*b"stagtrunc-churn1", "sttr_ns_e", "1MB").await;
+    let a = create(&h, "churn_a").await;
+    let path = squeezefs::keys::inode_path(a);
+
+    let mut x = 0x243F_6A88_85A3_08D3u64; // deterministic LCG offsets
+    for round in 0..ROUNDS {
+        // Full-length rewrite with a round-tagged pattern (over_cap stalls
+        // are fine — they exercise the promotion kick harder).
+        let mut pat = pattern(FULL);
+        for b in pat.iter_mut() {
+            *b = b.wrapping_add(round as u8);
+        }
+        write_at(&h, a, 0, &pat).await;
+
+        // fsx-shaped cycle: truncate down into the body, then re-expose via
+        // an extending sub-block RMW write (the copy_file_range dest shape).
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let down = 128 * 1024 + (x % (256 * 1024)); // [128K, 384K)
+        let woff = FULL as u64 - 32 * 1024 + (x % 8192); // extend near old EOF
+        truncate_to(&h, a, down).await;
+        write_at(&h, a, woff, &[0xEE; 4096]).await;
+
+        let meta = h.fs.router.fetch_metadata(&path).await.unwrap();
+        assert_eq!(meta.size, woff + 4096, "round {round}: size after cycle");
+
+        let got = read_all(&h, a, (woff + 4096) as usize).await;
+        let mut want = pat[..down as usize].to_vec();
+        want.resize((woff + 4096) as usize, 0);
+        want[woff as usize..].fill(0xEE);
+        if let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) {
+            panic!(
+                "round {round}: first mismatch at offset {i} (down={down}, woff={woff}): \
+                 got 0x{:02x}, want 0x{:02x} — stale bytes resurrected through the \
+                 promote-vs-truncate window",
+                got[i], want[i]
+            );
+        }
+    }
+}
+
 /// The in-place shrink primitive itself: patches `original_size` under the
 /// shard write lock without moving the extent (readers decode the clipped
 /// length; payload prefix intact), refuses growth and absent keys.

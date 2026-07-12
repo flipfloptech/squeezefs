@@ -617,6 +617,10 @@ impl BackendRouter {
     /// unparsable key) — the caller must re-resolve, never proceed unpinned.
     #[must_use]
     pub fn increment_refcount(&self, block_key: &str) -> bool {
+        // Decoration-tolerant (`bk:off:len` size-carrying mappings — see
+        // `parse_block_mapping`): the refcount belongs to the BASE block.
+        let cleaned = clean_block_key(block_key);
+        let block_key: &str = &cleaned;
         if let Ok((be_id, offset)) = self.parse_block_key(block_key) {
             if be_id == "backend_0" {
                 self.default_allocator.increment_refcount(offset)
@@ -705,7 +709,11 @@ impl BackendRouter {
     /// new owner's DMA at the reused offset (the acked-write lost-update
     /// class surfaced by PR 6's pinned striped concurrency test).
     pub async fn free_block(&self, block_key: &str) -> Result<()> {
-        let (be_id, offset) = self.parse_block_key(block_key)?;
+        // Decoration-tolerant: size-carrying mappings (`bk:off:len` — see
+        // `parse_block_mapping`) free their BASE block; a raw parse of the
+        // decorated string would err and silently leak the block.
+        let cleaned = clean_block_key(block_key);
+        let (be_id, offset) = self.parse_block_key(&cleaned)?;
 
         let (allocator, device_path) = if be_id == "backend_0" {
             (
@@ -1334,17 +1342,41 @@ impl DataRouter {
         let _ = self.inner.meta_backend.set(meta_backend);
     }
 
-    fn parse_block_mapping(&self, mapping_str: &str) -> Result<(u64, u64, usize)> {
+    /// Decode a staged/promoted block mapping. Two forms:
+    ///
+    /// * **Size-carrying** `bk:rel_off:packed_len` (what promotion / spill /
+    ///   truncate-clip publish): `packed_len` is the EXACT stored transform
+    ///   image length — `exact == true`. Without it a passthrough
+    ///   (no-compression) image is unrecoverable from a whole-block read:
+    ///   the trailing device bytes of a recycled block are indistinguishable
+    ///   from payload (framed transforms self-delimit; passthrough is
+    ///   byte-identity), which is how a promoted staged file's RMW seed
+    ///   ballooned to `block_size` carrying a prior tenant's stale bytes
+    ///   (`tests/staged_truncate_stale_tests.rs` churn test).
+    /// * **Bare legacy** `bk`: pre-fix volumes — the caller must read the
+    ///   whole block window and bound what it consumes (`exact == false`).
+    ///
+    /// The base key may itself contain `://` (non-default backends), so the
+    /// decoration is parsed strictly AFTER that prefix.
+    fn parse_block_mapping(&self, mapping_str: &str) -> Result<(u64, u64, usize, bool)> {
         let default_size = self.block_size.load(Ordering::Acquire) as usize;
-        let parts: Vec<&str> = mapping_str.split(':').collect();
+        let (prefix, rest) = match mapping_str.find("://") {
+            Some(pos) => mapping_str.split_at(pos + 3),
+            None => ("", mapping_str),
+        };
+        let parts: Vec<&str> = rest.split(':').collect();
         if parts.len() == 3 {
-            let bk = self.backend_router.parse_block_offset(parts[0])?;
+            let bk = self
+                .backend_router
+                .parse_block_offset(&format!("{prefix}{}", parts[0]))?;
             let off = parts[1].parse::<u64>().unwrap_or(0);
-            let sz = parts[2].parse::<usize>().unwrap_or(default_size);
-            Ok((bk, off, sz))
+            match parts[2].parse::<usize>() {
+                Ok(sz) => Ok((bk, off, sz, true)),
+                Err(_) => Ok((bk, off, default_size, false)),
+            }
         } else {
             let bk = self.backend_router.parse_block_offset(mapping_str)?;
-            Ok((bk, 0, default_size))
+            Ok((bk, 0, default_size, false))
         }
     }
 
@@ -2875,7 +2907,15 @@ impl DataRouter {
             return Ok(false);
         }
         let offset = allocator.allocate_block().await?;
-        let block_key = self.backend_router.persist_block_key(&be_id, offset);
+        // Size-carrying mapping (`bk:0:packed_len`): without the exact
+        // stored-image length, a passthrough transform cannot strip the
+        // whole-block read's recycled-tenant tail (see
+        // `parse_block_mapping`).
+        let block_key = format!(
+            "{}:0:{}",
+            self.backend_router.persist_block_key(&be_id, offset),
+            processed.len()
+        );
         if let Err(e) = writer.write_block(offset, processed).await {
             let _ = allocator.free_block(offset).await;
             return Err(e);
@@ -2998,9 +3038,24 @@ impl DataRouter {
     /// may belong to a freed-and-reused block if the identity moved while
     /// the read was in flight.
     async fn read_promoted_staged_block(&self, block_key: &str) -> Result<bytes::Bytes> {
-        let offset_u64 = self.backend_router.parse_block_offset(block_key)?;
-        let sz = self.block_size.load(Ordering::Acquire) as usize;
-        let packed_bytes = self.nvme_writer.read_block(offset_u64, sz).await?;
+        // Size-carrying (`bk:0:packed_len`) mappings decode to EXACTLY the
+        // promoted payload: read the 4 KiB-aligned window covering the image
+        // (device reads are LBA-aligned) and slice the exact image before
+        // the transform. A bare legacy key has lost the packed length: the
+        // whole-block read's tail is device garbage that a passthrough
+        // (no-compression) `process_read` cannot strip — callers must bound
+        // what they consume (the read path clamps to `meta.size`).
+        let (offset_u64, off, sz, exact) = self.parse_block_mapping(block_key)?;
+        let read_len = if exact { sz.div_ceil(4096) * 4096 } else { sz };
+        let packed_bytes = self
+            .nvme_writer
+            .read_block(offset_u64 + off, read_len)
+            .await?;
+        let packed_bytes = if exact && packed_bytes.len() > sz {
+            packed_bytes.slice(0..sz)
+        } else {
+            packed_bytes
+        };
         self.get_crypto().process_read_async(packed_bytes).await
     }
 
@@ -3378,12 +3433,25 @@ impl DataRouter {
                             // the D0 degrade contract).
                             let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
                             if let Some(mapping_str) = mapping_opt {
-                                let (offset_u64, off, sz) =
-                                    self.parse_block_mapping(&mapping_str)?;
-                                let packed_bytes =
-                                    self.nvme_writer.read_block(offset_u64 + off, sz).await?;
-                                let plain =
-                                    self.get_crypto().process_read_async(packed_bytes).await?;
+                                let mut plain =
+                                    self.read_promoted_staged_block(&mapping_str).await?;
+                                let (_, _, _, exact) = self.parse_block_mapping(&mapping_str)?;
+                                if !exact && plain.len() as u64 > meta.size {
+                                    // Bare legacy mapping: the whole-block
+                                    // read's tail is another tenant's device
+                                    // garbage a passthrough transform cannot
+                                    // strip. Bound by `meta.size` — safe on
+                                    // THIS leg only, because every event
+                                    // that publishes/clips a durable staged
+                                    // mapping (promotion, spill, truncate
+                                    // clip) persists the size in the same
+                                    // commit, so a ring-miss image never
+                                    // legitimately exceeds it (unlike the
+                                    // ring blob, whose size may lag — the
+                                    // pinned truncate_down_stale_size
+                                    // contract).
+                                    plain = plain.slice(0..meta.size as usize);
+                                }
                                 existing_data.resize(plain.len(), 0);
                                 existing_data.copy_from_slice(&plain);
                             }
@@ -3675,7 +3743,13 @@ impl DataRouter {
                     let (be_id, block_allocator, nvme_writer) =
                         self.backend_router.get_active_backend()?;
                     let be_offset = block_allocator.allocate_block().await?;
-                    let stored_block_key = self.backend_router.persist_block_key(&be_id, be_offset);
+                    // Size-carrying mapping (`bk:0:packed_len` — see
+                    // `parse_block_mapping`).
+                    let stored_block_key = format!(
+                        "{}:0:{}",
+                        self.backend_router.persist_block_key(&be_id, be_offset),
+                        processed_data.len()
+                    );
 
                     nvme_writer.write_block(be_offset, processed_data).await?;
                     block_allocator.publish_block(be_offset);
@@ -5227,7 +5301,13 @@ impl DataRouter {
                         let (be_id, allocator, writer) =
                             self.backend_router.get_active_backend()?;
                         let offset = allocator.allocate_block().await?;
-                        let new_bk = self.backend_router.persist_block_key(&be_id, offset);
+                        // Size-carrying mapping (`bk:0:packed_len` — see
+                        // `parse_block_mapping`).
+                        let new_bk = format!(
+                            "{}:0:{}",
+                            self.backend_router.persist_block_key(&be_id, offset),
+                            processed.len()
+                        );
                         if let Err(e) = writer.write_block(offset, processed).await {
                             let _ = allocator.free_block(offset).await;
                             return Err(e);

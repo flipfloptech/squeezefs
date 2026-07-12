@@ -336,6 +336,122 @@ async fn trunc_cycles_under_promotion_churn_never_resurrect() {
     }
 }
 
+/// Mini-fsx against a staged file under promotion churn: the full aged-storm
+/// op mix — truncate down/up, PUNCH_HOLE, ZERO_RANGE, copy_file_range,
+/// extending RMW writes — model-tracked and verified byte-exact after every
+/// round. The round-4 aged storm surfaced a LOSS class (acked bytes reading
+/// zeros) under exactly this mix; this pins whatever leg produced it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn staged_minifsx_under_promotion_churn_byte_exact() {
+    const FULL: usize = 800 * 1024; // > high water => constant promotion churn
+    const ROUNDS: usize = 40;
+
+    let h = make(*b"stagtrunc-mfsx01", "sttr_ns_f", "1MB").await;
+    let a = create(&h, "mfsx_a").await;
+    let path = squeezefs::keys::inode_path(a);
+
+    let mut model = vec![0u8; FULL];
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = move || {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        x
+    };
+
+    for round in 0..ROUNDS {
+        // Round seed: full-length rewrite.
+        let mut pat = pattern(FULL);
+        for b in pat.iter_mut() {
+            *b = b.wrapping_add(round as u8);
+        }
+        write_at(&h, a, 0, &pat).await;
+        model.clear();
+        model.extend_from_slice(&pat);
+
+        // 1. Truncate down into the body.
+        let d1 = 256 * 1024 + (rnd() % (256 * 1024));
+        truncate_to(&h, a, d1).await;
+        model.truncate(d1 as usize);
+
+        // 2. Punch a hole inside what survives.
+        let p_off = rnd() % (d1 / 2);
+        let p_len = 4096 + (rnd() % (64 * 1024)).min(d1 - p_off - 1);
+        h.fs.fallocate(
+            h.req,
+            a,
+            0,
+            p_off,
+            p_len,
+            (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE) as u32,
+        )
+        .await
+        .unwrap();
+        model[p_off as usize..(p_off + p_len) as usize].fill(0);
+
+        // 3. Extending RMW write past the truncated EOF.
+        let woff = d1 + (rnd() % (128 * 1024));
+        write_at(&h, a, woff, &[0xEE; 4096]).await;
+        model.resize(woff as usize + 4096, 0);
+        model[woff as usize..].fill(0xEE);
+
+        // 4. ZERO_RANGE (keep size) across the old-EOF boundary region.
+        let z_off = d1.saturating_sub(rnd() % (32 * 1024));
+        let z_len = 4096 + (rnd() % (32 * 1024));
+        let z_end = (z_off + z_len).min(model.len() as u64);
+        h.fs.fallocate(
+            h.req,
+            a,
+            0,
+            z_off,
+            z_end - z_off,
+            (libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE) as u32,
+        )
+        .await
+        .unwrap();
+        model[z_off as usize..z_end as usize].fill(0);
+
+        // 5. copy_file_range within the file (fsx COPY shape, may extend).
+        let src = rnd() % (model.len() as u64 / 2);
+        let clen = (4096 + (rnd() % (48 * 1024))).min(model.len() as u64 - src);
+        let dst = rnd() % (model.len() as u64);
+        let copied =
+            h.fs.copy_file_range(h.req, a, 0, src, a, 0, dst, clen, 0)
+                .await
+                .unwrap()
+                .copied;
+        assert!(
+            copied > 0,
+            "round {round}: copy_file_range made no progress"
+        );
+        let seg = model[src as usize..(src + copied) as usize].to_vec();
+        if (dst + copied) as usize > model.len() {
+            model.resize((dst + copied) as usize, 0);
+        }
+        model[dst as usize..(dst + copied) as usize].copy_from_slice(&seg);
+
+        // 6. Verify the whole image byte-exact.
+        let meta = h.fs.router.fetch_metadata(&path).await.unwrap();
+        assert_eq!(
+            meta.size,
+            model.len() as u64,
+            "round {round}: logical size diverged from the model"
+        );
+        let got = read_all(&h, a, model.len()).await;
+        if let Some(i) = (0..got.len().min(model.len())).find(|&i| got[i] != model[i]) {
+            panic!(
+                "round {round}: first mismatch at offset {i} of {}: got 0x{:02x}, want 0x{:02x} \
+                 (d1={d1}, p=[{p_off},{p_len}], woff={woff}, z=[{z_off},{}], copy {src}->{dst} x{copied})",
+                model.len(),
+                got[i],
+                model[i],
+                z_end - z_off,
+            );
+        }
+        assert_eq!(got.len(), model.len(), "round {round}: short read");
+    }
+}
+
 /// The in-place shrink primitive itself: patches `original_size` under the
 /// shard write lock without moving the extent (readers decode the clipped
 /// length; payload prefix intact), refuses growth and absent keys.

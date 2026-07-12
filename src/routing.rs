@@ -1001,6 +1001,22 @@ pub struct StreamLane {
     /// Completed fills not yet foreground-consumed — the resident-
     /// unconsumed bound (§5.5 mechanism i).
     unconsumed: std::sync::atomic::AtomicU32,
+    /// First block index NOT yet consumed by the foreground (the consume
+    /// cursor): consumption is counted per BLOCK the stream advances
+    /// past, never per request — four 1 MiB sub-reads of one 4 MiB block
+    /// are ONE consumption (the per-request draft drained `unconsumed` 4x
+    /// too fast, over-issued into the budget, and the AIMD quiescence arm
+    /// then stalled healthy lanes — measured live on the row-2 shape).
+    consumed_edge: std::sync::atomic::AtomicU32,
+    /// First block index of the ISSUED span: the evicted-unconsumed
+    /// detector probes residency only for blocks in
+    /// `[issued_base, next_prefetch_block)` — blocks the pipeline actually
+    /// fetched. Without this base the plan-REBASE span (blocks the reader
+    /// skipped past, never issued) counted as pipeline coverage, and every
+    /// foreground fetch inside it fired the detector: measured live on the
+    /// row-2 shape as `evicted_unconsumed` ≈ 1 700 false positives whose
+    /// AIMD/quiescence response froze healthy lanes at issued ≈ 33.
+    issued_base: std::sync::atomic::AtomicU32,
     /// Abandonment fence: bumped on lane reset; tasks check it at
     /// admission and before landing their fill accounting.
     generation: std::sync::atomic::AtomicU64,
@@ -1087,16 +1103,6 @@ pub(crate) struct LaneRef<'a> {
     pub(crate) streaming: bool,
 }
 
-/// Owned pipeline context threaded from `pipeline_touch` to the serve
-/// exits, so the consumer-side spiral detector can attribute a device
-/// fetch to its lane without re-resolving anything.
-pub(crate) struct PipelineCtx {
-    lanes: std::sync::Arc<StreamLanes>,
-    lane_idx: usize,
-    generation: u64,
-    covered: bool,
-}
-
 impl StreamLanes {
     fn new() -> Self {
         let mk = || StreamLane {
@@ -1108,6 +1114,8 @@ impl StreamLanes {
             window: std::sync::atomic::AtomicU32::new(2),
             inflight: std::sync::atomic::AtomicU32::new(0),
             unconsumed: std::sync::atomic::AtomicU32::new(0),
+            consumed_edge: std::sync::atomic::AtomicU32::new(0),
+            issued_base: std::sync::atomic::AtomicU32::new(0),
             generation: std::sync::atomic::AtomicU64::new(0),
             last_counted_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
             suppressed_until_ms: std::sync::atomic::AtomicU64::new(0),
@@ -1177,6 +1185,8 @@ impl StreamLanes {
             lane.next_prefetch_block.store(0, Relaxed);
             lane.window.store(2, Relaxed);
             lane.unconsumed.store(0, Relaxed);
+            lane.consumed_edge.store(0, Relaxed);
+            lane.issued_base.store(0, Relaxed);
             lane.last_seen_ms.store(now, Relaxed);
             return Some(LaneRef {
                 lane,
@@ -2001,6 +2011,21 @@ impl DataRouter {
     /// `will_wait_inflight`: the caller observed this request's block key
     /// already in the single-flight registry — the reader caught the
     /// pipeline (§5.5's growth trigger: pipeline too shallow).
+    ///
+    /// `first_key`: the resolved block key of `start_block` (None = hole/
+    /// unresolved). Feeds the CONSUME-TIME evicted-unconsumed detector:
+    /// when the reader advances onto a block the pipeline ISSUED
+    /// (`issued_base ≤ start_block < next_prefetch_block`), that fill must
+    /// still be findable — hot tier, RAM LRU, NVMe read tier, or the
+    /// single-flight registry (still in flight). Absent everywhere ⇒ the
+    /// fill was evicted before its consumer arrived (§5.5's R-5 spiral
+    /// signal): count `prefetch_evicted_unconsumed`, halve the window
+    /// (AIMD), and arm the quiescence gate. The probe runs at most once
+    /// per block (gated on the consume edge advancing), and only against
+    /// the issued span — a serve-exit detector tried first counted the
+    /// reader's own plan-rebase spans as evictions and froze healthy lanes
+    /// (measured: issued ≈ 33, false `evicted_unconsumed` ≈ 1 700 on the
+    /// clean row-2 shape).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn pipeline_touch(
         &self,
@@ -2012,15 +2037,18 @@ impl DataRouter {
         start_block: u32,
         end_block: u32,
         will_wait_inflight: bool,
-    ) -> Option<PipelineCtx> {
+        first_key: Option<&str>,
+    ) {
         if self.prefetch_window_cap == 0 || meta.file_type != "striped" {
-            return None;
+            return;
         }
         let lanes = self.stream_lanes.get_with(file_path.to_string(), || {
             std::sync::Arc::new(StreamLanes::new())
         });
         let (lane_idx, streaming) = {
-            let lane_ref = lanes.observe(offset, len)?;
+            let Some(lane_ref) = lanes.observe(offset, len) else {
+                return;
+            };
             let idx = lanes
                 .lanes
                 .iter()
@@ -2032,26 +2060,49 @@ impl DataRouter {
         use std::sync::atomic::Ordering::Relaxed;
         let generation = lane.generation.load(Relaxed);
 
-        // Consume bookkeeping: this request is about to be served; every
-        // pipeline-covered block it spans counts as consumed.
+        // Consume bookkeeping — per BLOCK ADVANCED, not per request: the
+        // stream consuming block b means every pipeline-issued block in
+        // [consumed_edge, end_block] is now behind the reader. (A
+        // per-request draft drained `unconsumed` once per sub-read — 4x
+        // too fast on the row-2 shape — over-issuing into the budget.)
         let issued_edge = lane.next_prefetch_block.load(Relaxed);
-        let covered = issued_edge > 0 && start_block < issued_edge;
-        if covered {
-            let span = (end_block.min(issued_edge - 1).max(start_block) - start_block) + 1;
-            for _ in 0..span {
-                let _ = lane
-                    .unconsumed
-                    .fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+        let issued_base = lane.issued_base.load(Relaxed);
+        let ce = lane.consumed_edge.load(Relaxed);
+        if end_block >= ce {
+            lane.consumed_edge.store(end_block + 1, Relaxed);
+            if issued_edge > ce {
+                let drain_from = ce.max(issued_base);
+                let drain_to = end_block.min(issued_edge - 1);
+                if drain_to >= drain_from {
+                    for _ in 0..=(drain_to - drain_from) {
+                        let _ = lane
+                            .unconsumed
+                            .fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+                    }
+                }
+            }
+
+            // Consume-time evicted-unconsumed detection (see doc comment).
+            if start_block >= issued_base && start_block < issued_edge {
+                if let Some(k) = first_key {
+                    let resident = self.cache.hot_block.get_no_promote(k).is_some()
+                        || self.cache.read_lru.get_no_promote(k).is_some()
+                        || self.cache.nvme.has_cached_read_block(k)
+                        || self.inflight_block_reads.read_sync(k, |_, _| ()).is_some();
+                    if !resident {
+                        METRICS.prefetch_evicted_unconsumed.fetch_add(1, Relaxed);
+                        let _ = lane
+                            .window
+                            .fetch_update(Relaxed, Relaxed, |w| Some((w / 2).max(2)));
+                        lane.suppressed_until_ms
+                            .store(StreamLanes::now_ms() + 2_000, Relaxed);
+                    }
+                }
             }
         }
 
         if !streaming {
-            return Some(PipelineCtx {
-                lanes: lanes.clone(),
-                lane_idx,
-                generation,
-                covered,
-            });
+            return;
         }
 
         // Foreground caught the pipeline: window ×2 (capped).
@@ -2074,29 +2125,20 @@ impl DataRouter {
             METRICS.prefetch_window_hwm.store(effective as u64, Relaxed);
         }
 
-        // Initialize/advance the plan base: issue starts past this request
-        // (pre-classification blocks are never "covered").
-        let _ = lane
-            .next_prefetch_block
-            .fetch_update(Relaxed, Relaxed, |v| {
-                if v <= end_block {
-                    Some(end_block + 1)
-                } else {
-                    None
-                }
-            });
+        // (Re)base the plan when it is uninitialized or fell behind the
+        // reader: issue restarts past this request. The skipped span was
+        // never issued, so the covered window empties with the base.
+        if lane.next_prefetch_block.load(Relaxed) <= end_block {
+            lane.next_prefetch_block.store(end_block + 1, Relaxed);
+            lane.issued_base.store(end_block + 1, Relaxed);
+        }
 
         // Top up: resident-unconsumed + in-flight bounded by the window
         // (§5.5 mechanism i — issue stops; the spiral cannot start), and
         // gated by the AIMD quiescence arm (sustained starvation pauses
         // issue for an epoch instead of re-feeding the evict cycle).
         if StreamLanes::now_ms() < lane.suppressed_until_ms.load(Relaxed) {
-            return Some(PipelineCtx {
-                lanes: lanes.clone(),
-                lane_idx,
-                generation,
-                covered,
-            });
+            return;
         }
         let total_blocks = meta.size.div_ceil(block_size) as u32;
         loop {
@@ -2131,13 +2173,6 @@ impl DataRouter {
                 generation,
             );
         }
-
-        Some(PipelineCtx {
-            lanes,
-            lane_idx,
-            generation,
-            covered,
-        })
     }
 
     /// One §5.5 pipeline fetch: through the single-flight (dedupes with
@@ -2171,7 +2206,14 @@ impl DataRouter {
                 let live = lane.generation.load(Relaxed) == generation;
                 if completed && live {
                     METRICS.prefetch_completed.fetch_add(1, Relaxed);
-                    lane.unconsumed.fetch_add(1, Relaxed);
+                    // Resident-unconsumed counts only fills the reader is
+                    // still BEHIND: a slow fill completing after the
+                    // consume edge passed its block has no drain left
+                    // (the edge only moves forward) — counting it would
+                    // occupy window budget forever and stall the lane.
+                    if block >= lane.consumed_edge.load(Relaxed) {
+                        lane.unconsumed.fetch_add(1, Relaxed);
+                    }
                 } else {
                     METRICS.prefetch_wasted.fetch_add(1, Relaxed);
                 }
@@ -2240,27 +2282,6 @@ impl DataRouter {
                 }
             }
         });
-    }
-
-    /// Consumer-side spiral detector (§5.5 / observability): the foreground
-    /// paid a DEVICE fetch for a block the pipeline had already covered —
-    /// its fill was evicted before consumption. AIMD: halve the lane
-    /// window (floor 2) and count it.
-    pub(crate) fn pipeline_on_device_fetch(&self, ctx: &PipelineCtx) {
-        use std::sync::atomic::Ordering::Relaxed;
-        if !ctx.covered {
-            return;
-        }
-        let lane = &ctx.lanes.lanes[ctx.lane_idx];
-        if lane.generation.load(Relaxed) != ctx.generation {
-            return;
-        }
-        METRICS.prefetch_evicted_unconsumed.fetch_add(1, Relaxed);
-        let _ = lane
-            .window
-            .fetch_update(Relaxed, Relaxed, |w| Some((w / 2).max(2)));
-        lane.suppressed_until_ms
-            .store(StreamLanes::now_ms() + 2_000, Relaxed);
     }
 
     /// The CURRENT block-index→key binding of `(file_path, b)`, as fresh as
@@ -3867,13 +3888,11 @@ impl DataRouter {
                         // foreground-wait (key already in the single-
                         // flight = the reader caught the pipeline), and
                         // the windowed top-up.
-                        let pipeline_ctx = {
-                            let will_wait = block_keys
-                                .first()
-                                .and_then(|(_, k)| k.as_deref())
-                                .is_some_and(|k| {
-                                    self.inflight_block_reads.read_sync(k, |_, _| ()).is_some()
-                                });
+                        {
+                            let first_key = block_keys.first().and_then(|(_, k)| k.as_deref());
+                            let will_wait = first_key.is_some_and(|k| {
+                                self.inflight_block_reads.read_sync(k, |_, _| ()).is_some()
+                            });
                             self.pipeline_touch(
                                 file_path,
                                 &meta,
@@ -3883,8 +3902,9 @@ impl DataRouter {
                                 start_block,
                                 end_block,
                                 will_wait,
-                            )
-                        };
+                                first_key,
+                            );
+                        }
                         if let Some((_, b_key_opt)) = block_keys.first() {
                             // R4 hot-block fast path (§5.4): a hot hit takes
                             // the SAME binding recheck as the NVMe-tier hit
@@ -4121,12 +4141,6 @@ impl DataRouter {
 
                             match downloaded {
                                 Some(downloaded) => {
-                                    // §5.5 consumer-side spiral detector:
-                                    // this serve paid a DEVICE fetch.
-                                    if let Some(ref ctx) = pipeline_ctx {
-                                        self.pipeline_on_device_fetch(ctx);
-                                    }
-
                                     if let Some(dest) = dest_addr {
                                         let len = (end_offset - offset) as usize;
                                         let data = bytes::Bytes::from_owner(
@@ -4179,11 +4193,10 @@ impl DataRouter {
                         .load_striped_block_keys(file_path, &meta, start_block, end_block)
                         .await?;
                     // §5.5: multi-block reads advance the pipeline past
-                    // end_block (consume span + top-up); the per-block
-                    // device-fetch attribution is deliberately coarse here
-                    // (the fan-out serves via get_block_for_index), so the
-                    // ctx is not threaded further.
-                    let _ = self.pipeline_touch(
+                    // end_block (consume span + top-up). The consume-time
+                    // detector probes the first block's key like the
+                    // single-block arm.
+                    self.pipeline_touch(
                         file_path,
                         &meta,
                         block_size,
@@ -4192,6 +4205,7 @@ impl DataRouter {
                         start_block,
                         end_block,
                         false,
+                        block_keys.first().and_then(|(_, k)| k.as_deref()),
                     );
 
                     let final_len = (end_offset - offset) as usize;

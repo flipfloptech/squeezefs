@@ -978,6 +978,20 @@ impl NvmeCache {
         None
     }
 
+    /// Cheap residency probe — index membership only (no payload access,
+    /// no guard, `read_recursive` per the shard-lock invariant). Same
+    /// device iteration as [`Self::get`]. Feeds the §5.5 consume-time
+    /// evicted-unconsumed detector.
+    pub fn contains(&self, key: &Bytes) -> bool {
+        let devices = self.devices.read();
+        devices.iter().any(|dev| {
+            dev.online.load(Ordering::Relaxed) && {
+                let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
+                dev.shards[shard_idx].has_key(key)
+            }
+        })
+    }
+
     pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes)> {
         match self.route_put(&key) {
             Some((dev, shard_idx)) => dev.shards[shard_idx].put(key, value),

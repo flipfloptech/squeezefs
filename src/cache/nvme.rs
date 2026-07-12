@@ -1317,6 +1317,13 @@ impl NvmeStaging {
         self.get_cached_read_block(block_key)
     }
 
+    /// Cheap tier residency probe — index membership only, no payload
+    /// copy (§5.5 consume-time detector).
+    pub fn has_cached_read_block(&self, block_key: &str) -> bool {
+        self.read_nvme_cache
+            .contains(&Bytes::copy_from_slice(block_key.as_bytes()))
+    }
+
     /// Drop a read-cache entry for a block key. Called when the physical block
     /// behind the key is freed: block keys are offset strings, so the next
     /// allocation of that offset reuses the same key string and must never be

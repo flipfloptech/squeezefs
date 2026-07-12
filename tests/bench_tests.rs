@@ -13,9 +13,8 @@ use squeezefs::bench::{
     clamp_auto_threads, dataset_root, fill_block, mount_free_bytes, parse_size, phase_passes,
     resolve_shape, resolve_time_box, run_invocation, run_passes, run_phases, select_mode,
     suite_passes, validate_dataset, validate_shape, BenchError, BenchInvocation, BenchMode, Pass,
-    Phase, PhaseResult, Shape, AUTO_MIN_TOTAL_BYTES, AUTO_PER_THREAD_BYTES,
-    AUTO_TOTAL_FLOOR_BYTES, DEFAULT_BLOCK, DEFAULT_RAND_TIME_BOX_SECS, SUITE_RAND_BLOCK,
-    SUITE_SEQ_BLOCK,
+    Phase, PhaseResult, Shape, AUTO_MIN_TOTAL_BYTES, AUTO_PER_THREAD_BYTES, AUTO_TOTAL_FLOOR_BYTES,
+    DEFAULT_BLOCK, DEFAULT_RAND_TIME_BOX_SECS, SUITE_RAND_BLOCK, SUITE_SEQ_BLOCK,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -210,7 +209,7 @@ fn test_auto_total_caps_at_quarter_of_free_space() {
     // (so -s % -b == 0 holds for both the 1m and 4k suite passes).
     let total = auto_total_bytes(4, 40 * GIB + 123_456_789).expect("odd free");
     assert_eq!(total % MIB, 0, "auto totals must round down to 1 MiB");
-    assert!(total >= 10 * GIB && total < 10 * GIB + 32 * MIB);
+    assert!((10 * GIB..10 * GIB + 32 * MIB).contains(&total));
 }
 
 #[test]
@@ -233,7 +232,10 @@ fn test_auto_total_too_small_filesystem_is_loud() {
 
 #[test]
 fn test_auto_file_size_rounds_down_to_1mib() {
-    assert_eq!(auto_file_size(32 * GIB, 16, 1).expect("even split"), 2 * GIB);
+    assert_eq!(
+        auto_file_size(32 * GIB, 16, 1).expect("even split"),
+        2 * GIB
+    );
     assert_eq!(auto_file_size(16 * GIB, 4, 2).expect("files>1"), 2 * GIB);
     // Non-aligned per-file result rounds down to a 1 MiB multiple.
     assert_eq!(
@@ -290,8 +292,8 @@ fn test_resolve_shape_auto_defaults() {
     if free >= 68 * GIB {
         let r2 = resolve_shape(&base, Some(2), None, None, None).expect("auto size");
         assert!(r2.size_auto);
-        let expected = auto_file_size(auto_total_bytes(2, free).expect("total"), 2, 1)
-            .expect("per-file");
+        let expected =
+            auto_file_size(auto_total_bytes(2, free).expect("total"), 2, 1).expect("per-file");
         let diff = r2.size.abs_diff(expected);
         assert!(
             diff <= 64 * MIB,
@@ -352,15 +354,7 @@ fn test_suite_pass_sequence_and_shapes() {
 
     let seq: Vec<(Phase, u64, bool, Option<Duration>, bool)> = passes
         .iter()
-        .map(|p| {
-            (
-                p.phase,
-                p.shape.block,
-                p.shape.rand,
-                p.time_box,
-                p.validate,
-            )
-        })
+        .map(|p| (p.phase, p.shape.block, p.shape.rand, p.time_box, p.validate))
         .collect();
     let box30 = Some(Duration::from_secs(DEFAULT_RAND_TIME_BOX_SECS));
     assert_eq!(
@@ -1333,7 +1327,10 @@ fn test_cli_direct_unaligned_block_rejected() {
     assert!(!dataset_root(&base).exists());
     cleanup(&base);
 
-    // And the truly-unaligned block case trips the 4096 rule.
+    // And the truly-unaligned block case trips the 4096 rule (fresh
+    // scratch dir: the benchmark path must exist — path errors come
+    // before shape errors).
+    let base = scratch("cli_direct_4096");
     let out = Command::new(bin())
         .arg("bench")
         .arg(&base)

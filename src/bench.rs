@@ -224,29 +224,6 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
     Ok(bytes)
 }
 
-/// Map phase flags to the fixed execution order `write, read, stat, del`
-/// (regardless of flag order on the command line). No flags selects the
-/// default `write + read` set.
-pub fn select_phases(write: bool, read: bool, stat: bool, del: bool) -> Vec<Phase> {
-    if !write && !read && !stat && !del {
-        return vec![Phase::Write, Phase::Read];
-    }
-    let mut phases = Vec::new();
-    if write {
-        phases.push(Phase::Write);
-    }
-    if read {
-        phases.push(Phase::Read);
-    }
-    if stat {
-        phases.push(Phase::Stat);
-    }
-    if del {
-        phases.push(Phase::Del);
-    }
-    phases
-}
-
 /// Validate the shape before any phase runs: nonzero counts/sizes and the
 /// O_DIRECT alignment contract (`block % 4096 == 0`, `size % block == 0`).
 pub fn validate_shape(shape: &Shape) -> Result<(), BenchError> {
@@ -517,12 +494,14 @@ async fn write_worker(
     tid: usize,
     shape: Shape,
     pb: ProgressBar,
+    deadline: Option<Instant>,
 ) -> Result<WorkerOut, BenchError> {
     let nblocks = block_count(&shape);
     let mut out = WorkerOut::with_capacity((nblocks as usize).saturating_mul(shape.files));
     let dir = dataset_root(&mount).join(format!("t{tid}"));
     tokio::fs::create_dir_all(&dir).await?;
     let mut buf = AlignedBuf::new(shape.block as usize, shape.direct);
+    let mut expired = false;
     for fid in 0..shape.files {
         let path = bench_file_path(&mount, tid, fid);
         let mut file = open_options(Phase::Write, shape.direct).open(&path).await?;
@@ -541,12 +520,26 @@ async fn write_worker(
             out.ops += 1;
             out.bytes += len as u64;
             pb.inc(1);
+            // Time box: checked AFTER each op so every worker completes at
+            // least one operation (honest nonzero rows even under a zero
+            // box).
+            if let Some(d) = deadline {
+                if Instant::now() >= d {
+                    expired = true;
+                    break;
+                }
+            }
         }
         // -w is authoritative for the dataset shape: trim any stale tail
         // left by a previously larger dataset, then make it durable —
         // fsync is INSIDE the timed phase (honest durable write numbers).
+        // On time-box expiry this still runs for the file in flight, so a
+        // boxed overwrite pass leaves the dataset shape-valid.
         file.set_len(shape.size).await?;
         file.sync_all().await?;
+        if expired {
+            break;
+        }
     }
     Ok(out)
 }
@@ -556,11 +549,12 @@ async fn read_worker(
     tid: usize,
     shape: Shape,
     pb: ProgressBar,
+    deadline: Option<Instant>,
 ) -> Result<WorkerOut, BenchError> {
     let nblocks = block_count(&shape);
     let mut out = WorkerOut::with_capacity((nblocks as usize).saturating_mul(shape.files));
     let mut buf = AlignedBuf::new(shape.block as usize, shape.direct);
-    for fid in 0..shape.files {
+    'files: for fid in 0..shape.files {
         let path = bench_file_path(&mount, tid, fid);
         let mut file = open_options(Phase::Read, shape.direct).open(&path).await?;
         let mut pos = 0u64;
@@ -579,6 +573,13 @@ async fn read_worker(
             out.ops += 1;
             out.bytes += len as u64;
             pb.inc(1);
+            // Time box: checked AFTER each op — every worker completes at
+            // least one operation.
+            if let Some(d) = deadline {
+                if Instant::now() >= d {
+                    break 'files;
+                }
+            }
         }
     }
     Ok(out)
@@ -638,12 +639,29 @@ fn progress_style() -> ProgressStyle {
         .progress_chars("#>-")
 }
 
-async fn run_one_phase(
+/// Human descriptor of a pass for progress bars and table rows:
+/// data passes carry access + block ("Write seq 1m", "Read rand 4k"),
+/// metadata passes just the label.
+fn pass_desc(phase: Phase, block: u64, rand: bool) -> String {
+    if phase.moves_data() {
+        format!(
+            "{} {} {}",
+            phase.label(),
+            if rand { "rand" } else { "seq" },
+            fmt_size(block)
+        )
+    } else {
+        phase.label().to_string()
+    }
+}
+
+async fn run_one_pass(
     mount: &Path,
-    phase: Phase,
-    shape: &Shape,
+    pass: &Pass,
     mp: &MultiProgress,
 ) -> Result<PhaseResult, BenchError> {
+    let phase = pass.phase;
+    let shape = &pass.shape;
     let per_file_ops = if phase.moves_data() {
         block_count(shape)
     } else {
@@ -652,9 +670,12 @@ async fn run_one_phase(
     let total_ops = per_file_ops * (shape.threads as u64) * (shape.files as u64);
     let pb = mp.add(ProgressBar::new(total_ops));
     pb.set_style(progress_style());
-    pb.set_message(phase.label());
+    pb.set_message(pass_desc(phase, shape.block, shape.rand));
 
     let start = Instant::now();
+    // The wall-clock box starts with the pass clock; workers stop issuing
+    // ops once it expires (each worker still completes >= 1 op).
+    let deadline = pass.time_box.map(|d| start + d);
     let mut tasks = Vec::with_capacity(shape.threads);
     for tid in 0..shape.threads {
         let mount = mount.to_path_buf();
@@ -662,8 +683,8 @@ async fn run_one_phase(
         let pb = pb.clone();
         tasks.push(tokio::spawn(async move {
             match phase {
-                Phase::Write => write_worker(mount, tid, shape, pb).await,
-                Phase::Read => read_worker(mount, tid, shape, pb).await,
+                Phase::Write => write_worker(mount, tid, shape, pb, deadline).await,
+                Phase::Read => read_worker(mount, tid, shape, pb, deadline).await,
                 Phase::Stat => stat_worker(mount, tid, shape, pb).await,
                 Phase::Del => del_worker(mount, tid, shape, pb).await,
             }
@@ -680,7 +701,10 @@ async fn run_one_phase(
         lat_ns.extend(out.lat_ns);
     }
     let elapsed = start.elapsed();
-    pb.finish_with_message(format!("{} done", phase.label()));
+    pb.finish_with_message(format!(
+        "{} done",
+        pass_desc(phase, shape.block, shape.rand)
+    ));
 
     if phase == Phase::Del {
         // Cleanup bookkeeping OUTSIDE the timed region: the timed ops are
@@ -701,7 +725,7 @@ async fn run_one_phase(
         block: shape.block,
         rand: shape.rand,
         direct: shape.direct,
-        time_box: None,
+        time_box: pass.time_box,
         expected_ops: total_ops,
         ops,
         bytes,
@@ -731,8 +755,23 @@ pub enum BenchMode {
 /// saturation suite (the old write+read default is gone); any flags run
 /// exactly those phases in the fixed order write, read, stat, del.
 pub fn select_mode(write: bool, read: bool, stat: bool, del: bool) -> BenchMode {
-    let _ = (write, read, stat, del);
-    todo!("auto-saturation bench not implemented yet")
+    if !write && !read && !stat && !del {
+        return BenchMode::Suite;
+    }
+    let mut phases = Vec::new();
+    if write {
+        phases.push(Phase::Write);
+    }
+    if read {
+        phases.push(Phase::Read);
+    }
+    if stat {
+        phases.push(Phase::Stat);
+    }
+    if del {
+        phases.push(Phase::Del);
+    }
+    BenchMode::Phases(phases)
 }
 
 /// The resolved (auto or explicit) run shape, with provenance markers so
@@ -760,8 +799,7 @@ pub struct ResolvedShape {
 
 /// Auto worker count: `min(available, 16)`, at least 1.
 pub fn clamp_auto_threads(available: usize) -> usize {
-    let _ = available;
-    todo!("auto-saturation bench not implemented yet")
+    available.clamp(1, AUTO_THREADS_CAP)
 }
 
 /// Auto total dataset size: `max(16 GiB, 2 GiB × threads)`, capped at 25%
@@ -769,23 +807,64 @@ pub fn clamp_auto_threads(available: usize) -> usize {
 /// Loud error when even [`AUTO_MIN_TOTAL_BYTES`] (4 GiB) does not fit
 /// under the cap.
 pub fn auto_total_bytes(threads: usize, free_bytes: u64) -> Result<u64, BenchError> {
-    let _ = (threads, free_bytes);
-    todo!("auto-saturation bench not implemented yet")
+    let desired = AUTO_TOTAL_FLOOR_BYTES.max(AUTO_PER_THREAD_BYTES.saturating_mul(threads as u64));
+    let cap = (free_bytes / 4) / AUTO_SIZE_ROUND_BYTES * AUTO_SIZE_ROUND_BYTES;
+    let total = desired.min(cap);
+    if total < AUTO_MIN_TOTAL_BYTES {
+        return Err(BenchError::Shape(format!(
+            "auto-sizing refused: the filesystem has {} free and the bench caps its dataset \
+             at 25% of free space ({} here), but even the 4 GiB minimum total does not fit. \
+             Free up space or pass an explicit -s (and optionally -t/-n) sized for this \
+             filesystem.",
+            fmt_size(free_bytes),
+            fmt_size(cap),
+        )));
+    }
+    Ok(total)
 }
 
 /// Per-file size from a total: `total / (threads × files)` rounded down to
 /// a 1 MiB multiple (so `-s % -b == 0` holds for both suite block sizes).
 /// Loud error when that rounds to zero.
 pub fn auto_file_size(total: u64, threads: usize, files: usize) -> Result<u64, BenchError> {
-    let _ = (total, threads, files);
-    todo!("auto-saturation bench not implemented yet")
+    let file_count = (threads as u64).saturating_mul(files as u64);
+    if file_count == 0 {
+        return Err(BenchError::Shape(
+            "--threads and --files must be >= 1".to_string(),
+        ));
+    }
+    let per_file = total / file_count / AUTO_SIZE_ROUND_BYTES * AUTO_SIZE_ROUND_BYTES;
+    if per_file == 0 {
+        return Err(BenchError::Shape(format!(
+            "auto-sizing refused: {} total across {} file(s) leaves less than the 1 MiB \
+             per-file rounding floor (auto sizes stay 1 MiB multiples so -s divides both \
+             suite block sizes). Pass an explicit -s, or lower -t/-n.",
+            fmt_size(total),
+            file_count,
+        )));
+    }
+    Ok(per_file)
 }
 
 /// Free space (bytes available to unprivileged users) on the filesystem
 /// holding `path`, via statvfs.
 pub fn mount_free_bytes(path: &Path) -> Result<u64, BenchError> {
-    let _ = path;
-    todo!("auto-saturation bench not implemented yet")
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        BenchError::Shape(format!(
+            "path {} contains an interior NUL byte",
+            path.display()
+        ))
+    })?;
+    // SAFETY: `stat` is a plain-old-data out-param zeroed before the call;
+    // `c_path` is a valid NUL-terminated C string that outlives the call.
+    // statvfs writes the struct only on success (rc == 0).
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return Err(BenchError::Io(std::io::Error::last_os_error()));
+    }
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
 /// Resolve explicit flags + auto defaults into a concrete run shape.
@@ -797,16 +876,49 @@ pub fn resolve_shape(
     size: Option<u64>,
     block: Option<u64>,
 ) -> Result<ResolvedShape, BenchError> {
-    let _ = (mount, threads, files, size, block);
-    todo!("auto-saturation bench not implemented yet")
+    let threads_auto = threads.is_none();
+    let resolved_threads = threads.unwrap_or_else(|| {
+        clamp_auto_threads(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        )
+    });
+    let files_auto = files.is_none();
+    let resolved_files = files.unwrap_or(1);
+    let block_auto = block.is_none();
+    let resolved_block = block.unwrap_or(DEFAULT_BLOCK);
+    let size_auto = size.is_none();
+    let resolved_size = match size {
+        Some(s) => s,
+        None => {
+            let free = mount_free_bytes(mount)?;
+            let total = auto_total_bytes(resolved_threads, free)?;
+            auto_file_size(total, resolved_threads, resolved_files)?
+        }
+    };
+    Ok(ResolvedShape {
+        threads: resolved_threads,
+        files: resolved_files,
+        size: resolved_size,
+        block: resolved_block,
+        threads_auto,
+        files_auto,
+        size_auto,
+        block_auto,
+    })
 }
 
 /// Resolve `--time` into a per-pass wall-clock box: explicit `N` caps the
 /// pass at N seconds, explicit `0` forces full coverage, and the default
 /// is 30 s for random passes / unlimited (full coverage) for sequential.
 pub fn resolve_time_box(time: Option<u64>, rand: bool) -> Option<Duration> {
-    let _ = (time, rand);
-    todo!("auto-saturation bench not implemented yet")
+    match time {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None if rand => Some(Duration::from_secs(DEFAULT_RAND_TIME_BOX_SECS)),
+        None => None,
+    }
 }
 
 /// One executable pass: a phase plus the concrete shape, wall-clock box
@@ -833,8 +945,62 @@ pub struct Pass {
 /// coverage); sequential passes always run to completion — the dataset
 /// lifecycle depends on it.
 pub fn suite_passes(threads: usize, files: usize, size: u64, time: Option<u64>) -> Vec<Pass> {
-    let _ = (threads, files, size, time);
-    todo!("auto-saturation bench not implemented yet")
+    let io_shape = |block: u64, rand: bool| Shape {
+        threads,
+        files,
+        size,
+        block,
+        rand,
+        direct: true,
+    };
+    // Stat/del never open data-path fds; keep their shape access-neutral.
+    let meta_shape = Shape {
+        threads,
+        files,
+        size,
+        block: SUITE_SEQ_BLOCK,
+        rand: false,
+        direct: false,
+    };
+    let rand_box = resolve_time_box(time, true);
+    vec![
+        Pass {
+            phase: Phase::Write,
+            shape: io_shape(SUITE_SEQ_BLOCK, false),
+            time_box: None,
+            validate: false,
+        },
+        Pass {
+            phase: Phase::Read,
+            shape: io_shape(SUITE_SEQ_BLOCK, false),
+            time_box: None,
+            validate: true,
+        },
+        Pass {
+            phase: Phase::Read,
+            shape: io_shape(SUITE_RAND_BLOCK, true),
+            time_box: rand_box,
+            validate: true,
+        },
+        Pass {
+            phase: Phase::Write,
+            shape: io_shape(SUITE_RAND_BLOCK, true),
+            time_box: rand_box,
+            validate: true,
+        },
+        Pass {
+            phase: Phase::Stat,
+            shape: meta_shape.clone(),
+            time_box: None,
+            validate: true,
+        },
+        Pass {
+            phase: Phase::Del,
+            shape: meta_shape,
+            time_box: None,
+            validate: true,
+        },
+    ]
 }
 
 /// Explicit phase flags → passes in the fixed order, all sharing `shape`.
@@ -842,15 +1008,38 @@ pub fn suite_passes(threads: usize, files: usize, size: u64, time: Option<u64>) 
 /// set lacks [`Phase::Write`] the first pass validates the dataset before
 /// any timing (exactly the old `-r` semantics).
 pub fn phase_passes(phases: &[Phase], shape: &Shape, time: Option<u64>) -> Vec<Pass> {
-    let _ = (phases, shape, time);
-    todo!("auto-saturation bench not implemented yet")
+    let has_write = phases.contains(&Phase::Write);
+    phases
+        .iter()
+        .enumerate()
+        .map(|(i, &phase)| Pass {
+            phase,
+            shape: shape.clone(),
+            time_box: if phase.moves_data() {
+                resolve_time_box(time, shape.rand)
+            } else {
+                None
+            },
+            validate: i == 0 && !has_write,
+        })
+        .collect()
 }
 
 /// Execute a prepared pass sequence. All passes must share the dataset
 /// fields (threads/files/size); block/rand/direct/time may vary per pass.
+/// Pass validation (found-vs-expected, never creating) happens BEFORE that
+/// pass's timing starts.
 pub async fn run_passes(mount: &Path, passes: &[Pass]) -> Result<BenchReport, BenchError> {
-    let _ = (mount, passes);
-    todo!("auto-saturation bench not implemented yet")
+    let mp = MultiProgress::new();
+    let mut report = BenchReport::default();
+    for pass in passes {
+        validate_shape(&pass.shape)?;
+        if pass.validate {
+            validate_dataset(mount, &pass.shape)?;
+        }
+        report.phases.push(run_one_pass(mount, pass, &mp).await?);
+    }
+    Ok(report)
 }
 
 /// A parsed `squeezefs bench` command line: phase flags, optional shape
@@ -886,37 +1075,17 @@ pub struct BenchInvocation {
     pub iterations: usize,
 }
 
-/// CLI entry point: resolves mode + auto shape, prints the loud header
-/// (with auto-vs-explicit provenance), then runs `iterations` repetitions
-/// of the selected pass set with per-iteration results table and daemon
-/// `.stats` metrics delta.
-pub async fn run_invocation(mount: &Path, inv: &BenchInvocation) -> Result<(), BenchError> {
-    let _ = (mount, inv);
-    todo!("auto-saturation bench not implemented yet")
-}
-
 /// Execute one iteration of the given phases (already in fixed order) over
 /// `mount` with `shape`. When the set does not include [`Phase::Write`],
 /// the existing dataset is validated against the shape before any timing.
+/// Read/write passes inherit the default time boxes (30 s for `--rand`,
+/// unlimited for sequential) — see [`resolve_time_box`].
 pub async fn run_phases(
     mount: &Path,
     phases: &[Phase],
     shape: &Shape,
 ) -> Result<BenchReport, BenchError> {
-    validate_shape(shape)?;
-    if !phases.contains(&Phase::Write) && !phases.is_empty() {
-        // Reusing a dataset from an earlier -w: its shape must match
-        // BEFORE any timing starts. Never silently create files here.
-        validate_dataset(mount, shape)?;
-    }
-    let mp = MultiProgress::new();
-    let mut report = BenchReport::default();
-    for &phase in phases {
-        report
-            .phases
-            .push(run_one_phase(mount, phase, shape, &mp).await?);
-    }
-    Ok(report)
+    run_passes(mount, &phase_passes(phases, shape, None)).await
 }
 
 /// Snapshot the daemon metric counters from the mount's virtual `.stats`
@@ -1034,42 +1203,110 @@ fn fmt_latency(d: Duration) -> String {
     }
 }
 
-/// Print the effective shape line (replaces the old canned-workload
-/// header).
-fn print_shape_header(mount: &Path, phases: &[Phase], shape: &Shape, iterations: usize) {
-    let phase_list = phases
-        .iter()
-        .map(|p| p.label().to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(",");
+/// `(auto)` / `(explicit)` provenance marker for the header.
+fn mark(auto: bool) -> &'static str {
+    if auto {
+        "(auto)"
+    } else {
+        "(explicit)"
+    }
+}
+
+fn fmt_time_box(b: Option<Duration>) -> String {
+    match b {
+        Some(d) => format!("{}s", d.as_secs()),
+        None => "none (full coverage)".to_string(),
+    }
+}
+
+/// Print the loud effective-shape header: mode, computed shape with
+/// auto-vs-explicit provenance, per-pass access/io/time-box facts.
+fn print_header(mount: &Path, mode: &BenchMode, resolved: &ResolvedShape, inv: &BenchInvocation) {
     let sep = "==================================================================================";
     println!("{}", sep.bold());
-    println!(
-        "  SqueezeFS Bench @ {} — phases: {}",
-        mount.display(),
-        phase_list
-    );
-    println!(
-        "  threads={} files/thread={} size={} ({} B) block={} ({} B) access={} io={} iterations={}",
-        shape.threads,
-        shape.files,
-        fmt_size(shape.size),
-        shape.size,
-        fmt_size(shape.block),
-        shape.block,
-        if shape.rand { "rand" } else { "seq" },
-        if shape.direct { "direct" } else { "buffered" },
-        iterations
-    );
+    match mode {
+        BenchMode::Suite => {
+            println!(
+                "  SqueezeFS Bench @ {} — FULL SATURATION SUITE",
+                mount.display()
+            );
+            println!(
+                "  passes: write seq {seq} -> read seq {seq} -> read rand {rnd} -> write rand {rnd} -> stat -> del (I/O passes O_DIRECT)",
+                seq = fmt_size(SUITE_SEQ_BLOCK),
+                rnd = fmt_size(SUITE_RAND_BLOCK),
+            );
+            println!(
+                "  threads={} {} files/thread={} {} size={}/file ({} B; total {}) {}",
+                resolved.threads,
+                mark(resolved.threads_auto),
+                resolved.files,
+                mark(resolved.files_auto),
+                fmt_size(resolved.size),
+                resolved.size,
+                fmt_size(resolved.size * resolved.threads as u64 * resolved.files as u64),
+                mark(resolved.size_auto),
+            );
+            println!(
+                "  block=1m seq / 4k rand (suite) io=direct (suite) rand time-box={} {} iterations={}",
+                fmt_time_box(resolve_time_box(inv.time, true)),
+                mark(inv.time.is_none()),
+                inv.iterations
+            );
+        }
+        BenchMode::Phases(phases) => {
+            let phase_list = phases
+                .iter()
+                .map(|p| p.label().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "  SqueezeFS Bench @ {} — phases: {}",
+                mount.display(),
+                phase_list
+            );
+            println!(
+                "  threads={} {} files/thread={} {} size={} ({} B) {} block={} ({} B) {}",
+                resolved.threads,
+                mark(resolved.threads_auto),
+                resolved.files,
+                mark(resolved.files_auto),
+                fmt_size(resolved.size),
+                resolved.size,
+                mark(resolved.size_auto),
+                fmt_size(resolved.block),
+                resolved.block,
+                mark(resolved.block_auto),
+            );
+            println!(
+                "  access={} io={} time-box={} {} iterations={}",
+                if inv.rand { "rand" } else { "seq" },
+                if inv.direct { "direct" } else { "buffered" },
+                fmt_time_box(resolve_time_box(inv.time, inv.rand)),
+                mark(inv.time.is_none()),
+                inv.iterations
+            );
+        }
+    }
     println!("{}", sep.bold());
 }
 
+fn fmt_coverage(res: &PhaseResult) -> String {
+    let pct = res.coverage() * 100.0;
+    if pct >= 99.95 {
+        "100%".to_string()
+    } else if pct >= 10.0 {
+        format!("{pct:.0}%")
+    } else {
+        format!("{pct:.1}%")
+    }
+}
+
 fn print_report(report: &BenchReport) {
-    let hline = "+--------+------------------+------------------+------------+------------+------------+------------+";
+    let hline = "+------------------+------------------+------------------+------+------------+------------+------------+------------+";
     println!("\n{}", hline.bold());
     println!(
-        "| {:<6} | {:<16} | {:<16} | {:<10} | {:<10} | {:<10} | {:<10} |",
-        "PHASE", "THROUGHPUT", "IOPS", "LAT MIN", "LAT AVG", "LAT P99", "LAT MAX"
+        "| {:<16} | {:<16} | {:<16} | {:<4} | {:<10} | {:<10} | {:<10} | {:<10} |",
+        "PASS", "THROUGHPUT", "IOPS", "COV", "LAT MIN", "LAT AVG", "LAT P99", "LAT MAX"
     );
     println!("{}", hline.bold());
     for res in &report.phases {
@@ -1104,10 +1341,11 @@ fn print_report(report: &BenchReport) {
             iops_s.red()
         };
         println!(
-            "| {:<6} | {:>16} | {:>16} | {:>10} | {:>10} | {:>10} | {:>10} |",
-            res.phase.label(),
+            "| {:<16} | {:>16} | {:>16} | {:>4} | {:>10} | {:>10} | {:>10} | {:>10} |",
+            pass_desc(res.phase, res.block, res.rand),
             tput_str,
             iops_str,
+            fmt_coverage(res),
             fmt_latency(res.lat_min),
             fmt_latency(res.lat_avg),
             fmt_latency(res.lat_p99),
@@ -1115,6 +1353,18 @@ fn print_report(report: &BenchReport) {
         );
     }
     println!("{}", hline.bold());
+    for res in &report.phases {
+        if res.coverage() < 1.0 - f64::EPSILON {
+            println!(
+                "  note: {} covered {} of {} ops ({}) — wall-clock time box {}",
+                pass_desc(res.phase, res.block, res.rand),
+                res.ops,
+                res.expected_ops,
+                fmt_coverage(res),
+                fmt_time_box(res.time_box),
+            );
+        }
+    }
 }
 
 fn print_metrics_delta(base: Option<HashMap<String, u64>>, post: Option<HashMap<String, u64>>) {
@@ -1158,19 +1408,38 @@ fn print_metrics_delta(base: Option<HashMap<String, u64>>, post: Option<HashMap<
     }
 }
 
-/// CLI entry point: mount detection warnings, `iterations` repetitions of
-/// the phase set (fresh timing each), per-iteration results table and
-/// daemon `.stats` metrics delta.
-pub async fn run_cli(
-    mount: &Path,
-    phases: &[Phase],
-    shape: &Shape,
-    iterations: usize,
-) -> Result<(), BenchError> {
-    if iterations == 0 {
+/// CLI entry point behind [`BenchInvocation`]: resolves the mode and the
+/// (auto or explicit) shape, prints the loud provenance header, then runs
+/// `iterations` repetitions of the selected pass set — the full
+/// saturation suite for a bare invocation, the explicit phases otherwise
+/// — with a per-iteration results table and daemon `.stats` metrics
+/// delta.
+pub async fn run_invocation(mount: &Path, inv: &BenchInvocation) -> Result<(), BenchError> {
+    if inv.iterations == 0 {
         return Err(BenchError::Shape("--iterations must be >= 1".to_string()));
     }
-    validate_shape(shape)?;
+    let mode = select_mode(inv.write, inv.read, inv.stat, inv.del);
+    if mode == BenchMode::Suite {
+        // The suite fixes per-pass access and block sizes (1m seq + 4k
+        // rand); a shape override that cannot apply is a loud error, never
+        // a silent ignore.
+        if inv.block.is_some() {
+            return Err(BenchError::Shape(
+                "-b applies to explicit phase runs; the bare invocation runs the fixed \
+                 saturation suite (1m seq + 4k rand passes). Select phases \
+                 (-w/-r/--stat/--del) to use -b."
+                    .to_string(),
+            ));
+        }
+        if inv.rand {
+            return Err(BenchError::Shape(
+                "--rand applies to explicit phase runs; the bare invocation runs the fixed \
+                 saturation suite (which already includes rand 4k passes). Select phases \
+                 (-w/-r/--stat/--del) to use --rand."
+                    .to_string(),
+            ));
+        }
+    }
 
     if let Err(e) = std::fs::metadata(mount) {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -1186,19 +1455,40 @@ pub async fn run_cli(
         )));
     }
 
-    warn_if_not_squeezefs_mount(mount);
-    print_shape_header(mount, phases, shape, iterations);
+    let resolved = resolve_shape(mount, inv.threads, inv.files, inv.size, inv.block)?;
+    let passes = match &mode {
+        BenchMode::Suite => suite_passes(resolved.threads, resolved.files, resolved.size, inv.time),
+        BenchMode::Phases(phases) => {
+            let shape = Shape {
+                threads: resolved.threads,
+                files: resolved.files,
+                size: resolved.size,
+                block: resolved.block,
+                rand: inv.rand,
+                direct: inv.direct,
+            };
+            phase_passes(phases, &shape, inv.time)
+        }
+    };
+    // Fail loud on shape/alignment problems before any warning noise or
+    // timing.
+    for pass in &passes {
+        validate_shape(&pass.shape)?;
+    }
 
-    for iter in 1..=iterations {
-        if iterations > 1 {
-            println!("\n--- Benchmark Iteration {iter}/{iterations} ---");
+    warn_if_not_squeezefs_mount(mount);
+    print_header(mount, &mode, &resolved, inv);
+
+    for iter in 1..=inv.iterations {
+        if inv.iterations > 1 {
+            println!("\n--- Benchmark Iteration {iter}/{}---", inv.iterations);
         }
         // Daemon metrics come straight from `.stats`; don't gate them on
         // the `.config`-based mount detection. A readable/parseable
         // `.stats` is sufficient, so metrics still show even when
         // `.config` is momentarily unreadable.
         let baseline = get_daemon_metrics_from_stats(mount);
-        let report = run_phases(mount, phases, shape).await?;
+        let report = run_passes(mount, &passes).await?;
         let post = get_daemon_metrics_from_stats(mount);
         print_report(&report);
         print_metrics_delta(baseline, post);

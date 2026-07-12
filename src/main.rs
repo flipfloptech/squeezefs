@@ -272,10 +272,15 @@ enum Commands {
         #[arg(long, short = 'f')]
         force: bool,
     },
-    /// Benchmark a mounted filesystem: explicit phases (write/read/stat/del)
-    /// over a persistent, reusable dataset at <MOUNTPOINT>/squeezefs-bench
-    /// (simplified-elbencho model). Phases always execute in the fixed order
-    /// write, read, stat, del; with no phase flags the default is write+read.
+    /// Benchmark a mounted filesystem over a persistent, reusable dataset at
+    /// <MOUNTPOINT>/squeezefs-bench (simplified-elbencho model). A BARE
+    /// invocation (no phase flags) runs the full saturation suite over one
+    /// auto-sized dataset: write seq 1m --direct, read seq 1m --direct, read
+    /// rand 4k --direct (30s box), write rand 4k --direct (30s box), stat,
+    /// del (leaves the mount clean). Explicit phase flags run exactly those
+    /// phases in the fixed order write, read, stat, del, with the same auto
+    /// defaults for -t/-n/-s so single-phase numbers stay comparable to the
+    /// suite passes.
     Bench {
         /// Path to the mounted filesystem directory
         mountpoint: PathBuf,
@@ -295,26 +300,37 @@ enum Commands {
         #[arg(long)]
         del: bool,
         /// Number of worker threads (worker t owns squeezefs-bench/t{t}/)
-        #[arg(short = 't', long, default_value_t = 1)]
-        threads: usize,
-        /// Files per thread
-        #[arg(short = 'n', long, default_value_t = 1)]
-        files: usize,
+        /// [default: auto = min(CPUs, 16)]
+        #[arg(short = 't', long)]
+        threads: Option<usize>,
+        /// Files per thread [default: auto = 1]
+        #[arg(short = 'n', long)]
+        files: Option<usize>,
         /// File size — human units 4k / 128k / 4m / 10g, or plain bytes
-        #[arg(short = 's', long, default_value = "1g", value_parser = squeezefs::bench::parse_size)]
-        size: u64,
-        /// I/O block size per operation, same units
-        #[arg(short = 'b', long, default_value = "1m", value_parser = squeezefs::bench::parse_size)]
-        block: u64,
+        /// [default: auto-sized — total max(16g, 2g x threads), capped at 25%
+        /// of the mountpoint's free space, rounded down to 1 MiB]
+        #[arg(short = 's', long, value_parser = squeezefs::bench::parse_size)]
+        size: Option<u64>,
+        /// I/O block size per operation, same units — explicit phase runs
+        /// only; the suite fixes 1m seq / 4k rand [default: 1m]
+        #[arg(short = 'b', long, value_parser = squeezefs::bench::parse_size)]
+        block: Option<u64>,
         /// Random offsets: shuffled full-coverage block list (every block
-        /// exactly once)
+        /// exactly once) — explicit phase runs only
         #[arg(long)]
         rand: bool,
         /// O_DIRECT I/O — requires -b to be a multiple of 4096 and -s to be a
-        /// multiple of -b (loud errors otherwise)
+        /// multiple of -b (loud errors otherwise). The suite's I/O passes are
+        /// always O_DIRECT.
         #[arg(long)]
         direct: bool,
-        /// Repeat the selected phase set N times (fresh timing each
+        /// Wall-clock time box in seconds for rand read/write passes
+        /// [default: 30 for --rand, unlimited (full coverage) for
+        /// sequential; 0 = force full coverage]. Partial coverage is stated
+        /// in the results row.
+        #[arg(long)]
+        time: Option<u64>,
+        /// Repeat the selected pass set N times (fresh timing each
         /// iteration; write iterations overwrite the dataset in place)
         #[arg(short = 'i', long, default_value_t = 1)]
         iterations: usize,
@@ -2471,18 +2487,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             block,
             rand,
             direct,
+            time,
             iterations,
         } => {
-            let phases = squeezefs::bench::select_phases(write, read, stat, del);
-            let shape = squeezefs::bench::Shape {
+            let inv = squeezefs::bench::BenchInvocation {
+                write,
+                read,
+                stat,
+                del,
                 threads,
                 files,
                 size,
                 block,
                 rand,
                 direct,
+                time,
+                iterations,
             };
-            squeezefs::bench::run_cli(&mountpoint, &phases, &shape, iterations).await?;
+            squeezefs::bench::run_invocation(&mountpoint, &inv).await?;
         }
         Commands::Clone {
             meta_uri: _,

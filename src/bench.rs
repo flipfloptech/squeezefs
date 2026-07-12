@@ -31,6 +31,28 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 /// bench dataset.
 const DATASET_DIR: &str = "squeezefs-bench";
 
+/// Auto-shape: worker-count cap (`threads = min(available_parallelism, 16)`).
+pub const AUTO_THREADS_CAP: usize = 16;
+/// Auto-shape: dataset floor — total = max(16 GiB, 2 GiB × threads).
+pub const AUTO_TOTAL_FLOOR_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Auto-shape: per-thread dataset contribution (2 GiB × threads).
+pub const AUTO_PER_THREAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Auto-shape: hard minimum — if even 4 GiB total does not fit under the
+/// free-space cap, auto-sizing fails loudly.
+pub const AUTO_MIN_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Auto sizes round down to 1 MiB so `-s % -b == 0` holds for BOTH suite
+/// block sizes (1 MiB seq and 4 KiB rand; 4k divides 1m).
+pub const AUTO_SIZE_ROUND_BYTES: u64 = 1024 * 1024;
+/// The saturation suite's sequential-pass I/O block size.
+pub const SUITE_SEQ_BLOCK: u64 = 1024 * 1024;
+/// The saturation suite's random-pass I/O block size.
+pub const SUITE_RAND_BLOCK: u64 = 4096;
+/// Default wall-clock time box for `--rand` read/write passes (seconds);
+/// sequential passes run to full coverage unless `--time` says otherwise.
+pub const DEFAULT_RAND_TIME_BOX_SECS: u64 = 30;
+/// Default I/O block size for explicit phase invocations without `-b`.
+pub const DEFAULT_BLOCK: u64 = 1024 * 1024;
+
 /// Errors surfaced by the bench engine. All are loud and fatal — the
 /// engine never silently repairs a shape/dataset mismatch.
 #[derive(Debug, thiserror::Error)]
@@ -99,11 +121,23 @@ pub struct Shape {
     pub direct: bool,
 }
 
-/// Timed result of one phase (aggregated across all workers).
+/// Timed result of one pass (aggregated across all workers).
 #[derive(Debug, Clone)]
 pub struct PhaseResult {
     /// Which phase this row measures.
     pub phase: Phase,
+    /// I/O block size this pass ran with.
+    pub block: u64,
+    /// Whether the pass used random (shuffled full-coverage) offsets.
+    pub rand: bool,
+    /// Whether the pass used O_DIRECT.
+    pub direct: bool,
+    /// Wall-clock time box the pass ran under (None = full coverage).
+    pub time_box: Option<Duration>,
+    /// Operations the full-coverage pass would perform; `ops < expected_ops`
+    /// means the time box expired first (partial coverage — stated in the
+    /// results row).
+    pub expected_ops: u64,
     /// Total operations across all workers.
     pub ops: u64,
     /// Total bytes moved (0 for stat/del).
@@ -138,6 +172,15 @@ impl PhaseResult {
             return 0.0;
         }
         self.ops as f64 / secs
+    }
+
+    /// Fraction of the full-coverage op count this pass completed
+    /// (1.0 unless a time box expired first).
+    pub fn coverage(&self) -> f64 {
+        if self.expected_ops == 0 {
+            return 1.0;
+        }
+        self.ops as f64 / self.expected_ops as f64
     }
 }
 
@@ -655,6 +698,11 @@ async fn run_one_phase(
     };
     Ok(PhaseResult {
         phase,
+        block: shape.block,
+        rand: shape.rand,
+        direct: shape.direct,
+        time_box: None,
+        expected_ops: total_ops,
         ops,
         bytes,
         elapsed,
@@ -663,6 +711,188 @@ async fn run_one_phase(
         lat_p99: Duration::from_nanos(percentile_ns(&lat_ns, 99.0)),
         lat_max: Duration::from_nanos(lat_ns.last().copied().unwrap_or(0)),
     })
+}
+
+/// What a `squeezefs bench` invocation runs: the full saturation suite
+/// (bare invocation — no phase flags) or an explicit phase set in the
+/// fixed order write, read, stat, del.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BenchMode {
+    /// Bare invocation: the full saturation suite over one auto-sized
+    /// dataset — write seq 1m → read seq 1m → read rand 4k (time-boxed)
+    /// → write rand 4k (time-boxed) → stat → del. All I/O passes
+    /// O_DIRECT.
+    Suite,
+    /// Explicit phase flags, fixed order.
+    Phases(Vec<Phase>),
+}
+
+/// Map phase flags to a [`BenchMode`]: no flags selects the full
+/// saturation suite (the old write+read default is gone); any flags run
+/// exactly those phases in the fixed order write, read, stat, del.
+pub fn select_mode(write: bool, read: bool, stat: bool, del: bool) -> BenchMode {
+    let _ = (write, read, stat, del);
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// The resolved (auto or explicit) run shape, with provenance markers so
+/// the header can state which values were auto-sized.
+#[derive(Debug, Clone)]
+pub struct ResolvedShape {
+    /// Worker count.
+    pub threads: usize,
+    /// Files per thread.
+    pub files: usize,
+    /// Per-file size in bytes.
+    pub size: u64,
+    /// I/O block size for explicit phase runs (the suite fixes its own
+    /// per-pass block sizes).
+    pub block: u64,
+    /// `--threads` was auto-sized (not given on the command line).
+    pub threads_auto: bool,
+    /// `--files` was auto-sized.
+    pub files_auto: bool,
+    /// `--size` was auto-sized (statfs-derived).
+    pub size_auto: bool,
+    /// `--block` was defaulted.
+    pub block_auto: bool,
+}
+
+/// Auto worker count: `min(available, 16)`, at least 1.
+pub fn clamp_auto_threads(available: usize) -> usize {
+    let _ = available;
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// Auto total dataset size: `max(16 GiB, 2 GiB × threads)`, capped at 25%
+/// of the filesystem's free space and rounded down to a 1 MiB multiple.
+/// Loud error when even [`AUTO_MIN_TOTAL_BYTES`] (4 GiB) does not fit
+/// under the cap.
+pub fn auto_total_bytes(threads: usize, free_bytes: u64) -> Result<u64, BenchError> {
+    let _ = (threads, free_bytes);
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// Per-file size from a total: `total / (threads × files)` rounded down to
+/// a 1 MiB multiple (so `-s % -b == 0` holds for both suite block sizes).
+/// Loud error when that rounds to zero.
+pub fn auto_file_size(total: u64, threads: usize, files: usize) -> Result<u64, BenchError> {
+    let _ = (total, threads, files);
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// Free space (bytes available to unprivileged users) on the filesystem
+/// holding `path`, via statvfs.
+pub fn mount_free_bytes(path: &Path) -> Result<u64, BenchError> {
+    let _ = path;
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// Resolve explicit flags + auto defaults into a concrete run shape.
+/// statvfs is consulted only when `-s` was not given.
+pub fn resolve_shape(
+    mount: &Path,
+    threads: Option<usize>,
+    files: Option<usize>,
+    size: Option<u64>,
+    block: Option<u64>,
+) -> Result<ResolvedShape, BenchError> {
+    let _ = (mount, threads, files, size, block);
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// Resolve `--time` into a per-pass wall-clock box: explicit `N` caps the
+/// pass at N seconds, explicit `0` forces full coverage, and the default
+/// is 30 s for random passes / unlimited (full coverage) for sequential.
+pub fn resolve_time_box(time: Option<u64>, rand: bool) -> Option<Duration> {
+    let _ = (time, rand);
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// One executable pass: a phase plus the concrete shape, wall-clock box
+/// and validate-before-timing flag it runs under.
+#[derive(Debug, Clone)]
+pub struct Pass {
+    /// Which phase to run.
+    pub phase: Phase,
+    /// Concrete shape for this pass (dataset fields must match across the
+    /// passes of one run; block/rand/direct may vary per pass).
+    pub shape: Shape,
+    /// Wall-clock time box (None = full coverage). Only read/write passes
+    /// are boxed; stat/del always complete.
+    pub time_box: Option<Duration>,
+    /// Validate the existing dataset against the shape before this pass
+    /// (never creates anything).
+    pub validate: bool,
+}
+
+/// The full saturation suite over one dataset (threads × files × size):
+/// write seq 1m direct → read seq 1m direct → read rand 4k direct
+/// (time-boxed) → write rand 4k direct (time-boxed) → stat → del.
+/// `time` overrides the rand passes' 30 s default box (`0` = full
+/// coverage); sequential passes always run to completion — the dataset
+/// lifecycle depends on it.
+pub fn suite_passes(threads: usize, files: usize, size: u64, time: Option<u64>) -> Vec<Pass> {
+    let _ = (threads, files, size, time);
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// Explicit phase flags → passes in the fixed order, all sharing `shape`.
+/// Read/write passes get the `--time` box (rand default 30 s); when the
+/// set lacks [`Phase::Write`] the first pass validates the dataset before
+/// any timing (exactly the old `-r` semantics).
+pub fn phase_passes(phases: &[Phase], shape: &Shape, time: Option<u64>) -> Vec<Pass> {
+    let _ = (phases, shape, time);
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// Execute a prepared pass sequence. All passes must share the dataset
+/// fields (threads/files/size); block/rand/direct/time may vary per pass.
+pub async fn run_passes(mount: &Path, passes: &[Pass]) -> Result<BenchReport, BenchError> {
+    let _ = (mount, passes);
+    todo!("auto-saturation bench not implemented yet")
+}
+
+/// A parsed `squeezefs bench` command line: phase flags, optional shape
+/// overrides (None = auto), access/time modifiers, iterations.
+#[derive(Debug, Clone, Default)]
+pub struct BenchInvocation {
+    /// `-w`: write phase selected.
+    pub write: bool,
+    /// `-r`: read phase selected.
+    pub read: bool,
+    /// `--stat`: stat phase selected.
+    pub stat: bool,
+    /// `--del`: delete phase selected.
+    pub del: bool,
+    /// `-t` (None = auto: min(CPUs, 16)).
+    pub threads: Option<usize>,
+    /// `-n` (None = auto: 1).
+    pub files: Option<usize>,
+    /// `-s` in bytes (None = auto-sized from free space).
+    pub size: Option<u64>,
+    /// `-b` in bytes (None = 1m for explicit phases; suite fixes per-pass
+    /// sizes and refuses an explicit `-b`).
+    pub block: Option<u64>,
+    /// `--rand` (explicit phase runs only; the suite fixes per-pass
+    /// access and refuses the flag).
+    pub rand: bool,
+    /// `--direct` (suite I/O passes are always direct).
+    pub direct: bool,
+    /// `--time` seconds (None = default: 30 s rand / unlimited seq;
+    /// 0 = force full coverage).
+    pub time: Option<u64>,
+    /// `-i` repetitions of the selected set.
+    pub iterations: usize,
+}
+
+/// CLI entry point: resolves mode + auto shape, prints the loud header
+/// (with auto-vs-explicit provenance), then runs `iterations` repetitions
+/// of the selected pass set with per-iteration results table and daemon
+/// `.stats` metrics delta.
+pub async fn run_invocation(mount: &Path, inv: &BenchInvocation) -> Result<(), BenchError> {
+    let _ = (mount, inv);
+    todo!("auto-saturation bench not implemented yet")
 }
 
 /// Execute one iteration of the given phases (already in fixed order) over

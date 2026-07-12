@@ -9,13 +9,20 @@
 
 use rstest::rstest;
 use squeezefs::bench::{
-    bench_file_path, block_count, block_order, block_seed, dataset_root, fill_block, parse_size,
-    run_cli, run_phases, select_phases, validate_dataset, validate_shape, BenchError, Phase,
-    PhaseResult, Shape,
+    auto_file_size, auto_total_bytes, bench_file_path, block_count, block_order, block_seed,
+    clamp_auto_threads, dataset_root, fill_block, mount_free_bytes, parse_size, phase_passes,
+    resolve_shape, resolve_time_box, run_invocation, run_passes, run_phases, select_mode,
+    suite_passes, validate_dataset, validate_shape, BenchError, BenchInvocation, BenchMode, Pass,
+    Phase, PhaseResult, Shape, AUTO_MIN_TOTAL_BYTES, AUTO_PER_THREAD_BYTES,
+    AUTO_TOTAL_FLOOR_BYTES, DEFAULT_BLOCK, DEFAULT_RAND_TIME_BOX_SECS, SUITE_RAND_BLOCK,
+    SUITE_SEQ_BLOCK,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+const GIB: u64 = 1024 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -122,15 +129,17 @@ fn test_parse_size_rejects_garbage(#[case] input: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// phase selection: empty => write+read; fixed order write,read,stat,del
+// mode selection: NO phase flags => the full saturation suite (the old
+// write+read default is DELETED); any flags => those phases, fixed order
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_phase_selection_default_is_write_read() {
+fn test_bare_invocation_selects_the_saturation_suite() {
     assert_eq!(
-        select_phases(false, false, false, false),
-        vec![Phase::Write, Phase::Read],
-        "no phase flags must default to write+read"
+        select_mode(false, false, false, false),
+        BenchMode::Suite,
+        "no phase flags must select the full saturation suite (the old \
+         write+read default is gone — clean break)"
     );
 }
 
@@ -151,10 +160,449 @@ fn test_phase_selection_fixed_order(
     #[case] expected: Vec<Phase>,
 ) {
     assert_eq!(
-        select_phases(w, r, s, d),
-        expected,
+        select_mode(w, r, s, d),
+        BenchMode::Phases(expected),
         "phase order is fixed (write, read, stat, del) regardless of flag order"
     );
+}
+
+// ---------------------------------------------------------------------------
+// auto-shape math: parallelism clamp, 16 GiB floor / 2 GiB×threads,
+// 25%-of-free cap, 4 GiB loud error, 1 MiB rounding
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[case(0, 1)] // defensive floor
+#[case(1, 1)]
+#[case(8, 8)]
+#[case(16, 16)]
+#[case(17, 16)]
+#[case(32, 16)]
+fn test_auto_threads_clamp(#[case] available: usize, #[case] expected: usize) {
+    assert_eq!(clamp_auto_threads(available), expected);
+}
+
+#[test]
+fn test_auto_total_floor_and_per_thread_scaling() {
+    let huge_free = 100 * 1024 * GIB;
+    // Small thread counts hit the 16 GiB floor.
+    assert_eq!(
+        auto_total_bytes(4, huge_free).expect("4 threads"),
+        AUTO_TOTAL_FLOOR_BYTES,
+        "total = max(16 GiB, 2 GiB × 4) = 16 GiB"
+    );
+    // Large thread counts scale at 2 GiB per thread.
+    assert_eq!(
+        auto_total_bytes(16, huge_free).expect("16 threads"),
+        16 * AUTO_PER_THREAD_BYTES,
+        "total = max(16 GiB, 2 GiB × 16) = 32 GiB"
+    );
+}
+
+#[test]
+fn test_auto_total_caps_at_quarter_of_free_space() {
+    // 40 GiB free => cap 10 GiB < the 16 GiB floor => capped total.
+    assert_eq!(
+        auto_total_bytes(4, 40 * GIB).expect("capped total"),
+        10 * GIB
+    );
+    // A non-aligned free space still yields a 1 MiB-multiple total
+    // (so -s % -b == 0 holds for both the 1m and 4k suite passes).
+    let total = auto_total_bytes(4, 40 * GIB + 123_456_789).expect("odd free");
+    assert_eq!(total % MIB, 0, "auto totals must round down to 1 MiB");
+    assert!(total >= 10 * GIB && total < 10 * GIB + 32 * MIB);
+}
+
+#[test]
+fn test_auto_total_too_small_filesystem_is_loud() {
+    // 8 GiB free => 25% cap = 2 GiB < the 4 GiB minimum => loud error.
+    let err = auto_total_bytes(4, 8 * GIB).expect_err("2 GiB cap must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("4 GiB") && msg.contains("25%"),
+        "error must state the 4 GiB minimum and the 25% free-space cap, got: {msg}"
+    );
+    // Exactly 16 GiB free => cap = exactly 4 GiB => allowed.
+    assert_eq!(
+        auto_total_bytes(1, 16 * GIB).expect("4 GiB fits exactly"),
+        AUTO_MIN_TOTAL_BYTES
+    );
+    // Just below => refused.
+    assert!(auto_total_bytes(1, 16 * GIB - 4 * MIB).is_err());
+}
+
+#[test]
+fn test_auto_file_size_rounds_down_to_1mib() {
+    assert_eq!(auto_file_size(32 * GIB, 16, 1).expect("even split"), 2 * GIB);
+    assert_eq!(auto_file_size(16 * GIB, 4, 2).expect("files>1"), 2 * GIB);
+    // Non-aligned per-file result rounds down to a 1 MiB multiple.
+    assert_eq!(
+        auto_file_size(3 * MIB + 123, 1, 1).expect("odd total"),
+        3 * MIB
+    );
+    let sz = auto_file_size(10 * GIB + 999, 3, 1).expect("odd split");
+    assert_eq!(sz % MIB, 0);
+    // Per-file below 1 MiB => loud error, never a zero-byte shape.
+    let err = auto_file_size(4 * GIB, 16, 1024).expect_err("tiny per-file");
+    assert!(
+        err.to_string().contains("1 MiB"),
+        "error must explain the 1 MiB rounding floor, got: {err}"
+    );
+}
+
+#[test]
+fn test_resolve_shape_explicit_flags_always_override() {
+    let base = scratch("resolve_explicit");
+    let r = resolve_shape(&base, Some(3), Some(2), Some(64 * MIB), Some(4096))
+        .expect("explicit resolve");
+    assert_eq!(
+        (r.threads, r.files, r.size, r.block),
+        (3, 2, 64 * MIB, 4096)
+    );
+    assert!(
+        !r.threads_auto && !r.files_auto && !r.size_auto && !r.block_auto,
+        "explicit flags must be marked explicit for the header"
+    );
+    cleanup(&base);
+}
+
+#[test]
+fn test_resolve_shape_auto_defaults() {
+    let base = scratch("resolve_auto");
+    // Explicit size => no statfs dependency; the rest auto-resolve.
+    let r = resolve_shape(&base, None, None, Some(8 * MIB), None).expect("auto resolve");
+    let expect_threads = clamp_auto_threads(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    );
+    assert_eq!(r.threads, expect_threads, "threads auto = min(CPUs, 16)");
+    assert!(r.threads_auto);
+    assert_eq!(r.files, 1, "files auto = 1 per thread");
+    assert!(r.files_auto);
+    assert_eq!(r.block, DEFAULT_BLOCK, "block defaults to 1m");
+    assert!(r.block_auto);
+    assert!(!r.size_auto);
+
+    // Auto size matches the pure composition over the real statfs free
+    // space (tolerate free-space jitter between the two statfs calls).
+    let free = mount_free_bytes(&base).expect("statfs");
+    if free >= 68 * GIB {
+        let r2 = resolve_shape(&base, Some(2), None, None, None).expect("auto size");
+        assert!(r2.size_auto);
+        let expected = auto_file_size(auto_total_bytes(2, free).expect("total"), 2, 1)
+            .expect("per-file");
+        let diff = r2.size.abs_diff(expected);
+        assert!(
+            diff <= 64 * MIB,
+            "auto size must follow max(16g,2g×t) capped at 25% free: got {} vs {expected}",
+            r2.size
+        );
+        assert_eq!(r2.size % MIB, 0, "auto size must be a 1 MiB multiple");
+    } else {
+        eprintln!("[SKIP] scratch fs has < 68 GiB free; exact auto-size pin skipped");
+    }
+    cleanup(&base);
+}
+
+// ---------------------------------------------------------------------------
+// --time semantics: rand default 30 s, seq unlimited, 0 = full coverage,
+// explicit override
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[case(None, false, None)]
+#[case(None, true, Some(Duration::from_secs(DEFAULT_RAND_TIME_BOX_SECS)))]
+#[case(Some(0), true, None)] // --time 0 forces full coverage on rand
+#[case(Some(0), false, None)]
+#[case(Some(7), true, Some(Duration::from_secs(7)))]
+#[case(Some(7), false, Some(Duration::from_secs(7)))]
+fn test_resolve_time_box(
+    #[case] time: Option<u64>,
+    #[case] rand: bool,
+    #[case] expected: Option<Duration>,
+) {
+    assert_eq!(
+        resolve_time_box(time, rand),
+        expected,
+        "time={time:?} rand={rand}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the saturation suite: pass sequence, per-pass shapes, time boxes,
+// direct ON for I/O passes, one dataset lifecycle ending clean
+// ---------------------------------------------------------------------------
+
+fn assert_suite_shape(passes: &[Pass], threads: usize, files: usize, size: u64) {
+    for (i, p) in passes.iter().enumerate() {
+        assert_eq!(
+            (p.shape.threads, p.shape.files, p.shape.size),
+            (threads, files, size),
+            "pass {i}: ONE dataset shape across the whole suite"
+        );
+    }
+}
+
+#[test]
+fn test_suite_pass_sequence_and_shapes() {
+    let passes = suite_passes(2, 1, 8 * MIB, None);
+    assert_eq!(passes.len(), 6, "suite = 6 passes");
+    assert_suite_shape(&passes, 2, 1, 8 * MIB);
+
+    let seq: Vec<(Phase, u64, bool, Option<Duration>, bool)> = passes
+        .iter()
+        .map(|p| {
+            (
+                p.phase,
+                p.shape.block,
+                p.shape.rand,
+                p.time_box,
+                p.validate,
+            )
+        })
+        .collect();
+    let box30 = Some(Duration::from_secs(DEFAULT_RAND_TIME_BOX_SECS));
+    assert_eq!(
+        seq[0],
+        (Phase::Write, SUITE_SEQ_BLOCK, false, None, false),
+        "pass 1: write seq 1m, full coverage, creates the dataset"
+    );
+    assert_eq!(
+        seq[1],
+        (Phase::Read, SUITE_SEQ_BLOCK, false, None, true),
+        "pass 2: read seq 1m, validates pass 1's dataset"
+    );
+    assert_eq!(
+        seq[2],
+        (Phase::Read, SUITE_RAND_BLOCK, true, box30, true),
+        "pass 3: read rand 4k, 30 s box"
+    );
+    assert_eq!(
+        seq[3],
+        (Phase::Write, SUITE_RAND_BLOCK, true, box30, true),
+        "pass 4: write rand 4k, 30 s box, over the EXISTING dataset"
+    );
+    assert_eq!(seq[4].0, Phase::Stat, "pass 5: stat");
+    assert!(seq[4].4, "stat validates");
+    assert_eq!(seq[5].0, Phase::Del, "pass 6: del (leaves the mount clean)");
+    assert!(seq[5].4, "del validates");
+
+    // All four I/O passes are O_DIRECT in the suite.
+    for (i, p) in passes.iter().take(4).enumerate() {
+        assert!(p.shape.direct, "suite I/O pass {i} must be O_DIRECT");
+    }
+}
+
+#[test]
+fn test_suite_time_flag_overrides_rand_boxes_only() {
+    let passes = suite_passes(1, 1, 4 * MIB, Some(10));
+    assert_eq!(passes[0].time_box, None, "seq write is never time-boxed");
+    assert_eq!(passes[1].time_box, None, "seq read is never time-boxed");
+    assert_eq!(passes[2].time_box, Some(Duration::from_secs(10)));
+    assert_eq!(passes[3].time_box, Some(Duration::from_secs(10)));
+
+    // --time 0 forces full coverage on the rand passes.
+    let full = suite_passes(1, 1, 4 * MIB, Some(0));
+    assert_eq!(full[2].time_box, None);
+    assert_eq!(full[3].time_box, None);
+}
+
+// ---------------------------------------------------------------------------
+// consistency rule: a single-phase invocation inherits the identical
+// defaults (same shape resolution, same 30 s rand box) as the suite pass
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_phase_passes_inherit_rand_time_box_default() {
+    let mut sh = shape(1, 1, 4 * MIB, 4096);
+    sh.rand = true;
+    let passes = phase_passes(&[Phase::Read], &sh, None);
+    assert_eq!(passes.len(), 1);
+    assert_eq!(
+        passes[0].time_box,
+        Some(Duration::from_secs(DEFAULT_RAND_TIME_BOX_SECS)),
+        "single-phase rand run must inherit the suite's 30 s box (comparable numbers)"
+    );
+    assert!(
+        passes[0].validate,
+        "read without write validates the dataset first"
+    );
+
+    // Sequential single-phase: unlimited (full coverage).
+    let seq = phase_passes(&[Phase::Read], &shape(1, 1, 4 * MIB, MIB), None);
+    assert_eq!(seq[0].time_box, None);
+
+    // Write present => no validation anywhere; stat/del never boxed.
+    let wrd = phase_passes(
+        &[Phase::Write, Phase::Read, Phase::Stat, Phase::Del],
+        &shape(1, 1, 4 * MIB, MIB),
+        Some(5),
+    );
+    assert!(wrd.iter().all(|p| !p.validate));
+    assert_eq!(wrd[0].time_box, Some(Duration::from_secs(5)));
+    assert_eq!(wrd[1].time_box, Some(Duration::from_secs(5)));
+    assert_eq!(wrd[2].time_box, None, "stat always completes");
+    assert_eq!(wrd[3].time_box, None, "del always completes");
+}
+
+// ---------------------------------------------------------------------------
+// time-boxed execution: partial coverage, >=1 op per worker, honest rows
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_time_box_expiry_yields_partial_coverage() {
+    let base = scratch("timebox");
+    let mut wr = shape(2, 2, 64 * 1024, 4096);
+    run_phases(&base, &[Phase::Write], &wr)
+        .await
+        .expect("dataset");
+
+    wr.rand = true;
+    let pass = Pass {
+        phase: Phase::Read,
+        shape: wr.clone(),
+        time_box: Some(Duration::ZERO),
+        validate: true,
+    };
+    let report = run_passes(&base, &[pass]).await.expect("boxed read");
+    let res = &report.phases[0];
+    let expected_full = 2 * 2 * (64 * 1024 / 4096);
+    assert_eq!(res.expected_ops, expected_full);
+    assert!(
+        res.ops >= 2 && res.ops < expected_full,
+        "zero box: at least one op per worker, well short of full coverage (got {})",
+        res.ops
+    );
+    assert!(res.coverage() < 1.0, "coverage must be partial");
+    assert_eq!(res.time_box, Some(Duration::ZERO));
+    assert!(res.iops() > 0.0);
+
+    // Time-boxed rand WRITE over the existing dataset: sizes untouched
+    // (overwrite in place), dataset still shape-valid afterwards.
+    let wpass = Pass {
+        phase: Phase::Write,
+        shape: wr.clone(),
+        time_box: Some(Duration::ZERO),
+        validate: true,
+    };
+    let report = run_passes(&base, &[wpass]).await.expect("boxed write");
+    assert!(report.phases[0].ops >= 2);
+    assert!(report.phases[0].coverage() < 1.0);
+    validate_dataset(&base, &wr).expect("boxed rand write must leave the dataset shape-valid");
+    cleanup(&base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_suite_lifecycle_on_tiny_dataset() {
+    // The suite's pass structure over a tiny dataset (buffered variant so
+    // it runs on any scratch filesystem; the O_DIRECT flavor is gated
+    // below): one dataset, six passes, mount left clean.
+    let base = scratch("suite_tiny");
+    let mut passes = suite_passes(2, 1, 8 * MIB, None);
+    for p in &mut passes {
+        p.shape.direct = false;
+    }
+    let report = run_passes(&base, &passes).await.expect("tiny suite");
+    let got: Vec<Phase> = report.phases.iter().map(|p| p.phase).collect();
+    assert_eq!(
+        got,
+        vec![
+            Phase::Write,
+            Phase::Read,
+            Phase::Read,
+            Phase::Write,
+            Phase::Stat,
+            Phase::Del
+        ],
+        "suite pass order"
+    );
+    assert_eq!(report.phases[2].block, SUITE_RAND_BLOCK);
+    assert_eq!(report.phases[3].block, SUITE_RAND_BLOCK);
+    for res in &report.phases {
+        assert!(res.ops > 0, "{:?}: ops", res.phase);
+        assert!(
+            res.coverage() >= 1.0 - f64::EPSILON,
+            "tiny dataset finishes well inside the 30 s boxes"
+        );
+        assert!(
+            res.lat_min <= res.lat_avg && res.lat_avg <= res.lat_max,
+            "{:?}: monotonic latencies",
+            res.phase
+        );
+    }
+    assert!(
+        !dataset_root(&base).exists(),
+        "the suite must leave the mount clean (del is the last pass)"
+    );
+    cleanup(&base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_suite_lifecycle_direct_when_supported() {
+    let base = scratch("suite_direct");
+    let probe = base.join("direct_probe.bin");
+    std::fs::write(&probe, vec![0u8; 4096]).expect("probe file");
+    let supported = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&probe)
+            .is_ok()
+    };
+    let _ = std::fs::remove_file(&probe);
+    if !supported {
+        eprintln!("[SKIP] scratch filesystem does not support O_DIRECT");
+        cleanup(&base);
+        return;
+    }
+    let passes = suite_passes(2, 1, 8 * MIB, None);
+    let report = run_passes(&base, &passes).await.expect("direct suite");
+    assert_eq!(report.phases.len(), 6);
+    assert!(report.phases.iter().take(4).all(|r| r.direct));
+    assert!(!dataset_root(&base).exists());
+    cleanup(&base);
+}
+
+// ---------------------------------------------------------------------------
+// run_invocation guards: suite refuses -b/--rand; iterations >= 1
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_suite_refuses_explicit_block_and_rand() {
+    let base = scratch("suite_guard");
+    let inv = BenchInvocation {
+        block: Some(4096),
+        size: Some(8 * MIB),
+        threads: Some(1),
+        iterations: 1,
+        ..Default::default()
+    };
+    let err = run_invocation(&base, &inv)
+        .await
+        .expect_err("-b without phases must be refused (suite fixes per-pass blocks)");
+    assert!(
+        matches!(&err, BenchError::Shape(m) if m.contains("-b")),
+        "error must point at -b vs the suite, got: {err}"
+    );
+
+    let inv = BenchInvocation {
+        rand: true,
+        size: Some(8 * MIB),
+        threads: Some(1),
+        iterations: 1,
+        ..Default::default()
+    };
+    let err = run_invocation(&base, &inv)
+        .await
+        .expect_err("--rand without phases must be refused");
+    assert!(matches!(&err, BenchError::Shape(m) if m.contains("--rand")));
+    assert!(
+        !dataset_root(&base).exists(),
+        "guard failures must not touch the filesystem"
+    );
+    cleanup(&base);
 }
 
 // ---------------------------------------------------------------------------
@@ -699,17 +1147,65 @@ async fn test_direct_end_to_end_when_supported() {
 }
 
 // ---------------------------------------------------------------------------
-// run_cli guards
+// run_invocation guards
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_run_cli_rejects_zero_iterations() {
+async fn test_run_invocation_rejects_zero_iterations() {
     let base = scratch("iter0");
-    let sh = shape(1, 1, 16 * 1024, 16 * 1024);
-    let err = run_cli(&base, &[Phase::Write], &sh, 0)
+    let inv = BenchInvocation {
+        write: true,
+        threads: Some(1),
+        size: Some(16 * 1024),
+        block: Some(16 * 1024),
+        iterations: 0,
+        ..Default::default()
+    };
+    let err = run_invocation(&base, &inv)
         .await
         .expect_err("--iterations 0 must be refused");
     assert!(matches!(err, BenchError::Shape(_)));
+    cleanup(&base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_single_phase_inherits_shape_against_written_dataset() {
+    // The user flow the consistency rule protects: -w with an explicit
+    // tiny shape, then a lone `-r --rand -b 4k` (the suite pass-3 shape)
+    // against the surviving dataset.
+    let base = scratch("consistency");
+    let winv = BenchInvocation {
+        write: true,
+        threads: Some(2),
+        size: Some(8 * MIB),
+        iterations: 1,
+        ..Default::default()
+    };
+    run_invocation(&base, &winv).await.expect("write phase");
+
+    let rinv = BenchInvocation {
+        read: true,
+        rand: true,
+        block: Some(4096),
+        threads: Some(2),
+        size: Some(8 * MIB),
+        iterations: 1,
+        ..Default::default()
+    };
+    run_invocation(&base, &rinv)
+        .await
+        .expect("single-phase rand 4k read over the -w dataset");
+
+    // Cleanup via the del phase.
+    let dinv = BenchInvocation {
+        del: true,
+        threads: Some(2),
+        size: Some(8 * MIB),
+        iterations: 1,
+        ..Default::default()
+    };
+    run_invocation(&base, &dinv).await.expect("del phase");
+    assert!(!dataset_root(&base).exists());
     cleanup(&base);
 }
 
@@ -861,7 +1357,7 @@ fn test_cli_direct_unaligned_block_rejected() {
 }
 
 #[test]
-fn test_cli_help_documents_fsync_and_units() {
+fn test_cli_help_documents_fsync_units_time_and_auto() {
     let out = Command::new(bin())
         .args(["bench", "--help"])
         .output()
@@ -883,14 +1379,106 @@ fn test_cli_help_documents_fsync_and_units() {
         "--block",
         "--rand",
         "--direct",
+        "--time",
         "--iterations",
     ] {
         assert!(help.contains(flag), "--help must document {flag}: {help}");
     }
+    assert!(
+        help.contains("auto"),
+        "--help must state that -t/-n/-s auto-size by default.\nhelp: {help}"
+    );
+    assert!(
+        help.to_ascii_lowercase().contains("suite"),
+        "--help must describe the bare-invocation saturation suite.\nhelp: {help}"
+    );
     for gone in ["--large-size", "--small-size", "--small-count", "--only"] {
         assert!(
             !help.contains(gone),
             "--help must not mention deleted flag {gone}"
         );
     }
+}
+
+#[test]
+fn test_cli_bare_invocation_runs_suite_with_explicit_tiny_shape() {
+    let base = scratch("cli_suite");
+    // Gate: the suite's I/O passes are O_DIRECT; skip cleanly where the
+    // scratch filesystem cannot do it.
+    let probe = base.join("direct_probe.bin");
+    std::fs::write(&probe, vec![0u8; 4096]).expect("probe file");
+    let supported = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&probe)
+            .is_ok()
+    };
+    let _ = std::fs::remove_file(&probe);
+    if !supported {
+        eprintln!("[SKIP] scratch filesystem does not support O_DIRECT");
+        cleanup(&base);
+        return;
+    }
+
+    // No phase flags => the full suite; explicit -t/-s keep it tiny (auto
+    // sizing would want >= 16 GiB — that lives in the real-mount smoke).
+    let out = Command::new(bin())
+        .arg("bench")
+        .arg(&base)
+        .args(["-t", "1", "-s", "8m"])
+        .output()
+        .expect("spawn squeezefs bench");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "bare invocation must run the suite.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    // The old write+read default is gone: all six passes show up.
+    for label in ["Write", "Read", "Stat", "Del"] {
+        assert!(stdout.contains(label), "suite must include {label} rows");
+    }
+    assert!(
+        stdout.contains("rand") && stdout.contains("seq"),
+        "suite rows must distinguish seq and rand passes.\nstdout: {stdout}"
+    );
+    // The header states the computed shape with auto-vs-explicit
+    // provenance.
+    assert!(
+        stdout.contains("(explicit)") && stdout.contains("(auto)"),
+        "header must mark auto vs explicit values.\nstdout: {stdout}"
+    );
+    assert!(
+        !dataset_root(&base).exists(),
+        "the suite ends with del: mount left clean"
+    );
+    cleanup(&base);
+}
+
+#[test]
+fn test_cli_block_without_phases_is_refused() {
+    let base = scratch("cli_suite_block");
+    let out = Command::new(bin())
+        .arg("bench")
+        .arg(&base)
+        .args(["-b", "4k", "-t", "1", "-s", "8m"])
+        .output()
+        .expect("spawn squeezefs bench");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "-b without phase flags must be refused (the suite fixes per-pass blocks).\n{combined}"
+    );
+    assert!(
+        combined.contains("-b"),
+        "error must explain the -b/suite conflict.\n{combined}"
+    );
+    assert!(!dataset_root(&base).exists());
+    cleanup(&base);
 }

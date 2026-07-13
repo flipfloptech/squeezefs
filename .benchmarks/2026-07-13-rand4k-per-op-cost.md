@@ -104,10 +104,13 @@ lever 2 goes to the structural menu.
 | Gate | Result |
 |---|---|
 | Pins + sharing + memoization tests | green (independence pins green through BOTH implementations; sharing/timeout red-first) |
-| Full serial cargo gate | see report table |
-| clippy -D warnings / fmt / doc / bench smoke | clean / clean / 0 warnings / 118 ok |
-| loom | run (no new cross-word atomics — Arc refcount only) |
-| QUICK ×3 {003,213}-only | see report table |
-| aged fsx ×3 | see report table |
-| kill9 + unmount soak (fix 1 touches layout publish) | see report table |
-| LTP | see report table |
+| Full serial cargo gate | **690 passed / 0 failed** (first roll hit the documented `test_kill9_remount_soak_v3` shutdown-drain flake at round 11 — 5/5 standalone green, test is KV-only vs a routing-only diff, lineage `91e9883`; count restarted per the multi-run directive, second roll fully green) |
+| clippy -D warnings / fmt | clean |
+| cargo doc --no-deps | 0 warnings |
+| bench smoke | 118 ok |
+| loom | 19/19 (no new cross-word atomics — Arc refcount only) |
+| QUICK ×3 | **{003,213}-only ×3** (trio 616/075/091 + 074 green every run) |
+| aged fsx ×3 (caged) | **3/3 CLEAN** |
+| kill9 deep churn | SQUEEZEFS_CRASH_ROUNDS=60: ok |
+| unmount kill soak | PASS — 30 cycles, 0 coredumps / 0 SIGABRT / 0 panics |
+| LTP | **174 PASS / 0 FAIL / 0 BROKEN** (9 conf-skips) |

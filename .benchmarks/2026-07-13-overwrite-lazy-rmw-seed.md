@@ -1,7 +1,7 @@
 # Item B — the overwrite lazy-RMW seed (row-4 write-path gap)
 
 **Branch:** `perf/overwrite-lazy-rmw-seed` off dev@b945a4d.
-**Commits:** `2587a7a` (red suite) → `bae38bc` (deferral mechanism) → `fa5fcc4` (unstable-incarnation contract moved to the item-B surface, RED) → `b916ace` (never-lossy custody across a refused materialize).
+**Commits:** `2587a7a` (red suite) → `bae38bc` (deferral mechanism) → `fa5fcc4` (unstable-incarnation contract moved to the item-B surface, RED) → `b916ace` (never-lossy custody across a refused materialize) → `8319990` (overlay-never-invisible red tests — the QUICK 075/112 transient) → `9ffc1b8` (fetch-visible / fill-sync / stage-then-remove).
 
 ## 1. The gap and the mechanism
 
@@ -56,6 +56,31 @@ their park/skip semantics. Pinned by the re-choreographed
 **Counters (stats inode `metrics.*`):** `overwrite_seed_deferred` /
 `overwrite_seed_skipped` / `overwrite_seed_materialized`.
 
+**Overlay never invisible (9ffc1b8) — found by the QUICK tier doing its
+job:** the first QUICK ×3 roll hit generic/075 twice (and a later roll
+generic/112, fsx `-A`) with a signature no unit test had: `.bad` ≡ `.good`
+— the durable state was NEVER wrong; a read served transient stale/zeros
+and the file healed itself. A/B pinned scope (base ×3 = {003,213} only),
+standalone 075 ×6 + tape replays ×5 passed (needs the aged-volume QUICK
+context), and a debug-assertions build refused to reproduce (timing).
+Root cause: the deferral-window materialize sites took the parked buffer
+OUT of the map across the seed fetch (a device-read await) — concurrent
+single-block FUSE reads (kernel readahead crossing a CFR/ZERO page-cache
+invalidation boundary — 112's mismatch split exactly at 0x41f000) probe
+the overlay lock-free, missed it, and served the backend's pre-merge
+bytes. fsync's stage exit (remove-then-stage) had the same window
+PRE-item-B (its red test fails on dev@b945a4d too) but item B widened it
+from a µs staging put to a ms device read, which is what surfaced it.
+Fix: `fetch_seed_image` (the awaited binding-validated fetch) takes no
+buffer; every exit keeps the buffer PARKED across every await, fills
+synchronously under the held block lock via short-lived map guards, and
+transfers authority STAGE-THEN-REMOVE — at every instant one readable
+copy exists, and whenever two exist they are identical. Custody on a
+refused fetch became trivial (the buffer never leaves the map). Pinned by
+`concurrent_reads_never_lose_the_overlay_during_{materialize,flush}`
+(the first = item-B regression, green on base; the second = pre-existing,
+red on base, item-B-widened — both green at the tip).
+
 ## 2. Red suite (committed first, `2587a7a`; test 1 verified RED pre-fix)
 
 `tests/striped_overwrite_lazy_seed_tests.rs` (BS=64 KiB; fixture builds a
@@ -100,20 +125,20 @@ ledger and the overwrite:create ratio are the transferable evidence.
 **Paired, order-controlled, cold page cache before the overwrite pass**
 (`sync; echo 3 > drop_caches` so BEFORE's seed reads hit the backing device):
 
-| Pass | BEFORE (dev@b945a4d) | AFTER (b916ace) |
-|---|---|---|
-| Row 1 create 16×1G | 1,648 MiB/s | 1,735 MiB/s |
-| Row 4 overwrite (existing) | 1,531 MiB/s | **1,826 MiB/s** |
-| overwrite : create ratio | 0.93× | **1.05×** |
-| **get_obj delta during row 4** | **4,083 reads (≈16 GiB)** | **1 read** |
-| overwrite_seed_deferred | n/a | 4,112 |
-| overwrite_seed_skipped | n/a | **4,096** (= exactly 16 GiB / 4 MiB) |
-| overwrite_seed_materialized | n/a | 16 (file-tail partials) |
+| Pass | BEFORE (dev@b945a4d) | AFTER (b916ace) | AFTER (final tip 9ffc1b8) |
+|---|---|---|---|
+| Row 1 create 16×1G | 1,648 MiB/s | 1,735 MiB/s | 1,563 MiB/s |
+| Row 4 overwrite (existing) | 1,531 MiB/s | **1,826 MiB/s** | **1,667 MiB/s** |
+| overwrite : create ratio | 0.93× | **1.05×** | **1.07×** |
+| **get_obj delta during row 4** | **4,083 reads (≈16 GiB)** | **1 read** | **2 reads** |
+| overwrite_seed_deferred | n/a | 4,112 | 4,112 |
+| overwrite_seed_skipped | n/a | **4,096** (= exactly 16 GiB / 4 MiB) | **4,096** |
+| overwrite_seed_materialized | n/a | 16 (file-tail partials) | 16 |
 
-Device-read bytes for fully-covered blocks: **~0** (1 stray read across
+Device-read bytes for fully-covered blocks: **~0** (1-2 stray reads across
 4,096 blocks; the acceptance ledger goal). Same protocol without the
 cold-cache step reproduces identically (get_obj delta 4,082 → 1-2 across
-three runs this session).
+five runs this session, two of them on the final tip).
 
 **Honest recording on the ≥2,000 MiB/s target:** on this loop-file sandbox
 the write path saturates at ~1.6-1.8 GiB/s for CREATES too, so the absolute
@@ -130,26 +155,28 @@ remaining delta there, if any, needs re-measurement on that hardware.
 
 Same-session, same substrate (uncontrolled tier warmth on read rows):
 
-| Row | BEFORE (session baseline) | AFTER (final tip) | Verdict |
+| Row | BEFORE (session baseline) | AFTER (final tip 9ffc1b8) | Verdict |
 |---|---|---|---|
-| 1 create 1M seq | 1,353-1,648 | 1,559-1,735 MiB/s | flat-to-up |
-| 2 seq read 1M | 1,053 | 3,897-4,856 MiB/s | improved (side-effect: overwrite pass no longer floods the read tiers with 16 GiB of seed blocks, so the read rows start from honest tier state; not claimed as an item-B win) |
-| 3 rand-4k read | 9,888 IOPS | 52,279-75,707 IOPS | improved (same tier-state effect) |
-| 5 rand-4k write | 131-140 IOPS | 113-141 IOPS | **flat** — partial blocks still seed, now at flush: row-5 pass deferred 3,207 / materialized 3,207 / skipped 0 (the mandated behavior; the RMW read moved, it did not disappear) |
+| 1 create 1M seq | 1,353-1,648 | 1,563-1,735 MiB/s | flat-to-up |
+| 2 seq read 1M | 1,053 | 3,897-4,918 MiB/s | improved (side-effect: overwrite pass no longer floods the read tiers with 16 GiB of seed blocks, so the read rows start from honest tier state; not claimed as an item-B win) |
+| 3 rand-4k read | 9,888 IOPS | 52,279-83,787 IOPS | improved (same tier-state effect) |
+| 5 rand-4k write | 131-140 IOPS | 113-150 IOPS | **flat-to-up** — partial blocks still seed, now at flush: row-5 pass deferred 3,207 / materialized 3,207 / skipped 0 (the mandated behavior; the RMW read moved, it did not disappear) |
 
-## 5. Acceptance evidence (this session, item-B tip)
+## 5. Acceptance evidence (this session, final tip 9ffc1b8)
 
 | Gate | Result |
 |---|---|
-| Red suite (8 scenarios) | 8/8 green (test 1 RED pre-fix: 6 reads) |
-| Moved leg-5 contract | RED against bae38bc → green at b916ace |
-| Full serial cargo gate | 684 passed / 0 failed (`--all-features -- --test-threads=1`) |
+| Red suite (10 scenarios) | 10/10 green (test 1 RED pre-fix: 6 reads; tests 9/10 RED pre-9ffc1b8 — test 9 also green on base = item-B regression pinned, test 10 red on base = pre-existing pinned) |
+| Moved leg-5 contract | RED against bae38bc → green from b916ace on |
+| Full serial cargo gate | **686 passed / 0 failed** (`--all-features -- --test-threads=1`) |
 | clippy -D warnings / fmt | clean |
 | cargo doc --no-deps | 0 warnings |
 | bench smoke | 118 ok |
 | loom | 19/19 (flush-unit atomics unchanged — `deferred_seed` is a plain bool mutated only under BLOCK_FLUSH_LOCKS; run anyway) |
 | legs-1..5 suites | all green in the serial gate (ring_pressure 6, aba 2, refill 4, truncate_stale 6, identity 7, crash_recovery 7, rmw_alloc 1, hole_read_zeros 7, write_visibility 9, writeback 9, write_through 28, cfr 5, data_path 24, sparse 5) |
-| Aged fsx protocol | **3/3 CLEAN** (fsstress age -n 30000 -p 8 + fsx -S 0 -U -N 10M -p 100000 -o 128000 -l 600000 --duration=120 ×3, caged) — leg-5 finish line does not regress |
-| QUICK ×3 {003,213}-only | see final report table |
-| kill9 deep churn + unmount soak | see final report table |
-| LTP | see final report table |
+| Aged fsx protocol | **3/3 CLEAN** on the final tip (fsstress age -n 30000 -p 8 + fsx -S 0 -U -N 10M -p 100000 -o 128000 -l 600000 --duration=120 ×3, caged) — leg-5 finish line does not regress (also 3/3 on b916ace earlier) |
+| QUICK ×3 | **{003,213}-only ×3** on the final tip (count restarted post-9ffc1b8 per the multi-run directive; the pre-fix roll that caught 075 ×2 + 112 ×1 is §Overlay-never-invisible) |
+| trio 616/075/091 + 074 | green inside every QUICK run (075 was the caught-and-fixed transient) |
+| kill9 deep churn | SQUEEZEFS_CRASH_ROUNDS=60 test_kill9_remount_soak_v3: ok, replay 0 dropped every round |
+| unmount kill soak | PASS — 30 cycles, 0 coredumps / 0 SIGABRT / 0 panics |
+| LTP | **174 PASS / 0 FAIL / 0 BROKEN** (9 skipped — standing conf skips) |

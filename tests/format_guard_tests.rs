@@ -15,11 +15,24 @@
 //! - Preflight alone has no side effects (it is the CLI's all-volumes
 //!   gate run before ANY volume is wiped) — it opens a read-only probe
 //!   mount and writes nothing.
+//! - A volume whose superblock this binary **refuses to interpret** (a
+//!   legacy v2 superblock, a pre-watermark v3 one — Finding A, unknown
+//!   future incompat bits, a torn checksum) follows the SAME ladder as a
+//!   healthy formatted volume: mount refuses loud, format without
+//!   `--force` refuses per the reformat guard, and `format --force`
+//!   CLOBBERS it — the refusal message demands a reformat, so `--force`
+//!   must be able to deliver one. Such a volume cannot be live-mounted by
+//!   this binary, so it cannot have live current clients by construction;
+//!   the live-client probe is impossible AND unnecessary there.
 
 use squeezefs::fuse_client::CLIENT_STALE_TTL_SECS;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{format_preflight, format_v3, FormatV3Options};
-use squeezefs::meta_backend::Metadata;
+use squeezefs::meta_backend::kv::superblock::{
+    classify_volume, write_superblock_v3, VolumeFormat, FEATURE_INCOMPAT_KV_V3,
+    FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
+};
+use squeezefs::meta_backend::{open_volume_for_mount, Metadata};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
@@ -56,6 +69,22 @@ async fn formatted_volume() -> NamedTempFile {
     let meta = blank_volume();
     format_v3(meta.path(), VOL_LEN, &opts(true)).await.unwrap();
     meta
+}
+
+/// Forge the pre-watermark shape the Finding-A gate refuses: a real v3
+/// volume whose superblock lacks incompat bit 1 (the same forge the §6.1
+/// gate suite in `tests/kv_backend_tests.rs` uses — no pre-watermark
+/// writer exists anymore).
+async fn forge_pre_watermark(path: &std::path::Path) {
+    let sb = match classify_volume(path).await.expect("classify the v3 volume") {
+        VolumeFormat::V3(sb) => sb,
+        other => panic!("expected a v3 volume to forge, got {other:?}"),
+    };
+    let mut pre = sb.clone();
+    pre.features_incompat = FEATURE_INCOMPAT_KV_V3;
+    write_superblock_v3(path, &pre)
+        .await
+        .expect("write the forged pre-watermark superblock");
 }
 
 /// Write a `client:{id}` registration into the volume's v3 xattr tree the
@@ -170,9 +199,11 @@ async fn preflight_allows_forced_idle_reformat() {
         .expect("preflight with force on an idle formatted volume must pass");
 }
 
-/// A legacy v2 superblock (crafted bytes — no v2 writer exists) is
-/// protected by the same already-formatted guard: refused without
-/// `--force`, reformatted to v3 with it.
+/// A legacy v2 superblock (crafted bytes — no v2 writer exists) walks the
+/// full unsupported-volume ladder: mount refuses loud, format without
+/// `--force` refuses per the reformat guard (side-effect-free), and
+/// `--force` reformats it to a mountable current v3 volume. Regression pin
+/// that the Finding-A watermark gate did not break the v2 `--force` path.
 #[tokio::test]
 async fn legacy_v2_volume_guarded_and_reformattable() {
     let meta = blank_volume();
@@ -183,16 +214,462 @@ async fn legacy_v2_volume_guarded_and_reformattable() {
         .await
         .unwrap();
 
-    format_preflight(meta.path(), false)
+    // 1. Mount refuses loud (the v2-purge contract — keep).
+    let err = open_volume_for_mount(meta.path().to_str().unwrap())
         .await
-        .expect_err("a legacy v2 volume must be refused without --force");
+        .expect_err("mounting a legacy v2 volume must refuse loud")
+        .to_string();
+    assert!(
+        err.contains("no longer supported"),
+        "the v2 mount refusal must be the precise 'no longer supported' message, got: {err}"
+    );
+
+    // 2. format without --force: refused per the reformat guard…
+    let image_before = std::fs::read(meta.path()).unwrap();
+    let err = format_preflight(meta.path(), false)
+        .await
+        .expect_err("a legacy v2 volume must be refused without --force")
+        .to_string();
+    assert!(
+        err.contains("--force"),
+        "the format refusal must point at --force (the reformat guard), got: {err}"
+    );
+    // 3. …and byte-identical after the refusal.
+    assert_eq!(
+        std::fs::read(meta.path()).unwrap(),
+        image_before,
+        "a refused format must leave the v2 volume byte-identical"
+    );
+
+    // 4. --force clobbers it; 5. the result mounts as CURRENT v3
+    // (watermark bit present).
     format_v3(meta.path(), VOL_LEN, &opts(true))
         .await
         .expect("--force must reformat a legacy v2 volume to v3");
-    assert!(
-        squeezefs::meta_backend::open_volume_for_mount(meta.path().to_str().unwrap())
-            .await
-            .is_ok(),
-        "the reformatted volume mounts as v3"
+    let be = open_volume_for_mount(meta.path().to_str().unwrap())
+        .await
+        .expect("the reformatted volume mounts as v3");
+    assert_ne!(
+        be.superblock().features_incompat & FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
+        0,
+        "the reformatted volume must carry the node-seq watermark incompat bit"
     );
+    be.shutdown().await.unwrap();
+}
+
+/// The user-hit Finding-A regression: the pre-watermark mount refusal
+/// ("reformat required") must NOT also fire inside `format --force` — the
+/// message would demand the very operation it blocks. Full ladder: mount
+/// refuses loud (keep) → format without `--force` refuses per the
+/// reformat guard → the refusal is side-effect-free → `format --force`
+/// SUCCEEDS → the fresh volume mounts with the watermark present.
+#[tokio::test]
+async fn pre_watermark_v3_volume_guarded_and_force_reformattable() {
+    let meta = formatted_volume().await;
+    forge_pre_watermark(meta.path()).await;
+
+    // 1. Mount refuses loud, naming the watermark gate and the remedy
+    //    (the Finding-A contract — keep green).
+    let err = open_volume_for_mount(meta.path().to_str().unwrap())
+        .await
+        .expect_err("mounting a pre-watermark v3 volume must refuse loud")
+        .to_string();
+    assert!(
+        err.contains("watermark") && err.contains("reformat required"),
+        "the mount refusal must name the watermark gate and the remedy, got: {err}"
+    );
+
+    // 2. format without --force: the reformat guard owns this surface —
+    //    the refusal must point at --force, not dead-end on the mount
+    //    refusal.
+    let image_before = std::fs::read(meta.path()).unwrap();
+    let err = format_v3(meta.path(), VOL_LEN, &opts(false))
+        .await
+        .expect_err("a pre-watermark volume must still be format-guarded without --force")
+        .to_string();
+    assert!(
+        err.contains("--force"),
+        "the format refusal must point at --force (the reformat guard), got: {err}"
+    );
+
+    // 3. The refusal has no side effects (byte-identical volume).
+    assert_eq!(
+        std::fs::read(meta.path()).unwrap(),
+        image_before,
+        "a refused format must leave the pre-watermark volume byte-identical"
+    );
+
+    // 4. format WITH --force succeeds: the volume cannot be live-mounted
+    //    by this binary, so no live current client can exist — --force
+    //    must deliver the reformat its own refusal message demands.
+    format_v3(meta.path(), VOL_LEN, &opts(true))
+        .await
+        .expect("--force must reformat a pre-watermark v3 volume");
+
+    // 5. The reformatted volume mounts as current v3, watermark present.
+    let be = open_volume_for_mount(meta.path().to_str().unwrap())
+        .await
+        .expect("the reformatted volume mounts as current v3");
+    assert_ne!(
+        be.superblock().features_incompat & FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
+        0,
+        "the reformatted volume must carry the node-seq watermark incompat bit"
+    );
+    be.shutdown().await.unwrap();
+}
+
+/// The user's exact multi-volume shape: a 4-volume metadata set where
+/// only SOME volumes are pre-watermark. The CLI preflights EVERY volume
+/// before ANY volume is wiped, then formats them all — without `--force`
+/// every volume refuses and stays byte-identical; with `--force` the
+/// whole set (mixed classes included) reformats to mountable current v3.
+#[tokio::test]
+async fn mixed_pre_watermark_volume_set_force_reformats_all() {
+    let mut vols = Vec::new();
+    for _ in 0..4 {
+        vols.push(formatted_volume().await);
+    }
+    forge_pre_watermark(vols[0].path()).await;
+    forge_pre_watermark(vols[2].path()).await;
+
+    // Without --force: the all-volumes preflight refuses each volume
+    // (current v3 and pre-watermark alike) and leaves EVERY volume
+    // byte-identical — the CLI's "refused format wipes nothing" pin.
+    let images: Vec<Vec<u8>> = vols
+        .iter()
+        .map(|v| std::fs::read(v.path()).unwrap())
+        .collect();
+    for v in &vols {
+        format_preflight(v.path(), false)
+            .await
+            .expect_err("every non-blank volume must refuse format without --force");
+    }
+    for (v, img) in vols.iter().zip(&images) {
+        assert_eq!(
+            &std::fs::read(v.path()).unwrap(),
+            img,
+            "a refused preflight must be side-effect-free on every volume"
+        );
+    }
+
+    // With --force: the CLI loop shape — preflight ALL volumes first,
+    // then format them all. The mixed set must pass both phases.
+    for v in &vols {
+        format_preflight(v.path(), true)
+            .await
+            .expect("--force preflight must pass on every volume, pre-watermark included");
+    }
+    for v in &vols {
+        format_v3(v.path(), VOL_LEN, &opts(true))
+            .await
+            .expect("--force must reformat every volume in the mixed set");
+    }
+    for v in &vols {
+        let be = open_volume_for_mount(v.path().to_str().unwrap())
+            .await
+            .expect("every reformatted volume mounts as current v3");
+        assert_ne!(
+            be.superblock().features_incompat & FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
+            0,
+            "every reformatted volume must carry the watermark incompat bit"
+        );
+        be.shutdown().await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CLI smoke — the user-hit regression end to end, against the real binary:
+// `format --force` over a crafted pre-watermark multi-volume sandbox must
+// succeed, and the result must mount, take writes, and survive a remount.
+// ---------------------------------------------------------------------------
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_squeezefs")
+}
+
+/// Scratch under ~/tmp (repo discipline: scratch lives in ~/tmp; unique
+/// per-process path so parallel runs never collide).
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").expect("HOME set");
+    let base = std::path::PathBuf::from(home)
+        .join("tmp")
+        .join(format!("fmtfix_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
+
+/// FUSE-over-io_uring mount support gate (same shape as the other
+/// real-CLI suites): the mount phase skips cleanly where it cannot run.
+fn transport_supported() -> bool {
+    if !std::path::Path::new("/dev/fuse").exists() {
+        eprintln!("[SKIP] /dev/fuse not present");
+        return false;
+    }
+    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
+        Ok(v)
+            if matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "y" | "1" | "yes" | "true" | "on"
+            ) => {}
+        other => {
+            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
+            return false;
+        }
+    }
+    if std::process::Command::new("fusermount3")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("[SKIP] fusermount3 not available");
+        return false;
+    }
+    true
+}
+
+/// Run a CLI invocation with a hard deadline; a hang is converted into a
+/// loud failure instead of wedging the suite.
+fn run_with_deadline(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+    what: &str,
+) -> std::process::Output {
+    let start = std::time::Instant::now();
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(_) => break,
+            None if start.elapsed() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what} did not exit within {deadline:?} — must fail fast and loud");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("collect {what} output: {e}"))
+}
+
+/// A spawned `squeezefs mount` child: unmounted via `fusermount3 -u` and
+/// reaped BY PID on drop (never by name).
+struct CliMount {
+    child: std::process::Child,
+    mnt: std::path::PathBuf,
+}
+
+impl CliMount {
+    fn unmount(&mut self) {
+        for _ in 0..10 {
+            let st = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg(&self.mnt)
+                .status()
+                .expect("run fusermount3 -u");
+            if st.success() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if self.child.try_wait().expect("try_wait").is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let _ = self.child.kill();
+        panic!("mount daemon did not exit within 30s of unmount");
+    }
+}
+
+impl Drop for CliMount {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&self.mnt)
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn `squeezefs mount <metas...> <mnt>` and wait for the stats inode.
+fn spawn_cli_mount(metas: &[std::path::PathBuf], mnt: &std::path::Path, log: &std::path::Path) -> CliMount {
+    std::fs::create_dir_all(mnt).unwrap();
+    let logf = std::fs::File::create(log).unwrap();
+    let mut cmd = std::process::Command::new(bin());
+    cmd.arg("mount");
+    for m in metas {
+        cmd.arg(format!("sqmeta://{}", m.display()));
+    }
+    let child = cmd
+        .arg(mnt)
+        .arg("--uid")
+        .arg(unsafe { libc::getuid() }.to_string())
+        .arg("--gid")
+        .arg(unsafe { libc::getgid() }.to_string())
+        .stdout(std::process::Stdio::from(logf.try_clone().unwrap()))
+        .stderr(std::process::Stdio::from(logf))
+        .spawn()
+        .expect("spawn squeezefs mount");
+    let mount = CliMount {
+        child,
+        mnt: mnt.to_path_buf(),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if std::fs::read_to_string(mount.mnt.join(".stats")).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mount did not become ready in 90s; log:\n{}",
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    mount
+}
+
+/// The user's exact flow, end to end: seed a 4-meta-volume set, forge two
+/// volumes pre-watermark, then (a) mount refuses loud, (b) `format`
+/// without `--force` refuses pointing at `--force`, (c) the user's
+/// `format --force` command SUCCEEDS, (d) the fresh filesystem mounts,
+/// takes a write, and serves it back across a remount.
+#[test]
+fn cli_format_force_reformats_pre_watermark_set_then_mounts() {
+    let base = scratch("cli");
+    let metas: Vec<std::path::PathBuf> =
+        (0..4).map(|i| base.join(format!("mds{i}.bin"))).collect();
+    for m in &metas {
+        std::fs::File::create(m)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+    }
+    let data = base.join("data.bin");
+    std::fs::File::create(&data)
+        .unwrap()
+        .set_len(2 * 1024 * 1024 * 1024)
+        .unwrap();
+
+    let format_cmd = |force: bool| {
+        let mut cmd = std::process::Command::new(bin());
+        cmd.arg("format");
+        for m in &metas {
+            cmd.arg(format!("sqmeta://{}", m.display()));
+        }
+        cmd.arg(format!("sqdata://{}", data.display()));
+        if force {
+            cmd.arg("--force");
+        }
+        cmd
+    };
+
+    // Seed: a current-format 4-volume set.
+    let out = run_with_deadline(
+        format_cmd(true),
+        std::time::Duration::from_secs(180),
+        "seed format",
+    );
+    assert!(
+        out.status.success(),
+        "seed format failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Forge volumes 0 and 2 pre-watermark (the user's mixed shape).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        forge_pre_watermark(&metas[0]).await;
+        forge_pre_watermark(&metas[2]).await;
+    });
+
+    // (a) Mount refuses loud, naming the pre-watermark gate.
+    let mnt = base.join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let mut refuse_cmd = std::process::Command::new(bin());
+    refuse_cmd.arg("mount");
+    for m in &metas {
+        refuse_cmd.arg(format!("sqmeta://{}", m.display()));
+    }
+    refuse_cmd.arg(&mnt);
+    let out = run_with_deadline(
+        refuse_cmd,
+        std::time::Duration::from_secs(60),
+        "mount of a pre-watermark set",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "mounting a pre-watermark set must fail\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains("pre-watermark"),
+        "the mount refusal must name the pre-watermark gate\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // (b) format WITHOUT --force: refused, pointing at --force.
+    let out = run_with_deadline(
+        format_cmd(false),
+        std::time::Duration::from_secs(60),
+        "format without --force",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "format without --force must refuse a non-blank set\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains("--force"),
+        "the refusal must point at --force\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // (c) The user's exact command: format --force over the mixed set.
+    let out = run_with_deadline(
+        format_cmd(true),
+        std::time::Duration::from_secs(180),
+        "format --force over the pre-watermark set",
+    );
+    assert!(
+        out.status.success(),
+        "format --force must reformat a pre-watermark set (the user-hit regression): {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (d) Mount + write + remount + read-back (transport-gated).
+    if !transport_supported() {
+        eprintln!("[SKIP] mount phase skipped (transport unsupported); format phases verified");
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+    let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    {
+        let mut m = spawn_cli_mount(&metas, &mnt, &base.join("mount1.log"));
+        std::fs::write(mnt.join("smoke.bin"), &payload).expect("write through the fresh mount");
+        let back = std::fs::read(mnt.join("smoke.bin")).expect("read back");
+        assert_eq!(back, payload, "read-back mismatch on the fresh mount");
+        m.unmount();
+    }
+    {
+        let mut m = spawn_cli_mount(&metas, &mnt, &base.join("mount2.log"));
+        let back = std::fs::read(mnt.join("smoke.bin")).expect("read after remount");
+        assert_eq!(back, payload, "read-back mismatch after remount");
+        m.unmount();
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }

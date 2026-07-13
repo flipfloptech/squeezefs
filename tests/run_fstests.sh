@@ -110,6 +110,7 @@ cat << EOF > /sbin/mount.fuse.squeezefs
 # mount is usable when we return.
 set -u
 SQUEEZEFS_BIN="$SQUEEZEFS_BIN"
+SCRATCH_DEV="$SCRATCH_DEV"
 EOF
 cat << 'EOF' >> /sbin/mount.fuse.squeezefs
 DEV="$1"
@@ -156,6 +157,36 @@ if ! stat "$MNT" >/dev/null 2>&1; then
 fi
 if ! mountpoint -q "$MNT" 2>/dev/null; then
     find "$MNT" -mindepth 1 -delete 2>/dev/null
+fi
+
+# SCRATCH raw-clobber resilience (2026-07-13 release-gate provenance):
+# xfstests treats SCRATCH_DEV as a raw block device it may scribble on —
+# generic/515 pwrites 0x58 over [0, 300 MiB) BEFORE its _require bails
+# notrun on FUSE (_scratch_mkfs_sized unsupported), and 250/252/399 carry
+# the same shape behind other _requires. Real filesystems re-mkfs inside
+# those tests; FUSE scratch is never re-mkfs'd (common/rc _scratch_mkfs
+# just rm -rf's), so one raw writer destroyed the superblock and
+# mountfailed all 84 later scratch tests of the first full sweep. The
+# scratch volume is disposable between tests BY xfstests' own contract,
+# so: if the SCRATCH meta device no longer carries a squeezefs
+# superblock (magic "METALV01" at byte 0), re-mkfs it before mounting.
+# The predicate is deliberately NARROW — a volume whose magic is intact
+# but whose innards are corrupt (the Finding-A class) still fails the
+# mount LOUD; only a foreign raw overwrite (X-splat, zero-splat) can
+# strip the magic. TEST_DEV is exempt: its state persists across tests
+# by design and auto-reformat there would mask real damage.
+if [ "$DEV" = "$SCRATCH_DEV" ] && [ -e "$DEV" ]; then
+    MAGIC=$(head -c 8 "$DEV" 2>/dev/null | LC_ALL=C tr -d '\0')
+    if [ "$MAGIC" != "METALV01" ]; then
+        {
+            echo "mount.fuse.squeezefs: scratch superblock magic gone" \
+                 "(raw-clobber class, e.g. generic/515) — re-mkfs $DEV"
+        } >> "$LOG" 2>&1
+        if ! /sbin/mkfs.fuse.squeezefs "$DEV" >> "$LOG" 2>&1; then
+            echo "mount.fuse.squeezefs: raw-clobber re-mkfs of $DEV failed; see $LOG" >&2
+            exit 32
+        fi
+    fi
 fi
 
 # xfstests' check runs every test inside a transient systemd scope and stops

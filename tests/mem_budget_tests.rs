@@ -1021,8 +1021,15 @@ async fn advisory_integration_phases() {
     // 512 KiB entries — the measured production shape: 100% refusals,
     // staging_mmap=0 the whole run) inserts proceeded past the cap
     // unbounded (1,937 parked = 7.6 GiB anon at the kill). At Red the
-    // writer must instead AWAIT the never-lossy drain until the parked
-    // set is back under the halved cap — bounded, byte-exact, no spin.
+    // writer gives the shared drain a brief assist window, then — leg B's
+    // lesson: drain CONVOYS produced 36 ten-second deadline stalls across
+    // 4 suites — escalates to a SELF-FLUSH: this block goes durable
+    // through upload_active_block_bytes (the fsync staging-refusal
+    // escalation, legal under the held block guard per the P1-9 extended
+    // order) and is never parked. Assist window pinned to 0 here so the
+    // escalation leg is deterministic; either way the parked set must
+    // never exceed the halved cap and every byte must survive.
+    std::env::set_var("SQUEEZEFS_PARKED_GATE_ASSIST_MS", "0");
     let h4 = make_disk(*b"membudget-f-oom2", "mb_ns_f", "1MB").await;
     let ino_f = h4
         .fs
@@ -1056,7 +1063,19 @@ async fn advisory_integration_phases() {
         METRICS.parked_gate_waits.load(Ordering::Relaxed) > gate_waits0,
         "the blocking admission gate must be observable (parked_gate_waits)"
     );
+    assert!(
+        METRICS.parked_gate_self_flushes.load(Ordering::Relaxed) > 0,
+        "past the assist window the writer must self-flush durably, never \
+         stall on a drain convoy (leg B: 36 ten-second deadline stalls)"
+    );
+    assert_eq!(
+        METRICS.parked_gate_timeouts.load(Ordering::Relaxed),
+        0,
+        "the loud past-cap park is reserved for self-flush FAILURE — a \
+         working backend must never take it"
+    );
     force_level(Level::Green);
+    std::env::remove_var("SQUEEZEFS_PARKED_GATE_ASSIST_MS");
     h4.fs.fsync(h4.req, ino_f, 0, false).await.unwrap();
     for b in 0..STORM_BLOCKS {
         let d = read_at(&h4, ino_f, b * BS, 4096).await;

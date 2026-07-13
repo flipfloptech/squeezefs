@@ -406,9 +406,14 @@ pub struct Metrics {
     /// past the halved cap). The pre-fix advisory-soft cap let the parked
     /// set balloon to 1,937 buffers / 7.6 GiB anon under 16-writer rand-4k.
     pub parked_gate_waits: Align64<AtomicU64>,
-    /// Gate waits that hit the liveness deadline and parked past the cap
-    /// anyway (loud — sustained growth means the drain cannot make forward
-    /// progress against this workload).
+    /// Gated writers that escalated to a durable SELF-FLUSH of their own
+    /// block (the fsync staging-refusal escalation) after the drain-assist
+    /// window — the block never parks, RAM frees immediately, and no
+    /// writer ever stalls behind another inode's drain convoy (leg B
+    /// measured 36 ten-second deadline stalls before this escalation).
+    pub parked_gate_self_flushes: Align64<AtomicU64>,
+    /// Self-flush FAILURES that parked past the cap anyway (loud — the
+    /// never-lossy last resort when the backend refuses the upload).
     pub parked_gate_timeouts: Align64<AtomicU64>,
     /// Staged-file RMW seeds served through the bounded `BUFFER_POOL`
     /// (follow-up C): the whole-image read_staged seed recycles instead of
@@ -1215,6 +1220,7 @@ impl SqueezefsFilesystem {
                 "mem_budget_tier_publish_paused": crate::mem_budget::MEM_BUDGET.tier_publish_paused(),
                 "read_tier_publishes_paused": METRICS.read_tier_publishes_paused.load(Ordering::Relaxed),
                 "parked_gate_waits": METRICS.parked_gate_waits.load(Ordering::Relaxed),
+                "parked_gate_self_flushes": METRICS.parked_gate_self_flushes.load(Ordering::Relaxed),
                 "parked_gate_timeouts": METRICS.parked_gate_timeouts.load(Ordering::Relaxed),
                 "staged_rmw_pooled_seeds": METRICS.staged_rmw_pooled_seeds.load(Ordering::Relaxed),
                 "staged_truncate_inplace_shrinks": METRICS.staged_truncate_inplace_shrinks.load(Ordering::Relaxed),
@@ -2610,52 +2616,115 @@ impl SqueezefsFilesystem {
         // authority already shedding — parking past the halved cap is the
         // measured OOM engine (staging refused 100% of spills on the
         // saturation suite; the parked set ballooned 256 → 1,937 buffers
-        // = 7.6 GiB anon while the 1 Hz drain lost the race). The writer
-        // instead AWAITS the never-lossy drain until the set is back
-        // under the cap: awaited backpressure in async context (the
-        // §4.4-pt-5 ring-admission precedent — no spin, no held-lock
-        // wait; the drain worker acquires its locks in a clean context
-        // and never needs THIS block's lock, which is not in the map).
-        // Deadline-bounded for liveness: a drain that cannot progress
-        // (hard failures) must not wedge the write path — park loud.
+        // = 7.6 GiB anon while the 1 Hz drain lost the race). Two-stage
+        // awaited backpressure (the §4.4-pt-5 ring-admission precedent —
+        // no spin, no lock acquired while waiting):
+        //
+        // 1. DRAIN ASSIST (brief, env-tunable): post a target and give
+        //    the shared drain worker a moment to free room — the cheap
+        //    path when the backlog is other inodes' cold parks.
+        // 2. SELF-FLUSH: still over cap ⇒ THIS block goes durable now
+        //    through `upload_active_block_bytes` (the fsync
+        //    staging-refusal escalation — upload + merge under the block
+        //    guard the caller already holds, the established 3 → 3.5
+        //    extended order) and never parks; RAM frees when the buffer
+        //    drops here. Leg B measured why waiting longer is wrong: a
+        //    drain CONVOY (writers of the same hot inode queueing behind
+        //    one flush pass) produced 36 ten-second deadline stalls —
+        //    the writer paying for its own block's writeback is bounded
+        //    by the device, not by the convoy.
+        //
+        // Never-lossy at every exit: assist parks nothing it does not
+        // own; self-flush makes the bytes durable BEFORE the buffer
+        // drops; self-flush FAILURE parks past the cap loud
+        // (parked_gate_timeouts) — RAM is the last-resort custody of
+        // dirty data, exactly like the staging-refusal soft-cap leg.
         if crate::mem_budget::level() == crate::mem_budget::Level::Red {
-            const PARKED_GATE_DEADLINE: Duration = Duration::from_secs(10);
-            let deadline = std::time::Instant::now() + PARKED_GATE_DEADLINE;
-            let mut waited = false;
-            loop {
-                let lvl = crate::mem_budget::level();
-                if lvl != crate::mem_budget::Level::Red {
-                    break;
-                }
-                let cap = crate::mem_budget::effective_parked_cap(MAX_ACTIVE_BLOCK_BUFFERS, lvl);
-                if self.active_block_buffers.len() < cap {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    METRICS.parked_gate_timeouts.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "Red parked-buffer gate: drain made no room in {:?} — parking past \
-                         the cap ({} buffers) to preserve liveness",
-                        PARKED_GATE_DEADLINE,
-                        self.active_block_buffers.len()
-                    );
-                    break;
-                }
-                if !waited {
-                    waited = true;
-                    METRICS.parked_gate_waits.fetch_add(1, Ordering::Relaxed);
-                }
+            let cap = crate::mem_budget::effective_parked_cap(
+                MAX_ACTIVE_BLOCK_BUFFERS,
+                crate::mem_budget::Level::Red,
+            );
+            if self.active_block_buffers.len() >= cap {
+                METRICS.parked_gate_waits.fetch_add(1, Ordering::Relaxed);
+                let assist_ms = std::env::var("SQUEEZEFS_PARKED_GATE_ASSIST_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(250);
+                let deadline = std::time::Instant::now() + Duration::from_millis(assist_ms);
                 let bs = self.router.block_size.load(Ordering::Relaxed).max(1);
                 // Aim one block under the cap so this insert lands within it.
                 let cap_bytes = (cap as u64).saturating_mul(bs).saturating_sub(bs);
-                self.parked_drain_target
-                    .fetch_min(cap_bytes, Ordering::Relaxed);
-                self.ensure_parked_drain_worker();
-                self.parked_drain_kick.notify_one();
-                let progress = self.parked_drain_progress.notified();
-                tokio::select! {
-                    _ = progress => {}
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                while self.active_block_buffers.len() >= cap
+                    && crate::mem_budget::level() == crate::mem_budget::Level::Red
+                    && std::time::Instant::now() < deadline
+                {
+                    self.parked_drain_target
+                        .fetch_min(cap_bytes, Ordering::Relaxed);
+                    self.ensure_parked_drain_worker();
+                    self.parked_drain_kick.notify_one();
+                    let progress = self.parked_drain_progress.notified();
+                    tokio::select! {
+                        _ = progress => {}
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
+                }
+                let still_over = self.active_block_buffers.len() >= cap
+                    && crate::mem_budget::level() == crate::mem_budget::Level::Red;
+                if still_over {
+                    if let Some((ino, b)) = Self::parse_active_block_key(&cache_key) {
+                        let mut data = block_data;
+                        // §5.3 exit 2: zero-complete Fresh buffers before
+                        // their bytes leave RAM (hole intervals materialize
+                        // as zeros — recycled pool bytes never escape).
+                        data.zero_complete();
+                        match upload_active_block_bytes(
+                            ino,
+                            b,
+                            data.snapshot(),
+                            fencing_token,
+                            &self.router,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                METRICS
+                                    .parked_gate_self_flushes
+                                    .fetch_add(1, Ordering::Relaxed);
+                                // A staler STAGED image under this key (an
+                                // earlier spill) must not outlive the newer
+                                // durable merge — same fencing-checked
+                                // remove as flush_one_active_block, on the
+                                // blocking pool (shard write lock).
+                                let nvme = self.router.cache.nvme.clone();
+                                let key = cache_key.clone();
+                                let token = fencing_token;
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    match nvme.get_staged_fencing_token(&key) {
+                                        Some(tok) if tok != token => {}
+                                        _ => {
+                                            nvme.remove_active_block(&key);
+                                        }
+                                    }
+                                })
+                                .await;
+                                return;
+                            }
+                            Err(e) => {
+                                METRICS.parked_gate_timeouts.fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    "Red parked-buffer gate: self-flush of ino {} block {} \
+                                     failed ({:?}) — parking past the cap ({} buffers) to \
+                                     preserve the dirty bytes",
+                                    ino,
+                                    b,
+                                    e,
+                                    self.active_block_buffers.len()
+                                );
+                                self.active_block_buffers.insert(cache_key, data);
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         }

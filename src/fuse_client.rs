@@ -3288,22 +3288,34 @@ impl Filesystem for SqueezefsFilesystem {
                     // abandonment semantics (in-flight fills settle wasted).
                     Arc::new(move |_| lanes.invalidate_all()),
                 ));
+                // The two mmap tiers are attribution-only (§5.7): their
+                // logical bytes sit over kernel-reclaimable page cache —
+                // counting them as pressure pinned phantom Red through the
+                // f1 rand passes (5 GiB of already-reclaimed tier bytes)
+                // while the REAL kill-relevant residue (dirty/writeback)
+                // is measured by the unreclaimable arm.
                 let staging = self.router.cache.nvme.clone();
-                MEM_BUDGET.register(Component::new(
-                    "staging_mmap",
-                    0,
-                    0, // weight 0: staging keeps its existing refusal behavior
-                    Arc::new(move || staging.current_staged_write_bytes()),
-                    Arc::new(|_| {}),
-                ));
+                MEM_BUDGET.register(
+                    Component::new(
+                        "staging_mmap",
+                        0,
+                        0, // weight 0: staging keeps its existing refusal behavior
+                        Arc::new(move || staging.current_staged_write_bytes()),
+                        Arc::new(|_| {}),
+                    )
+                    .kernel_reclaimable(),
+                );
                 let tier = self.router.cache.nvme.clone();
-                MEM_BUDGET.register(Component::new(
-                    "read_tier_mmap",
-                    0,
-                    0, // mmap residency is kernel-owned; reclaim_extent is churn-driven (§5.7)
-                    Arc::new(move || tier.current_read_cache_bytes()),
-                    Arc::new(|_| {}),
-                ));
+                MEM_BUDGET.register(
+                    Component::new(
+                        "read_tier_mmap",
+                        0,
+                        0, // mmap residency is kernel-owned; reclaim_extent is churn-driven (§5.7)
+                        Arc::new(move || tier.current_read_cache_bytes()),
+                        Arc::new(|_| {}),
+                    )
+                    .kernel_reclaimable(),
+                );
                 // RAM metadata caches (refill-from-backend caches — a Red
                 // clear is always correctness-safe). Gauges are
                 // conservative per-entry estimates: the VALUE here is the

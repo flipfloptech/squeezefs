@@ -122,6 +122,13 @@ pub struct Component {
     /// Shed toward `target` bytes through the component's own never-lossy
     /// mechanism (early flush, probation drop, plan clear, pool trim).
     pub shed: Arc<dyn Fn(u64) + Send + Sync>,
+    /// This component's bytes are kernel-reclaimable page cache (the mmap
+    /// tiers): registered for ATTRIBUTION (stats registry, full gauge
+    /// sum) but EXCLUDED from the pressure basis — the f1 verification
+    /// trace showed 5 GiB of already-reclaimed tier logical bytes pinning
+    /// phantom Red through the rand passes. Their kill-relevant residue
+    /// (dirty/writeback) is what the unreclaimable arm measures.
+    kernel_reclaimable: bool,
     sheds: AtomicU64,
     shed_target_bytes: AtomicU64,
 }
@@ -140,9 +147,17 @@ impl Component {
             floor,
             weight,
             shed,
+            kernel_reclaimable: false,
             sheds: AtomicU64::new(0),
             shed_target_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Builder: mark this component's bytes as kernel-reclaimable page
+    /// cache (see the field doc — attribution-only, never pressure).
+    pub fn kernel_reclaimable(mut self) -> Self {
+        self.kernel_reclaimable = true;
+        self
     }
 
     pub fn sheds(&self) -> u64 {
@@ -338,9 +353,21 @@ impl MemBudget {
         self.unreclaimable.store(unreclaim_max, Relaxed);
 
         let reg = self.registry.load();
-        let gauge_sum: u64 = reg.iter().map(|c| (c.current)()).sum();
+        // Full registry sum: the ATTRIBUTION surface (stats). The pressure
+        // basis excludes kernel-reclaimable components — their logical
+        // bytes over reclaimed pages are phantom pressure (f1 trace), and
+        // their kill-relevant residue arrives via the unreclaimable arm.
+        let mut gauge_sum = 0u64;
+        let mut pressure_gauges = 0u64;
+        for c in reg.iter() {
+            let cur = (c.current)();
+            gauge_sum += cur;
+            if !c.kernel_reclaimable {
+                pressure_gauges += cur;
+            }
+        }
         self.gauge_sum.store(gauge_sum, Relaxed);
-        let pressure = gauge_sum.max(rss_max).max(unreclaim_max);
+        let pressure = pressure_gauges.max(rss_max).max(unreclaim_max);
         self.pressure.store(pressure, Relaxed);
 
         if budget == 0 {

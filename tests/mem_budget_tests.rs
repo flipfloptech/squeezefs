@@ -520,6 +520,57 @@ fn red_convergence_under_admission_storm() {
 }
 
 #[test]
+fn kernel_reclaimable_components_do_not_drive_pressure() {
+    // The f1 verification run's honest lesson (trace committed with the
+    // closing note): read_tier_mmap's LOGICAL gauge (5 GiB of tier bytes
+    // whose resident pages the kernel had already reclaimed) pinned the
+    // level at Red through the rand passes — phantom pressure — and the
+    // Red parked gate then throttled rand-write to drain speed for
+    // nothing. Components whose bytes are kernel-reclaimable page cache
+    // (the mmap tiers) must be visible in the stats registry for
+    // attribution but EXCLUDED from the pressure basis: their
+    // kill-relevant residue (dirty/writeback) is exactly what the
+    // unreclaimable arm measures.
+    let b = MemBudget::new_for_test();
+    let ga = Arc::new(AtomicU64::new(400));
+    b.register(comp("anon_ish", ga, 0, 1, Arc::new(Mutex::new(Vec::new()))));
+    let gt = Arc::new(AtomicU64::new(5000));
+    let gt_gauge = gt.clone();
+    b.register(
+        Component::new(
+            "tier_mmap",
+            0,
+            0,
+            Arc::new(move || gt_gauge.load(Ordering::Relaxed)),
+            Arc::new(|_| {}),
+        )
+        .kernel_reclaimable(),
+    );
+
+    b.tick_inner(1000, 0, 0);
+    assert_eq!(
+        b.level(),
+        Level::Green,
+        "5000 reclaimable + 400 real against 1000 must NOT be pressure"
+    );
+    assert_eq!(
+        b.pressure_bytes(),
+        400,
+        "pressure basis excludes reclaimable"
+    );
+    assert_eq!(
+        b.gauge_sum_bytes(),
+        5400,
+        "the attribution surface still reports the full registry sum"
+    );
+
+    // The kill-relevant residue of those tier bytes (dirty/writeback)
+    // arrives through the unreclaimable arm and stays authoritative.
+    b.tick_inner(1000, 0, 990);
+    assert_eq!(b.level(), Level::Red);
+}
+
+#[test]
 fn memory_stat_unreclaimable_parser() {
     // The kill-relevant set: anon + dirty + writeback + shmem +
     // unevictable + unreclaimable slab. Clean file cache (`file` minus

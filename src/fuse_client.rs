@@ -7353,6 +7353,87 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
+    /// NEVER-LOSSY WRITEBACK, pinned (the multi-volume bench-suite EIO):
+    /// a writeback unit whose upload keeps failing has its bytes SAFE in
+    /// staging (never-lossy custody) — the retry ladder must therefore
+    /// never park the request on a sticky per-ino failure map that later
+    /// poisons fsync into EIO after the condition healed. The taped
+    /// cascade: churn overshoot → transient upload failures → 4 retries
+    /// in ~0.75 s → sticky → the bench write-rand pass's per-file
+    /// `sync_all` returns the errno → the suite dies while the daemon and
+    /// every byte are fine. fsync's honest error surface is its OWN
+    /// synchronous flush of the same staged blocks.
+    ///
+    /// Contract: a requeue that finds the queue FULL must WAIT (bounded
+    /// await, never drop, never sticky) — the sticky map must stay empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writeback_requeue_on_full_queue_never_goes_sticky() {
+        let ino = 990_001u64;
+        WRITEBACK_HARD_FAILURES.remove(&ino);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WritebackRequest>(1);
+        // Occupy the single slot so the requeue hits Full.
+        tx.try_send(WritebackRequest {
+            ino: 1,
+            block_idx: 0,
+            fencing_token: 1,
+            attempts: 0,
+        })
+        .unwrap();
+        let req = WritebackRequest {
+            ino,
+            block_idx: 7,
+            fencing_token: 1,
+            attempts: 0,
+        };
+        let tx2 = tx.clone();
+        let requeue = tokio::spawn(async move {
+            requeue_or_hard_fail(&tx2, req, "transient upload failure".into()).await;
+        });
+        // Give the requeue a moment to hit the Full arm, then drain.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = rx.recv().await; // frees the slot
+        requeue.await.unwrap();
+        assert!(
+            !WRITEBACK_HARD_FAILURES.contains_key(&ino),
+            "a FULL requeue queue must never mark a sticky hard failure — \
+             the bytes are safe in staging and the queue drains"
+        );
+        // The request must still be queued (never lost).
+        let got = rx.recv().await.expect("requeued unit");
+        assert_eq!(got.ino, ino);
+        assert_eq!(got.block_idx, 7);
+    }
+
+    /// Contract: EXHAUSTED bounded retries re-enqueue with capped backoff
+    /// (observability counter, no sticky map entry) — retry-forever is the
+    /// only disposition consistent with never-lossy custody; genuinely
+    /// superseded units (fencing) already no-op inside the flush unit and
+    /// never reach this ladder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writeback_exhausted_retries_requeue_forever_not_sticky() {
+        let ino = 990_002u64;
+        WRITEBACK_HARD_FAILURES.remove(&ino);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WritebackRequest>(8);
+        let req = WritebackRequest {
+            ino,
+            block_idx: 3,
+            fencing_token: 1,
+            attempts: WRITEBACK_MAX_ATTEMPTS - 1,
+        };
+        requeue_or_hard_fail(&tx, req, "transient upload failure".into()).await;
+        assert!(
+            !WRITEBACK_HARD_FAILURES.contains_key(&ino),
+            "exhausted retries must NOT poison the ino sticky — the staged \
+             bytes are intact and a later flush (or fsync's own synchronous \
+             flush) is the honest surface"
+        );
+        let got = rx
+            .try_recv()
+            .expect("exhausted unit must be RE-ENQUEUED (retry forever), not dropped");
+        assert_eq!(got.ino, ino);
+        assert_eq!(got.block_idx, 3);
+    }
+
     /// `SQUEEZEFS_TIMEOUT` is a LAUNCH-TIME knob: the op timeout must be
     /// resolved once and memoized, not re-read per FUSE op —
     /// `std::env::var` takes the process-global env lock and allocates,

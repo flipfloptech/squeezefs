@@ -87,6 +87,11 @@ pub const FEATURE_INCOMPAT_KV_V3: u64 = 1 << 0;
 /// counter above every persisted frame stamp). Set on every volume
 /// formatted since; pre-watermark v3 volumes refuse loud (their ledger
 /// slots also no longer decode) — forward-only, reformat required.
+/// `format --force` delivers that reformat: the format preflight
+/// degrades every refused superblock class to its plain force gate
+/// (`kv::builder::format_preflight` — refused classes cannot host live
+/// current clients by construction), so this refusal never blocks the
+/// remedy it demands.
 pub const FEATURE_INCOMPAT_NODE_SEQ_WATERMARK: u64 = 1 << 1;
 
 /// Incompat feature bits this binary understands. Any other set bit

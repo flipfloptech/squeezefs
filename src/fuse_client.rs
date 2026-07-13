@@ -1723,10 +1723,21 @@ impl SqueezefsFilesystem {
             };
             if block_data.seed_deferred() {
                 // Item B stage exit: the uncovered complement owes old
-                // bytes — never zeros.
+                // bytes — never zeros. A failed materialize RE-PARKS the
+                // buffer before propagating (never-lossy: the ACKed bytes
+                // stay in RAM custody, readers keep serving them, and a
+                // healed retry flushes the SAME preserved bytes); dropping
+                // it here would make the next fsync succeed vacuously with
+                // the write silently lost.
                 let file_path = crate::keys::inode_path(ino);
-                self.materialize_deferred_seed(&file_path, b, &mut block_data)
-                    .await?;
+                if let Err(e) = self
+                    .materialize_deferred_seed(&file_path, b, &mut block_data)
+                    .await
+                {
+                    self.active_block_buffers.insert(key, block_data);
+                    drop(block_guard);
+                    return Err(e);
+                }
             }
             block_data.zero_complete();
             let nvme_clone = self.router.cache.nvme.clone();
@@ -1905,8 +1916,17 @@ impl SqueezefsFilesystem {
                     let (c0, c1) = (c0 as usize, c1 as usize);
                     let gap = c0 != c1 && (rel_start > c1 || rel_start + slice_len < c0);
                     if gap {
-                        self.materialize_deferred_seed(&file_path, b as u32, &mut block_data)
-                            .await?;
+                        if let Err(e) = self
+                            .materialize_deferred_seed(&file_path, b as u32, &mut block_data)
+                            .await
+                        {
+                            // Never-lossy: the previously-ACKed covered
+                            // bytes RE-PARK unmerged; only THIS write —
+                            // never merged, never ACKed — fails loud.
+                            self.active_block_buffers
+                                .insert(cache_key.clone(), block_data);
+                            return Err(e);
+                        }
                     }
                 }
                 block_data.record_write(rel_start, rel_start + slice_len);
@@ -1924,8 +1944,25 @@ impl SqueezefsFilesystem {
                     if block_data.seed_deferred() {
                         // Trigger with partial coverage (stream started
                         // mid-block): the uncovered head owes old bytes.
-                        self.materialize_deferred_seed(&file_path, b as u32, &mut block_data)
-                            .await?;
+                        // The request slice is already merged, so a failed
+                        // materialize PARKS instead of writing through (the
+                        // staging-refusal precedent): the write ACKs, the
+                        // error surfaces at fsync's materialize, nothing is
+                        // lost and no zeros are codified.
+                        if let Err(e) = self
+                            .materialize_deferred_seed(&file_path, b as u32, &mut block_data)
+                            .await
+                        {
+                            warn!(
+                                "deferred RMW seed for ino {} block {} unreadable at \
+                                 write-through ({:?}); parking — fsync surfaces the error",
+                                ino, b, e
+                            );
+                            self.active_block_buffers
+                                .insert(cache_key.clone(), block_data);
+                            std::mem::drop(block_guard);
+                            return Ok::<(), SqueezefsError>(());
+                        }
                     }
                     block_data.zero_complete();
                     match self
@@ -4114,19 +4151,27 @@ impl Filesystem for SqueezefsFilesystem {
                         // Item B: the uncovered complement owes the OLD
                         // block's bytes (not zeros). Materialize under the
                         // block lock — the reader pays the read the writer
-                        // deferred — then serve the merged content.
+                        // deferred — then serve the merged content. The
+                        // buffer is CHECKED OUT (remove → own → re-insert)
+                        // for the await, never mutated through a held map
+                        // guard: a dashmap RefMut held across an await
+                        // parks every same-shard reader on an OS thread
+                        // (the §5.5 executor-starvation wedge class). On a
+                        // failed materialize the buffer re-parks unchanged
+                        // (never-lossy) and the read fails loud.
                         let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, start_block as u32);
                         let _block_guard = block_lock.lock().await;
-                        if let Some(mut entry) = self.active_block_buffers.get_mut(&cache_key) {
-                            self.materialize_deferred_seed(
-                                &file_path,
-                                start_block as u32,
-                                entry.value_mut(),
-                            )
-                            .await
-                            .map_err(map_squeezefs_err)?;
-                            let snap = entry.value().snapshot();
-                            drop(entry);
+                        if let Some((_, mut owned)) = self.active_block_buffers.remove(&cache_key) {
+                            let materialized = self
+                                .materialize_deferred_seed(
+                                    &file_path,
+                                    start_block as u32,
+                                    &mut owned,
+                                )
+                                .await;
+                            let snap = owned.snapshot();
+                            self.active_block_buffers.insert(cache_key.clone(), owned);
+                            materialized.map_err(map_squeezefs_err)?;
                             return Ok(ReplyData {
                                 data: snap.slice(rel_offset..rel_end),
                                 backing: None,

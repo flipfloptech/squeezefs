@@ -1230,7 +1230,10 @@ async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
     // The ACKed bytes serve from the parked overlay while the seed is
     // still deferred (covered-range read — no materialize needed).
     let got = read_at(&h, ino, (block + 10) as u64, patch.len() as u32).await;
-    assert_eq!(got, patch, "ACKed bytes must serve from the deferred overlay");
+    assert_eq!(
+        got, patch,
+        "ACKed bytes must serve from the deferred overlay"
+    );
 
     // The flush boundary is where the deferred seed materializes: the
     // fill misses every cache and device-reads the in-flight key. The

@@ -6996,10 +6996,31 @@ async fn requeue_or_hard_fail(
     req.attempts += 1;
     let backoff_ms = 50u64.saturating_mul(1u64 << req.attempts.min(6));
     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-    if let Err(e) = requeue_tx.send(req).await {
-        // Channel closed: daemon shutdown — the dismount force-flush owns
-        // every staged block from here (never-lossy teardown).
-        warn!("Constant Writeback: requeue after shutdown ({e}); unit handed to teardown");
+    // Wait for queue room WITHOUT a bare `send().await`: this task's own
+    // sender clone keeps the channel open, so a full queue whose RECEIVER
+    // already exited (dismount) would park the send forever and wedge
+    // daemon exit. try_send + is_closed polling escapes to teardown —
+    // which owns every staged block from there (never-lossy teardown).
+    let mut unit = req;
+    loop {
+        match requeue_tx.try_send(unit) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                warn!("Constant Writeback: requeue after shutdown; unit handed to teardown");
+                return;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(r)) => {
+                if requeue_tx.is_closed() {
+                    warn!(
+                        "Constant Writeback: queue receiver gone at shutdown; \
+                         unit handed to teardown"
+                    );
+                    return;
+                }
+                unit = r;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
     }
 }
 

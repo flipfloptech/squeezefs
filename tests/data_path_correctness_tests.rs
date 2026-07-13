@@ -1165,11 +1165,19 @@ async fn test_rmw_seed_nvme_tier_hit_does_not_repromote_into_ram_lru() {
 /// publishing would poison the key for its (new) owner. Since the
 /// binding-validated serve (the reused-key stale-fill fix), the seed also
 /// refuses to USE such unproven bytes at all: a still-mapped key that never
-/// settles is indistinguishable from a key mid-reallocation, so the write
+/// settles is indistinguishable from a key mid-reallocation, so the seed
 /// fails LOUD (EIO after bounded rebind retries) instead of merging user
-/// data over bytes that may belong to a dead incarnation. In production the
-/// state is transient by protocol — owners publish before merging — so a
-/// retry against a settled map succeeds (the heal leg below).
+/// data over bytes that may belong to a dead incarnation.
+///
+/// Item B (the overwrite lazy-RMW seed) moved the seed read from write()
+/// time to the last responsible moment, so the refusal surface moved with
+/// it: the partial overwrite now ACKs with the seed DEFERRED (no device
+/// read), and the loud failure lands at the flush boundary — fsync — the
+/// POSIX delayed-write-error surface. Custody is never-lossy across the
+/// refusal: the ACKed bytes stay in the parked RAM overlay (served to
+/// readers), and once the owner publishes (the transient window closes,
+/// as every production owner does before merging) the SAME preserved
+/// bytes flush durably without the application re-writing anything.
 #[tokio::test]
 async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
     let h = make().await;
@@ -1213,25 +1221,27 @@ async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
     h.fs.router.cache.read_lru.remove(&dk);
     h.fs.router.cache.nvme.remove_cached_read_block(&dk);
 
-    // Partial overwrite INSIDE block 1: the seed misses every cache and
-    // device-reads the in-flight key. The unproven bytes must be refused
-    // loud — not merged, not published.
+    // Partial overwrite INSIDE block 1: item B DEFERS the seed, so the
+    // write ACKs without touching the in-flight key (no device read at
+    // write time — that is the whole point of the lazy seed).
     let patch: Vec<u8> = (0..100).map(|i| ((i % 97) as u8) ^ 0x33).collect();
-    let refused =
-        h.fs.write(
-            h.req,
-            ino,
-            0,
-            (block + 10) as u64,
-            bytes::Bytes::copy_from_slice(&patch),
-            0,
-            0,
-        )
-        .await;
+    write_at(&h, ino, (block + 10) as u64, &patch).await;
+
+    // The ACKed bytes serve from the parked overlay while the seed is
+    // still deferred (covered-range read — no materialize needed).
+    let got = read_at(&h, ino, (block + 10) as u64, patch.len() as u32).await;
+    assert_eq!(got, patch, "ACKed bytes must serve from the deferred overlay");
+
+    // The flush boundary is where the deferred seed materializes: the
+    // fill misses every cache and device-reads the in-flight key. The
+    // unproven bytes must be refused loud — not merged, not published.
+    let fencing_token = h.fs.router.dlm.get_fencing_token_ino(ino);
+    let refused = h.fs.flush_inode_to_backend(ino, fencing_token).await;
     assert!(
         refused.is_err(),
-        "RMW seed merged over a never-settling UNSTABLE incarnation instead \
-         of failing loud — user data over possibly-dead bytes"
+        "deferred RMW seed merged over a never-settling UNSTABLE incarnation \
+         at flush time instead of failing loud — user data over possibly-dead \
+         bytes"
     );
 
     assert!(
@@ -1245,7 +1255,7 @@ async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
          the NVMe read tier — an unvalidated fill that poisons the key's owner"
     );
 
-    // Sanity: the refused write left OUR in-flight mapping in place (the
+    // Sanity: the refused flush left OUR in-flight mapping in place (the
     // seed really resolved `dk` and retried against it).
     let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
     assert_eq!(
@@ -1254,11 +1264,24 @@ async fn test_rmw_seed_fill_must_not_publish_unstable_incarnation() {
         "test premise: block 1 must still resolve to the in-flight key"
     );
 
+    // NEVER-LOSSY CUSTODY: the refused flush must leave the ACKed bytes in
+    // RAM custody — a dropped parked buffer here would make the NEXT fsync
+    // succeed vacuously with the write silently lost.
+    let got = read_at(&h, ino, (block + 10) as u64, patch.len() as u32).await;
+    assert_eq!(
+        got, patch,
+        "refused flush dropped the parked overlay — ACKed bytes lost from \
+         RAM custody (the next fsync would succeed with the write gone)"
+    );
+
     // Heal leg: the owner publishes (the transient window closes, as every
-    // production owner does before merging) — the same write now seeds from
-    // the settled incarnation and succeeds.
+    // production owner does before merging) — the SAME preserved bytes now
+    // seed from the settled incarnation and flush durably, with no
+    // application re-write.
     allocator.publish_block(dest);
-    write_at(&h, ino, (block + 10) as u64, &patch).await;
+    h.fs.flush_inode_to_backend(ino, fencing_token)
+        .await
+        .expect("post-publish flush must succeed from preserved custody");
     let mut expected = seeded.clone();
     expected[10..110].copy_from_slice(&patch);
     let got = read_at(&h, ino, block as u64, block as u32).await;

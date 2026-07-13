@@ -1164,3 +1164,114 @@ async fn test_block_allocator_recovery() {
         );
     }
 }
+
+/// Superseded-token writeback units must ADOPT the current fencing epoch and
+/// merge — never spin forever with a dead token and never leak a published
+/// block per attempt (the generic/074-shape strand: release() spawns the
+/// background flush with token T and drops the lease; the next open bumps to
+/// T+1..T+n; every queued unit's merge then fails FencingTokenExpired while
+/// its staged bytes — the ONLY durable-path copy of ACKED data — sit
+/// stranded, and each retry's published-then-unmerged block leaks device
+/// space).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_stale_token_writeback_adopts_current_epoch_no_leak() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
+    std::env::remove_var("SQUEEZEFS_WRITEBACK_QUEUE_CAP");
+
+    let dlm = DlmClient::new("local").unwrap();
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), "stale_token_wb")
+            .await
+            .unwrap(),
+    );
+    let staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![staging.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("128MB"),
+        Some("128MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba.clone(), nvme);
+    let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+    let meta_temp = NamedTempFile::new().unwrap();
+    let meta_backend = open_v3_meta(meta_temp.path(), 256 * 1024 * 1024).await;
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        meta_backend,
+    ]));
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed);
+    let req = fuse3::raw::Request {
+        unique: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        pid: 1,
+    };
+
+    let ino = fs
+        .create(
+            req,
+            1,
+            OsStr::new("stale_tok.bin"),
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .unwrap()
+        .attr
+        .ino;
+
+    // Striped file: two full 4 KiB blocks through the write path (write-
+    // through stages + enqueues writeback units carrying the CURRENT token).
+    let data = vec![0xAAu8; 8192 + 1];
+    fs.write(req, ino, 0, 0, bytes::Bytes::copy_from_slice(&data), 0, 0)
+        .await
+        .unwrap();
+
+    // Supersede the token HARD: burn 40 lease epochs (each acquire bumps the
+    // fencing counter), exactly the release/reopen churn shape.
+    let path = squeezefs::keys::inode_path(ino);
+    fs.invalidate_local_lease(ino);
+    for _ in 0..40 {
+        let l = dlm
+            .acquire_lock(&path, None, Duration::from_secs(5))
+            .await
+            .unwrap();
+        drop(l);
+    }
+
+    // fsync drives the staged blocks durable through the flush units. With
+    // the dead-token strand, this either errors or leaves the map short and
+    // leaks one published block per retry.
+    fs.fsync(req, ino, 0, false).await.expect("fsync clean");
+
+    // Every staged block must have merged into the durable map.
+    let meta = fs.router.fetch_metadata(&path).await.unwrap();
+    let mapped = meta.block_map.as_ref().map(|m| m.len()).unwrap_or(0);
+    assert!(
+        mapped >= 2,
+        "staged blocks stranded by dead-token writeback: only {mapped} of >=2 merged"
+    );
+
+    // No per-retry leak: used blocks == mapped blocks (each block exactly one
+    // device allocation; nothing published-but-unmerged left behind).
+    let used = ba.get_used_blocks();
+    assert!(
+        used <= mapped as u64 + 1,
+        "leaked published-but-unmerged blocks: used={used} mapped={mapped}"
+    );
+}

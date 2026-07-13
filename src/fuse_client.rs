@@ -7229,7 +7229,7 @@ async fn flush_one_active_block(
         // start-of-call `old_block_key` free was exactly the stale-snapshot
         // anti-pattern the routing merge comment forbids.
         let entries = [(b, stored_block_key.clone())];
-        let Some(displaced) = router
+        let merge_res = router
             .merge_block_mappings_if_epoch(
                 ino,
                 crate::routing::BlockMapOp::Merge(&entries),
@@ -7238,8 +7238,19 @@ async fn flush_one_active_block(
                 fencing_token,
                 Some(capture_epoch),
             )
-            .await?
-        else {
+            .await;
+        let displaced = match merge_res {
+            Ok(d) => d,
+            Err(e) => {
+                // The uploaded block never reached the map: free it before
+                // propagating, or every retry of a failing merge (e.g. a
+                // superseded fencing token between release and reopen)
+                // leaks one published block of device space.
+                let _ = block_allocator.free_block(offset).await;
+                return Err(e);
+            }
+        };
+        let Some(displaced) = displaced else {
             // A prune invalidated this capture (hazard 2): the uploaded
             // block is unreachable — free it and re-capture.
             let _ = block_allocator.free_block(offset).await;

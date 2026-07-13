@@ -3156,13 +3156,26 @@ impl DataRouter {
     /// layout is published (backend as applicable + RAM cache): the staging
     /// ring entry (returns its budget) and any promoted/spilled durable
     /// copies the new layout no longer references. Callers hold the
-    /// per-inode metadata lock; `old_maps` are the pre-publish snapshots
-    /// (write-entry meta + last cached meta) so a promotion that landed
-    /// between them cannot leak its block.
+    /// per-inode metadata lock; `old_map` is the LAST PUBLISHED layout's
+    /// map, captured UNDER that lock immediately before the caller's commit
+    /// (`metadata_cache.get` at the top of the locked section).
+    ///
+    /// NEVER pass the op-entry `meta` snapshot: any mapping present there
+    /// but absent from the under-lock state was already displaced by an
+    /// intermediate commit (promotion re-publish, spill, truncate clip) —
+    /// and every displacing commit frees what it displaced, so freeing the
+    /// stale key again is a DOUBLE FREE. `free_block` punches the device
+    /// extent, so when the offset had already been reallocated the second
+    /// free zeroed a LIVE block under its new owner — scattered durable
+    /// zero runs for acked data (the aged zeros-LOSS residual: one device
+    /// offset cycling as `block_map[0]` across consecutive promotions on
+    /// the failure tape). A promotion that lands between the caller's
+    /// snapshot and its lock cannot leak: its published mapping IS the
+    /// under-lock state this frees.
     async fn release_superseded_staged(
         &self,
         old_ring_id: Option<&str>,
-        old_maps: [Option<&std::collections::HashMap<u32, String>>; 2],
+        old_map: Option<&std::collections::HashMap<u32, String>>,
         keep_block_key: Option<&str>,
     ) {
         if let Some(fid) = old_ring_id {
@@ -3170,7 +3183,7 @@ impl DataRouter {
             let _ = self.cache.nvme.remove_staged_async(fid.to_string()).await;
         }
         let mut freed = std::collections::HashSet::new();
-        for map in old_maps.into_iter().flatten() {
+        for map in old_map.into_iter() {
             for bk in map.values() {
                 if keep_block_key == Some(bk.as_str()) || !freed.insert(bk.clone()) {
                     continue;
@@ -3657,10 +3670,7 @@ impl DataRouter {
                 // (budget) and any promoted/spilled durable copy.
                 self.release_superseded_staged(
                     meta.file_id.as_deref(),
-                    [
-                        meta.block_map.as_ref(),
-                        fresh.as_ref().and_then(|f| f.block_map.as_ref()),
-                    ],
+                    fresh.as_ref().and_then(|f| f.block_map.as_ref()),
                     None,
                 )
                 .await;
@@ -3729,10 +3739,7 @@ impl DataRouter {
             // entry and/or a durable copy behind: release them.
             self.release_superseded_staged(
                 meta.file_id.as_deref(),
-                [
-                    meta.block_map.as_ref(),
-                    fresh.as_ref().and_then(|f| f.block_map.as_ref()),
-                ],
+                fresh.as_ref().and_then(|f| f.block_map.as_ref()),
                 None,
             )
             .await;
@@ -3791,10 +3798,7 @@ impl DataRouter {
                     // fresh data (replaced in-place by stage_write) — keep it.
                     self.release_superseded_staged(
                         None,
-                        [
-                            meta.block_map.as_ref(),
-                            fresh.as_ref().and_then(|f| f.block_map.as_ref()),
-                        ],
+                        fresh.as_ref().and_then(|f| f.block_map.as_ref()),
                         None,
                     )
                     .await;
@@ -3875,10 +3879,7 @@ impl DataRouter {
                     // budget) and any older durable copy it had.
                     self.release_superseded_staged(
                         meta.file_id.as_deref(),
-                        [
-                            meta.block_map.as_ref(),
-                            fresh.as_ref().and_then(|f| f.block_map.as_ref()),
-                        ],
+                        fresh.as_ref().and_then(|f| f.block_map.as_ref()),
                         Some(&stored_block_key),
                     )
                     .await;

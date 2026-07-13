@@ -421,6 +421,113 @@ async fn extend_vs_promotion_never_strands_payload() {
     }
 }
 
+/// Directed hammer for the superseded-mapping DOUBLE-FREE: ring-miss RMW
+/// patches against promoted files. The RMW's stage-commit released the
+/// durable mapping from its STALE pre-commit snapshot while a racing
+/// promotion commit had already displaced-freed the same mapping — the
+/// offset was freed twice, reallocated to ANOTHER file's promotion, then
+/// punched/overwritten under the new owner: reads and RMW seeds through
+/// the clobbered mapping returned another tenant's bytes or zeros (the
+/// aged tape: one device offset cycling as map0 across consecutive
+/// promotions and into the truncate clip's own allocation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn promote_patch_cycles_never_clobber_neighbor_mappings() {
+    const FILES: usize = 8;
+    const ROUNDS: usize = 60;
+    let h = Arc::new(make(*b"szl-mfp-dblfree1", "mfp_ns_d", "1MB").await);
+    let mut tasks = Vec::new();
+    for i in 0..FILES {
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            let ino =
+                h.fs.create(
+                    h.req,
+                    1,
+                    OsStr::new(&format!("dbl_{i}")),
+                    libc::S_IFREG | 0o644,
+                    0,
+                )
+                .await
+                .unwrap()
+                .attr
+                .ino;
+            let path = squeezefs::keys::inode_path(ino);
+            let mut rng = Lcg(0x00DB_1F00 + i as u64);
+            let mut model: Vec<u8> = Vec::new();
+            for round in 0..ROUNDS {
+                // Big write: crosses the ring high-water mark => promotion
+                // of this file is enqueued.
+                let body = 192 * 1024 + (rng.next() % (64 * 1024)) as usize;
+                let val = (round % 249) as u8 | 1;
+                h.fs.write(h.req, ino, 0, 0, bytes::Bytes::from(vec![val; body]), 0, 0)
+                    .await
+                    .unwrap();
+                model.clear();
+                model.resize(body, val);
+
+                // Wait (bounded) until the promotion PUBLISHES the mapping —
+                // the next patch then runs the ring-miss RMW + stale-snapshot
+                // release against a fresh re-promotion cycle.
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+                    loop {
+                        let promoted = h
+                            .fs
+                            .router
+                            .metadata_cache
+                            .get(&path)
+                            .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()))
+                            .is_some();
+                        if promoted {
+                            return;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+
+                // Sub-block patches: each is a whole-image RMW re-stage that
+                // supersedes (and frees) the promoted mapping, then crosses
+                // high-water again and re-promotes.
+                for _ in 0..3 {
+                    let off = rng.next() % (body as u64 - 4096);
+                    h.fs.write(
+                        h.req,
+                        ino,
+                        0,
+                        off,
+                        bytes::Bytes::from(vec![0xEE; 4096]),
+                        0,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                    model[off as usize..off as usize + 4096].fill(0xEE);
+                }
+
+                let got =
+                    h.fs.read(h.req, ino, 0, 0, body as u32, 0)
+                        .await
+                        .unwrap_or_else(|e| panic!("file{i} round {round}: read failed {e:?}"))
+                        .data
+                        .to_vec();
+                assert_eq!(got.len(), body, "file{i} round {round}: short read");
+                if let Some(p) = (0..body).find(|&p| got[p] != model[p]) {
+                    let zeros = got.iter().filter(|&&b| b == 0).count();
+                    panic!(
+                        "file{i} round {round}: byte {p} reads {:#04x} want {:#04x} \
+                         ({zeros}/{body} zero) — a neighbor's promotion/free clobbered \
+                         this file's durable mapping (the double-free engine)",
+                        got[p], model[p]
+                    );
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.expect("worker panicked");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn multifile_ring_pressure_seed_a() {
     multifile_pressure(0x000A_5EED_0001, 6, 120, *b"szl-mfp-seed-a01", "mfp_ns_a").await;

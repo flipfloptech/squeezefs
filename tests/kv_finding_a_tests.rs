@@ -236,6 +236,12 @@ async fn node_seq_mints_stay_above_every_persisted_stamp_across_remount() {
             0,
             "precondition: clean shutdown ⇒ empty replay window (cycle {cycle})"
         );
+        assert!(
+            re.mounted_ledger().node_seq_watermark >= ceiling,
+            "cycle {cycle}: the persisted mint watermark ({}) must cover every stamp \
+             observed live ({ceiling})",
+            re.mounted_ledger().node_seq_watermark
+        );
         let dir2 = re
             .create(
                 ROOT_INO,

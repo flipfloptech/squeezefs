@@ -489,6 +489,24 @@ async fn v3_unknown_incompat_bit_refuses_naming_it_and_unknown_ro_does_not() {
         "the refusal must name the unknown bit, got: {err}"
     );
 
+    // Pre-watermark v3 (incompat bit 1 absent) ⇒ refuse loud, naming the
+    // reformat requirement (Finding A: such a volume's node-seq mints
+    // re-minted across clean remounts; its ledger slots no longer decode
+    // either — forward-only, no shims).
+    let mut pre_watermark = sb.clone();
+    pre_watermark.features_incompat = FEATURE_INCOMPAT_KV_V3;
+    write_superblock_v3(file.path(), &pre_watermark)
+        .await
+        .unwrap();
+    let err = classify_volume(file.path())
+        .await
+        .expect_err("pre-watermark v3 volumes must refuse the mount")
+        .to_string();
+    assert!(
+        err.contains("reformat required") && err.contains("watermark"),
+        "the refusal must name the watermark gate and the remedy, got: {err}"
+    );
+
     // Unknown RO bit ⇒ classification and the read-side mount succeed
     // (§4.11: read-only semantics; K6a's read path has nothing to
     // withhold — K6b withholds the write path).

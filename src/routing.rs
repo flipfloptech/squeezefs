@@ -102,8 +102,8 @@ pub struct CachedMetadata {
     /// copy of every key String (measured 24% of daemon CPU on the cold
     /// rand-4k row as `HashMap::clone` + drop, plus the allocator traffic
     /// serving them). Writers publish copy-on-write: mutate through
-    /// [`Arc::make_mut`] (or build a fresh map) so held snapshots keep
-    /// observing exactly the map they were taken with — pinned by
+    /// [`std::sync::Arc::make_mut`] (or build a fresh map) so held snapshots
+    /// keep observing exactly the map they were taken with — pinned by
     /// `test_block_map_snapshot_independent_of_*`.
     pub block_map: Option<std::sync::Arc<std::collections::HashMap<u32, String>>>,
     /// When true, layout/size live only in RAM (+ staging mmap); must persist on fsync/release.

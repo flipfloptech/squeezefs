@@ -163,7 +163,7 @@ async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
         .to_vec()
 }
 
-async fn block_map_of(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
+async fn block_map_of(h: &H, ino: u64) -> std::sync::Arc<std::collections::HashMap<u32, String>> {
     let path = squeezefs::keys::inode_path(ino);
     h.fs.router
         .fetch_metadata(&path)
@@ -175,13 +175,13 @@ async fn block_map_of(h: &H, ino: u64) -> std::collections::HashMap<u32, String>
 
 /// fsync + purge every current block key through the unified helper —
 /// production cold state (also exercises the helper on every fixture).
-async fn make_cold(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
+async fn make_cold(h: &H, ino: u64) -> std::sync::Arc<std::collections::HashMap<u32, String>> {
     h.fs.fsync(h.req, ino, 0, false).await.unwrap();
     let map = block_map_of(h, ino).await;
     for key in map.values() {
         h.fs.router.cache.purge_block_key(key);
     }
-    for (b, key) in &map {
+    for (b, key) in map.iter() {
         assert!(
             h.fs.router.cache.hot_block.get(key).is_none(),
             "fixture: block {b} must start cold in the hot tier"

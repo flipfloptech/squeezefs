@@ -173,7 +173,7 @@ async fn write_pattern(h: &H, ino: u64, len: u64) {
     }
 }
 
-async fn make_cold(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
+async fn make_cold(h: &H, ino: u64) -> std::sync::Arc<std::collections::HashMap<u32, String>> {
     h.fs.fsync(h.req, ino, 0, false).await.unwrap();
     let path = squeezefs::keys::inode_path(ino);
     let map =

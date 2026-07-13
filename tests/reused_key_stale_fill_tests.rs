@@ -165,7 +165,7 @@ async fn truncate_to(h: &H, ino: u64, size: u64) {
 }
 
 /// Current block map of `ino` as the write paths just published it.
-async fn block_map_of(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
+async fn block_map_of(h: &H, ino: u64) -> std::sync::Arc<std::collections::HashMap<u32, String>> {
     let path = squeezefs::keys::inode_path(ino);
     h.fs.router
         .fetch_metadata(&path)

@@ -96,7 +96,16 @@ pub struct CachedMetadata {
     /// Inline payload held zero-copy: `Bytes` clones are O(1) refcount bumps, so
     /// hot-path `metadata_cache` gets / `meta.clone()` don't deep-copy the file.
     pub data_key: Option<bytes::Bytes>,
-    pub block_map: Option<std::collections::HashMap<u32, String>>,
+    /// Striped block map, shared zero-copy (item A): `CachedMetadata` is
+    /// handed out BY VALUE on every read (moka get + `fetch_metadata`), so
+    /// the map rides an `Arc` — clone = refcount bump, not a per-op deep
+    /// copy of every key String (measured 24% of daemon CPU on the cold
+    /// rand-4k row as `HashMap::clone` + drop, plus the allocator traffic
+    /// serving them). Writers publish copy-on-write: mutate through
+    /// [`Arc::make_mut`] (or build a fresh map) so held snapshots keep
+    /// observing exactly the map they were taken with — pinned by
+    /// `test_block_map_snapshot_independent_of_*`.
+    pub block_map: Option<std::sync::Arc<std::collections::HashMap<u32, String>>>,
     /// When true, layout/size live only in RAM (+ staging mmap); must persist on fsync/release.
     pub layout_dirty: bool,
 }
@@ -1458,7 +1467,7 @@ impl DataRouter {
                         file_id: layout.file_id,
                         cached_at: std::time::Instant::now(),
                         data_key: layout.data_key.map(bytes::Bytes::from),
-                        block_map,
+                        block_map: block_map.map(std::sync::Arc::new),
                         layout_dirty: false,
                     }));
                 }
@@ -1498,7 +1507,7 @@ impl DataRouter {
             block_prefix: m.block_prefix.clone(),
             file_id: m.file_id.clone(),
             data_key: m.data_key.as_ref().map(|b| b.to_vec()),
-            block_map: m.block_map.clone(),
+            block_map: m.block_map.as_deref().cloned(),
         };
 
         // §5.3: spill the inline block map to an indirect block only when the
@@ -2852,7 +2861,10 @@ impl DataRouter {
         };
         if let Some(entry) = self.metadata_cache.get(file_path) {
             if fresh_or_dirty(&entry) {
-                return Ok(entry.clone());
+                // moka's get already returned an owned clone — hand it out
+                // directly (the old `entry.clone()` re-cloned every field
+                // per op on the hot read path).
+                return Ok(entry);
             }
         }
 
@@ -2865,7 +2877,7 @@ impl DataRouter {
         let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
         if let Some(entry) = self.metadata_cache.get(file_path) {
             if fresh_or_dirty(&entry) {
-                return Ok(entry.clone());
+                return Ok(entry);
             }
         }
         if let Some(m) = self.fetch_metadata_from_backend(ino).await? {
@@ -3036,7 +3048,9 @@ impl DataRouter {
             }
             let mut updated = current.clone();
             let mut block_map = updated.block_map.take().unwrap_or_default();
-            let displaced = block_map.insert(0, block_key.clone());
+            // CoW publish: a held reader snapshot keeps its map (pinned by
+            // test_block_map_snapshot_independent_of_*).
+            let displaced = std::sync::Arc::make_mut(&mut block_map).insert(0, block_key.clone());
             updated.block_map = Some(block_map);
             // The promoted image IS acked file content: a `current` snapshot
             // whose size persist lags the blob (the RMW that staged this
@@ -3292,7 +3306,11 @@ impl DataRouter {
             None => self.metadata_cache.get(&file_path).unwrap_or_default(),
         };
 
-        let mut block_map = current.block_map.take().unwrap_or_default();
+        // CoW publish (item A): take the Arc, mutate a uniquely-owned copy
+        // via `make_mut` — held reader snapshots keep the exact map they
+        // were taken with (test_block_map_snapshot_independent_of_*).
+        let mut block_map_arc = current.block_map.take().unwrap_or_default();
+        let block_map = std::sync::Arc::make_mut(&mut block_map_arc);
         let mut displaced: Vec<String> = Vec::new();
         let purge = |bk: &str| {
             // Purge every cache tier for a displaced/removed key: its offset
@@ -3350,7 +3368,7 @@ impl DataRouter {
                 }
             }
         }
-        current.block_map = Some(block_map);
+        current.block_map = Some(block_map_arc);
 
         match layout_flip {
             LayoutFlip::ToStripedKeepStagedIdentity => {
@@ -3754,7 +3772,7 @@ impl DataRouter {
                 let mut updated_meta = meta.clone();
                 updated_meta.file_type = "striped".to_string();
                 updated_meta.size = new_size as u64;
-                updated_meta.block_map = Some(block_map);
+                updated_meta.block_map = Some(std::sync::Arc::new(block_map));
                 updated_meta.file_id = None;
                 self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
                     .await?;
@@ -3768,7 +3786,7 @@ impl DataRouter {
                 // (budget) and any promoted/spilled durable copy.
                 self.release_superseded_staged(
                     meta.file_id.as_deref(),
-                    fresh.as_ref().and_then(|f| f.block_map.as_ref()),
+                    fresh.as_ref().and_then(|f| f.block_map.as_deref()),
                     None,
                 )
                 .await;
@@ -3837,7 +3855,7 @@ impl DataRouter {
             // entry and/or a durable copy behind: release them.
             self.release_superseded_staged(
                 meta.file_id.as_deref(),
-                fresh.as_ref().and_then(|f| f.block_map.as_ref()),
+                fresh.as_ref().and_then(|f| f.block_map.as_deref()),
                 None,
             )
             .await;
@@ -3923,7 +3941,7 @@ impl DataRouter {
                     if ring_resident {
                         self.release_superseded_staged(
                             None,
-                            fresh.as_ref().and_then(|f| f.block_map.as_ref()),
+                            fresh.as_ref().and_then(|f| f.block_map.as_deref()),
                             None,
                         )
                         .await;
@@ -3994,7 +4012,7 @@ impl DataRouter {
                     updated_meta.size = new_size as u64;
                     updated_meta.file_id = Some(spill_file_id);
                     updated_meta.data_key = None;
-                    updated_meta.block_map = Some(block_map);
+                    updated_meta.block_map = Some(std::sync::Arc::new(block_map));
                     // Durable backend write already happened — commit layout now.
                     updated_meta.layout_dirty = false;
                     self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
@@ -4005,7 +4023,7 @@ impl DataRouter {
                     // budget) and any older durable copy it had.
                     self.release_superseded_staged(
                         meta.file_id.as_deref(),
-                        fresh.as_ref().and_then(|f| f.block_map.as_ref()),
+                        fresh.as_ref().and_then(|f| f.block_map.as_deref()),
                         Some(&stored_block_key),
                     )
                     .await;
@@ -5584,8 +5602,9 @@ impl DataRouter {
             if updated.file_type == "staged" && updated.file_id == snapshot_file_id {
                 if let Some((ref old_bk, ref new_bk)) = clipped_bk {
                     if let Some(ref mut bm) = updated.block_map {
+                        // CoW publish (item A): mutate a uniquely-owned copy.
                         if bm.get(&0) == Some(old_bk) {
-                            bm.insert(0, new_bk.clone());
+                            std::sync::Arc::make_mut(bm).insert(0, new_bk.clone());
                             blocks_to_free.push(old_bk.clone());
                             published = true;
                         }
@@ -5595,7 +5614,7 @@ impl DataRouter {
                 // itself on truncate-to-zero).
                 if let Some(ref mut bm) = updated.block_map {
                     let block_size = self.block_size.load(Ordering::Relaxed);
-                    bm.retain(|&b, bk| {
+                    std::sync::Arc::make_mut(bm).retain(|&b, bk| {
                         let block_start = b as u64 * block_size;
                         if block_start >= new_size {
                             blocks_to_free.push(bk.clone());

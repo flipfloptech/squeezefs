@@ -108,7 +108,7 @@ fn striped_meta(block_map: &[(u32, String)], size: u64, dirty: bool) -> CachedMe
     CachedMetadata {
         file_type: "striped".to_string(),
         size,
-        block_map: Some(block_map.iter().cloned().collect()),
+        block_map: Some(std::sync::Arc::new(block_map.iter().cloned().collect())),
         layout_dirty: dirty,
         ..Default::default()
     }

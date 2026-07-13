@@ -171,7 +171,7 @@ async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
 }
 
 /// Current block map of `ino` as the write paths just published it.
-async fn block_map_of(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
+async fn block_map_of(h: &H, ino: u64) -> std::sync::Arc<std::collections::HashMap<u32, String>> {
     let path = squeezefs::keys::inode_path(ino);
     h.fs.router
         .fetch_metadata(&path)
@@ -196,14 +196,14 @@ fn hot_or_tier_has(h: &H, key: &str) -> bool {
 /// own cache retentions (read-LRU slice retention, tier copies) for every
 /// current block key. Leaves exactly the production cold-read shape: block
 /// map + device bytes, nothing cached. Returns the (post-flush) block map.
-async fn make_cold(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
+async fn make_cold(h: &H, ino: u64) -> std::sync::Arc<std::collections::HashMap<u32, String>> {
     h.fs.fsync(h.req, ino, 0, false).await.unwrap();
     // Map AFTER the flush: flush merges can displace keys.
     let map = block_map_of(h, ino).await;
     for key in map.values() {
         h.fs.router.cache.purge_block_key(key);
     }
-    for (b, key) in &map {
+    for (b, key) in map.iter() {
         assert!(
             !hot_or_tier_has(h, key),
             "fixture: block {b} must start cold in every read tier"

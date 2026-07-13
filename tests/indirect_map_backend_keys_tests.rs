@@ -538,7 +538,7 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
         CachedMetadata {
             file_type: "striped".to_string(),
             size: (SPILL_BLOCKS * BLOCK) as u64,
-            block_map: Some(map),
+            block_map: Some(std::sync::Arc::new(map.clone())),
             layout_dirty: true,
             ..Default::default()
         },
@@ -589,7 +589,7 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
     let fetched = router.fetch_metadata(&path).await.expect("cold fetch");
     let fetched_map = fetched.block_map.clone().expect("rehydrated block map");
     assert_eq!(
-        fetched_map, expect,
+        *fetched_map, expect,
         "rehydrated indirect map must be IDENTICAL to what was persisted \
          (bare offsets here = the wrong-device corruption)"
     );
@@ -616,7 +616,7 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
     let expect_shrunk = shrunk_map.clone();
     let mut shrunk = fetched.clone();
     shrunk.size = 10 * BLOCK as u64;
-    shrunk.block_map = Some(shrunk_map);
+    shrunk.block_map = Some(std::sync::Arc::new(shrunk_map));
     shrunk.layout_dirty = true;
     router.metadata_cache.insert(path.clone(), shrunk);
     persist_under_lease(&router, &dlm, &path).await;
@@ -731,7 +731,7 @@ async fn test_single_volume_spilled_map_keys_stay_bare_and_roundtrip() {
     h.fs.router.metadata_cache.invalidate(&path);
     let fetched = h.fs.router.fetch_metadata(&path).await.expect("cold fetch");
     let map = fetched.block_map.as_ref().expect("block map");
-    for (b, key) in map {
+    for (b, key) in map.iter() {
         assert!(
             !key.contains("://"),
             "single-volume mounts must keep persisting BARE block keys through the \

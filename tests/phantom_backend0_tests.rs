@@ -491,7 +491,7 @@ async fn test_single_volume_persisted_keys_stay_unprefixed_and_read_back() {
         .as_ref()
         .expect("striped file has a block map");
     assert_eq!(map.len(), nblocks);
-    for (idx, key) in map {
+    for (idx, key) in map.iter() {
         assert!(
             !key.contains("://"),
             "single-volume mounts must keep persisting UNPREFIXED block keys \

@@ -167,7 +167,7 @@ async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
     read_flags(h, ino, off, size, 0).await
 }
 
-async fn block_map_of(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
+async fn block_map_of(h: &H, ino: u64) -> std::sync::Arc<std::collections::HashMap<u32, String>> {
     let path = squeezefs::keys::inode_path(ino);
     h.fs.router
         .fetch_metadata(&path)
@@ -177,7 +177,7 @@ async fn block_map_of(h: &H, ino: u64) -> std::collections::HashMap<u32, String>
         .unwrap_or_default()
 }
 
-async fn make_cold(h: &H, ino: u64) -> std::collections::HashMap<u32, String> {
+async fn make_cold(h: &H, ino: u64) -> std::sync::Arc<std::collections::HashMap<u32, String>> {
     h.fs.fsync(h.req, ino, 0, false).await.unwrap();
     let map = block_map_of(h, ino).await;
     for key in map.values() {

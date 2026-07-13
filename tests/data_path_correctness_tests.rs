@@ -1397,7 +1397,7 @@ fn striped_map_meta(n: usize, block_size: u64) -> CachedMetadata {
     CachedMetadata {
         file_type: "striped".to_string(),
         size: n as u64 * block_size,
-        block_map: Some(bm),
+        block_map: Some(std::sync::Arc::new(bm)),
         layout_dirty: true,
         ..Default::default()
     }
@@ -1461,7 +1461,7 @@ async fn test_v3_six_gib_shaped_file_keeps_inline_map() {
     // End-to-end round-trip: every entry preserved inline, byte-exact.
     let got = layout.block_map.unwrap();
     assert_eq!(got.len(), n, "all {n} inline entries preserved");
-    assert_eq!(got, expect, "inline block map round-trips exactly");
+    assert_eq!(got, *expect, "inline block map round-trips exactly");
 }
 
 /// §5.3 spill boundary, BOTH directions: inline while under the cap, spill to
@@ -1524,7 +1524,7 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
         "indirect map holds every entry"
     );
     let round: std::collections::HashMap<u32, String> = entries.into_iter().collect();
-    for (b, s) in &big_map {
+    for (b, s) in big_map.iter() {
         assert_eq!(
             round.get(b),
             Some(s),
@@ -1735,6 +1735,52 @@ async fn test_block_map_snapshot_independent_of_merge_publish() {
         Some("31457280".to_string()),
         "the merge publish must be visible to the next fetch"
     );
+}
+
+/// The sharing contract itself (the measured win): two fetch_metadata
+/// snapshots of an unchanged file SHARE one map allocation — clone is a
+/// refcount bump, not a per-op deep copy of every key String. Publishes
+/// break sharing copy-on-write (the fresh fetch holds a NEW allocation).
+#[tokio::test]
+async fn test_block_map_clone_is_shared_until_publish() {
+    let h = make().await;
+    let block = 65536usize;
+    let ino = create(&h, "snap_shared").await;
+    let path = format!("inode_{ino}");
+    write_at(&h, ino, 0, &pattern(2 * block)).await;
+
+    let a = h.fs.router.fetch_metadata(&path).await.expect("fetch a");
+    let b = h.fs.router.fetch_metadata(&path).await.expect("fetch b");
+    let (ma, mb) = (
+        a.block_map.as_ref().expect("map a"),
+        b.block_map.as_ref().expect("map b"),
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(ma, mb),
+        "two snapshots of an unchanged file must SHARE one map allocation \
+         (per-op deep clone was 24% of daemon CPU on the cold rand-4k row)"
+    );
+
+    // A publish must produce a NEW allocation (CoW), leaving `a`/`b` intact.
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+    let entries = [(7u32, "41943040".to_string())];
+    h.fs.router
+        .merge_block_mappings(
+            ino,
+            squeezefs::routing::BlockMapOp::Merge(&entries),
+            8 * block as u64,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("merge publish");
+    let c = h.fs.router.fetch_metadata(&path).await.expect("fetch c");
+    let mc = c.block_map.as_ref().expect("map c");
+    assert!(
+        !std::sync::Arc::ptr_eq(ma, mc),
+        "a publish must break sharing copy-on-write"
+    );
+    assert!(ma.get(&7).is_none() && mc.get(&7).is_some());
 }
 
 /// A held metadata snapshot survives a concurrent TRUNCATE prune unchanged

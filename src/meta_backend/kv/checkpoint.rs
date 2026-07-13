@@ -105,8 +105,15 @@ pub const ROOT_LEDGER_MAGIC: u32 = 0x4B56_524C;
 pub const ROOT_LEDGER_HDR_LEN: usize = 24;
 
 /// Fixed payload prefix: `journal_tail_seq | next_ino |
-/// alloc_bitmap_generation | n_roots`.
-const PAYLOAD_FIXED_LEN: usize = 8 + 8 + 8 + 2;
+/// alloc_bitmap_generation | node_seq_watermark | n_roots`.
+///
+/// Format note (forward-only): the watermark widened this prefix by 8
+/// bytes; pre-watermark slots fail the `n_roots` length-consistency
+/// check and decode as absent. The superblock incompat bit
+/// [`super::superblock::FEATURE_INCOMPAT_NODE_SEQ_WATERMARK`] refuses
+/// pre-watermark volumes loud (reformat required) before any slot is
+/// read, per the standing no-backwards-compatibility directive.
+const PAYLOAD_FIXED_LEN: usize = 8 + 8 + 8 + 8 + 2;
 /// Encoded size of one tree root: `tree_id | node_addr | node_seq`.
 const ROOT_ENC_LEN: usize = 1 + 8 + 8;
 
@@ -134,6 +141,17 @@ pub struct LedgerRecord {
     pub next_ino: u64,
     /// Allocator bitmap generation (§4.7 — consumed by K4).
     pub alloc_bitmap_generation: u64,
+    /// Node-seq mint watermark: the per-volume mint counter at record
+    /// build time. A mount reseeds the counter **at or above** this
+    /// value, so node incarnation seqs never repeat within a generation
+    /// — the invariant the §4.5 `node_seq_at_write == node_seq` frame
+    /// admission relies on. Before this field existed, a clean shutdown
+    /// (empty replay window) collapsed the reseed floor to the ROOT
+    /// seqs and re-minted every non-root seq; recycled extents still
+    /// holding frames stamped with a re-minted seq then chained the
+    /// previous incarnation's checksummed records into the new node
+    /// (the 2026-07-13 release-gate Finding A).
+    pub node_seq_watermark: u64,
 }
 
 /// xxh3 over a slot image with the checksum field (bytes 16..24) zeroed —
@@ -177,6 +195,8 @@ impl LedgerRecord {
         image[pos..pos + 8].copy_from_slice(&self.next_ino.to_le_bytes());
         pos += 8;
         image[pos..pos + 8].copy_from_slice(&self.alloc_bitmap_generation.to_le_bytes());
+        pos += 8;
+        image[pos..pos + 8].copy_from_slice(&self.node_seq_watermark.to_le_bytes());
         pos += 8;
         image[pos..pos + 2].copy_from_slice(&(self.tree_roots.len() as u16).to_le_bytes());
         pos += 2;
@@ -225,7 +245,8 @@ impl LedgerRecord {
         let journal_tail_seq = u64::from_le_bytes(payload[0..8].try_into().unwrap());
         let next_ino = u64::from_le_bytes(payload[8..16].try_into().unwrap());
         let alloc_bitmap_generation = u64::from_le_bytes(payload[16..24].try_into().unwrap());
-        let n_roots = usize::from(u16::from_le_bytes(payload[24..26].try_into().unwrap()));
+        let node_seq_watermark = u64::from_le_bytes(payload[24..32].try_into().unwrap());
+        let n_roots = usize::from(u16::from_le_bytes(payload[32..34].try_into().unwrap()));
         if PAYLOAD_FIXED_LEN + n_roots * ROOT_ENC_LEN != payload_len {
             return Err(KvError::Corrupt(format!(
                 "ledger n_roots {n_roots} inconsistent with payload length {payload_len}"
@@ -247,6 +268,7 @@ impl LedgerRecord {
             journal_tail_seq,
             next_ino,
             alloc_bitmap_generation,
+            node_seq_watermark,
         })
     }
 }
@@ -617,6 +639,13 @@ impl KvMetaBackend {
             journal_tail_seq: tail,
             next_ino: self.next_ino(),
             alloc_bitmap_generation: ckpt_seq,
+            // Captured AFTER the flush loop (whose SMOs mint): every seq
+            // stamped into a frame that an extent freed ≤ this record can
+            // carry is ≤ this watermark; mints after capture are covered
+            // by replay floors (journaled SMO pointers) until the NEXT
+            // record's watermark — see the extent-reuse chain argument
+            // on [`LedgerRecord::node_seq_watermark`].
+            node_seq_watermark: inodes.node_seq_snapshot(),
         };
         write_ledger_slot(
             self.device_path(),

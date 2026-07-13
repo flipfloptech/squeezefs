@@ -138,6 +138,7 @@ fn ledger_rec(seq: u64) -> LedgerRecord {
         journal_tail_seq: 10 * seq,
         next_ino: 100 + seq,
         alloc_bitmap_generation: seq,
+        node_seq_watermark: 100 + seq,
     }
 }
 

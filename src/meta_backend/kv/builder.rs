@@ -447,6 +447,7 @@ impl ImageBuilder {
             });
         }
         let nodes_written = writer.nodes_written;
+        let node_seq_watermark = writer.next_node_seq;
 
         // Persist the allocator's claimed-extent bitmap (A slots,
         // generation 1 — the ledger names it).
@@ -462,6 +463,7 @@ impl ImageBuilder {
             journal_tail_seq: 0,
             next_ino: self.next_ino,
             alloc_bitmap_generation: 1,
+            node_seq_watermark,
         };
         write_ledger_slot(path, sb.root_ledger.start, &ledger).await?;
 

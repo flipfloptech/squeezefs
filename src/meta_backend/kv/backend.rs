@@ -295,7 +295,12 @@ impl KvMetaBackend {
             writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
         });
         cache.set_durable_tail(ledger.journal_tail_seq);
-        let seq = Arc::new(AtomicU64::new(ledger.seq));
+        // Node-seq mint floor: the persisted watermark keeps mints
+        // strictly above every seq ever stamped into a frame this
+        // generation (Finding A — re-minted seqs made recycled-extent
+        // residue admissible). The root/replay fetch_max floors below
+        // stay as the crash-window belt-and-braces.
+        let seq = Arc::new(AtomicU64::new(ledger.seq.max(ledger.node_seq_watermark)));
         let mut opened: Vec<KvTree> = Vec::with_capacity(3);
         for tree_id in [TREE_INODES, TREE_DENTRIES, TREE_XATTRS] {
             let root = ledger
@@ -1045,6 +1050,12 @@ impl KvMetaBackend {
                 )
             })
             .collect();
+        // Finding-A hardening: staged records must decode under their own
+        // tree's typed decoder before any byte is persisted (debug tiers).
+        #[cfg(debug_assertions)]
+        for (tree_id, r) in &recs {
+            super::node::debug_audit_records(*tree_id, 0, std::slice::from_ref(r));
+        }
         let len = entry_len_for(&recs)?;
 
         // (2) Admission — park holding nothing the drain needs.
@@ -1362,6 +1373,10 @@ impl KvMetaBackend {
                 )
             })
             .collect();
+        #[cfg(debug_assertions)]
+        for (tree_id, r) in &recs {
+            super::node::debug_audit_records(*tree_id, 0, std::slice::from_ref(r));
+        }
         let len = entry_len_for(&recs)?;
         let Some(adm) = self.ring.try_admit(len, AdmissionClass::Checkpoint) else {
             return Err(KvError::JournalReserveExhausted { needed: len });

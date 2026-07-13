@@ -82,9 +82,17 @@ pub const SUPERBLOCK_V3_LEN: usize = SECTOR_SIZE;
 /// v3 volume.
 pub const FEATURE_INCOMPAT_KV_V3: u64 = 1 << 0;
 
+/// `features_incompat` bit 1: the root ledger carries the node-seq mint
+/// watermark (Finding A, 2026-07-13 — mounts must reseed the mint
+/// counter above every persisted frame stamp). Set on every volume
+/// formatted since; pre-watermark v3 volumes refuse loud (their ledger
+/// slots also no longer decode) — forward-only, reformat required.
+pub const FEATURE_INCOMPAT_NODE_SEQ_WATERMARK: u64 = 1 << 1;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
-pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3;
+pub const FEATURES_INCOMPAT_KNOWN: u64 =
+    FEATURE_INCOMPAT_KV_V3 | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -212,7 +220,7 @@ impl SuperblockV3 {
 
         Ok(Self {
             node_size: node_size as u32,
-            features_incompat: FEATURE_INCOMPAT_KV_V3,
+            features_incompat: FEATURE_INCOMPAT_KV_V3 | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
             features_ro: 0,
             root_ledger,
             journal,
@@ -336,6 +344,13 @@ impl SuperblockV3 {
         if sb.features_incompat & FEATURE_INCOMPAT_KV_V3 == 0 {
             return Err(KvError::Corrupt(
                 "v3 superblock without the KV_V3 incompat bit (corrupt feature field)".to_string(),
+            ));
+        }
+        if sb.features_incompat & FEATURE_INCOMPAT_NODE_SEQ_WATERMARK == 0 {
+            return Err(KvError::Corrupt(
+                "pre-watermark v3 volume: formatted before the node-seq mint watermark \
+                 (Finding A) and no longer supported; reformat required"
+                    .to_string(),
             ));
         }
         let unknown = sb.unknown_incompat();

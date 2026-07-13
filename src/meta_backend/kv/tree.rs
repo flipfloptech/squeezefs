@@ -1257,6 +1257,14 @@ impl KvTree {
         self.seq.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    /// Current value of the shared per-volume node-seq mint counter —
+    /// the checkpoint captures it as the ledger's `node_seq_watermark`
+    /// so a mount can reseed at or above every seq ever stamped into a
+    /// persisted frame (Finding A, 2026-07-13).
+    pub(crate) fn node_seq_snapshot(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
+    }
+
     /// Resolve `node`'s parent: descend to `node.level() + 1` routing by
     /// `node.min_key()` (the partition rule makes the child's own
     /// separator the first one ≥ its min). Stable during an SMO — SMOs

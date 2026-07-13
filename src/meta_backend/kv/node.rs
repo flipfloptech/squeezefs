@@ -49,6 +49,54 @@ use bytes::Bytes;
 use std::ops::Range;
 use std::path::Path;
 
+/// Debug-build write-side audit (Finding A hardening): every record value
+/// about to be encoded into a frame must round-trip its tree's typed
+/// decoder — a malformed encode (or an in-RAM corruption of the staged
+/// records) fails HERE, on the writer with a backtrace, instead of
+/// surfacing as a reader-side "corrupt KV encoding" on a checksum-valid
+/// frame days later. Debug builds only: zero release-path cost; the
+/// debug/test tiers (cargo gate, QUICK, soaks) all run with it armed.
+///
+/// Armed at the TYPED boundary — the backend's commit staging
+/// (`commit_tx` / `commit_compensation`), the only layer whose contract
+/// says values are inode/dentry/xattr encodings. The tree and node
+/// layers are deliberately contents-agnostic containers (their tests
+/// forge synthetic payloads to attack cap / overflow / torn-frame /
+/// SMO mechanics), so the audit does not run there; every record a
+/// production freeze/compact/split re-folds passed the audit when it
+/// was first staged.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
+    use super::record::{
+        DentryValue, InodeDelta, InodeValue, RecordKind, XattrValue, TREE_DENTRIES, TREE_INODES,
+        TREE_XATTRS,
+    };
+    for r in records {
+        let ok = match (level, r.kind) {
+            (_, RecordKind::Delete) => true, // tombstones carry no value
+            (l, RecordKind::Put) if l > 0 => r.value.len() == 16,
+            (l, _) if l > 0 => false, // interior nodes hold Put/Delete pointers only
+            (_, RecordKind::Put) => match tree_id {
+                TREE_INODES => InodeValue::decode(&r.value).is_ok(),
+                TREE_DENTRIES => DentryValue::decode(&r.value).is_ok(),
+                TREE_XATTRS => XattrValue::decode(&r.value).is_ok(),
+                _ => true, // foreign trees (test harnesses) are not audited
+            },
+            (_, RecordKind::Delta) => tree_id != TREE_INODES || InodeDelta::decode(&r.value).is_ok(),
+        };
+        assert!(
+            ok,
+            "write-side encode audit: record (tree {tree_id}, level {level}, kind {:?}, \
+             seq {}, key len {}, value len {}) does not decode under its own type — \
+             refusing to persist a malformed record",
+            r.kind,
+            r.seq,
+            r.key.len(),
+            r.value.len()
+        );
+    }
+}
+
 /// Node page size: the header page, and the append granularity (§4.1).
 pub const NODE_PAGE: usize = 4096;
 
@@ -448,8 +496,21 @@ enum FrameProbe {
     /// Frame magic present but the header does not verify, or its version is
     /// foreign: a torn/garbage unit — the counted stop class.
     Garbage,
-    /// A checksum-verified frame stamped by a previous node incarnation:
+    /// A checksum-verified frame stamped by a DIFFERENT node incarnation:
     /// recycled-extent residue, a clean end (§4.1 `node_seq_at_write`).
+    ///
+    /// Direction note (Finding A): within one volume generation the
+    /// ledger's `node_seq_watermark` makes mints strictly monotonic, so
+    /// same-generation residue is always OLDER than the live node. A
+    /// numerically HIGHER stamp still classifies here — quick-reformat
+    /// residue from a dead generation carries stamps from a foreign
+    /// uuid-derived base (`builder::node_seq_base`) that is above the
+    /// live base on a coin flip, and must stay silently buried
+    /// (`v3_quick_reformat_buries_previous_generation_records`). A loud
+    /// higher-stamp tripwire would need a generation tag in the frame
+    /// header (the reserved u16 is the candidate slot) to be sound;
+    /// rejected for now — the watermark invariant is pinned directly in
+    /// `tests/kv_finding_a_tests.rs` instead.
     StaleIncarnation,
     /// A checksum-verified frame stamped by THIS incarnation.
     Frame(FrameHeader),

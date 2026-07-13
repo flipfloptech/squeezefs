@@ -359,7 +359,11 @@ async fn test_kv_node_valid_bset_after_tear_horizon_le_tail_fails_loud() {
     assert_eq!(node.bset_count(), 2, "the view still truncates at the tear");
 
     // A stale-incarnation frame (node_seq 999 ≠ 1) with horizon ≤ tail:
-    // recycled-extent garbage, structurally expected — never loud.
+    // recycled-extent garbage, structurally expected — never loud. The
+    // higher-stamp direction is deliberate: dead-generation residue after
+    // a quick reformat can out-number the live uuid-derived seq base and
+    // must stay silently buried (see FrameProbe::StaleIncarnation and
+    // tests/kv_finding_a_tests.rs).
     let stale = encode_bset_frame(&l, 999, &[kv_put(10, 5)], 5).expect("forge stale");
     let stale_off = beyond + squeezefs::meta_backend::kv::node::NODE_PAGE;
     uring_fs::write_at(vol.path(), stale_off as u64, stale)
@@ -848,6 +852,7 @@ fn kv_ledger_rec(seq: u64) -> LedgerRecord {
         journal_tail_seq: 100 * seq,
         next_ino: 2 + seq,
         alloc_bitmap_generation: seq,
+        node_seq_watermark: seq,
     }
 }
 
@@ -1131,6 +1136,7 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
         journal_tail_seq: 0,
         next_ino: 2,
         alloc_bitmap_generation: generation,
+        node_seq_watermark: seq,
     };
 
     let ring = JournalRing::new(f.path(), 0, RING_PAGES, 0);
@@ -1445,6 +1451,7 @@ async fn test_kv_v3_torn_newest_ledger_mount_serves_predecessor() {
         journal_tail_seq: 0,
         next_ino: 999_999,
         alloc_bitmap_generation: 999,
+        node_seq_watermark: 999,
     };
     torn.tree_roots
         .push(squeezefs::meta_backend::kv::checkpoint::TreeRoot {

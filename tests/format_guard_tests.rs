@@ -501,7 +501,11 @@ impl Drop for CliMount {
 }
 
 /// Spawn `squeezefs mount <metas...> <mnt>` and wait for the stats inode.
-fn spawn_cli_mount(metas: &[std::path::PathBuf], mnt: &std::path::Path, log: &std::path::Path) -> CliMount {
+fn spawn_cli_mount(
+    metas: &[std::path::PathBuf],
+    mnt: &std::path::Path,
+    log: &std::path::Path,
+) -> CliMount {
     std::fs::create_dir_all(mnt).unwrap();
     let logf = std::fs::File::create(log).unwrap();
     let mut cmd = std::process::Command::new(bin());
@@ -546,8 +550,7 @@ fn spawn_cli_mount(metas: &[std::path::PathBuf], mnt: &std::path::Path, log: &st
 #[test]
 fn cli_format_force_reformats_pre_watermark_set_then_mounts() {
     let base = scratch("cli");
-    let metas: Vec<std::path::PathBuf> =
-        (0..4).map(|i| base.join(format!("mds{i}.bin"))).collect();
+    let metas: Vec<std::path::PathBuf> = (0..4).map(|i| base.join(format!("mds{i}.bin"))).collect();
     for m in &metas {
         std::fs::File::create(m)
             .unwrap()

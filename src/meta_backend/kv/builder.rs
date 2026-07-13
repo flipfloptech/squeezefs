@@ -809,15 +809,19 @@ pub async fn format_preflight(
     }
 
     if !force {
-        return Err(crate::error::SqueezefsError::InvalidOperation(match refused {
-            Some(reason) => format!(
-                "Metadata volume carries prior on-disk state ({reason}); refusing to destroy \
+        return Err(crate::error::SqueezefsError::InvalidOperation(
+            match refused {
+                Some(reason) => format!(
+                    "Metadata volume carries prior on-disk state ({reason}); refusing to destroy \
                  it. Pass --force to reformat."
-            ),
-            None => "Metadata volume is already formatted as SqueezeFS; refusing to destroy it. \
+                ),
+                None => {
+                    "Metadata volume is already formatted as SqueezeFS; refusing to destroy it. \
                      Pass --force to reformat."
-                .to_string(),
-        }));
+                        .to_string()
+                }
+            },
+        ));
     }
     Ok(())
 }

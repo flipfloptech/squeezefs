@@ -7346,6 +7346,31 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
+    /// `SQUEEZEFS_TIMEOUT` is a LAUNCH-TIME knob: the op timeout must be
+    /// resolved once and memoized, not re-read per FUSE op —
+    /// `std::env::var` takes the process-global env lock and allocates,
+    /// and it showed up at ~0.7% of daemon cycles (plus lock
+    /// serialization) on the warm rand-4k transport row, called on every
+    /// request. Mid-run env mutation taking effect was never a contract.
+    #[test]
+    fn fuse_timeout_is_memoized_not_per_op_env_read() {
+        let first = get_fuse_timeout();
+        // A later env mutation must NOT change the resolved timeout.
+        std::env::set_var("SQUEEZEFS_TIMEOUT", "1234");
+        let second = get_fuse_timeout();
+        std::env::remove_var("SQUEEZEFS_TIMEOUT");
+        assert_eq!(
+            first, second,
+            "get_fuse_timeout consulted the environment after first \
+             resolution — a per-op env::var read on the hot path"
+        );
+        assert_ne!(
+            second,
+            Duration::from_secs(1234),
+            "the post-launch env mutation leaked into the op timeout"
+        );
+    }
+
     /// Regular-file open/create replies must advertise
     /// FOPEN_PARALLEL_DIRECT_WRITES (kernel ABI bit 1 << 6, fuse ≥ 7.38 /
     /// Linux ≥ 6.2). Without it the kernel takes the inode lock EXCLUSIVE

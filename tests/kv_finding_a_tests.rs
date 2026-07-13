@@ -279,6 +279,113 @@ async fn node_seq_mints_stay_above_every_persisted_stamp_across_remount() {
     );
 }
 
+/// The mechanism demonstration (forensic link, software-pin evidence):
+/// forge the exact state the re-mint hole produced — an extent whose
+/// previous LEAF incarnation appended a frame with a 75-byte dentry
+/// record, recycled by an INTERIOR node carrying the SAME seq — and
+/// reproduce the release-gate scratch signature verbatim: the frame is
+/// admitted (same-incarnation stamp, checksum-valid) and the fold's
+/// interior decode fails with "interior value must be 16 bytes, got
+/// 75". The node layer cannot distinguish this state from its own log
+/// (that is by design — stamps ARE the identity); the mint watermark
+/// makes the state unreachable through every production path, which is
+/// the fix. Bypasses mints deliberately; stays green as documentation
+/// of WHY the invariant matters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn equal_stamp_recycled_extent_reproduces_the_gate_signature() {
+    let file = NamedTempFile::new().expect("temp file");
+    file.as_file().set_len(2 * 1024 * 1024).unwrap();
+    let layout = NodeLayout::new(NODE_SIZE).expect("layout");
+    let path = file.path();
+    let key = vec![7u8; 16];
+
+    // Incarnation 1: a dentry LEAF at extent 0, seq 4242, whose appended
+    // frame carries a 75-byte dentry value (10 + 65-byte name — the
+    // long-name shape fstests produces).
+    let leaf = squeezefs::meta_backend::kv::node::write_node(
+        path,
+        &layout,
+        &NodeWriteParams {
+            node_addr: 0,
+            node_seq: 4242,
+            tree_id: 2,
+            level: 0,
+            min_key: b"",
+            max_key: &[0xFF; 32],
+        },
+        &[],
+        0,
+    )
+    .await
+    .expect("incarnation-1 leaf");
+    let dentry_75 = DentryValue {
+        child_ino: 99,
+        file_type: 8,
+        name: vec![b'n'; 65],
+    }
+    .encode()
+    .expect("dentry encodes");
+    assert_eq!(dentry_75.len(), 75, "the gate's exact foreign-value size");
+    append_bset(
+        path,
+        &layout,
+        &AppendDest {
+            node_addr: 0,
+            node_seq: 4242,
+            tail_offset: leaf.bytes_written,
+        },
+        &[Record {
+            key: key.clone(),
+            seq: 11,
+            kind: RecordKind::Put,
+            value: dentry_75,
+        }],
+        11,
+    )
+    .await
+    .expect("incarnation-1 append");
+
+    // Incarnation 2: the extent is recycled by an INTERIOR node whose
+    // re-minted seq COLLIDES (4242) — exactly what the unpersisted mint
+    // counter produced across clean remounts.
+    squeezefs::meta_backend::kv::node::write_node(
+        path,
+        &layout,
+        &NodeWriteParams {
+            node_addr: 0,
+            node_seq: 4242,
+            tree_id: 2,
+            level: 1,
+            min_key: b"",
+            max_key: &[0xFF; 32],
+        },
+        &[],
+        0,
+    )
+    .await
+    .expect("incarnation-2 interior");
+
+    let node = load_node(path, &layout, 0, u64::MAX)
+        .await
+        .expect("the poisoned node loads clean (checksums all pass)");
+    assert_eq!(
+        node.bset_count(),
+        1,
+        "the equal-stamp residue frame is ADMITTED — the corruption is silent until decode"
+    );
+    let folded = node.lookup(&key).expect("fold");
+    let value = folded
+        .live_value()
+        .expect("the foreign dentry record resolves under the interior node");
+    let err = decode_interior_value(value)
+        .expect_err("a 75-byte dentry value under the interior decoder");
+    assert_eq!(
+        err.to_string(),
+        "corrupt KV encoding: interior value must be 16 bytes, got 75",
+        "the release-gate scratch signature, reproduced from pure software state"
+    );
+}
+
 /// Contract 2 — residue is NEVER admitted, in either stamp direction.
 /// Within one generation the watermark makes residue strictly older;
 /// across a quick reformat, dead-generation residue carries a foreign

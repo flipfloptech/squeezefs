@@ -528,6 +528,97 @@ async fn promote_patch_cycles_never_clobber_neighbor_mappings() {
     }
 }
 
+/// Directed hammer for the promote-consume-vs-RMW-commit sole-copy free
+/// (leg 5): every patch's re-stage crosses the high-water mark (promotion
+/// of the SAME image is enqueued while the RMW walks from `stage_write` to
+/// its commit lock), and a concurrent fsync loop contends the per-inode
+/// meta lock so the promotion can win the lock race. When it does, the old
+/// RMW commit published "ring is authoritative, map=None" AFTER the
+/// promotion had consumed-and-removed the ring entry, then freed the
+/// promotion's just-published mapping — the file's sole surviving copy
+/// (aged tape: bare router_free of the live mapping, offset reallocated to
+/// two other inodes, the next durable clip reading 100% zeros). Every
+/// acked byte must read back exactly, forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rmw_commit_vs_promotion_never_frees_sole_copy() {
+    const FILES: usize = 8;
+    const ROUNDS: usize = 350;
+    let h = Arc::new(make(*b"szl-mfp-leg5-001", "mfp_ns_l5", "1MB").await);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for i in 0..FILES {
+        let h = h.clone();
+        let stop = stop.clone();
+        tasks.push(tokio::spawn(async move {
+            let ino = h
+                .fs
+                .create(
+                    h.req,
+                    1,
+                    OsStr::new(&format!("l5_{i}")),
+                    libc::S_IFREG | 0o644,
+                    0,
+                )
+                .await
+                .unwrap()
+                .attr
+                .ino;
+            // fsync contender: takes INODE_META_LOCKS (persist_dirty_layout)
+            // in a tight loop, delaying the RMW commit's lock acquisition.
+            let hf = h.clone();
+            let stopf = stop.clone();
+            let fsyncer = tokio::spawn(async move {
+                while !stopf.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = hf.fs.fsync(hf.req, ino, 0, false).await;
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            let mut rng = Lcg(0x1E65_0000 + i as u64);
+            let mut model: Vec<u8> = Vec::new();
+            for round in 0..ROUNDS {
+                let body = 160 * 1024 + (rng.next() % (96 * 1024)) as usize;
+                let val = (round % 249) as u8 | 1;
+                h.fs.write(h.req, ino, 0, 0, bytes::Bytes::from(vec![val; body]), 0, 0)
+                    .await
+                    .unwrap();
+                model.clear();
+                model.resize(body, val);
+                // Sub-block patches: each re-stage crosses high-water and
+                // races its own enqueued promotion to the commit lock.
+                for p in 0..4u8 {
+                    let off = rng.next() % (body as u64 - 4096);
+                    let pv = 0xE0 | p;
+                    h.fs.write(h.req, ino, 0, off, bytes::Bytes::from(vec![pv; 4096]), 0, 0)
+                        .await
+                        .unwrap();
+                    model[off as usize..off as usize + 4096].fill(pv);
+                }
+                let got = h
+                    .fs
+                    .read(h.req, ino, 0, 0, body as u32, 0)
+                    .await
+                    .unwrap_or_else(|e| panic!("file{i} round {round}: read failed {e:?}"))
+                    .data
+                    .to_vec();
+                assert_eq!(got.len(), body, "file{i} round {round}: short read");
+                if let Some(p) = (0..body).find(|&p| got[p] != model[p]) {
+                    let zeros = got.iter().filter(|&&b| b == 0).count();
+                    panic!(
+                        "file{i} round {round}: byte {p} reads {:#04x} want {:#04x}                          ({zeros}/{body} zero) — the RMW commit freed the promotion's                          sole-copy mapping (leg 5)",
+                        got[p], model[p]
+                    );
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            fsyncer.await.unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.expect("worker panicked");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn multifile_ring_pressure_seed_a() {
     multifile_pressure(0x000A_5EED_0001, 6, 120, *b"szl-mfp-seed-a01", "mfp_ns_a").await;

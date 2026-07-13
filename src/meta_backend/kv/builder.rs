@@ -732,6 +732,20 @@ fn parse_client_registration_ts(val: &[u8]) -> Option<u64> {
 ///   never block. Legacy-v2 volumes cannot be probed (no v2 reader
 ///   exists) and cannot be live-mounted by this binary — `force` is the
 ///   gate there.
+/// - a volume whose sector 0 **reads back but refuses classification**
+///   (a pre-watermark v3 superblock — Finding A, unknown future incompat
+///   bits, a version above 3, a torn superblock checksum, foreign magic)
+///   degrades to the same plain `force` gate: without `force` the refusal
+///   carries the classification reason plus the `--force` remedy; with
+///   `force` the format proceeds. The live-client probe is impossible
+///   there AND unnecessary **by construction**: this binary refuses to
+///   mount every one of those classes, so no live *current* client can
+///   exist on such a volume (a current client could never have mounted
+///   it). Anything else strands the operator — the mount refusal demands
+///   the very reformat the gate would be blocking (the user-hit
+///   pre-watermark `format --force` regression). Device **I/O errors**
+///   still propagate: "pass `--force`" would be a lie when the volume
+///   cannot even be read.
 ///
 /// The probe is **read-only**: no checkpoint task is spawned and nothing
 /// is written, so preflighting a volume another process has live-mounted
@@ -743,10 +757,15 @@ pub async fn format_preflight(
     force: bool,
 ) -> Result<(), crate::error::SqueezefsError> {
     use super::superblock::{classify_volume, VolumeFormat};
-    match classify_volume(path).await? {
-        VolumeFormat::Blank => return Ok(()), // never formatted: nothing to protect
-        VolumeFormat::V2Legacy => {}
-        VolumeFormat::V3(_) => {
+    // `refused`: the classification reason for a non-blank volume this
+    // binary refuses to interpret (see the policy above) — carried into
+    // the no-`force` refusal so the operator sees WHAT is on the volume
+    // alongside the `--force` remedy.
+    let mut refused: Option<String> = None;
+    match classify_volume(path).await {
+        Ok(VolumeFormat::Blank) => return Ok(()), // never formatted: nothing to protect
+        Ok(VolumeFormat::V2Legacy) => {}
+        Ok(VolumeFormat::V3(_)) => {
             if let Ok(be) = KvMetaBackend::open_probe(path).await {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -775,14 +794,30 @@ pub async fn format_preflight(
                 }
             }
         }
+        // Sector 0 was READ but refused interpretation (every
+        // classification refusal is `KvError::Corrupt`): unsupported or
+        // unreadable prior state — pre-watermark v3, unknown incompat
+        // bits, future versions, torn superblocks, foreign magic. No
+        // live-client probe is possible, and none is needed: this binary
+        // cannot mount such a volume, so it cannot host a live current
+        // client. `--force` must be able to clobber it — the refused
+        // classes' own mount errors demand exactly that reformat.
+        Err(KvError::Corrupt(reason)) => refused = Some(reason),
+        // A device that cannot be read at all is a real error, not a
+        // guarded format: propagate loud (formatting would fail anyway).
+        Err(e) => return Err(e.into()),
     }
 
     if !force {
-        return Err(crate::error::SqueezefsError::InvalidOperation(
-            "Metadata volume is already formatted as SqueezeFS; refusing to destroy it. \
-             Pass --force to reformat."
+        return Err(crate::error::SqueezefsError::InvalidOperation(match refused {
+            Some(reason) => format!(
+                "Metadata volume carries prior on-disk state ({reason}); refusing to destroy \
+                 it. Pass --force to reformat."
+            ),
+            None => "Metadata volume is already formatted as SqueezeFS; refusing to destroy it. \
+                     Pass --force to reformat."
                 .to_string(),
-        ));
+        }));
     }
     Ok(())
 }

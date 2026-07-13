@@ -74,7 +74,11 @@ async fn walk_user_meta_key_forms() {
                                 ),
                                 None => (
                                     "BARE".to_string(),
-                                    key.split(':').next().unwrap_or("").parse().unwrap_or(u64::MAX),
+                                    key.split(':')
+                                        .next()
+                                        .unwrap_or("")
+                                        .parse()
+                                        .unwrap_or(u64::MAX),
                                 ),
                             };
                             *per_prefix.entry(prefix.clone()).or_default() += 1;

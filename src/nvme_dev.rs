@@ -537,6 +537,14 @@ pub struct NvmeBlockDev {
     worker: Arc<UringWorker>,
 }
 
+/// Capacity in bytes of a backing file OR block device (seek-to-end works
+/// for both; `metadata.len()` is 0 for block devices).
+pub fn device_capacity_bytes(path: &str) -> std::io::Result<u64> {
+    use std::io::Seek;
+    let mut f = std::fs::File::open(path)?;
+    f.seek(std::io::SeekFrom::End(0))
+}
+
 impl NvmeBlockDev {
     pub fn new(device_path: &str) -> Self {
         Self {

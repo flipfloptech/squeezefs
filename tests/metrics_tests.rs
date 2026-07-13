@@ -47,7 +47,7 @@ fn test_lease_metrics_fields_exist() {
     // Smoke: fields are readable (no panics / alignment issues).
     let _ = METRICS.lease_acquire_ok.load(Ordering::Relaxed);
     let _ = METRICS.lease_acquire_fail.load(Ordering::Relaxed);
-    let _ = METRICS.writeback_hard_failures.load(Ordering::Relaxed);
+    let _ = METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed);
     let _ = METRICS.layout_staged_writes.load(Ordering::Relaxed);
     let _ = METRICS.layout_striped_writes.load(Ordering::Relaxed);
 }

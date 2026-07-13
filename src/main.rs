@@ -2283,6 +2283,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?,
             );
+            match squeezefs::nvme_dev::device_capacity_bytes(first_data_path) {
+                Ok(cap) => block_alloc.set_capacity_bytes(cap),
+                Err(e) => log::warn!(
+                    "could not size data volume {first_data_path}: {e}; allocator unbounded"
+                ),
+            }
 
             let nvme_dev =
                 std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(first_data_path));
@@ -2331,6 +2337,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await?,
                     );
+                    match squeezefs::nvme_dev::device_capacity_bytes(path) {
+                        Ok(cap) => a.set_capacity_bytes(cap),
+                        Err(e) => log::warn!(
+                            "could not size data volume {path}: {e}; allocator unbounded"
+                        ),
+                    }
                     (d, a)
                 };
 

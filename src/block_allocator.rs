@@ -9,6 +9,14 @@ pub struct BlockAllocator {
     chunk_size: u64,
     free_blocks: dashmap::DashSet<u64>,
     highest_block: AtomicU64,
+    /// Device capacity in whole chunks (0 = unbounded: offline tools /
+    /// tests without a real device). Set at mount registration from the
+    /// backing device/file size. `allocate_block` refuses to mint offsets
+    /// past it: on a real block device the write would fail EIO/ENOSPC at
+    /// DMA time; on a FILE-backed volume it silently GREW the file past
+    /// its provisioned size — both discovered by the multi-volume bench
+    /// EIO investigation.
+    capacity_blocks: AtomicU64,
     refcounts: scc::HashMap<u64, AtomicU32>,
     /// Per-offset incarnation seqlock: `gen << 1 | stable`.
     ///
@@ -35,6 +43,7 @@ impl BlockAllocator {
             chunk_size: 4 * 1024 * 1024, // 4MB
             free_blocks: dashmap::DashSet::new(),
             highest_block: AtomicU64::new(0),
+            capacity_blocks: AtomicU64::new(0),
             refcounts: scc::HashMap::new(),
             incarnations: scc::HashMap::new(),
         })
@@ -133,6 +142,39 @@ impl BlockAllocator {
         self.chunk_size
     }
 
+    /// Bound this allocator to a device of `bytes` capacity (whole chunks).
+    /// Zero leaves it unbounded (offline tools / tests).
+    pub fn set_capacity_bytes(&self, bytes: u64) {
+        self.capacity_blocks
+            .store(bytes / self.chunk_size, Ordering::Relaxed);
+    }
+
+    /// Advance the fresh-block cursor by one, refusing to mint an offset at
+    /// or past the device capacity (when bounded). CAS loop: a refused
+    /// racer must not bump the cursor.
+    fn next_fresh_block(&self) -> Result<u64> {
+        let cap = self.capacity_blocks.load(Ordering::Relaxed);
+        loop {
+            let cur = self.highest_block.load(Ordering::Relaxed);
+            if cap != 0 && cur >= cap {
+                return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "data volume '{}' full: {} of {} blocks allocated",
+                        self._volume_id, cur, cap
+                    ),
+                )));
+            }
+            if self
+                .highest_block
+                .compare_exchange(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(cur);
+            }
+        }
+    }
+
     pub async fn allocate_block(&self) -> Result<u64> {
         let mut found_idx = None;
         for item in self.free_blocks.iter() {
@@ -143,10 +185,10 @@ impl BlockAllocator {
             if self.free_blocks.remove(&idx).is_some() {
                 idx
             } else {
-                self.highest_block.fetch_add(1, Ordering::Relaxed)
+                self.next_fresh_block()?
             }
         } else {
-            self.highest_block.fetch_add(1, Ordering::Relaxed)
+            self.next_fresh_block()?
         };
         let offset = block_idx * self.chunk_size;
         let _ = self.refcounts.insert_sync(offset, AtomicU32::new(1));
@@ -471,5 +513,46 @@ impl BlockAllocator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Capacity contract (the multi-volume bench EIO investigation): a
+    /// bounded allocator must refuse to mint offsets past its device end —
+    /// on real block devices the write would EIO/ENOSPC at DMA time, and on
+    /// FILE-backed volumes it silently grew the file past its provisioned
+    /// size. Freed blocks make the offset pool reusable again; capacity 0
+    /// stays unbounded for offline tools.
+    #[tokio::test]
+    async fn allocate_block_respects_device_capacity() {
+        let dlm = crate::dlm::DlmClient::new("local").unwrap();
+        let a = BlockAllocator::new(dlm.meta_client().clone(), "cap_test")
+            .await
+            .unwrap();
+        a.set_capacity_bytes(3 * a.chunk_size());
+
+        let o0 = a.allocate_block().await.expect("block 0");
+        let o1 = a.allocate_block().await.expect("block 1");
+        let o2 = a.allocate_block().await.expect("block 2");
+        assert_eq!((o0, o1, o2), (0, a.chunk_size(), 2 * a.chunk_size()));
+
+        let refused = a.allocate_block().await;
+        match refused {
+            Err(crate::error::SqueezefsError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::StorageFull => {}
+            other => panic!("allocation past device capacity must fail StorageFull, got {other:?}"),
+        }
+
+        // A freed block re-opens exactly one slot.
+        a.free_block(o1).await.unwrap();
+        let again = a.allocate_block().await.expect("reuse freed block");
+        assert_eq!(again, o1);
+        assert!(
+            a.allocate_block().await.is_err(),
+            "pool exhausted again after the freed slot was reused"
+        );
     }
 }

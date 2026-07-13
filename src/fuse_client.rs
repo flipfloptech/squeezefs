@@ -494,7 +494,7 @@ pub struct Metrics {
     pub lease_acquire_ok: Align64<AtomicU64>,
     pub lease_acquire_fail: Align64<AtomicU64>,
     /// Writeback path: durable flush hard failures (sticky).
-    pub writeback_hard_failures: Align64<AtomicU64>,
+    pub writeback_retry_exhaustions: Align64<AtomicU64>,
     /// Copy-on-write duplications of an active-block accumulation buffer
     /// forced by a live reader snapshot (zero-copy write-path design §5.2).
     /// Sequential streams never pay this; spikes mean read/write contention
@@ -652,12 +652,6 @@ pub struct WritebackRequest {
     /// 0-based attempt count; re-queued failures increment this.
     pub attempts: u32,
 }
-
-/// Inodes with exhausted writeback retries (or last hard failure) until a
-/// successful flush clears them. fsync consults this for durable error reporting.
-pub static WRITEBACK_HARD_FAILURES: once_cell::sync::Lazy<
-    dashmap::DashMap<u64, String, ahash::RandomState>,
-> = once_cell::sync::Lazy::new(|| dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
 /// Aggregated result of the dismount active-block force-flush: one report
 /// per unmount, never a log line per block.
@@ -1289,7 +1283,7 @@ impl SqueezefsFilesystem {
                 "nvme_unaligned_write_fallbacks": METRICS.nvme_unaligned_write_fallbacks.load(Ordering::Relaxed),
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),
-                "writeback_hard_failures": METRICS.writeback_hard_failures.load(Ordering::Relaxed),
+                "writeback_retry_exhaustions": METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed),
                 "active_block_cow_copies": METRICS.active_block_cow_copies.load(Ordering::Relaxed),
                 "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
@@ -2519,7 +2513,6 @@ impl SqueezefsFilesystem {
             .await?;
         }
 
-        WRITEBACK_HARD_FAILURES.remove(&ino);
         Ok(())
     }
 
@@ -5879,19 +5872,14 @@ impl Filesystem for SqueezefsFilesystem {
         // is deliberately non-transactional — so its single reader never
         // observed `true`. Zero fsync behavior change; the single-barrier
         // suites are the regression guard.)
+        // fsync's OWN synchronous flush of the staged/parked blocks is the
+        // durable error surface (never-lossy writeback: a failed background
+        // unit keeps its bytes in staging and is retried forever, so a
+        // sticky per-ino poison map would report errors for data that is
+        // safe — and did: the multi-volume bench-suite EIO cascade).
         if let Err(e) = self.flush_inode_to_backend(ino, fencing_token).await {
             error!("FUSE Fsync failed for ino {}: {:?}", ino, e);
-            WRITEBACK_HARD_FAILURES.insert(ino, format!("{e:?}"));
             return Err(map_squeezefs_err(e));
-        }
-
-        if let Some(err_msg) = WRITEBACK_HARD_FAILURES.get(&ino) {
-            error!(
-                "FUSE Fsync: prior writeback hard failure for ino {}: {}",
-                ino,
-                err_msg.value()
-            );
-            return Err(Errno::from(libc::EIO));
         }
 
         Ok(())
@@ -6954,9 +6942,7 @@ async fn run_constant_writeback_worker(
             )
             .await
             {
-                Ok(()) => {
-                    WRITEBACK_HARD_FAILURES.remove(&req.ino);
-                }
+                Ok(()) => {}
                 Err(e) => {
                     log::error!(
                         "Constant Writeback: Failed to flush block {} of inode {} (attempt {}): {:?}",
@@ -6972,35 +6958,48 @@ async fn run_constant_writeback_worker(
     }
 }
 
+/// Never-lossy writeback retry ladder. A failed unit's bytes are SAFE in
+/// staging (custody invariant), so every disposition here must converge on
+/// "try again" — never a sticky per-ino error that later poisons fsync for
+/// healed conditions (the multi-volume bench-suite EIO cascade: transient
+/// upload failures burned WRITEBACK_MAX_ATTEMPTS in ~0.75 s, went sticky,
+/// and the next per-file sync_all surfaced EIO for durable-safe data).
+///
+/// - Bounded fast retries first (`WRITEBACK_MAX_ATTEMPTS`, exponential
+///   backoff capped at 3.2 s), then the attempt counter WRAPS: the unit
+///   re-enqueues at the capped backoff forever, with
+///   `writeback_retry_exhaustions` counting each wrap for observability.
+/// - A FULL queue WAITS (`send`, not `try_send`): the worker owns no locks
+///   here, and dropping the unit would orphan its staged bytes' durability
+///   promise. `Closed` means shutdown — teardown's force-flush owns the
+///   staged data from there.
+/// - Genuinely superseded units (fencing/NotFound) never reach this ladder:
+///   the flush unit itself resolves them as clean no-ops.
 async fn requeue_or_hard_fail(
     requeue_tx: &tokio::sync::mpsc::Sender<WritebackRequest>,
     mut req: WritebackRequest,
     err_msg: String,
 ) {
-    if req.attempts + 1 < WRITEBACK_MAX_ATTEMPTS {
-        req.attempts += 1;
-        let backoff_ms = 50u64.saturating_mul(1u64 << req.attempts.min(6));
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        // Bounded queue: try_send; if full, sticky-fail rather than blocking the worker forever.
-        if let Err(e) = requeue_tx.try_send(req) {
-            error!("Constant Writeback: requeue failed ({e}); marking hard failure: {err_msg}");
-            // req moved into try_send Err variants
-            match e {
-                tokio::sync::mpsc::error::TrySendError::Full(r)
-                | tokio::sync::mpsc::error::TrySendError::Closed(r) => {
-                    WRITEBACK_HARD_FAILURES.insert(r.ino, err_msg);
-                }
-            }
-        }
-    } else {
-        error!(
-            "Constant Writeback: exhausted retries for ino {} block {}; sticky hard failure: {}",
+    if req.attempts + 1 >= WRITEBACK_MAX_ATTEMPTS {
+        warn!(
+            "Constant Writeback: retries exhausted for ino {} block {} ({}); \
+             continuing at capped backoff (bytes remain staged; fsync's own \
+             flush is the error surface)",
             req.ino, req.block_idx, err_msg
         );
-        WRITEBACK_HARD_FAILURES.insert(req.ino, err_msg);
         METRICS
-            .writeback_hard_failures
+            .writeback_retry_exhaustions
             .fetch_add(1, Ordering::Relaxed);
+        // Wrap to the capped-backoff steady state instead of going sticky.
+        req.attempts = 0;
+    }
+    req.attempts += 1;
+    let backoff_ms = 50u64.saturating_mul(1u64 << req.attempts.min(6));
+    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+    if let Err(e) = requeue_tx.send(req).await {
+        // Channel closed: daemon shutdown — the dismount force-flush owns
+        // every staged block from here (never-lossy teardown).
+        warn!("Constant Writeback: requeue after shutdown ({e}); unit handed to teardown");
     }
 }
 
@@ -7369,7 +7368,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writeback_requeue_on_full_queue_never_goes_sticky() {
         let ino = 990_001u64;
-        WRITEBACK_HARD_FAILURES.remove(&ino);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<WritebackRequest>(1);
         // Occupy the single slot so the requeue hits Full.
         tx.try_send(WritebackRequest {
@@ -7393,12 +7391,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         let _ = rx.recv().await; // frees the slot
         requeue.await.unwrap();
-        assert!(
-            !WRITEBACK_HARD_FAILURES.contains_key(&ino),
-            "a FULL requeue queue must never mark a sticky hard failure — \
-             the bytes are safe in staging and the queue drains"
-        );
-        // The request must still be queued (never lost).
+        // The request must still be queued (never lost, never sticky).
         let got = rx.recv().await.expect("requeued unit");
         assert_eq!(got.ino, ino);
         assert_eq!(got.block_idx, 7);
@@ -7412,7 +7405,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writeback_exhausted_retries_requeue_forever_not_sticky() {
         let ino = 990_002u64;
-        WRITEBACK_HARD_FAILURES.remove(&ino);
+        let before = METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<WritebackRequest>(8);
         let req = WritebackRequest {
             ino,
@@ -7421,17 +7414,15 @@ mod tests {
             attempts: WRITEBACK_MAX_ATTEMPTS - 1,
         };
         requeue_or_hard_fail(&tx, req, "transient upload failure".into()).await;
-        assert!(
-            !WRITEBACK_HARD_FAILURES.contains_key(&ino),
-            "exhausted retries must NOT poison the ino sticky — the staged \
-             bytes are intact and a later flush (or fsync's own synchronous \
-             flush) is the honest surface"
-        );
         let got = rx
             .try_recv()
             .expect("exhausted unit must be RE-ENQUEUED (retry forever), not dropped");
         assert_eq!(got.ino, ino);
         assert_eq!(got.block_idx, 3);
+        assert!(
+            METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed) > before,
+            "each exhaustion wrap must be counted for observability"
+        );
     }
 
     /// `SQUEEZEFS_TIMEOUT` is a LAUNCH-TIME knob: the op timeout must be

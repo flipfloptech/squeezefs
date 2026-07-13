@@ -1675,3 +1675,102 @@ async fn test_mixed_node_size_volumes_spill_per_volume() {
     // Keep temp backing/volumes alive to end of scope.
     let _keep = (backing, smallf, bigf, staging);
 }
+
+// ---------------------------------------------------------------------------
+// Item A (rand-4k per-op cost): `CachedMetadata` snapshots are handed out by
+// value on EVERY read (`fetch_metadata`) and consulted lock-free while
+// concurrent writers publish new maps through `merge_block_mappings` /
+// `truncate_layout`. The contract pinned here is snapshot INDEPENDENCE: a
+// held snapshot must keep observing exactly the map it was taken with, no
+// matter what a concurrent publish does — and publishes must be visible to
+// the NEXT fetch. The block-map sharing optimization (Arc'd map, clone =
+// refcount bump) must preserve this observable behavior bit-for-bit; a
+// naive shared-mutation implementation fails these.
+// ---------------------------------------------------------------------------
+
+/// A held metadata snapshot survives a concurrent map MERGE publish
+/// unchanged; the next fetch observes the merge.
+#[tokio::test]
+async fn test_block_map_snapshot_independent_of_merge_publish() {
+    let h = make().await;
+    let block = 65536usize;
+    let ino = create(&h, "snap_indep_merge").await;
+    let path = format!("inode_{ino}");
+
+    // Striped file, 2 mapped blocks.
+    let base = pattern(2 * block);
+    write_at(&h, ino, 0, &base).await;
+
+    let snap = h.fs.router.fetch_metadata(&path).await.expect("snapshot");
+    let snap_map = snap.block_map.clone().expect("striped map");
+    assert!(snap_map.get(&0).is_some() && snap_map.get(&1).is_some());
+    assert!(snap_map.get(&5).is_none(), "premise: no block 5 yet");
+
+    // Concurrent publish: bind block 5 to a fresh key.
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+    let entries = [(5u32, "31457280".to_string())];
+    h.fs.router
+        .merge_block_mappings(
+            ino,
+            squeezefs::routing::BlockMapOp::Merge(&entries),
+            6 * block as u64,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("merge publish");
+
+    // The held snapshot is IMMUTABLE: still exactly {0,1}.
+    assert!(
+        snap_map.get(&5).is_none(),
+        "a held CachedMetadata snapshot observed a LATER merge publish — \
+         snapshot independence broken (shared mutable map)"
+    );
+    assert_eq!(snap_map.len(), 2, "held snapshot's map must be unchanged");
+
+    // The next fetch observes the publish.
+    let fresh = h.fs.router.fetch_metadata(&path).await.expect("refetch");
+    assert_eq!(
+        fresh.block_map.as_ref().and_then(|bm| bm.get(&5)).cloned(),
+        Some("31457280".to_string()),
+        "the merge publish must be visible to the next fetch"
+    );
+}
+
+/// A held metadata snapshot survives a concurrent TRUNCATE prune unchanged
+/// (the prune mutates the current map by REMOVING entries — the shared-
+/// mutation failure mode is the mirror of the merge case).
+#[tokio::test]
+async fn test_block_map_snapshot_independent_of_truncate_prune() {
+    let h = make().await;
+    let block = 65536usize;
+    let ino = create(&h, "snap_indep_trunc").await;
+    let path = format!("inode_{ino}");
+
+    let base = pattern(3 * block);
+    write_at(&h, ino, 0, &base).await;
+
+    let snap = h.fs.router.fetch_metadata(&path).await.expect("snapshot");
+    let snap_map = snap.block_map.clone().expect("striped map");
+    assert!(snap_map.get(&2).is_some(), "premise: block 2 mapped");
+
+    // Concurrent truncate DOWN to one block: prunes blocks 1..3.
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+    h.fs.router
+        .truncate_layout(ino, block as u64, token)
+        .await
+        .expect("truncate publish");
+
+    assert!(
+        snap_map.get(&2).is_some() && snap_map.get(&1).is_some(),
+        "a held CachedMetadata snapshot lost entries to a LATER truncate \
+         prune — snapshot independence broken (shared mutable map)"
+    );
+
+    let fresh = h.fs.router.fetch_metadata(&path).await.expect("refetch");
+    let fresh_map = fresh.block_map.expect("still striped");
+    assert!(
+        fresh_map.get(&1).is_none() && fresh_map.get(&2).is_none(),
+        "the truncate prune must be visible to the next fetch"
+    );
+}

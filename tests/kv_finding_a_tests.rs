@@ -208,7 +208,9 @@ async fn node_seq_mints_stay_above_every_persisted_stamp_across_remount() {
                 // s1_max regardless), so proceed with what we have.
                 break (s1, s1_max);
             }
-            let be = KvMetaBackend::open(file.path()).await.expect("re-open for shaping");
+            let be = KvMetaBackend::open(file.path())
+                .await
+                .expect("re-open for shaping");
             churn(&be, dir.ino, 50 + extra, 400).await;
             be.shutdown().await.expect("shaping shutdown");
             drop(be);

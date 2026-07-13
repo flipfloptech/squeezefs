@@ -82,7 +82,9 @@ pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
                 TREE_XATTRS => XattrValue::decode(&r.value).is_ok(),
                 _ => true, // foreign trees (test harnesses) are not audited
             },
-            (_, RecordKind::Delta) => tree_id != TREE_INODES || InodeDelta::decode(&r.value).is_ok(),
+            (_, RecordKind::Delta) => {
+                tree_id != TREE_INODES || InodeDelta::decode(&r.value).is_ok()
+            }
         };
         assert!(
             ok,

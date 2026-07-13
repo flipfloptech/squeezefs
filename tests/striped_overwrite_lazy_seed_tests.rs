@@ -529,3 +529,170 @@ async fn crash_inside_window_leaves_old_block_intact() {
         "post-crash read: old durable content intact (unfsynced patch legally lost)",
     );
 }
+
+/// 9. OVERLAY NEVER INVISIBLE (the generic/075-in-QUICK transient): an
+/// ACKed deferred write must be visible to EVERY concurrent reader of its
+/// block for the WHOLE deferral window — including while another read is
+/// materializing the seed (a device-read await). The buggy shape checked
+/// the buffer OUT of the parked map across that await: concurrent
+/// single-block reads (kernel readahead, AIO) missed the overlay, fell to
+/// the backend, and served pre-merge bytes — transient stale/zeros that
+/// self-heal (fsx 075/112: `.bad` ≡ `.good` afterwards), exactly the
+/// hardest corruption class to catch after the fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_reads_never_lose_the_overlay_during_materialize() {
+    let h = Arc::new(make(*b"owlz-invis-0001!", "owlz_ns_i").await);
+    const ROUNDS: usize = 24;
+    let (ino, base) = durable_striped(&h, "invis", 0x00).await;
+
+    let woff = 2 * BS + 20 * 1024; // interior of block 2
+    let wlen = 8 * 1024usize;
+    let path = squeezefs::keys::inode_path(ino);
+
+    for round in 0..ROUNDS {
+        // Fresh deferral each round: patch block 2 (deferred), tiers cold so
+        // the materialize is a REAL device-read await.
+        let patch = pattern(wlen, 0xA0 ^ (round as u8));
+        write_at(&h, ino, woff, &patch).await;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+
+        // Materialize trigger: ONE read of the UNCOVERED head of block 2 —
+        // the reader pays the deferred seed (device read await).
+        let trig = {
+            let h = h.clone();
+            let barrier = barrier.clone();
+            let base = base.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let got = read_at(&h, ino, 2 * BS, 8 * 1024).await;
+                assert_bytes(
+                    &got,
+                    &base[(2 * BS) as usize..(2 * BS) as usize + 8 * 1024],
+                    "uncovered head must serve OLD bytes",
+                );
+                let _ = done_tx.send(true);
+            })
+        };
+
+        // Concurrent patch probes: the ACKed bytes must be visible in every
+        // single read while the trigger's materialize is in flight.
+        let mut probes = Vec::new();
+        for p in 0..4 {
+            let h = h.clone();
+            let barrier = barrier.clone();
+            let patch = patch.clone();
+            let mut done = done_rx.clone();
+            probes.push(tokio::spawn(async move {
+                barrier.wait().await;
+                loop {
+                    let got = read_at(&h, ino, woff, patch.len()).await;
+                    assert_bytes(
+                        &got,
+                        &patch,
+                        &format!(
+                            "round {round} probe {p}: ACKed deferred bytes vanished \
+                             mid-materialize (overlay checked out across an await)"
+                        ),
+                    );
+                    if *done.borrow_and_update() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        trig.await.unwrap();
+        for pr in probes {
+            pr.await.unwrap();
+        }
+
+        // Reset for the next round: flush the merge durably, then cold tiers.
+        fsync(&h, ino).await;
+        h.fs.router.cache.write_lru.remove(&path);
+        h.fs.router.cache.read_lru.remove(&path);
+        if let Ok(m) = h.fs.router.fetch_metadata(&path).await {
+            if let Some(bm) = m.block_map.as_ref() {
+                for bk in bm.values() {
+                    h.fs.router.cache.purge_block_key(bk);
+                }
+            }
+        }
+    }
+}
+
+/// 10. Same invariant at the FLUSH exit: while fsync's stage loop
+/// materializes the deferred seed (device-read await), concurrent readers
+/// of the patch must never lose the overlay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_reads_never_lose_the_overlay_during_flush() {
+    let h = Arc::new(make(*b"owlz-invis-0002!", "owlz_ns_j").await);
+    const ROUNDS: usize = 24;
+    let (ino, base) = durable_striped(&h, "invisf", 0x00).await;
+    let _ = base;
+
+    let woff = 1 * BS + 24 * 1024; // interior of block 1
+    let wlen = 8 * 1024usize;
+    let path = squeezefs::keys::inode_path(ino);
+
+    for round in 0..ROUNDS {
+        let patch = pattern(wlen, 0xB0 ^ (round as u8));
+        write_at(&h, ino, woff, &patch).await;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+
+        let syncer = {
+            let h = h.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                fsync(&h, ino).await;
+                let _ = done_tx.send(true);
+            })
+        };
+
+        let mut probes = Vec::new();
+        for p in 0..4 {
+            let h = h.clone();
+            let barrier = barrier.clone();
+            let patch = patch.clone();
+            let mut done = done_rx.clone();
+            probes.push(tokio::spawn(async move {
+                barrier.wait().await;
+                loop {
+                    let got = read_at(&h, ino, woff, patch.len()).await;
+                    assert_bytes(
+                        &got,
+                        &patch,
+                        &format!(
+                            "round {round} probe {p}: ACKed deferred bytes vanished \
+                             mid-flush (overlay checked out across the stage await)"
+                        ),
+                    );
+                    if *done.borrow_and_update() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        syncer.await.unwrap();
+        for pr in probes {
+            pr.await.unwrap();
+        }
+
+        h.fs.router.cache.write_lru.remove(&path);
+        h.fs.router.cache.read_lru.remove(&path);
+        if let Ok(m) = h.fs.router.fetch_metadata(&path).await {
+            if let Some(bm) = m.block_map.as_ref() {
+                for bk in bm.values() {
+                    h.fs.router.cache.purge_block_key(bk);
+                }
+            }
+        }
+    }
+}

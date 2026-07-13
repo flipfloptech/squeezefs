@@ -1338,6 +1338,21 @@ impl NvmeStaging {
         if self.staging_dirs.is_empty() {
             return Ok(());
         }
+        // R5 finding-#2 escalation (§5.7): while the authority's
+        // unreclaimable arm rides the Red band, tier publishes are
+        // PAUSED — this is the single funnel every producer (fill path,
+        // dehydration, p2p store) routes through, so one gate covers the
+        // population by construction. Never-lossy: the tier is a read
+        // cache; absence means the next reader goes to the device.
+        // Measured pre-fix: 5.06 GiB of tier writes in ~10 s against a
+        // 5 GiB budget while every sheddable component already sat at its
+        // floor.
+        if crate::mem_budget::tier_publish_paused() {
+            crate::fuse_client::METRICS
+                .read_tier_publishes_paused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
         let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
         let val_bytes = data;
         // Evictions are discarded here, so use the non-materializing put:

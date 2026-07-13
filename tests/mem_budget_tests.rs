@@ -433,7 +433,11 @@ fn hard_backstop_escalates_to_floors_after_sustained_overage() {
     // component's FLOOR.
     targets.lock().unwrap().clear();
     b.tick_inner(1000, 0, 1100);
-    assert_eq!(b.hard_backstops(), 1, "sustained overage trips the backstop");
+    assert_eq!(
+        b.hard_backstops(),
+        1,
+        "sustained overage trips the backstop"
+    );
     assert!(b.backstop_active());
     {
         let t = targets.lock().unwrap();
@@ -455,13 +459,7 @@ fn hard_backstop_escalates_to_floors_after_sustained_overage() {
     // kill signature.
     let b2 = MemBudget::new_for_test();
     let g2 = Arc::new(AtomicU64::new(1500));
-    b2.register(comp(
-        "phantom",
-        g2,
-        0,
-        1,
-        Arc::new(Mutex::new(Vec::new())),
-    ));
+    b2.register(comp("phantom", g2, 0, 1, Arc::new(Mutex::new(Vec::new()))));
     for _ in 0..5 {
         b2.tick_inner(1000, 0, 100);
     }
@@ -510,7 +508,10 @@ fn red_convergence_under_admission_storm() {
         post_shed.iter().all(|&v| v <= 850),
         "every Red tick must shed the storm back to <= the 85% target: {post_shed:?}"
     );
-    assert!(b.hard_backstops() >= 1, "sustained storm trips the backstop");
+    assert!(
+        b.hard_backstops() >= 1,
+        "sustained storm trips the backstop"
+    );
     assert_eq!(
         g.load(Ordering::Relaxed),
         floor,
@@ -940,18 +941,11 @@ async fn advisory_integration_phases() {
 
     // Miss 2 under PAUSE: ghost-admitted, but the tier publish is paused.
     mem_budget::MEM_BUDGET.force_tier_publish_paused_for_test(true);
-    let paused0 = METRICS
-        .read_tier_publishes_paused
-        .load(Ordering::Relaxed);
+    let paused0 = METRICS.read_tier_publishes_paused.load(Ordering::Relaxed);
     let d = read_at(&h3, ino_e, 0, 4096).await;
     assert!(d.iter().all(|&x| x == 70), "paused fill still serves");
     assert!(
-        h3.fs
-            .router
-            .cache
-            .nvme
-            .get_cached_read_block(&k0)
-            .is_none(),
+        h3.fs.router.cache.nvme.get_cached_read_block(&k0).is_none(),
         "a ghost-admitted fill must NOT reach the tier while paused"
     );
     assert!(
@@ -965,12 +959,7 @@ async fn advisory_integration_phases() {
     let d = read_at(&h3, ino_e, 0, 4096).await;
     assert!(d.iter().all(|&x| x == 70));
     assert!(
-        h3.fs
-            .router
-            .cache
-            .nvme
-            .get_cached_read_block(&k0)
-            .is_some(),
+        h3.fs.router.cache.nvme.get_cached_read_block(&k0).is_some(),
         "publishes resume after the pause releases"
     );
     drop(h3);

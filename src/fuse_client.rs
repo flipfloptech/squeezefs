@@ -397,6 +397,19 @@ pub struct Metrics {
     /// memory authority paused dehydration entirely (protected included —
     /// disk-tier warmth is the cheapest sacrifice under memory pressure).
     pub mem_budget_dehydrate_paused: Align64<AtomicU64>,
+    /// R5 finding-#2 escalation: disk-tier publishes skipped at the
+    /// `cache_read_block` funnel while the authority's unreclaimable arm
+    /// rides the Red band (never-lossy — read-cache absence).
+    pub read_tier_publishes_paused: Align64<AtomicU64>,
+    /// R5 finding-#2 escalation: writers that entered the Red parked-buffer
+    /// admission gate (awaited the never-lossy drain instead of parking
+    /// past the halved cap). The pre-fix advisory-soft cap let the parked
+    /// set balloon to 1,937 buffers / 7.6 GiB anon under 16-writer rand-4k.
+    pub parked_gate_waits: Align64<AtomicU64>,
+    /// Gate waits that hit the liveness deadline and parked past the cap
+    /// anyway (loud — sustained growth means the drain cannot make forward
+    /// progress against this workload).
+    pub parked_gate_timeouts: Align64<AtomicU64>,
     /// Staged-file RMW seeds served through the bounded `BUFFER_POOL`
     /// (follow-up C): the whole-image read_staged seed recycles instead of
     /// mallocing ~4 MiB per sub-block write — the allocation flood behind
@@ -673,6 +686,15 @@ pub struct SqueezefsFilesystem {
     active_block_buffers: std::sync::Arc<
         dashmap::DashMap<String, crate::cache::active_block::ActiveBlockBuf, ahash::RandomState>,
     >,
+    /// §5.7 Red parked-buffer drain plumbing, shared across clones: the
+    /// authority's shed closure AND the Red admission gate post a byte
+    /// target + kick; one lazily-spawned worker runs
+    /// [`Self::drain_parked_toward`]; waiters (gated writers) wake on
+    /// `progress` after every inode flush.
+    parked_drain_target: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    parked_drain_kick: std::sync::Arc<tokio::sync::Notify>,
+    parked_drain_progress: std::sync::Arc<tokio::sync::Notify>,
+    parked_drain_worker_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub open_virtual_files: dashmap::DashMap<u64, Vec<u8>, ahash::RandomState>,
     pub next_virtual_fh: std::sync::atomic::AtomicU64,
     pub latest_stats_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
@@ -725,6 +747,10 @@ impl Clone for SqueezefsFilesystem {
             mountpoint: self.mountpoint.clone(),
             max_background_uploads: self.max_background_uploads,
             active_block_buffers: self.active_block_buffers.clone(),
+            parked_drain_target: self.parked_drain_target.clone(),
+            parked_drain_kick: self.parked_drain_kick.clone(),
+            parked_drain_progress: self.parked_drain_progress.clone(),
+            parked_drain_worker_started: self.parked_drain_worker_started.clone(),
             open_virtual_files: self.open_virtual_files.clone(),
             next_virtual_fh: std::sync::atomic::AtomicU64::new(
                 self.next_virtual_fh.load(Ordering::Relaxed),
@@ -809,6 +835,12 @@ impl SqueezefsFilesystem {
             max_background_uploads: std::cmp::max(16, crate::cpu::process_parallelism() * 2),
             active_block_buffers: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
+            )),
+            parked_drain_target: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            parked_drain_kick: std::sync::Arc::new(tokio::sync::Notify::new()),
+            parked_drain_progress: std::sync::Arc::new(tokio::sync::Notify::new()),
+            parked_drain_worker_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
             )),
             open_virtual_files: dashmap::DashMap::with_hasher(ahash::RandomState::new()),
             next_virtual_fh: std::sync::atomic::AtomicU64::new(0x1000_0000_0000_0000),
@@ -1177,6 +1209,13 @@ impl SqueezefsFilesystem {
                 "mem_budget_red_events": crate::mem_budget::MEM_BUDGET.red_events(),
                 "mem_budget_floors_clamped": crate::mem_budget::MEM_BUDGET.floors_clamped(),
                 "mem_budget_dehydrate_paused": METRICS.mem_budget_dehydrate_paused.load(Ordering::Relaxed),
+                "mem_budget_unreclaimable_bytes": crate::mem_budget::MEM_BUDGET.unreclaimable_bytes(),
+                "mem_budget_hard_backstops": crate::mem_budget::MEM_BUDGET.hard_backstops(),
+                "mem_budget_backstop_active": crate::mem_budget::MEM_BUDGET.backstop_active(),
+                "mem_budget_tier_publish_paused": crate::mem_budget::MEM_BUDGET.tier_publish_paused(),
+                "read_tier_publishes_paused": METRICS.read_tier_publishes_paused.load(Ordering::Relaxed),
+                "parked_gate_waits": METRICS.parked_gate_waits.load(Ordering::Relaxed),
+                "parked_gate_timeouts": METRICS.parked_gate_timeouts.load(Ordering::Relaxed),
                 "staged_rmw_pooled_seeds": METRICS.staged_rmw_pooled_seeds.load(Ordering::Relaxed),
                 "staged_truncate_inplace_shrinks": METRICS.staged_truncate_inplace_shrinks.load(Ordering::Relaxed),
                 "staged_truncate_durable_clips": METRICS.staged_truncate_durable_clips.load(Ordering::Relaxed),
@@ -2456,11 +2495,43 @@ impl SqueezefsFilesystem {
                 let _ = self
                     .flush_memory_buffers_for_inode(ino, fencing_token)
                     .await;
+                // Wake Red-gated writers after every inode flush — space
+                // frees incrementally, admission resumes incrementally.
+                self.parked_drain_progress.notify_waiters();
                 if self.parked_buffer_bytes() <= target {
                     break;
                 }
             }
         }
+        self.parked_drain_progress.notify_waiters();
+    }
+
+    /// Spawn-once worker behind the parked-drain plumbing: the authority's
+    /// Red shed closure and the Red admission gate both post a target to
+    /// [`Self::parked_drain_target`] and kick; the worker runs the
+    /// never-lossy [`Self::drain_parked_toward`] outside every caller's
+    /// lock context (P1-9: the drain takes lease locks (2) and OTHER
+    /// blocks' flush locks (3) — never legal from under a writer's own
+    /// held block lock, which is exactly why gated writers WAIT instead
+    /// of draining inline).
+    fn ensure_parked_drain_worker(&self) {
+        if self
+            .parked_drain_worker_started
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let fs = self.clone();
+        tokio::spawn(async move {
+            loop {
+                fs.parked_drain_kick.notified().await;
+                let target = fs.parked_drain_target.swap(u64::MAX, Ordering::Relaxed);
+                if target == u64::MAX {
+                    continue;
+                }
+                fs.drain_parked_toward(target).await;
+            }
+        });
     }
 
     async fn insert_active_block_buffer(
@@ -2532,6 +2603,60 @@ impl SqueezefsFilesystem {
             if !spilled {
                 // Every candidate was contended or vanished: soft cap.
                 break;
+            }
+        }
+        // R5 Red BLOCKING admission (§5.7, finding #2): below Red the cap
+        // stays soft (spill-or-keep, today's semantics). At Red — the
+        // authority already shedding — parking past the halved cap is the
+        // measured OOM engine (staging refused 100% of spills on the
+        // saturation suite; the parked set ballooned 256 → 1,937 buffers
+        // = 7.6 GiB anon while the 1 Hz drain lost the race). The writer
+        // instead AWAITS the never-lossy drain until the set is back
+        // under the cap: awaited backpressure in async context (the
+        // §4.4-pt-5 ring-admission precedent — no spin, no held-lock
+        // wait; the drain worker acquires its locks in a clean context
+        // and never needs THIS block's lock, which is not in the map).
+        // Deadline-bounded for liveness: a drain that cannot progress
+        // (hard failures) must not wedge the write path — park loud.
+        if crate::mem_budget::level() == crate::mem_budget::Level::Red {
+            const PARKED_GATE_DEADLINE: Duration = Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + PARKED_GATE_DEADLINE;
+            let mut waited = false;
+            loop {
+                let lvl = crate::mem_budget::level();
+                if lvl != crate::mem_budget::Level::Red {
+                    break;
+                }
+                let cap = crate::mem_budget::effective_parked_cap(MAX_ACTIVE_BLOCK_BUFFERS, lvl);
+                if self.active_block_buffers.len() < cap {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    METRICS.parked_gate_timeouts.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Red parked-buffer gate: drain made no room in {:?} — parking past \
+                         the cap ({} buffers) to preserve liveness",
+                        PARKED_GATE_DEADLINE,
+                        self.active_block_buffers.len()
+                    );
+                    break;
+                }
+                if !waited {
+                    waited = true;
+                    METRICS.parked_gate_waits.fetch_add(1, Ordering::Relaxed);
+                }
+                let bs = self.router.block_size.load(Ordering::Relaxed).max(1);
+                // Aim one block under the cap so this insert lands within it.
+                let cap_bytes = (cap as u64).saturating_mul(bs).saturating_sub(bs);
+                self.parked_drain_target
+                    .fetch_min(cap_bytes, Ordering::Relaxed);
+                self.ensure_parked_drain_worker();
+                self.parked_drain_kick.notify_one();
+                let progress = self.parked_drain_progress.notified();
+                tokio::select! {
+                    _ = progress => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
             }
         }
         self.active_block_buffers.insert(cache_key, block_data);
@@ -3104,35 +3229,26 @@ impl Filesystem for SqueezefsFilesystem {
                 let bufs = self.active_block_buffers.clone();
                 let bs_atomic = self.router.block_size.clone();
                 // §5.7 Red parked shed: cap-halving at admission gates NEW
-                // parks; the DRAIN below flushes the existing backlog
-                // through the durable path (the "early
-                // flush_memory_buffers_*" mechanism — measured necessary:
-                // the row-5 trace grew 250 → 1,750 parked buffers with the
-                // cap alone). Shed closures are sync, the flush is async:
-                // the closure posts the target and wakes a drain worker.
-                let drain_target = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-                let drain_notify = Arc::new(tokio::sync::Notify::new());
-                {
-                    let fs = self.clone();
-                    let target = drain_target.clone();
-                    let notify = drain_notify.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            notify.notified().await;
-                            let t = target.load(Ordering::Relaxed);
-                            fs.drain_parked_toward(t).await;
-                        }
-                    });
-                }
-                let shed_target = drain_target.clone();
+                // parks; the DRAIN flushes the existing backlog through
+                // the durable path (the "early flush_memory_buffers_*"
+                // mechanism — measured necessary: the row-5 trace grew
+                // 250 → 1,750 parked buffers with the cap alone). Shed
+                // closures are sync, the flush is async: the closure posts
+                // the target and kicks the shared drain worker — the SAME
+                // plumbing the Red admission gate uses
+                // (`insert_active_block_buffer`), so the shed and the
+                // gate never race two competing drains.
+                self.ensure_parked_drain_worker();
+                let shed_target = self.parked_drain_target.clone();
+                let shed_kick = self.parked_drain_kick.clone();
                 MEM_BUDGET.register(Component::new(
                     "parked_write_buffers",
                     32 * 4 * MIB, // 32 parked blocks at the default 4 MiB
                     4,
                     Arc::new(move || bufs.len() as u64 * bs_atomic.load(Ordering::Relaxed)),
                     Arc::new(move |target| {
-                        shed_target.store(target, Ordering::Relaxed);
-                        drain_notify.notify_one();
+                        shed_target.fetch_min(target, Ordering::Relaxed);
+                        shed_kick.notify_one();
                     }),
                 ));
                 let hot = self.router.cache.hot_block.clone();

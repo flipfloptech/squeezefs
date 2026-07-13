@@ -6,11 +6,15 @@
 //! register a `Component` — a gauge closure, a floor, a weight, and a shed
 //! closure — into a latch-free `ArcSwap` registry. A 1 Hz sampler
 //! resolves the budget (flag → env → cgroup `memory.max` × 0.8 re-read
-//! every tick → 70 % RAM), samples `/proc/self/statm` RSS into a 5-slot
-//! decaying window (max-of-window, explicitly NOT a ratchet), computes
-//! `pressure = max(Σ gauges, windowed_rss_max)`, and drives the level
-//! machine with hysteresis. Red ticks shed to weights over floors through
-//! the components' own never-lossy mechanisms.
+//! every tick → 70 % RAM), samples `/proc/self/statm` RSS **and** the
+//! cgroup-v2 UNRECLAIMABLE set (`memory.stat`: anon + dirty + writeback +
+//! shmem + unevictable + unreclaimable slab — the bytes the OOM killer
+//! cannot reclaim its way out of; clean cache deliberately excluded) into
+//! two 5-slot decaying windows (max-of-window, explicitly NOT ratchets),
+//! computes `pressure = max(Σ gauges, windowed_rss_max,
+//! windowed_unreclaimable_max)`, and drives the level machine with
+//! hysteresis. Red ticks shed to weights over floors through the
+//! components' own never-lossy mechanisms.
 //!
 //! Enforcement is ADVISORY-AT-ADMISSION: growth paths call [`level`] —
 //! one relaxed atomic load, no lock, nothing blocking — and apply their
@@ -19,6 +23,31 @@
 //! prefetch issue). Write-side durability is untouched: shedding parked
 //! buffers means flushing them through the existing durable paths sooner,
 //! never dropping them.
+//!
+//! Two escalations beyond advisory (the 2026-07-12 saturation-suite
+//! cage-OOM finding #2 — Red fired but shedding did not converge against
+//! 16-stream admission; `.benchmarks/2026-07-12-saturation-suite-oom-
+//! finding2.md`):
+//! - **Disk-tier publish pause** ([`tier_publish_paused`]): while the
+//!   unreclaimable arm sits in the Red band (enter ≥ 95 %, release
+//!   < 91 % — same 4-point hysteresis), read-tier publishes are skipped
+//!   at [`crate::cache::NvmeStaging::cache_read_block`] (never-lossy —
+//!   it is a read cache). Keyed on the unreclaimable arm, NOT the level:
+//!   gauge-driven Red over clean (kernel-reclaimable) tier bytes must
+//!   keep publishing or warm-up would starve (the PR 3 knee scenario).
+//! - **Hard backstop** ([`MemBudget::hard_backstops`]): the unreclaimable
+//!   arm ≥ 100 % of budget for [`BACKSTOP_SUSTAIN_TICKS`] consecutive
+//!   ticks — Red demonstrably not converging — collapses the shed target
+//!   from 85 % to the FLOORS until the window decays below the Red-exit
+//!   edge. This holds even when a component gauge undercounts: the arm
+//!   reads the kernel's accounting, not ours.
+//!
+//! The third Red response lives at the parked-buffer admission site
+//! (`fuse_client::insert_active_block_buffer`): at Red the halved cap is
+//! a real bound — writers await the never-lossy drain (bounded, async)
+//! instead of parking past it. See the §4.4-pt-5 ring-admission
+//! precedent; measured pre-fix: 1,937 parked buffers = 7.6 GiB anon
+//! against a 256 cap while staging refused every spill.
 //!
 //! Concurrency: single-word relaxed atomics throughout (level, budget,
 //! pressure, event counters) — racy-tolerant by design (a stale level
@@ -70,6 +99,11 @@ const SHED_TARGET_PCT: u64 = 85;
 const FLOOR_CAP_PCT: u64 = 90;
 /// RSS window length (1 Hz samples) — the decay horizon.
 const RSS_WINDOW: usize = 5;
+/// Consecutive ticks the windowed unreclaimable arm must sit at/over the
+/// FULL budget before the hard backstop escalates Red sheds to the floors
+/// (§5.7 Red semantics). One or two ticks is a spike the normal Red
+/// response absorbs; three is a convergence failure.
+pub const BACKSTOP_SUSTAIN_TICKS: u64 = 3;
 
 /// One registered RAM consumer (§5.7 authority). Closures, not fn
 /// pointers: components carry state (cache handles, gauges) and the
@@ -127,10 +161,25 @@ pub struct MemBudget {
     gauge_sum: AtomicU64,
     rss_window: [AtomicU64; RSS_WINDOW],
     rss_idx: AtomicUsize,
+    /// Decaying window over the cgroup-v2 unreclaimable set (anon + dirty
+    /// + writeback + shmem + unevictable + unreclaimable slab) — the
+    /// kill-relevant arm the statm sampler cannot see (dirty page cache)
+    /// and component gauges may undercount.
+    unreclaim_window: [AtomicU64; RSS_WINDOW],
+    unreclaim_idx: AtomicUsize,
+    /// Last windowed unreclaimable max (stats surface).
+    unreclaimable: AtomicU64,
     level: AtomicU8,
     yellow_events: AtomicU64,
     red_events: AtomicU64,
     floors_clamped: AtomicBool,
+    /// Disk-tier publish pause (unreclaimable-arm Red band, hysteresis).
+    tier_paused: AtomicBool,
+    /// Hard-backstop state: consecutive at/over-budget ticks, active flag,
+    /// entry-edge counter.
+    backstop_over_ticks: AtomicU64,
+    backstop_on: AtomicBool,
+    hard_backstops: AtomicU64,
 }
 
 impl MemBudget {
@@ -143,10 +192,17 @@ impl MemBudget {
             gauge_sum: AtomicU64::new(0),
             rss_window: Default::default(),
             rss_idx: AtomicUsize::new(0),
+            unreclaim_window: Default::default(),
+            unreclaim_idx: AtomicUsize::new(0),
+            unreclaimable: AtomicU64::new(0),
             level: AtomicU8::new(Level::Green as u8),
             yellow_events: AtomicU64::new(0),
             red_events: AtomicU64::new(0),
             floors_clamped: AtomicBool::new(false),
+            tier_paused: AtomicBool::new(false),
+            backstop_over_ticks: AtomicU64::new(0),
+            backstop_on: AtomicBool::new(false),
+            hard_backstops: AtomicU64::new(0),
         }
     }
 
@@ -199,10 +255,37 @@ impl MemBudget {
         self.floors_clamped.load(Relaxed)
     }
 
+    /// Windowed max of the cgroup unreclaimable arm (stats surface).
+    pub fn unreclaimable_bytes(&self) -> u64 {
+        self.unreclaimable.load(Relaxed)
+    }
+
+    /// Hard-backstop entry edges (§5.7 Red-semantics escalation).
+    pub fn hard_backstops(&self) -> u64 {
+        self.hard_backstops.load(Relaxed)
+    }
+
+    /// Whether the hard backstop is currently escalating Red sheds to the
+    /// floors.
+    pub fn backstop_active(&self) -> bool {
+        self.backstop_on.load(Relaxed)
+    }
+
+    /// Whether disk-tier publishes are paused (unreclaimable-arm Red band).
+    pub fn tier_publish_paused(&self) -> bool {
+        self.tier_paused.load(Relaxed)
+    }
+
     /// Test seam: pin the process level (integration phases drive the
     /// advisory checks without a live sampler).
     pub fn force_level_for_test(&self, l: Level) {
         self.level.store(l as u8, Relaxed);
+    }
+
+    /// Test seam: pin the tier-publish pause (integration phases drive the
+    /// publish gate without a live sampler).
+    pub fn force_tier_publish_paused_for_test(&self, paused: bool) {
+        self.tier_paused.store(paused, Relaxed);
     }
 
     /// Effective floors for `budget` (§5.7 floor validation): proportional
@@ -228,8 +311,9 @@ impl MemBudget {
     }
 
     /// One sampler tick with injected inputs (the test seam; the real
-    /// [`Self::tick`] resolves budget + RSS and delegates here).
-    pub fn tick_inner(&self, budget: u64, rss_sample: u64) {
+    /// [`Self::tick`] resolves budget + RSS + the cgroup unreclaimable
+    /// set and delegates here).
+    pub fn tick_inner(&self, budget: u64, rss_sample: u64, unreclaimable_sample: u64) {
         self.budget.store(budget, Relaxed);
 
         // Decaying RSS window: overwrite the oldest slot, take the max.
@@ -242,16 +326,71 @@ impl MemBudget {
             .max()
             .unwrap_or(0);
 
+        // Same decay semantics for the unreclaimable arm.
+        let uidx = self.unreclaim_idx.fetch_add(1, Relaxed) % RSS_WINDOW;
+        self.unreclaim_window[uidx].store(unreclaimable_sample, Relaxed);
+        let unreclaim_max = self
+            .unreclaim_window
+            .iter()
+            .map(|s| s.load(Relaxed))
+            .max()
+            .unwrap_or(0);
+        self.unreclaimable.store(unreclaim_max, Relaxed);
+
         let reg = self.registry.load();
         let gauge_sum: u64 = reg.iter().map(|c| (c.current)()).sum();
         self.gauge_sum.store(gauge_sum, Relaxed);
-        let pressure = gauge_sum.max(rss_max);
+        let pressure = gauge_sum.max(rss_max).max(unreclaim_max);
         self.pressure.store(pressure, Relaxed);
 
         if budget == 0 {
             self.level.store(Level::Green as u8, Relaxed);
+            self.tier_paused.store(false, Relaxed);
+            self.backstop_over_ticks.store(0, Relaxed);
+            self.backstop_on.store(false, Relaxed);
             return;
         }
+
+        // Disk-tier publish pause: the unreclaimable arm alone (the
+        // dirty-flood / anon-balloon kill signature), Red band with the
+        // same 4-point hysteresis. Gauge- or statm-driven Red must NOT
+        // pause publishes: logical tier bytes over clean page cache are
+        // kernel-reclaimable, and pausing warm-up on them would regress
+        // the PR 3 oversubscription scenario.
+        let upct = unreclaim_max.saturating_mul(100) / budget;
+        if upct >= RED_ENTER_PCT {
+            if !self.tier_paused.swap(true, Relaxed) {
+                log::warn!(
+                    "mem_budget: unreclaimable {unreclaim_max} B >= {RED_ENTER_PCT}% of the \
+                     {budget} B budget — disk-tier publishes paused"
+                );
+            }
+        } else if upct < RED_EXIT_PCT && self.tier_paused.swap(false, Relaxed) {
+            log::info!("mem_budget: unreclaimable pressure receded — disk-tier publishes resume");
+        }
+
+        // Hard backstop (§5.7 Red semantics): sustained unreclaimable
+        // at/over the FULL budget means Red shedding is not converging
+        // against admission — escalate the shed target to the floors.
+        // Kernel accounting, not component gauges: this holds even when a
+        // gauge undercounts.
+        if unreclaim_max >= budget {
+            let over = self.backstop_over_ticks.fetch_add(1, Relaxed) + 1;
+            if over >= BACKSTOP_SUSTAIN_TICKS && !self.backstop_on.swap(true, Relaxed) {
+                self.hard_backstops.fetch_add(1, Relaxed);
+                log::warn!(
+                    "mem_budget: HARD BACKSTOP — unreclaimable {unreclaim_max} B >= the full \
+                     {budget} B budget for {over} consecutive ticks; Red sheds escalate to \
+                     component floors until the pressure recedes"
+                );
+            }
+        } else {
+            self.backstop_over_ticks.store(0, Relaxed);
+            if upct < RED_EXIT_PCT && self.backstop_on.swap(false, Relaxed) {
+                log::info!("mem_budget: hard backstop released");
+            }
+        }
+
         let pct = pressure.saturating_mul(100) / budget;
         let prev = Level::from_u8(self.level.load(Relaxed));
         let next = match prev {
@@ -309,16 +448,22 @@ impl MemBudget {
     /// Red response (§5.7): distribute the excess over `SHED_TARGET_PCT`
     /// across components ∝ weight, floors respected (single pass, floor-
     /// clamped — a shortfall reappears as pressure on the next tick).
-    /// Components already at/below their target get no call.
+    /// Components already at/below their target get no call. Under the
+    /// hard backstop the target collapses to the floor sum: every
+    /// over-floor component is shed to its floor.
     fn shed_to_weights(&self, budget: u64, pressure: u64, reg: &[Arc<Component>]) {
-        let target_total = budget * SHED_TARGET_PCT / 100;
+        let floors = self.effective_floors(budget);
+        let target_total = if self.backstop_on.load(Relaxed) {
+            floors.iter().sum()
+        } else {
+            budget * SHED_TARGET_PCT / 100
+        };
         let Some(mut excess) = pressure.checked_sub(target_total) else {
             return;
         };
         if excess == 0 {
             return;
         }
-        let floors = self.effective_floors(budget);
         // Sheddable set: above-floor components with weight > 0.
         let mut sheddable: Vec<(usize, u64, u64)> = Vec::new(); // (idx, headroom, weight)
         let mut weight_sum = 0u64;
@@ -360,7 +505,8 @@ impl MemBudget {
     }
 
     /// Production tick: resolve the budget (flag → env → cgroup × 0.8
-    /// re-read NOW → 70 % RAM), sample RSS, delegate.
+    /// re-read NOW → 70 % RAM), sample RSS + the cgroup unreclaimable
+    /// set, delegate.
     pub fn tick(&self) {
         let flag = match self.flag_budget.load(Relaxed) {
             0 => None,
@@ -371,7 +517,11 @@ impl MemBudget {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(|mb| mb * 1024 * 1024);
         let budget = resolve_budget_from(flag, env, read_cgroup_memory_max(), system_ram_bytes());
-        self.tick_inner(budget, read_rss_bytes());
+        self.tick_inner(
+            budget,
+            read_rss_bytes(),
+            read_cgroup_unreclaimable().unwrap_or(0),
+        );
     }
 
     /// Serialize the registry for the stats inode: `(name, current, floor,
@@ -393,6 +543,15 @@ pub static MEM_BUDGET: Lazy<MemBudget> = Lazy::new(MemBudget::new);
 #[inline]
 pub fn level() -> Level {
     MEM_BUDGET.level()
+}
+
+/// One-atomic-load disk-tier publish gate (the finding-#2 escalation) —
+/// read by [`crate::cache::NvmeStaging::cache_read_block`], the single
+/// funnel every tier producer (fill path, dehydration, p2p store) routes
+/// through.
+#[inline]
+pub fn tier_publish_paused() -> bool {
+    MEM_BUDGET.tier_publish_paused()
 }
 
 /// §5.7 budget resolution order, pure: flag → env → cgroup `memory.max`
@@ -438,6 +597,45 @@ fn read_cgroup_memory_max() -> Option<u64> {
         return None;
     }
     max.parse::<u64>().ok()
+}
+
+/// The kill-relevant subset of cgroup-v2 `memory.stat`: bytes the kernel
+/// cannot reclaim without I/O or at all — `anon` (the OOM killer's prey)
+/// + `file_dirty` + `file_writeback` (unreclaimable until writeback
+/// completes) + `shmem` + `unevictable` + `slab_unreclaimable`. Clean
+/// file cache is deliberately EXCLUDED: it is dropped, not killed over
+/// (counting it would pin healthy warm mounts — 5 GiB of clean tier mmap
+/// by design — in permanent Red).
+pub fn parse_unreclaimable_memory_stat(stat: &str) -> u64 {
+    let mut sum = 0u64;
+    for line in stat.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(key), Some(val)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if matches!(
+            key,
+            "anon"
+                | "file_dirty"
+                | "file_writeback"
+                | "shmem"
+                | "unevictable"
+                | "slab_unreclaimable"
+        ) {
+            sum += val.parse::<u64>().unwrap_or(0);
+        }
+    }
+    sum
+}
+
+/// cgroup v2 `memory.stat` unreclaimable sample for THIS process — one
+/// small file read per tick, same cost class as the `memory.max` re-read.
+/// `None` off-cgroup (the arm disengages; statm + gauges remain).
+fn read_cgroup_unreclaimable() -> Option<u64> {
+    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cg.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let stat = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.stat")).ok()?;
+    Some(parse_unreclaimable_memory_stat(&stat))
 }
 
 /// `/proc/self/statm` resident pages × page size.

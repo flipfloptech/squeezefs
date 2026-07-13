@@ -2990,6 +2990,7 @@ impl DataRouter {
             return Ok(false);
         };
 
+        let raw_len = raw.len();
         let processed = self
             .get_crypto()
             .process_write_async(bytes::Bytes::from(raw))
@@ -3037,6 +3038,15 @@ impl DataRouter {
             let mut block_map = updated.block_map.take().unwrap_or_default();
             let displaced = block_map.insert(0, block_key.clone());
             updated.block_map = Some(block_map);
+            // The promoted image IS acked file content: a `current` snapshot
+            // whose size persist lags the blob (the RMW that staged this
+            // image reaches its commit lock AFTER this promotion) must not
+            // persist a size SMALLER than the image — a later TTL refill
+            // would resurrect the stale pair {old size, new image} and roll
+            // an acked extend back to an implicit-zero tail (the leg-5
+            // fail3 tape: promote saved size=306494 with a 425111-byte
+            // image).
+            updated.size = updated.size.max(raw_len as u64);
             updated.layout_dirty = false;
             updated.cached_at = std::time::Instant::now();
             self.save_metadata_to_backend(ino, &updated, fencing_token)
@@ -3049,18 +3059,33 @@ impl DataRouter {
                     let _ = self.backend_router.free_block(&prev).await;
                 }
             }
+            // Ring-entry release INSIDE the commit's lock section — the
+            // DESTRUCTIVE step of the promotion lifecycle is serialized with
+            // every layout commit (leg 5 of the zeros-LOSS family): released
+            // after the lock, it landed inside an RMW's stage→commit-lock
+            // window, so the RMW's commit saw its just-staged entry gone yet
+            // published "ring is authoritative, map=None" and freed this
+            // promotion's mapping — the file's sole surviving copy (the
+            // offset was reallocated and punched under two other inodes;
+            // the next durable clip read 100 % zeros). Under the lock, the
+            // staged-arm commit's residency check is exact: removal cannot
+            // interleave with it. Still generation-gated: a re-stage that
+            // bumped the generation after our blob read keeps its (newer)
+            // ring entry — this promotion's mapping is then the one the
+            // RMW's commit releases as superseded. Blocking-pool hop: shard
+            // WRITE lock (invariant rule 2); bounded (index remove + page
+            // reclaim), the same class of work truncate already holds this
+            // lock across.
+            let _ = nvme
+                .remove_staged_if_generation_async(file_id.to_string(), gen)
+                .await;
             Ok(true)
         }
         .await;
 
+        // TEMP-PROBE (leg5-v2 rail a; stripped before commit)
         match commit {
-            Ok(true) => {
-                // Blocking-pool hop: shard WRITE lock (invariant rule 2).
-                let _ = nvme
-                    .remove_staged_if_generation_async(file_id.to_string(), gen)
-                    .await;
-                Ok(true)
-            }
+            Ok(true) => Ok(true),
             Ok(false) => {
                 let _ = allocator.free_block(offset).await;
                 Ok(false)
@@ -3537,29 +3562,102 @@ impl DataRouter {
                             // possibly-pre-promotion snapshot alone. A miss
                             // everywhere = genuine crash loss (zeros base per
                             // the D0 degrade contract).
-                            let mapping_opt = self.staged_block_mapping(file_path, &meta).await;
-                            if let Some(mapping_str) = mapping_opt {
-                                let mut plain =
-                                    self.read_promoted_staged_block(&mapping_str).await?;
-                                let (_, _, _, exact) = self.parse_block_mapping(&mapping_str)?;
-                                if !exact && plain.len() as u64 > meta.size {
-                                    // Bare legacy mapping: the whole-block
-                                    // read's tail is another tenant's device
-                                    // garbage a passthrough transform cannot
-                                    // strip. Bound by `meta.size` — safe on
-                                    // THIS leg only, because every event
-                                    // that publishes/clips a durable staged
-                                    // mapping (promotion, spill, truncate
-                                    // clip) persists the size in the same
-                                    // commit, so a ring-miss image never
-                                    // legitimately exceeds it (unlike the
-                                    // ring blob, whose size may lag — the
-                                    // pinned truncate_down_stale_size
-                                    // contract).
-                                    plain = plain.slice(0..meta.size as usize);
+                            // Binding-revalidated fetch (the promoted-mapping
+                            // ABA, WRITE-side — the read path learned this in
+                            // the 074/127/616 family): the mapping resolved
+                            // here is freed the moment ANY layout commit
+                            // supersedes it (an RMW commit releasing it as
+                            // superseded, a re-promotion displacing it, a
+                            // truncate clip), and the allocator hands the
+                            // offset straight to the next promotion of the
+                            // SAME file — the leg-5 residual tape shows one
+                            // offset ping-ponging promote→free→realloc at
+                            // storm rate. An unvalidated read then seeds the
+                            // whole-image rebuild from punched zeros /
+                            // another incarnation's bytes and CODIFIES them.
+                            // Serve rule: only a fetch whose binding is still
+                            // the CURRENT identity after the read completed
+                            // may seed; on movement re-resolve and retry —
+                            // bounded, then loud (never a silent zeros seed
+                            // for acked data).
+                            let mut attempts = 0u32;
+                            let mut mapping_opt = self.staged_block_mapping(file_path, &meta).await;
+                            while let Some(mapping_str) = mapping_opt.take() {
+                                attempts += 1;
+                                if attempts > 64 {
+                                    return Err(SqueezefsError::InvalidOperation(format!(
+                                        "staged RMW seed of {file_path} kept moving after \
+                                         {attempts} re-resolves (offset {offset})"
+                                    )));
                                 }
-                                existing_data.resize(plain.len(), 0);
-                                existing_data.copy_from_slice(&plain);
+                                let fetched = self.read_promoted_staged_block(&mapping_str).await;
+                                let fresh = self.freshest_layout_identity(file_path).await;
+                                let still_bound = fresh.as_ref().is_some_and(|f| {
+                                    f.file_type == "staged"
+                                        && f.file_id == meta.file_id
+                                        && f.block_map
+                                            .as_ref()
+                                            .and_then(|bm| bm.get(&0))
+                                            .is_some_and(|cur| *cur == mapping_str)
+                                });
+                                match fetched {
+                                    Ok(mut plain) if still_bound => {
+                                        let (_, _, _, exact) =
+                                            self.parse_block_mapping(&mapping_str)?;
+                                        if !exact && plain.len() as u64 > meta.size {
+                                            // Bare legacy mapping: the whole-
+                                            // block read's tail is another
+                                            // tenant's device garbage a
+                                            // passthrough transform cannot
+                                            // strip. Bound by `meta.size` —
+                                            // safe on THIS leg only (every
+                                            // durable-mapping publish persists
+                                            // the size in the same commit).
+                                            plain = plain.slice(0..meta.size as usize);
+                                        }
+                                        existing_data.resize(plain.len(), 0);
+                                        existing_data.copy_from_slice(&plain);
+                                        break;
+                                    }
+                                    Err(e) if still_bound => return Err(e),
+                                    _ => {
+                                        // Binding moved (or the fetch hit the
+                                        // freed window): re-resolve. A ring
+                                        // entry re-appearing means a newer
+                                        // re-stage owns the truth — the outer
+                                        // ring-hit path can't be re-entered
+                                        // here, but its content supersedes
+                                        // this write's base only through the
+                                        // fresh mapping/identity, so keep
+                                        // resolving the freshest mapping.
+                                        crate::fuse_client::METRICS
+                                            .staged_identity_retries
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if let Some(f) = fresh {
+                                            if f.file_id == meta.file_id && f.file_type == "staged"
+                                            {
+                                                if let Some(id) = f.file_id.as_deref() {
+                                                    if self
+                                                        .cache
+                                                        .nvme
+                                                        .read_staged_into(id, &mut existing_data)
+                                                    {
+                                                        crate::fuse_client::METRICS
+                                                            .staged_rmw_pooled_seeds
+                                                            .fetch_add(1, Ordering::Relaxed);
+                                                        break;
+                                                    }
+                                                }
+                                                mapping_opt =
+                                                    self.staged_block_mapping(file_path, &f).await;
+                                                continue;
+                                            }
+                                        }
+                                        // Identity flipped entirely: nothing
+                                        // durable to seed from this shape.
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -3772,13 +3870,39 @@ impl DataRouter {
                 Ok(_) => {
                     let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
                     let fresh = self.metadata_cache.get(file_path);
+                    // Ring-residency check (leg 5 of the zeros-LOSS family).
+                    // A promotion enqueued by THIS stage's high-water
+                    // crossing can consume the just-staged image before we
+                    // reach this lock: it commits (its generation check
+                    // passes against this stage's generation), publishes
+                    // `block_map[0]` (the `fresh` read above), and releases
+                    // the ring entry. Publishing "ring is authoritative,
+                    // map=None" and freeing fresh's mapping would then free
+                    // the file's SOLE copy. The check is EXACT, not a
+                    // TOCTOU: the promotion's ring release runs INSIDE its
+                    // commit's `INODE_META_LOCKS` section (see
+                    // `promote_staged_file`), so while we hold the lock no
+                    // removal can interleave — present means present until
+                    // we release.
+                    let ring_resident = self.cache.nvme.staged_len(&new_file_id).is_some();
                     let mut updated_meta = meta.clone();
                     updated_meta.file_type = "staged".to_string();
                     updated_meta.size = new_size as u64;
                     updated_meta.file_id = Some(new_file_id);
                     updated_meta.data_key = None;
-                    updated_meta.block_map = None;
-                    updated_meta.layout_dirty = true;
+                    if ring_resident {
+                        updated_meta.block_map = None;
+                        updated_meta.layout_dirty = true;
+                    } else {
+                        // A promotion consumed exactly our staged bytes:
+                        // ADOPT its published mapping. DIRTY unconditionally
+                        // — this entry is the only holder of the consistent
+                        // {size, mapping} pair (the promotion may have
+                        // persisted a pre-RMW size), and only dirty entries
+                        // are refill-immune under the dirty-authority rule.
+                        updated_meta.block_map = fresh.as_ref().and_then(|f| f.block_map.clone());
+                        updated_meta.layout_dirty = true;
+                    }
                     updated_meta.cached_at = std::time::Instant::now();
                     self.metadata_cache
                         .insert(file_path.to_string(), updated_meta);
@@ -3794,14 +3918,16 @@ impl DataRouter {
                     self.cache.write_lru.remove(file_path);
                     self.cache.read_lru.remove(file_path);
                     // The fresh stage supersedes any promoted/spilled durable
-                    // copy of older content. The ring entry itself is the
-                    // fresh data (replaced in-place by stage_write) — keep it.
-                    self.release_superseded_staged(
-                        None,
-                        fresh.as_ref().and_then(|f| f.block_map.as_ref()),
-                        None,
-                    )
-                    .await;
+                    // copy of older content — release it ONLY when the ring
+                    // entry actually survives to be authoritative.
+                    if ring_resident {
+                        self.release_superseded_staged(
+                            None,
+                            fresh.as_ref().and_then(|f| f.block_map.as_ref()),
+                            None,
+                        )
+                        .await;
+                    }
                 }
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
                     // Spill is the designed degraded mode under sustained
@@ -5367,27 +5493,48 @@ impl DataRouter {
                 // re-promotion (merge worker — not FUSE-serialized) freeing
                 // `old_bk`: a failed read re-resolves the freshest binding
                 // once and retries; an error on a STABLE binding is real.
+                // Binding-revalidated fetch (the promoted-mapping ABA, same
+                // serve rule as the read path and the RMW seed): a mapping
+                // can be displaced-and-freed while our read is in flight and
+                // the offset instantly re-tenanted by the next promotion —
+                // an error-only revalidation misses the poisoned SUCCESS
+                // (freed+rewritten bytes read back fine). Only a fetch whose
+                // binding still holds after the read may be clipped; on
+                // movement re-resolve and retry, bounded, then loud.
                 let mut old_bk = old_bk;
-                let img = match self.read_promoted_staged_block(&old_bk).await {
-                    Ok(img) => Some(img),
-                    Err(e) => {
-                        let fresh = self.freshest_layout_identity(&file_path).await;
-                        let fresh_bk = match fresh {
-                            Some(ref f) if f.file_type == "staged" => {
-                                f.block_map.as_ref().and_then(|bm| bm.get(&0).cloned())
-                            }
-                            _ => None,
-                        };
-                        match fresh_bk {
-                            Some(bk) if bk != old_bk => {
-                                old_bk = bk;
-                                Some(self.read_promoted_staged_block(&old_bk).await?)
-                            }
-                            Some(_) => return Err(e),
-                            None => None,
-                        }
+                let mut img = None;
+                let mut attempts = 0u32;
+                loop {
+                    attempts += 1;
+                    if attempts > 64 {
+                        return Err(SqueezefsError::InvalidOperation(format!(
+                            "truncate durable clip of {file_path} kept moving after \
+                             {attempts} re-resolves (new_size {new_size})"
+                        )));
                     }
-                };
+                    let fetched = self.read_promoted_staged_block(&old_bk).await;
+                    let fresh = self.freshest_layout_identity(&file_path).await;
+                    let fresh_bk = match fresh {
+                        Some(ref f) if f.file_type == "staged" && f.file_id == snapshot_file_id => {
+                            f.block_map.as_ref().and_then(|bm| bm.get(&0).cloned())
+                        }
+                        _ => None,
+                    };
+                    match (fetched, fresh_bk) {
+                        (Ok(i), Some(ref bk)) if *bk == old_bk => {
+                            img = Some(i);
+                            break;
+                        }
+                        (Err(e), Some(ref bk)) if *bk == old_bk => return Err(e),
+                        (_, Some(bk)) => {
+                            crate::fuse_client::METRICS
+                                .staged_identity_retries
+                                .fetch_add(1, Ordering::Relaxed);
+                            old_bk = bk;
+                        }
+                        (_, None) => break,
+                    }
+                }
                 if let Some(img) = img {
                     if img.len() as u64 > new_size {
                         let clipped = img.slice(0..new_size as usize);

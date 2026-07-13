@@ -1634,26 +1634,30 @@ impl SqueezefsFilesystem {
             && (write_start > block_start || write_end < existing_block_end)
     }
 
-    /// Item B: materialize a deferred RMW seed — fetch the block's old
-    /// durable content and fill the buffer's uncovered complement. The
+    /// Item B: fetch a deferred RMW seed's OLD block image. The
     /// binding-validated fetch is verbatim the old eager-seed discipline
     /// (the 8e3995e follow-up): `bk` can be displaced, freed, and
     /// reallocated under the same key while we read it, so the fill routes
     /// through `get_block_for_index` (single-flight validated fill:
     /// read_lru → NVMe tier → device read under the incarnation seqlock,
     /// PLUS the block-index→key recheck once the bytes are in hand); a
-    /// hole rebind (concurrent truncate/punch pruned the mapping) seeds
-    /// zeros — the block IS a hole now. Callers hold this block's
-    /// `BLOCK_FLUSH_LOCKS` (the same lock the eager seed read under).
-    async fn materialize_deferred_seed(
+    /// hole rebind (concurrent truncate/punch pruned the mapping) returns
+    /// `None` — the block IS a hole now, its complement seeds zeros.
+    ///
+    /// OVERLAY NEVER INVISIBLE: this await deliberately takes NO buffer —
+    /// callers keep the deferred buffer PARKED (visible to every
+    /// concurrent single-block read: kernel readahead, AIO) across the
+    /// device read and apply the image afterwards with the synchronous
+    /// [`crate::cache::active_block::ActiveBlockBuf::fill_complement_from`]
+    /// under this block's `BLOCK_FLUSH_LOCKS` (the same lock the eager
+    /// seed read under). Checking the buffer out across this await is the
+    /// generic/075-in-QUICK transient: readers fell to the backend and
+    /// served pre-merge bytes.
+    async fn fetch_seed_image(
         &self,
         file_path: &str,
         b: u32,
-        buf: &mut crate::cache::active_block::ActiveBlockBuf,
-    ) -> Result<(), SqueezefsError> {
-        if !buf.seed_deferred() {
-            return Ok(());
-        }
+    ) -> Result<Option<crate::cache::pool::ReadBlockValue>, SqueezefsError> {
         let mut block_map_id = None;
         let mut block_map = None;
         if let Some(entry) = self.router.metadata_cache.get(file_path) {
@@ -1688,8 +1692,7 @@ impl SqueezefsFilesystem {
                     .await?;
             }
         }
-        buf.fill_complement_from(existing.as_deref().unwrap_or(&[]));
-        Ok(())
+        Ok(existing)
     }
 
     pub async fn flush_memory_buffers_for_inode(
@@ -1717,39 +1720,65 @@ impl SqueezefsFilesystem {
             // concurrent write's checkout of the same block.
             let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
             let block_guard = block_lock.lock().await;
-            let Some((_, mut block_data)) = self.active_block_buffers.remove(&key) else {
-                drop(block_guard);
-                continue;
-            };
-            if block_data.seed_deferred() {
-                // Item B stage exit: the uncovered complement owes old
-                // bytes — never zeros. A failed materialize RE-PARKS the
-                // buffer before propagating (never-lossy: the ACKed bytes
-                // stay in RAM custody, readers keep serving them, and a
-                // healed retry flushes the SAME preserved bytes); dropping
-                // it here would make the next fsync succeed vacuously with
-                // the write silently lost.
-                let file_path = crate::keys::inode_path(ino);
-                if let Err(e) = self
-                    .materialize_deferred_seed(&file_path, b, &mut block_data)
-                    .await
-                {
-                    self.active_block_buffers.insert(key, block_data);
+            // OVERLAY NEVER INVISIBLE (the QUICK 075/112 transient): the
+            // buffer stays PARKED across every await on this exit —
+            // concurrent single-block reads (kernel readahead, AIO) keep
+            // serving the ACKed bytes from the overlay. The block lock
+            // excludes every mutator, so the entry cannot change under us;
+            // the seed image is fetched first (await, buffer visible),
+            // applied synchronously, and authority transfers
+            // STAGE-THEN-REMOVE so there is no window where neither copy
+            // is readable.
+            let deferred = match self.active_block_buffers.get(&key) {
+                Some(entry) => entry.value().seed_deferred(),
+                None => {
                     drop(block_guard);
-                    return Err(e);
+                    continue;
+                }
+            };
+            if deferred {
+                // Item B stage exit: the uncovered complement owes old
+                // bytes — never zeros. A failed fetch propagates with the
+                // buffer still parked (never-lossy: the ACKed bytes stay
+                // in RAM custody, readers keep serving them, and a healed
+                // retry flushes the SAME preserved bytes).
+                let file_path = crate::keys::inode_path(ino);
+                let image = match self.fetch_seed_image(&file_path, b).await {
+                    Ok(img) => img,
+                    Err(e) => {
+                        drop(block_guard);
+                        return Err(e);
+                    }
+                };
+                if let Some(mut entry) = self.active_block_buffers.get_mut(&key) {
+                    entry
+                        .value_mut()
+                        .fill_complement_from(image.as_deref().unwrap_or(&[]));
                 }
             }
-            block_data.zero_complete();
+            let staging_copy = match self.active_block_buffers.get_mut(&key) {
+                Some(mut entry) => {
+                    entry.value_mut().zero_complete();
+                    entry.value().snapshot()
+                }
+                None => {
+                    drop(block_guard);
+                    continue;
+                }
+            };
             let nvme_clone = self.router.cache.nvme.clone();
             let key_clone = key.clone();
-            let staging_copy = block_data.snapshot();
+            let staging_snapshot = staging_copy.clone();
             let admitted = tokio::task::spawn_blocking(move || {
-                nvme_clone.put_active_block(&key_clone, &staging_copy, fencing_token)
+                nvme_clone.put_active_block(&key_clone, &staging_snapshot, fencing_token)
             })
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
             if admitted {
+                // Authority transferred: the staged copy is identical and
+                // router reads serve it — the RAM copy can go.
+                self.active_block_buffers.remove(&key);
                 drop(block_guard);
                 let req = WritebackRequest {
                     ino,
@@ -1764,14 +1793,11 @@ impl SqueezefsFilesystem {
                 // escalation merges via the shared primitive
                 // (INODE_META_LOCKS — after BLOCK_FLUSH_LOCKS in the P1-9
                 // extended order), so holding the block guard is legal.
-                upload_active_block_bytes(
-                    ino,
-                    b,
-                    block_data.snapshot(),
-                    fencing_token,
-                    &self.router,
-                )
-                .await?;
+                // The RAM copy stays parked (readable) until the durable
+                // merge has published.
+                upload_active_block_bytes(ino, b, staging_copy, fencing_token, &self.router)
+                    .await?;
+                self.active_block_buffers.remove(&key);
                 drop(block_guard);
             }
         }
@@ -1859,7 +1885,7 @@ impl SqueezefsFilesystem {
                         // coverage completes. Every escape path (gap write,
                         // partial-coverage trigger, stage/upload exits,
                         // sparse reads) materializes the seed first via
-                        // `materialize_deferred_seed` — the SAME binding-
+                        // `fetch_seed_image` — the SAME binding-
                         // validated fetch the eager seed used, just moved
                         // to the last responsible moment.
                         METRICS
@@ -1916,17 +1942,28 @@ impl SqueezefsFilesystem {
                     let (c0, c1) = (c0 as usize, c1 as usize);
                     let gap = c0 != c1 && (rel_start > c1 || rel_start + slice_len < c0);
                     if gap {
-                        if let Err(e) = self
-                            .materialize_deferred_seed(&file_path, b as u32, &mut block_data)
-                            .await
-                        {
-                            // Never-lossy: the previously-ACKed covered
-                            // bytes RE-PARK unmerged; only THIS write —
-                            // never merged, never ACKed — fails loud.
-                            self.active_block_buffers
-                                .insert(cache_key.clone(), block_data);
-                            return Err(e);
-                        }
+                        // OVERLAY NEVER INVISIBLE: re-park the checked-out
+                        // buffer for the fetch await (readers keep serving
+                        // the ACKed covered bytes), then re-check it out —
+                        // guaranteed: the held block lock excludes every
+                        // mutator — and fill synchronously. A failed fetch
+                        // leaves the old bytes parked (never-lossy); only
+                        // THIS write — never merged, never ACKed — fails
+                        // loud.
+                        self.active_block_buffers
+                            .insert(cache_key.clone(), block_data);
+                        let image = match self.fetch_seed_image(&file_path, b as u32).await {
+                            Ok(img) => img,
+                            Err(e) => return Err(e),
+                        };
+                        let Some((_, reowned)) = self.active_block_buffers.remove(&cache_key)
+                        else {
+                            unreachable!(
+                                "parked buffer vanished under a held BLOCK_FLUSH_LOCKS guard"
+                            );
+                        };
+                        block_data = reowned;
+                        block_data.fill_complement_from(image.as_deref().unwrap_or(&[]));
                     }
                 }
                 block_data.record_write(rel_start, rel_start + slice_len);
@@ -1944,24 +1981,40 @@ impl SqueezefsFilesystem {
                     if block_data.seed_deferred() {
                         // Trigger with partial coverage (stream started
                         // mid-block): the uncovered head owes old bytes.
-                        // The request slice is already merged, so a failed
-                        // materialize PARKS instead of writing through (the
-                        // staging-refusal precedent): the write ACKs, the
-                        // error surfaces at fsync's materialize, nothing is
-                        // lost and no zeros are codified.
-                        if let Err(e) = self
-                            .materialize_deferred_seed(&file_path, b as u32, &mut block_data)
-                            .await
-                        {
-                            warn!(
-                                "deferred RMW seed for ino {} block {} unreadable at \
-                                 write-through ({:?}); parking — fsync surfaces the error",
-                                ino, b, e
-                            );
-                            self.active_block_buffers
-                                .insert(cache_key.clone(), block_data);
-                            std::mem::drop(block_guard);
-                            return Ok::<(), SqueezefsError>(());
+                        // OVERLAY NEVER INVISIBLE: park the merged buffer
+                        // for the fetch await (previously-ACKed bytes stay
+                        // readable; the in-flight slice becoming readable
+                        // early is POSIX-legal for a racing read), re-check
+                        // it out under the held block lock, fill sync.
+                        // A failed fetch leaves it PARKED instead of
+                        // writing through (the staging-refusal precedent):
+                        // the write ACKs, the error surfaces at fsync's
+                        // materialize, nothing is lost and no zeros are
+                        // codified.
+                        self.active_block_buffers
+                            .insert(cache_key.clone(), block_data);
+                        match self.fetch_seed_image(&file_path, b as u32).await {
+                            Ok(image) => {
+                                let Some((_, reowned)) =
+                                    self.active_block_buffers.remove(&cache_key)
+                                else {
+                                    unreachable!(
+                                        "parked buffer vanished under a held \
+                                         BLOCK_FLUSH_LOCKS guard"
+                                    );
+                                };
+                                block_data = reowned;
+                                block_data.fill_complement_from(image.as_deref().unwrap_or(&[]));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "deferred RMW seed for ino {} block {} unreadable at \
+                                     write-through ({:?}); parking — fsync surfaces the error",
+                                    ino, b, e
+                                );
+                                std::mem::drop(block_guard);
+                                return Ok::<(), SqueezefsError>(());
+                            }
                         }
                     }
                     block_data.zero_complete();
@@ -2667,40 +2720,51 @@ impl SqueezefsFilesystem {
                     // writer/flusher owns this block right now — skip it.
                     continue;
                 };
-                let Some((_, mut data)) = self.active_block_buffers.remove(&spill_key) else {
-                    continue; // checked out by a racing writer meanwhile
-                };
+                // OVERLAY NEVER INVISIBLE: the victim stays PARKED across
+                // every await (seed fetch + staging put) — readers keep
+                // serving it; the held victim lock excludes mutators.
                 // Zero-complete Fresh victims under their lock: recycled
                 // pool bytes must never reach staging (§5.3 exit 2). Item B:
                 // a deferred victim owes old bytes first — on a failed
-                // materialize keep it parked (never-lossy; never zeros).
-                if data.seed_deferred() {
+                // fetch it just stays parked (never-lossy; never zeros).
+                let deferred = match self.active_block_buffers.get(&spill_key) {
+                    Some(entry) => entry.value().seed_deferred(),
+                    None => continue, // checked out by a racing writer meanwhile
+                };
+                if deferred {
                     let file_path = crate::keys::inode_path(v_ino);
-                    if self
-                        .materialize_deferred_seed(&file_path, v_b, &mut data)
-                        .await
-                        .is_err()
-                    {
-                        self.active_block_buffers.insert(spill_key, data);
+                    let Ok(image) = self.fetch_seed_image(&file_path, v_b).await else {
                         continue;
+                    };
+                    if let Some(mut entry) = self.active_block_buffers.get_mut(&spill_key) {
+                        entry
+                            .value_mut()
+                            .fill_complement_from(image.as_deref().unwrap_or(&[]));
                     }
                 }
-                data.zero_complete();
+                let snapshot = match self.active_block_buffers.get_mut(&spill_key) {
+                    Some(mut entry) => {
+                        entry.value_mut().zero_complete();
+                        entry.value().snapshot()
+                    }
+                    None => continue,
+                };
                 // Blocking-pool hop: shard WRITE lock (invariant rule 2).
                 let admitted = self
                     .router
                     .cache
                     .nvme
-                    .put_active_block_async(spill_key.clone(), data.snapshot(), fencing_token)
+                    .put_active_block_async(spill_key.clone(), snapshot, fencing_token)
                     .await
                     .unwrap_or(false);
                 if !admitted {
                     // Staging refused (never-lossy backpressure): keep the
                     // buffer in RAM — exceeding the soft cap beats losing
                     // dirty data. fsync drains it durably.
-                    self.active_block_buffers.insert(spill_key, data);
                     break 'spill;
                 }
+                // Authority transferred stage-then-remove (identical copy).
+                self.active_block_buffers.remove(&spill_key);
                 spilled = true;
                 break;
             }
@@ -2774,19 +2838,27 @@ impl SqueezefsFilesystem {
                         // §5.3 exit 2: zero-complete Fresh buffers before
                         // their bytes leave RAM (hole intervals materialize
                         // as zeros — recycled pool bytes never escape).
-                        // Item B: deferred buffers owe old bytes first —
-                        // on a failed materialize keep the buffer parked
-                        // (never-lossy; the gate stays soft for it).
+                        // Item B: deferred buffers owe old bytes first.
+                        // OVERLAY NEVER INVISIBLE: park for the fetch await
+                        // (the caller holds this block's lock, so the
+                        // re-checkout is guaranteed); a failed fetch leaves
+                        // the buffer parked (never-lossy; the gate stays
+                        // soft for it).
                         if data.seed_deferred() {
                             let file_path = crate::keys::inode_path(ino);
-                            if self
-                                .materialize_deferred_seed(&file_path, b, &mut data)
-                                .await
-                                .is_err()
-                            {
-                                self.active_block_buffers.insert(cache_key, data);
+                            self.active_block_buffers.insert(cache_key.clone(), data);
+                            let Ok(image) = self.fetch_seed_image(&file_path, b).await else {
                                 return;
-                            }
+                            };
+                            let Some((_, reowned)) = self.active_block_buffers.remove(&cache_key)
+                            else {
+                                unreachable!(
+                                    "parked buffer vanished under the caller's held \
+                                     BLOCK_FLUSH_LOCKS guard"
+                                );
+                            };
+                            data = reowned;
+                            data.fill_complement_from(image.as_deref().unwrap_or(&[]));
                         }
                         data.zero_complete();
                         match upload_active_block_bytes(
@@ -2860,36 +2932,57 @@ impl SqueezefsFilesystem {
             // zero-complete Fresh buffers before they leave RAM.
             let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
             let block_guard = block_lock.lock().await;
-            let Some((_, mut block_data)) = self.active_block_buffers.remove(&key) else {
-                drop(block_guard);
-                continue;
-            };
-            if block_data.seed_deferred() {
-                // Item B teardown exit: on a failed materialize SKIP this
-                // buffer (unfsynced loss is D0-legal; staging a zeros-
-                // codified block is corruption).
-                let file_path = crate::keys::inode_path(ino);
-                if self
-                    .materialize_deferred_seed(&file_path, b, &mut block_data)
-                    .await
-                    .is_err()
-                {
-                    error!(
-                        "dismount: deferred RMW seed for ino {ino} block {b} unreadable; \
-                         leaving unflushed (D0)"
-                    );
+            // OVERLAY NEVER INVISIBLE: the buffer stays PARKED across every
+            // await here too — teardown races the last reads/FORGETs, and
+            // the same transparency rules apply (see
+            // flush_memory_buffers_for_inode).
+            let deferred = match self.active_block_buffers.get(&key) {
+                Some(entry) => entry.value().seed_deferred(),
+                None => {
                     drop(block_guard);
                     continue;
                 }
+            };
+            if deferred {
+                // Item B teardown exit: on a failed fetch SKIP this buffer
+                // (unfsynced loss is D0-legal; staging a zeros-codified
+                // block is corruption). It stays parked until process end.
+                let file_path = crate::keys::inode_path(ino);
+                match self.fetch_seed_image(&file_path, b).await {
+                    Ok(image) => {
+                        if let Some(mut entry) = self.active_block_buffers.get_mut(&key) {
+                            entry
+                                .value_mut()
+                                .fill_complement_from(image.as_deref().unwrap_or(&[]));
+                        }
+                    }
+                    Err(_) => {
+                        error!(
+                            "dismount: deferred RMW seed for ino {ino} block {b} unreadable; \
+                             leaving unflushed (D0)"
+                        );
+                        drop(block_guard);
+                        continue;
+                    }
+                }
             }
-            block_data.zero_complete();
+            let staging_copy = match self.active_block_buffers.get_mut(&key) {
+                Some(mut entry) => {
+                    entry.value_mut().zero_complete();
+                    entry.value().snapshot()
+                }
+                None => {
+                    drop(block_guard);
+                    continue;
+                }
+            };
             let fencing_token = self.dlm.get_fencing_token_ino(ino);
 
             let nvme_clone = self.router.cache.nvme.clone();
             let key_clone = key.clone();
-            let staging_copy = block_data.snapshot();
+            let staging_snapshot = staging_copy.clone();
             let admitted = match tokio::task::spawn_blocking(move || {
-                nvme_clone.put_active_block(&key_clone, &staging_copy, fencing_token)
+                nvme_clone.put_active_block(&key_clone, &staging_snapshot, fencing_token)
             })
             .await
             {
@@ -2908,22 +3001,21 @@ impl SqueezefsFilesystem {
                 // not strand dirty RAM — upload the block durably right now
                 // (the escalation merges via the shared primitive, legal
                 // under the block guard per the P1-9 extended order).
-                if let Err(e) = upload_active_block_bytes(
-                    ino,
-                    b,
-                    block_data.snapshot(),
-                    fencing_token,
-                    &self.router,
-                )
-                .await
+                if let Err(e) =
+                    upload_active_block_bytes(ino, b, staging_copy, fencing_token, &self.router)
+                        .await
                 {
                     error!(
                         "Dismount durable upload failed for ino {} block {}: {:?}",
                         ino, b, e
                     );
+                } else {
+                    self.active_block_buffers.remove(&key);
                 }
                 continue;
             }
+            // Authority transferred stage-then-remove (identical copy).
+            self.active_block_buffers.remove(&key);
             drop(block_guard);
 
             let req = WritebackRequest {
@@ -4151,31 +4243,61 @@ impl Filesystem for SqueezefsFilesystem {
                         // Item B: the uncovered complement owes the OLD
                         // block's bytes (not zeros). Materialize under the
                         // block lock — the reader pays the read the writer
-                        // deferred — then serve the merged content. The
-                        // buffer is CHECKED OUT (remove → own → re-insert)
-                        // for the await, never mutated through a held map
-                        // guard: a dashmap RefMut held across an await
-                        // parks every same-shard reader on an OS thread
-                        // (the §5.5 executor-starvation wedge class). On a
-                        // failed materialize the buffer re-parks unchanged
-                        // (never-lossy) and the read fails loud.
+                        // deferred — then serve the merged content.
+                        // OVERLAY NEVER INVISIBLE (the QUICK 075/112
+                        // transient): the buffer stays PARKED across the
+                        // fetch await — checking it out here made every
+                        // concurrent single-block read (kernel readahead,
+                        // AIO) fall to the backend and serve pre-merge
+                        // bytes. The held block lock excludes mutators, so
+                        // the fill applies synchronously via a short-lived
+                        // map guard afterwards (never a guard across an
+                        // await — the §5.5 executor-starvation wedge
+                        // class). On a failed fetch the buffer is parked
+                        // unchanged (never-lossy) and the read fails loud.
                         let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, start_block as u32);
                         let _block_guard = block_lock.lock().await;
-                        if let Some((_, mut owned)) = self.active_block_buffers.remove(&cache_key) {
-                            let materialized = self
-                                .materialize_deferred_seed(
-                                    &file_path,
-                                    start_block as u32,
-                                    &mut owned,
-                                )
-                                .await;
-                            let snap = owned.snapshot();
-                            self.active_block_buffers.insert(cache_key.clone(), owned);
-                            materialized.map_err(map_squeezefs_err)?;
-                            return Ok(ReplyData {
-                                data: snap.slice(rel_offset..rel_end),
-                                backing: None,
-                            });
+                        let still_deferred = self
+                            .active_block_buffers
+                            .get(&cache_key)
+                            .map(|e| e.value().seed_deferred());
+                        match still_deferred {
+                            Some(true) => {
+                                let image = self
+                                    .fetch_seed_image(&file_path, start_block as u32)
+                                    .await
+                                    .map_err(map_squeezefs_err)?;
+                                if let Some(mut entry) =
+                                    self.active_block_buffers.get_mut(&cache_key)
+                                {
+                                    entry
+                                        .value_mut()
+                                        .fill_complement_from(image.as_deref().unwrap_or(&[]));
+                                    let snap = entry.value().snapshot();
+                                    drop(entry);
+                                    return Ok(ReplyData {
+                                        data: snap.slice(rel_offset..rel_end),
+                                        backing: None,
+                                    });
+                                }
+                                // Vanished between fetch and fill — the lock
+                                // forbids it; fall through to a backend read
+                                // (now authoritative) rather than abort a
+                                // read path.
+                            }
+                            Some(false) => {
+                                // A racing flush/write materialized it first:
+                                // serve the now content-valid snapshot.
+                                if let Some(entry) = self.active_block_buffers.get(&cache_key) {
+                                    let snap = entry.value().snapshot();
+                                    drop(entry);
+                                    return Ok(ReplyData {
+                                        data: snap.slice(rel_offset..rel_end),
+                                        backing: None,
+                                    });
+                                }
+                            }
+                            None => {}
                         }
                         // Buffer vanished (flushed meanwhile): fall through
                         // to the normal backend read below.

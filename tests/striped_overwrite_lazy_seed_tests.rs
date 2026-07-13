@@ -633,7 +633,7 @@ async fn concurrent_reads_never_lose_the_overlay_during_flush() {
     let (ino, base) = durable_striped(&h, "invisf", 0x00).await;
     let _ = base;
 
-    let woff = 1 * BS + 24 * 1024; // interior of block 1
+    let woff = BS + 24 * 1024; // interior of block 1
     let wlen = 8 * 1024usize;
     let path = squeezefs::keys::inode_path(ino);
 

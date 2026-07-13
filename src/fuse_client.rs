@@ -58,12 +58,19 @@ pub const CLIENT_HEARTBEAT_INTERVAL_SECS: u64 = 10;
 pub const CLIENT_STALE_TTL_SECS: u64 = 45;
 
 fn get_fuse_timeout() -> Duration {
-    if let Ok(val) = std::env::var("SQUEEZEFS_TIMEOUT") {
-        if let Ok(secs) = val.parse::<u64>() {
-            return Duration::from_secs(secs);
+    // Launch-time knob, memoized (item A): `std::env::var` takes the
+    // process-global env lock and allocates — measured at ~0.7% of daemon
+    // cycles on the warm rand-4k transport row, called per FUSE op. Pinned
+    // by `fuse_timeout_is_memoized_not_per_op_env_read`.
+    static FUSE_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *FUSE_TIMEOUT.get_or_init(|| {
+        if let Ok(val) = std::env::var("SQUEEZEFS_TIMEOUT") {
+            if let Ok(secs) = val.parse::<u64>() {
+                return Duration::from_secs(secs);
+            }
         }
-    }
-    Duration::from_secs(30)
+        Duration::from_secs(30)
+    })
 }
 
 // `StripeLocks` moved to `crate::stripe_locks` so `meta_backend` can use it

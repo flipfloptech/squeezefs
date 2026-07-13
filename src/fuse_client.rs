@@ -420,6 +420,17 @@ pub struct Metrics {
     /// mallocing ~4 MiB per sub-block write — the allocation flood behind
     /// the aged-daemon cage kills (dhat: ~21 GB churn / 30 k-op storm).
     pub staged_rmw_pooled_seeds: Align64<AtomicU64>,
+    /// Item B (overwrite lazy-RMW seed): existing-data blocks checked out
+    /// with the seed read DEFERRED.
+    pub overwrite_seed_deferred: Align64<AtomicU64>,
+    /// Deferred seeds that were SKIPPED forever — accumulation fully
+    /// covered the block before any exit (the row-4 win: one elided device
+    /// block read each).
+    pub overwrite_seed_skipped: Align64<AtomicU64>,
+    /// Deferred seeds materialized at an escape point (gap write, partial
+    /// trigger, stage/upload exit, sparse read) — same cost as the old
+    /// eager seed, paid only when actually needed.
+    pub overwrite_seed_materialized: Align64<AtomicU64>,
     /// Truncate-shrinks of a staged blob applied as an IN-PLACE ring header
     /// patch (never a re-stage that ring pressure can refuse) — the fix for
     /// the aged-fsx stale-resurrection corruption
@@ -1223,6 +1234,9 @@ impl SqueezefsFilesystem {
                 "parked_gate_self_flushes": METRICS.parked_gate_self_flushes.load(Ordering::Relaxed),
                 "parked_gate_timeouts": METRICS.parked_gate_timeouts.load(Ordering::Relaxed),
                 "staged_rmw_pooled_seeds": METRICS.staged_rmw_pooled_seeds.load(Ordering::Relaxed),
+                "overwrite_seed_deferred": METRICS.overwrite_seed_deferred.load(Ordering::Relaxed),
+                "overwrite_seed_skipped": METRICS.overwrite_seed_skipped.load(Ordering::Relaxed),
+                "overwrite_seed_materialized": METRICS.overwrite_seed_materialized.load(Ordering::Relaxed),
                 "staged_truncate_inplace_shrinks": METRICS.staged_truncate_inplace_shrinks.load(Ordering::Relaxed),
                 "staged_truncate_durable_clips": METRICS.staged_truncate_durable_clips.load(Ordering::Relaxed),
                 "mem_budget_components": crate::mem_budget::MEM_BUDGET
@@ -1620,6 +1634,64 @@ impl SqueezefsFilesystem {
             && (write_start > block_start || write_end < existing_block_end)
     }
 
+    /// Item B: materialize a deferred RMW seed — fetch the block's old
+    /// durable content and fill the buffer's uncovered complement. The
+    /// binding-validated fetch is verbatim the old eager-seed discipline
+    /// (the 8e3995e follow-up): `bk` can be displaced, freed, and
+    /// reallocated under the same key while we read it, so the fill routes
+    /// through `get_block_for_index` (single-flight validated fill:
+    /// read_lru → NVMe tier → device read under the incarnation seqlock,
+    /// PLUS the block-index→key recheck once the bytes are in hand); a
+    /// hole rebind (concurrent truncate/punch pruned the mapping) seeds
+    /// zeros — the block IS a hole now. Callers hold this block's
+    /// `BLOCK_FLUSH_LOCKS` (the same lock the eager seed read under).
+    async fn materialize_deferred_seed(
+        &self,
+        file_path: &str,
+        b: u32,
+        buf: &mut crate::cache::active_block::ActiveBlockBuf,
+    ) -> Result<(), SqueezefsError> {
+        if !buf.seed_deferred() {
+            return Ok(());
+        }
+        let mut block_map_id = None;
+        let mut block_map = None;
+        if let Some(entry) = self.router.metadata_cache.get(file_path) {
+            if entry.cached_at.elapsed() < Duration::from_secs(1) {
+                block_map_id = entry.block_map_id.clone();
+                block_map = entry.block_map.clone();
+            }
+        }
+        if block_map_id.is_none() && block_map.is_none() {
+            if let Ok(meta) = self.router.fetch_metadata(file_path).await {
+                block_map_id = meta.block_map_id.clone();
+                block_map = meta.block_map.clone();
+            }
+        }
+        let mut existing: Option<crate::cache::pool::ReadBlockValue> = None;
+        if block_map_id.is_some() || block_map.is_some() {
+            let mut old_block_key: Option<String> = None;
+            if let Some(ref bm) = block_map {
+                old_block_key = bm.get(&b).cloned();
+            }
+            if old_block_key.is_none() {
+                if let Ok(meta) = self.router.fetch_metadata(file_path).await {
+                    if let Some(ref bm) = meta.block_map {
+                        old_block_key = bm.get(&b).cloned();
+                    }
+                }
+            }
+            if let Some(bk) = old_block_key {
+                existing = self
+                    .router
+                    .get_block_for_index(file_path, b, Some(&bk))
+                    .await?;
+            }
+        }
+        buf.fill_complement_from(existing.as_deref().unwrap_or(&[]));
+        Ok(())
+    }
+
     pub async fn flush_memory_buffers_for_inode(
         &self,
         ino: u64,
@@ -1649,6 +1721,13 @@ impl SqueezefsFilesystem {
                 drop(block_guard);
                 continue;
             };
+            if block_data.seed_deferred() {
+                // Item B stage exit: the uncovered complement owes old
+                // bytes — never zeros.
+                let file_path = crate::keys::inode_path(ino);
+                self.materialize_deferred_seed(&file_path, b, &mut block_data)
+                    .await?;
+            }
             block_data.zero_complete();
             let nvme_clone = self.router.cache.nvme.clone();
             let key_clone = key.clone();
@@ -1760,73 +1839,22 @@ impl SqueezefsFilesystem {
                         // any stage/upload exit.
                         crate::cache::active_block::ActiveBlockBuf::fresh(block_size as usize)
                     } else {
-                        // Try cache first
-                        let mut block_map_id_opt = None;
-                        if let Some(entry) = self.router.metadata_cache.get(&file_path) {
-                            if entry.cached_at.elapsed() < Duration::from_secs(1) {
-                                block_map_id_opt = entry.block_map_id.clone();
-                            }
-                        }
-
-                        let mut block_map_id = block_map_id_opt.clone();
-                        let mut block_map = None;
-                        if block_map_id.is_none() {
-                            if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
-                                block_map_id = meta.block_map_id.clone();
-                                block_map = meta.block_map.clone();
-                            }
-                        }
-
-                        let mut existing: Option<crate::cache::pool::ReadBlockValue> = None;
-                        // Read the existing block for the read-modify-write whenever the
-                        // file has a block map — whether stored INLINE (`block_map`, the
-                        // common <=32-block case) or via an INDIRECT block (`block_map_id`).
-                        // Gating only on `block_map_id` skipped the existing-block read for
-                        // inline maps, so a partial (non-block-aligned) overwrite of a
-                        // striped file zeroed the un-overwritten bytes of the block.
-                        if block_map_id.is_some() || block_map.is_some() {
-                            let mut old_block_key: Option<String> = None;
-                            if let Some(ref bm) = block_map {
-                                old_block_key = bm.get(&(b as u32)).cloned();
-                            }
-                            if old_block_key.is_none() {
-                                if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
-                                    if let Some(ref bm) = meta.block_map {
-                                        old_block_key = bm.get(&(b as u32)).cloned();
-                                    }
-                                }
-                            }
-
-                            if let Some(bk) = old_block_key {
-                                // The seed is a cache FILL like any other: `bk`
-                                // can be displaced, freed, and reallocated under
-                                // the SAME key string while (or right after) we
-                                // read it — including by THIS call, when the
-                                // merged block completes and write-through
-                                // displaces + frees `bk` before a detached tier
-                                // publish of its old bytes lands. Route through
-                                // the BINDING-VALIDATED fetch (the 8e3995e
-                                // follow-up, closed): single-flight validated
-                                // fill (read_lru → NVMe tier → device read
-                                // under the incarnation seqlock) PLUS the
-                                // block-index→key recheck once the bytes are
-                                // in hand — a key reallocated to another block
-                                // mid-seed would otherwise become this RMW's
-                                // base and merge user data over a foreign
-                                // block's bytes (persistent corruption). A
-                                // hole rebind (concurrent truncate/punch)
-                                // seeds zeros.
-                                existing = self
-                                    .router
-                                    .get_block_for_index(&file_path, b as u32, Some(&bk))
-                                    .await?;
-                            }
-                        }
-
-                        crate::cache::active_block::ActiveBlockBuf::seeded(
-                            existing.as_deref().unwrap_or(&[]),
-                            block_size as usize,
-                        )
+                        // Item B (the overwrite lazy-RMW seed): DEFER the
+                        // old-block read. A sequential overwrite fully
+                        // covers the block before its write-through, so the
+                        // seed read — one device block read per block, the
+                        // row-4 4x gap (17.8 GiB of reads in a pure
+                        // overwrite pass) — is skipped entirely when
+                        // coverage completes. Every escape path (gap write,
+                        // partial-coverage trigger, stage/upload exits,
+                        // sparse reads) materializes the seed first via
+                        // `materialize_deferred_seed` — the SAME binding-
+                        // validated fetch the eager seed used, just moved
+                        // to the last responsible moment.
+                        METRICS
+                            .overwrite_seed_deferred
+                            .fetch_add(1, Ordering::Relaxed);
+                        crate::cache::active_block::ActiveBlockBuf::deferred(block_size as usize)
                     };
 
                 // ONE-AUTHORITY INVARIANT (generic/075.2): per block, the
@@ -1866,7 +1894,21 @@ impl SqueezefsFilesystem {
                 // zero-copy write-path design §5.2). Coverage bookkeeping
                 // first (§5.3): a gap write zeroes the complement before
                 // the merge lands.
+                //
+                // Item B: a GAP write into a deferred-seed buffer would
+                // zero-degrade over old bytes — materialize the seed first
+                // (rare on sequential streams; identical cost to the old
+                // eager seed when it happens).
                 let rel_start = (write_start - b_start_offset) as usize;
+                if block_data.seed_deferred() {
+                    let (c0, c1) = block_data.covered();
+                    let (c0, c1) = (c0 as usize, c1 as usize);
+                    let gap = c0 != c1 && (rel_start > c1 || rel_start + slice_len < c0);
+                    if gap {
+                        self.materialize_deferred_seed(&file_path, b as u32, &mut block_data)
+                            .await?;
+                    }
+                }
                 block_data.record_write(rel_start, rel_start + slice_len);
                 block_data.make_mut()[rel_start..rel_start + slice_len]
                     .copy_from_slice(file_data_slice);
@@ -1879,6 +1921,12 @@ impl SqueezefsFilesystem {
                 // complement of a Fresh entry), never required before it.
                 let is_block_complete = write_end == b_end_offset;
                 if is_block_complete {
+                    if block_data.seed_deferred() {
+                        // Trigger with partial coverage (stream started
+                        // mid-block): the uncovered head owes old bytes.
+                        self.materialize_deferred_seed(&file_path, b as u32, &mut block_data)
+                            .await?;
+                    }
                     block_data.zero_complete();
                     match self
                         .upload_full_block(ino, b as u32, block_data.snapshot(), fencing_token)
@@ -2586,7 +2634,20 @@ impl SqueezefsFilesystem {
                     continue; // checked out by a racing writer meanwhile
                 };
                 // Zero-complete Fresh victims under their lock: recycled
-                // pool bytes must never reach staging (§5.3 exit 2).
+                // pool bytes must never reach staging (§5.3 exit 2). Item B:
+                // a deferred victim owes old bytes first — on a failed
+                // materialize keep it parked (never-lossy; never zeros).
+                if data.seed_deferred() {
+                    let file_path = crate::keys::inode_path(v_ino);
+                    if self
+                        .materialize_deferred_seed(&file_path, v_b, &mut data)
+                        .await
+                        .is_err()
+                    {
+                        self.active_block_buffers.insert(spill_key, data);
+                        continue;
+                    }
+                }
                 data.zero_complete();
                 // Blocking-pool hop: shard WRITE lock (invariant rule 2).
                 let admitted = self
@@ -2676,6 +2737,20 @@ impl SqueezefsFilesystem {
                         // §5.3 exit 2: zero-complete Fresh buffers before
                         // their bytes leave RAM (hole intervals materialize
                         // as zeros — recycled pool bytes never escape).
+                        // Item B: deferred buffers owe old bytes first —
+                        // on a failed materialize keep the buffer parked
+                        // (never-lossy; the gate stays soft for it).
+                        if data.seed_deferred() {
+                            let file_path = crate::keys::inode_path(ino);
+                            if self
+                                .materialize_deferred_seed(&file_path, b, &mut data)
+                                .await
+                                .is_err()
+                            {
+                                self.active_block_buffers.insert(cache_key, data);
+                                return;
+                            }
+                        }
                         data.zero_complete();
                         match upload_active_block_bytes(
                             ino,
@@ -2752,6 +2827,24 @@ impl SqueezefsFilesystem {
                 drop(block_guard);
                 continue;
             };
+            if block_data.seed_deferred() {
+                // Item B teardown exit: on a failed materialize SKIP this
+                // buffer (unfsynced loss is D0-legal; staging a zeros-
+                // codified block is corruption).
+                let file_path = crate::keys::inode_path(ino);
+                if self
+                    .materialize_deferred_seed(&file_path, b, &mut block_data)
+                    .await
+                    .is_err()
+                {
+                    error!(
+                        "dismount: deferred RMW seed for ino {ino} block {b} unreadable; \
+                         leaving unflushed (D0)"
+                    );
+                    drop(block_guard);
+                    continue;
+                }
+            }
             block_data.zero_complete();
             let fencing_token = self.dlm.get_fencing_token_ino(ino);
 
@@ -4013,30 +4106,60 @@ impl Filesystem for SqueezefsFilesystem {
                     // buffer holds recycled pool bytes that must NEVER be
                     // served through the kernel.
                     let (snapshot, covered) = buf.value().covered_snapshot();
-                    let data = if covered.0 as usize <= rel_offset && rel_end <= covered.1 as usize
+                    let deferred = buf.value().seed_deferred();
+                    drop(buf);
+                    if deferred
+                        && !(covered.0 as usize <= rel_offset && rel_end <= covered.1 as usize)
                     {
-                        // Common case (every Seeded/content-valid entry and
-                        // every sequential read): zero-copy slice.
-                        snapshot.slice(rel_offset..rel_end)
-                    } else {
-                        // Rare sparse read overlapping uncovered bytes:
-                        // build the reply in a fresh buffer — zeros plus
-                        // covered ∩ range — WITHOUT mutating the shared
-                        // buffer (zeroing in place here would be a mutation
-                        // outside BLOCK_FLUSH_LOCKS).
-                        let mut out = vec![0u8; read_len];
-                        let is = (covered.0 as usize).max(rel_offset);
-                        let ie = (covered.1 as usize).min(rel_end);
-                        if is < ie {
-                            out[is - rel_offset..ie - rel_offset]
-                                .copy_from_slice(&snapshot[is..ie]);
+                        // Item B: the uncovered complement owes the OLD
+                        // block's bytes (not zeros). Materialize under the
+                        // block lock — the reader pays the read the writer
+                        // deferred — then serve the merged content.
+                        let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, start_block as u32);
+                        let _block_guard = block_lock.lock().await;
+                        if let Some(mut entry) = self.active_block_buffers.get_mut(&cache_key) {
+                            self.materialize_deferred_seed(
+                                &file_path,
+                                start_block as u32,
+                                entry.value_mut(),
+                            )
+                            .await
+                            .map_err(map_squeezefs_err)?;
+                            let snap = entry.value().snapshot();
+                            drop(entry);
+                            return Ok(ReplyData {
+                                data: snap.slice(rel_offset..rel_end),
+                                backing: None,
+                            });
                         }
-                        bytes::Bytes::from(out)
-                    };
-                    return Ok(ReplyData {
-                        data,
-                        backing: None,
-                    });
+                        // Buffer vanished (flushed meanwhile): fall through
+                        // to the normal backend read below.
+                    } else {
+                        let data =
+                            if covered.0 as usize <= rel_offset && rel_end <= covered.1 as usize {
+                                // Common case (every Seeded/content-valid entry and
+                                // every sequential read): zero-copy slice.
+                                snapshot.slice(rel_offset..rel_end)
+                            } else {
+                                // Rare sparse read overlapping uncovered bytes:
+                                // build the reply in a fresh buffer — zeros plus
+                                // covered ∩ range — WITHOUT mutating the shared
+                                // buffer (zeroing in place here would be a mutation
+                                // outside BLOCK_FLUSH_LOCKS).
+                                let mut out = vec![0u8; read_len];
+                                let is = (covered.0 as usize).max(rel_offset);
+                                let ie = (covered.1 as usize).min(rel_end);
+                                if is < ie {
+                                    out[is - rel_offset..ie - rel_offset]
+                                        .copy_from_slice(&snapshot[is..ie]);
+                                }
+                                bytes::Bytes::from(out)
+                            };
+                        return Ok(ReplyData {
+                            data,
+                            backing: None,
+                        });
+                    }
                 }
                 (file_size, false)
             } else {

@@ -136,6 +136,16 @@ pub struct ActiveBlockBuf {
     /// [`ActiveBlockBuf::fresh`] buffers grow it via
     /// [`ActiveBlockBuf::record_write`]. Never write-through trigger input.
     covered: (u32, u32),
+    /// Item B (the overwrite lazy-RMW seed): the uncovered complement's
+    /// correct content is the block's OLD DEVICE BYTES, not zeros — the
+    /// seed read was deferred at checkout. Cleared when coverage reaches
+    /// full (the old bytes are wholly overwritten — the row-4 win: no read
+    /// at all) or when [`ActiveBlockBuf::fill_complement_from`]
+    /// materializes the seed (gap write / partial trigger / stage exit /
+    /// sparse read). While set, [`ActiveBlockBuf::zero_complete`] and the
+    /// gap-write zero-degrade are FORBIDDEN — zeroing would codify zeros
+    /// over acked old bytes.
+    deferred_seed: bool,
 }
 
 impl ActiveBlockBuf {
@@ -148,7 +158,63 @@ impl ActiveBlockBuf {
         Self {
             cell: CowCell::new(AlignedBlock::alloc_raw(block_size)),
             covered: (0, 0),
+            deferred_seed: false,
         }
+    }
+
+    /// A deferred-RMW accumulation buffer for a block WITH existing device
+    /// data whose seed read is postponed (item B): born uncovered, the
+    /// complement's correct content is the old block. If accumulation
+    /// fully covers the block before any exit, the seed read never happens
+    /// (the sequential-overwrite fast path); otherwise the owner
+    /// materializes via [`ActiveBlockBuf::fill_complement_from`] before
+    /// the bytes can escape.
+    pub fn deferred(block_size: usize) -> Self {
+        Self {
+            cell: CowCell::new(AlignedBlock::alloc_raw(block_size)),
+            covered: (0, 0),
+            deferred_seed: true,
+        }
+    }
+
+    /// Whether the uncovered complement still owes the old-block seed.
+    pub fn seed_deferred(&self) -> bool {
+        self.deferred_seed
+    }
+
+    /// Materialize the deferred seed: fill the uncovered complement from
+    /// `old` (the block's current device/durable content; shorter-than-
+    /// block seeds zero-fill their own tail, matching
+    /// [`ActiveBlockBuf::seeded`] semantics) and become content-valid.
+    /// Callers hold this block's `BLOCK_FLUSH_LOCKS`. Idempotent-safe: a
+    /// no-op when the seed is no longer deferred.
+    pub fn fill_complement_from(&mut self, old: &[u8]) {
+        if !self.deferred_seed {
+            return;
+        }
+        self.deferred_seed = false;
+        if self.is_content_valid() {
+            return;
+        }
+        let len = self.cell.peek().len;
+        let (c0, c1) = (self.covered.0 as usize, self.covered.1 as usize);
+        let slice = self.make_mut();
+        // Head [0, c0): old bytes, zero-filled past the seed's length.
+        let head_src = old.len().min(c0);
+        slice[..head_src].copy_from_slice(&old[..head_src]);
+        slice[head_src..c0].fill(0);
+        // Tail [c1, len): old bytes, zero-filled past the seed's length.
+        let tail_src_end = old.len().min(len);
+        if tail_src_end > c1 {
+            slice[c1..tail_src_end].copy_from_slice(&old[c1..tail_src_end]);
+            slice[tail_src_end..].fill(0);
+        } else {
+            slice[c1..].fill(0);
+        }
+        self.covered = (0, len as u32);
+        crate::fuse_client::METRICS
+            .overwrite_seed_materialized
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A block seeded from existing content (RMW / staged / promotion
@@ -156,6 +222,7 @@ impl ActiveBlockBuf {
     /// zero-fills the remainder, so the buffer is born content-valid at
     /// full block size regardless of the seed's length.
     pub fn seeded(existing: &[u8], block_size: usize) -> Self {
+        // (deferred_seed: false — a seeded buffer is content-valid at birth.)
         let block = AlignedBlock::alloc_raw(block_size);
         let copy_len = existing.len().min(block_size);
         // SAFETY: `block.ptr` is a fresh `block_size`-byte allocation;
@@ -172,6 +239,7 @@ impl ActiveBlockBuf {
         Self {
             cell: CowCell::new(block),
             covered: (0, block_size as u32),
+            deferred_seed: false,
         }
     }
 
@@ -221,6 +289,12 @@ impl ActiveBlockBuf {
             // Gap write: zero the whole uncovered complement (the correct
             // content of a Fresh block's complement *is* zeros) and degrade
             // to fully-initialized — recycled bytes can now never escape.
+            debug_assert!(
+                !self.deferred_seed,
+                "gap write into a deferred-seed buffer: the owner must \
+                 materialize the old-block seed BEFORE merging (zeroing \
+                 would codify zeros over acked old bytes)"
+            );
             self.zero_complement();
         }
     }
@@ -230,6 +304,11 @@ impl ActiveBlockBuf {
     /// was born Seeded). Idempotent. Callers hold this block's
     /// `BLOCK_FLUSH_LOCKS`.
     pub fn zero_complete(&mut self) {
+        debug_assert!(
+            !self.deferred_seed,
+            "zero_complete on a deferred-seed buffer: the owner must \
+             materialize the old-block seed first (item B exit contract)"
+        );
         if self.is_content_valid() {
             return;
         }
@@ -252,6 +331,14 @@ impl ActiveBlockBuf {
     fn complete_coverage(&mut self, zeroed_bytes: usize) {
         let len = self.cell.peek().len;
         self.covered = (0, len as u32);
+        if self.deferred_seed {
+            // Fully covered: every old byte was overwritten — the deferred
+            // seed read is skipped forever (the row-4 win).
+            self.deferred_seed = false;
+            crate::fuse_client::METRICS
+                .overwrite_seed_skipped
+                .fetch_add(1, Ordering::Relaxed);
+        }
         crate::fuse_client::METRICS
             .active_block_memset_elided_bytes
             .fetch_add((len - zeroed_bytes) as u64, Ordering::Relaxed);

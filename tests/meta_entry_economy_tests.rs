@@ -583,3 +583,151 @@ async fn reclaim_gather_close_reasons_and_fill_are_counted() {
         "closed empty channel ends the gather loop"
     );
 }
+
+// ---------------------------------------------------------------------
+// D1.a attribution rig (design-metadata-throughput §5.1): the
+// SQUEEZEFS_OP_PROFILE-gated per-op phase profile, the under-`i_rwsem`
+// span estimator, and the watchdog-ready op registry scaffolding.
+// ---------------------------------------------------------------------
+
+use squeezefs::fuse_client::{
+    op_profile_enabled, op_profile_inflight, op_profile_phase_json, op_profile_under_lock_json,
+    FuseOpKind, OpProf,
+};
+
+fn hist_total(hist: &serde_json::Value) -> u64 {
+    hist.as_object()
+        .expect("histogram object")
+        .values()
+        .map(|v| v.as_u64().unwrap_or(0))
+        .sum()
+}
+
+fn phase_total(json: &serde_json::Value, op: &str, phase: &str) -> u64 {
+    hist_total(&json[op][phase])
+}
+
+/// The rig's gate is a LAUNCH-TIME knob, memoized like `SQUEEZEFS_TIMEOUT`
+/// (`get_fuse_timeout`) — zero per-op env reads, and default OFF: with the
+/// variable unset the rig must add nothing to any hot path (`OpProf::begin`
+/// = one memoized atomic load + branch → `None`).
+#[test]
+fn op_profile_gate_is_memoized_and_default_off() {
+    assert!(
+        !op_profile_enabled(),
+        "SQUEEZEFS_OP_PROFILE unset ⇒ the rig is OFF by default"
+    );
+    assert!(
+        OpProf::begin(FuseOpKind::Create, 1).is_none(),
+        "disabled rig hands handlers None — no stamps, no slots"
+    );
+    std::env::set_var("SQUEEZEFS_OP_PROFILE", "1");
+    assert!(
+        !op_profile_enabled(),
+        "the gate consulted the environment after first resolution — a \
+         per-op env::var read on the hot path"
+    );
+    std::env::remove_var("SQUEEZEFS_OP_PROFILE");
+}
+
+/// Phase recording + registry lifecycle: begin claims a registry slot
+/// (the D1.b watchdog's future scan surface — (op, ino, start)), the
+/// marks split the op into handler→backend / backend / backend→reply /
+/// total, drop records all four and releases the slot. Slot exhaustion
+/// degrades to unregistered-but-still-profiled (never blocks, never
+/// loses the histogram sample).
+#[tokio::test]
+async fn op_prof_records_phases_and_recycles_registry_slots() {
+    let inflight0 = op_profile_inflight();
+    let before = op_profile_phase_json();
+
+    let p = OpProf::begin_forced(FuseOpKind::Create, 42);
+    assert_eq!(
+        op_profile_inflight(),
+        inflight0 + 1,
+        "begin claims a registry slot"
+    );
+    p.mark_backend_start();
+    p.mark_backend_done();
+    drop(p);
+    assert_eq!(
+        op_profile_inflight(),
+        inflight0,
+        "drop releases the registry slot"
+    );
+
+    let after = op_profile_phase_json();
+    for phase in ["handler_to_backend", "backend", "backend_to_reply", "total"] {
+        assert_eq!(
+            phase_total(&after, "create", phase),
+            phase_total(&before, "create", phase) + 1,
+            "one create op records one sample in the {phase} phase"
+        );
+    }
+
+    // Exhaustion: more live ops than slots must not block or panic; the
+    // overflow ops still profile (histograms move), just unregistered.
+    let before_total = phase_total(&op_profile_phase_json(), "getattr", "total");
+    let herd: Vec<OpProf> = (0..300)
+        .map(|i| OpProf::begin_forced(FuseOpKind::Getattr, i))
+        .collect();
+    assert!(
+        op_profile_inflight() <= inflight0 + 256,
+        "registry is a FIXED slab (256 slots)"
+    );
+    drop(herd);
+    assert_eq!(
+        op_profile_inflight(),
+        inflight0,
+        "every claimed slot is released on drop"
+    );
+    assert_eq!(
+        phase_total(&op_profile_phase_json(), "getattr", "total"),
+        before_total + 300,
+        "slot exhaustion never drops histogram samples"
+    );
+}
+
+/// The under-`i_rwsem` span estimator (§5.1 artifact 1): a create's
+/// preceding LOOKUP is paired by (parent, name) through a bounded
+/// latch-free table; LOOKUP-arrival → CREATE-reply lands in
+/// `fuse_create_under_lock_ns`. One lookup arms exactly one pairing
+/// (the slot is consumed), and an unpaired create records nothing.
+#[tokio::test]
+async fn under_lock_estimator_pairs_lookup_arrival_to_create_reply() {
+    let before = hist_total(&op_profile_under_lock_json());
+
+    // LOOKUP arrival, then the paired CREATE reply.
+    let lk = OpProf::begin_forced(FuseOpKind::Lookup, 1);
+    lk.note_lookup_arrival(1, "pair_me");
+    drop(lk);
+    let cr = OpProf::begin_forced(FuseOpKind::Create, 1);
+    cr.pair_create_reply(1, "pair_me");
+    drop(cr);
+    assert_eq!(
+        hist_total(&op_profile_under_lock_json()),
+        before + 1,
+        "a (parent, name)-paired LOOKUP→CREATE records one under-lock span"
+    );
+
+    // The pairing slot is consumed: a second create of the same name
+    // without a fresh lookup records nothing.
+    let cr2 = OpProf::begin_forced(FuseOpKind::Create, 1);
+    cr2.pair_create_reply(1, "pair_me");
+    drop(cr2);
+    assert_eq!(
+        hist_total(&op_profile_under_lock_json()),
+        before + 1,
+        "a consumed pairing slot must not double-count"
+    );
+
+    // Never-looked-up name: nothing to pair.
+    let cr3 = OpProf::begin_forced(FuseOpKind::Create, 1);
+    cr3.pair_create_reply(1, "never_looked_up");
+    drop(cr3);
+    assert_eq!(
+        hist_total(&op_profile_under_lock_json()),
+        before + 1,
+        "an unpaired create records no span"
+    );
+}

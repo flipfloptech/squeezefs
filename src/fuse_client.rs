@@ -79,6 +79,372 @@ fn get_fuse_timeout() -> Duration {
 // and the lock-order documentation continue to work).
 pub use crate::stripe_locks::StripeLocks;
 
+// ===========================================================================
+// D1.a per-op attribution rig (design-metadata-throughput §5.1, PR M2)
+//
+// Off by default; `SQUEEZEFS_OP_PROFILE=1` (launch-time, memoized like
+// `SQUEEZEFS_TIMEOUT`) turns on per-op-type phase histograms — monotonic
+// stamps at handler entry → backend entry → backend (commit_tx) return →
+// reply enqueued (= handler return; fuse3 enqueues the reply immediately
+// after) — plus the two first-class artifacts the program's cost model
+// rests on:
+//
+//  1. the **under-`i_rwsem` span estimator**: each create's preceding
+//     LOOKUP is paired by `(parent, name)` through a bounded latch-free
+//     table, and LOOKUP-arrival → CREATE-reply lands in
+//     `fuse_create_under_lock_ns` — the direct measurement §4's cost model
+//     and the R1 arithmetic are re-derived from;
+//  2. the **watchdog-ready op registry**: a fixed lock-free slab holding
+//     `(op, ino, start)` per in-flight profiled op. M2 lands the slot
+//     claim/release plumbing (exercised by this rig and surfaced as
+//     `fuse_op_profile_inflight`); D1.b (PR M4) reuses it as the deadline
+//     watchdog's scan surface when per-op `timeout()` wrapping dies.
+//
+// Cost contract (hard M2 acceptance): with the variable unset the rig is
+// ZERO work on every path — `OpProf::begin` is one memoized atomic load +
+// branch returning `None`; no `Instant` reads, no allocation, no slots.
+// When enabled, each op pays its stamps (four `Instant` reads) and one
+// slot claim/release — profile mode is explicitly allowed to cost.
+// ===========================================================================
+
+/// Launch-time gate for the D1.a rig, memoized (the `get_fuse_timeout`
+/// pattern): `std::env::var` takes the process-global env lock and
+/// allocates — never on the per-op path. Pinned by
+/// `op_profile_gate_is_memoized_and_default_off`.
+pub fn op_profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SQUEEZEFS_OP_PROFILE").is_ok_and(|v| v == "1"))
+}
+
+/// Op types the rig attributes — the mdstorm-visible request mix (the
+/// storm ops plus their trailing FLUSH/RELEASE/GETATTR/FORGET/SETATTR
+/// traffic). `repr(usize)` indexes the phase-histogram table directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum FuseOpKind {
+    Lookup = 0,
+    Getattr = 1,
+    Setattr = 2,
+    Mknod = 3,
+    Mkdir = 4,
+    Create = 5,
+    Unlink = 6,
+    Rmdir = 7,
+    Rename = 8,
+    Flush = 9,
+    Release = 10,
+    Forget = 11,
+}
+
+const FUSE_OP_KINDS: usize = 12;
+
+impl FuseOpKind {
+    const ALL: [FuseOpKind; FUSE_OP_KINDS] = [
+        FuseOpKind::Lookup,
+        FuseOpKind::Getattr,
+        FuseOpKind::Setattr,
+        FuseOpKind::Mknod,
+        FuseOpKind::Mkdir,
+        FuseOpKind::Create,
+        FuseOpKind::Unlink,
+        FuseOpKind::Rmdir,
+        FuseOpKind::Rename,
+        FuseOpKind::Flush,
+        FuseOpKind::Release,
+        FuseOpKind::Forget,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            FuseOpKind::Lookup => "lookup",
+            FuseOpKind::Getattr => "getattr",
+            FuseOpKind::Setattr => "setattr",
+            FuseOpKind::Mknod => "mknod",
+            FuseOpKind::Mkdir => "mkdir",
+            FuseOpKind::Create => "create",
+            FuseOpKind::Unlink => "unlink",
+            FuseOpKind::Rmdir => "rmdir",
+            FuseOpKind::Rename => "rename",
+            FuseOpKind::Flush => "flush",
+            FuseOpKind::Release => "release",
+            FuseOpKind::Forget => "forget",
+        }
+    }
+}
+
+/// Phase split of one op's wall (design §5.1 stamp points): handler entry
+/// → backend entry → backend return (`commit_tx` return for mutations) →
+/// reply enqueued. Reads use the same marks around their backend fetch.
+const OP_PHASES: usize = 4;
+const OP_PHASE_NAMES: [&str; OP_PHASES] = [
+    "handler_to_backend", // pre-backend handler glue (arg parse, caches)
+    "backend",            // backend entry → return (engine + commit)
+    "backend_to_reply",   // post-backend glue → reply enqueued
+    "total",              // handler entry → reply enqueued
+];
+
+/// Watchdog-ready op registry slot count. Sized for the daemon's realistic
+/// in-flight op ceiling (over-uring queues × depth is far below this);
+/// claim degrades to unregistered-but-profiled when full — never blocks.
+const OP_REGISTRY_SLOTS: usize = 256;
+
+struct OpSlot {
+    /// 0 = free, 1 = claimed. CAS-claimed, store-released.
+    state: std::sync::atomic::AtomicU32,
+    /// `FuseOpKind as u32` — the watchdog's op detail.
+    kind: std::sync::atomic::AtomicU32,
+    /// Primary ino argument (parent for name-ops) — the watchdog's target.
+    ino: AtomicU64,
+    /// Op start, ns since [`prof_epoch`] — the watchdog's overdue test.
+    start_ns: AtomicU64,
+}
+
+struct OpRegistry {
+    slots: [OpSlot; OP_REGISTRY_SLOTS],
+    /// Round-robin claim cursor: keeps claim O(1) amortized instead of
+    /// rescanning slot 0 under storm.
+    cursor: std::sync::atomic::AtomicUsize,
+}
+
+impl OpRegistry {
+    fn claim(&self, kind: FuseOpKind, ino: u64, start_ns: u64) -> Option<usize> {
+        let base = self.cursor.fetch_add(1, Ordering::Relaxed);
+        for probe in 0..OP_REGISTRY_SLOTS {
+            let idx = (base + probe) % OP_REGISTRY_SLOTS;
+            let slot = &self.slots[idx];
+            if slot
+                .state
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                slot.kind.store(kind as u32, Ordering::Relaxed);
+                slot.ino.store(ino, Ordering::Relaxed);
+                slot.start_ns.store(start_ns, Ordering::Relaxed);
+                return Some(idx);
+            }
+        }
+        None // slab full: op still profiles, just unregistered
+    }
+
+    fn release(&self, idx: usize) {
+        self.slots[idx].state.store(0, Ordering::Release);
+    }
+
+    fn active(&self) -> u64 {
+        self.slots
+            .iter()
+            .filter(|s| s.state.load(Ordering::Relaxed) == 1)
+            .count() as u64
+    }
+}
+
+/// Bounded latch-free recent-LOOKUPs table for the under-`i_rwsem`
+/// estimator: open-addressed single-probe slots keyed by
+/// `xxh3(parent ‖ name) | 1` (0 = empty). A colliding arrival overwrites
+/// the older one (fixed capacity, evict-on-collision — the pairing
+/// distance in a create storm is one op, so 1024 slots is generous), and
+/// `take` consumes the slot so one lookup arms at most one pairing.
+/// Estimator-grade by design: a torn racing overwrite loses or skews one
+/// SAMPLE, never memory safety or a wrong op's reply.
+const LOOKUP_PAIR_SLOTS: usize = 1024;
+
+struct LookupPairTable {
+    keys: [AtomicU64; LOOKUP_PAIR_SLOTS],
+    stamps: [AtomicU64; LOOKUP_PAIR_SLOTS],
+}
+
+impl LookupPairTable {
+    fn hash(parent: u64, name: &str) -> u64 {
+        let mut buf = Vec::with_capacity(8 + name.len());
+        buf.extend_from_slice(&parent.to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        xxhash_rust::xxh3::xxh3_64(&buf) | 1
+    }
+
+    fn note(&self, parent: u64, name: &str, arrival_ns: u64) {
+        let h = Self::hash(parent, name);
+        let idx = (h as usize) % LOOKUP_PAIR_SLOTS;
+        self.stamps[idx].store(arrival_ns, Ordering::Relaxed);
+        self.keys[idx].store(h, Ordering::Release);
+    }
+
+    fn take(&self, parent: u64, name: &str) -> Option<u64> {
+        let h = Self::hash(parent, name);
+        let idx = (h as usize) % LOOKUP_PAIR_SLOTS;
+        if self.keys[idx]
+            .compare_exchange(h, 0, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(self.stamps[idx].load(Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+}
+
+struct OpProfileState {
+    /// `[op][phase]` latency histograms — the §9 `fuse_op_phase_ns` family
+    /// (recorded from ns `Duration`s into the repo's standard µs-bucket
+    /// [`LatencyHistogram`]).
+    phases: [[LatencyHistogram; OP_PHASES]; FUSE_OP_KINDS],
+    /// LOOKUP-arrival → CREATE-reply spans — `fuse_create_under_lock_ns`,
+    /// the §4 cost model's direct measurement.
+    create_under_lock: LatencyHistogram,
+    registry: OpRegistry,
+    recent_lookups: LookupPairTable,
+}
+
+static OP_PROFILE: Lazy<OpProfileState> = Lazy::new(|| OpProfileState {
+    phases: std::array::from_fn(|_| std::array::from_fn(|_| LatencyHistogram::default())),
+    create_under_lock: LatencyHistogram::default(),
+    registry: OpRegistry {
+        slots: std::array::from_fn(|_| OpSlot {
+            state: std::sync::atomic::AtomicU32::new(0),
+            kind: std::sync::atomic::AtomicU32::new(0),
+            ino: AtomicU64::new(0),
+            start_ns: AtomicU64::new(0),
+        }),
+        cursor: std::sync::atomic::AtomicUsize::new(0),
+    },
+    recent_lookups: LookupPairTable {
+        keys: std::array::from_fn(|_| AtomicU64::new(0)),
+        stamps: std::array::from_fn(|_| AtomicU64::new(0)),
+    },
+});
+
+/// Monotonic ns since the rig's first use (one process-wide `Instant`
+/// epoch — stamps are u64s so they live in atomics).
+fn prof_now_ns() -> u64 {
+    static PROF_EPOCH: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
+    PROF_EPOCH.elapsed().as_nanos() as u64
+}
+
+/// One profiled op: created at handler entry, marks at the backend
+/// boundary, `Drop` at handler return records all four phases and
+/// releases the registry slot (drop-based so error and timeout exits
+/// record truthfully).
+pub struct OpProf {
+    kind: FuseOpKind,
+    slot: Option<usize>,
+    t0_ns: u64,
+    backend_start_ns: AtomicU64,
+    backend_done_ns: AtomicU64,
+}
+
+impl OpProf {
+    /// The handler entry point: `None` (zero further cost) unless
+    /// `SQUEEZEFS_OP_PROFILE=1`.
+    #[inline]
+    pub fn begin(kind: FuseOpKind, ino: u64) -> Option<OpProf> {
+        if !op_profile_enabled() {
+            return None;
+        }
+        Some(Self::begin_forced(kind, ino))
+    }
+
+    /// Gate-bypassing constructor: the tests' seam (the memoized gate is
+    /// process-wide and default-off under `cargo test`, so rig behavior
+    /// is exercised explicitly).
+    pub fn begin_forced(kind: FuseOpKind, ino: u64) -> OpProf {
+        let t0_ns = prof_now_ns();
+        OpProf {
+            kind,
+            slot: OP_PROFILE.registry.claim(kind, ino, t0_ns),
+            t0_ns,
+            backend_start_ns: AtomicU64::new(0),
+            backend_done_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Stamp the backend entry (first backend/router touch).
+    #[inline]
+    pub fn mark_backend_start(&self) {
+        self.backend_start_ns
+            .store(prof_now_ns(), Ordering::Relaxed);
+    }
+
+    /// Stamp the backend return (`commit_tx` return for mutations; fetch
+    /// return for reads).
+    #[inline]
+    pub fn mark_backend_done(&self) {
+        self.backend_done_ns.store(prof_now_ns(), Ordering::Relaxed);
+    }
+
+    /// Record this LOOKUP's arrival for the under-`i_rwsem` estimator
+    /// (called at lookup handler exit with the op's entry stamp — the
+    /// kernel holds the parent's `i_rwsem` from before LOOKUP dispatch
+    /// through CREATE completion, so arrival is the honest span start).
+    pub fn note_lookup_arrival(&self, parent: u64, name: &str) {
+        OP_PROFILE.recent_lookups.note(parent, name, self.t0_ns);
+    }
+
+    /// Pair this CREATE's reply with its preceding LOOKUP and record the
+    /// LOOKUP-arrival → CREATE-reply span (`fuse_create_under_lock_ns`).
+    pub fn pair_create_reply(&self, parent: u64, name: &str) {
+        if let Some(arrival_ns) = OP_PROFILE.recent_lookups.take(parent, name) {
+            let span = prof_now_ns().saturating_sub(arrival_ns);
+            OP_PROFILE
+                .create_under_lock
+                .record(Duration::from_nanos(span));
+        }
+    }
+}
+
+impl Drop for OpProf {
+    fn drop(&mut self) {
+        let now = prof_now_ns();
+        let hists = &OP_PROFILE.phases[self.kind as usize];
+        let bs = self.backend_start_ns.load(Ordering::Relaxed);
+        let bd = self.backend_done_ns.load(Ordering::Relaxed);
+        if bs > 0 {
+            hists[0].record(Duration::from_nanos(bs.saturating_sub(self.t0_ns)));
+            if bd >= bs {
+                hists[1].record(Duration::from_nanos(bd - bs));
+            }
+        }
+        let reply_from = if bd > 0 {
+            bd
+        } else if bs > 0 {
+            bs
+        } else {
+            self.t0_ns
+        };
+        hists[2].record(Duration::from_nanos(now.saturating_sub(reply_from)));
+        hists[3].record(Duration::from_nanos(now.saturating_sub(self.t0_ns)));
+        if let Some(idx) = self.slot {
+            OP_PROFILE.registry.release(idx);
+        }
+    }
+}
+
+/// `fuse_op_phase_ns` stats payload: `{op: {phase: histogram}}`.
+pub fn op_profile_phase_json() -> serde_json::Value {
+    let mut ops = serde_json::Map::new();
+    for kind in FuseOpKind::ALL {
+        let mut phases = serde_json::Map::new();
+        for (pi, pname) in OP_PHASE_NAMES.iter().enumerate() {
+            phases.insert(
+                (*pname).to_string(),
+                OP_PROFILE.phases[kind as usize][pi].to_json(),
+            );
+        }
+        ops.insert(kind.name().to_string(), serde_json::Value::Object(phases));
+    }
+    serde_json::Value::Object(ops)
+}
+
+/// `fuse_create_under_lock_ns` stats payload.
+pub fn op_profile_under_lock_json() -> serde_json::Value {
+    OP_PROFILE.create_under_lock.to_json()
+}
+
+/// Live profiled-op count from the registry (`fuse_op_profile_inflight`)
+/// — the D1.b watchdog's future scan surface, kept honest now by the
+/// claim/release lifecycle tests.
+pub fn op_profile_inflight() -> u64 {
+    OP_PROFILE.registry.active()
+}
+
 #[inline]
 fn osstr_to_cow(name: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
     name.to_str()
@@ -1543,6 +1909,21 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "writer_guard_pr_reacquires".into(),
                     per_volume(&|be| be.writer_guard_pr_reacquires()),
+                );
+            }
+            // PR M2 (design-metadata-throughput §5.1/§9): the D1.a rig's
+            // fields exist only when the rig is armed — a disabled mount's
+            // stats surface is byte-identical to pre-M2 (the zero-cost
+            // contract extends to the JSON).
+            if op_profile_enabled() {
+                metrics.insert("fuse_op_phase_ns".into(), op_profile_phase_json());
+                metrics.insert(
+                    "fuse_create_under_lock_ns".into(),
+                    op_profile_under_lock_json(),
+                );
+                metrics.insert(
+                    "fuse_op_profile_inflight".into(),
+                    op_profile_inflight().into(),
                 );
             }
         }
@@ -3882,6 +4263,7 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        let prof = OpProf::begin(FuseOpKind::Lookup, parent);
         let lookup_future = async {
             let backend = self
                 .meta_backend
@@ -3890,10 +4272,14 @@ impl Filesystem for SqueezefsFilesystem {
                     SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
                 })
                 .map_err(map_squeezefs_err)?;
-            let inode = backend
-                .lookup(parent, &name_str)
-                .await
-                .map_err(map_squeezefs_err)?;
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
+            let backend_res = backend.lookup(parent, &name_str).await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            let inode = backend_res.map_err(map_squeezefs_err)?;
             let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
@@ -3904,7 +4290,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(get_fuse_timeout(), lookup_future).await {
+        let res = match tokio::time::timeout(get_fuse_timeout(), lookup_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -3913,7 +4299,13 @@ impl Filesystem for SqueezefsFilesystem {
                 );
                 Err(Errno::from(libc::ETIMEDOUT))
             }
+        };
+        // Under-`i_rwsem` estimator: this LOOKUP (hit or ENOENT probe) may
+        // be the one the kernel holds the parent lock across into CREATE.
+        if let Some(p) = &prof {
+            p.note_lookup_arrival(parent, &name_str);
         }
+        res
     }
 
     async fn getattr(
@@ -3952,11 +4344,16 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        let prof = OpProf::begin(FuseOpKind::Getattr, ino);
         let getattr_future = async {
-            let attr = self
-                .get_attr_internal(ino)
-                .await
-                .map_err(map_squeezefs_err)?;
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
+            let attr_res = self.get_attr_internal(ino).await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            let attr = attr_res.map_err(map_squeezefs_err)?;
 
             Ok(ReplyAttr {
                 ttl: Duration::from_secs(1),
@@ -3990,15 +4387,22 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, mode, rdev
         );
 
+        let prof = OpProf::begin(FuseOpKind::Mknod, parent);
         let mknod_future = async {
             let backend = self
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
-            let inode = backend
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
+            let backend_res = backend
                 .create(parent, &name_str, mode, req.uid, req.gid)
-                .await
-                .map_err(map_squeezefs_err)?;
+                .await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            let inode = backend_res.map_err(map_squeezefs_err)?;
             let mut attr = self.inode_to_file_attr(&inode);
             attr.rdev = rdev;
             self.attr_cache
@@ -4042,15 +4446,22 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, mode, flags
         );
 
+        let prof = OpProf::begin(FuseOpKind::Create, parent);
         let create_future = async {
             let backend = self
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
-            let inode = backend
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
+            let backend_res = backend
                 .create(parent, &name_str, mode, req.uid, req.gid)
-                .await
-                .map_err(map_squeezefs_err)?;
+                .await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            let inode = backend_res.map_err(map_squeezefs_err)?;
             let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
@@ -4082,7 +4493,7 @@ impl Filesystem for SqueezefsFilesystem {
             })
         };
 
-        match tokio::time::timeout(get_fuse_timeout(), create_future).await {
+        let res = match tokio::time::timeout(get_fuse_timeout(), create_future).await {
             Ok(res) => res,
             Err(_) => {
                 error!(
@@ -4091,7 +4502,14 @@ impl Filesystem for SqueezefsFilesystem {
                 );
                 Err(Errno::from(libc::ETIMEDOUT))
             }
+        };
+        // Under-`i_rwsem` estimator: pair this CREATE's reply with its
+        // preceding LOOKUP of the same (parent, name) —
+        // `fuse_create_under_lock_ns` (design §5.1 artifact 1).
+        if let Some(p) = &prof {
+            p.pair_create_reply(parent, &name_str);
         }
+        res
     }
 
     async fn open(&self, _req: Request, inode: Inode, _flags: u32) -> FuseResult<ReplyOpen> {
@@ -4638,16 +5056,23 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, mode, umask
         );
 
+        let prof = OpProf::begin(FuseOpKind::Mkdir, parent);
         let mkdir_future = async {
             let backend = self
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
             let final_mode = ((mode & !umask) & 0o7777) | libc::S_IFDIR;
-            let inode = backend
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
+            let backend_res = backend
                 .create(parent, &name_str, final_mode, req.uid, req.gid)
-                .await
-                .map_err(map_squeezefs_err)?;
+                .await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            let inode = backend_res.map_err(map_squeezefs_err)?;
             let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
@@ -4679,11 +5104,15 @@ impl Filesystem for SqueezefsFilesystem {
         let name_str = osstr_to_cow(name);
         debug!("FUSE rmdir: parent = {}, name = {}", parent, name_str);
 
+        let prof = OpProf::begin(FuseOpKind::Rmdir, parent);
         let rmdir_future = async {
             let backend = self
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
             let current_inode = backend
                 .lookup(parent, &name_str)
                 .await
@@ -4700,10 +5129,11 @@ impl Filesystem for SqueezefsFilesystem {
             } else {
                 return Err(Errno::from(libc::ENOTDIR));
             }
-            backend
-                .unlink(parent, &name_str)
-                .await
-                .map_err(map_squeezefs_err)?;
+            let backend_res = backend.unlink(parent, &name_str).await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            backend_res.map_err(map_squeezefs_err)?;
             self.dir_entry_cache_v3.invalidate(&parent);
             self.dir_entry_cache_v3.invalidate(&current_inode.ino);
             self.attr_cache.invalidate(&parent);
@@ -4740,11 +5170,15 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EACCES));
         }
 
+        let prof = OpProf::begin(FuseOpKind::Setattr, ino);
         let setattr_future = async {
             let backend = self
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
             let current_inode = backend.getattr(ino).await.map_err(map_squeezefs_err)?;
             let mut size_to_set = None;
             let mut mode_to_set = None;
@@ -4851,7 +5285,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .map_err(map_squeezefs_err)?;
             }
 
-            let inode = backend
+            let backend_res = backend
                 .setattr(
                     ino,
                     mode_to_set,
@@ -4862,8 +5296,11 @@ impl Filesystem for SqueezefsFilesystem {
                     mtime_to_set,
                     ctime_to_set,
                 )
-                .await
-                .map_err(map_squeezefs_err)?;
+                .await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            let inode = backend_res.map_err(map_squeezefs_err)?;
             let mut attr = self.inode_to_file_attr(&inode);
             // A metadata-only setattr (chmod/chown/utimes — no `size` in the
             // request) must never change the file size. The durable inode can
@@ -5051,15 +5488,20 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EPERM));
         }
 
+        let prof = OpProf::begin(FuseOpKind::Unlink, parent);
         let unlink_future = async {
             let backend = self
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
-            let child_ino = backend
-                .unlink(parent, &name_str)
-                .await
-                .map_err(map_squeezefs_err)?;
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
+            let backend_res = backend.unlink(parent, &name_str).await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            let child_ino = backend_res.map_err(map_squeezefs_err)?;
             self.dir_entry_cache_v3.invalidate(&parent);
             self.attr_cache.invalidate(&parent);
             self.attr_cache.invalidate(&child_ino);
@@ -5103,20 +5545,27 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EPERM));
         }
 
+        let prof = OpProf::begin(FuseOpKind::Rename, parent);
         let rename_future = async {
             let backend = self
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
             let dest_ino = if let Ok(inode) = backend.lookup(new_parent, &new_name_str).await {
                 Some(inode.ino)
             } else {
                 None
             };
-            backend
+            let backend_res = backend
                 .rename(parent, &name_str, new_parent, &new_name_str, 0)
-                .await
-                .map_err(map_squeezefs_err)?;
+                .await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            backend_res.map_err(map_squeezefs_err)?;
             self.dir_entry_cache_v3.invalidate(&parent);
             self.dir_entry_cache_v3.invalidate(&new_parent);
             self.attr_cache.invalidate(&parent);
@@ -5165,12 +5614,16 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EPERM));
         }
 
+        let prof = OpProf::begin(FuseOpKind::Rename, parent);
         let rename_future = async {
             let backend = self
                 .meta_backend
                 .as_ref()
                 .expect("meta_backend must be configured");
 
+            if let Some(p) = &prof {
+                p.mark_backend_start();
+            }
             let src_ino = if let Ok(inode) = backend.lookup(parent, &name_str).await {
                 Some(inode.ino)
             } else {
@@ -5182,10 +5635,13 @@ impl Filesystem for SqueezefsFilesystem {
                 None
             };
 
-            backend
+            let backend_res = backend
                 .rename(parent, &name_str, new_parent, &new_name_str, flags)
-                .await
-                .map_err(map_squeezefs_err)?;
+                .await;
+            if let Some(p) = &prof {
+                p.mark_backend_done();
+            }
+            backend_res.map_err(map_squeezefs_err)?;
 
             self.dir_entry_cache_v3.invalidate(&parent);
             self.dir_entry_cache_v3.invalidate(&new_parent);
@@ -5832,6 +6288,10 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(());
         }
 
+        let prof = OpProf::begin(FuseOpKind::Flush, ino);
+        if let Some(p) = &prof {
+            p.mark_backend_start();
+        }
         let fencing_token = self
             .get_or_acquire_lease(ino)
             .await
@@ -5842,6 +6302,9 @@ impl Filesystem for SqueezefsFilesystem {
         let _ = self
             .flush_memory_buffers_for_inode(ino, fencing_token)
             .await;
+        if let Some(p) = &prof {
+            p.mark_backend_done();
+        }
 
         Ok(())
     }
@@ -5863,6 +6326,10 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(());
         }
 
+        let prof = OpProf::begin(FuseOpKind::Release, ino);
+        if let Some(p) = &prof {
+            p.mark_backend_start();
+        }
         // Non-blocking: schedule layout/active flush in background so close is
         // cheap. fsync still waits. Staging mmap retains data for same-session reads.
         if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
@@ -5902,6 +6369,9 @@ impl Filesystem for SqueezefsFilesystem {
             if let Some((_, PosixLock::Global(lease))) = self.active_posix_locks.remove(&key) {
                 let _ = lease.release().await;
             }
+        }
+        if let Some(p) = &prof {
+            p.mark_backend_done();
         }
 
         // Static lock array does not need dynamic cleanup
@@ -6038,6 +6508,7 @@ impl Filesystem for SqueezefsFilesystem {
     async fn forget(&self, _req: Request, ino: u64, count: u64) {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Forget: ino = {}, count = {}", ino, count);
+        let _prof = OpProf::begin(FuseOpKind::Forget, ino);
         self.attr_cache.invalidate(&ino);
         self.active_inode_locks.remove(&ino);
         // Reclaim inodes that reached nlink==0 while still open (unlink/14.t).
@@ -6052,6 +6523,7 @@ impl Filesystem for SqueezefsFilesystem {
     async fn batch_forget(&self, _req: Request, inodes: &[u64]) {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE BatchForget: {} inodes", inodes.len());
+        let _prof = OpProf::begin(FuseOpKind::Forget, inodes.first().copied().unwrap_or(0));
         for &ino in inodes {
             self.attr_cache.invalidate(&ino);
             self.active_inode_locks.remove(&ino);

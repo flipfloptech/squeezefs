@@ -1094,6 +1094,23 @@ impl KvMetaBackend {
         self.checkpoint_cycle(&mut smo, true).await
     }
 
+    /// PR M6 (design-metadata-throughput §5.4 D4): live pending-times
+    /// refinements parked by the SETATTR-echo absorber — awaiting the
+    /// next drain. A stats gauge and the entry-economy tests' probe.
+    pub fn pending_times_len(&self) -> usize {
+        0 // M6 scaffolding: absorber not yet implemented
+    }
+
+    /// PR M6: drain every parked pending-times refinement into ONE
+    /// journaled transaction (Δtime merge records for the inos the
+    /// refinement still advances), under per-ino DLM exclusive guards.
+    /// Returns the number of refinements made durable. Called by the
+    /// per-volume drain task on the flush cadence, by the fsync/unmount
+    /// durability paths, and by tests.
+    pub async fn drain_pending_times_now(&self) -> Result<u64> {
+        Ok(0) // M6 scaffolding: absorber not yet implemented
+    }
+
     /// Clean unmount: reject new mutations, drain in-flight commits, run
     /// a final checkpoint (tail == head ⇒ an empty replay window on the
     /// next mount) and JOIN the checkpoint task (no leaked tasks —

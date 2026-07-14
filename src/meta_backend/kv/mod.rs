@@ -145,6 +145,30 @@ pub static META_KV_NODE_REWRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Surfaced as `meta_kv_checkpoints` in PR K7.
 pub static META_KV_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
 
+/// PR M6 (design-metadata-throughput §5.4 D4): kernel post-op ctime
+/// writeback echoes (`fuse_update_ctime` → `fuse_flush_times` →
+/// times-only `FUSE_SETATTR`) **absorbed with zero journal entries** —
+/// the refinement parks in the per-volume pending-times map and rides a
+/// batched drain instead of a per-op commit. The G4 gate's mechanism
+/// counter: rename/unlink entries/op ≤ 1.02/1.05 requires this to track
+/// `meta_updates` for the storm shapes. Surfaced as
+/// `meta_kv_times_echo_absorbed`.
+pub static META_KV_TIMES_ECHO_ABSORBED: AtomicU64 = AtomicU64::new(0);
+
+/// Pending-times drain transactions committed (ONE journal entry each,
+/// carrying every pending refinement that still advances its inode).
+/// The honest residual G4 pays for the echo: ≈ drain cadence, amortized
+/// across every absorbed echo in the window — and the named counter the
+/// M7 conveyor inherits if it ever folds drains into user batches.
+/// Surfaced as `meta_kv_times_echo_drain_commits`.
+pub static META_KV_TIMES_ECHO_DRAIN_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Pending ctime/mtime refinements made durable by drain transactions
+/// (records staged, not entries — pairs with
+/// `META_KV_TIMES_ECHO_DRAIN_COMMITS` for the amortization ratio).
+/// Surfaced as `meta_kv_times_echo_drained`.
+pub static META_KV_TIMES_ECHO_DRAINED: AtomicU64 = AtomicU64::new(0);
+
 /// Successful `commit_tx` executions per **construction site** of the
 /// committed [`backend::KvMetaBackend`] transaction — the
 /// metadata-throughput program's D4.a "debug hook counting `commit_tx`

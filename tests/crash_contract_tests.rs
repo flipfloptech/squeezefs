@@ -1488,3 +1488,163 @@ async fn test_kv_v3_torn_newest_ledger_mount_serves_predecessor() {
         "reads serve normally from the fallback state"
     );
 }
+
+// ===========================================================================
+// PR M6 (design-metadata-throughput §5.4 D4.b): rename one-entry atomicity.
+// The routed rename stages dentry surgery + BOTH parents' Δtimes + the
+// moved inode's Δctime (+ dest accounting) in ONE KvTx — one checksummed
+// journal entry — so a crash straddling a rename leaves either the fully-
+// old or the fully-new naming AND time surface, never a half (the pre-M6
+// fragments could persist the naming without the time updates; worse, a
+// multi-tx shape could tear between fragments). Injected with the
+// power-cut shim: the same volatile-cache-loss model kill-9 cannot produce
+// on file-backed volumes.
+// ===========================================================================
+
+/// Format a v3 volume, drive a routed rename, cut power before the barrier
+/// ⇒ remount serves the FULLY-OLD state (naming + parent times + source
+/// ctime, byte-exact); repeat with a barrier before the cut ⇒ FULLY-NEW.
+/// Never a mixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rename_one_entry_atomicity_power_cut() {
+    use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
+    use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
+    use std::sync::Arc;
+
+    // Deterministic cadence: park the checkpoint task an hour out so no
+    // background barrier can make the rename durable inside the
+    // rename→power_cut window (the knob is read at backend open;
+    // --test-threads=1 makes the env mutation safe).
+    const KNOB: &str = "SQUEEZEFS_META_FLUSH_INTERVAL_MS";
+    struct EnvRestore(Option<String>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(KNOB, v),
+                None => std::env::remove_var(KNOB),
+            }
+        }
+    }
+    let restore = EnvRestore(std::env::var(KNOB).ok());
+    std::env::set_var(KNOB, "3600000");
+
+    let f = NamedTempFile::new().unwrap();
+    f.as_file().set_len(96 * 1024 * 1024).unwrap();
+    format_v3(
+        f.path(),
+        96 * 1024 * 1024,
+        &FormatV3Options {
+            node_size: 64 * 1024,
+            journal_len_override: Some(1024 * 1024),
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3");
+    let _g = FaultGuard;
+
+    // ---- Durable base: two dirs + the file, barriered. -------------------
+    let kv = KvMetaBackend::open(f.path()).await.expect("mount 1");
+    let b = Arc::new(RoutedMetaBackend::new(vec![kv]));
+    let d_from = b
+        .create(1, "d_from", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .expect("mkdir d_from")
+        .ino;
+    let d_to = b
+        .create(1, "d_to", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .expect("mkdir d_to")
+        .ino;
+    let ino = b
+        .create(d_from, "victim", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("create victim")
+        .ino;
+    b.volumes[0].sync_device().await.expect("base barrier");
+    let from_base = b.getattr(d_from).await.expect("d_from base");
+    let to_base = b.getattr(d_to).await.expect("d_to base");
+    let src_base = b.getattr(ino).await.expect("victim base");
+
+    // ---- Crash leg: rename lands in the ring UNSYNCED, power cut. --------
+    uring_fs::arm_power_cut(f.path());
+    b.rename(d_from, "victim", d_to, "renamed", 0)
+        .await
+        .expect("rename (unsynced)");
+    // RAM sanity: the tx applied before the cut.
+    assert!(b.lookup(d_to, "renamed").await.is_ok(), "RAM sees new name");
+    assert!(
+        b.lookup(d_from, "victim").await.is_err(),
+        "RAM lost old name"
+    );
+    let reverted = uring_fs::power_cut(f.path());
+    assert!(reverted >= 1, "the unsynced rename bytes must be reverted");
+    drop(b); // releases the writer-guard flock; checkpoint task reaps via Weak
+
+    let kv = KvMetaBackend::open(f.path()).await.expect("remount 1");
+    let b = Arc::new(RoutedMetaBackend::new(vec![kv]));
+    let old_name = b.lookup(d_from, "victim").await;
+    let new_name = b.lookup(d_to, "renamed").await;
+    assert!(
+        old_name.is_ok() && new_name.is_err(),
+        "power cut before the barrier ⇒ FULLY-OLD naming (old: {:?}, new: {:?})",
+        old_name.map(|i| i.ino),
+        new_name.map(|i| i.ino)
+    );
+    assert_eq!(
+        old_name.unwrap().ino,
+        ino,
+        "the surviving old name resolves the original inode"
+    );
+    let from_after = b.getattr(d_from).await.expect("d_from after cut");
+    let to_after = b.getattr(d_to).await.expect("d_to after cut");
+    let src_after = b.getattr(ino).await.expect("victim after cut");
+    assert_eq!(
+        (from_after.mtime, from_after.ctime),
+        (from_base.mtime, from_base.ctime),
+        "FULLY-OLD means the old parent's times reverted byte-exact"
+    );
+    assert_eq!(
+        (to_after.mtime, to_after.ctime),
+        (to_base.mtime, to_base.ctime),
+        "FULLY-OLD means the new parent's times reverted byte-exact"
+    );
+    assert_eq!(
+        src_after.ctime, src_base.ctime,
+        "FULLY-OLD means the moved inode's ctime reverted byte-exact"
+    );
+
+    // ---- Committed leg: rename + barrier, then cut ⇒ FULLY-NEW. ----------
+    uring_fs::arm_power_cut(f.path());
+    b.rename(d_from, "victim", d_to, "renamed", 0)
+        .await
+        .expect("rename (to be synced)");
+    b.volumes[0].sync_device().await.expect("rename barrier");
+    let _ = uring_fs::power_cut(f.path());
+    drop(b);
+
+    let kv = KvMetaBackend::open(f.path()).await.expect("remount 2");
+    let b = Arc::new(RoutedMetaBackend::new(vec![kv]));
+    assert!(
+        b.lookup(d_from, "victim").await.is_err() && b.lookup(d_to, "renamed").await.is_ok(),
+        "barrier before the cut ⇒ FULLY-NEW naming"
+    );
+    let from_new = b.getattr(d_from).await.expect("d_from committed");
+    let to_new = b.getattr(d_to).await.expect("d_to committed");
+    let src_new = b.getattr(ino).await.expect("victim committed");
+    assert!(
+        from_new.mtime > from_base.mtime && from_new.ctime > from_base.ctime,
+        "FULLY-NEW carries the old parent's time updates in the SAME entry"
+    );
+    assert!(
+        to_new.mtime > to_base.mtime && to_new.ctime > to_base.ctime,
+        "FULLY-NEW carries the new parent's time updates in the SAME entry"
+    );
+    assert!(
+        src_new.ctime > src_base.ctime,
+        "FULLY-NEW carries the moved inode's ctime in the SAME entry"
+    );
+    drop(restore);
+}

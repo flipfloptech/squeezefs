@@ -1,37 +1,47 @@
-//! PR M2 — journal-entry economy pins (design-metadata-throughput §5.4
-//! D4.a, resolving Open Question 1) + the D4.c fill-vs-window attribution
-//! counters.
+//! Journal-entry economy: the PR M2 attribution pins (design-
+//! metadata-throughput §5.4 D4.a, which resolved Open Question 1) tightened
+//! to the **PR M6 G4 thresholds** — rename ≤ 1.02 and unlink ≤ 1.05
+//! entries/op — plus the D4.c fill-vs-window attribution counters.
 //!
-//! The baseline (`.benchmarks/2026-07-14-metadata-throughput-baseline.md`)
-//! measured, through the mount: create **1.006** journal entries/op,
-//! rename **2.002**, unlink **2.020** — and the design deliberately left
-//! WHERE the second rename/unlink entry comes from to a pin test. These
-//! tests settle it with mount-shaped storms through `RoutedMetaBackend`
-//! (the exact handler call sequence, including the kernel's post-op ctime
-//! writeback echo — `fuse_update_ctime` → `fuse_flush_times` →
-//! `FUSE_SETATTR(FATTR_MTIME|FATTR_CTIME)` — visible in the baseline's own
-//! per-phase snapshots as `meta_updates` = 2.0/op during the rename AND
-//! unlink phases) and a `commit_tx` call-site attribution hook
-//! (`META_KV_COMMIT_SITES`, `#[track_caller]`-captured `KvTx` construction
-//! sites):
+//! History: the baseline measured, through the mount, create **1.006**
+//! entries/op, rename **2.002**, unlink **2.020**. M2's pins named the
+//! second rename/unlink entry on a live mount: the kernel's post-op ctime
+//! writeback (`fuse_update_ctime` → `fuse_flush_times` →
+//! `FUSE_SETATTR(FATTR_MTIME|FATTR_CTIME)`, exactly 1.000/op under
+//! writeback cache) landing as a times-only `Metadata::setattr` commit at
+//! `setattr_locked` — and REFUTED the destroy-batch-fill prior (fill ≈ 62,
+//! contributing only 1/fill ≈ 0.016/op). Model:
+//! `2.019 ≈ 1 (op tx) + 1.000 (SETATTR echo) + 0.016 (destroy) + ambient`.
 //!
-//! - **create = 1 entry/op** (the whole-tx `routed_create_local` commit).
-//! - **rename = 1 entry/op at the backend** (`routed_rename_local` is ONE
-//!   `commit_tx` — exonerated); the mount's second entry is the **adjacent
-//!   handler-path commit**: the kernel's ctime-flush SETATTR landing in
-//!   `setattr_locked`. Site-attributed, not inferred.
-//! - **unlink = 1 entry/op at the backend** plus the same SETATTR echo
-//!   (the whole second entry) plus **1/batch_fill** from the FORGET-side
-//!   `destroy_inodes` batches. The design's stated prior — "2.020 ⇒
-//!   destroy-batch fill ≈ 1" — is REFUTED: fill is cap-sized (the
-//!   baseline's own `meta_reclaim_batch_size` deltas show ~63/batch:
-//!   1,579 batches ≤64 for 100 k unlinks), contributing only ~0.016/op.
-//!   The model that fits is `1 (unlink tx) + 1 (SETATTR echo) + 1/fill +
-//!   ambient`.
+//! PR M6 closes G4 on both terms the measurements left standing:
+//!
+//! - **D4.b rename one-tx shape**: `routed_rename_local` carries parent
+//!   Δtimes (shared-parent-safe merge records), the moved inode's Δctime,
+//!   and dest accounting in ONE `KvTx` — still exactly one entry/op at the
+//!   rename site (records grew; entries did not), closing the POSIX
+//!   parent-mtime-on-rename gap and removing the crash window between the
+//!   old fragments.
+//! - **The SETATTR echo is ABSORBED, not committed**: rename/unlink
+//!   replies carry no attrs, so under writeback cache the kernel holds
+//!   locally-authored dirty ctime and synchronously flushes it — the wire
+//!   message is protocol-mandated and cannot be suppressed daemon-side.
+//!   `setattr_locked` therefore recognizes the echo shape (times-only,
+//!   mtime unchanged vs the folded stored value) and parks the refinement
+//!   in a latch-free per-volume pending-times map: **zero journal
+//!   entries** at op time (`META_KV_TIMES_ECHO_ABSORBED`), full read-side
+//!   visibility (getattr/lookup fold pending over stored, monotone
+//!   max-semantics), durability via batched Δtime **drain** transactions
+//!   (`META_KV_TIMES_ECHO_DRAIN_COMMITS`, one entry per drain — cadence /
+//!   fsync / unmount / cap triggered) under per-ino DLM guards. Real
+//!   times news (changed mtime — the buffered-write flush shape; explicit
+//!   utimes; any non-times field) still commits.
+//! - **unlink**: `routed_unlink_local` already stages the child's Δctime
+//!   in the op tx; with the echo absorbed the model closes to
+//!   `1 + 1/fill + drain amortization ≤ 1.05`.
 //! - **zero-commit teardown** (`routing.rs` `delete_file`): reclaim's
 //!   data-path teardown of an inline/empty corpse lands ZERO journal
-//!   entries — the comment-only contract at routing.rs:5754-5759 becomes
-//!   a regression pin.
+//!   entries — the comment-only contract at routing.rs:5754-5759 stays a
+//!   regression pin.
 //! - `drain_reclaim_batch` records the D4.c **fill-vs-window attribution**:
 //!   gather fill + how each batch closed (cap / window expiry / channel
 //!   close), so a future fill degeneration is attributable from `.stats`
@@ -40,7 +50,10 @@
 //! Runs against local file-backed MetaLV sandboxes (no root, no mount).
 
 use squeezefs::fuse_client::METRICS;
-use squeezefs::meta_backend::kv::{commit_sites_snapshot, META_KV_JOURNAL_ENTRIES};
+use squeezefs::meta_backend::kv::{
+    commit_sites_snapshot, META_KV_JOURNAL_ENTRIES, META_KV_TIMES_ECHO_ABSORBED,
+    META_KV_TIMES_ECHO_DRAINED, META_KV_TIMES_ECHO_DRAIN_COMMITS,
+};
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -121,14 +134,31 @@ where
     site
 }
 
-/// The kernel's post-mutation ctime writeback echo: after rename/unlink the
-/// FUSE kernel dirties the inode's ctime locally (`fuse_update_ctime`) and
-/// flushes it as `FUSE_SETATTR(FATTR_MTIME|FATTR_CTIME)` — the daemon's
-/// setattr handler forwards it as a times-only `Metadata::setattr`. The
-/// baseline's per-phase `.stats` snapshots pin this shape: `meta_updates`
-/// (bumped once per mutation HANDLER) moved 200,000 for 100 k renames and
-/// 200,000 for 100 k unlinks.
-async fn kernel_ctime_flush_echo(backend: &RoutedMetaBackend, ino: u64, now_ns: u64) {
+fn clock_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+/// The kernel's post-mutation ctime writeback echo, modeled faithfully:
+/// after rename/unlink/link/setxattr of a writeback-cache regular file the
+/// kernel authors the inode's ctime from ITS clock (`fuse_update_ctime` →
+/// `inode_set_ctime_current` — the daemon's replies to those ops carry no
+/// attrs, so nothing can pre-empt the dirtying) and synchronously flushes
+/// `FUSE_SETATTR(FATTR_MTIME|FATTR_CTIME)` with **mtime = the kernel's
+/// cached (daemon-authored, round-tripped) mtime — UNCHANGED — and ctime =
+/// kernel-now**. The daemon's setattr handler forwards it as a times-only
+/// `Metadata::setattr`. The baseline's per-phase `.stats` snapshots pin the
+/// cadence: `meta_updates` (bumped once per mutation HANDLER) moved 200,000
+/// for 100 k renames and 200,000 for 100 k unlinks. Returns the echoed
+/// ctime.
+async fn kernel_ctime_flush_echo(backend: &RoutedMetaBackend, ino: u64) -> u64 {
+    let cached = backend
+        .getattr(ino)
+        .await
+        .expect("echo target must be readable (FUSE keeps it alive until FORGET)");
+    let kernel_ctime = clock_ns();
     backend
         .setattr(
             ino,
@@ -137,11 +167,12 @@ async fn kernel_ctime_flush_echo(backend: &RoutedMetaBackend, ino: u64, now_ns: 
             None,
             None,
             None,
-            Some(now_ns),
-            Some(now_ns),
+            Some(cached.mtime),
+            Some(kernel_ctime),
         )
         .await
         .expect("times-only setattr (the kernel ctime-flush echo)");
+    kernel_ctime
 }
 
 /// Baseline row `create = 1.006 entries/op`: through the mount-shaped call
@@ -174,17 +205,19 @@ async fn mount_shaped_create_storm_lands_one_journal_entry_per_op() {
     );
 }
 
-/// OQ 1, rename half. (a) The backend rename path — the FUSE handler's
-/// exact sequence: dest-probe lookup + `Metadata::rename` — is ONE journal
-/// entry per op: `routed_rename_local` is exonerated. (b) Adding the
-/// kernel's ctime-flush SETATTR echo reproduces the measured 2.002/op
-/// shape. (c) The commit-site attribution NAMES the second committer: the
-/// times-only setattr commit (`setattr_locked`'s tx), a different call
-/// site from the rename tx, both in the kv backend.
+/// PR M6 / G4, rename half (was M2's OQ-1 pin of the 2.002 shape — the
+/// mechanism it named is now absorbed). (a) The backend rename path — the
+/// FUSE handler's exact sequence: dest-probe lookup + `Metadata::rename` —
+/// stays ONE journal entry per op at the rename tx site even though D4.b
+/// grew the tx (parent Δtimes + moved-inode Δctime ride the same entry).
+/// (b) Adding the kernel's ctime-flush SETATTR echo — the mount shape that
+/// measured 2.002 — must now meet **G4: ≤ 1.02 entries/op**, with ZERO
+/// commits at the setattr tx site (`META_KV_TIMES_ECHO_ABSORBED` moves
+/// instead) and the refined ctime visible through getattr.
 #[tokio::test]
-async fn rename_second_committer_is_the_ctime_flush_setattr_not_the_rename_tx() {
+async fn mount_shaped_rename_meets_g4_one_entry_per_op() {
     let (_t, backend) = routed_sandbox().await;
-    const N: u64 = 256;
+    const N: u64 = 1024;
 
     for i in 0..N {
         backend
@@ -194,6 +227,9 @@ async fn rename_second_committer_is_the_ctime_flush_setattr_not_the_rename_tx() 
     }
 
     // Calibrate the two candidate committers' sites with single-op probes.
+    // A COMMITTED setattr shape (explicit mtime change — the buffered-write
+    // flush class) calibrates the setattr tx site: post-M6 a pure echo
+    // commits nothing, so it can no longer serve as the calibration probe.
     let b = backend.clone();
     let rename_site = calibrate_single_site("rename", || async move {
         let _ = b.lookup(1, "r_cal").await; // dest probe (miss, no commit)
@@ -203,9 +239,12 @@ async fn rename_second_committer_is_the_ctime_flush_setattr_not_the_rename_tx() 
     })
     .await;
     let b = backend.clone();
-    let setattr_site = calibrate_single_site("times-only setattr", || async move {
+    let setattr_site = calibrate_single_site("mtime-change setattr", || async move {
         let ino = b.lookup(1, "r_cal").await.expect("probe target").ino;
-        kernel_ctime_flush_echo(&b, ino, 1_000_000_007).await;
+        let t = clock_ns();
+        b.setattr(ino, None, None, None, None, None, Some(t + 1), Some(t))
+            .await
+            .expect("explicit mtime-change setattr must commit");
     })
     .await;
     assert_ne!(
@@ -219,9 +258,9 @@ async fn rename_second_committer_is_the_ctime_flush_setattr_not_the_rename_tx() 
         );
     }
 
-    // (a) Backend shape (no kernel echo): 1 entry/op — the engine path is
-    // exonerated; whatever companion commit the mount measures is NOT in
-    // routed_rename_local.
+    // (a) Backend shape (no kernel echo): 1 entry/op — D4.b's one-tx shape
+    // (dentry surgery + parent Δtimes + moved-inode Δctime) grows the
+    // RECORDS, never the entry count.
     let e0 = entries_now();
     let s0 = sites_now();
     for i in 1..N {
@@ -239,7 +278,7 @@ async fn rename_second_committer_is_the_ctime_flush_setattr_not_the_rename_tx() 
     let backend_delta = entries_now() - e0;
     let backend_sites = site_deltas(&s0, &sites_now());
     assert!(
-        (N - 1..=(N - 1) + 8).contains(&backend_delta),
+        (N - 1..=(N - 1) + (N - 1) / 32).contains(&backend_delta),
         "backend-shape rename must be ~1 entry/op (got {backend_delta} for {} renames)",
         N - 1
     );
@@ -254,10 +293,12 @@ async fn rename_second_committer_is_the_ctime_flush_setattr_not_the_rename_tx() 
          is not the engine's doing"
     );
 
-    // (b)+(c) Mount shape (with the kernel ctime-flush echo): 2 entries/op,
-    // second committer NAMED as the setattr site.
+    // (b) Mount shape (rename + the kernel ctime-flush echo): G4 — the
+    // echo is ABSORBED (zero setattr-site commits, absorbed counter moves
+    // 1:1), so entries/op ≤ 1.02 including the amortized drain commits.
     let e1 = entries_now();
     let s1 = sites_now();
+    let absorbed0 = META_KV_TIMES_ECHO_ABSORBED.load(Ordering::Relaxed);
     for i in 1..N {
         let dst = format!("r{i:07}");
         let src = format!("q{i:07}");
@@ -266,44 +307,46 @@ async fn rename_second_committer_is_the_ctime_flush_setattr_not_the_rename_tx() 
             .await
             .expect("storm rename back");
         let ino = backend.lookup(1, &src).await.expect("renamed file").ino;
-        kernel_ctime_flush_echo(&backend, ino, 2_000_000_000 + i).await;
+        kernel_ctime_flush_echo(&backend, ino).await;
     }
     let mount_delta = entries_now() - e1;
     let mount_sites = site_deltas(&s1, &sites_now());
     let per_op = mount_delta as f64 / (N - 1) as f64;
     assert!(
-        (1.99..=2.05).contains(&per_op),
-        "mount-shaped rename (rename + ctime-flush SETATTR) must land \
-         ~2.0 entries/op — the baseline's measured 2.002 — got {per_op:.3}"
+        per_op <= 1.02,
+        "G4: mount-shaped rename (rename + ctime-flush SETATTR echo) must \
+         land ≤ 1.02 entries/op — got {per_op:.3} (sites moved: {mount_sites:?})"
     );
     assert_eq!(
         mount_sites.get(&rename_site).copied().unwrap_or(0),
         N - 1,
-        "first committer: the rename tx at {rename_site}"
+        "the rename tx at {rename_site} stays the ONE committer per op"
     );
     assert_eq!(
         mount_sites.get(&setattr_site).copied().unwrap_or(0),
+        0,
+        "the ctime-flush echo must not commit at the setattr tx site \
+         {setattr_site} — it is absorbed into the pending-times map"
+    );
+    assert_eq!(
+        META_KV_TIMES_ECHO_ABSORBED.load(Ordering::Relaxed) - absorbed0,
         N - 1,
-        "SECOND committer: the kernel ctime-flush SETATTR landing at \
-         {setattr_site} — OQ 1 (rename) settled: an adjacent handler-path \
-         commit, absorbed by D4.b's one-tx shape"
+        "every echo counts one absorption"
     );
 }
 
-/// OQ 1, unlink half — the `1 + 1/fill + ambient` model, decomposed and
-/// pinned term by term:
-///   - the unlink tx itself: 1 entry/op;
-///   - the kernel ctime-flush SETATTR echo: the whole second entry
-///     (site-attributed);
+/// PR M6 / G4, unlink half (was M2's `1 + 1 + 1/fill` pin — the echo term
+/// is now absorbed). The model, decomposed and pinned term by term:
+///   - the unlink tx itself: 1 entry/op (child Δctime already in-tx);
+///   - the kernel ctime-flush SETATTR echo: **absorbed** — ≤ drain-commit
+///     noise instead of the old whole-second-entry, with the absorbed
+///     counter moving 1:1 and zero commits at the setattr tx site;
 ///   - the FORGET-side `destroy_inodes` batches: 1 entry per BATCH — with
-///     the gather working (fill = cap = 64), that is 1/64 ≈ 0.016/op,
-///     matching the baseline's 2.020 vs rename's 2.002. The design's
-///     round-1 prior "fill ≈ 1 explains the 2.020" is hereby REFUTED: a
-///     singleton-fill mechanism would land ~3.0 entries/op in this storm
-///     (1 + 1 + 1), and the baseline's own snapshots recorded 1,579
-///     destroy batches (≤64 bucket) for 100 k unlinks — fill ≈ 63.
+///     the gather healthy (fill = cap = 64, the M2-measured shape), that
+///     is 1/64 ≈ 0.016/op.
+/// Total: **G4 ≤ 1.05 entries/op** (was 2.020).
 #[tokio::test]
-async fn unlink_entry_economy_model_batch_fill_is_large_not_the_second_entry() {
+async fn unlink_entry_economy_meets_g4_via_echo_absorption() {
     let (_t, backend) = routed_sandbox().await;
     const N: u64 = 320;
     const FILL: usize = 64; // SQUEEZEFS_RECLAIM_BATCH default
@@ -317,11 +360,24 @@ async fn unlink_entry_economy_model_batch_fill_is_large_not_the_second_entry() {
         inos.push(f.ino);
     }
 
-    // Calibrate the setattr committer site.
+    // Calibrate the setattr committer site with a COMMITTED shape (explicit
+    // mtime change — post-M6 a pure echo commits nothing).
     let b = backend.clone();
     let probe_ino = inos[0];
-    let setattr_site = calibrate_single_site("times-only setattr", || async move {
-        kernel_ctime_flush_echo(&b, probe_ino, 41).await;
+    let setattr_site = calibrate_single_site("mtime-change setattr", || async move {
+        let t = clock_ns();
+        b.setattr(
+            probe_ino,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(t + 1),
+            Some(t),
+        )
+        .await
+        .expect("explicit mtime-change setattr must commit");
     })
     .await;
 
@@ -344,32 +400,50 @@ async fn unlink_entry_economy_model_batch_fill_is_large_not_the_second_entry() {
         "unlink tx must be ~1 entry/op (got {unlink_delta} for {N})"
     );
     let unlink_sites = site_deltas(&s0, &sites_now());
-    assert_eq!(
-        unlink_sites.len(),
-        1,
-        "the unlink storm commits through exactly one site: {unlink_sites:?}"
+    assert!(
+        unlink_sites.len() <= 2,
+        "the unlink storm commits through the unlink site (+ at most the \
+         pending-times drain): {unlink_sites:?}"
     );
 
-    // Term 2: the kernel ctime-flush echo — the WHOLE second entry, at the
-    // setattr site (the unlinked-but-not-yet-destroyed inode record is
-    // still writable: FUSE keeps it alive until FORGET).
+    // Term 2: the kernel ctime-flush echo — ABSORBED (the unlinked-but-not-
+    // yet-destroyed inode record is still writable: FUSE keeps it alive
+    // until FORGET, and the kernel may getattr it — so the refinement must
+    // be READABLE, just not per-op-journaled).
     let e1 = entries_now();
     let s1 = sites_now();
-    for (i, &ino) in inos.iter().enumerate() {
-        kernel_ctime_flush_echo(&backend, ino, 3_000_000_000 + i as u64).await;
+    let absorbed0 = META_KV_TIMES_ECHO_ABSORBED.load(Ordering::Relaxed);
+    let mut echoed = Vec::with_capacity(inos.len());
+    for &ino in &inos {
+        echoed.push((ino, kernel_ctime_flush_echo(&backend, ino).await));
     }
     let echo_delta = entries_now() - e1;
     let echo_sites = site_deltas(&s1, &sites_now());
     assert!(
-        (N..=N + 8).contains(&echo_delta),
-        "the ctime-flush echo adds ~1 entry/op (got {echo_delta} for {N})"
+        echo_delta <= N / 32,
+        "the ctime-flush echo must be absorbed, not committed: {echo_delta} \
+         entries for {N} echoes (sites: {echo_sites:?})"
     );
     assert_eq!(
         echo_sites.get(&setattr_site).copied().unwrap_or(0),
-        N,
-        "OQ 1 (unlink) settled: the second per-op entry is the kernel \
-         ctime-flush SETATTR at {setattr_site}, not reclaim"
+        0,
+        "zero echo commits at the setattr tx site {setattr_site}"
     );
+    assert_eq!(
+        META_KV_TIMES_ECHO_ABSORBED.load(Ordering::Relaxed) - absorbed0,
+        N,
+        "every echo counts one absorption"
+    );
+    // The refinement is READ-VISIBLE while pending (kernel getattr of an
+    // unlinked-open inode must see the refreshed ctime).
+    for &(ino, kctime) in &echoed {
+        let got = backend.getattr(ino).await.expect("unlinked-open getattr");
+        assert!(
+            got.ctime >= kctime,
+            "absorbed echo invisible to getattr: ino {ino} ctime {} < echoed {kctime}",
+            got.ctime
+        );
+    }
 
     // Term 3: FORGET-side destroys at healthy fill — 1 entry per BATCH,
     // recorded in the destroy-fill histogram's ≤64 bucket (index 7 of the
@@ -395,18 +469,255 @@ async fn unlink_entry_economy_model_batch_fill_is_large_not_the_second_entry() {
         "every destroy batch records its fill in the ≤64 bucket (fill = cap, not 1)"
     );
 
-    // The model, assembled: 1 + 1 + 1/fill (+0 ambient in this sandbox).
+    // The model, assembled: 1 + (absorbed ≈ 0) + 1/fill + drain noise.
     let total = unlink_delta + echo_delta + destroy_delta;
     let per_op = total as f64 / N as f64;
     assert!(
-        (2.0..=2.05).contains(&per_op),
-        "unlink economy must fit 1 + 1 + 1/fill ≈ 2.016 — the measured \
-         2.020 shape — got {per_op:.3}"
+        per_op <= 1.05,
+        "G4: unlink economy must close to 1 + 1/fill + drain ≤ 1.05 \
+         entries/op (was the measured 2.020) — got {per_op:.3}"
+    );
+}
+
+/// PR M6 absorber semantics, the POSIX-visibility half: an absorbed echo
+/// must be indistinguishable from a committed one to every reader — the
+/// mission's non-negotiable "stat after unlink-of-hardlink must show
+/// updated ctime" case — and a drain must make it durable across a real
+/// remount with ONE batched entry, leaving the read view byte-identical.
+#[tokio::test]
+async fn times_echo_absorption_is_read_visible_and_drains_durable() {
+    let tmp = NamedTempFile::new().unwrap();
+    let kv = open_v3_meta(tmp.path(), 256 * 1024 * 1024).await;
+    let backend = Arc::new(RoutedMetaBackend::new(vec![kv]));
+
+    // unlink-of-hardlink: victim name dies, the inode survives via the
+    // second link — the echo lands on the surviving inode.
+    let f = backend
+        .create(1, "hl_a", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("create");
+    backend.link(f.ino, 1, "hl_b").await.expect("hardlink");
+    let pre = backend.getattr(f.ino).await.expect("pre-unlink getattr");
+    backend.unlink(1, "hl_a").await.expect("unlink one link");
+
+    let in_tx = backend.getattr(f.ino).await.expect("post-unlink getattr");
+    assert!(
+        in_tx.ctime > pre.ctime,
+        "the unlink tx itself must advance the surviving inode's ctime \
+         (in-tx Δctime): {} !> {}",
+        in_tx.ctime,
+        pre.ctime
+    );
+
+    let kctime = kernel_ctime_flush_echo(&backend, f.ino).await;
+    let folded = backend.getattr(f.ino).await.expect("folded getattr");
+    assert!(
+        folded.ctime >= kctime,
+        "stat after unlink-of-hardlink must show the echoed ctime: {} < {kctime}",
+        folded.ctime
+    );
+    let via_lookup = backend.lookup(1, "hl_b").await.expect("lookup survivor");
+    assert_eq!(
+        via_lookup.ctime, folded.ctime,
+        "lookup and getattr must serve the same folded ctime"
+    );
+
+    // Drain: ONE batched entry, refinements durable, view unchanged.
+    let drained0 = META_KV_TIMES_ECHO_DRAINED.load(Ordering::Relaxed);
+    let commits0 = META_KV_TIMES_ECHO_DRAIN_COMMITS.load(Ordering::Relaxed);
+    let e0 = entries_now();
+    backend.volumes[0]
+        .drain_pending_times_now()
+        .await
+        .expect("explicit drain");
+    assert_eq!(
+        backend.volumes[0].pending_times_len(),
+        0,
+        "drain must leave no pending refinements"
     );
     assert!(
-        per_op < 2.5,
-        "a singleton destroy-fill mechanism (the refuted prior) would land \
-         ≥ 3.0 entries/op; measured {per_op:.3}"
+        entries_now() - e0 <= 1,
+        "one drain = at most one journal entry"
+    );
+    assert!(
+        META_KV_TIMES_ECHO_DRAINED.load(Ordering::Relaxed) > drained0
+            || META_KV_TIMES_ECHO_DRAIN_COMMITS.load(Ordering::Relaxed) > commits0
+            || folded.ctime == in_tx.ctime,
+        "a pending refinement existed, so the drain counters must move \
+         (unless the background drain already took it)"
+    );
+    let post_drain = backend.getattr(f.ino).await.expect("post-drain getattr");
+    assert_eq!(
+        post_drain.ctime, folded.ctime,
+        "draining must not change the served ctime"
+    );
+
+    // Durability: clean shutdown + remount serves the refined ctime from
+    // the trees alone (no pending map on a fresh mount).
+    backend.volumes[0].shutdown().await.expect("clean shutdown");
+    let reopened = squeezefs::meta_backend::kv::backend::KvMetaBackend::open(tmp.path())
+        .await
+        .expect("remount");
+    assert_eq!(reopened.pending_times_len(), 0, "fresh mount, empty map");
+    let durable = reopened.getattr(f.ino).await.expect("remounted getattr");
+    assert_eq!(
+        durable.ctime, folded.ctime,
+        "the drained refinement must survive remount byte-exact"
+    );
+    reopened.shutdown().await.expect("second shutdown");
+}
+
+/// PR M6 absorber semantics, the monotonicity half: the kernel's coarse
+/// clock (`ktime_get_coarse_real_ts64`, jiffy resolution) can stamp an
+/// echo ctime BEHIND the daemon's fine-grained in-tx ctime. Absorption
+/// must never move the served ctime backwards — the old committed path
+/// happily regressed it — and a stale refinement must not survive a
+/// fresher committed write (the drain skips it).
+#[tokio::test]
+async fn times_echo_never_regresses_ctime() {
+    let (_t, backend) = routed_sandbox().await;
+    let f = backend
+        .create(1, "mono", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("create");
+    let stored = backend.getattr(f.ino).await.expect("getattr");
+
+    // A coarse-clock echo: times-only, mtime unchanged, ctime BEHIND the
+    // stored value (the jiffy-lag shape).
+    let e0 = entries_now();
+    let absorbed0 = META_KV_TIMES_ECHO_ABSORBED.load(Ordering::Relaxed);
+    backend
+        .setattr(
+            f.ino,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(stored.mtime),
+            Some(stored.ctime.saturating_sub(3_000_000)), // 3 ms behind
+        )
+        .await
+        .expect("regressive echo");
+    assert_eq!(
+        entries_now() - e0,
+        0,
+        "a regressive echo must not commit a journal entry"
+    );
+    assert_eq!(
+        META_KV_TIMES_ECHO_ABSORBED.load(Ordering::Relaxed) - absorbed0,
+        1,
+        "a regressive echo still counts one absorption"
+    );
+    let after = backend.getattr(f.ino).await.expect("getattr");
+    assert_eq!(
+        after.ctime, stored.ctime,
+        "ctime must never move backwards through the absorber"
+    );
+
+    // A stale pending refinement never clobbers a fresher committed write:
+    // absorb a forward echo, then chmod (commits ctime = now > echo) —
+    // the drain must not regress it.
+    let kctime = kernel_ctime_flush_echo(&backend, f.ino).await;
+    backend
+        .setattr(f.ino, Some(0o600), None, None, None, None, None, None)
+        .await
+        .expect("chmod");
+    let post_chmod = backend.getattr(f.ino).await.expect("getattr");
+    assert!(
+        post_chmod.ctime >= kctime,
+        "chmod's committed ctime must supersede the pending echo"
+    );
+    backend.volumes[0]
+        .drain_pending_times_now()
+        .await
+        .expect("drain");
+    let post_drain = backend.getattr(f.ino).await.expect("getattr");
+    assert_eq!(
+        post_drain.ctime, post_chmod.ctime,
+        "a stale refinement must not fold over a fresher committed ctime"
+    );
+    assert!(
+        post_drain.mode & 0o777 == 0o600,
+        "the committed chmod stands"
+    );
+}
+
+/// PR M6 absorber eligibility: only the echo shape (times-only, mtime
+/// unchanged) absorbs. Real times news — a CHANGED mtime (the
+/// buffered-write `fuse_flush_times` shape carrying kernel-authored write
+/// mtime), an explicit utimensat (atime present), a truncate — must keep
+/// committing: absorbing those would lose data-visible metadata.
+#[tokio::test]
+async fn real_times_news_still_commits() {
+    let (_t, backend) = routed_sandbox().await;
+    let f = backend
+        .create(1, "news", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("create");
+
+    // (a) mtime CHANGED + ctime: the buffered-write flush — commits.
+    let t = clock_ns();
+    let e0 = entries_now();
+    backend
+        .setattr(f.ino, None, None, None, None, None, Some(t), Some(t))
+        .await
+        .expect("write-mtime flush");
+    assert_eq!(
+        entries_now() - e0,
+        1,
+        "a changed-mtime times flush must commit exactly one entry"
+    );
+    let got = backend.getattr(f.ino).await.expect("getattr");
+    assert_eq!(got.mtime, t, "the flushed mtime must persist exactly");
+    assert_eq!(got.ctime, t, "the flushed ctime must persist exactly");
+
+    // (b) explicit utimensat (atime + mtime + ctime): exact-set semantics,
+    // commits — even setting times BACKWARDS, and even with a live pending
+    // refinement parked on the inode (the commit must retire it: a dead
+    // refinement folding over an intentional backwards utimes would
+    // resurrect the newer ctime).
+    kernel_ctime_flush_echo(&backend, f.ino).await;
+    let past = t - 86_400_000_000_000; // a day earlier
+    let e1 = entries_now();
+    backend
+        .setattr(
+            f.ino,
+            None,
+            None,
+            None,
+            None,
+            Some(past),
+            Some(past),
+            Some(past + 1),
+        )
+        .await
+        .expect("explicit utimes");
+    let utimes_delta = entries_now() - e1;
+    assert!(
+        (1..=2).contains(&utimes_delta),
+        "explicit utimes must commit exactly one entry (+ at most one \
+         background drain of the planted echo): got {utimes_delta}"
+    );
+    let got = backend.getattr(f.ino).await.expect("getattr");
+    assert_eq!(got.atime, past, "explicit atime is exact");
+    assert_eq!(got.mtime, past, "explicit backwards mtime is exact");
+    assert_eq!(
+        got.ctime,
+        past + 1,
+        "explicit ctime is exact — never max-clamped by a dead refinement"
+    );
+
+    // (c) truncate (size) with times: commits.
+    let e2 = entries_now();
+    backend
+        .setattr(f.ino, None, None, None, Some(0), None, None, None)
+        .await
+        .expect("truncate");
+    assert_eq!(
+        entries_now() - e2,
+        1,
+        "truncate must commit exactly one entry"
     );
 }
 

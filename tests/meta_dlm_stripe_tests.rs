@@ -387,6 +387,132 @@ async fn test_concurrent_same_parent_unlinks_correct() {
     assert_eq!(after.nlink, before.nlink, "parent nlink corrupted");
 }
 
+/// Contract 8 (PR M6, design-metadata-throughput §5.4 D4.b): rename is ONE
+/// whole-tx entry carrying the POSIX parent-time surface — "rename() shall
+/// mark for update the last data modification and last file status change
+/// timestamps of the parent directory of each file" — plus the moved
+/// inode's ctime (the Linux surface the kernel's own `fuse_update_ctime`
+/// asserts). Same-parent and cross-parent shapes; parent nlink stays
+/// intact for file renames; directory moves keep the nlink shift AND gain
+/// the time updates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rename_updates_parent_times_and_source_ctime() {
+    let (b, _f) = backend().await;
+
+    // Same-parent file rename: parent mtime/ctime advance, nlink intact,
+    // moved inode ctime advances.
+    let dir = mk_dir(&b, ROOT, "rtimes").await;
+    let ino = mk_file(&b, dir, "src").await;
+    let dir_before = b.getattr(dir).await.expect("parent before");
+    let src_before = b.getattr(ino).await.expect("source before");
+    b.rename(dir, "src", dir, "dst", 0)
+        .await
+        .expect("same-parent rename");
+    let dir_after = b.getattr(dir).await.expect("parent after");
+    let src_after = b.getattr(ino).await.expect("source after");
+    assert!(
+        dir_after.mtime > dir_before.mtime,
+        "same-parent rename must advance the parent's mtime: {} !> {}",
+        dir_after.mtime,
+        dir_before.mtime
+    );
+    assert!(
+        dir_after.ctime > dir_before.ctime,
+        "same-parent rename must advance the parent's ctime"
+    );
+    assert_eq!(
+        dir_after.nlink, dir_before.nlink,
+        "file rename must not move parent nlink"
+    );
+    assert!(
+        src_after.ctime > src_before.ctime,
+        "rename must advance the moved inode's ctime: {} !> {}",
+        src_after.ctime,
+        src_before.ctime
+    );
+
+    // Cross-parent file rename: BOTH parents' times advance.
+    let d1 = mk_dir(&b, ROOT, "rt_from").await;
+    let d2 = mk_dir(&b, ROOT, "rt_to").await;
+    mk_file(&b, d1, "mv").await;
+    let d1_before = b.getattr(d1).await.expect("old parent before");
+    let d2_before = b.getattr(d2).await.expect("new parent before");
+    b.rename(d1, "mv", d2, "mv2", 0)
+        .await
+        .expect("cross-parent rename");
+    let d1_after = b.getattr(d1).await.expect("old parent after");
+    let d2_after = b.getattr(d2).await.expect("new parent after");
+    assert!(
+        d1_after.mtime > d1_before.mtime && d1_after.ctime > d1_before.ctime,
+        "cross-parent rename must advance the OLD parent's times"
+    );
+    assert!(
+        d2_after.mtime > d2_before.mtime && d2_after.ctime > d2_before.ctime,
+        "cross-parent rename must advance the NEW parent's times"
+    );
+    assert_eq!(d1_after.nlink, d1_before.nlink, "old parent nlink intact");
+    assert_eq!(d2_after.nlink, d2_before.nlink, "new parent nlink intact");
+
+    // Directory move across parents: the nlink shift survives AND the
+    // times advance (folded into the same parent records, same tx).
+    let sub = mk_dir(&b, d1, "movedir").await;
+    let _ = sub;
+    let d1_b2 = b.getattr(d1).await.expect("old parent before dirmove");
+    let d2_b2 = b.getattr(d2).await.expect("new parent before dirmove");
+    b.rename(d1, "movedir", d2, "movedir", 0)
+        .await
+        .expect("directory move");
+    let d1_a2 = b.getattr(d1).await.expect("old parent after dirmove");
+    let d2_a2 = b.getattr(d2).await.expect("new parent after dirmove");
+    assert_eq!(
+        d1_a2.nlink,
+        d1_b2.nlink - 1,
+        "directory move must drop the old parent's nlink"
+    );
+    assert_eq!(
+        d2_a2.nlink,
+        d2_b2.nlink + 1,
+        "directory move must bump the new parent's nlink"
+    );
+    assert!(
+        d1_a2.mtime > d1_b2.mtime && d2_a2.mtime > d2_b2.mtime,
+        "directory move must advance both parents' mtimes"
+    );
+
+    // RENAME_EXCHANGE: both parents' times advance, both swapped inodes'
+    // ctimes advance.
+    let ea = mk_file(&b, d1, "xa").await;
+    let eb = mk_file(&b, d2, "xb").await;
+    let d1_b3 = b.getattr(d1).await.expect("before exchange");
+    let d2_b3 = b.getattr(d2).await.expect("before exchange");
+    let ea_before = b.getattr(ea).await.expect("xa before");
+    let eb_before = b.getattr(eb).await.expect("xb before");
+    b.rename(d1, "xa", d2, "xb", libc::RENAME_EXCHANGE)
+        .await
+        .expect("exchange");
+    assert!(
+        b.getattr(d1).await.unwrap().mtime > d1_b3.mtime
+            && b.getattr(d2).await.unwrap().mtime > d2_b3.mtime,
+        "EXCHANGE must advance both parents' mtimes"
+    );
+    assert!(
+        b.getattr(ea).await.unwrap().ctime > ea_before.ctime
+            && b.getattr(eb).await.unwrap().ctime > eb_before.ctime,
+        "EXCHANGE must advance both swapped inodes' ctimes"
+    );
+    // The swap itself still holds.
+    assert_eq!(
+        b.lookup(d2, "xb").await.expect("xb resolves").ino,
+        ea,
+        "EXCHANGE swapped xa into xb's name"
+    );
+    assert_eq!(
+        b.lookup(d1, "xa").await.expect("xa resolves").ino,
+        eb,
+        "EXCHANGE swapped xb into xa's name"
+    );
+}
+
 /// Contract 5: unlink's two-phase child discovery must revalidate — racing
 /// rename of the same dentry never double-frees, never panics, and always
 /// leaves exactly one consistent outcome.

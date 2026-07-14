@@ -1977,7 +1977,11 @@ impl KvMetaBackend {
                         key,
                         seq: 0, // stamped from the reservation, in-lock
                         kind,
-                        value: value.to_vec(),
+                        // D1.c stage_put audit: `Bytes::to_vec` COPIED every
+                        // staged value at commit; `Vec::from(Bytes)` reclaims
+                        // the unique Vec-backed allocation instead (stage
+                        // sites build values as `Bytes::from(vec)`).
+                        value: Vec::from(value),
                     },
                 )
             })
@@ -2356,7 +2360,8 @@ impl KvMetaBackend {
                         key,
                         seq: 0,
                         kind,
-                        value: value.to_vec(),
+                        // Same single-copy move as `commit_tx` (D1.c).
+                        value: Vec::from(value),
                     },
                 )
             })
@@ -2752,12 +2757,8 @@ impl KvMetaBackend {
         tx.stage_put(
             TREE_DENTRIES,
             dkey,
-            DentryValue {
-                child_ino: global_ino,
-                file_type: Self::ft_byte(final_mode),
-                name: name.as_bytes().to_vec(),
-            }
-            .encode()?,
+            // D1.c single-copy staging (no intermediate name Vec).
+            DentryValue::encode_parts(global_ino, Self::ft_byte(final_mode), name.as_bytes())?,
         );
         // Directory (exclusive parent): nlink+1 + times; regular file
         // (SHARED parent): the §4.4 pt 6 Δtime merge record.
@@ -2812,12 +2813,8 @@ impl KvMetaBackend {
         tx.stage_put(
             TREE_DENTRIES,
             dkey,
-            DentryValue {
-                child_ino: global_child,
-                file_type: Self::ft_byte(ft_mode_bits),
-                name: name.as_bytes().to_vec(),
-            }
-            .encode()?,
+            // D1.c single-copy staging (no intermediate name Vec).
+            DentryValue::encode_parts(global_child, Self::ft_byte(ft_mode_bits), name.as_bytes())?,
         );
         let now = Self::now_ns();
         match parent_update {
@@ -2950,12 +2947,8 @@ impl KvMetaBackend {
         tx.stage_put(
             TREE_DENTRIES,
             dkey,
-            DentryValue {
-                child_ino: global_child,
-                file_type: Self::ft_byte(child.mode),
-                name: name.as_bytes().to_vec(),
-            }
-            .encode()?,
+            // D1.c single-copy staging (no intermediate name Vec).
+            DentryValue::encode_parts(global_child, Self::ft_byte(child.mode), name.as_bytes())?,
         );
         self.stage_parent_update(&mut tx, local_parent, false, 0, now)
             .await?;
@@ -3052,12 +3045,8 @@ impl KvMetaBackend {
             tx.stage_put(
                 TREE_DENTRIES,
                 nk,
-                DentryValue {
-                    child_ino: old_d.child_ino,
-                    file_type: old_d.file_type,
-                    name: new_name.as_bytes().to_vec(),
-                }
-                .encode()?,
+                // D1.c single-copy staging (no intermediate name Vec).
+                DentryValue::encode_parts(old_d.child_ino, old_d.file_type, new_name.as_bytes())?,
             );
             let ok = self
                 .dentry_insert_key(&tx, local_old_parent, old_name)
@@ -3065,12 +3054,8 @@ impl KvMetaBackend {
             tx.stage_put(
                 TREE_DENTRIES,
                 ok,
-                DentryValue {
-                    child_ino: new_d.child_ino,
-                    file_type: new_d.file_type,
-                    name: old_name.as_bytes().to_vec(),
-                }
-                .encode()?,
+                // D1.c single-copy staging (no intermediate name Vec).
+                DentryValue::encode_parts(new_d.child_ino, new_d.file_type, old_name.as_bytes())?,
             );
             return self.commit_tx(tx).await.map_err(Into::into);
         }
@@ -3127,12 +3112,8 @@ impl KvMetaBackend {
         tx.stage_put(
             TREE_DENTRIES,
             nk,
-            DentryValue {
-                child_ino: old_d.child_ino,
-                file_type: old_d.file_type,
-                name: new_name.as_bytes().to_vec(),
-            }
-            .encode()?,
+            // D1.c single-copy staging (no intermediate name Vec).
+            DentryValue::encode_parts(old_d.child_ino, old_d.file_type, new_name.as_bytes())?,
         );
         self.commit_tx(tx).await?;
         Ok(())
@@ -3266,11 +3247,8 @@ impl KvMetaBackend {
         tx.stage_put(
             TREE_XATTRS,
             key,
-            XattrValue {
-                name: name.as_bytes().to_vec(),
-                value: value.to_vec(),
-            }
-            .encode()?,
+            // D1.c single-copy staging (no intermediate name/value Vecs).
+            XattrValue::encode_parts(name.as_bytes(), value)?,
         );
         self.commit_tx(tx).await?;
         Ok(())
@@ -3362,12 +3340,8 @@ impl Metadata for KvMetaBackend {
         tx.stage_put(
             TREE_DENTRIES,
             dkey,
-            DentryValue {
-                child_ino: ino,
-                file_type: Self::ft_byte(final_mode),
-                name: name.as_bytes().to_vec(),
-            }
-            .encode()?,
+            // D1.c single-copy staging (no intermediate name Vec).
+            DentryValue::encode_parts(ino, Self::ft_byte(final_mode), name.as_bytes())?,
         );
         self.stage_parent_update(&mut tx, parent, false, 0, now)
             .await?;
@@ -3469,12 +3443,8 @@ impl Metadata for KvMetaBackend {
         tx.stage_put(
             TREE_DENTRIES,
             dkey,
-            DentryValue {
-                child_ino: ino,
-                file_type: Self::ft_byte(child.mode),
-                name: new_name.as_bytes().to_vec(),
-            }
-            .encode()?,
+            // D1.c single-copy staging (no intermediate name Vec).
+            DentryValue::encode_parts(ino, Self::ft_byte(child.mode), new_name.as_bytes())?,
         );
         self.stage_parent_update(&mut tx, new_parent, false, 0, now)
             .await?;
@@ -3531,23 +3501,15 @@ impl Metadata for KvMetaBackend {
             tx.stage_put(
                 TREE_DENTRIES,
                 nk,
-                DentryValue {
-                    child_ino: old_d.child_ino,
-                    file_type: old_d.file_type,
-                    name: new_name.as_bytes().to_vec(),
-                }
-                .encode()?,
+                // D1.c single-copy staging (no intermediate name Vec).
+                DentryValue::encode_parts(old_d.child_ino, old_d.file_type, new_name.as_bytes())?,
             );
             let ok = self.dentry_insert_key(&tx, old_parent, old_name).await?;
             tx.stage_put(
                 TREE_DENTRIES,
                 ok,
-                DentryValue {
-                    child_ino: new_d.child_ino,
-                    file_type: new_d.file_type,
-                    name: old_name.as_bytes().to_vec(),
-                }
-                .encode()?,
+                // D1.c single-copy staging (no intermediate name Vec).
+                DentryValue::encode_parts(new_d.child_ino, new_d.file_type, old_name.as_bytes())?,
             );
         } else {
             if flags & libc::RENAME_NOREPLACE != 0 && new_pos.is_some() {
@@ -3569,12 +3531,8 @@ impl Metadata for KvMetaBackend {
             tx.stage_put(
                 TREE_DENTRIES,
                 nk,
-                DentryValue {
-                    child_ino: old_d.child_ino,
-                    file_type: old_d.file_type,
-                    name: new_name.as_bytes().to_vec(),
-                }
-                .encode()?,
+                // D1.c single-copy staging (no intermediate name Vec).
+                DentryValue::encode_parts(old_d.child_ino, old_d.file_type, new_name.as_bytes())?,
             );
         }
         self.commit_tx(tx).await?;

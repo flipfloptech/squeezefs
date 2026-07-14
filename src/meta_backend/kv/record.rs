@@ -352,16 +352,23 @@ pub struct DentryValue {
 impl DentryValue {
     /// Encode; names longer than 255 bytes are a clean [`KvError::NameTooLong`].
     pub fn encode(&self) -> Result<Vec<u8>, KvError> {
-        if self.name.len() > 255 {
-            return Err(KvError::NameTooLong {
-                len: self.name.len(),
-            });
+        Self::encode_parts(self.child_ino, self.file_type, &self.name)
+    }
+
+    /// Encode straight from parts — the staging call sites' single-copy
+    /// form (PR M4 D1.c `stage_put` audit: building a `DentryValue` first
+    /// copied the name into the struct's `Vec` and then AGAIN into the
+    /// encoded record buffer; one copy per record — into this buffer — is
+    /// the design floor).
+    pub fn encode_parts(child_ino: u64, file_type: u8, name: &[u8]) -> Result<Vec<u8>, KvError> {
+        if name.len() > 255 {
+            return Err(KvError::NameTooLong { len: name.len() });
         }
-        let mut out = Vec::with_capacity(10 + self.name.len());
-        out.extend_from_slice(&self.child_ino.to_le_bytes());
-        out.push(self.file_type);
-        out.push(self.name.len() as u8);
-        out.extend_from_slice(&self.name);
+        let mut out = Vec::with_capacity(10 + name.len());
+        out.extend_from_slice(&child_ino.to_le_bytes());
+        out.push(file_type);
+        out.push(name.len() as u8);
+        out.extend_from_slice(name);
         Ok(out)
     }
 
@@ -393,15 +400,21 @@ pub struct XattrValue {
 impl XattrValue {
     /// Encode; names longer than 255 bytes are a clean [`KvError::NameTooLong`].
     pub fn encode(&self) -> Result<Vec<u8>, KvError> {
-        if self.name.len() > 255 {
-            return Err(KvError::NameTooLong {
-                len: self.name.len(),
-            });
+        Self::encode_parts(&self.name, &self.value)
+    }
+
+    /// Encode straight from parts — the staging call sites' single-copy
+    /// form (PR M4 D1.c `stage_put` audit, the [`DentryValue::encode_parts`]
+    /// twin: building an `XattrValue` first copied name AND value into the
+    /// struct's `Vec`s and then again into the record buffer).
+    pub fn encode_parts(name: &[u8], value: &[u8]) -> Result<Vec<u8>, KvError> {
+        if name.len() > 255 {
+            return Err(KvError::NameTooLong { len: name.len() });
         }
-        let mut out = Vec::with_capacity(1 + self.name.len() + self.value.len());
-        out.push(self.name.len() as u8);
-        out.extend_from_slice(&self.name);
-        out.extend_from_slice(&self.value);
+        let mut out = Vec::with_capacity(1 + name.len() + value.len());
+        out.push(name.len() as u8);
+        out.extend_from_slice(name);
+        out.extend_from_slice(value);
         Ok(out)
     }
 

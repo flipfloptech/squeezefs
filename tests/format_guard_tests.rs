@@ -377,6 +377,132 @@ async fn mixed_pre_watermark_volume_set_force_reformats_all() {
     }
 }
 
+/// The force gate over a REFUSED superblock must bury prior-generation
+/// residue exactly like the recognized-current-v3 reformat path — the
+/// user's future reformats take this gate (root-daemon EIO takeover,
+/// burial-delta audit: `.benchmarks/2026-07-13-rootd-eio-residue-history-
+/// exclusion.md`). Mechanistic, per residue class: journal-ring bytes
+/// proven present pre-format and all-zero post-format (nothing to
+/// replay); heap node frames proven to SURVIVE the quick format while no
+/// ghost dentry is served (burial-by-admission via uuid-namespaced node
+/// seqs, not erasure); the first create mints ino 2 (fresh `next_ino`
+/// watermark — no ledger/allocator residue); fresh generation uuid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn force_gate_over_refused_superblock_buries_all_residue_classes() {
+    use squeezefs::meta_backend::kv::builder::ROOT_INO;
+
+    let meta = blank_volume();
+
+    // Aged generation: live-path population with enough payload to
+    // spread residue through the ring and several heap extents.
+    format_v3(meta.path(), VOL_LEN, &opts(true))
+        .await
+        .expect("gen1 format");
+    let be = KvMetaBackend::open(meta.path()).await.expect("gen1 open");
+    let big = vec![0xa5u8; 8 * 1024];
+    for i in 0..40 {
+        let ino = be
+            .create(ROOT_INO, &format!("gen1_{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("gen1 create")
+            .ino;
+        be.setxattr(ino, "user.residue", &big)
+            .await
+            .expect("gen1 xattr");
+    }
+    be.shutdown().await.expect("gen1 shutdown");
+    drop(be);
+
+    let gen1_sb = match classify_volume(meta.path()).await.unwrap() {
+        VolumeFormat::V3(sb) => sb,
+        other => panic!("expected v3 before the forge, got {other:?}"),
+    };
+    let ring = gen1_sb.journal;
+    let image = std::fs::read(meta.path()).unwrap();
+    assert!(
+        image[ring.start as usize..ring.end() as usize]
+            .iter()
+            .any(|b| *b != 0),
+        "aging must leave journal-ring residue or this pin is vacuous"
+    );
+
+    // The refused class the user hits: pre-watermark v3. The force
+    // ladder: refused without --force (pointing at it), reformatted with
+    // it — burial runs downstream of the gate, unconditionally.
+    forge_pre_watermark(meta.path()).await;
+    let err = format_v3(meta.path(), VOL_LEN, &opts(false))
+        .await
+        .expect_err("pre-watermark volume must be format-guarded without --force")
+        .to_string();
+    assert!(
+        err.contains("--force"),
+        "the refusal must point at --force, got: {err}"
+    );
+    format_v3(meta.path(), VOL_LEN, &opts(true))
+        .await
+        .expect("--force must reformat the refused (pre-watermark) volume");
+
+    let gen2_sb = match classify_volume(meta.path()).await.unwrap() {
+        VolumeFormat::V3(sb) => sb,
+        other => panic!("expected v3 after the force reformat, got {other:?}"),
+    };
+    assert_ne!(gen2_sb.uuid, gen1_sb.uuid, "fresh generation identity");
+    assert_ne!(
+        gen2_sb.features_incompat & FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
+        0,
+        "the reformatted volume must carry the watermark bit"
+    );
+    assert_eq!(
+        gen2_sb.journal, ring,
+        "identical knobs must re-plan identical geometry"
+    );
+
+    // Journal burial: the whole fresh ring is zero — nothing to replay.
+    let image = std::fs::read(meta.path()).unwrap();
+    assert!(
+        image[ring.start as usize..ring.end() as usize]
+            .iter()
+            .all(|b| *b == 0),
+        "the force gate over a refused superblock must zero the whole ring"
+    );
+    // Heap residue survives (burial by admission, not erasure). If a
+    // future format full-wipes by default this turns vacuously true; the
+    // ghost assertions below still hold.
+    let heap = gen2_sb.heap;
+    let node = u64::from(gen2_sb.node_size);
+    let scan =
+        &image[(heap.start + 8 * node) as usize..(heap.start + 64 * node).min(heap.end()) as usize];
+    assert!(
+        scan.iter().any(|b| *b != 0),
+        "expected surviving heap frames (quick format leaves the heap)"
+    );
+
+    // Ghost checks + fresh ino watermark.
+    let be = KvMetaBackend::open(meta.path()).await.expect("gen2 open");
+    let entries = be.readdir(ROOT_INO, 0, 4096).await.expect("readdir");
+    let ghosts: Vec<&str> = entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .filter(|n| n.starts_with("gen1_"))
+        .collect();
+    assert!(
+        ghosts.is_empty(),
+        "force gate resurrected {} dead dentries, e.g. {:?}",
+        ghosts.len(),
+        ghosts.first()
+    );
+    assert!(
+        be.lookup(ROOT_INO, "gen1_0").await.is_err(),
+        "dead generation's file served through the force-gate reformat"
+    );
+    let probe = be
+        .create(ROOT_INO, "probe", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("probe create");
+    assert_eq!(probe.ino, ROOT_INO + 1, "fresh next_ino watermark");
+    be.shutdown().await.expect("gen2 shutdown");
+}
+
 // ---------------------------------------------------------------------------
 // CLI smoke — the user-hit regression end to end, against the real binary:
 // `format --force` over a crafted pre-watermark multi-volume sandbox must

@@ -136,8 +136,8 @@ files).
 |---|---|
 | Residue-history recipe (aged 2 gens + dd-head-zero + virgin `format --force` + uncaged root-daemon + full bench), under live `-g auto` | **3/3 PASS** (rc=0, daemon alive, 0 ERRORs, 0 ghosts, 0 replayed entries; residue proven present pre-format) |
 | Pristine exact user recipe (same binary), under live `-g auto` | **3/3 PASS** (rc=0, daemon alive, 0 ERRORs) |
-| Unit pin on dev (`144d829`) | GREEN (and green cherry-picked onto 3f51a7a) |
-| Pending-branch force-gate burial (throwaway vs 3f51a7a) | PASS |
+| Unit pin on dev (dd-zeroed-head virgin burial, `tests/kv_backend_tests.rs`) | GREEN (also green cherry-picked onto 3f51a7a while it was pending) |
+| Force-gate burial over a refused superblock | verified throwaway vs pending 3f51a7a, then — after that branch landed on dev mid-session — committed as a standing pin in `tests/format_guard_tests.rs` (GREEN) |
 | cargo clippy/fmt/test(all-features, single-thread)/doc/bench-smoke | ALL GREEN on the branch tip |
 | fstests QUICK (curated set, 19 cases) | 16 pass; generic/074 flake solo-green on retry; **generic/003 + generic/213 fail identically on dev-tip code in the owner's `-g auto` inventory** (pre-existing, owned by that effort — not this branch: zero src delta) |
 | LTP syscalls | PASS (0 TFAIL / 0 TBROK) |

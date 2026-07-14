@@ -609,3 +609,143 @@ fn test_mount_preflight_fails_loud_with_chown_remedy_on_unwritable_staging() {
     std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
     cleanup(&base);
 }
+
+// ---------------------------------------------------------------------------
+// Unit-level pins for the library helpers (no sudo, no mount required).
+// ---------------------------------------------------------------------------
+
+/// The pure ownership-resolution rule behind every format-grade stamp
+/// (staging roots + root inode): sudo ⇒ invoking user; genuine root ⇒
+/// root; non-root ⇒ self; garbage SUDO_* falls back per-field.
+#[test]
+fn test_resolve_invoking_owner_rule() {
+    use squeezefs::config_ops::resolve_invoking_owner;
+    // Root via sudo: the INVOKING user wins.
+    assert_eq!(
+        resolve_invoking_owner(0, 0, Some("1000"), Some("1000")),
+        (1000, 1000),
+        "sudo (SUDO_UID/SUDO_GID present) must resolve to the invoking user"
+    );
+    assert_eq!(
+        resolve_invoking_owner(0, 0, Some(" 1234 "), Some(" 4321 ")),
+        (1234, 4321),
+        "whitespace-padded SUDO_* values must parse"
+    );
+    // Genuine root: no SUDO_* env ⇒ stays root.
+    assert_eq!(
+        resolve_invoking_owner(0, 0, None, None),
+        (0, 0),
+        "genuine root (no SUDO_* env) must not be second-guessed"
+    );
+    // Non-root: always self — even with stray SUDO_* markers (a non-root
+    // process could not chown anyway).
+    assert_eq!(resolve_invoking_owner(1000, 1000, None, None), (1000, 1000));
+    assert_eq!(
+        resolve_invoking_owner(1000, 1000, Some("0"), Some("0")),
+        (1000, 1000),
+        "stray SUDO_* env on a non-root invoker must be ignored"
+    );
+    // Hostile/garbage SUDO_* falls back per-field to the effective ids.
+    assert_eq!(
+        resolve_invoking_owner(0, 0, Some("not-a-uid"), Some("1000")),
+        (0, 1000),
+        "unparseable SUDO_UID must fall back to euid without poisoning gid"
+    );
+    assert_eq!(
+        resolve_invoking_owner(0, 0, Some("1000"), Some("")),
+        (1000, 0),
+        "empty SUDO_GID must fall back to egid"
+    );
+}
+
+/// `stamp_staging_dir` (the shared format/set-cache-paths stamp): creates
+/// a missing root, wipes pre-existing content, and — as a non-root
+/// invoker — leaves it owned by self (the chown is a structural no-op).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_stamp_staging_dir_creates_wipes_and_owns() {
+    let base = scratch("stamp_unit");
+
+    // Missing at stamp: created.
+    let fresh = base.join("fresh");
+    squeezefs::config_ops::stamp_staging_dir(&fresh)
+        .await
+        .expect("stamp a missing staging root");
+    assert!(fresh.is_dir(), "stamp must create a missing staging root");
+    assert_eq!(owner(&fresh), me(), "non-root stamp keeps self-ownership");
+
+    // Pre-existing with junk: wiped empty.
+    let dirty = base.join("dirty");
+    std::fs::create_dir_all(dirty.join("nested")).unwrap();
+    std::fs::write(dirty.join("nested/stale.bin"), b"poison").unwrap();
+    squeezefs::config_ops::stamp_staging_dir(&dirty)
+        .await
+        .expect("stamp a pre-existing staging root");
+    assert!(dirty.is_dir(), "stamped root must exist");
+    assert_eq!(
+        std::fs::read_dir(&dirty).unwrap().count(),
+        0,
+        "stamp must wipe pre-existing content (format-grade cleanliness)"
+    );
+
+    cleanup(&base);
+}
+
+/// `staging_write_preflight`: Ok on writable roots and on missing roots
+/// under writable ancestors; loud Err — naming the dir, the presentation-
+/// only rule, and the chown remedy — when the daemon identity cannot
+/// write (existing-root and missing-root-under-unwritable-ancestor legs).
+#[test]
+fn test_staging_write_preflight_unit() {
+    use squeezefs::config_ops::staging_write_preflight;
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("[SKIP] permission-simulation contract needs a non-root test identity");
+        return;
+    }
+    let base = scratch("preflight_unit");
+
+    // Writable root: Ok.
+    let ok_dir = base.join("writable");
+    std::fs::create_dir_all(&ok_dir).unwrap();
+    staging_write_preflight(std::slice::from_ref(&ok_dir)).expect("writable root must pass");
+
+    // Missing root under a writable ancestor: Ok (mount creates the chain).
+    let missing = base.join("not_yet/there");
+    staging_write_preflight(std::slice::from_ref(&missing))
+        .expect("missing root under a writable ancestor must pass");
+
+    // Unwritable existing root: loud Err with the remedy.
+    let locked = base.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let err = staging_write_preflight(std::slice::from_ref(&locked))
+        .expect_err("unwritable root must fail the preflight");
+    assert!(
+        err.contains(locked.to_str().unwrap()) && err.contains("chown"),
+        "refusal must name the dir and the chown remedy: {err}"
+    );
+    assert!(
+        err.contains("--uid"),
+        "refusal must document the presentation-only --uid/--gid rule: {err}"
+    );
+
+    // Missing root under an UNWRITABLE ancestor: loud Err naming both.
+    let under_locked = locked.join("sub/root");
+    let err = staging_write_preflight(std::slice::from_ref(&under_locked))
+        .expect_err("missing root under an unwritable ancestor must fail");
+    assert!(
+        err.contains(under_locked.to_str().unwrap())
+            && err.contains(locked.to_str().unwrap())
+            && err.contains("chown"),
+        "refusal must name the missing root, the blocking ancestor, and the \
+         chown remedy: {err}"
+    );
+
+    // First-failure semantics with a mixed set: the offender is reported.
+    let err = staging_write_preflight(&[ok_dir, locked.clone()])
+        .expect_err("a mixed set with one unwritable root must fail");
+    assert!(err.contains(locked.to_str().unwrap()));
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    cleanup(&base);
+}

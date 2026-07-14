@@ -217,7 +217,13 @@ impl RoutedMetaBackend {
     /// holds the D-guard).
     async fn remove_dentry_routed(&self, idx: usize, local_parent: Ino, name: &str) -> Result<()> {
         let out = self.volumes[idx]
-            .routed_remove_dentry(local_parent, name, kv::backend::RoutedParentUpdate::None)
+            // PR M6 D4.b: cross-volume rename fragments carry the POSIX
+            // parent-time update (rename holds both parents EXCLUSIVE).
+            .routed_remove_dentry(
+                local_parent,
+                name,
+                kv::backend::RoutedParentUpdate::ExclusiveTimes,
+            )
             .await;
         if out.is_err() {
             self.mirror_volume_failure(idx);
@@ -225,8 +231,8 @@ impl RoutedMetaBackend {
         out
     }
 
-    /// Rename fragment: pure dentry insertion on one volume (`ft_bits` =
-    /// `mode & S_IFMT`).
+    /// Rename fragment: dentry insertion + parent times on one volume
+    /// (`ft_bits` = `mode & S_IFMT`).
     async fn insert_dentry_routed(
         &self,
         idx: usize,
@@ -241,9 +247,23 @@ impl RoutedMetaBackend {
                 name,
                 global_child,
                 ft_bits,
-                kv::backend::RoutedParentUpdate::None,
+                // PR M6 D4.b: parent times ride the fragment (exclusive
+                // parent I-guard held by the rename).
+                kv::backend::RoutedParentUpdate::ExclusiveTimes,
             )
             .await;
+        if out.is_err() {
+            self.mirror_volume_failure(idx);
+        }
+        out
+    }
+
+    /// Rename fragment (PR M6 D4.b): stamp the moved/exchanged inode's
+    /// ctime when it lives on a DIFFERENT volume than the dentry surgery
+    /// (the same-volume path stages it inside the rename tx).
+    async fn touch_ctime_routed(&self, idx: usize, local_ino: Ino) -> Result<()> {
+        self.check_volume_enabled(idx)?;
+        let out = self.volumes[idx].routed_touch_ctime(local_ino).await;
         if out.is_err() {
             self.mirror_volume_failure(idx);
         }
@@ -949,24 +969,47 @@ impl Metadata for RoutedMetaBackend {
 
         if old_parent_v_idx == new_parent_v_idx {
             // Same-volume rename: dentry surgery + dir-move nlink shifts +
-            // local-dest accounting as ONE whole-tx entry; a remote
+            // parent Δtimes + local-dest accounting + the moved inode's
+            // Δctime as ONE whole-tx entry (PR M6 D4.b); a remote
             // destination inode is settled first (ENOTEMPTY aborts before
-            // any surgery) — check-then-mutate order.
+            // any surgery) — check-then-mutate order — and a remote
+            // moved/exchanged inode gets its ctime as a per-volume
+            // fragment after the surgery (cross-volume renames were never
+            // transactional across volumes).
             let be = &self.volumes[old_parent_v_idx];
-            let mut dest_local = None;
-            if flags & libc::RENAME_EXCHANGE == 0 {
-                if let Some((dest_global, _ft)) = new_dentry_opt {
-                    if flags & libc::RENAME_NOREPLACE != 0 {
-                        return Err(crate::error::SqueezefsError::Io(
-                            std::io::Error::from_raw_os_error(libc::EEXIST),
-                        ));
-                    }
-                    let (dest_v_idx, local_dest) = self.route_ino(dest_global);
-                    if dest_v_idx == old_parent_v_idx {
-                        dest_local = Some(local_dest);
+            let (src_local, src_remote) = match old_dentry_opt {
+                Some((src_global, _ft)) => {
+                    let (v, l) = self.route_ino(src_global);
+                    if v == old_parent_v_idx {
+                        (Some(l), None)
                     } else {
-                        self.dest_replace_routed(dest_v_idx, local_dest).await?;
+                        (None, Some((v, l)))
                     }
+                }
+                None => (None, None),
+            };
+            let mut dest_local = None;
+            let mut dest_remote = None;
+            if flags & libc::RENAME_EXCHANGE != 0 {
+                if let Some((dest_global, _ft)) = new_dentry_opt {
+                    let (v, l) = self.route_ino(dest_global);
+                    if v == old_parent_v_idx {
+                        dest_local = Some(l);
+                    } else {
+                        dest_remote = Some((v, l));
+                    }
+                }
+            } else if let Some((dest_global, _ft)) = new_dentry_opt {
+                if flags & libc::RENAME_NOREPLACE != 0 {
+                    return Err(crate::error::SqueezefsError::Io(
+                        std::io::Error::from_raw_os_error(libc::EEXIST),
+                    ));
+                }
+                let (dest_v_idx, local_dest) = self.route_ino(dest_global);
+                if dest_v_idx == old_parent_v_idx {
+                    dest_local = Some(local_dest);
+                } else {
+                    self.dest_replace_routed(dest_v_idx, local_dest).await?;
                 }
             }
             let out = be
@@ -976,13 +1019,22 @@ impl Metadata for RoutedMetaBackend {
                     local_new_parent,
                     new_name,
                     flags,
+                    src_local,
                     dest_local,
                 )
                 .await;
             if out.is_err() {
                 self.mirror_volume_failure(old_parent_v_idx);
             }
-            out
+            out?;
+            // Remote moved/exchanged inode ctime fragments.
+            if let Some((v, l)) = src_remote {
+                self.touch_ctime_routed(v, l).await?;
+            }
+            if let Some((v, l)) = dest_remote {
+                self.touch_ctime_routed(v, l).await?;
+            }
+            Ok(())
         } else if flags & libc::RENAME_EXCHANGE != 0 {
             let (old_child, old_ft) = old_dentry_opt.ok_or_else(|| {
                 crate::error::SqueezefsError::Io(std::io::Error::from_raw_os_error(libc::ENOENT))
@@ -993,6 +1045,8 @@ impl Metadata for RoutedMetaBackend {
 
             // Remove both, insert swapped — per-volume fragments (cross-
             // volume renames were never transactional across volumes).
+            // PR M6 D4.b: each fragment carries its parent's time update;
+            // the swapped inodes' ctimes follow as their own fragments.
             self.remove_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
                 .await?;
             self.remove_dentry_routed(new_parent_v_idx, local_new_parent, new_name)
@@ -1013,6 +1067,10 @@ impl Metadata for RoutedMetaBackend {
                 new_ft,
             )
             .await?;
+            for child in [old_child, new_child] {
+                let (v, l) = self.route_ino(child);
+                self.touch_ctime_routed(v, l).await?;
+            }
 
             Ok(())
         } else {
@@ -1053,6 +1111,9 @@ impl Metadata for RoutedMetaBackend {
                     old_ft,
                 )
                 .await?;
+                // PR M6 D4.b: the moved inode's ctime fragment.
+                let (v, l) = self.route_ino(old_child);
+                self.touch_ctime_routed(v, l).await?;
                 Ok(())
             } else {
                 Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -1166,6 +1227,10 @@ impl Metadata for RoutedMetaBackend {
 impl RoutedMetaBackend {
     pub async fn sync_all_devices(&self) -> Result<()> {
         for vol in &self.volumes {
+            // PR M6: parked times refinements ride this durability point
+            // (fsyncdir/syncfs-class callers) — journal them BEFORE the
+            // barrier so the barrier covers them.
+            vol.drain_pending_times_now().await?;
             // The coalesced barrier ALSO drains the §4.6 pt 3
             // pending-reclaim bookkeeping.
             vol.sync_device().await?;
@@ -1180,6 +1245,10 @@ impl RoutedMetaBackend {
         crate::fuse_client::METRICS
             .meta_sync_requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // PR M6: fsync(ino) durability covers the ino's absorbed times
+        // refinement — drain the volume's parked set (batched, usually
+        // empty) ahead of the barrier.
+        self.volumes[v_idx].drain_pending_times_now().await?;
         self.volumes[v_idx].sync_device().await
     }
 

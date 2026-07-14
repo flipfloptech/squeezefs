@@ -2149,6 +2149,22 @@ impl SqueezefsFilesystem {
                     "meta_kv_delta_orphans".into(),
                     load(&meta_kv::META_KV_DELTA_ORPHANS),
                 );
+                // PR M6 (design-metadata-throughput §5.4 D4): the
+                // SETATTR-echo absorber — echoes absorbed with zero
+                // entries, batched drain commits (the amortized residual
+                // an M7 conveyor would inherit), refinements drained.
+                metrics.insert(
+                    "meta_kv_times_echo_absorbed".into(),
+                    load(&meta_kv::META_KV_TIMES_ECHO_ABSORBED),
+                );
+                metrics.insert(
+                    "meta_kv_times_echo_drain_commits".into(),
+                    load(&meta_kv::META_KV_TIMES_ECHO_DRAIN_COMMITS),
+                );
+                metrics.insert(
+                    "meta_kv_times_echo_drained".into(),
+                    load(&meta_kv::META_KV_TIMES_ECHO_DRAINED),
+                );
                 // PR M2 (design-metadata-throughput §5.4 D4.a): journal
                 // entries per commit_tx construction site — the named-
                 // committer decomposition of `meta_kv_journal_entries`
@@ -2181,6 +2197,13 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "meta_kv_replay_entries".into(),
                     per_volume(&|be| be.replay_stats().entries),
+                );
+                // PR M6: refinements currently parked (per volume) — a
+                // growing gauge on a quiet mount means the drain task
+                // stalled.
+                metrics.insert(
+                    "meta_kv_times_echo_pending".into(),
+                    per_volume(&|be| be.pending_times_len() as u64),
                 );
                 metrics.insert(
                     "meta_kv_replay_dropped_torn".into(),

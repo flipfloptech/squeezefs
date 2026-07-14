@@ -118,6 +118,15 @@ fn squeezefs_timeout_env() -> std::time::Duration {
 /// are rare and serialized, so the loop is short; exhaustion is a bug).
 const COMMIT_RETRY_BUDGET: usize = 256;
 
+/// PR M6: pending-times drain batch — inos per DLM `lock_many` set / per
+/// drain transaction (the `destroy_inodes` batching shape).
+const PENDING_TIMES_DRAIN_BATCH: usize = 128;
+
+/// PR M6: pending-times population that wakes the drain task ahead of its
+/// cadence tick (bounds the map and the crash-loss window by count, not
+/// just time).
+const PENDING_TIMES_DRAIN_CAP: u64 = 512;
+
 /// The single-writer mount guard's claim record: an xattr on ino 1 beside
 /// the `client:{id}` registrations (design-metadata-throughput §5.0 B2).
 /// JSON `{"id","ts","pid","boot"}`; staleness follows the ONE staleness
@@ -255,6 +264,24 @@ pub struct KvMetaBackend {
     ckpt_wake: Arc<tokio::sync::Notify>,
     ckpt_join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     ckpt_alive: std::sync::Mutex<Weak<()>>,
+
+    // ---- PR M6: the SETATTR-echo absorber (design §5.4 D4) ----
+    /// Pending times refinements, `ino → (mtime, ctime)`: the kernel's
+    /// post-op ctime writeback echoes parked by `setattr_locked`'s absorb
+    /// arm instead of committing one journal entry each (the measured
+    /// whole second entry per rename/unlink — G4). Latch-free (hot-path
+    /// policy); mutations run under the per-ino DLM I-guard (absorb /
+    /// commit-retire) or the drain's own guard set, so entries never
+    /// race. Folded over every inode read (monotone max — never regresses
+    /// a fresher committed write); made durable by batched drain
+    /// transactions on the flush cadence / fsync / unmount / cap.
+    pending_times: scc::HashMap<Ino, (u64, u64)>,
+    /// O(1) element count for the hot-path cap check + the stats gauge
+    /// (`scc` `len()` walks buckets).
+    pending_times_count: AtomicU64,
+    /// Drain-task lifecycle: cap-crossing wake + join handle.
+    times_drain_wake: Arc<tokio::sync::Notify>,
+    times_drain_join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Mount-probe hardware classification (resolved OQ 2's second
     /// field), set once by the mount path.
     atomicity_physical: std::sync::OnceLock<crate::meta_backend::atomicity::AtomicityClass>,
@@ -413,6 +440,7 @@ impl KvMetaBackend {
         }
 
         super::checkpoint::spawn_checkpoint_task(&be);
+        super::checkpoint::spawn_times_drain_task(&be);
         Ok(be)
     }
 
@@ -655,6 +683,10 @@ impl KvMetaBackend {
             ckpt_wake: Arc::new(tokio::sync::Notify::new()),
             ckpt_join: std::sync::Mutex::new(None),
             ckpt_alive: std::sync::Mutex::new(Weak::new()),
+            pending_times: scc::HashMap::new(),
+            pending_times_count: AtomicU64::new(0),
+            times_drain_wake: Arc::new(tokio::sync::Notify::new()),
+            times_drain_join: std::sync::Mutex::new(None),
             atomicity_physical: std::sync::OnceLock::new(),
             guard_fd: std::sync::Mutex::new(None),
             writer_id: String::new(),
@@ -807,12 +839,15 @@ impl KvMetaBackend {
     }
 
     /// Attributes of `ino` from the inode tree (K1 fold; Δtime deltas
-    /// folded into the base record).
+    /// folded into the base record; PR M6 pending-times refinements
+    /// folded on top — absorbed echoes are read-visible before they
+    /// drain).
     pub async fn getattr(&self, ino: Ino) -> Result<Inode> {
-        let v = self
+        let mut v = self
             .read_inode_value(ino)
             .await?
             .ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
+        self.fold_pending_times(ino, &mut v);
         Ok(Inode {
             ino,
             mode: v.mode,
@@ -1098,17 +1133,113 @@ impl KvMetaBackend {
     /// refinements parked by the SETATTR-echo absorber — awaiting the
     /// next drain. A stats gauge and the entry-economy tests' probe.
     pub fn pending_times_len(&self) -> usize {
-        0 // M6 scaffolding: absorber not yet implemented
+        self.pending_times_count.load(Ordering::Relaxed) as usize
     }
 
-    /// PR M6: drain every parked pending-times refinement into ONE
-    /// journaled transaction (Δtime merge records for the inos the
-    /// refinement still advances), under per-ino DLM exclusive guards.
-    /// Returns the number of refinements made durable. Called by the
-    /// per-volume drain task on the flush cadence, by the fsync/unmount
+    /// PR M6: fold any pending (absorbed, not-yet-drained) times
+    /// refinement over an inode value — **monotone max per field**, so a
+    /// stale refinement (the kernel's coarse clock can stamp behind the
+    /// daemon's fine-grained in-tx ctime) never regresses a fresher
+    /// committed write. One relaxed load when the map is empty — the
+    /// read-path common case.
+    pub(super) fn fold_pending_times(&self, ino: Ino, v: &mut InodeValue) {
+        if self.pending_times_count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        if let Some((pm, pc)) = self.pending_times.read_sync(&ino, |_, p| *p) {
+            if pm > v.mtime {
+                v.mtime = pm;
+            }
+            if pc > v.ctime {
+                v.ctime = pc;
+            }
+        }
+    }
+
+    /// Retire an ino's pending refinement (a committed inode write now
+    /// carries — or supersedes — it). Callers hold the ino's DLM I-guard,
+    /// so retirement never races an absorb.
+    fn retire_pending_times(&self, ino: Ino) {
+        if self.pending_times.remove_sync(&ino).is_some() {
+            self.pending_times_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// PR M6: drain every parked pending-times refinement into batched
+    /// journaled transactions (Δtime merge records for the inos the
+    /// refinement still advances — destroyed / superseded inos are GC'd
+    /// recordlessly), under per-ino DLM exclusive guards acquired through
+    /// `lock_many`'s canonical order. Returns the number of refinements
+    /// made durable. Called by the per-volume drain task on the flush
+    /// cadence (cap crossings wake it early), by the fsync/unmount
     /// durability paths, and by tests.
     pub async fn drain_pending_times_now(&self) -> Result<u64> {
-        Ok(0) // M6 scaffolding: absorber not yet implemented
+        let mut total = 0u64;
+        loop {
+            if self.write_gate().is_err() {
+                // Failing / shutting-down volume: refinements are µs-grade
+                // time polish — never worth failing a barrier path over.
+                return Ok(total);
+            }
+            // Snapshot up to a batch of inos (scan stops at the cap).
+            let mut batch: Vec<Ino> = Vec::new();
+            self.pending_times.iter_sync(|k, _| {
+                batch.push(*k);
+                batch.len() < PENDING_TIMES_DRAIN_BATCH
+            });
+            if batch.is_empty() {
+                return Ok(total);
+            }
+            let saw_full_batch = batch.len() >= PENDING_TIMES_DRAIN_BATCH;
+            let lock_plan: Vec<(u64, LockMode)> = batch
+                .iter()
+                .map(|&ino| (ino, LockMode::Exclusive))
+                .collect();
+            let _guards = self.dlm.lock_many(&lock_plan, &[]).await;
+
+            let mut tx = KvTx::new();
+            let mut records = 0u64;
+            let mut drained: Vec<Ino> = Vec::with_capacity(batch.len());
+            for &ino in &batch {
+                // Re-read under the guard: a committed setattr may have
+                // retired the entry between snapshot and lock.
+                let Some((pm, pc)) = self.pending_times.read_sync(&ino, |_, p| *p) else {
+                    continue;
+                };
+                match self.read_inode_value(ino).await? {
+                    None => drained.push(ino), // destroyed: GC, no record
+                    Some(v) => {
+                        if pc > v.ctime || pm > v.mtime {
+                            // Stage only the advance (mtime is invariant-
+                            // equal to stored for echo-born refinements;
+                            // the times form is the belt).
+                            let delta = if pm > v.mtime {
+                                InodeDelta::times(pm.max(v.mtime), pc.max(v.ctime))
+                            } else {
+                                InodeDelta::ctime(pc)
+                            };
+                            tx.stage_delta(TREE_INODES, inode_key(ino), &delta);
+                            records += 1;
+                        }
+                        drained.push(ino);
+                    }
+                }
+            }
+            if !tx.is_empty() {
+                // A drain failure keeps the refinements parked (the next
+                // trigger retries); fsync-path callers surface the error.
+                self.commit_tx(tx).await?;
+                super::META_KV_TIMES_ECHO_DRAIN_COMMITS.fetch_add(1, Ordering::Relaxed);
+                super::META_KV_TIMES_ECHO_DRAINED.fetch_add(records, Ordering::Relaxed);
+            }
+            for ino in &drained {
+                self.retire_pending_times(*ino);
+            }
+            total += records;
+            if !saw_full_batch {
+                return Ok(total);
+            }
+        }
     }
 
     /// Clean unmount: reject new mutations, drain in-flight commits, run
@@ -1123,6 +1254,16 @@ impl KvMetaBackend {
     /// kill-9 skips both by construction: the claim is reclaimed by the
     /// dead-pid proof / TTL, the reservation by the successor's preempt.
     pub async fn shutdown(&self) -> std::result::Result<(), KvError> {
+        // PR M6: make parked pending-times refinements durable while the
+        // write gate is still open (best-effort — they are µs-grade time
+        // polish; a failing volume loses them like a kill-9 would).
+        if let Err(e) = self.drain_pending_times_now().await {
+            log::warn!(
+                "meta volume {}: clean unmount could not drain pending times \
+                 refinements: {e} (dropped — µs-grade ctime polish only)",
+                self.path.display()
+            );
+        }
         // D0: delete OUR claim exactly once — best-effort (a fenced or
         // failed volume cannot write; the claim then ages out by TTL).
         if self.claimed.swap(false, Ordering::AcqRel) && !self.is_failed() {
@@ -1137,6 +1278,15 @@ impl KvMetaBackend {
         self.shutting_down.store(true, Ordering::Release);
         self.ring.wake_parked();
         self.ckpt_wake.notify_waiters();
+        // PR M6: the drain task observes the flag on its wake and exits;
+        // joining it keeps the no-leaked-tasks teardown contract.
+        self.times_drain_wake.notify_waiters();
+        let drain_handle = self.times_drain_join.lock().unwrap().take();
+        if let Some(handle) = drain_handle {
+            handle
+                .await
+                .map_err(|e| KvError::Corrupt(format!("pending-times drain task panicked: {e}")))?;
+        }
         let handle = self.ckpt_join.lock().unwrap().take();
         if let Some(handle) = handle {
             // The task observes the flag, runs the final checkpoint, and
@@ -1182,6 +1332,16 @@ impl KvMetaBackend {
     ) {
         *self.ckpt_join.lock().unwrap() = Some(handle);
         *self.ckpt_alive.lock().unwrap() = alive;
+    }
+
+    /// PR M6: the pending-times drain task's wake (cap crossings + the
+    /// shutdown broadcast).
+    pub(super) fn times_drain_wake_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.times_drain_wake.clone()
+    }
+
+    pub(super) fn install_times_drain_task(&self, handle: tokio::task::JoinHandle<()>) {
+        *self.times_drain_join.lock().unwrap() = Some(handle);
     }
 
     /// R5 defense-in-depth gauge (follow-up C): the node cache's RAM
@@ -2685,6 +2845,12 @@ impl KvMetaBackend {
             .meta_reclaim_batch_size
             .record(doomed);
         self.commit_tx(tx).await?;
+        // PR M6: a destroyed corpse's pending times refinement is moot —
+        // GC it under the exclusive locks (the drain would drop it on the
+        // missing-inode read anyway; this keeps the map tight).
+        for &ino in inos {
+            self.retire_pending_times(ino);
+        }
         Ok(())
     }
 
@@ -3033,7 +3199,15 @@ impl KvMetaBackend {
     /// Routed same-volume rename — ONE whole-tx entry covering the v2
     /// arm's semantics: EXCHANGE swap, NOREPLACE guard, replace with
     /// destination nlink accounting + ENOTEMPTY (when the destination
-    /// inode is local: `dest_local`), directory-move parent nlink shifts.
+    /// inode is local: `dest_local`), directory-move parent nlink shifts —
+    /// **plus the PR M6 D4.b time surface in the SAME entry**: Δtime merge
+    /// records on both parents (folded into the nlink-shift `Put`s when a
+    /// directory move already rewrites them), and a Δctime on the moved
+    /// inode when it lives on this volume (`src_local`; a remote child's
+    /// stamp is the routed layer's per-volume fragment). One entry means
+    /// one crash exposure: naming and times commit or revert together
+    /// (`tests/crash_contract_tests.rs` rename atomicity), and strict mode
+    /// pays ONE barrier where the old fragment shape paid two.
     #[allow(clippy::too_many_arguments)] // the routed rename's parameter surface
     pub async fn routed_rename_local(
         &self,
@@ -3042,12 +3216,14 @@ impl KvMetaBackend {
         local_new_parent: Ino,
         new_name: &str,
         flags: u32,
+        src_local: Option<Ino>,
         dest_local: Option<Ino>,
     ) -> Result<()> {
         self.write_gate()?;
         let old_pos = self.find_dentry_pos(local_old_parent, old_name).await?;
         let new_pos = self.find_dentry_pos(local_new_parent, new_name).await?;
         let mut tx = KvTx::new();
+        let now = Self::now_ns();
         if flags & libc::RENAME_EXCHANGE != 0 {
             let enoent = || {
                 crate::error::SqueezefsError::Io(std::io::Error::from_raw_os_error(libc::ENOENT))
@@ -3074,6 +3250,29 @@ impl KvMetaBackend {
                 // D1.c single-copy staging (no intermediate name Vec).
                 DentryValue::encode_parts(new_d.child_ino, new_d.file_type, old_name.as_bytes())?,
             );
+            // D4.b: both parents' Δtimes + both swapped inodes' Δctimes
+            // ride the swap entry (dedup the shared-parent / same-inode
+            // shapes).
+            tx.stage_delta(
+                TREE_INODES,
+                inode_key(local_old_parent),
+                &InodeDelta::times(now, now),
+            );
+            if local_new_parent != local_old_parent {
+                tx.stage_delta(
+                    TREE_INODES,
+                    inode_key(local_new_parent),
+                    &InodeDelta::times(now, now),
+                );
+            }
+            if let Some(src) = src_local {
+                tx.stage_delta(TREE_INODES, inode_key(src), &InodeDelta::ctime(now));
+            }
+            if let Some(dst) = dest_local {
+                if src_local != Some(dst) {
+                    tx.stage_delta(TREE_INODES, inode_key(dst), &InodeDelta::ctime(now));
+                }
+            }
             return self.commit_tx(tx).await.map_err(Into::into);
         }
         if flags & libc::RENAME_NOREPLACE != 0 && new_pos.is_some() {
@@ -3089,20 +3288,40 @@ impl KvMetaBackend {
         };
         let is_dir = u32::from(old_d.file_type) << 12 == libc::S_IFDIR;
         let cross_dir = local_old_parent != local_new_parent;
-        let now = Self::now_ns();
         if is_dir && cross_dir {
-            // Parent nlink shift, best-effort like the v2 arm.
+            // Parent nlink shift, best-effort like the v2 arm — the D4.b
+            // parent times fold into these full `Put`s (same records,
+            // same entry; no separate Δtime needed below).
             if let Some(mut op) = self.read_inode_value(local_old_parent).await? {
                 if op.nlink > 2 {
                     op.nlink -= 1;
                 }
+                op.mtime = now;
+                op.ctime = now;
                 tx.stage_put(TREE_INODES, inode_key(local_old_parent), op.encode());
             }
             if let Some(mut np) = self.read_inode_value(local_new_parent).await? {
                 np.nlink += 1;
+                np.mtime = now;
+                np.ctime = now;
                 tx.stage_put(TREE_INODES, inode_key(local_new_parent), np.encode());
             }
+        } else {
+            // D4.b: parent Δtime merge records (one per distinct parent).
+            tx.stage_delta(
+                TREE_INODES,
+                inode_key(local_old_parent),
+                &InodeDelta::times(now, now),
+            );
+            if cross_dir {
+                tx.stage_delta(
+                    TREE_INODES,
+                    inode_key(local_new_parent),
+                    &InodeDelta::times(now, now),
+                );
+            }
         }
+        let mut dest_replaced = None;
         if let Some((new_key, _new_d)) = new_pos {
             if let Some(dest) = dest_local {
                 if let Some(mut dv) = self.read_inode_value(dest).await? {
@@ -3118,6 +3337,7 @@ impl KvMetaBackend {
                     }
                     dv.ctime = now;
                     tx.stage_put(TREE_INODES, inode_key(dest), dv.encode());
+                    dest_replaced = Some(dest);
                 }
             }
             tx.stage_delete(TREE_DENTRIES, new_key);
@@ -3131,6 +3351,34 @@ impl KvMetaBackend {
             nk,
             // D1.c single-copy staging (no intermediate name Vec).
             DentryValue::encode_parts(old_d.child_ino, old_d.file_type, new_name.as_bytes())?,
+        );
+        // D4.b: the moved inode's ctime, in the same entry (skip when the
+        // dest-replace `Put` above already stamped the same local inode —
+        // rename over a hardlink of itself).
+        if let Some(src) = src_local {
+            if dest_replaced != Some(src) {
+                tx.stage_delta(TREE_INODES, inode_key(src), &InodeDelta::ctime(now));
+            }
+        }
+        self.commit_tx(tx).await?;
+        Ok(())
+    }
+
+    /// PR M6 D4.b, the cross-volume fragment: stamp `ctime = now` on a
+    /// moved/exchanged inode that lives on a DIFFERENT volume than the
+    /// rename's dentry surgery (per-volume fragments — cross-volume
+    /// renames were never transactional across volumes). Best-effort on a
+    /// missing inode, like every routed rename fragment.
+    pub async fn routed_touch_ctime(&self, local_ino: Ino) -> Result<()> {
+        self.write_gate()?;
+        if self.read_inode_value(local_ino).await?.is_none() {
+            return Ok(());
+        }
+        let mut tx = KvTx::new();
+        tx.stage_delta(
+            TREE_INODES,
+            inode_key(local_ino),
+            &InodeDelta::ctime(Self::now_ns()),
         );
         self.commit_tx(tx).await?;
         Ok(())
@@ -3193,6 +3441,25 @@ impl KvMetaBackend {
     /// The setattr body with the DLM I-guard already held — the routed
     /// layer's entry (it locks through `volume_dlm`, the SAME manager, so
     /// re-locking here would self-deadlock on a stripe).
+    ///
+    /// **PR M6 (design-metadata-throughput §5.4 D4): the SETATTR-echo
+    /// absorb arm.** Under writeback cache the kernel authors regular-file
+    /// ctime locally after every rename/unlink/link/setxattr
+    /// (`fuse_update_ctime` — those replies carry no attrs, so nothing
+    /// can pre-empt the dirtying) and synchronously flushes a times-only
+    /// `FUSE_SETATTR(FATTR_MTIME|FATTR_CTIME)` whose mtime is the
+    /// daemon's own round-tripped value, UNCHANGED. That echo measured a
+    /// whole 1.000 journal entries/op on rename AND unlink storms (the M2
+    /// attribution rig) — the entire G4 gap. It is recognized here by
+    /// shape — times-only, mtime absent-or-equal to the folded stored
+    /// value — and **parked in the pending-times map with zero journal
+    /// entries**: read-visible immediately (every inode read folds the
+    /// map, monotone max), durable via the batched drain. Everything else
+    /// — changed mtime (the buffered-write flush carrying kernel-authored
+    /// write times), explicit utimes (atime present, exact-set), chmod /
+    /// chown / truncate — commits exactly as before, folding and retiring
+    /// any pending refinement so exact-set semantics never get max-clamped
+    /// by a dead echo.
     #[allow(clippy::too_many_arguments)] // the trait's parameter surface
     pub async fn setattr_locked(
         &self,
@@ -3210,6 +3477,40 @@ impl KvMetaBackend {
             .read_inode_value(ino)
             .await?
             .ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
+        // Fold the pending refinement into the base: the absorb arm's
+        // eligibility compares against the freshest view, and the commit
+        // arm's RMW must carry (never clobber) a newer refined ctime.
+        self.fold_pending_times(ino, &mut v);
+
+        let times_only =
+            mode.is_none() && uid.is_none() && gid.is_none() && size.is_none() && atime.is_none();
+        if times_only && mtime.is_none_or(|m| m == v.mtime) {
+            if let Some(req_ctime) = ctime {
+                super::META_KV_TIMES_ECHO_ABSORBED.fetch_add(1, Ordering::Relaxed);
+                if req_ctime > v.ctime {
+                    v.ctime = req_ctime;
+                    match self.pending_times.entry_sync(ino) {
+                        scc::hash_map::Entry::Occupied(mut o) => {
+                            let p = o.get_mut();
+                            p.0 = v.mtime;
+                            p.1 = p.1.max(req_ctime);
+                        }
+                        scc::hash_map::Entry::Vacant(slot) => {
+                            slot.insert_entry((v.mtime, req_ctime));
+                            self.pending_times_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if self.pending_times_count.load(Ordering::Relaxed) >= PENDING_TIMES_DRAIN_CAP {
+                        self.times_drain_wake.notify_one();
+                    }
+                }
+                // A refinement at-or-behind the folded view persists
+                // nothing (monotonicity: ctime never moves backwards) —
+                // still an absorption, still zero entries.
+                return Ok(Self::to_inode(ino, &v));
+            }
+        }
+
         let mut ctime_updated = false;
         if let Some(m) = mode {
             v.mode = m;
@@ -3241,6 +3542,10 @@ impl KvMetaBackend {
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
         self.commit_tx(tx).await?;
+        // The committed Put carries (or intentionally supersedes) the
+        // refinement — retire it so a dead echo never max-folds over an
+        // exact-set (under the caller's I-guard: race-free).
+        self.retire_pending_times(ino);
         Ok(Self::to_inode(ino, &v))
     }
 

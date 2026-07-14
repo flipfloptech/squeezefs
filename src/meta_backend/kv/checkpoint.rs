@@ -361,6 +361,64 @@ pub(super) fn spawn_checkpoint_task(be: &Arc<KvMetaBackend>) {
     be.install_checkpoint_task(handle, probe);
 }
 
+/// Spawn the per-volume **pending-times drain** task (PR M6, design-
+/// metadata-throughput §5.4 D4 — called by `KvMetaBackend::open` beside
+/// the checkpoint task). It makes absorbed SETATTR-echo refinements
+/// durable in batched transactions on the flush cadence (strict mode
+/// ticks at 100 ms like the checkpoint task; commits inside the drain
+/// barrier themselves there), waking early on cap crossings.
+///
+/// A DEDICATED task, deliberately not a checkpoint-tick step: the drain
+/// commits through `commit_tx`, whose ring admission may park — parking
+/// the checkpoint task on admission would deadlock the very drain that
+/// frees ring space (§4.4 pt 5's liveness shape holds precisely because
+/// parked committers and the checkpoint drain are different tasks). Same
+/// `Weak` sentinel discipline: dropping the backend without `shutdown`
+/// reaps it on its next tick; `shutdown` wakes and JOINS it (no leaked
+/// tasks).
+pub(super) fn spawn_times_drain_task(be: &Arc<KvMetaBackend>) {
+    let weak = Arc::downgrade(be);
+    let wake = be.times_drain_wake_handle();
+    let interval = match crate::meta_backend::resolve_flush_interval_ms() {
+        0 => 100,
+        ms => ms,
+    };
+    let handle = tokio::spawn(times_drain_task(weak, wake, interval));
+    be.install_times_drain_task(handle);
+}
+
+async fn times_drain_task(
+    weak: std::sync::Weak<KvMetaBackend>,
+    wake: Arc<tokio::sync::Notify>,
+    interval_ms: u64,
+) {
+    let period = std::time::Duration::from_millis(interval_ms);
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = wake.notified() => {}
+        };
+        let Some(be) = weak.upgrade() else {
+            return; // backend dropped without shutdown: exit, leak nothing
+        };
+        if be.is_shutting_down() {
+            return; // shutdown drained inline and joins us
+        }
+        if be.pending_times_len() == 0 {
+            continue;
+        }
+        if let Err(e) = be.drain_pending_times_now().await {
+            log::warn!(
+                "kv pending-times drain failed on {:?}: {e} (refinements stay \
+                 parked; the next tick retries)",
+                be.device_path()
+            );
+        }
+    }
+}
+
 async fn checkpoint_task(
     weak: std::sync::Weak<KvMetaBackend>,
     alive: Arc<()>,

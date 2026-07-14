@@ -471,6 +471,19 @@ impl InodeDelta {
         }
     }
 
+    /// The Δctime record (PR M6, design-metadata-throughput §5.4 D4.b):
+    /// overwrite `ctime` only — the moved-inode stamp rename carries
+    /// in-tx, and the pending-times drain's mtime-untouched shape.
+    pub fn ctime(ctime: u64) -> Self {
+        Self {
+            mask: DELTA_CTIME,
+            fields: InodeValue {
+                ctime,
+                ..InodeValue::default()
+            },
+        }
+    }
+
     /// Encode as `mask: u16 LE` + the masked fields in canonical field order.
     pub fn encode(&self) -> Vec<u8> {
         debug_assert_eq!(self.mask & !DELTA_MASK_ALL, 0, "unknown delta mask bits");

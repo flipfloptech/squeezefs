@@ -42,6 +42,7 @@ pub mod defrag;
 pub mod jobs;
 pub mod storage;
 pub mod stripe_locks;
+pub mod supervisor;
 pub mod uring_fs;
 
 use parking_lot::RwLock;

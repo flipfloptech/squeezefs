@@ -79,6 +79,95 @@ fn get_fuse_timeout() -> Duration {
 // and the lock-order documentation continue to work).
 pub use crate::stripe_locks::StripeLocks;
 
+/// Per-class kernel cache TTLs (design-metadata-throughput §5.2 D2.b/D2.c
+/// + the reference-client survey P1-C rider: DAOS ships the per-class
+/// split as container attributes, JuiceFS as mount flags — SqueezeFS
+/// previously hardcoded 1 s everywhere and silently DROPPED user-passed
+/// `entry_timeout`/`attr_timeout`/`negative_timeout` mount options).
+///
+/// Four classes, all defaulting to the historical 1 s:
+/// - `attr`: GETATTR/SETATTR reply TTL + the daemon attr-cache freshness
+///   window (`get_attr_internal`).
+/// - `entry`: dentry TTL for non-directory lookup/create/link results.
+/// - `dir_entry`: dentry TTL for directory results (dir dentries
+///   invalidate whole subtrees — the DAOS `dfuse-dentry-dir-time` split).
+/// - `negative`: TTL on cacheable negative lookup replies (D2.b);
+///   `0` disables negative caching (miss replies stay bare ENOENT).
+///
+/// Sources, later wins: defaults → `SQUEEZEFS_FUSE_{ATTR,ENTRY,DIR_ENTRY,
+/// NEGATIVE}_TTL_MS` env (launch-time, read once at construction — the
+/// `get_fuse_timeout` convention) → `-o attr_timeout=/entry_timeout=/
+/// dir_entry_timeout=/negative_timeout=` mount options (libfuse-style
+/// float seconds). The mount options are daemon-level: they are still
+/// stripped from the kernel `mount(2)` option string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelCacheTtls {
+    pub attr: Duration,
+    pub entry: Duration,
+    pub dir_entry: Duration,
+    pub negative: Duration,
+}
+
+impl Default for KernelCacheTtls {
+    fn default() -> Self {
+        Self {
+            attr: Duration::from_secs(1),
+            entry: Duration::from_secs(1),
+            dir_entry: Duration::from_secs(1),
+            negative: Duration::from_secs(1),
+        }
+    }
+}
+
+impl KernelCacheTtls {
+    /// Launch-time env knobs (milliseconds). Read once at filesystem
+    /// construction — never on the per-op path.
+    pub fn from_env() -> Self {
+        fn env_ms(key: &str, default: Duration) -> Duration {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(default)
+        }
+        let d = Self::default();
+        Self {
+            attr: env_ms("SQUEEZEFS_FUSE_ATTR_TTL_MS", d.attr),
+            entry: env_ms("SQUEEZEFS_FUSE_ENTRY_TTL_MS", d.entry),
+            dir_entry: env_ms("SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", d.dir_entry),
+            negative: env_ms("SQUEEZEFS_FUSE_NEGATIVE_TTL_MS", d.negative),
+        }
+    }
+
+    /// Apply `-o` mount-option overrides (libfuse-style float seconds:
+    /// `attr_timeout=2.5,entry_timeout=1,dir_entry_timeout=10,
+    /// negative_timeout=0`). Unknown keys and unparseable values are
+    /// ignored (the kernel-option filter owns rejection of stray keys).
+    pub fn with_mount_options(mut self, opts: &str) -> Self {
+        for opt in opts.split(',') {
+            let opt = opt.trim();
+            let Some((key, val)) = opt.split_once('=') else {
+                continue;
+            };
+            let Ok(secs) = val.trim().parse::<f64>() else {
+                continue;
+            };
+            if !secs.is_finite() || secs < 0.0 {
+                continue;
+            }
+            let ttl = Duration::from_secs_f64(secs);
+            match key.trim() {
+                "attr_timeout" => self.attr = ttl,
+                "entry_timeout" => self.entry = ttl,
+                "dir_entry_timeout" => self.dir_entry = ttl,
+                "negative_timeout" => self.negative = ttl,
+                _ => {}
+            }
+        }
+        self
+    }
+}
+
 // ===========================================================================
 // D1.b AWAIT-DISPOSITION AUDIT (design-metadata-throughput §5.1, PR M4)
 //
@@ -945,6 +1034,25 @@ pub struct Metrics {
     /// per scan per overdue op (was: silent per-op ETIMEDOUT synthesis).
     /// > 0 ⇒ investigate.
     pub fuse_op_watchdog_overdue: Align64<AtomicU64>,
+    /// D1.d (design-metadata-throughput §5.1, PR M5): FLUSH requests on a
+    /// never-dirtied handle served by the fast path — no lease acquire, no
+    /// buffer scan. On kernels that honor `FOPEN_NOFLUSH` (D2.a) the FLUSH
+    /// round trip itself disappears and this stays ~0; growth here means
+    /// the kernel still sends FLUSH and D1.d is absorbing its cost.
+    pub fuse_flush_clean_fastpath: Align64<AtomicU64>,
+    /// D1.d: RELEASE requests on a never-dirtied handle that skipped the
+    /// lease acquire + background flush spawn (bookkeeping still runs:
+    /// lease/lock teardown, open-count, reclaim queue).
+    pub fuse_release_clean_fastpath: Align64<AtomicU64>,
+    /// D2.b: lookup misses answered with a cacheable negative entry
+    /// (nodeid 0 + entry TTL) instead of a bare ENOENT — each is a
+    /// kernel-side negative dentry that absorbs repeated-miss round trips.
+    pub fuse_lookup_negative_replies: Align64<AtomicU64>,
+    /// D2.c: post-op attr-cache refreshes (unlink/rename/link family) —
+    /// parent/child attrs re-seeded from the RAM-authoritative backend
+    /// instead of invalidated, so the kernel's forced revalidation GETATTR
+    /// is a ~µs cache hit rather than a contended backend fetch.
+    pub fuse_attr_cache_refreshes: Align64<AtomicU64>,
     pub meta_updates: Align64<AtomicU64>,
     pub put_obj: Align64<AtomicU64>,
     pub get_obj: Align64<AtomicU64>,
@@ -1423,6 +1531,10 @@ pub struct SqueezefsFilesystem {
         arc_swap::ArcSwap<Option<std::sync::Arc<fuse3::raw::connection::FuseConnection>>>,
     >,
     pub open_inodes: std::sync::Arc<dashmap::DashMap<u64, usize, ahash::RandomState>>,
+    /// Per-class kernel cache TTLs (attr / entry / dir-entry / negative).
+    /// Per-mount (DAOS per-container model): env-seeded at construction,
+    /// mount-option-overridden in `start_mount`, direct-set in tests.
+    pub kernel_ttls: KernelCacheTtls,
     pub reclaim_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     /// FUSE-over-io_uring surfaces Destroy once per queue; teardown must
     /// run exactly once.
@@ -1475,6 +1587,7 @@ impl Clone for SqueezefsFilesystem {
             // publishes after mount (re-enables the read zero-copy dest).
             session_connection: self.session_connection.clone(),
             open_inodes: self.open_inodes.clone(),
+            kernel_ttls: self.kernel_ttls,
             reclaim_semaphore: self.reclaim_semaphore.clone(),
             dismount_once: self.dismount_once.clone(),
             reclaim_tx: self.reclaim_tx.clone(),
@@ -1568,6 +1681,7 @@ impl SqueezefsFilesystem {
             open_inodes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            kernel_ttls: KernelCacheTtls::from_env(),
             reclaim_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 reclaim_concurrency,
             )),
@@ -1603,6 +1717,16 @@ impl SqueezefsFilesystem {
         } else {
             false
         }
+    }
+
+    /// D1.d: has any data-mutating op (write / truncate / fallocate /
+    /// copy_file_range dest) touched this inode since its open count last
+    /// rose from zero? FLUSH/RELEASE on a never-dirtied handle take the
+    /// fast path (no lease acquire, no buffer scan, no background flush
+    /// spawn).
+    pub fn handle_dirty(&self, _ino: u64) -> bool {
+        // RED scaffold: pre-M5 behavior treated every handle as dirty.
+        true
     }
 
     pub fn queue_reclaim_inode(&self, ino: u64) {
@@ -1901,6 +2025,10 @@ impl SqueezefsFilesystem {
             "metrics": {
                 "fuse_ops": METRICS.fuse_ops.load(Ordering::Relaxed),
                 "fuse_op_watchdog_overdue": METRICS.fuse_op_watchdog_overdue.load(Ordering::Relaxed),
+                "fuse_flush_clean_fastpath": METRICS.fuse_flush_clean_fastpath.load(Ordering::Relaxed),
+                "fuse_release_clean_fastpath": METRICS.fuse_release_clean_fastpath.load(Ordering::Relaxed),
+                "fuse_lookup_negative_replies": METRICS.fuse_lookup_negative_replies.load(Ordering::Relaxed),
+                "fuse_attr_cache_refreshes": METRICS.fuse_attr_cache_refreshes.load(Ordering::Relaxed),
                 "meta_updates": METRICS.meta_updates.load(Ordering::Relaxed),
                 "put_obj": METRICS.put_obj.load(Ordering::Relaxed),
                 "get_obj": METRICS.get_obj.load(Ordering::Relaxed),

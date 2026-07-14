@@ -610,3 +610,212 @@ async fn delete_file_purges_staged_active_blocks() {
         "delete_file left a stale staged active_block entry alive (wrong key format?)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8. PR M5 (design-metadata-throughput §5.1 D1.d): clean-handle
+//    FLUSH/RELEASE fast path. A handle nothing ever dirtied (no write /
+//    truncate / fallocate / copy_file_range) must FLUSH and RELEASE without
+//    lease acquisition or buffer scans — and, load-bearing for the write
+//    path: a handle that WAS dirtied must keep today's full FLUSH/RELEASE
+//    behavior bit-for-bit (data visible after flush, durable after fsync).
+//    Observability contract: the fast path (and only the fast path) counts
+//    `fuse_flush_clean_fastpath` / `fuse_release_clean_fastpath`.
+// ---------------------------------------------------------------------------
+
+fn flush_fast_count() -> u64 {
+    squeezefs::fuse_client::METRICS
+        .fuse_flush_clean_fastpath
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn release_fast_count() -> u64 {
+    squeezefs::fuse_client::METRICS
+        .fuse_release_clean_fastpath
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+async fn flush(h: &H, ino: u64) {
+    h.fs.flush(h.req, ino, ino, 0).await.unwrap();
+}
+
+async fn release(h: &H, ino: u64) {
+    h.fs.release(h.req, ino, ino, 0, 0, false).await.unwrap();
+}
+
+async fn open(h: &H, ino: u64) {
+    let _ = h.fs.open(h.req, ino, libc::O_RDONLY as u32).await.unwrap();
+}
+
+/// Never-dirtied handle: FLUSH and RELEASE take the fast path (counters
+/// move), and the release still tears down open-count bookkeeping so
+/// inode reclaim keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_handle_flush_release_take_fast_path() {
+    let h = make().await;
+    // create() leaves the handle open and CLEAN (empty file, no writes).
+    let ino = create(&h, "clean_fast").await;
+
+    let f0 = flush_fast_count();
+    flush(&h, ino).await;
+    assert_eq!(
+        flush_fast_count() - f0,
+        1,
+        "FLUSH on a never-dirtied handle must take the D1.d fast path"
+    );
+
+    let r0 = release_fast_count();
+    release(&h, ino).await;
+    assert_eq!(
+        release_fast_count() - r0,
+        1,
+        "RELEASE on a never-dirtied handle must take the D1.d fast path"
+    );
+    assert!(
+        !h.fs.is_open(ino),
+        "fast-path release must still decrement the open count (reclaim lifecycle)"
+    );
+
+    // Reopen for read only: still clean, still fast.
+    open(&h, ino).await;
+    let f1 = flush_fast_count();
+    let r1 = release_fast_count();
+    flush(&h, ino).await;
+    release(&h, ino).await;
+    assert_eq!(flush_fast_count() - f1, 1, "read-only reopen stays clean");
+    assert_eq!(release_fast_count() - r1, 1, "read-only reopen stays clean");
+}
+
+/// Dirty-handle FLUSH/RELEASE behavior is UNCHANGED (the D2.a semantics
+/// review's pin): full path runs (no fast-path counts), written data is
+/// visible after flush and survives fsync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dirty_handle_flush_release_behavior_unchanged() {
+    let h = make().await;
+    let ino = create(&h, "dirty_full").await;
+
+    write_at(&h, ino, 0, &vec![0xAAu8; (BS + 17) as usize]).await;
+
+    let f0 = flush_fast_count();
+    flush(&h, ino).await;
+    assert_eq!(
+        flush_fast_count() - f0,
+        0,
+        "FLUSH on a dirtied handle must run the FULL flush path, never the fast path"
+    );
+    assert_fill(&h, ino, 0, BS + 17, 0xAA, "dirty-flush").await;
+
+    let r0 = release_fast_count();
+    release(&h, ino).await;
+    assert_eq!(
+        release_fast_count() - r0,
+        0,
+        "RELEASE on a dirtied handle must run the FULL release path (background flush spawn)"
+    );
+
+    // Durability unaffected: reopen, fsync, read back.
+    open(&h, ino).await;
+    fsync(&h, ino).await;
+    assert_fill(&h, ino, 0, BS + 17, 0xAA, "dirty-fsync").await;
+    release(&h, ino).await;
+}
+
+/// Every data-mutating op class must set the dirty bit: truncate (setattr
+/// size), fallocate, copy_file_range destination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncate_fallocate_copy_range_mark_handle_dirty() {
+    let h = make().await;
+
+    // setattr(size) — truncate dirties.
+    let a = create(&h, "dirty_trunc").await;
+    truncate_to(&h, a, 4096).await;
+    let f0 = flush_fast_count();
+    flush(&h, a).await;
+    assert_eq!(flush_fast_count() - f0, 0, "truncate must dirty the handle");
+
+    // fallocate dirties.
+    let b = create(&h, "dirty_falloc").await;
+    falloc(&h, b, 0, 8192).await;
+    let f1 = flush_fast_count();
+    flush(&h, b).await;
+    assert_eq!(
+        flush_fast_count() - f1,
+        0,
+        "fallocate must dirty the handle"
+    );
+
+    // copy_file_range dirties the DESTINATION only.
+    let src = create(&h, "cfr_src").await;
+    write_at(&h, src, 0, &[0x5Au8; 4096]).await;
+    flush(&h, src).await;
+    let dst = create(&h, "cfr_dst").await;
+    let copied =
+        h.fs.copy_file_range(h.req, src, src, 0, dst, dst, 0, 4096, 0)
+            .await
+            .unwrap();
+    assert_eq!(copied.copied, 4096, "copy_file_range short copy");
+    let f2 = flush_fast_count();
+    flush(&h, dst).await;
+    assert_eq!(
+        flush_fast_count() - f2,
+        0,
+        "copy_file_range must dirty the destination handle"
+    );
+}
+
+/// The dirty bit is per open-generation: after the last close of a
+/// dirtied inode, a fresh reopen that never writes is clean again (its
+/// unflushed state was already handed to the background path at the dirty
+/// close — nothing new to flush).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopen_after_dirty_close_is_clean_again() {
+    let h = make().await;
+    let ino = create(&h, "reopen_clean").await;
+    write_at(&h, ino, 0, &[0x11u8; 1024]).await;
+    release(&h, ino).await; // dirty close: full path, schedules bg flush
+
+    open(&h, ino).await; // open count 0 -> 1 resets the dirty bit
+    let f0 = flush_fast_count();
+    let r0 = release_fast_count();
+    flush(&h, ino).await;
+    release(&h, ino).await;
+    assert_eq!(
+        flush_fast_count() - f0,
+        1,
+        "clean reopen after dirty close must be fast again"
+    );
+    assert_eq!(
+        release_fast_count() - r0,
+        1,
+        "clean reopen after dirty close must be fast again"
+    );
+    // And the data written before the dirty close is still there.
+    assert_fill(&h, ino, 0, 1024, 0x11, "reopen-clean").await;
+}
+
+/// While ANY handle of the inode is dirty, a second handle's close must
+/// NOT take the fast path (the dirty bit is per-inode: conservative for
+/// multi-handle opens, exact for the create-storm shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_clean_handle_of_dirty_inode_stays_on_full_path() {
+    let h = make().await;
+    let ino = create(&h, "two_handles").await; // handle 1 (clean)
+    open(&h, ino).await; // handle 2 (clean)
+    write_at(&h, ino, 0, &[0x22u8; 512]).await; // dirties the inode
+
+    let f0 = flush_fast_count();
+    let r0 = release_fast_count();
+    flush(&h, ino).await; // "handle 2" flush
+    release(&h, ino).await; // "handle 2" close — inode still open once
+    assert_eq!(
+        flush_fast_count() - f0,
+        0,
+        "dirty inode: no flush may take the fast path while the dirty state is live"
+    );
+    assert_eq!(
+        release_fast_count() - r0,
+        0,
+        "dirty inode: no release may take the fast path while the dirty state is live"
+    );
+    assert!(h.fs.is_open(ino), "one handle must remain open");
+    release(&h, ino).await;
+}

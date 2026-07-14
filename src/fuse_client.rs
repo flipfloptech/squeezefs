@@ -1346,7 +1346,7 @@ pub struct SqueezefsFilesystem {
     /// never enter it.
     ///
     /// PR M4 (D1.c): keyed by `(parent, generation)` — mutators bump the
-    /// parent's [`Self::dir_gen`] counter instead of running a moka
+    /// parent's `dir_gen` counter instead of running a moka
     /// `invalidate` per create/unlink/rename (the measured
     /// cache-maintenance tax), and a snapshot built against a superseded
     /// generation lands under a dead key (the pre-M4 invalidate-then-

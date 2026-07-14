@@ -621,7 +621,9 @@ async fn fuse_readdir_v3_emits_key_cookies_and_streams() {
     // fuse_readdir_v3_big_dir_streams_exactly_once.)
     h.fs.dir_entry_cache_v3.run_pending_tasks();
     assert!(
-        h.fs.dir_entry_cache_v3.get(&1).is_some(),
+        h.fs.dir_entry_cache_v3
+            .get(&(1, h.fs.dir_generation(1)))
+            .is_some(),
         "a small v3 directory must be cached (with cookies) after a listing start — §4.5"
     );
     let walked_again = walk_fuse_readdir(&h.fs, 1, 0, 7).await;
@@ -782,7 +784,9 @@ async fn fuse_readdir_v3_big_dir_streams_exactly_once() {
         "the §4.5 policy constant"
     );
     assert!(
-        h.fs.dir_entry_cache_v3.get(&dir.ino).is_none(),
+        h.fs.dir_entry_cache_v3
+            .get(&(dir.ino, h.fs.dir_generation(dir.ino)))
+            .is_none(),
         "big v3 directories must never enter dir_entry_cache_v3 (≤ 10 K policy)"
     );
 

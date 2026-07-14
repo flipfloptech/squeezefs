@@ -101,6 +101,19 @@ const JOURNAL_FAILURE_LATCH: u64 = 3;
 /// stall IS the scenario under test, not a coordination primitive).
 pub static TEST_COMMIT_ADMITTED_STALL_MS: AtomicU64 = AtomicU64::new(0);
 
+/// `SQUEEZEFS_TIMEOUT` as the D1.b watchdog/escalation threshold
+/// (design-metadata-throughput §6): read per `open` (control-plane —
+/// never on an op path), default 30 s. Deliberately NOT process-memoized:
+/// each mount/open captures the env it was launched with (and tests can
+/// vary it per sandbox).
+fn squeezefs_timeout_env() -> std::time::Duration {
+    std::env::var("SQUEEZEFS_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(30))
+}
+
 /// Commit-path retry budget against SMO revalidation races (§4.6: SMOs
 /// are rare and serialized, so the loop is short; exhaustion is a bug).
 const COMMIT_RETRY_BUDGET: usize = 256;
@@ -214,6 +227,13 @@ pub struct KvMetaBackend {
     journal_failures: AtomicU64,
     /// `meta_kv_journal_full_stalls` (§4.4 pt 5): ring-admission parks.
     stalls: AtomicU64,
+    /// PR M4 (design-metadata-throughput §5.1 D1.b): `SQUEEZEFS_TIMEOUT`
+    /// read once at open (control-plane; default 30 s). Two consumers:
+    /// the ring-admission park-escalation rung (audit row 2 — parked
+    /// cumulatively ≥ this trips `note_journal_failure` per crossing) and
+    /// the coalesced barrier bound (audit row 1 — `sync_device` waits are
+    /// bounded + synthesized-error).
+    timeout_threshold: std::time::Duration,
     /// The serialized SMO/checkpoint context (§4.6: "all SMOs run on the
     /// per-volume checkpoint task, one at a time" — K5's `&mut SmoContext`
     /// discipline carried by this mutex; the background task is the
@@ -627,6 +647,7 @@ impl KvMetaBackend {
             failed: AtomicBool::new(false),
             journal_failures: AtomicU64::new(0),
             stalls: AtomicU64::new(0),
+            timeout_threshold: squeezefs_timeout_env(),
             smo,
             retire_seq,
             pending_reclaim: std::sync::Mutex::new(Vec::new()),
@@ -989,9 +1010,21 @@ impl KvMetaBackend {
     /// barriers ONLY. The data-path writeback ladder (staging flush /
     /// block upload retries) is elsewhere and stays retry-forever by
     /// design — the never-lossy contract.
+    ///
+    /// **PR M4 (D1.b audit row 1): the wait is bounded** — `barrier_bounded`
+    /// races each batch's `fdatasync` against `timeout_threshold`
+    /// (`SQUEEZEFS_TIMEOUT`) and synthesizes an `ETIMEDOUT`-class error
+    /// for the batch on expiry, so fsync-path callers keep userspace
+    /// liveness on a sick device (the synthesized error the audit calls
+    /// load-bearing). A bounded-out barrier's device op is abandoned to
+    /// its `uring_fs` worker; its true outcome is unknown, so it counts
+    /// toward NEITHER barrier rung (`note_barrier_success/_failure` run
+    /// only on real outcomes) — escalation truth stays with real
+    /// failures, and a genuinely wedged device keeps producing loud
+    /// bounded errors every attempt.
     pub async fn sync_device(&self) -> Result<()> {
         self.sync
-            .barrier(|| async move {
+            .barrier_bounded(self.timeout_threshold, || async move {
                 crate::fuse_client::METRICS
                     .meta_device_syncs
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1957,28 +1990,64 @@ impl KvMetaBackend {
         }
         let len = entry_len_for(&recs)?;
 
-        // (2) Admission — park holding nothing the drain needs.
-        let adm = loop {
-            if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
-                break adm;
-            }
-            self.stalls.fetch_add(1, Ordering::Relaxed);
-            let notified = self.ring_space_notified();
-            if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
-                break adm;
-            }
-            // Re-check liveness flags after each park so shutdown/failure
-            // cannot strand a parked committer.
-            if self.is_shutting_down() || self.is_failed() {
-                return Err(KvError::Io(
-                    self.eio("commit aborted while parked for ring space"),
-                ));
-            }
-            notified.await;
-            if self.is_shutting_down() || self.is_failed() {
-                return Err(KvError::Io(
-                    self.eio("commit aborted while parked for ring space"),
-                ));
+        // (2) Admission — park holding nothing the drain needs, with the
+        // D1.b escalation rung (design-metadata-throughput §5.1, audit
+        // row 2): a wedged-not-failed drain never notifies, so each park
+        // is time-bounded (the liveness re-check must not depend on a
+        // wake) and cumulative parked time ≥ `timeout_threshold` logs
+        // loud + trips `note_journal_failure` once per crossing. Repeated
+        // crossings latch `failed` (JOURNAL_FAILURE_LATCH — ~3× threshold
+        // for a solo committer, ~1× under real op concurrency where every
+        // parked committer crosses); the loop's flag re-check then fails
+        // this op with EIO and the routed layer mirrors the volume into
+        // `disabled_volumes`. Self-arbitrating: any other committer's
+        // entry-write success resets `journal_failures` (step 7), so a
+        // merely starved-but-alive volume logs loud without fail-stopping.
+        let adm = {
+            let threshold = self.timeout_threshold;
+            let mut parked_since: Option<std::time::Instant> = None;
+            loop {
+                if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
+                    break adm;
+                }
+                self.stalls.fetch_add(1, Ordering::Relaxed);
+                let notified = self.ring_space_notified();
+                if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
+                    break adm;
+                }
+                // Re-check liveness flags after each park so shutdown/failure
+                // cannot strand a parked committer.
+                if self.is_shutting_down() || self.is_failed() {
+                    return Err(KvError::Io(
+                        self.eio("commit aborted while parked for ring space"),
+                    ));
+                }
+                let since = *parked_since.get_or_insert_with(std::time::Instant::now);
+                let until_crossing = threshold
+                    .saturating_sub(since.elapsed())
+                    .max(std::time::Duration::from_millis(10));
+                // Dropping `notified` on tick expiry only unregisters this
+                // waiter; the re-registration + try_admit recheck at the
+                // loop top preserves the register-recheck-await shape.
+                let _ = tokio::time::timeout(until_crossing, notified).await;
+                if since.elapsed() >= threshold {
+                    log::error!(
+                        "meta volume {}: committer parked {} ms (≥ {} ms) waiting for \
+                         journal-ring admission ({len} B) — the drain is not advancing \
+                         (wedged-not-failed class); escalating through the journal-failure \
+                         lattice (D1.b audit row 2)",
+                        self.path.display(),
+                        since.elapsed().as_millis(),
+                        threshold.as_millis(),
+                    );
+                    self.note_journal_failure();
+                    parked_since = None;
+                }
+                if self.is_shutting_down() || self.is_failed() {
+                    return Err(KvError::Io(
+                        self.eio("commit aborted while parked for ring space"),
+                    ));
+                }
             }
         };
 

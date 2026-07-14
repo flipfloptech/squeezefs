@@ -60,18 +60,36 @@ impl SyncCoalescer {
     /// the coalescer: an outer `timeout()` would drop an inline LEADER
     /// mid-`sync_fn`, stranding `flushing = true` and wedging every later
     /// barrier on the volume.
+    ///
+    /// Semantics:
+    /// - **Leader**: each batch's `sync_fn` is raced against `bound`. On
+    ///   expiry the in-flight device op is abandoned to its owner (the
+    ///   `uring_fs` worker completes it harmlessly — dropping that future
+    ///   holds no budget), the CURRENT batch **and every queued waiter**
+    ///   receive a synthesized timeout error, `flushing` resets, and the
+    ///   leader returns — the next arrival elects a fresh leader with its
+    ///   own bound. The coalescer can therefore never wedge behind one
+    ///   hung barrier (pinned by
+    ///   `bounded_barrier_errs_on_hung_leader_and_coalescer_recovers`).
+    /// - **Follower**: the result wait is bounded by `2 × bound` (worst
+    ///   case: the remainder of the in-flight barrier + its own batch's
+    ///   barrier, each ≤ `bound` by the leader rule). On expiry the
+    ///   follower synthesizes the same error; the leader's later send
+    ///   into the dead oneshot is harmless.
+    /// - The synthesized error carries `ETIMEDOUT` so callers (fsync)
+    ///   surface a truthful errno. Escalation truth (the barrier-failure
+    ///   rungs) stays with REAL `sync_fn` outcomes — an abandoned
+    ///   barrier's outcome is unknown and deliberately not counted.
     pub async fn barrier_bounded<F, Fut>(
         &self,
-        _bound: std::time::Duration,
+        bound: std::time::Duration,
         sync_fn: F,
     ) -> Result<()>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        // Scaffolding (tests-first commit): delegates unbounded; the M4
-        // implementation commit moves the leader/follower bounds inside.
-        self.barrier(sync_fn).await
+        self.barrier_inner(Some(bound), sync_fn).await
     }
 
     /// Request a durability barrier, coalescing with any concurrent requests.
@@ -80,6 +98,18 @@ impl SyncCoalescer {
     /// invoked once per batch by the leader; callers piggyback on the shared
     /// result. The caller must already have persisted its write before calling.
     pub async fn barrier<F, Fut>(&self, sync_fn: F) -> Result<()>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.barrier_inner(None, sync_fn).await
+    }
+
+    async fn barrier_inner<F, Fut>(
+        &self,
+        bound: Option<std::time::Duration>,
+        sync_fn: F,
+    ) -> Result<()>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<()>>,
@@ -107,7 +137,32 @@ impl SyncCoalescer {
                     std::mem::take(&mut inner.pending)
                 };
 
-                let outcome: BatchOutcome = sync_fn().await.map_err(|e| e.to_string());
+                let raced = match bound {
+                    None => Ok(sync_fn().await),
+                    Some(b) => tokio::time::timeout(b, sync_fn()).await,
+                };
+                let outcome: BatchOutcome = match raced {
+                    Ok(res) => res.map_err(|e| e.to_string()),
+                    Err(_elapsed) => {
+                        // Bounded-out barrier: fail this batch AND the queue,
+                        // reset flushing, stop leading (audit row 1).
+                        let msg = format!(
+                            "device barrier exceeded its bound ({} ms) — synthesized \
+                             timeout (D1.b bounded barrier wait; the device op was \
+                             abandoned to its uring worker)",
+                            bound.map(|b| b.as_millis()).unwrap_or_default()
+                        );
+                        let drained = {
+                            let mut inner = self.inner.lock().unwrap();
+                            inner.flushing = false;
+                            std::mem::take(&mut inner.pending)
+                        };
+                        for waiter in batch.into_iter().chain(drained) {
+                            let _ = waiter.send(Err(msg.clone()));
+                        }
+                        break;
+                    }
+                };
 
                 for waiter in batch {
                     let _ = waiter.send(outcome.clone());
@@ -122,10 +177,33 @@ impl SyncCoalescer {
             }
         }
 
-        match rx.await {
+        let waited = match bound {
+            None => rx.await.map_err(|_| ()),
+            // Follower budget: in-flight barrier remainder + own batch.
+            Some(b) => match tokio::time::timeout(b.saturating_mul(2), rx).await {
+                Ok(res) => res.map_err(|_| ()),
+                Err(_elapsed) => {
+                    return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
+                        libc::ETIMEDOUT,
+                    )));
+                }
+            },
+        };
+        match waited {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(msg)) => Err(SqueezefsError::Io(std::io::Error::other(msg))),
-            Err(_) => Err(SqueezefsError::InvalidOperation(
+            Ok(Err(msg)) => {
+                // Synthesized-timeout outcomes carry a truthful errno for
+                // the fsync surface; real sync errors stay generic I/O.
+                if msg.contains("synthesized") {
+                    Err(SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        msg,
+                    )))
+                } else {
+                    Err(SqueezefsError::Io(std::io::Error::other(msg)))
+                }
+            }
+            Err(()) => Err(SqueezefsError::InvalidOperation(
                 "sync coalescer leader dropped without completing barrier".to_string(),
             )),
         }

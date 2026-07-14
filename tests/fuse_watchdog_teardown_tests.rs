@@ -455,8 +455,11 @@ async fn bounded_barrier_bounds_followers_behind_a_slow_leader() {
         "the bounded-out follower must surface a synthesized error"
     );
 
-    // Release the leader: its own barrier completes fine.
-    gate.add_permits(1);
+    // Release the leader: its own barrier completes fine. TWO permits —
+    // the bounded-out follower's oneshot sender is still queued (only the
+    // receiver died), so the leader correctly serves it a second batch
+    // whose fan-out lands in the dead oneshot (harmless by design).
+    gate.add_permits(2);
     let leader_res = tokio::time::timeout(Duration::from_secs(15), leader)
         .await
         .expect("leader must finish once released")

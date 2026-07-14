@@ -608,18 +608,39 @@ fn phase_total(json: &serde_json::Value, op: &str, phase: &str) -> u64 {
 }
 
 /// The rig's gate is a LAUNCH-TIME knob, memoized like `SQUEEZEFS_TIMEOUT`
-/// (`get_fuse_timeout`) — zero per-op env reads, and default OFF: with the
-/// variable unset the rig must add nothing to any hot path (`OpProf::begin`
-/// = one memoized atomic load + branch → `None`).
+/// (`get_fuse_timeout`) — zero per-op env reads, and default OFF.
+///
+/// PR M4 (D1.b) evolves the disabled-cost contract: `OpProf::begin`
+/// ALWAYS claims a watchdog registry slot (the scan surface that
+/// replaced the per-op `timeout()` wrappers — a CAS + relaxed stores,
+/// no clock reads), but with the rig disabled it takes NO profile
+/// stamps: the phase histograms must not move and the marks are no-ops.
 #[test]
 fn op_profile_gate_is_memoized_and_default_off() {
     assert!(
         !op_profile_enabled(),
         "SQUEEZEFS_OP_PROFILE unset ⇒ the rig is OFF by default"
     );
-    assert!(
-        OpProf::begin(FuseOpKind::Create, 1).is_none(),
-        "disabled rig hands handlers None — no stamps, no slots"
+    let phases_before = op_profile_phase_json();
+    let inflight0 = op_profile_inflight();
+    let p = OpProf::begin(FuseOpKind::Create, 1);
+    assert_eq!(
+        op_profile_inflight(),
+        inflight0 + 1,
+        "begin always registers with the watchdog (D1.b), rig on or off"
+    );
+    p.mark_backend_start();
+    p.mark_backend_done();
+    drop(p);
+    assert_eq!(
+        op_profile_inflight(),
+        inflight0,
+        "op exit clears the watchdog slot"
+    );
+    assert_eq!(
+        phase_total(&op_profile_phase_json(), "create", "total"),
+        phase_total(&phases_before, "create", "total"),
+        "disabled rig records NO phase samples (no stamps, no clock reads)"
     );
     std::env::set_var("SQUEEZEFS_OP_PROFILE", "1");
     assert!(

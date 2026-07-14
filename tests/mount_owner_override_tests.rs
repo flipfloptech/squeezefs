@@ -393,6 +393,16 @@ fn test_sudo_format_stamps_invoking_user_then_user_mount_works_without_chown() {
     let log = base.join("mount.log");
     let mut mount = spawn_user_mount(&meta, &mnt, &log);
 
+    // The filesystem ROOT INODE must also belong to the invoking user
+    // (same raw-getuid() bug one layer deeper: a 0:0 root dir +
+    // default_permissions EACCES'd every user-mode create).
+    assert_eq!(
+        owner(&mnt),
+        expect,
+        "sudo format must stamp the root inode with the INVOKING user \
+         (SUDO_UID:SUDO_GID), or user-mode mounts cannot create anything"
+    );
+
     let isolated = isolated_staging_dir(&staging_pre, &mnt);
     assert!(
         isolated.is_dir() && isolated.join(MARKER).is_file(),

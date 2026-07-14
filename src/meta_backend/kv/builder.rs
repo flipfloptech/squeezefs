@@ -859,12 +859,13 @@ pub async fn format_v3(
         journal_len_override: opts.journal_len_override,
         ..BuilderConfig::new(opts.node_size)
     })?;
-    // Root stamping: the root directory belongs to the formatting user,
-    // or an unprivileged mount cannot create anything under it. The
-    // BUILDER default stays 0:0 (its determinism contract); the public
-    // formatter is the user-facing surface.
-    let root_uid = unsafe { libc::getuid() };
-    let root_gid = unsafe { libc::getgid() };
+    // Root stamping: the root directory belongs to the INVOKING user
+    // (SUDO_UID:SUDO_GID under sudo — raw getuid() is root there, which
+    // made every user-mode mount EACCES on create; genuine root stays
+    // root), or an unprivileged mount cannot create anything under it.
+    // The BUILDER default stays 0:0 (its determinism contract); the
+    // public formatter is the user-facing surface.
+    let (root_uid, root_gid) = crate::config_ops::invoking_owner();
     builder.set_owner(ROOT_INO, root_uid, root_gid)?;
     if let Some(cfg) = &opts.format_config_xattr {
         builder.set_xattr(ROOT_INO, FORMAT_CONFIG_XATTR, cfg)?;

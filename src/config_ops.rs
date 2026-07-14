@@ -85,6 +85,168 @@ async fn read_format_config(first_meta: &str) -> Result<crate::FormatConfig> {
     })
 }
 
+/// Ownership that format-time stamps must carry (the staging/cache roots
+/// AND the filesystem root inode) — the pure resolution rule shared by
+/// `format`, `config set-cache-paths`, and the v3 builder's root-inode
+/// stamp (all usually run under `sudo` for the block volumes, while both
+/// the staging roots and the mounted tree are used by the operator's own
+/// user):
+///
+/// - **root via sudo** (`SUDO_UID`/`SUDO_GID` present) ⇒ the INVOKING
+///   user. Stamping raw `getuid()` (= root under sudo) forced users to
+///   `chown -R` by hand before a user-mode mount could use its own
+///   staging (EACCES).
+/// - **genuine root** (no `SUDO_*` env) ⇒ root: a deliberate root
+///   deployment is never second-guessed.
+/// - **non-root** ⇒ the current identity (the chown is a no-op — and a
+///   non-root invoker could not chown away from itself anyway).
+///
+/// Unparseable `SUDO_UID`/`SUDO_GID` values fall back per-field to the
+/// effective identity (never a panic on a hostile environment).
+pub fn resolve_invoking_owner(
+    euid: u32,
+    egid: u32,
+    sudo_uid: Option<&str>,
+    sudo_gid: Option<&str>,
+) -> (u32, u32) {
+    if euid != 0 {
+        return (euid, egid);
+    }
+    (
+        sudo_uid
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(euid),
+        sudo_gid
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(egid),
+    )
+}
+
+/// [`resolve_invoking_owner`] applied to the live process identity and
+/// environment.
+pub fn invoking_owner() -> (u32, u32) {
+    let sudo_uid = std::env::var("SUDO_UID").ok();
+    let sudo_gid = std::env::var("SUDO_GID").ok();
+    resolve_invoking_owner(
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+        sudo_uid.as_deref(),
+        sudo_gid.as_deref(),
+    )
+}
+
+/// Wipe + recreate + OWNERSHIP-STAMP one staging/cache root: the shared
+/// format-grade stamp used by `format --disk-cache-paths` and
+/// `config set-cache-paths`. The root comes up empty (fresh staging
+/// generation, no discard noise) and owned by [`invoking_owner`], so the
+/// daemon identity that will actually mount can use it without a manual
+/// `chown -R`. The chown only runs as root (elsewhere it is a no-op by
+/// construction); failures are loud — a half-stamped root is exactly the
+/// EACCES-later trap this exists to close.
+pub async fn stamp_staging_dir(dir: &Path) -> Result<()> {
+    let ctx = |what: &str, e: &std::io::Error| {
+        SqueezefsError::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "failed to {what} staging/cache dir '{}': {e}",
+                dir.display()
+            ),
+        ))
+    };
+    match tokio::fs::remove_dir_all(dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ctx("wipe", &e)),
+    }
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| ctx("create", &e))?;
+    let (uid, gid) = invoking_owner();
+    if unsafe { libc::geteuid() } == 0 {
+        std::os::unix::fs::chown(dir, Some(uid), Some(gid))
+            .map_err(|e| ctx(&format!("stamp ownership {uid}:{gid} on"), &e))?;
+    }
+    Ok(())
+}
+
+/// `W_OK | X_OK` access check with the EFFECTIVE identity (`faccessat` +
+/// `AT_EACCESS`) — the daemon needs to create/traverse inside the root.
+fn effective_access_wx(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the
+    // call; faccessat only reads it and touches no Rust-managed memory.
+    let rc = unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Mount-side staging WRITABILITY preflight. Cache-path policy: mount is
+/// side-effect-free on the staging roots — it never chowns/chmods; it
+/// only verifies and fails loud with the remedy.
+///
+/// The daemon performs ALL staging I/O as the identity that runs
+/// `squeezefs mount`; `--uid`/`--gid` change FUSE presentation only and
+/// grant no staging access. A root-stamped root + user daemon therefore
+/// has to fail HERE — naming the directory and the chown fix — instead of
+/// surfacing a raw EACCES from deep inside bootstrap (the user-hit
+/// failure mode). A missing root is fine when its nearest existing
+/// ancestor is writable (mount creates the chain itself).
+pub fn staging_write_preflight(dirs: &[PathBuf]) -> std::result::Result<(), String> {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    for dir in dirs {
+        // The root itself when it exists, else the nearest existing
+        // ancestor mount would have to create the chain under.
+        let mut probe: &Path = dir.as_path();
+        while !probe.exists() {
+            probe = match probe.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                Some(_) => Path::new("."),
+                None => Path::new("/"),
+            };
+        }
+        let Err(e) = effective_access_wx(probe) else {
+            continue;
+        };
+        let cause = if probe == dir.as_path() {
+            format!(
+                "staging/cache directory '{}' is not writable by the daemon identity \
+                 (uid {euid} gid {egid}): {e}",
+                dir.display()
+            )
+        } else {
+            format!(
+                "staging/cache directory '{}' cannot be created by the daemon identity \
+                 (uid {euid} gid {egid}): nearest existing ancestor '{}' is not writable: {e}",
+                dir.display(),
+                probe.display()
+            )
+        };
+        return Err(format!(
+            "{cause}. Staging I/O runs as the user that executes `squeezefs mount`; \
+             `--uid`/`--gid` only change FUSE presentation and grant no staging access, \
+             and mount never chowns staging roots itself (cache-path policy). Remedy: \
+             `sudo mkdir -p '{0}' && sudo chown -R {euid}:{egid} '{0}'`, or re-run \
+             `squeezefs format`/`squeezefs config set-cache-paths` (they stamp ownership \
+             to the invoking user), then retry the mount",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
 /// `squeezefs config get-cache-paths`: the staging/cache directories the
 /// filesystem was formatted with (`None`/empty ⇒ permanently cache-less).
 pub async fn get_cache_paths(meta_lvs: &[String]) -> Result<Option<Vec<PathBuf>>> {
@@ -105,11 +267,13 @@ pub async fn get_cache_paths(meta_lvs: &[String]) -> Result<Option<Vec<PathBuf>>
 ///   active mount is never safe);
 /// - the volume set must be formatted (the config read fails loud
 ///   otherwise) — checked BEFORE any directory is touched;
-/// - the NEW directories are wiped + recreated (the same cleanliness
-///   `format --disk-cache-paths` applies), so the next mount stamps a
-///   fresh staging generation into empty dirs (no discard noise). Content
-///   safety does not depend on the wipe: staging generation-binding
-///   discards foreign content at mount anyway.
+/// - the NEW directories are wiped + recreated + OWNERSHIP-STAMPED (the
+///   same [`stamp_staging_dir`] `format --disk-cache-paths` applies —
+///   invoking user under sudo, root only for genuine root), so the next
+///   mount stamps a fresh staging generation into empty dirs it can
+///   actually write (no discard noise, no EACCES). Content safety does
+///   not depend on the wipe: staging generation-binding discards foreign
+///   content at mount anyway.
 ///
 /// The rewrite itself is one setxattr transaction on the FIRST volume's
 /// root inode (where format recorded it), made durable by the v3 journal
@@ -134,12 +298,10 @@ pub async fn set_cache_paths(meta_lvs: &[String], paths: &[PathBuf]) -> Result<(
     // 2. The volume set must be formatted; read the config to rewrite.
     let mut cfg = read_format_config(first).await?;
 
-    // 3. Wipe + recreate the NEW dirs (format-grade cleanliness).
+    // 3. Wipe + recreate + ownership-stamp the NEW dirs (format-grade
+    //    cleanliness AND the SUDO_UID ownership rule).
     for dir in paths {
-        if dir.exists() {
-            tokio::fs::remove_dir_all(dir).await?;
-        }
-        tokio::fs::create_dir_all(dir).await?;
+        stamp_staging_dir(dir).await?;
     }
 
     // 4. Rewrite the format config on the first volume (journal-durable

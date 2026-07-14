@@ -199,11 +199,17 @@ enum Commands {
         #[arg(long)]
         daemon: bool,
 
-        /// Custom UID owner for the mount (default: current user or SUDO_UID)
+        /// Custom UID presented as the owner of files in the mount
+        /// (default: current user or SUDO_UID). Presentation-only: staging
+        /// /cache I/O still runs as the user executing `squeezefs mount`
+        /// (the staging preflight enforces that identity can write the
+        /// roots; format/set-cache-paths stamp their ownership).
         #[arg(long)]
         uid: Option<u32>,
 
-        /// Custom GID owner for the mount (default: current group or SUDO_GID)
+        /// Custom GID presented as the group of files in the mount
+        /// (default: current group or SUDO_GID). Presentation-only, like
+        /// --uid.
         #[arg(long)]
         gid: Option<u32>,
 
@@ -1397,6 +1403,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // conjured, no staging/read-cache tier exists.
         let staging_dirs = format_config.disk_cache_paths.clone().unwrap_or_default();
 
+        // Staging WRITABILITY preflight: the daemon identity (the user
+        // running this process — --uid/--gid are presentation-only) must
+        // be able to use every declared root. Fails LOUD with the chown
+        // remedy here — before the summary, the runtime, and any FUSE
+        // setup — never as a raw EACCES mid-bootstrap. On a daemonized
+        // child the message reaches the parent via the handshake pipe.
+        if let Err(msg) = squeezefs::config_ops::staging_write_preflight(&staging_dirs) {
+            mount_bootstrap_fail(&msg);
+        }
+
         let data_lvs = format_config.data_lv.clone().unwrap_or_default();
         let writeback = !no_writeback;
 
@@ -1869,13 +1885,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("metadata volume '{}': {}", path, e))?;
             }
 
+            // Wipe + recreate + OWNERSHIP-STAMP every declared staging
+            // root (config_ops::stamp_staging_dir): owned by the INVOKING
+            // user under sudo (SUDO_UID:SUDO_GID), root only for a genuine
+            // root deployment — a later user-mode mount must never EACCES
+            // on its own staging.
             if let Some(ref paths) = disk_cache_paths {
                 for dir in paths {
-                    if dir.exists() {
-                        log::info!("Wiping local staging/cache directory: {:?}", dir);
-                        let _ = tokio::fs::remove_dir_all(dir).await;
-                        let _ = tokio::fs::create_dir_all(dir).await;
-                    }
+                    log::info!("Stamping local staging/cache directory: {:?}", dir);
+                    squeezefs::config_ops::stamp_staging_dir(dir).await?;
                 }
             }
 
@@ -2227,13 +2245,31 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             let sanitized_mount_clean = sanitized_mount_clean.trim_matches('_');
 
+            // TOCTOU backstop behind the bootstrap staging preflight: if a
+            // root changed underneath us since the check, the failure still
+            // names the directory and the chown remedy.
+            let staging_remedy = |dir: &Path, e: std::io::Error| {
+                let euid = unsafe { libc::geteuid() };
+                let egid = unsafe { libc::getegid() };
+                format!(
+                    "failed to prepare staging dir '{}' as the daemon identity \
+                     (uid {euid} gid {egid}): {e}; --uid/--gid are FUSE-presentation-only. \
+                     Remedy: `sudo chown -R {euid}:{egid}` on the staging root, then retry \
+                     the mount",
+                    dir.display()
+                )
+            };
             let mut isolated_staging_dirs = Vec::new();
             for dir in active_staging_dirs {
                 let isolated_dir = dir.join(&fs_name).join(sanitized_mount_clean);
                 let shared_cache_dir = dir.join(&fs_name).join("cache_segment");
 
-                fs::create_dir_all(&isolated_dir).await?;
-                fs::create_dir_all(&shared_cache_dir).await?;
+                fs::create_dir_all(&isolated_dir)
+                    .await
+                    .map_err(|e| staging_remedy(&isolated_dir, e))?;
+                fs::create_dir_all(&shared_cache_dir)
+                    .await
+                    .map_err(|e| staging_remedy(&shared_cache_dir, e))?;
 
                 let symlink_path = isolated_dir.join("cache_segment");
                 let metadata = fs::symlink_metadata(&symlink_path).await;

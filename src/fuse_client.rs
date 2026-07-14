@@ -966,6 +966,58 @@ pub struct ClientStats {
     pub cache_misses: u64,
 }
 
+/// `.stats` payload size floor: every generation is tail-padded (spaces +
+/// final newline — legal JSON) to this CONSTANT length, chosen with ~6×
+/// headroom over the rig-enabled ~41 KB payload. See
+/// [`pad_virtual_payload`] for why constancy (not mere quantization) is
+/// the contract.
+const STATS_PAYLOAD_FLOOR: usize = 256 * 1024;
+
+/// `.config` twin of [`STATS_PAYLOAD_FLOOR`] (config JSON is ~2–4 KB).
+const CONFIG_PAYLOAD_FLOOR: usize = 64 * 1024;
+
+/// Tail-pad a virtual-inode payload (`.stats` / `.config` JSON) with
+/// spaces + a final newline to the CONSTANT `floor` length. Trailing
+/// whitespace is legal JSON, so parsers are unaffected — and size
+/// CONSTANCY is what makes snapshot reads robust against the kernel's
+/// splice read path, whose copy bound is a possibly one-generation-stale
+/// `i_size` no matter what the daemon replies (`FOPEN_DIRECT_IO` exempts
+/// only the plain-`read(2)` path; `cat` uses splice — measured in the M2
+/// acceptance session, where 4 KiB quantization still tore whenever a
+/// storm grew the payload across a quantum). With a constant size,
+/// `i_size` never moves between generations, so every stale bound covers
+/// the whole payload and truncation can only ever remove padding.
+/// Overflow (payload > floor) falls back to 4 KiB quantization — reads
+/// stay correct through the plain-read path and the GETATTR published-
+/// size contract; only the stale-splice-bound immunity degrades (loud —
+/// warn once per process). Paired with the GETATTR published-size
+/// contract; pinned by
+/// `metrics_tests::stats_snapshot_getattr_size_matches_served_bytes_under_churn`.
+fn pad_virtual_payload(mut s: String, floor: usize) -> String {
+    let target = if s.len() < floor {
+        floor
+    } else {
+        static OVERFLOW_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !OVERFLOW_WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                "virtual payload exceeds its constant-size floor ({} > {floor}): \
+                 falling back to 4 KiB quantization — raise the floor to restore \
+                 stale-splice-bound immunity",
+                s.len()
+            );
+        }
+        (s.len() + 1).div_ceil(4096) * 4096
+    };
+    let pad = target - s.len() - 1;
+    s.reserve(pad + 1);
+    for _ in 0..pad {
+        s.push(' ');
+    }
+    s.push('\n');
+    s
+}
+
 #[cold]
 #[inline(never)]
 fn map_squeezefs_err(e: SqueezefsError) -> Errno {
@@ -1100,6 +1152,19 @@ pub struct SqueezefsFilesystem {
     pub next_virtual_fh: std::sync::atomic::AtomicU64,
     pub latest_stats_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
     pub latest_config_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
+    /// Byte length of the most recently PUBLISHED (lookup/first-touch) or
+    /// PINNED (open) `.stats` generation — what GETATTR reports (0 = never
+    /// generated). The kernel copies exactly `i_size` bytes out of a
+    /// virtual file (`cat` → `copy_file_range`), so GETATTR must never
+    /// regenerate-and-republish a different size than the generation an
+    /// open fh serves — that clamp tears every snapshot read under counter
+    /// churn (pinned by
+    /// `metrics_tests::stats_snapshot_getattr_size_matches_served_bytes_under_churn`).
+    /// Shared across handler clones (`Arc`): the publish point and the
+    /// GETATTR reader may run on different clones.
+    pub latest_stats_size: std::sync::Arc<AtomicU64>,
+    /// `.config` twin of [`Self::latest_stats_size`].
+    pub latest_config_size: std::sync::Arc<AtomicU64>,
     pub inodes_limit: std::sync::Arc<std::sync::OnceLock<u64>>,
     /// Formatted capacity in bytes (`FormatConfig.capacity`: the summed
     /// data-backend size, or the lower explicit `--capacity` quota) — the
@@ -1158,6 +1223,8 @@ impl Clone for SqueezefsFilesystem {
             ),
             latest_stats_json: arc_swap::ArcSwap::new(self.latest_stats_json.load_full()),
             latest_config_json: arc_swap::ArcSwap::new(self.latest_config_json.load_full()),
+            latest_stats_size: self.latest_stats_size.clone(),
+            latest_config_size: self.latest_config_size.clone(),
             inodes_limit: self.inodes_limit.clone(),
             capacity_limit: self.capacity_limit.clone(),
             // Share the one cell — never split it per clone, or the mounted
@@ -1247,6 +1314,8 @@ impl SqueezefsFilesystem {
             next_virtual_fh: std::sync::atomic::AtomicU64::new(0x1000_0000_0000_0000),
             latest_stats_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
             latest_config_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
+            latest_stats_size: std::sync::Arc::new(AtomicU64::new(0)),
+            latest_config_size: std::sync::Arc::new(AtomicU64::new(0)),
             inodes_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
             capacity_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
             session_connection: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
@@ -1480,7 +1549,10 @@ impl SqueezefsFilesystem {
             "block_size": self.router.block_size.load(Ordering::Relaxed),
         });
 
-        serde_json::to_string_pretty(&config_obj).unwrap_or_default()
+        pad_virtual_payload(
+            serde_json::to_string_pretty(&config_obj).unwrap_or_default(),
+            CONFIG_PAYLOAD_FLOOR,
+        )
     }
 
     fn get_stats_attr(&self, size: u64) -> FileAttr {
@@ -1928,7 +2000,10 @@ impl SqueezefsFilesystem {
             }
         }
 
-        serde_json::to_string_pretty(&stats_obj).unwrap_or_default()
+        pad_virtual_payload(
+            serde_json::to_string_pretty(&stats_obj).unwrap_or_default(),
+            STATS_PAYLOAD_FLOOR,
+        )
     }
 
     fn get_config_attr(&self, size: u64) -> FileAttr {
@@ -4241,6 +4316,7 @@ impl Filesystem for SqueezefsFilesystem {
             let size = bytes.len() as u64;
             self.latest_config_json
                 .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+            self.latest_config_size.store(size, Ordering::Release);
             let attr = self.get_config_attr(size);
             return Ok(ReplyEntry {
                 ttl: Duration::from_secs(1),
@@ -4255,6 +4331,7 @@ impl Filesystem for SqueezefsFilesystem {
             let size = bytes.len() as u64;
             self.latest_stats_json
                 .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+            self.latest_stats_size.store(size, Ordering::Release);
             let attr = self.get_stats_attr(size);
             return Ok(ReplyEntry {
                 ttl: Duration::from_secs(0), // dynamic stats shouldn't be cached long
@@ -4318,12 +4395,28 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE GetAttr: ino = {}", ino);
 
+        // Virtual inodes: GETATTR reports the PUBLISHED generation's size
+        // and must never regenerate-and-republish — the kernel copies
+        // exactly `i_size` bytes out of these files (`cat` →
+        // `copy_file_range`), so an fstat between open and read that
+        // republished a *different* size than the open-pinned generation
+        // tore every snapshot read under counter churn (the M2 acceptance
+        // session measured 9/10 torn phase snapshots with the rig's ~40 KB
+        // payload). First touch (never generated) generates once and
+        // publishes, so a bare `stat` keeps working. Pinned by
+        // `metrics_tests::stats_snapshot_getattr_size_matches_served_bytes_under_churn`.
         if ino == CONFIG_INODE {
-            let config_data = self.generate_config_json().await;
-            let bytes = config_data.into_bytes();
-            let size = bytes.len() as u64;
-            self.latest_config_json
-                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+            let published = self.latest_config_size.load(Ordering::Acquire);
+            let size = if published > 0 {
+                published
+            } else {
+                let bytes = self.generate_config_json().await.into_bytes();
+                let size = bytes.len() as u64;
+                self.latest_config_json
+                    .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+                self.latest_config_size.store(size, Ordering::Release);
+                size
+            };
             let attr = self.get_config_attr(size);
             return Ok(ReplyAttr {
                 ttl: Duration::from_secs(1),
@@ -4332,11 +4425,17 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         if ino == STATS_INODE {
-            let stats_data = self.generate_stats_json().await;
-            let bytes = stats_data.into_bytes();
-            let size = bytes.len() as u64;
-            self.latest_stats_json
-                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+            let published = self.latest_stats_size.load(Ordering::Acquire);
+            let size = if published > 0 {
+                published
+            } else {
+                let bytes = self.generate_stats_json().await.into_bytes();
+                let size = bytes.len() as u64;
+                self.latest_stats_json
+                    .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+                self.latest_stats_size.store(size, Ordering::Release);
+                size
+            };
             let attr = self.get_stats_attr(size);
             return Ok(ReplyAttr {
                 ttl: Duration::from_secs(0),
@@ -4532,7 +4631,20 @@ impl Filesystem for SqueezefsFilesystem {
                     self.generate_config_json().await.into_bytes()
                 }
             };
+            // PIN point: this open's fh serves exactly `content` — publish
+            // its size so a subsequent fstat (GETATTR, which never
+            // regenerates) reports the bound the kernel will copy to.
+            // Single-reader snapshots are exact by construction; concurrent
+            // readers race last-open-wins (bounded, documented residual).
+            let pinned_size = content.len() as u64;
+            if inode == STATS_INODE {
+                self.latest_stats_size.store(pinned_size, Ordering::Release);
+            } else {
+                self.latest_config_size
+                    .store(pinned_size, Ordering::Release);
+            }
             let fh = self.next_virtual_fh.fetch_add(1, Ordering::Relaxed);
+            debug!("FUSE Open virtual: ino = {inode}, fh = {fh}, pinned {pinned_size} bytes");
             self.open_virtual_files.insert(fh, content);
             // FOPEN_DIRECT_IO: the payload is regenerated per open, but the
             // kernel clamps buffered reads to i_size from a PREVIOUS
@@ -4629,7 +4741,13 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         if ino == STATS_INODE {
-            let bytes = if let Some(cached) = self.open_virtual_files.get(&fh) {
+            let cached_hit = self.open_virtual_files.get(&fh);
+            debug!(
+                "FUSE Read virtual: ino = {ino}, fh = {fh}, hit = {}, len = {:?}",
+                cached_hit.is_some(),
+                cached_hit.as_ref().map(|c| c.len())
+            );
+            let bytes = if let Some(cached) = cached_hit {
                 cached.clone()
             } else {
                 self.generate_stats_json().await.into_bytes()
@@ -5851,9 +5969,24 @@ impl Filesystem for SqueezefsFilesystem {
                     });
                 }
                 if parent == 1 && !more_reals {
+                    // Virtual entries carry the PUBLISHED generation's size
+                    // (never a freshly generated throwaway's — that size
+                    // referred to bytes no fh will ever serve; see the
+                    // GETATTR coherence contract). First touch generates
+                    // once, publishes, and stores the pending generation.
                     if offset < READDIR_VIRTUAL_CONFIG_COOKIE {
-                        let config_data = self.generate_config_json().await;
-                        let attr = self.get_config_attr(config_data.len() as u64);
+                        let published = self.latest_config_size.load(Ordering::Acquire);
+                        let size = if published > 0 {
+                            published
+                        } else {
+                            let bytes = self.generate_config_json().await.into_bytes();
+                            let size = bytes.len() as u64;
+                            self.latest_config_json
+                                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+                            self.latest_config_size.store(size, Ordering::Release);
+                            size
+                        };
+                        let attr = self.get_config_attr(size);
                         entries.push(DirectoryEntryPlus {
                             name: ".config".into(),
                             kind: FileType::RegularFile,
@@ -5866,8 +5999,18 @@ impl Filesystem for SqueezefsFilesystem {
                         });
                     }
                     if offset < READDIR_VIRTUAL_STATS_COOKIE {
-                        let stats_data = self.generate_stats_json().await;
-                        let attr = self.get_stats_attr(stats_data.len() as u64);
+                        let published = self.latest_stats_size.load(Ordering::Acquire);
+                        let size = if published > 0 {
+                            published
+                        } else {
+                            let bytes = self.generate_stats_json().await.into_bytes();
+                            let size = bytes.len() as u64;
+                            self.latest_stats_json
+                                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+                            self.latest_stats_size.store(size, Ordering::Release);
+                            size
+                        };
+                        let attr = self.get_stats_attr(size);
                         entries.push(DirectoryEntryPlus {
                             name: ".stats".into(),
                             kind: FileType::RegularFile,

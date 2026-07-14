@@ -538,6 +538,24 @@ pub struct Metrics {
     /// transaction (design §4.5) — headroom before `SQUEEZEFS_RECLAIM_BATCH`
     /// needs raising.
     pub meta_reclaim_batch_size: Align64<QueueDepthHistogram>,
+    /// D4.a fill-vs-window attribution (design-metadata-throughput §5.4):
+    /// inos per gathered reclaim batch at the `drain_reclaim_batch` edge
+    /// (post-dedup, pre-admission — pairs with `meta_reclaim_batch_size`,
+    /// which records the post-admission destroy fill). Distinguishes "the
+    /// gather window degenerates to singletons" from "admission thins the
+    /// batch".
+    pub meta_reclaim_gather_fill: Align64<QueueDepthHistogram>,
+    /// Gather batches closed by hitting `SQUEEZEFS_RECLAIM_BATCH` (cap) —
+    /// the healthy storm outcome (fill == cap).
+    pub meta_reclaim_gather_cap_closes: Align64<AtomicU64>,
+    /// Gather batches closed by `SQUEEZEFS_RECLAIM_BATCH_WINDOW_MS` expiry
+    /// with the channel still open — the trickle outcome. A FORGET storm
+    /// landing here with tiny fills is the batch-fill degeneration D4.c
+    /// hunts (per-FORGET spawn jitter / window-vs-arrival cadence).
+    pub meta_reclaim_gather_window_closes: Align64<AtomicU64>,
+    /// Gather batches closed because the reclaim channel closed (unmount /
+    /// teardown drain).
+    pub meta_reclaim_gather_channel_closes: Align64<AtomicU64>,
     /// Staging dirs whose content was discarded at init because it was
     /// stamped by a DEAD filesystem generation (or predated generation
     /// stamping) — the reformat-over-stale-staging guard (`cache::nvme::
@@ -7354,7 +7372,14 @@ async fn flush_one_active_block(
 /// quiescent). Reclaim is background by definition; +`window` of slot-reuse
 /// latency is free, and the batch's meta work amortizes ~cap× (§4.5).
 /// Returns `None` when the channel closed with nothing pending.
-async fn drain_reclaim_batch(
+///
+/// Records the D4.a fill-vs-window attribution
+/// (design-metadata-throughput §5.4): the post-dedup gather fill
+/// (`meta_reclaim_gather_fill`) and how the batch closed
+/// (`meta_reclaim_gather_{cap,window,channel}_closes`). `pub` because it
+/// is the reclaim worker pool's gather step and the seam
+/// `tests/meta_entry_economy_tests.rs` drives to pin those counters.
+pub async fn drain_reclaim_batch(
     rx: &mut tokio::sync::mpsc::Receiver<u64>,
     cap: usize,
     window: std::time::Duration,

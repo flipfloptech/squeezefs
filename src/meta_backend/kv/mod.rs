@@ -145,6 +145,61 @@ pub static META_KV_NODE_REWRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Surfaced as `meta_kv_checkpoints` in PR K7.
 pub static META_KV_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
 
+/// Successful `commit_tx` executions per **construction site** of the
+/// committed [`backend::KvMetaBackend`] transaction — the
+/// metadata-throughput program's D4.a "debug hook counting `commit_tx`
+/// call sites" (design-metadata-throughput §5.4). Each `KvTx` captures its
+/// `#[track_caller]` construction [`std::panic::Location`]; a successful
+/// journal-entry write counts one against that site, so per-op journal
+/// entry ratios (`meta_kv_journal_entries`) decompose into *named*
+/// committers (e.g. `backend.rs:<rename tx>` vs `backend.rs:<setattr tx>`).
+/// Counts successful user commits only — SMO/compensation entries and the
+/// checkpoint ledger are not `commit_tx` and are visible as the ambient
+/// entries term instead. Surfaced on the stats inode as
+/// `meta_kv_commit_sites`; read directly by
+/// `tests/meta_entry_economy_tests.rs` (the OQ-1 pin).
+pub static META_KV_COMMIT_SITES: once_cell::sync::Lazy<
+    scc::HashMap<&'static std::panic::Location<'static>, AtomicU64>,
+> = once_cell::sync::Lazy::new(scc::HashMap::new);
+
+/// Count one successful `commit_tx` against `site` (lock-free after the
+/// first commit from a site: an scc bucket read + one relaxed `fetch_add`).
+pub fn note_commit_site(site: &'static std::panic::Location<'static>) {
+    use std::sync::atomic::Ordering;
+    if META_KV_COMMIT_SITES
+        .read_sync(&site, |_, v| {
+            v.fetch_add(1, Ordering::Relaxed);
+        })
+        .is_none()
+    {
+        match META_KV_COMMIT_SITES.entry_sync(site) {
+            scc::hash_map::Entry::Occupied(o) => {
+                o.get().fetch_add(1, Ordering::Relaxed);
+            }
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry(AtomicU64::new(1));
+            }
+        }
+    }
+}
+
+/// Snapshot of the commit-site attribution map as `("file:line", count)`
+/// rows, sorted by descending count (stats-inode serialization + the
+/// entry-economy pin tests' calibration reads).
+pub fn commit_sites_snapshot() -> Vec<(String, u64)> {
+    use std::sync::atomic::Ordering;
+    let mut out = Vec::new();
+    META_KV_COMMIT_SITES.iter_sync(|k, v| {
+        out.push((
+            format!("{}:{}", k.file(), k.line()),
+            v.load(Ordering::Relaxed),
+        ));
+        true
+    });
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
 /// Errors from the pure KV encoding / fold layer.
 ///
 /// Kept separate from [`crate::error::SqueezefsError`] so the contracts stay

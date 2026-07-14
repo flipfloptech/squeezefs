@@ -1014,6 +1014,216 @@ async fn v3_quick_reformat_buries_previous_generation_records() {
     assert_ne!(g1, g2, "every format invocation mints a fresh uuid");
 }
 
+/// The field workaround behind the root-daemon EIO investigation
+/// (2026-07-13): an operator dd'd 1 MiB of zeros over each meta volume's
+/// HEAD only (to clear a refused superblock), leaving days of prior-
+/// generation residue — journal-ring payloads, node frames, allocator
+/// bitmap bytes — beyond 1 MiB. `format` then classifies the volume
+/// **Blank** and takes the VIRGIN path. This pin proves the virgin path
+/// buries every residue class exactly like the recognized-reformat path
+/// (`v3_quick_reformat_buries_previous_generation_records` above),
+/// because burial is unconditional in `ImageBuilder::build`:
+/// `zero_range[0, heap.start)` re-zeroes the ledger + WHOLE journal ring
+/// + bitmap from the freshly planned geometry, and heap frames are
+/// refused by uuid-namespaced node-seq admission — never by wiping.
+///
+/// Mechanistic assertions, per residue class:
+/// - **journal**: prior-generation ring bytes beyond the 1 MiB dd are
+///   proven present pre-format and all-zero post-format (nothing to
+///   replay — a fresh mount must see `journal_tail_seq = 0` over a
+///   silent ring);
+/// - **nodes**: prior-generation heap frames are proven to SURVIVE the
+///   quick format (burial-by-admission, not by erasure) while no ghost
+///   dentry/xattr/ino is served;
+/// - **allocator/ino**: the first create on the reformatted volume mints
+///   ino 2 (fresh `next_ino` watermark — no ledger/allocator residue).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_dd_zeroed_head_virgin_format_buries_all_residue_classes() {
+    use std::os::unix::fs::FileExt;
+
+    const DD_LEN: u64 = 1024 * 1024; // the operator's `dd bs=1M count=1`
+                                     // A ring bigger than the dd so journal residue provably outlives it
+                                     // (field volumes carry 32 MiB rings; the dd covered only their head).
+    const RING_LEN: u64 = 2 * 1024 * 1024;
+    let opts = |force: bool| FormatV3Options {
+        node_size: V3_NODE_SIZE,
+        journal_len_override: Some(RING_LEN),
+        force,
+        full_wipe: false,
+        format_config_xattr: Some(b"{\"probe\":true}".to_vec()),
+    };
+
+    let file = NamedTempFile::new().unwrap();
+    file.as_file().set_len(V3_VOL_LEN).unwrap();
+
+    // Generation 1: real live-path activity, cleanly checkpointed.
+    format_v3(file.path(), V3_VOL_LEN, &opts(false))
+        .await
+        .expect("gen1 format");
+    let be = KvMetaBackend::open(file.path()).await.expect("gen1 open");
+    for i in 0..200 {
+        be.create(ROOT_INO, &format!("gen1_{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("gen1 create");
+    }
+    be.shutdown().await.expect("gen1 shutdown");
+    drop(be);
+
+    // Generation 2 (the user's history: multiple prior formats): a
+    // RECOGNIZED-superblock quick reformat, then enough journal payload
+    // that ring bytes provably extend past the dd horizon.
+    format_v3(file.path(), V3_VOL_LEN, &opts(true))
+        .await
+        .expect("gen2 recognized reformat");
+    let be = KvMetaBackend::open(file.path()).await.expect("gen2 open");
+    let big = vec![0xa5u8; 8 * 1024];
+    for i in 0..160 {
+        let ino = be
+            .create(ROOT_INO, &format!("gen2_{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("gen2 create")
+            .ino;
+        be.setxattr(ino, "user.residue", &big)
+            .await
+            .expect("gen2 xattr");
+    }
+    be.shutdown().await.expect("gen2 shutdown");
+    drop(be);
+
+    // Capture gen2 geometry + identity BEFORE the dd erases sector 0.
+    let gen2_sb = match classify_volume(file.path()).await.unwrap() {
+        VolumeFormat::V3(sb) => sb,
+        other => panic!("expected v3 before the dd, got {other:?}"),
+    };
+    let ring = gen2_sb.journal;
+    assert!(
+        ring.end() > DD_LEN,
+        "test geometry must put ring bytes beyond the dd horizon \
+         (ring ends at {}, dd covers {DD_LEN})",
+        ring.end()
+    );
+    let image = std::fs::read(file.path()).unwrap();
+    let ring_past_dd = &image[DD_LEN as usize..ring.end() as usize];
+    assert!(
+        ring_past_dd.iter().any(|b| *b != 0),
+        "aging must leave journal-ring residue beyond the dd horizon, \
+         or this pin is vacuous — grow the gen2 payload"
+    );
+
+    // The operator's workaround: zero ONLY the first MiB.
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(file.path())
+        .unwrap();
+    f.write_all_at(&vec![0u8; DD_LEN as usize], 0).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    // Premise pin: the volume now classifies Blank — format takes the
+    // VIRGIN path (no recognized superblock to reformat against), and
+    // the virgin gate needs no --force.
+    assert!(
+        matches!(
+            classify_volume(file.path()).await.unwrap(),
+            VolumeFormat::Blank
+        ),
+        "a dd-zeroed head must classify Blank — the workaround's premise"
+    );
+    format_v3(file.path(), V3_VOL_LEN, &opts(false))
+        .await
+        .expect("the virgin path must format a dd-zeroed volume without --force");
+
+    let gen3_sb = match classify_volume(file.path()).await.unwrap() {
+        VolumeFormat::V3(sb) => sb,
+        other => panic!("expected v3 after the virgin format, got {other:?}"),
+    };
+    assert_ne!(
+        gen3_sb.uuid, gen2_sb.uuid,
+        "the virgin format must mint a fresh generation identity"
+    );
+    assert_eq!(
+        gen3_sb.journal, ring,
+        "identical knobs must re-plan identical geometry (the burial \
+         range covers the whole prior ring)"
+    );
+
+    // Journal burial: the WHOLE fresh ring is zero — nothing to replay.
+    let image = std::fs::read(file.path()).unwrap();
+    let ring_bytes = &image[ring.start as usize..ring.end() as usize];
+    assert!(
+        ring_bytes.iter().all(|b| *b == 0),
+        "the virgin format must zero the whole journal ring exactly like \
+         the recognized-reformat path (prior-generation entries would \
+         otherwise replay into the fresh volume)"
+    );
+
+    // Node-frame residue SURVIVES the quick format beyond the freshly
+    // written empty tree roots — burial here is by node-seq admission,
+    // not erasure. (If a future format full-wipes by default this turns
+    // vacuously true; the ghost assertions below still hold.)
+    let heap = gen3_sb.heap;
+    let node = gen3_sb.node_size as u64;
+    let residue_scan_start = (heap.start + 8 * node) as usize;
+    let residue_scan_end = (heap.start + 64 * node).min(heap.end()) as usize;
+    let heap_residue = image[residue_scan_start..residue_scan_end]
+        .iter()
+        .any(|b| *b != 0);
+    assert!(
+        heap_residue,
+        "expected prior-generation node frames to survive a quick format \
+         (the design leaves the heap; admission buries it) — if this \
+         fails the aging phases stopped writing enough nodes"
+    );
+
+    // Ghost checks across every tree.
+    let be = KvMetaBackend::open(file.path())
+        .await
+        .expect("gen3 open (fresh mount over buried residue)");
+    let entries = be.readdir(ROOT_INO, 0, 4096).await.expect("gen3 readdir");
+    let ghosts: Vec<&str> = entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .filter(|n| n.starts_with("gen1_") || n.starts_with("gen2_"))
+        .collect();
+    assert!(
+        ghosts.is_empty(),
+        "virgin format resurrected {} prior-generation dentries, e.g. {:?}",
+        ghosts.len(),
+        ghosts.first()
+    );
+    assert!(
+        be.lookup(ROOT_INO, "gen1_0").await.is_err(),
+        "gen1 file served by the dd-then-virgin-formatted volume"
+    );
+    assert!(
+        be.lookup(ROOT_INO, "gen2_0").await.is_err(),
+        "gen2 file served by the dd-then-virgin-formatted volume"
+    );
+
+    // Fresh ino watermark: the first create mints ino 2 (ino 0 reserved,
+    // 1 = root) — a leaked ledger/next_ino would mint above the dead
+    // population instead.
+    let probe = be
+        .create(ROOT_INO, "probe", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("gen3 probe create");
+    assert_eq!(
+        probe.ino,
+        ROOT_INO + 1,
+        "the reformatted volume must mint inos from the fresh watermark"
+    );
+    // And the dead generation's xattrs are unreachable on the fresh ino
+    // space: the probe ino carries no residue xattr.
+    assert!(
+        be.getxattr(probe.ino, "user.residue")
+            .await
+            .expect("gen3 getxattr")
+            .is_none(),
+        "prior-generation xattr served on a freshly minted ino"
+    );
+    be.shutdown().await.expect("gen3 shutdown");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v3_format_guards_match_the_preflight_contract() {
     let file = NamedTempFile::new().unwrap();

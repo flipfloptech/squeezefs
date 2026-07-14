@@ -305,6 +305,58 @@ impl NvmeReservationClient {
         self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)
     }
 
+    /// One Reservation Report transfer: header (gen u32, rtype u8,
+    /// regctl u16, …, PTPLS) + regctl registered-controller structures —
+    /// 24 B each in the short form (64-bit hostid), 64 B each in the
+    /// extended form (128-bit hostid; rkey sits before the hostid there).
+    fn report_with(&self, extended: bool) -> io::Result<ReservationReport> {
+        let mut data = vec![0u8; 4096];
+        let numd = (data.len() / 4 - 1) as u32; // 0-based dword count
+        let mut cmd = NvmePassthruCmd {
+            opcode: NVME_CMD_RESV_REPORT,
+            nsid: self.nsid,
+            addr: data.as_mut_ptr() as u64,
+            data_len: data.len() as u32,
+            cdw10: numd,
+            cdw11: u32::from(extended), // EDS
+            ..Default::default()
+        };
+        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)?;
+        let rtype = data[4];
+        let regctl = u16::from_le_bytes([data[5], data[6]]) as usize;
+        // The short form packs 24 B controller structures after a 24 B
+        // header; the extended form pads BOTH to 64 B (verified byte-wise
+        // against kernel nvmet in the M1 root session — first regctlext
+        // at 0x40).
+        let (hdr, stride) = if extended { (64, 64) } else { (24, 24) };
+        let mut registered_keys = Vec::with_capacity(regctl);
+        let mut holder_key = None;
+        for i in 0..regctl {
+            let base = hdr + i * stride;
+            if base + stride > data.len() {
+                break;
+            }
+            // Both forms open with: cntlid u16, rcsts u8, rsvd…; the
+            // short form carries hostid u64 @8 then rkey u64 @16; the
+            // extended form carries rkey u64 @8 then hostid[16] @16.
+            let rcsts = data[base + 2];
+            let rkey_off = if extended { 8 } else { 16 };
+            let rkey = u64::from_le_bytes(
+                data[base + rkey_off..base + rkey_off + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            registered_keys.push(rkey);
+            if rcsts & 0x1 != 0 && rtype != 0 {
+                holder_key = Some(rkey);
+            }
+        }
+        Ok(ReservationReport {
+            holder_key,
+            registered_keys,
+        })
+    }
+
     /// Reservation Acquire / Preempt: 16 B payload `[crkey, prkey]`.
     fn resv_acquire(&self, racqa: u32, crkey: u64, prkey: u64) -> io::Result<()> {
         let mut data = [0u8; 16];
@@ -391,46 +443,28 @@ impl ReservationClient for NvmeReservationClient {
             cdw10: RTYPE_WRITE_EXCLUSIVE << 8, // RRELA 0: release
             ..Default::default()
         };
-        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)
+        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)?;
+        // NVMe release does NOT unregister; drop the registration too so
+        // a clean unmount leaves zero residue on the namespace (a stale
+        // registration would make this host's next fresh-key register
+        // conflict — observed against kernel nvmet in the M1 session).
+        // RREGA 1: unregister, crkey = our key.
+        self.resv_register(1, key, 0)
     }
 
     fn report(&self) -> io::Result<ReservationReport> {
-        // Reservation Report: header (gen u32, rtype u8, regctl u16, ...)
-        // + regctl × 24 B registered-controller data structures.
-        let mut data = vec![0u8; 4096];
-        let numd = (data.len() / 4 - 1) as u32; // 0-based dword count
-        let mut cmd = NvmePassthruCmd {
-            opcode: NVME_CMD_RESV_REPORT,
-            nsid: self.nsid,
-            addr: data.as_mut_ptr() as u64,
-            data_len: data.len() as u32,
-            cdw10: numd,
-            cdw11: 0, // EDS 0: 24-byte registered-controller structures
-            ..Default::default()
-        };
-        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)?;
-        let rtype = data[4];
-        let regctl = u16::from_le_bytes([data[5], data[6]]) as usize;
-        let mut registered_keys = Vec::with_capacity(regctl);
-        let mut holder_key = None;
-        for i in 0..regctl {
-            let base = 24 + i * 24;
-            if base + 24 > data.len() {
-                break;
-            }
-            // Registered Controller Data Structure: cntlid u16, rcsts u8,
-            // rsvd, hostid u64, rkey u64.
-            let rcsts = data[base + 2];
-            let rkey = u64::from_le_bytes(data[base + 16..base + 24].try_into().unwrap());
-            registered_keys.push(rkey);
-            if rcsts & 0x1 != 0 && rtype != 0 {
-                holder_key = Some(rkey);
-            }
+        // Reservation Report. Controllers with 128-bit host identifiers —
+        // every fabrics association, hence the repo's nvmet-loop shape —
+        // require the EXTENDED data structure (EDS = 1, CDW11 bit 0);
+        // asking for the short form there fails with Host Identifier
+        // Inconsistent Format (SC 0x18 — observed against kernel nvmet in
+        // the M1 root session). Try extended first, fall back to the
+        // short form for 64-bit-hostid (PCIe) controllers.
+        match self.report_with(true) {
+            Ok(rep) => Ok(rep),
+            Err(e) if is_reservation_conflict(&e) => Err(e),
+            Err(_) => self.report_with(false),
         }
-        Ok(ReservationReport {
-            holder_key,
-            registered_keys,
-        })
     }
 }
 

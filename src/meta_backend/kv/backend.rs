@@ -956,7 +956,15 @@ impl KvMetaBackend {
     ///   of the reservation-conflict block status): this holder has been
     ///   fenced/usurped at the device ⇒ latch `failed` IMMEDIATELY with
     ///   the guard message (`writer_guard_fenced`). Detection bound:
-    ///   one flush cadence + one barrier.
+    ///   one flush cadence + one barrier. Measured caveat (M1 root
+    ///   session, kernel nvmet 7.1.3): direct/passthru writes surface
+    ///   the conflict status (0x83/EBADE), but the buffered-writeback
+    ///   path can normalize it to plain `EIO` by the time `fdatasync`
+    ///   reports (`mapping_set_error` collapses AS-mapping errors) — in
+    ///   which case the generic rung below still fail-stops the fenced
+    ///   holder within [`JOURNAL_FAILURE_LATCH`] barriers (the design's
+    ///   stated fallback: "falling back to generic escalation on plain
+    ///   EIO").
     /// - **generic class**: consecutive-barrier-failure rung — reuses the
     ///   [`JOURNAL_FAILURE_LATCH`] = 3 semantics with success-reset, on a
     ///   counter deliberately separate from `journal_failures` (which the

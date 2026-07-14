@@ -1038,6 +1038,40 @@ fn root_session_real_nvme_reservations() {
     }
     let key = 0x5155_4545_5A45_0001u64; // "QUEEZE" + 1
     client.register(key).expect("reservation register");
+
+    // Optional preempt leg: `SQUEEZEFS_M1_ROOT_VICTIM_KEY=<hex>` names a
+    // foreign registrant (a second controller association with a distinct
+    // hostnqn/hostid) that already holds the WE reservation — our acquire
+    // must CONFLICT, the report must name the victim, and the PREEMPT
+    // action must transfer holdership (the §5.0 B1 pt 3 arbitration,
+    // against real device state).
+    if let Ok(victim_hex) = std::env::var("SQUEEZEFS_M1_ROOT_VICTIM_KEY") {
+        let victim = u64::from_str_radix(victim_hex.trim_start_matches("0x"), 16)
+            .expect("SQUEEZEFS_M1_ROOT_VICTIM_KEY is hex");
+        let conflict = client
+            .acquire_write_exclusive(key)
+            .expect_err("acquire against a foreign holder must conflict");
+        assert!(
+            squeezefs::meta_backend::reservation::is_reservation_conflict(&conflict),
+            "conflict maps to the reservation-conflict errno class, got {conflict:?}"
+        );
+        let rep = client.report().expect("pre-preempt report");
+        println!("[m1-root] pre-preempt report: {rep:?}");
+        assert_eq!(rep.holder_key, Some(victim), "report names the victim");
+        client.preempt(key, victim).expect("reservation preempt");
+        let rep = client.report().expect("post-preempt report");
+        println!("[m1-root] post-preempt report: {rep:?}");
+        assert_eq!(rep.holder_key, Some(key), "preempt transferred the WE");
+        assert!(
+            !rep.registered_keys.contains(&victim),
+            "preempt unregistered the victim key"
+        );
+        println!("[m1-root] conflict/report/preempt validated against {dev}");
+        // Hold (do NOT release): the session script fence-checks the
+        // preempted association's writes before tearing down.
+        return;
+    }
+
     client
         .acquire_write_exclusive(key)
         .expect("reservation acquire (Write Exclusive)");

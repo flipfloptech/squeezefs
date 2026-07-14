@@ -1329,6 +1329,14 @@ impl SqueezefsFilesystem {
                 "writeback_queue_depth": METRICS.writeback_queue_depth.to_json(),
                 "meta_flush_deferred": METRICS.meta_flush_deferred.load(Ordering::Relaxed),
                 "meta_reclaim_batch_size": METRICS.meta_reclaim_batch_size.to_json(),
+                // D4.a fill-vs-window attribution (design-metadata-
+                // throughput §5.4): gather fill + close reasons decide
+                // between the batch-fill degeneration suspects from
+                // `.stats` alone.
+                "meta_reclaim_gather_fill": METRICS.meta_reclaim_gather_fill.to_json(),
+                "meta_reclaim_gather_cap_closes": METRICS.meta_reclaim_gather_cap_closes.load(Ordering::Relaxed),
+                "meta_reclaim_gather_window_closes": METRICS.meta_reclaim_gather_window_closes.load(Ordering::Relaxed),
+                "meta_reclaim_gather_channel_closes": METRICS.meta_reclaim_gather_channel_closes.load(Ordering::Relaxed),
                 // Per-volume atomicity fields (design §Observability —
                 // live signals over ad-hoc logging). Resolved OQ 2
                 // (design-cow-kv-metadata §4.10): TWO fields per volume —
@@ -1457,6 +1465,19 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "meta_kv_delta_orphans".into(),
                     load(&meta_kv::META_KV_DELTA_ORPHANS),
+                );
+                // PR M2 (design-metadata-throughput §5.4 D4.a): journal
+                // entries per commit_tx construction site — the named-
+                // committer decomposition of `meta_kv_journal_entries`
+                // (the OQ-1 attribution surface).
+                metrics.insert(
+                    "meta_kv_commit_sites".into(),
+                    serde_json::Value::Object(
+                        meta_kv::commit_sites_snapshot()
+                            .into_iter()
+                            .map(|(site, n)| (site, serde_json::Value::from(n)))
+                            .collect(),
+                    ),
                 );
                 // Per-volume gauges (mount-scoped replay stats, allocator
                 // occupancy, ring-admission parks), arrays parallel to
@@ -7386,24 +7407,51 @@ pub async fn drain_reclaim_batch(
 ) -> Option<Vec<u64>> {
     let first = rx.recv().await?;
     let mut batch = vec![first];
+    let mut channel_closed = false;
     if !window.is_zero() {
         let deadline = tokio::time::Instant::now() + window;
         while batch.len() < cap {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(ino)) => batch.push(ino),
-                Ok(None) | Err(_) => break, // closed or window elapsed
+                Ok(None) => {
+                    channel_closed = true;
+                    break;
+                }
+                Err(_) => break, // window elapsed
             }
         }
     }
     while batch.len() < cap {
         match rx.try_recv() {
             Ok(ino) => batch.push(ino),
-            Err(_) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                channel_closed = true;
+                break;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
         }
+    }
+    // D4.a fill-vs-window attribution: how did this gather close? Cap
+    // (the healthy storm outcome) beats channel-close beats window-expiry
+    // (the trickle outcome — a FORGET storm landing here with tiny fills
+    // is the batch-fill degeneration D4.c hunts).
+    if batch.len() >= cap {
+        METRICS
+            .meta_reclaim_gather_cap_closes
+            .fetch_add(1, Ordering::Relaxed);
+    } else if channel_closed {
+        METRICS
+            .meta_reclaim_gather_channel_closes
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        METRICS
+            .meta_reclaim_gather_window_closes
+            .fetch_add(1, Ordering::Relaxed);
     }
     // FORGET can enqueue an ino more than once across sessions.
     batch.sort_unstable();
     batch.dedup();
+    METRICS.meta_reclaim_gather_fill.record(batch.len());
     Some(batch)
 }
 

@@ -1773,14 +1773,24 @@ where
 /// One staged (not yet committed) transaction: `(tree_id, key, kind,
 /// value)` in stage order. Seqs are assigned at commit, inside the node
 /// locks, from the journal reservation (§4.4 pt 2).
-#[derive(Default)]
 pub(super) struct KvTx {
     staged: Vec<(u8, Vec<u8>, RecordKind, Bytes)>,
+    /// The `#[track_caller]` construction site — the metadata-throughput
+    /// D4.a attribution hook (design §5.4): a successful `commit_tx`
+    /// counts one journal entry against this location in
+    /// [`super::META_KV_COMMIT_SITES`], so per-op entry ratios decompose
+    /// into *named* committers (`meta_kv_commit_sites` on the stats
+    /// inode; the OQ-1 pin in `tests/meta_entry_economy_tests.rs`).
+    site: &'static std::panic::Location<'static>,
 }
 
 impl KvTx {
+    #[track_caller]
     fn new() -> Self {
-        Self::default()
+        Self {
+            staged: Vec::new(),
+            site: std::panic::Location::caller(),
+        }
     }
 
     fn stage_put(&mut self, tree_id: u8, key: impl Into<Vec<u8>>, value: impl Into<Bytes>) {
@@ -1912,6 +1922,9 @@ impl KvMetaBackend {
         if tx.is_empty() {
             return Ok(());
         }
+        // D4.a attribution: the construction site this (about-to-be-
+        // committed) tx counts against on success.
+        let site = tx.site;
         // (1) Exact size before any lock (§4.4 pt 5).
         let mut recs: Vec<(u8, Record)> = tx
             .staged
@@ -2074,6 +2087,11 @@ impl KvMetaBackend {
         // (6–8) The committer's own bytes, outside every lock.
         match self.ring.commit_entry(&res, &recs).await {
             Ok(()) => {
+                // D4.a: one successful commit_tx = one journal entry,
+                // counted against the tx's construction site (an scc
+                // bucket read + relaxed fetch_add — noise against the
+                // pipeline's own cost, and per COMMIT, not per FUSE op).
+                super::note_commit_site(site);
                 // D0 chain-reachability: this tx is findable only through
                 // its predecessors — wait for the completed prefix.
                 self.ring.wait_completed_upto(res.end()).await;

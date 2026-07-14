@@ -54,6 +54,26 @@ impl SyncCoalescer {
         Self::default()
     }
 
+    /// [`Self::barrier`] with a bounded wait (PR M4 D1.b audit row 1:
+    /// FLUSH/FSYNC-class barrier waits keep a synthesized error for
+    /// userspace liveness on a sick device). The bound MUST live inside
+    /// the coalescer: an outer `timeout()` would drop an inline LEADER
+    /// mid-`sync_fn`, stranding `flushing = true` and wedging every later
+    /// barrier on the volume.
+    pub async fn barrier_bounded<F, Fut>(
+        &self,
+        _bound: std::time::Duration,
+        sync_fn: F,
+    ) -> Result<()>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        // Scaffolding (tests-first commit): delegates unbounded; the M4
+        // implementation commit moves the leader/follower bounds inside.
+        self.barrier(sync_fn).await
+    }
+
     /// Request a durability barrier, coalescing with any concurrent requests.
     ///
     /// `sync_fn` performs the actual device barrier (e.g. `fdatasync`). It is

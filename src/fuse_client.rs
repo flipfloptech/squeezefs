@@ -504,6 +504,64 @@ pub fn op_profile_inflight() -> u64 {
     OP_PROFILE.registry.active()
 }
 
+/// One overdue in-flight op as reported by [`op_watchdog_tick`] (D1.b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverdueOp {
+    /// Op-kind name (`FuseOpKind::name`).
+    pub op: &'static str,
+    /// Primary ino argument (parent for name-ops).
+    pub ino: u64,
+    /// Age at scan time, ms.
+    pub age_ms: u64,
+}
+
+/// D1.b watchdog scan primitive (design-metadata-throughput §5.1): walk
+/// the op registry and report every in-flight op older than `threshold`
+/// — logging each LOUDLY and counting `fuse_op_watchdog_overdue` (§9:
+/// counter + structured log; the counter counts overdue *observations*,
+/// one per scan per stuck op, so a still-stuck op keeps the signal
+/// alive). The per-daemon watchdog task calls this on its tick; tests
+/// call it directly with their own thresholds (no env coupling).
+///
+/// Scan-vs-release race note: a slot can be released (or reused by a new
+/// op) between the state load and the field loads — worst case one scan
+/// reports one op with a mixed kind/ino/age for one tick. Diagnostic
+/// grade by design (same contract as the estimator tables above); never
+/// memory-unsafe, never affects any op's reply.
+pub fn op_watchdog_tick(threshold: Duration) -> Vec<OverdueOp> {
+    let now = prof_now_ns();
+    let threshold_ns = threshold.as_nanos() as u64;
+    let mut overdue = Vec::new();
+    for slot in &OP_PROFILE.registry.slots {
+        if slot.state.load(Ordering::Acquire) != 1 {
+            continue;
+        }
+        let start = slot.start_ns.load(Ordering::Relaxed);
+        let age = now.saturating_sub(start);
+        if age < threshold_ns {
+            continue;
+        }
+        let kind = slot.kind.load(Ordering::Relaxed) as usize;
+        let op = FuseOpKind::ALL
+            .get(kind)
+            .map(|k| k.name())
+            .unwrap_or("unknown");
+        let ino = slot.ino.load(Ordering::Relaxed);
+        let age_ms = age / 1_000_000;
+        error!(
+            "FUSE op watchdog: {op} (ino {ino}) in flight for {age_ms} ms (> {} ms) — \
+             op is NOT cancelled (D1.b semantics: no ETIMEDOUT synthesis); investigate \
+             the volume/device if this repeats",
+            threshold.as_millis()
+        );
+        METRICS
+            .fuse_op_watchdog_overdue
+            .fetch_add(1, Ordering::Relaxed);
+        overdue.push(OverdueOp { op, ino, age_ms });
+    }
+    overdue
+}
+
 #[inline]
 fn osstr_to_cow(name: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
     name.to_str()
@@ -780,6 +838,11 @@ impl QueueDepthHistogram {
 #[derive(Default)]
 pub struct Metrics {
     pub fuse_ops: Align64<ProbabilisticAtomic>,
+    /// D1.b watchdog (design-metadata-throughput §9): in-flight ops
+    /// observed past `SQUEEZEFS_TIMEOUT` by the watchdog scan — one count
+    /// per scan per overdue op (was: silent per-op ETIMEDOUT synthesis).
+    /// > 0 ⇒ investigate.
+    pub fuse_op_watchdog_overdue: Align64<AtomicU64>,
     pub meta_updates: Align64<AtomicU64>,
     pub put_obj: Align64<AtomicU64>,
     pub get_obj: Align64<AtomicU64>,
@@ -1181,6 +1244,15 @@ pub struct SqueezefsFilesystem {
     /// never enter it.
     pub dir_entry_cache_v3:
         moka::sync::Cache<u64, std::sync::Arc<[(std::boxed::Box<str>, u64, u64, u32)]>>,
+    /// PR M4 (D1.c): per-directory readdir-snapshot generation counters —
+    /// latch-free (`scc` bucket read + one relaxed `fetch_add`), O(1),
+    /// allocation-free on the mutate path for already-seen parents (one
+    /// one-time entry insert per directory). Readdir snapshots key on
+    /// `(parent, gen)`; every entry-set mutation (create/mknod/mkdir/
+    /// symlink/link/unlink/rmdir/rename) bumps the affected parents so
+    /// stale snapshots die by key mismatch, not by eager moka
+    /// invalidation.
+    dir_gen: std::sync::Arc<scc::HashMap<u64, std::sync::atomic::AtomicU64>>,
     pub dismount_wait: u64,
     /// Bounded writeback queue (P1-2). Full → synchronous flush of that block.
     writeback_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
@@ -1264,6 +1336,7 @@ impl Clone for SqueezefsFilesystem {
             active_inode_locks: self.active_inode_locks.clone(),
             attr_cache: self.attr_cache.clone(),
             dir_entry_cache_v3: self.dir_entry_cache_v3.clone(),
+            dir_gen: self.dir_gen.clone(),
             dismount_wait: self.dismount_wait,
             writeback_tx: self.writeback_tx.clone(),
             writeback_rx: self.writeback_rx.clone(),
@@ -1353,6 +1426,7 @@ impl SqueezefsFilesystem {
             active_inode_locks: std::sync::Arc::new(StripeLocks::new()),
             attr_cache,
             dir_entry_cache_v3,
+            dir_gen: std::sync::Arc::new(scc::HashMap::new()),
             dismount_wait: 10,
             writeback_tx,
             writeback_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(writeback_rx))),
@@ -2087,6 +2161,15 @@ impl SqueezefsFilesystem {
             rdev: 0,
             blksize: 4096,
         }
+    }
+
+    /// Current readdir-snapshot generation for a directory (PR M4 D1.c).
+    /// 0 until the first entry-set mutation; monotonic per mutation.
+    /// Latch-free read (`scc` bucket read, no allocation).
+    pub fn dir_generation(&self, dir: u64) -> u64 {
+        self.dir_gen
+            .read_sync(&dir, |_, g| g.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     pub fn get_inode_lock(&self, ino: u64) -> &tokio::sync::RwLock<()> {

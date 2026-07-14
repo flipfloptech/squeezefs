@@ -93,6 +93,14 @@ pub struct KvReplayStats {
 /// (§4.4 pt 4 "repeated journal write failures").
 const JOURNAL_FAILURE_LATCH: u64 = 3;
 
+/// Test seam (PR M4 D1.b): artificial stall, in milliseconds, injected in
+/// `commit_tx` between ring admission and the locked window — the exact
+/// await span where a dropped future leaks admitted budget. One relaxed
+/// load per commit when zero; the watchdog/no-drop suite arms it to hold
+/// a live commit open deterministically (no sleep-based test sync — the
+/// stall IS the scenario under test, not a coordination primitive).
+pub static TEST_COMMIT_ADMITTED_STALL_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Commit-path retry budget against SMO revalidation races (§4.6: SMOs
 /// are rare and serialized, so the loop is short; exhaustion is a bug).
 const COMMIT_RETRY_BUDGET: usize = 256;
@@ -1973,6 +1981,21 @@ impl KvMetaBackend {
                 ));
             }
         };
+
+        // Test seam (PR M4 D1.b — the `TEST_TIER_PUBLISH_DELAY_MS`
+        // precedent: one relaxed load per commit, zero-cost when unset, no
+        // `#[cfg(test)]` fork of the production path): an artificial stall
+        // INSIDE the cancellation hazard window — `adm` is held, nothing
+        // reserved yet — so the watchdog suite can hold a live commit here
+        // long enough to prove (a) no per-op `timeout()` drops this future
+        // any more (a drop here leaks the admission's ring budget forever)
+        // and (b) the overdue op is visible to the watchdog scan.
+        {
+            let stall = TEST_COMMIT_ADMITTED_STALL_MS.load(Ordering::Relaxed);
+            if stall > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+            }
+        }
 
         // (3–5) The locked window, with revalidate/retry.
         let mut attempt = 0usize;

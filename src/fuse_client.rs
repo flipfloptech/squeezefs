@@ -80,6 +80,65 @@ fn get_fuse_timeout() -> Duration {
 pub use crate::stripe_locks::StripeLocks;
 
 // ===========================================================================
+// D1.b AWAIT-DISPOSITION AUDIT (design-metadata-throughput §5.1, PR M4)
+//
+// PR M4 retires the per-op `tokio::time::timeout(get_fuse_timeout(), …)`
+// wrappers. Their replacement — the deadline watchdog below — only LOGS;
+// it never cancels. So every handler-reachable await that can block
+// indefinitely on device/ring/network needs an explicit disposition, and
+// the design mandates that the exception list be DERIVED FROM AN AUDIT,
+// not named ad hoc. This block is that audit, verified against dev @
+// 3c9eda4 (line anchors current at that tip).
+//
+// Why removal is a correctness fix, not just a perf cut: `timeout()`
+// expiry DROPS the handler's future at whatever await it is parked on.
+// Reachable through every mutation handler sits `commit_tx`
+// (`src/meta_backend/kv/backend.rs:1921+`), whose journal accounting is
+// deliberately unforgiving: an `Admission` dropped between ring admission
+// and `reserve_registered` leaks ring budget forever
+// (`journal_core.rs:197-204` — `#[must_use]`, no Drop recovery), and a
+// registered `Reservation` whose future dies before `complete()`
+// permanently stalls the `completed_upto` watermark
+// (`journal.rs:398-420`), wedging every later committer's
+// `wait_completed_upto`. The 30 s per-op timeout was therefore a live
+// volume-wedge vector on any commit that crossed the threshold. After M4
+// NO per-op `timeout()` future-drop can hit `commit_tx` — the residual
+// drop vectors (unmount/session teardown, panics) are owned by PR M7's
+// detached-pass shield (§5.5 lifecycle; the M4 → M7 load-bearing edge).
+//
+// Semantics change, stated loudly: ops no longer synthesize `ETIMEDOUT`
+// at `SQUEEZEFS_TIMEOUT`. The watchdog task scans the op registry every
+// WATCHDOG_TICK and logs (ERROR, with op detail + age) every op older
+// than the threshold, counting `fuse_op_watchdog_overdue`. The wedge
+// classes the old timeout papered over were fixed structurally in the
+// unmount/sideband work (2026-07-08-unmount-stuck-request-rootcause);
+// hang *diagnosis* is preserved — louder and structured.
+//
+// The audit table. "Watchdog-only" = the op stays parked (correct for a
+// genuinely wedged device — an op error cannot fix it) and the watchdog
+// reports it; "bounded" = a synthesized error stays load-bearing.
+//
+// | # | Await class (anchors @ 3c9eda4)              | Disposition |
+// |---|-----------------------------------------------|-------------|
+// | 1 | FLUSH/FSYNC-class barrier waits: `fsync` (fuse_client `flush_inode_to_backend` → `sync_device_for_ino`, meta_backend/mod.rs:1177) and `fsyncdir` (`sync_all_devices`, mod.rs:1167) funnel into `KvMetaBackend::sync_device` (backend.rs:984-1000), the per-volume `SyncCoalescer::barrier` (sync_coalescer.rs:62-112) and its leader's `uring_fs::fdatasync`. The strict-mode `commit_tx` step-7 barrier and the checkpoint tick barriers (checkpoint.rs:402) share the same funnel. At this tip NOTHING bounds the wait (the fsync/fsyncdir handlers were never timeout-wrapped; the coalescer waits are unbounded). | **bounded wait + error** — M4 adds the bound INSIDE the coalescer (`SyncCoalescer::barrier_bounded`): the one drop-safe layer. Bounding from outside (a `timeout()` around `sync_device`) would drop an inline LEADER mid-`sync_fn`, stranding `flushing = true` and every queued follower — the exact wedge shape this PR exists to remove. A synthesized `ETIMEDOUT`-class error stays load-bearing for userspace fsync liveness on a sick device; escalation truth (barrier_failures rungs) stays with REAL barrier outcomes, never the bound. |
+// | 2 | Ring-admission parking: `commit_tx` step 2 (backend.rs:1952-1975) — the register-recheck-await loop on `space_notified()` (journal.rs:472-474). Shutdown/failure flags are re-checked per park, but a wedged-not-failed drain (checkpoint task alive, `reusable_upto` frozen — e.g. admitted-but-never-reserved budget, a stuck device write in the flush path) never notifies: a parked committer waits forever and, pre-M4, the op timeout dropped its future while the volume kept wedging. | **watchdog + escalation** — each park is time-bounded so the liveness re-check can never be starved by a silent drain; cumulative parked time ≥ `SQUEEZEFS_TIMEOUT` logs loud and trips `note_journal_failure()` (backend.rs:1883) once per threshold crossing. Repeated crossings latch `failed` (JOURNAL_FAILURE_LATCH = 3 → ~3× threshold for a solo committer, one threshold under real op concurrency), every mutation then returns EIO and the routed layer mirrors the volume into `disabled_volumes` (mod.rs:210) — strictly more actionable than the old ETIMEDOUT-while-the-volume-keeps-wedging. Self-arbitrating: any OTHER committer's entry-write success resets `journal_failures` (backend.rs:2098), so a merely starved-but-alive volume logs loud without fail-stopping. |
+// | 3 | `wait_completed_upto` (journal.rs:443-453): commit_tx step 7's predecessor-completion wait. A stall here means an uncompleted registered reservation — a commit-pipeline bug, not an op-recoverable condition. | **watchdog-only** — the overdue log names the op; post-M7 this wait is conveyor-leader-internal and additionally surfaced by `meta_commit_group_*`. |
+// | 4 | Demand-paged node reads: every backend lookup/commit may fault KV nodes through the node cache's demand paging into `uring_fs` device reads (process-worker owned, no timeout). | **watchdog-only** — device ERRORS already propagate as op errors; only true device hangs remain, and synthesizing an op error cannot fix those (the volume needs operator action; the watchdog log is the signal). |
+// | 5 | DLM stripe locks + in-process serialization: `DlmLockManager` I/D stripes (meta_backend/dlm.rs — RAM tokio RwLocks, canonical acquisition order), `active_inode_locks`/`lease_locks`/`INODE_META_LOCKS`/`BLOCK_FLUSH_LOCKS` (P1-9 order). Cluster lease acquisition (`get_or_acquire_lease`, fuse_client.rs:2065) is already bounded (`acquire_lock(…, 5 s)`) and measured ZERO on metadata storms (baseline lever 9 demotion). No unbounded network awaits exist on metadata paths. | **watchdog-only** — deadlock-freedom is the lock-order contract's job; a violation is a bug the watchdog now makes visible in production. |
+// | 6 | Data-path device I/O: `NvmeBlockDev` read/write (bounded io_uring worker queues + backpressure), staging mmap ops, `read_file_range_zero_copy`, active-block flushes. The never-lossy writeback ladder stays retry-forever BY DESIGN (AGENTS.md). | **watchdog-only** — the old `max(SQUEEZEFS_TIMEOUT, 30 s)` read/write timeouts synthesized ETIMEDOUT while leaving the device wedged; reads/writes now park visibly. |
+//
+// Bounded waits that already exist and are KEPT (not per-op timeouts):
+// `destroy()`'s staged-drain wait (bounded by `dismount_wait`,
+// fuse_client.rs:4243-4261), `ensure_delegation_held`'s 40×50 ms retry
+// budget (:2102+), the 2 s device health probe (routing.rs:898), the
+// DLM lease acquire's 5 s bound, and the reclaim gather window
+// (`drain_reclaim_batch`'s `timeout_at`, fuse_client.rs:8018+ — a batch
+// WINDOW, not an op wait). POSIX blocking locks (`setlk` F_SETLKW)
+// legitimately block indefinitely per contract and are exempt from
+// watchdog registration; they were never timeout-wrapped.
+// ===========================================================================
+
+// ===========================================================================
 // D1.a per-op attribution rig (design-metadata-throughput §5.1, PR M2)
 //
 // Off by default; `SQUEEZEFS_OP_PROFILE=1` (launch-time, memoized like

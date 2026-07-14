@@ -1,6 +1,7 @@
 pub mod atomicity;
 pub mod dlm;
 pub mod kv;
+pub mod reservation;
 pub mod sync_coalescer;
 
 use crate::error::Result;
@@ -135,6 +136,36 @@ async fn open_volume_gated(
             })
         }
     }
+}
+
+/// Open a mount's whole metadata volume set **in set order**, each volume
+/// through the version gate + the D0 single-writer guard
+/// (design-metadata-throughput §5.0: "multi-volume mounts claim every meta
+/// volume in the set (volume order)"). A guard refusal or open failure on
+/// volume k releases the guards already taken on volumes `0..k` — flocks,
+/// `writer_claim` records, and NVMe reservations — via each backend's
+/// clean shutdown, then propagates the volume-k error loud.
+pub async fn open_meta_volume_set(
+    paths: &[String],
+) -> Result<Vec<std::sync::Arc<kv::backend::KvMetaBackend>>> {
+    let mut opened: Vec<std::sync::Arc<kv::backend::KvMetaBackend>> = Vec::new();
+    for path in paths {
+        match open_volume_for_mount(path).await {
+            Ok(be) => opened.push(be),
+            Err(e) => {
+                for prior in &opened {
+                    if let Err(te) = prior.shutdown().await {
+                        log::warn!(
+                            "releasing guard on {:?} after a failed set open failed too: {te}",
+                            prior.device_path()
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(opened)
 }
 
 /// The routed multi-volume metadata backend: `volumes` stripes inos over

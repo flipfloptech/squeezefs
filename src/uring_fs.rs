@@ -328,6 +328,13 @@ struct FaultState {
     /// write admitted since the last `fdatasync` — i.e. the volatile cache a
     /// real power loss would drop. [`power_cut`] reverts them.
     tracked: std::collections::HashMap<PathBuf, Vec<(u64, Vec<u8>)>>,
+    /// Barrier fault: per path, the raw OS errno every `fdatasync` fails
+    /// with while armed. Writes and reads proceed untouched — exactly the
+    /// shape of a device-level write fence (NVMe reservation conflict):
+    /// buffered entry writes keep succeeding into the page cache and the
+    /// conflict surfaces only at the durability barrier
+    /// (design-metadata-throughput §5.0 B1 pt 3, Issue 14).
+    barrier_errors: std::collections::HashMap<PathBuf, i32>,
 }
 
 static FAULT_STATE: Lazy<std::sync::Mutex<FaultState>> =
@@ -355,6 +362,31 @@ pub fn arm_power_cut(path: impl AsRef<Path>) {
         .tracked
         .insert(path.as_ref().to_path_buf(), Vec::new());
     FAULTS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Arm the barrier fault on `path`: every `fdatasync` fails with
+/// `raw_os_error` until [`disarm_barrier_error`] / [`clear_faults`],
+/// while writes and reads proceed untouched. This is the **barrier-layer**
+/// fence-injection point the writer-guard tests require (design
+/// §5.0 B1 pt 5: injecting at the entry-write layer would pass against
+/// wiring the real fence never exercises — a fenced holder's buffered
+/// writes succeed; only the barrier carries the reservation conflict).
+pub fn arm_barrier_error(path: impl AsRef<Path>, raw_os_error: i32) {
+    FAULT_STATE
+        .lock()
+        .unwrap()
+        .barrier_errors
+        .insert(path.as_ref().to_path_buf(), raw_os_error);
+    FAULTS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Disarm the barrier fault on `path` (the next `fdatasync` succeeds —
+/// the consecutive-failure escalation's success-reset case).
+pub fn disarm_barrier_error(path: impl AsRef<Path>) {
+    let mut st = FAULT_STATE.lock().unwrap();
+    st.barrier_errors.remove(path.as_ref());
+    // FAULTS_ACTIVE stays set while other faults may be armed; harmless
+    // when none are (the shim just finds nothing to do).
 }
 
 /// Simulate power loss on `path`: revert (in reverse admission order) every
@@ -399,6 +431,7 @@ pub fn clear_faults() {
     let mut st = FAULT_STATE.lock().unwrap();
     st.poisoned.clear();
     st.tracked.clear();
+    st.barrier_errors.clear();
     FAULTS_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -557,6 +590,17 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
             Some(FsReq::WriteAtBatch { path, ops, tx })
         }
         FsReq::Fdatasync { path, tx } => {
+            // Barrier fault first: the fence rejects the flush wholesale —
+            // nothing becomes durable, tracked volatile writes stay
+            // volatile, and the armed errno (reservation-conflict class in
+            // the guard tests) reaches the caller with its raw_os_error
+            // intact.
+            if let Some(code) = st.barrier_errors.get(&path) {
+                let _ = tx.send(Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
+                    *code,
+                ))));
+                return None;
+            }
             // The barrier makes everything admitted before it durable. The
             // caller awaits this completion before relying on durability, and
             // the serial test harness admits no concurrent writes in the

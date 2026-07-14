@@ -97,3 +97,97 @@ async fn test_legacy_registration_value_treated_as_stale() {
         "legacy timestamp-less registration must not block format: {allowed:?}"
     );
 }
+
+// ===========================================================================
+// PR M1 (design-metadata-throughput §5.0): the `writer_claim` record joins
+// the `client:{id}` registrations in the format-preflight live sweep —
+// the filter extends from `client:*` to `client:* ∪ writer_claim`.
+// ===========================================================================
+
+use squeezefs::meta_backend::kv::backend::{WriterClaim, WRITER_CLAIM_XATTR};
+
+/// Plant a `writer_claim` value the way a crashed writer leaves one: set
+/// through a live backend, then shut down — but re-add after the shutdown
+/// path so the claim survives (a clean shutdown deletes the mount's OWN
+/// claim, not a value written afterward through a fresh handle).
+async fn set_claim(meta: &NamedTempFile, ts: u64) {
+    let be = KvMetaBackend::open(meta.path()).await.unwrap();
+    let claim = WriterClaim {
+        id: "preflight-claimant".into(),
+        ts,
+        pid: 4_100_000,
+        boot: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+    };
+    be.setxattr(1, WRITER_CLAIM_XATTR, &claim.encode())
+        .await
+        .unwrap();
+    be.sync_device().await.unwrap();
+    // Crash-shaped exit: no clean shutdown, so the forged claim survives.
+    drop(be);
+}
+
+/// A fresh `writer_claim` marks a live mount: format is refused even with
+/// `--force` — exactly the `client:*` semantics, one staleness law.
+#[tokio::test]
+async fn test_fresh_writer_claim_blocks_format() {
+    let meta = formatted_volume().await;
+    set_claim(&meta, now_secs()).await;
+
+    let blocked = format_v3(meta.path(), VOL_LEN, &opts(true)).await;
+    assert!(
+        blocked.is_err(),
+        "a fresh writer_claim (live mount) must block format even with --force"
+    );
+}
+
+/// A stale `writer_claim` (crashed writer) never blocks format.
+#[tokio::test]
+async fn test_stale_writer_claim_does_not_block_format() {
+    let meta = formatted_volume().await;
+    set_claim(&meta, now_secs().saturating_sub(CLIENT_STALE_TTL_SECS + 90)).await;
+
+    let allowed = format_v3(meta.path(), VOL_LEN, &opts(true)).await;
+    assert!(
+        allowed.is_ok(),
+        "a stale writer_claim must not block format: {allowed:?}"
+    );
+}
+
+/// Claim and client registrations coexist on ino 1 (independent records,
+/// one staleness law): a stale claim beside a fresh registration still
+/// refuses format (the registration is live), and a fresh claim beside a
+/// stale registration still refuses (the claim is live).
+#[tokio::test]
+async fn test_claim_and_registrations_coexist_in_preflight() {
+    let now = now_secs();
+    let stale_ts = now.saturating_sub(CLIENT_STALE_TTL_SECS + 90);
+
+    // Stale claim + fresh registration => refused (registration live).
+    // (Registration first: set_claim crash-exits and leaves its claim, and
+    // a later guarded open would refuse the stale-foreign residue.)
+    let meta = formatted_volume().await;
+    set_registration(&meta, "live", Some(&reg_value(now))).await;
+    set_claim(&meta, stale_ts).await;
+    assert!(
+        format_v3(meta.path(), VOL_LEN, &opts(true)).await.is_err(),
+        "a fresh client registration must refuse format regardless of claim staleness"
+    );
+
+    // Fresh claim + stale registration => refused (claim live).
+    let meta2 = formatted_volume().await;
+    set_registration(&meta2, "dead", Some(&reg_value(stale_ts))).await;
+    set_claim(&meta2, now).await;
+    assert!(
+        format_v3(meta2.path(), VOL_LEN, &opts(true)).await.is_err(),
+        "a fresh writer_claim must refuse format regardless of registration staleness"
+    );
+
+    // Both stale => format proceeds.
+    let meta3 = formatted_volume().await;
+    set_registration(&meta3, "dead", Some(&reg_value(stale_ts))).await;
+    set_claim(&meta3, stale_ts).await;
+    assert!(
+        format_v3(meta3.path(), VOL_LEN, &opts(true)).await.is_ok(),
+        "stale claim + stale registration must not block format"
+    );
+}

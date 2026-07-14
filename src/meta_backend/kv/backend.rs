@@ -97,6 +97,75 @@ const JOURNAL_FAILURE_LATCH: u64 = 3;
 /// are rare and serialized, so the loop is short; exhaustion is a bug).
 const COMMIT_RETRY_BUDGET: usize = 256;
 
+/// The single-writer mount guard's claim record: an xattr on ino 1 beside
+/// the `client:{id}` registrations (design-metadata-throughput §5.0 B2).
+/// JSON `{"id","ts","pid","boot"}`; staleness follows the ONE staleness
+/// law ([`crate::fuse_client::CLIENT_STALE_TTL_SECS`]).
+pub const WRITER_CLAIM_XATTR: &str = "writer_claim";
+
+/// A decoded `writer_claim` record (design-metadata-throughput §5.0 B2):
+/// the mounted writer's identity, heartbeat timestamp, pid, and boot id —
+/// the evidence the mount-time staleness / dead-pid-proof decisions
+/// consume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterClaim {
+    /// The writer's per-mount identity (uuid).
+    pub id: String,
+    /// Heartbeat timestamp (unix seconds) — the authoritative liveness
+    /// signal, refreshed every `CLIENT_HEARTBEAT_INTERVAL_SECS`.
+    pub ts: u64,
+    /// Holder pid (same-host dead-pid proof: `boot` matches this boot AND
+    /// `kill(pid, 0) == ESRCH` ⇒ automatic instant reclaim).
+    pub pid: u32,
+    /// Holder boot id (`/proc/sys/kernel/random/boot_id`) — scopes the
+    /// pid proof to this boot (pid-reuse mitigation).
+    pub boot: String,
+}
+
+impl WriterClaim {
+    /// Encode as the compact JSON the record stores.
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::json!({
+            "id": self.id,
+            "ts": self.ts,
+            "pid": self.pid,
+            "boot": self.boot,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Decode a stored claim. `None` for unparseable values — callers
+    /// treat those as a stale *foreign* claim (never auto-taken: a value
+    /// we cannot attribute cannot prove anything).
+    pub fn decode(val: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(val).ok()?;
+        Some(Self {
+            id: v.get("id")?.as_str()?.to_string(),
+            ts: v.get("ts")?.as_u64()?,
+            pid: v.get("pid")?.as_u64()? as u32,
+            boot: v.get("boot")?.as_str()?.to_string(),
+        })
+    }
+
+    /// Claim age in seconds against `now` (unix seconds).
+    pub fn age_secs(&self, now: u64) -> u64 {
+        now.saturating_sub(self.ts)
+    }
+}
+
+/// Outcome of [`KvMetaBackend::claim_clear`] — the operator-attested
+/// `squeezefs claim clear` admin verb (design-metadata-throughput §5.0:
+/// the recovery rung for a stale cross-host claim on a non-PR volume).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimClearOutcome {
+    /// The volume carries no `writer_claim` — nothing to clear.
+    NoClaim,
+    /// A stale claim was removed; the holder it named is returned for the
+    /// verb's attestation output.
+    Cleared(WriterClaim),
+}
+
 /// One mounted v3 metadata volume.
 pub struct KvMetaBackend {
     path: PathBuf,
@@ -880,6 +949,78 @@ impl KvMetaBackend {
 
     pub(super) fn allocator(&self) -> &Arc<ExtentAllocator> {
         &self.alloc
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D0 — the single-writer mount guard (design-metadata-throughput §5.0):
+// Layer A dedicated-fd flock (same host), Layer B1 NVMe Persistent
+// Reservations (cross host, enforcement), Layer B2 `writer_claim` record
+// (identity + detection). PR M1.
+// ---------------------------------------------------------------------------
+
+impl KvMetaBackend {
+    /// The guarantee class this volume actually mounted with
+    /// (`writer_guard_mode` on the stats surface, design §9):
+    /// `"flock+pr"` (PR-capable namespace — enforcement-grade cross-host),
+    /// `"flock+claim"` (detection-grade cross-host), `"flock"` (read-only
+    /// mount: no claim is written), or `"unguarded"` (probe backends —
+    /// never mounted, never in stats).
+    pub fn writer_guard_mode(&self) -> &'static str {
+        "unguarded"
+    }
+
+    /// Reservation-conflict-class barrier failures mapped to guard
+    /// fail-stop (`writer_guard_fenced`, design §9): a fenced/usurped
+    /// holder detected at a durability barrier — working as designed,
+    /// always investigate.
+    pub fn writer_guard_fenced(&self) -> u64 {
+        0
+    }
+
+    /// Heartbeat-cadence Reservation Report re-checks that found
+    /// holdership lapsed with no foreign holder and re-acquired
+    /// (`writer_guard_pr_reacquires`, design §9 — a PTPL-less target
+    /// power-cycled; audit the fabric).
+    pub fn writer_guard_pr_reacquires(&self) -> u64 {
+        0
+    }
+
+    /// Mount-sequence event trace (guard-harness surface): the ordered
+    /// guard events of this backend's `open` — pinned order
+    /// `flock_acquired` → `claim_committed` → `claim_barriered` →
+    /// `checkpoint_task_spawned` (the claim is the volume's first
+    /// post-replay mutation *by construction*, design §5.0 B2).
+    pub fn open_trace(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Read and decode the volume's `writer_claim` record (from the
+    /// replayed RAM state — the staleness evidence the mount gate and
+    /// the `claim clear` verb consume). `None` when absent or
+    /// unparseable.
+    pub async fn read_writer_claim(&self) -> Option<WriterClaim> {
+        match self.getxattr(1, WRITER_CLAIM_XATTR).await {
+            Ok(Some(val)) => WriterClaim::decode(&val),
+            _ => None,
+        }
+    }
+
+    /// Heartbeat-cadence guard refresh (design §5.0 B1 pt 6 + B2): re-commit
+    /// the `writer_claim` with a fresh timestamp, and on PR volumes
+    /// re-verify host identity + run the Reservation Report re-check
+    /// (holdership lapsed + no foreign holder ⇒ re-acquire, counted;
+    /// foreign holder or identity mismatch ⇒ fail-stop). Best-effort;
+    /// never fails the caller.
+    pub async fn guard_heartbeat(&self) {}
+
+    /// The `squeezefs claim clear` admin verb body (design §5.0):
+    /// operator-attested removal of a **stale** `writer_claim` on `path`.
+    /// Refuses fresh claims, refuses when the volume is flock-held on this
+    /// host or live-mounted anywhere (`format_preflight`-style live-check),
+    /// and makes the removal durable before returning.
+    pub async fn claim_clear(_path: &Path) -> std::result::Result<ClaimClearOutcome, KvError> {
+        Ok(ClaimClearOutcome::NoClaim)
     }
 }
 

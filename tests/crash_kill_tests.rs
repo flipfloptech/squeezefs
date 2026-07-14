@@ -424,6 +424,112 @@ async fn test_kill9_remount_soak_v3() {
     }
 }
 
+// ===========================================================================
+// PR M1 (design-metadata-throughput §5.0): kill-9 after arm ⇒ same-host
+// instant reclaim. The killed daemon leaves a heartbeat-FRESH writer_claim
+// (10 s cadence vs 45 s TTL) — the remount must reclaim it immediately via
+// the dead-pid proof (boot id matches this boot AND kill(pid,0) == ESRCH),
+// never waiting out the TTL (design §5.0 B2 "no wait ever" / R6).
+// ===========================================================================
+
+/// Child branch: mount the volume (taking the writer claim), signal
+/// readiness through a marker file, then park forever holding the mount —
+/// the parent SIGKILLs us mid-hold.
+#[test]
+fn guard_child_hold_v3() {
+    if std::env::var("SQUEEZEFS_GUARD_HOLD_CHILD").is_err() {
+        return;
+    }
+    let vol = std::path::PathBuf::from(std::env::var("SQUEEZEFS_CRASH_VOL").unwrap());
+    let ready = std::path::PathBuf::from(std::env::var("SQUEEZEFS_GUARD_READY").unwrap());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let backend = KvMetaBackend::open(&vol).await.expect("child mounts");
+        // Prove the claim is durable before signaling armed.
+        backend.sync_device().await.expect("claim durable");
+        std::fs::write(&ready, format!("{}", std::process::id())).expect("ready marker");
+        std::future::pending::<()>().await
+    });
+}
+
+/// Kill-9 after arm ⇒ same-host instant reclaim (crash case, PR M1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kill9_after_arm_same_host_instant_reclaim() {
+    let dir = tempfile::tempdir().unwrap();
+    let vol = dir.path().join("guard.v3.meta");
+    let ready = dir.path().join("armed");
+    {
+        let f = std::fs::File::create(&vol).unwrap();
+        f.set_len(V3_VOL_SIZE).unwrap();
+        format_v3(&vol, V3_VOL_SIZE, &v3_format_opts())
+            .await
+            .unwrap();
+    }
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut child = Command::new(&exe)
+        .args([
+            "--exact",
+            "guard_child_hold_v3",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("SQUEEZEFS_GUARD_HOLD_CHILD", "1")
+        .env("SQUEEZEFS_CRASH_VOL", &vol)
+        .env("SQUEEZEFS_GUARD_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn guard-hold child");
+
+    // Wait for the child to arm (claim committed + barriered).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(ready.exists(), "child never armed in 60 s");
+    let child_pid: u32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+
+    // While the child holds: this process must be refused (two daemons,
+    // one meta volume — incident 4's exact shape, cross-process).
+    assert!(
+        KvMetaBackend::open(&vol).await.is_err(),
+        "a second process must be refused while the child daemon holds the volume"
+    );
+
+    child.kill().expect("SIGKILL the armed holder");
+    let _ = child.wait();
+
+    // Instant reclaim: the claim is heartbeat-FRESH (killed seconds after
+    // arming) — only the dead-pid proof can admit us, and it must do so
+    // immediately (no TTL wait; kernel released the flock at kill).
+    let started = std::time::Instant::now();
+    let be = KvMetaBackend::open(&vol)
+        .await
+        .expect("kill-9'd holder must be reclaimed instantly via dead-pid proof");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "reclaim must be instant, not TTL-gated (took {:?})",
+        started.elapsed()
+    );
+    let claim = be
+        .read_writer_claim()
+        .await
+        .expect("the reclaiming mount re-commits the claim");
+    assert_eq!(claim.pid, std::process::id(), "the claim now names us");
+    assert_ne!(claim.pid, child_pid, "the dead holder's claim was replaced");
+
+    // The reclaimed volume serves.
+    Metadata::create(be.as_ref(), 1, "reclaimed", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("post-reclaim create");
+    be.shutdown().await.unwrap();
+}
+
 /// Physical file offset of the FIRST byte a reservation starting at
 /// logical ring position `pos` would write (the §4.4 fault-arming helper:
 /// entry headers start at the reservation's first logical byte).

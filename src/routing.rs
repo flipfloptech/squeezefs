@@ -924,7 +924,12 @@ pub struct DataRouterInner {
     pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     pub backend_router: std::sync::Arc<BackendRouter>,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub metadata_cache: moka::sync::Cache<String, CachedMetadata>,
+    /// Hot layout/size cache, keyed by **ino** (PR M4 D1.c: the FUSE layer
+    /// and every internal path derive the old `inode_{ino}` string from a
+    /// `u64` they already hold — the per-op key alloc + string hash bought
+    /// nothing; string forms remain only where backend keys genuinely need
+    /// `fs_key!`-class shapes).
+    pub metadata_cache: moka::sync::Cache<u64, CachedMetadata>,
     pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
     /// Single-flight registry. `scc::HashMap`, NOT `HashIndex` (a measured
     /// deviation from the design doc's "container stays" note): HashIndex
@@ -1487,7 +1492,6 @@ impl DataRouter {
         })?;
 
         // Fencing check
-        let file_path = crate::keys::inode_path(ino);
         let current_fencing = self.inner.dlm.get_fencing_token_ino(ino);
         if fencing_token < current_fencing {
             return Err(SqueezefsError::FencingTokenExpired {
@@ -1608,7 +1612,7 @@ impl DataRouter {
         // Keep hot cache coherent without a remove+refetch on the next write.
         let mut cached = m.clone();
         cached.cached_at = std::time::Instant::now();
-        self.metadata_cache.insert(file_path.to_string(), cached);
+        self.metadata_cache.insert(ino, cached);
 
         if let Some(ref old_key) = old_indirect_to_free {
             let _ = self.backend_router.free_block(old_key).await;
@@ -2563,7 +2567,8 @@ impl DataRouter {
     /// reallocated by the time this runs. On a miss, `fetch_metadata`'s
     /// refill reads the backend under the same lock (serialized ≥ merges).
     async fn current_block_binding(&self, file_path: &str, b: u32) -> Result<Option<String>> {
-        let meta = match self.metadata_cache.get(file_path) {
+        let ino = parse_inode_from_path(file_path);
+        let meta = match self.metadata_cache.get(&ino) {
             Some(m) => m,
             None => self.fetch_metadata(file_path).await?,
         };
@@ -2859,7 +2864,8 @@ impl DataRouter {
         let fresh_or_dirty = |entry: &CachedMetadata| {
             entry.layout_dirty || entry.cached_at.elapsed() < Duration::from_secs(1)
         };
-        if let Some(entry) = self.metadata_cache.get(file_path) {
+        let ino = parse_inode_from_path(file_path);
+        if let Some(entry) = self.metadata_cache.get(&ino) {
             if fresh_or_dirty(&entry) {
                 // moka's get already returned an owned clone — hand it out
                 // directly (the old `entry.clone()` re-cloned every field
@@ -2868,20 +2874,18 @@ impl DataRouter {
             }
         }
 
-        let ino = parse_inode_from_path(file_path);
-
         // Refill under the per-inode metadata lock so a stale backend snapshot
         // can never clobber a concurrent writer's fresh cache entry (see
         // INODE_META_LOCKS). Double-check after acquiring: a writer or racing
         // filler may have refreshed (or dirtied) the entry while we waited.
         let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
-        if let Some(entry) = self.metadata_cache.get(file_path) {
+        if let Some(entry) = self.metadata_cache.get(&ino) {
             if fresh_or_dirty(&entry) {
                 return Ok(entry);
             }
         }
         if let Some(m) = self.fetch_metadata_from_backend(ino).await? {
-            self.metadata_cache.insert(file_path.to_string(), m.clone());
+            self.metadata_cache.insert(ino, m.clone());
             return Ok(m);
         }
 
@@ -2897,7 +2901,7 @@ impl DataRouter {
             block_map: None,
             layout_dirty: false,
         };
-        self.metadata_cache.insert(file_path.to_string(), m.clone());
+        self.metadata_cache.insert(ino, m.clone());
         Ok(m)
     }
 
@@ -2915,10 +2919,9 @@ impl DataRouter {
         target_size: u64,
         fencing_token: u64,
     ) -> Result<()> {
-        let file_path = crate::keys::inode_path(ino);
         let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
         // NOTE: `fetch_metadata` would retake this lock.
-        let current = match self.metadata_cache.get(&file_path) {
+        let current = match self.metadata_cache.get(&ino) {
             Some(m) => Some(m),
             None => self.fetch_metadata_from_backend(ino).await?,
         };
@@ -2936,7 +2939,7 @@ impl DataRouter {
         updated.cached_at = std::time::Instant::now();
         self.save_metadata_to_backend(ino, &updated, fencing_token)
             .await?;
-        self.metadata_cache.insert(file_path, updated);
+        self.metadata_cache.insert(ino, updated);
         Ok(())
     }
 
@@ -2953,7 +2956,7 @@ impl DataRouter {
     ) -> Result<()> {
         let ino = parse_inode_from_path(file_path);
         let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
-        let Some(meta) = self.metadata_cache.get(file_path) else {
+        let Some(meta) = self.metadata_cache.get(&ino) else {
             return Ok(());
         };
         if !meta.layout_dirty {
@@ -2964,7 +2967,7 @@ impl DataRouter {
         clean.cached_at = std::time::Instant::now();
         self.save_metadata_to_backend(ino, &clean, fencing_token)
             .await?;
-        self.metadata_cache.insert(file_path.to_string(), clean);
+        self.metadata_cache.insert(ino, clean);
         Ok(())
     }
 
@@ -3033,7 +3036,7 @@ impl DataRouter {
             let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
             // Authoritative meta: RAM cache first (post-write truth), then
             // backend. NOTE: `fetch_metadata` would retake this lock.
-            let current = match self.metadata_cache.get(file_path) {
+            let current = match self.metadata_cache.get(&ino) {
                 Some(m) => Some(m),
                 None => self.fetch_metadata_from_backend(ino).await?,
             };
@@ -3065,7 +3068,7 @@ impl DataRouter {
             updated.cached_at = std::time::Instant::now();
             self.save_metadata_to_backend(ino, &updated, fencing_token)
                 .await?;
-            self.metadata_cache.insert(file_path.to_string(), updated);
+            self.metadata_cache.insert(ino, updated);
             if let Some(prev) = displaced {
                 if prev != block_key {
                     // Re-promotion over an older durable copy: purge + free it.
@@ -3138,10 +3141,10 @@ impl DataRouter {
         if let Some(mapping) = map0(meta) {
             return Some(mapping);
         }
-        if let Some(mapping) = self.metadata_cache.get(file_path).as_ref().and_then(map0) {
+        let ino = parse_inode_from_path(file_path);
+        if let Some(mapping) = self.metadata_cache.get(&ino).as_ref().and_then(map0) {
             return Some(mapping);
         }
-        let ino = parse_inode_from_path(file_path);
         self.fetch_metadata_from_backend(ino)
             .await
             .ok()
@@ -3158,10 +3161,10 @@ impl DataRouter {
     /// clobber a concurrent writer's fresher RAM entry (`fetch_metadata`
     /// owns the locked refill).
     async fn freshest_layout_identity(&self, file_path: &str) -> Option<CachedMetadata> {
-        if let Some(m) = self.metadata_cache.get(file_path) {
+        let ino = parse_inode_from_path(file_path);
+        if let Some(m) = self.metadata_cache.get(&ino) {
             return Some(m);
         }
-        let ino = parse_inode_from_path(file_path);
         self.fetch_metadata_from_backend(ino).await.ok().flatten()
     }
 
@@ -3280,7 +3283,6 @@ impl DataRouter {
         fencing_token: u64,
         expected_epoch: Option<u64>,
     ) -> Result<Option<Vec<String>>> {
-        let file_path = crate::keys::inode_path(ino);
         let _map_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
 
         let epoch_word = LAYOUT_PRUNE_EPOCHS.get_inode_lock(ino);
@@ -3303,7 +3305,7 @@ impl DataRouter {
             Some(m) => m,
             // Never-persisted layout: the freshest RAM entry (post-write
             // truth for dirty layouts) beats an empty default.
-            None => self.metadata_cache.get(&file_path).unwrap_or_default(),
+            None => self.metadata_cache.get(&ino).unwrap_or_default(),
         };
 
         // CoW publish (item A): take the Arc, mutate a uniquely-owned copy
@@ -3332,7 +3334,7 @@ impl DataRouter {
                 // RAM size (writes publish size to the RAM cache ahead of the
                 // deferred layout commit — a merge must not regress it).
                 current.size = std::cmp::max(current.size, min_size);
-                if let Some(cached) = self.metadata_cache.get(&file_path) {
+                if let Some(cached) = self.metadata_cache.get(&ino) {
                     if cached.size > current.size {
                         current.size = cached.size;
                     }
@@ -3361,7 +3363,7 @@ impl DataRouter {
                 // A punch never grows or shrinks the file: hold the size at the
                 // caller's floor / freshest RAM size (same discipline as Merge).
                 current.size = std::cmp::max(current.size, min_size);
-                if let Some(cached) = self.metadata_cache.get(&file_path) {
+                if let Some(cached) = self.metadata_cache.get(&ino) {
                     if cached.size > current.size {
                         current.size = cached.size;
                     }
@@ -3404,11 +3406,11 @@ impl DataRouter {
     pub async fn update_metadata_cache_size(&self, file_path: &str, size: u64) {
         let ino = parse_inode_from_path(file_path);
         let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
-        let entry = match self.metadata_cache.get(file_path) {
+        let entry = match self.metadata_cache.get(&ino) {
             Some(entry) => Some(entry),
             None => match self.fetch_metadata_from_backend(ino).await {
                 Ok(Some(m)) => {
-                    self.metadata_cache.insert(file_path.to_string(), m.clone());
+                    self.metadata_cache.insert(ino, m.clone());
                     Some(m)
                 }
                 Ok(None) | Err(_) => None,
@@ -3418,7 +3420,7 @@ impl DataRouter {
             if size > entry.size {
                 entry.size = size;
                 entry.cached_at = std::time::Instant::now();
-                self.metadata_cache.insert(file_path.to_string(), entry);
+                self.metadata_cache.insert(ino, entry);
             }
         }
     }
@@ -3768,7 +3770,7 @@ impl DataRouter {
 
             {
                 let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
-                let fresh = self.metadata_cache.get(file_path);
+                let fresh = self.metadata_cache.get(&ino);
                 let mut updated_meta = meta.clone();
                 updated_meta.file_type = "striped".to_string();
                 updated_meta.size = new_size as u64;
@@ -3780,8 +3782,7 @@ impl DataRouter {
                 self.cache.write_lru.remove(file_path);
                 self.cache.read_lru.remove(file_path);
 
-                self.metadata_cache
-                    .insert(file_path.to_string(), updated_meta);
+                self.metadata_cache.insert(ino, updated_meta);
                 // The staged form is superseded: release its ring entry
                 // (budget) and any promoted/spilled durable copy.
                 self.release_superseded_staged(
@@ -3835,7 +3836,7 @@ impl DataRouter {
             let shared_data = payload_bytes;
 
             let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
-            let fresh = self.metadata_cache.get(file_path);
+            let fresh = self.metadata_cache.get(&ino);
             let mut updated_meta = meta.clone();
             updated_meta.file_type = "inline".to_string();
             updated_meta.size = new_size as u64;
@@ -3849,8 +3850,7 @@ impl DataRouter {
 
             self.cache.write_lru.put(file_path, shared_data.clone());
             self.cache.read_lru.put(file_path, shared_data);
-            self.metadata_cache
-                .insert(file_path.to_string(), updated_meta);
+            self.metadata_cache.insert(ino, updated_meta);
             // A truncated-then-rewritten staged/spilled file leaves a ring
             // entry and/or a durable copy behind: release them.
             self.release_superseded_staged(
@@ -3887,7 +3887,7 @@ impl DataRouter {
             match stage_res {
                 Ok(_) => {
                     let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
-                    let fresh = self.metadata_cache.get(file_path);
+                    let fresh = self.metadata_cache.get(&ino);
                     // Ring-residency check (leg 5 of the zeros-LOSS family).
                     // A promotion enqueued by THIS stage's high-water
                     // crossing can consume the just-staged image before we
@@ -3922,8 +3922,7 @@ impl DataRouter {
                         updated_meta.layout_dirty = true;
                     }
                     updated_meta.cached_at = std::time::Instant::now();
-                    self.metadata_cache
-                        .insert(file_path.to_string(), updated_meta);
+                    self.metadata_cache.insert(ino, updated_meta);
                     // Drop any stale whole-file RAM snapshot: the staging ring
                     // entry is now authoritative for this file, but a prior
                     // `read_file` (e.g. a copy_file_range source read) or an
@@ -4006,7 +4005,7 @@ impl DataRouter {
                     let spill_file_id = Uuid::new_v4().to_string();
 
                     let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
-                    let fresh = self.metadata_cache.get(file_path);
+                    let fresh = self.metadata_cache.get(&ino);
                     let mut updated_meta = meta.clone();
                     updated_meta.file_type = "staged".to_string();
                     updated_meta.size = new_size as u64;
@@ -4017,8 +4016,7 @@ impl DataRouter {
                     updated_meta.layout_dirty = false;
                     self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
                         .await?;
-                    self.metadata_cache
-                        .insert(file_path.to_string(), updated_meta);
+                    self.metadata_cache.insert(ino, updated_meta);
                     // Release the superseded stale ring entry (returns its
                     // budget) and any older durable copy it had.
                     self.release_superseded_staged(
@@ -5372,7 +5370,7 @@ impl DataRouter {
             self.cache.write_lru.put(dest, cached);
         }
 
-        self.metadata_cache.insert(dest.to_string(), updated_meta);
+        self.metadata_cache.insert(dest_ino, updated_meta);
         Ok(())
     }
 
@@ -5469,7 +5467,7 @@ impl DataRouter {
             }
             self.save_metadata_to_backend(ino, &meta, fencing_token)
                 .await?;
-            self.metadata_cache.insert(file_path.clone(), meta);
+            self.metadata_cache.insert(ino, meta);
             self.cache.write_lru.remove(&file_path);
             self.cache.read_lru.remove(&file_path);
             return Ok(());
@@ -5588,7 +5586,7 @@ impl DataRouter {
         let commit = async {
             let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
             // NOTE: `fetch_metadata` would retake this lock.
-            let current = match self.metadata_cache.get(&file_path) {
+            let current = match self.metadata_cache.get(&ino) {
                 Some(m) => Some(m),
                 None => self.fetch_metadata_from_backend(ino).await?,
             };
@@ -5629,7 +5627,7 @@ impl DataRouter {
             updated.cached_at = std::time::Instant::now();
             self.save_metadata_to_backend(ino, &updated, fencing_token)
                 .await?;
-            self.metadata_cache.insert(file_path.clone(), updated);
+            self.metadata_cache.insert(ino, updated);
 
             // The truncated tail is gone: drop any whole-file RAM snapshot so
             // a later re-extend reads zeros instead of a stale copy.
@@ -5787,7 +5785,8 @@ impl DataRouter {
 
         self.cache.write_lru.remove(file_path);
         self.cache.read_lru.remove(file_path);
-        self.metadata_cache.invalidate(file_path);
+        self.metadata_cache
+            .invalidate(&parse_inode_from_path(file_path));
         Ok(())
     }
 

@@ -558,7 +558,7 @@ async fn test_staged_meta_with_lost_ring_entry_reads_zeros_not_error() {
     // Simulate the crash outcome: the ring entry is gone (torn → discarded
     // by recovery, or lost before landing). No promoted mapping exists.
     h.fs.router.cache.nvme.remove_staged(&file_id);
-    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.router.metadata_cache.invalidate(&ino);
     h.fs.router.cache.read_lru.remove(&path);
     h.fs.router.cache.write_lru.remove(&path);
 

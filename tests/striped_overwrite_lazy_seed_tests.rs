@@ -419,7 +419,7 @@ async fn fsync_forces_merge_durably() {
 
     // Cold: drop the layout cache + whole-file LRUs + block read tiers.
     let path = squeezefs::keys::inode_path(ino);
-    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.router.metadata_cache.invalidate(&ino);
     h.fs.router.cache.write_lru.remove(&path);
     h.fs.router.cache.read_lru.remove(&path);
 

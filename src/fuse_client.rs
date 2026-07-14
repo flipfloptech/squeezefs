@@ -2463,7 +2463,8 @@ impl SqueezefsFilesystem {
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>, SqueezefsError> {
         let mut block_map_id = None;
         let mut block_map = None;
-        if let Some(entry) = self.router.metadata_cache.get(file_path) {
+        let seed_ino = crate::routing::parse_inode_from_path(file_path);
+        if let Some(entry) = self.router.metadata_cache.get(&seed_ino) {
             if entry.cached_at.elapsed() < Duration::from_secs(1) {
                 block_map_id = entry.block_map_id.clone();
                 block_map = entry.block_map.clone();
@@ -3068,8 +3069,7 @@ impl SqueezefsFilesystem {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
         let mut size = backend.getattr(ino).await?.size;
-        let file_path = crate::keys::inode_path(ino);
-        if let Some(m) = self.router.metadata_cache.get(&file_path) {
+        if let Some(m) = self.router.metadata_cache.get(&ino) {
             size = size.max(m.size);
         }
         if let Some((attr, _)) = self.attr_cache.get(&ino) {
@@ -3329,11 +3329,10 @@ impl SqueezefsFilesystem {
             .await?;
         self.flush_active_blocks_with_retry(ino, fencing_token)
             .await?;
-        let file_path = crate::keys::inode_path(ino);
         let file_id_opt = self
             .router
             .metadata_cache
-            .get(&file_path)
+            .get(&ino)
             .and_then(|m| m.file_id.clone());
 
         let sync_data_fut = async {
@@ -3351,7 +3350,7 @@ impl SqueezefsFilesystem {
 
         let sync_meta_fut = async {
             self.router
-                .persist_dirty_layout_if_needed(&file_path, fencing_token)
+                .persist_dirty_layout_if_needed(&crate::keys::inode_path(ino), fencing_token)
                 .await?;
             if let Some(backend) = self.meta_backend.as_ref() {
                 backend.sync_device_for_ino(ino).await?;
@@ -4121,8 +4120,7 @@ impl SqueezefsFilesystem {
         // otherwise truncates reads to zero and SIGBUSes mmap under the FUSE
         // writeback cache.
         if attr.kind == FileType::RegularFile {
-            let file_path = crate::keys::inode_path(ino);
-            if let Some(m) = self.router.metadata_cache.get(&file_path) {
+            if let Some(m) = self.router.metadata_cache.get(&ino) {
                 if m.size != attr.size {
                     attr.size = m.size;
                     attr.blocks = m.size.div_ceil(512);
@@ -4259,9 +4257,7 @@ impl SqueezefsFilesystem {
             let _ = lease.release().await;
         }
         self.active_posix_locks.retain(|key, _| key.0 != ino);
-        self.router
-            .metadata_cache
-            .remove(&crate::keys::inode_path(ino));
+        self.router.metadata_cache.remove(&ino);
         self.attr_cache.invalidate(&ino);
     }
 }
@@ -4814,10 +4810,11 @@ impl Filesystem for SqueezefsFilesystem {
             let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
-            // Seed layout cache so the first write skips a cold meta backend fetch.
-            let file_path = crate::keys::inode_path(inode.ino);
+            // Seed layout cache so the first write skips a cold meta
+            // backend fetch. Ino-keyed (D1.c): the pre-M4 shape allocated
+            // an `inode_{ino}` String per create just to key this insert.
             self.router.metadata_cache.insert(
-                file_path,
+                inode.ino,
                 crate::routing::CachedMetadata {
                     file_type: "inline".to_string(),
                     size: 0,
@@ -5044,7 +5041,7 @@ impl Filesystem for SqueezefsFilesystem {
             // would observe a stale size (0 on a fresh file), return a short
             // read, and let the kernel cache zero pages — silent read-after-
             // write corruption.
-            if let Some(m) = self.router.metadata_cache.get(&file_path) {
+            if let Some(m) = self.router.metadata_cache.get(&ino) {
                 file_size = m.size;
             }
 
@@ -5247,8 +5244,7 @@ impl Filesystem for SqueezefsFilesystem {
             let block_size = self.router.block_size.load(Ordering::Relaxed);
             // Prefer hot caches for path selection (avoids meta RTT on every small write).
             // write_file still loads authoritative layout when it mutates data.
-            let (old_size, file_type) = if let Some(m) = self.router.metadata_cache.get(&file_path)
-            {
+            let (old_size, file_type) = if let Some(m) = self.router.metadata_cache.get(&ino) {
                 (m.size, m.file_type.clone())
             } else if let Some((attr, cached_at)) = self.attr_cache.get(&ino) {
                 if cached_at.elapsed() < Duration::from_secs(1) {
@@ -6462,7 +6458,7 @@ impl Filesystem for SqueezefsFilesystem {
         let dest_is_striped = self
             .router
             .metadata_cache
-            .get(&dest_path)
+            .get(&inode_out)
             .map(|m| m.file_type == "striped")
             .unwrap_or_else(|| {
                 // Cold cache: classify by the freshest known size, exactly

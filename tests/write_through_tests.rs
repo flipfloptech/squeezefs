@@ -203,7 +203,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 /// Authoritative backend meta (bypasses the RAM TTL cache).
 async fn backend_meta(h: &H, ino: u64) -> squeezefs::routing::CachedMetadata {
     let path = squeezefs::keys::inode_path(ino);
-    h.fs.router.metadata_cache.remove(&path);
+    h.fs.router.metadata_cache.remove(&ino);
     h.fs.router.fetch_metadata(&path).await.unwrap()
 }
 
@@ -1354,11 +1354,10 @@ async fn test_staged_identity_promotion_fsync_ring_entry_exact() {
     // (layout_dirty) — evicting it here would orphan the staged identity.
     let p0 = pattern(8000, 41);
     write_at(&h, ino, 0, &p0).await;
-    let path = squeezefs::keys::inode_path(ino);
     let ram =
         h.fs.router
             .metadata_cache
-            .get(&path)
+            .get(&ino)
             .expect("staged RAM meta present");
     assert_eq!(ram.file_type, "staged", "premise: staged layout");
     let file_id = ram.file_id.clone().expect("staged file_id");
@@ -1457,11 +1456,10 @@ async fn test_defrag_block_move_merges_through_primitive() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // RAM cache is coherent with the merge (the raw-xattr path left it stale).
-    let path = squeezefs::keys::inode_path(ino);
     let ram =
         h.fs.router
             .metadata_cache
-            .get(&path)
+            .get(&ino)
             .expect("RAM meta present");
     assert_eq!(
         ram.block_map.as_ref().and_then(|m| m.get(&0)),

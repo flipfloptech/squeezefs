@@ -357,7 +357,7 @@ async fn test_small_block_map_stays_inline() {
 
     // Remove from cache to force backend read
     let file_path = squeezefs::keys::inode_path(child_ino);
-    fs.router.metadata_cache.remove(&file_path);
+    fs.router.metadata_cache.remove(&child_ino);
 
     // §5.3 (PR K8): the spill boundary is the per-volume record cap
     // (~60 KiB serialized at the default node size), not an entry count —
@@ -812,7 +812,7 @@ async fn test_striped_flush_dma_zero_copy_aligned_no_lru_retention() {
     // (no plaintext block cached for an already-striped file — neither a
     // copy nor, worse, a guard-backed Bytes).
     let file_path = squeezefs::keys::inode_path(ino);
-    h.fs.router.metadata_cache.remove(&file_path);
+    h.fs.router.metadata_cache.remove(&ino);
     let meta = h.fs.router.fetch_metadata(&file_path).await.unwrap();
     assert_eq!(meta.file_type, "striped");
     let bm = meta
@@ -912,7 +912,7 @@ async fn test_promotion_flush_lru_entry_is_real_copy_not_guard_backed() {
     );
 
     let file_path = squeezefs::keys::inode_path(ino);
-    h.fs.router.metadata_cache.remove(&file_path);
+    h.fs.router.metadata_cache.remove(&ino);
     let meta = h.fs.router.fetch_metadata(&file_path).await.unwrap();
     let bm = meta
         .block_map

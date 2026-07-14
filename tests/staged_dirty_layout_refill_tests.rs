@@ -251,7 +251,7 @@ async fn staged_layout_persists_after_ttl_refill_fsync_cold_reread() {
     // Cold cache: drop the hot entry so the next read resolves the layout
     // from the persisted backend (the remount-equivalent for the layout).
     let path = squeezefs::keys::inode_path(ino);
-    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.router.metadata_cache.invalidate(&ino);
 
     let got = read_all(&h, ino, LEN).await;
     assert_bytes(&got, &pat, "cold re-read after TTL + fsync");
@@ -287,7 +287,7 @@ async fn staged_growth_survives_ttl_refill_after_promotion() {
             let promoted =
                 h.fs.router
                     .metadata_cache
-                    .get(&path)
+                    .get(&ino)
                     .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()))
                     .is_some();
             if promoted && h.fs.router.cache.nvme.read_staged(&file_id).is_none() {

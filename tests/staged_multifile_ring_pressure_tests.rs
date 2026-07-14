@@ -474,7 +474,7 @@ async fn promote_patch_cycles_never_clobber_neighbor_mappings() {
                             .fs
                             .router
                             .metadata_cache
-                            .get(&path)
+                            .get(&squeezefs::routing::parse_inode_from_path(&path))
                             .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()))
                             .is_some();
                         if promoted {

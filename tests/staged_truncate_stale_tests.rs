@@ -261,7 +261,7 @@ async fn trunc_cycle_reads_zeros_after_promotion() {
             let promoted =
                 h.fs.router
                     .metadata_cache
-                    .get(&path)
+                    .get(&a)
                     .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()))
                     .is_some();
             promoted && h.fs.router.cache.nvme.read_staged(&file_id).is_none()

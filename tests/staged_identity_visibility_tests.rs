@@ -183,7 +183,7 @@ async fn reader_loop(
             .await
             .unwrap_or_else(|e| panic!("[{tag}] read errored during identity churn: {e:?}"));
         if data.len() != len {
-            let cache_meta = router.metadata_cache.get(&file_path);
+            let cache_meta = router.metadata_cache.get(&ino);
             panic!(
                 "[{tag}] short read of live staged data: got {} want {len} \
                  (identity transition dropped coverage); cache meta = {:?}",

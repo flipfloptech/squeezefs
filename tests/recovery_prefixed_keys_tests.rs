@@ -553,7 +553,7 @@ async fn test_multi_volume_inline_map_remount_recovery_smoke() {
         ("post_recovery_probe.bin", probe_ino),
     ] {
         let path = squeezefs::keys::inode_path(target).to_string();
-        h2.fs.router.metadata_cache.invalidate(&path);
+        h2.fs.router.metadata_cache.invalidate(&target);
         let mut con = h2.fs.router.dlm.get_connection().await.unwrap();
         h2.fs
             .router

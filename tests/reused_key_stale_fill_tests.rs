@@ -338,7 +338,7 @@ async fn size_bump_never_reverts_merged_map() {
         // Force the size-bump through its refill leg (get-miss → awaited
         // fetch_metadata → mutate → insert), mirroring the write handler's
         // per-write `expected_new_size` call under an eviction/miss.
-        h.fs.router.metadata_cache.invalidate(&path);
+        h.fs.router.metadata_cache.invalidate(&ino);
 
         let bump = {
             let h = h.clone();
@@ -370,10 +370,10 @@ async fn size_bump_never_reverts_merged_map() {
         let ram_map =
             h.fs.router
                 .metadata_cache
-                .get(&path)
+                .get(&ino)
                 .and_then(|m| m.block_map);
         if let Some(ram_map) = ram_map {
-            h.fs.router.metadata_cache.invalidate(&path);
+            h.fs.router.metadata_cache.invalidate(&ino);
             let backend_map = block_map_of(&h, ino).await;
             assert_eq!(
                 ram_map.get(&0),

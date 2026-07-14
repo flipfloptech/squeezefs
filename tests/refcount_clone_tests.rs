@@ -116,7 +116,9 @@ fn striped_meta(block_map: &[(u32, String)], size: u64, dirty: bool) -> CachedMe
 
 /// Seed a layout into cache AND backend through the public writeback flow.
 async fn seed_meta(router: &DataRouter, path: &str, meta: CachedMetadata) {
-    router.metadata_cache.insert(path.to_string(), meta);
+    router
+        .metadata_cache
+        .insert(squeezefs::routing::parse_inode_from_path(path), meta);
     router
         .persist_dirty_layout_if_needed(path, 1)
         .await
@@ -195,7 +197,9 @@ async fn test_clone_retries_via_authoritative_map() {
     // …while the hot cache holds a stale map with an unpinnable key
     // (clean flag: nothing re-persists the stale form over the good one).
     let stale = striped_meta(&[(0, "424243".to_string())], 4096, false);
-    router.metadata_cache.insert(src.clone(), stale);
+    router
+        .metadata_cache
+        .insert(squeezefs::routing::parse_inode_from_path(&src), stale);
 
     router
         .clone_file(&src, &dest, Some(1), Some(1))

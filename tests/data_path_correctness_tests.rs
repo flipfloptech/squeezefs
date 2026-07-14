@@ -421,13 +421,13 @@ async fn test_concurrent_write_read_striped_no_stale_zeros() {
                     // map entry, the durable backend layout entry, and whether a
                     // whole-file RAM snapshot exists.
                     let fp = format!("inode_{ino}");
-                    let cached_key = h.fs.router.metadata_cache.get(&fp).and_then(|m| {
+                    let cached_key = h.fs.router.metadata_cache.get(&ino).and_then(|m| {
                         m.block_map
                             .as_ref()
                             .and_then(|bm| bm.get(&(b as u32)).cloned())
                     });
                     // Durable view: drop the cache entry and force a backend refill.
-                    h.fs.router.metadata_cache.invalidate(&fp);
+                    h.fs.router.metadata_cache.invalidate(&ino);
                     let durable_key = h.fs.router.fetch_metadata(&fp).await.ok().and_then(|m| {
                         m.block_map
                             .as_ref()
@@ -834,9 +834,7 @@ async fn test_aligned_striped_overwrite_equivalence_64k_blocks() {
     assert_eq!(got, expected, "aligned append mismatch");
 
     // Durable view: drop the hot meta/attr caches and read again.
-    h.fs.router
-        .metadata_cache
-        .invalidate(&format!("inode_{ino}"));
+    h.fs.router.metadata_cache.invalidate(&ino);
     h.fs.attr_cache.invalidate(&ino);
     assert_eq!(
         read_at(&h, ino, 0, (size + block) as u32).await,
@@ -915,7 +913,7 @@ async fn test_inline_to_striped_promotion_roundtrip() {
     );
 
     // Durable view (cold meta/attr caches).
-    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.router.metadata_cache.invalidate(&ino);
     h.fs.attr_cache.invalidate(&ino);
     assert_eq!(
         read_at(&h, ino, 0, expected.len() as u32).await,
@@ -957,7 +955,7 @@ async fn test_staged_to_striped_promotion_roundtrip() {
     );
 
     // Durable view (cold meta/attr caches).
-    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.router.metadata_cache.invalidate(&ino);
     h.fs.attr_cache.invalidate(&ino);
     assert_eq!(
         read_at(&h, ino, 0, expected.len() as u32).await,
@@ -1447,7 +1445,7 @@ async fn test_v3_six_gib_shaped_file_keeps_inline_map() {
     let n = 1500usize; // ≈6 GiB at 4 MiB blocks; ≈30 KiB serialized ≪ 60 KiB cap.
     let meta = striped_map_meta(n, K8_BLOCK_SIZE);
     let expect = meta.block_map.clone().unwrap();
-    router.metadata_cache.insert(path.clone(), meta);
+    router.metadata_cache.insert(ino, meta);
     persist_under_lease(&router, &dlm, &path).await;
 
     let layout = persisted_layout(&routed, ino).await;
@@ -1476,7 +1474,7 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
     // (a) 200 entries — past the OLD 32-entry rule, ≈4 KiB ≪ 60 KiB — inline.
     router
         .metadata_cache
-        .insert(path.clone(), striped_map_meta(200, K8_BLOCK_SIZE));
+        .insert(ino, striped_map_meta(200, K8_BLOCK_SIZE));
     persist_under_lease(&router, &dlm, &path).await;
     assert!(
         is_inline(&persisted_layout(&routed, ino).await),
@@ -1486,7 +1484,7 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
     // (b) grow past the cap (5000 entries ≈ 100 KiB) → spills to indirect.
     let big = striped_map_meta(5000, K8_BLOCK_SIZE);
     let big_map = big.block_map.clone().unwrap();
-    router.metadata_cache.insert(path.clone(), big);
+    router.metadata_cache.insert(ino, big);
     persist_under_lease(&router, &dlm, &path).await;
     let grown = persisted_layout(&routed, ino).await;
     assert!(
@@ -1535,7 +1533,7 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
     // (d) shrink back under the cap → re-inlines (indirect mechanism unchanged).
     let mut shrunk = striped_map_meta(80, K8_BLOCK_SIZE);
     shrunk.block_map_id = grown.block_map_id.clone(); // let save free the old indirect block
-    router.metadata_cache.insert(path.clone(), shrunk);
+    router.metadata_cache.insert(ino, shrunk);
     persist_under_lease(&router, &dlm, &path).await;
     assert!(
         is_inline(&persisted_layout(&routed, ino).await),
@@ -1655,7 +1653,7 @@ async fn test_mixed_node_size_volumes_spill_per_volume() {
         let path = format!("inode_{ino}");
         router
             .metadata_cache
-            .insert(path.clone(), striped_map_meta(n, K8_BLOCK_SIZE));
+            .insert(ino, striped_map_meta(n, K8_BLOCK_SIZE));
         persist_under_lease(&router, &dlm, &path).await;
     }
 

@@ -378,7 +378,7 @@ async fn test_multi_volume_spilled_map_survives_cold_remount_byte_exact() {
     // Cold fetch in-session: the rehydrated map must still carry backend-true
     // (prefixed) keys for the blocks placed on non-default volumes.
     let path = squeezefs::keys::inode_path(ino).to_string();
-    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.router.metadata_cache.invalidate(&ino);
     let fetched = h.fs.router.fetch_metadata(&path).await.expect("cold fetch");
     let map = fetched
         .block_map
@@ -534,7 +534,7 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
     let expect = map.clone();
 
     router.metadata_cache.insert(
-        path.clone(),
+        ino,
         CachedMetadata {
             file_type: "striped".to_string(),
             size: (SPILL_BLOCKS * BLOCK) as u64,
@@ -585,7 +585,7 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
     }
 
     // --- Contract 1: cold rehydrate is key-identical.
-    router.metadata_cache.invalidate(&path);
+    router.metadata_cache.invalidate(&ino);
     let fetched = router.fetch_metadata(&path).await.expect("cold fetch");
     let fetched_map = fetched.block_map.clone().expect("rehydrated block map");
     assert_eq!(
@@ -618,7 +618,7 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
     shrunk.size = 10 * BLOCK as u64;
     shrunk.block_map = Some(std::sync::Arc::new(shrunk_map));
     shrunk.layout_dirty = true;
-    router.metadata_cache.insert(path.clone(), shrunk);
+    router.metadata_cache.insert(ino, shrunk);
     persist_under_lease(&router, &dlm, &path).await;
 
     let inline = persisted_layout(&routed, ino).await;
@@ -681,7 +681,7 @@ async fn test_delete_spilled_file_frees_blocks_on_owning_volumes() {
     // Cold delete: the metadata (and its spilled map) must be re-read from
     // the backend, exactly like a delete after remount/cache expiry.
     let path = squeezefs::keys::inode_path(ino).to_string();
-    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.router.metadata_cache.invalidate(&ino);
     purge_read_tiers(&h);
 
     let mut con = h.fs.router.dlm.get_connection().await.unwrap();
@@ -728,7 +728,7 @@ async fn test_single_volume_spilled_map_keys_stay_bare_and_roundtrip() {
     );
 
     let path = squeezefs::keys::inode_path(ino).to_string();
-    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.router.metadata_cache.invalidate(&ino);
     let fetched = h.fs.router.fetch_metadata(&path).await.expect("cold fetch");
     let map = fetched.block_map.as_ref().expect("block map");
     for (b, key) in map.iter() {
@@ -748,7 +748,7 @@ async fn test_single_volume_spilled_map_keys_stay_bare_and_roundtrip() {
         assert_block_bytes(b, &reply.data);
     }
 
-    h.fs.router.metadata_cache.invalidate(&path);
+    h.fs.router.metadata_cache.invalidate(&ino);
     let mut con = h.fs.router.dlm.get_connection().await.unwrap();
     h.fs.router
         .delete_file(&path, &mut con)

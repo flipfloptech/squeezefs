@@ -462,7 +462,7 @@ async fn truncate_down_stale_size_reads_zeros(
     assert_eq!(m.size, big, "[v3/{lname}] setup: physical size");
     m.size = stale;
     m.cached_at = std::time::Instant::now();
-    h.fs.router.metadata_cache.insert(file_path.clone(), m);
+    h.fs.router.metadata_cache.insert(ino, m);
 
     // Truncate DOWN to `mid`, with `stale < mid < big`. The buggy path treats
     // this as a grow (mid >= stale) and never removes the bytes in [mid, big).
@@ -487,7 +487,7 @@ async fn truncate_down_stale_size_reads_zeros(
     // cache — the property that made the original bug survive daemon SIGKILL +
     // remount. `truncate_layout` already drops read_lru/write_lru, so evicting
     // metadata_cache forces the whole read through the durable path.
-    h.fs.router.metadata_cache.invalidate(&file_path);
+    h.fs.router.metadata_cache.invalidate(&ino);
     let dtag = format!("{tag} (durable re-read)");
     assert_hole(&h, ino, mid, big - mid, &dtag).await;
     if small_present > 0 {

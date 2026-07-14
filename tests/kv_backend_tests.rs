@@ -998,6 +998,13 @@ async fn v3_quick_reformat_buries_previous_generation_records() {
         be.lookup(ROOT_INO, "gen1_0").await.is_err(),
         "dead generation's file served by the freshly formatted volume"
     );
+    // Unmount gen2 before reformatting again: the single-writer guard's
+    // writer_claim now (correctly) marks this backend as a LIVE mount,
+    // and the preflight refuses to format under one — the gen3 format
+    // below used to rip the volume out from under the still-open `be`,
+    // which only "worked" because raw backends left no registration.
+    be.shutdown().await.expect("gen2 clean shutdown");
+    drop(be);
     // The fresh volume must also produce a fresh generation identity
     // (superblock uuid) — the staging generation binding depends on it.
     let g1 = match classify_volume(file.path()).await.unwrap() {

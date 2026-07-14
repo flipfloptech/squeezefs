@@ -129,6 +129,12 @@ enum Commands {
         /// Metadata URI (sqmeta://...)
         meta_uri: String,
     },
+    /// Single-writer mount-guard claim administration
+    /// (docs/design-metadata-throughput.md §5.0)
+    Claim {
+        #[command(subcommand)]
+        action: ClaimActions,
+    },
     /// Mount squeezefs at a target path
     Mount {
         /// Metadata URIs (sqmeta://...) and Mountpoint path (last argument)
@@ -409,6 +415,22 @@ enum Commands {
     Storage {
         #[command(subcommand)]
         action: StorageActions,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum ClaimActions {
+    /// Operator-attested removal of a STALE writer_claim (the recovery
+    /// rung for a crashed cross-host writer on a volume without NVMe
+    /// Persistent Reservations). Refuses fresh claims and live-mounted
+    /// volumes; re-verifies staleness under its own probe. The automation
+    /// ladder ahead of this verb: same-host dead-pid auto-reclaim -> PR
+    /// preempt -> claim TTL. There is NO mount flag that bypasses the
+    /// guard.
+    Clear {
+        /// Metadata URI (sqmeta://...) — every volume in the set is
+        /// cleared in order
+        meta_uri: String,
     },
 }
 
@@ -2083,6 +2105,45 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::set_fs_prefix("squeezefs");
             println!("No active clients connected.");
         }
+        Commands::Claim { action } => {
+            let ClaimActions::Clear { meta_uri } = action;
+            squeezefs::set_fs_prefix("squeezefs");
+            let meta_lvs = parse_block_uri(&meta_uri, "sqmeta://")?;
+            let mut failures = 0usize;
+            for path in &meta_lvs {
+                match squeezefs::meta_backend::kv::backend::KvMetaBackend::claim_clear(
+                    std::path::Path::new(path),
+                )
+                .await
+                {
+                    Ok(squeezefs::meta_backend::kv::backend::ClaimClearOutcome::NoClaim) => {
+                        println!("{path}: no writer claim present — nothing to clear");
+                    }
+                    Ok(squeezefs::meta_backend::kv::backend::ClaimClearOutcome::Cleared(
+                        holder,
+                    )) => {
+                        println!(
+                            "{path}: cleared stale writer claim (holder id={}, pid={}, \
+                             boot={}, last heartbeat ts={}). This was an operator \
+                             attestation that the holder is down — if it was merely \
+                             partitioned, stop it before it reconnects.",
+                            holder.id, holder.pid, holder.boot, holder.ts
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("\x1b[91mERROR\x1b[0m {path}: {e}");
+                        failures += 1;
+                    }
+                }
+            }
+            if failures > 0 {
+                return Err(format!(
+                    "claim clear refused/failed on {failures} of {} volume(s)",
+                    meta_lvs.len()
+                )
+                .into());
+            }
+        }
         Commands::Mount {
             args,
             mem_cache_size,
@@ -2398,15 +2459,28 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Mount every volume through the sector-0 version gate
             // (design-cow-kv-metadata §6.1): v3 mounts read-write (the
             // §4.4 commit pipeline + §4.6 checkpoint task are live);
-            // blank and legacy-v2 volumes refuse loud.
-            let mut meta_backends = Vec::new();
-            for path in &meta_lvs {
-                let be = squeezefs::meta_backend::open_volume_for_mount(path).await?;
+            // blank and legacy-v2 volumes refuse loud. The whole set
+            // opens through the D0 single-writer guard in set order
+            // (design-metadata-throughput §5.0): a refusal on volume k
+            // releases the guards taken on volumes 0..k and fails the
+            // mount LOUD — the refusal text names the holder and the
+            // remedy (dead-pid auto-reclaim / wait for the claim TTL /
+            // `squeezefs claim clear`).
+            let meta_backends = match squeezefs::meta_backend::open_meta_volume_set(&meta_lvs).await
+            {
+                Ok(backends) => backends,
+                Err(e) => {
+                    eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
+                    return Err(e.into());
+                }
+            };
+            for (path, be) in meta_lvs.iter().zip(&meta_backends) {
                 // §10 mount log: format version, ledger seq chosen,
                 // replay entries/dropped/ms, free extents — plus BOTH
                 // resolved-OQ-2 atomicity fields (the contract class and
                 // the physical probe; the probe is informational — the
-                // CoW contract holds by construction).
+                // CoW contract holds by construction) — and the guard
+                // guarantee class this volume actually mounted with.
                 let physical = squeezefs::meta_backend::atomicity::probe_meta_volume(
                     std::path::Path::new(path),
                 );
@@ -2415,7 +2489,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 log::info!(
                     "meta volume {}: format=3 ledger_seq={} replay_entries={} \
                      replay_dropped_torn={} replay_ms={} free_extents={} next_ino={} \
-                     meta_volume_atomicity={} meta_volume_atomicity_physical={}",
+                     meta_volume_atomicity={} meta_volume_atomicity_physical={} \
+                     writer_guard_mode={}",
                     path,
                     be.mounted_ledger().seq,
                     stats.entries,
@@ -2425,8 +2500,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     be.next_ino(),
                     be.atomicity_contract(),
                     physical,
+                    be.writer_guard_mode(),
                 );
-                meta_backends.push(be);
             }
 
             let routed_meta_backend = std::sync::Arc::new(

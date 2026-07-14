@@ -255,6 +255,14 @@ pub enum KvError {
     /// per AGENTS.md; a poisoned/torn device surfaces here as `EIO`).
     #[error("kv extent I/O failed: {0}")]
     Io(#[from] crate::error::SqueezefsError),
+
+    /// D0 single-writer mount guard refusal
+    /// (design-metadata-throughput §5.0): another writer holds the volume
+    /// — flock held, fresh `writer_claim`, or a conflicting NVMe
+    /// reservation. The message names the holder and the remedy; the
+    /// mount exits nonzero.
+    #[error("{0}")]
+    Busy(String),
 }
 
 /// Map KV-layer errors onto the crate error surface (mount / CLI / trait

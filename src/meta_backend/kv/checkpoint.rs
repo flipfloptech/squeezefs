@@ -342,6 +342,10 @@ const CHECKPOINT_MAX_AGE_MS: u128 = 1000;
 /// `tests/dismount_teardown_tests.rs`) — plus an owned liveness token the
 /// teardown tests probe through `checkpoint_alive_probe`.
 pub(super) fn spawn_checkpoint_task(be: &Arc<KvMetaBackend>) {
+    // PR M1 ordering pin (design-metadata-throughput §5.0 B2): the mount
+    // gate committed + barriered the writer_claim BEFORE this call — the
+    // trace event is the spawn hook the ordering assertion reads.
+    be.trace_guard_event("checkpoint_task_spawned");
     let weak = Arc::downgrade(be);
     let alive = Arc::new(());
     let probe = Arc::downgrade(&alive);
@@ -382,11 +386,24 @@ async fn checkpoint_task(
             return; // backend dropped without shutdown: exit, leak nothing
         };
         let shutting_down = be.is_shutting_down();
+        // PR M1 (design-metadata-throughput §5.0, Issue 14): a FAILED
+        // volume — fenced at a barrier (reservation conflict) or latched
+        // by repeated write/barrier failures — is fail-stopped: mutations
+        // already return EIO, and re-running maintenance + barriers every
+        // tick against a fenced/dead device is pure log spam (and, post-
+        // fence, writes past a foreign reservation). Idle until shutdown,
+        // whose final attempt still runs loud. This applies to the
+        // journal-durability paths ONLY — the data-path writeback ladder
+        // lives elsewhere and stays retry-forever (never-lossy contract).
+        if be.is_failed() && !shutting_down {
+            continue;
+        }
         if cadence || shutting_down {
             if let Err(e) = tick(&be, &mut last_checkpoint, shutting_down).await {
                 log::warn!(
                     "kv checkpoint tick failed on {:?}: {e} (state stays RAM-consistent; \
-                     retrying next tick)",
+                     retrying next tick — barrier failures additionally escalate through \
+                     the sync_device rungs, design-metadata-throughput §5.0)",
                     be.device_path()
                 );
             }

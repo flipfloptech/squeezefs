@@ -375,7 +375,11 @@ async fn test_inline_map_recovery_recovers_prefixed_keys_on_owning_volume() {
         .expect("plant layout");
 
     // --- Simulated remount: fresh allocators (same volume names), fresh
-    // router wired exactly like mount, recovery walk.
+    // router wired exactly like mount, recovery walk. The first mount is
+    // dropped FIRST (the sibling smoke test's discipline): the
+    // single-writer guard refuses two concurrent write mounts of one
+    // meta volume, which is exactly what h + h2 alive together would be.
+    drop(h);
     let h2 = mount_h(&specs, meta.path(), false).await;
     for vol in &h2.volumes {
         assert_eq!(

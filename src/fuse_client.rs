@@ -1480,6 +1480,31 @@ impl SqueezefsFilesystem {
                     "meta_kv_pending_free".into(),
                     per_volume(&|be| be.pending_free_extents()),
                 );
+                // PR M1 — the single-writer mount guard (design
+                // §9 Observability): per-volume guarantee class + the
+                // fence / PTPL-reacquire counters.
+                metrics.insert(
+                    "writer_guard_mode".into(),
+                    self.meta_backend
+                        .as_ref()
+                        .map(|mb| {
+                            serde_json::Value::Array(
+                                mb.volumes
+                                    .iter()
+                                    .map(|v| v.writer_guard_mode().into())
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or_default(),
+                );
+                metrics.insert(
+                    "writer_guard_fenced".into(),
+                    per_volume(&|be| be.writer_guard_fenced()),
+                );
+                metrics.insert(
+                    "writer_guard_pr_reacquires".into(),
+                    per_volume(&|be| be.writer_guard_pr_reacquires()),
+                );
             }
         }
 
@@ -6611,6 +6636,12 @@ pub async fn start_mount<P: AsRef<Path>>(
     // can distinguish a live mount from a crashed one. If this process dies
     // ungracefully (kill -9), the heartbeat stops and the registration goes stale
     // after CLIENT_STALE_TTL_SECS, so it no longer blocks `format`.
+    //
+    // PR M1 (design-metadata-throughput §5.0): the single-writer guard
+    // rides the SAME cadence — one staleness law. Each beat refreshes the
+    // per-volume `writer_claim` heartbeat and, on PR-capable namespaces,
+    // runs the Reservation Report re-check (PTPL-lapse re-acquire /
+    // foreign-holder fail-stop / host-identity stability).
     let heartbeat_handle = {
         let fs = fs.clone();
         tokio::spawn(async move {
@@ -6621,6 +6652,11 @@ pub async fn start_mount<P: AsRef<Path>>(
             loop {
                 interval.tick().await;
                 fs.refresh_client_registration().await;
+                if let Some(mb) = fs.meta_backend.as_ref() {
+                    for vol in &mb.volumes {
+                        vol.guard_heartbeat().await;
+                    }
+                }
             }
         })
     };

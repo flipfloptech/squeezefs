@@ -230,6 +230,57 @@ pub struct KvMetaBackend {
     /// Mount-probe hardware classification (resolved OQ 2's second
     /// field), set once by the mount path.
     atomicity_physical: std::sync::OnceLock<crate::meta_backend::atomicity::AtomicityClass>,
+
+    // ---- PR M1: the D0 single-writer mount guard (§5.0) ----
+    /// Layer A lock carrier: a **dedicated, daemon-lifetime** fd holding
+    /// `flock(LOCK_EX)` for the whole mount. Never registered with
+    /// `uring_fs` (its `FdCache` evicts by LRU and would silently release
+    /// a lock riding a cache fd), never read or written — released only
+    /// at clean `shutdown` (after the final checkpoint) or at backend
+    /// drop, which is when the kernel releases the lock (instant crash
+    /// reclaim, no TTL). `None` on probe backends.
+    guard_fd: std::sync::Mutex<Option<std::fs::File>>,
+    /// This mount's writer identity (uuid) — the `writer_claim.id` and the
+    /// input to the PR reservation key.
+    writer_id: String,
+    /// This boot's id (`/proc/sys/kernel/random/boot_id`) — scopes the
+    /// same-host dead-pid proof.
+    boot_id: String,
+    /// Whether this backend committed a `writer_claim` (clean unmount
+    /// deletes it exactly once).
+    claimed: AtomicBool,
+    /// Layer B1: the reservation client when the volume is a PR-capable
+    /// namespace (`RESCAP ≠ 0` — enforcement grade); `None` on everything
+    /// else (detection grade).
+    reservations: Option<Arc<dyn crate::meta_backend::reservation::ReservationClient>>,
+    /// Our 64-bit reservation key: `xxh3_64(writer_id ‖ boot_id)`.
+    pr_key: u64,
+    /// The host identity recorded at mount (§5.0 B1 pt 6 stability
+    /// requirement); set once by the mount gate, compared by the
+    /// heartbeat re-check.
+    pr_identity: std::sync::OnceLock<crate::meta_backend::reservation::HostIdentity>,
+    /// Whether we currently believe we hold the WE reservation (release
+    /// exactly once at clean unmount).
+    pr_active: AtomicBool,
+    /// `writer_guard_fenced` (§9): usurpation-class fail-stops —
+    /// reservation-conflict errno at a barrier, foreign holder at the
+    /// heartbeat re-check, host-identity mismatch.
+    guard_fenced: AtomicU64,
+    /// `writer_guard_pr_reacquires` (§9): PTPL-lapse re-acquisitions.
+    pr_reacquires: AtomicU64,
+    /// Consecutive **barrier** failures (generic class). Deliberately NOT
+    /// `journal_failures`: that counter is reset on every entry-write
+    /// success (`commit_tx` step 6→7), which on the strict path runs
+    /// immediately *before* the barrier — sharing it would erase the
+    /// escalation each commit and consecutive failing barriers could
+    /// never latch (the Issue-14 ordering trap this field exists for).
+    /// Reset on barrier success; latches `failed` at
+    /// [`JOURNAL_FAILURE_LATCH`].
+    barrier_failures: AtomicU64,
+    /// Guard-event trace of this backend's `open` (test/ops surface): the
+    /// pinned order `flock_acquired` → `claim_committed` →
+    /// `claim_barriered` → `checkpoint_task_spawned`.
+    guard_trace: std::sync::Mutex<Vec<&'static str>>,
 }
 
 impl std::fmt::Debug for KvMetaBackend {
@@ -259,6 +310,26 @@ impl KvMetaBackend {
     /// stale/corrupt tree roots, real device I/O errors. Journal-window
     /// tears recover and are counted, never loud (§4.1).
     ///
+    /// **PR M1 — the D0 single-writer mount guard runs here**
+    /// (design-metadata-throughput §5.0), in the pinned order:
+    ///
+    /// 1. **Layer A**: `flock(LOCK_EX | LOCK_NB)` on a dedicated
+    ///    daemon-lifetime guard fd — refuse loud on `EWOULDBLOCK`
+    ///    (same-host exclusivity; kernel-instant crash reclaim).
+    /// 2. Bootstrap replay (the read-only, torn-tolerant `open_probe`
+    ///    sequence) — the `writer_claim` evidence comes from this state.
+    /// 3. **Layer B2** decision: fresh-foreign ⇒ refuse; same-host
+    ///    dead-pid proof / own residue ⇒ reclaim; TTL-stale foreign on a
+    ///    non-PR volume ⇒ refuse naming `squeezefs claim clear` (NO
+    ///    automatic cross-host takeover without device enforcement).
+    /// 4. **Layer B1** on `RESCAP`-capable namespaces: register + acquire
+    ///    Write Exclusive; conflict arbitration (fresh ⇒ refuse,
+    ///    TTL-stale ⇒ PREEMPT — safe because the device fences).
+    /// 5. The claim tx is committed **and barriered** — the volume's
+    ///    first post-replay mutation by construction — and only then is
+    ///    `spawn_checkpoint_task` called (no maintenance record can
+    ///    precede the claim) and the backend returned for FUSE arm.
+    ///
     /// Returns `Arc<Self>` (PR K6b): the per-volume checkpoint/writeback
     /// task holds a `Weak` back-reference to the backend, so construction
     /// and task spawn are one step. The task rides the existing flusher
@@ -266,7 +337,53 @@ impl KvMetaBackend {
     /// [`Self::shutdown`] or when the backend is dropped (the v2 flusher's
     /// sentinel discipline — no leaked tasks).
     pub async fn open(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
-        let be = Arc::new(Self::open_inner(path).await?);
+        // (1) Layer A first: kernel-arbitrated, cheapest, and the refusal
+        // the measured incident (two same-host daemons) needs.
+        let guard_fd = match Self::acquire_writer_flock(path) {
+            Ok(fd) => fd,
+            Err(FlockOutcome::Held) => {
+                let holder = Self::probe_claim_best_effort(path).await;
+                return Err(KvError::Busy(format!(
+                    "{}: another squeezefs process holds the writer lock{} — concurrent \
+                     mounts of one metadata volume are refused (single-writer guard)",
+                    path.display(),
+                    holder_suffix(&holder),
+                )));
+            }
+            Err(FlockOutcome::Io(e)) => {
+                return Err(KvError::Io(crate::error::SqueezefsError::Io(e)));
+            }
+        };
+
+        // (2) Bootstrap replay.
+        let mut inner = Self::open_inner(path).await?;
+        *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
+        inner.writer_id = uuid::Uuid::new_v4().to_string();
+        inner.boot_id = read_boot_id();
+        // Layer B1 resolution: test override first, then the real RESCAP
+        // probe (control-plane ioctl — off the async runtime).
+        let probe_path = path.to_path_buf();
+        inner.reservations = tokio::task::spawn_blocking(move || {
+            crate::meta_backend::reservation::resolve_for_mount(&probe_path)
+        })
+        .await
+        .ok()
+        .flatten();
+        inner.pr_key = xxhash_rust::xxh3::xxh3_64(
+            format!("{}\u{0}{}", inner.writer_id, inner.boot_id).as_bytes(),
+        );
+        let be = Arc::new(inner);
+        be.trace_guard_event("flock_acquired");
+
+        // (3)+(4)+(5) The claim gate: decision, PR acquisition, claim
+        // commit + barrier. Any refusal drops the Arc — flock releases,
+        // nothing was spawned, nothing was written (PR registrations are
+        // rolled back best-effort inside the gate).
+        if let Err(e) = be.writer_guard_gate().await {
+            be.release_reservation().await;
+            return Err(e);
+        }
+
         super::checkpoint::spawn_checkpoint_task(&be);
         Ok(be)
     }
@@ -510,6 +627,18 @@ impl KvMetaBackend {
             ckpt_join: std::sync::Mutex::new(None),
             ckpt_alive: std::sync::Mutex::new(Weak::new()),
             atomicity_physical: std::sync::OnceLock::new(),
+            guard_fd: std::sync::Mutex::new(None),
+            writer_id: String::new(),
+            boot_id: String::new(),
+            claimed: AtomicBool::new(false),
+            reservations: None,
+            pr_key: 0,
+            pr_identity: std::sync::OnceLock::new(),
+            pr_active: AtomicBool::new(false),
+            guard_fenced: AtomicU64::new(0),
+            pr_reacquires: AtomicU64::new(0),
+            barrier_failures: AtomicU64::new(0),
+            guard_trace: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -816,21 +945,77 @@ impl KvMetaBackend {
     /// `SyncCoalescer` group-commit discipline — §4.6 pt 4). After the
     /// barrier, ledger records written before it are known durable: the
     /// §4.6 pt 3 pending-reclaim watermark drains here too.
+    ///
+    /// **PR M1 — barrier-failure escalation lives HERE** (design
+    /// §5.0 B1 pt 3, Issue 14), so every journal-durability barrier —
+    /// the strict `commit_tx` path, the checkpoint tick's deferred-flush
+    /// and cycle barriers, and the fsync path — shares the same two
+    /// rungs:
+    ///
+    /// - **reservation-conflict class** (`EBADE` — the kernel's mapping
+    ///   of the reservation-conflict block status): this holder has been
+    ///   fenced/usurped at the device ⇒ latch `failed` IMMEDIATELY with
+    ///   the guard message (`writer_guard_fenced`). Detection bound:
+    ///   one flush cadence + one barrier.
+    /// - **generic class**: consecutive-barrier-failure rung — reuses the
+    ///   [`JOURNAL_FAILURE_LATCH`] = 3 semantics with success-reset, on a
+    ///   counter deliberately separate from `journal_failures` (which the
+    ///   entry-write success path resets right *before* the strict
+    ///   barrier runs — sharing it would erase the escalation every
+    ///   commit).
+    ///
+    /// Classification happens inside the leader's `sync_fn` because the
+    /// coalescer fans failures out as rendered strings (`raw_os_error`
+    /// does not survive to the waiters) — exactly one classification per
+    /// physical barrier attempt.
+    ///
+    /// **Scope boundary**: this escalation covers journal-durability
+    /// barriers ONLY. The data-path writeback ladder (staging flush /
+    /// block upload retries) is elsewhere and stays retry-forever by
+    /// design — the never-lossy contract.
     pub async fn sync_device(&self) -> Result<()> {
-        let path = self.path.clone();
         self.sync
-            .barrier(|| {
-                let path = path.clone();
-                async move {
-                    crate::fuse_client::METRICS
-                        .meta_device_syncs
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    crate::uring_fs::fdatasync(path).await
+            .barrier(|| async move {
+                crate::fuse_client::METRICS
+                    .meta_device_syncs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let out = crate::uring_fs::fdatasync(self.path.clone()).await;
+                match &out {
+                    Ok(()) => self.note_barrier_success(),
+                    Err(e) => self.note_barrier_failure(e),
                 }
+                out
             })
             .await?;
         self.after_durable_barrier();
         Ok(())
+    }
+
+    /// Barrier succeeded: reset the consecutive-failure rung.
+    fn note_barrier_success(&self) {
+        self.barrier_failures.store(0, Ordering::Release);
+    }
+
+    /// Barrier failed: classify and escalate (see [`Self::sync_device`]).
+    fn note_barrier_failure(&self, e: &crate::error::SqueezefsError) {
+        if let crate::error::SqueezefsError::Io(ioe) = e {
+            if crate::meta_backend::reservation::is_reservation_conflict(ioe) {
+                self.guard_fail_stop(
+                    "reservation-conflict errno at a durability barrier — this holder's \
+                     writes are fenced at the device (usurped or paused-then-preempted)",
+                );
+                return;
+            }
+        }
+        let n = self.barrier_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= JOURNAL_FAILURE_LATCH && !self.failed.swap(true, Ordering::AcqRel) {
+            log::error!(
+                "meta volume {}: {n} consecutive durability-barrier failures — volume \
+                 marked FAILED (mutations return EIO until remount; §4.4 pt 4 semantics \
+                 extended to barriers, design-metadata-throughput §5.0)",
+                self.path.display()
+            );
+        }
     }
 
     /// Post-barrier bookkeeping (§4.6 pt 3, §4.7): every ledger record
@@ -864,7 +1049,25 @@ impl KvMetaBackend {
     /// a final checkpoint (tail == head ⇒ an empty replay window on the
     /// next mount) and JOIN the checkpoint task (no leaked tasks —
     /// `tests/dismount_teardown_tests.rs`). Idempotent.
+    ///
+    /// PR M1: guard teardown brackets the drain — the `writer_claim` is
+    /// deleted first (while the write gate is still open; the final
+    /// checkpoint makes the deletion durable), and the NVMe reservation
+    /// is released last (control-plane, after the final barrier). A
+    /// kill-9 skips both by construction: the claim is reclaimed by the
+    /// dead-pid proof / TTL, the reservation by the successor's preempt.
     pub async fn shutdown(&self) -> std::result::Result<(), KvError> {
+        // D0: delete OUR claim exactly once — best-effort (a fenced or
+        // failed volume cannot write; the claim then ages out by TTL).
+        if self.claimed.swap(false, Ordering::AcqRel) && !self.is_failed() {
+            if let Err(e) = Metadata::removexattr(self, 1, WRITER_CLAIM_XATTR).await {
+                log::warn!(
+                    "meta volume {}: clean unmount could not delete the writer_claim: \
+                     {e} (it will age out by TTL)",
+                    self.path.display()
+                );
+            }
+        }
         self.shutting_down.store(true, Ordering::Release);
         self.ring.wake_parked();
         self.ckpt_wake.notify_waiters();
@@ -882,6 +1085,13 @@ impl KvMetaBackend {
             self.ring.wait_completed_upto(self.ring.core().head()).await;
             self.checkpoint_now().await?;
         }
+        // D0: release the Write Exclusive reservation after the final
+        // barrier (nothing of ours writes past this point), then the
+        // Layer A flock — a shut-down backend no longer excludes anyone
+        // ("lives until shutdown/drop", §5.0; the still-referenced Arc
+        // must not block the volume's next mount).
+        self.release_reservation().await;
+        drop(self.guard_fd.lock().unwrap().take());
         Ok(())
     }
 
@@ -959,7 +1169,305 @@ impl KvMetaBackend {
 // (identity + detection). PR M1.
 // ---------------------------------------------------------------------------
 
+/// Layer A refusal classes: the lock is held (another live writer on this
+/// host) vs a real I/O error opening/locking the node.
+enum FlockOutcome {
+    Held,
+    Io(std::io::Error),
+}
+
+/// Compose the `(claim: id=…, pid=…, boot=…, age=…s)` holder suffix for
+/// refusal messages (design §6: refusals name the holder).
+fn holder_suffix(holder: &Option<(WriterClaim, u64)>) -> String {
+    match holder {
+        Some((c, now)) => format!(
+            " (claim: id={}, pid={}, boot={}, age={}s)",
+            c.id,
+            c.pid,
+            c.boot,
+            c.age_secs(*now)
+        ),
+        None => String::new(),
+    }
+}
+
+/// This boot's id, empty when unreadable (non-Linux dev shells).
+fn read_boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Unix seconds now (the claim heartbeat clock).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The same-host dead-pid proof's pid half: `kill(pid, 0) == ESRCH`.
+/// `EPERM` (alive, foreign uid) and success (alive, ours) are NOT proof.
+fn pid_provably_dead(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    // SAFETY: signal 0 probes process existence without delivering.
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// The Layer B2 mount-gate classification of the replayed claim evidence.
+#[derive(Debug)]
+enum ClaimEvidence {
+    /// No claim (or our own residue / a dead same-host holder): proceed.
+    Reclaimable,
+    /// A heartbeat-fresh claim from a holder we cannot prove dead.
+    FreshForeign(WriterClaim),
+    /// TTL-stale (or unattributable) claim we did not write and cannot
+    /// dead-pid-prove: PR volumes preempt it; non-PR volumes refuse
+    /// (operator attestation only).
+    StaleForeign(Option<WriterClaim>),
+}
+
 impl KvMetaBackend {
+    /// Take the Layer A lock: `flock(LOCK_EX | LOCK_NB)` on a dedicated
+    /// `std::fs::File` (design §5.0 — a `uring_fs` cache fd would drop
+    /// the lock at LRU eviction).
+    fn acquire_writer_flock(path: &Path) -> std::result::Result<std::fs::File, FlockOutcome> {
+        let fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(FlockOutcome::Io)?;
+        // SAFETY: flock on an owned, open fd; NB never blocks.
+        let rc = unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                FlockOutcome::Held
+            } else {
+                FlockOutcome::Io(e)
+            });
+        }
+        Ok(fd)
+    }
+
+    /// Best-effort claim read for refusal messages only (a read-only probe
+    /// of the possibly-live volume — the preflight-sanctioned shape).
+    async fn probe_claim_best_effort(path: &Path) -> Option<(WriterClaim, u64)> {
+        let probe = Self::open_probe(path).await.ok()?;
+        let claim = probe.read_writer_claim().await?;
+        Some((claim, unix_now_secs()))
+    }
+
+    /// Append a guard event to this backend's open trace (also called by
+    /// `spawn_checkpoint_task` — the ordering assertion's spawn hook).
+    pub(super) fn trace_guard_event(&self, ev: &'static str) {
+        self.guard_trace.lock().unwrap().push(ev);
+    }
+
+    /// Classify the replayed claim evidence for the mount gate.
+    fn classify_claim(&self, raw: Option<Vec<u8>>, now: u64) -> ClaimEvidence {
+        let Some(raw) = raw else {
+            return ClaimEvidence::Reclaimable; // absent: first guard-aware mount claims it
+        };
+        let Some(claim) = WriterClaim::decode(&raw) else {
+            // Unattributable bytes prove nothing — never auto-taken.
+            return ClaimEvidence::StaleForeign(None);
+        };
+        let same_host = !self.boot_id.is_empty() && claim.boot == self.boot_id;
+        if same_host && claim.pid == std::process::id() {
+            // Our own residue (drop-without-shutdown in this process).
+            return ClaimEvidence::Reclaimable;
+        }
+        if same_host && pid_provably_dead(claim.pid) {
+            // The dead-pid proof: boot matches this boot AND the pid is
+            // provably gone AND the flock was free (we hold it) — instant
+            // reclaim regardless of heartbeat age (kill -9 leaves a fresh
+            // claim; "no wait ever", §5.0 R6).
+            log::info!(
+                "meta volume {}: reclaiming writer_claim from dead same-host holder \
+                 (id={}, pid={} ESRCH, age={}s)",
+                self.path.display(),
+                claim.id,
+                claim.pid,
+                claim.age_secs(now)
+            );
+            return ClaimEvidence::Reclaimable;
+        }
+        if claim.age_secs(now) <= crate::fuse_client::CLIENT_STALE_TTL_SECS {
+            ClaimEvidence::FreshForeign(claim)
+        } else {
+            ClaimEvidence::StaleForeign(Some(claim))
+        }
+    }
+
+    /// The §5.0 mount gate: claim decision (B2), PR acquisition (B1), and
+    /// the claim commit + barrier — all **before** the checkpoint task
+    /// exists and before any FUSE arm.
+    async fn writer_guard_gate(self: &Arc<Self>) -> std::result::Result<(), KvError> {
+        if self.read_only {
+            // §4.11 read-only mounts withhold every mutation — including
+            // the claim. Layer A still guards; B1/B2 do not apply (the
+            // volume cannot advance its journal from this mount).
+            log::warn!(
+                "meta volume {}: read-only mount — single-writer guard is flock-only \
+                 (no writer_claim is written)",
+                self.path.display()
+            );
+            return Ok(());
+        }
+        let now = unix_now_secs();
+        let raw = self
+            .getxattr(1, WRITER_CLAIM_XATTR)
+            .await
+            .map_err(KvError::Io)?;
+        let evidence = self.classify_claim(raw, now);
+
+        match (&evidence, &self.reservations) {
+            // Fresh foreign holders refuse on every substrate — the PR
+            // acquire would also conflict, but the claim names the holder.
+            (ClaimEvidence::FreshForeign(c), _) => {
+                return Err(KvError::Busy(format!(
+                    "{}: metadata volume is claimed by a live writer{} — concurrent \
+                     mounts of one metadata volume are refused (single-writer guard). \
+                     A crashed holder on THIS host is reclaimed automatically once its \
+                     pid is provably dead; otherwise stop that writer or wait for its \
+                     claim to expire (ttl {}s)",
+                    self.path.display(),
+                    holder_suffix(&Some((c.clone(), now))),
+                    crate::fuse_client::CLIENT_STALE_TTL_SECS,
+                )));
+            }
+            // Stale/unattributable foreign WITHOUT device enforcement:
+            // automatic cross-host takeover is disabled (a paused holder
+            // cannot be detected on a RAM-authoritative backend) —
+            // operator attestation only.
+            (ClaimEvidence::StaleForeign(c), None) => {
+                let named = match c {
+                    Some(c) => holder_suffix(&Some((c.clone(), now))),
+                    None => " (unparseable claim value)".to_string(),
+                };
+                return Err(KvError::Busy(format!(
+                    "{}: stale writer claim{} from another holder — automatic cross-host \
+                     takeover is disabled on volumes without NVMe Persistent Reservations \
+                     (a paused holder cannot be detected); verify the holder is down, then \
+                     run `squeezefs claim clear <sqmeta-uri>` (operator attestation). The \
+                     claim is never auto-taken",
+                    self.path.display(),
+                    named,
+                )));
+            }
+            // Stale foreign WITH enforcement: B1's preempt arbitrates
+            // below (safe — the device fences the victim).
+            (ClaimEvidence::StaleForeign(_), Some(_)) | (ClaimEvidence::Reclaimable, _) => {}
+        }
+
+        // Layer B1: register + acquire Write Exclusive on PR volumes.
+        if let Some(rsv) = self.reservations.clone() {
+            match rsv_call(&rsv, |c| c.host_identity()).await {
+                Ok(id) => {
+                    // Recorded once; the heartbeat re-check verifies
+                    // stability against exactly this value.
+                    let _ = self.pr_identity.set(id);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "meta volume {}: host identity unreadable ({e}) — PR guard \
+                         proceeds; identity stability cannot be verified this session",
+                        self.path.display()
+                    );
+                }
+            }
+            let key = self.pr_key;
+            rsv_call(&rsv, move |c| c.register(key))
+                .await
+                .map_err(|e| self.pr_error("reservation register", e))?;
+            let acquire = rsv_call(&rsv, move |c| c.acquire_write_exclusive(key)).await;
+            match acquire {
+                Ok(()) => {}
+                Err(e) if crate::meta_backend::reservation::is_reservation_conflict(&e) => {
+                    // Arbitration: the evidence here is Reclaimable or
+                    // StaleForeign (fresh refused above) — preempt the
+                    // holder key (device-fenced takeover).
+                    let report = rsv_call(&rsv, |c| c.report())
+                        .await
+                        .map_err(|e| self.pr_error("reservation report", e))?;
+                    let Some(victim) = report.holder_key else {
+                        return Err(KvError::Busy(format!(
+                            "{}: reservation acquire conflicted but the report names no \
+                             holder — refusing to arbitrate blind (single-writer guard)",
+                            self.path.display()
+                        )));
+                    };
+                    rsv_call(&rsv, move |c| c.preempt(key, victim))
+                        .await
+                        .map_err(|e| self.pr_error("reservation preempt", e))?;
+                    log::warn!(
+                        "meta volume {}: preempted stale reservation holder key {victim:#018x} \
+                         (device-fenced takeover; writer_claim evidence was stale/absent)",
+                        self.path.display()
+                    );
+                }
+                Err(e) => return Err(self.pr_error("reservation acquire", e)),
+            }
+            self.pr_active.store(true, Ordering::Release);
+        }
+
+        // Layer B2: commit our claim and make it durable — the volume's
+        // first post-replay mutation, BEFORE the checkpoint task exists.
+        let claim = WriterClaim {
+            id: self.writer_id.clone(),
+            ts: unix_now_secs(),
+            pid: std::process::id(),
+            boot: self.boot_id.clone(),
+        };
+        Metadata::setxattr(&**self, 1, WRITER_CLAIM_XATTR, &claim.encode()).await?;
+        self.claimed.store(true, Ordering::Release);
+        self.trace_guard_event("claim_committed");
+        self.sync_device().await.map_err(KvError::Io)?;
+        self.trace_guard_event("claim_barriered");
+        log::info!(
+            "meta volume {}: writer claim taken (id={}, mode={})",
+            self.path.display(),
+            claim.id,
+            self.writer_guard_mode()
+        );
+        Ok(())
+    }
+
+    fn pr_error(&self, what: &str, e: std::io::Error) -> KvError {
+        KvError::Busy(format!(
+            "{}: {what} failed on the PR-capable namespace: {e} (single-writer guard)",
+            self.path.display()
+        ))
+    }
+
+    /// Release the Write Exclusive reservation exactly once (clean
+    /// unmount / failed mount teardown). Best-effort control-plane call.
+    async fn release_reservation(&self) {
+        if !self.pr_active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(rsv) = self.reservations.clone() {
+            let key = self.pr_key;
+            match rsv_call(&rsv, move |c| c.release(key)).await {
+                Ok(()) => log::debug!("meta volume {}: reservation released", self.path.display()),
+                Err(e) => log::warn!(
+                    "meta volume {}: reservation release failed: {e} (a successor \
+                     preempts it via the TTL-stale rule)",
+                    self.path.display()
+                ),
+            }
+        }
+    }
+
     /// The guarantee class this volume actually mounted with
     /// (`writer_guard_mode` on the stats surface, design §9):
     /// `"flock+pr"` (PR-capable namespace — enforcement-grade cross-host),
@@ -967,15 +1475,21 @@ impl KvMetaBackend {
     /// mount: no claim is written), or `"unguarded"` (probe backends —
     /// never mounted, never in stats).
     pub fn writer_guard_mode(&self) -> &'static str {
-        "unguarded"
+        let guarded = self.guard_fd.lock().unwrap().is_some();
+        match (guarded, &self.reservations) {
+            (false, _) => "unguarded",
+            (true, Some(_)) => "flock+pr",
+            (true, None) if self.read_only => "flock",
+            (true, None) => "flock+claim",
+        }
     }
 
-    /// Reservation-conflict-class barrier failures mapped to guard
-    /// fail-stop (`writer_guard_fenced`, design §9): a fenced/usurped
-    /// holder detected at a durability barrier — working as designed,
-    /// always investigate.
+    /// Reservation-conflict-class barrier failures and usurpation-class
+    /// re-check outcomes mapped to guard fail-stop (`writer_guard_fenced`,
+    /// design §9): a fenced/usurped holder — working as designed, always
+    /// investigate.
     pub fn writer_guard_fenced(&self) -> u64 {
-        0
+        self.guard_fenced.load(Ordering::Relaxed)
     }
 
     /// Heartbeat-cadence Reservation Report re-checks that found
@@ -983,7 +1497,7 @@ impl KvMetaBackend {
     /// (`writer_guard_pr_reacquires`, design §9 — a PTPL-less target
     /// power-cycled; audit the fabric).
     pub fn writer_guard_pr_reacquires(&self) -> u64 {
-        0
+        self.pr_reacquires.load(Ordering::Relaxed)
     }
 
     /// Mount-sequence event trace (guard-harness surface): the ordered
@@ -992,7 +1506,7 @@ impl KvMetaBackend {
     /// `checkpoint_task_spawned` (the claim is the volume's first
     /// post-replay mutation *by construction*, design §5.0 B2).
     pub fn open_trace(&self) -> Vec<&'static str> {
-        Vec::new()
+        self.guard_trace.lock().unwrap().clone()
     }
 
     /// Read and decode the volume's `writer_claim` record (from the
@@ -1006,22 +1520,237 @@ impl KvMetaBackend {
         }
     }
 
-    /// Heartbeat-cadence guard refresh (design §5.0 B1 pt 6 + B2): re-commit
-    /// the `writer_claim` with a fresh timestamp, and on PR volumes
-    /// re-verify host identity + run the Reservation Report re-check
-    /// (holdership lapsed + no foreign holder ⇒ re-acquire, counted;
-    /// foreign holder or identity mismatch ⇒ fail-stop). Best-effort;
-    /// never fails the caller.
-    pub async fn guard_heartbeat(&self) {}
+    /// Usurpation-class fail-stop: latch `failed` loud and count it in
+    /// `writer_guard_fenced`.
+    fn guard_fail_stop(&self, why: &str) {
+        self.guard_fenced.fetch_add(1, Ordering::AcqRel);
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            log::error!(
+                "meta volume {}: single-writer guard fail-stop — {why}; volume marked \
+                 FAILED (mutations return EIO until remount; writer_guard_fenced)",
+                self.path.display()
+            );
+        }
+    }
+
+    /// Heartbeat-cadence guard refresh (design §5.0 B1 pt 6 + B2): on PR
+    /// volumes re-verify host-identity stability and run the Reservation
+    /// Report re-check (holdership lapsed + no foreign holder ⇒
+    /// re-register + re-acquire, counted in `writer_guard_pr_reacquires`;
+    /// foreign holder or identity mismatch ⇒ fail-stop), then re-commit
+    /// the `writer_claim` with a fresh timestamp. Best-effort; never
+    /// fails the caller.
+    pub async fn guard_heartbeat(&self) {
+        if self.guard_fd.lock().unwrap().is_none()
+            || self.read_only
+            || self.is_failed()
+            || self.is_shutting_down()
+        {
+            return;
+        }
+        // B1 first: never refresh a claim past a foreign reservation.
+        if let Some(rsv) = self.reservations.clone() {
+            match rsv_call(&rsv, |c| c.host_identity()).await {
+                Ok(current) => {
+                    if let Some(recorded) = self.pr_identity.get() {
+                        if *recorded != current {
+                            self.guard_fail_stop(&format!(
+                                "host identity changed under the reservation \
+                                 (recorded hostnqn={} hostid={}, now hostnqn={} hostid={}) — \
+                                 our registration is not ours (stable hostnqn/hostid is \
+                                 required for guarded namespaces)",
+                                recorded.hostnqn, recorded.hostid, current.hostnqn, current.hostid
+                            ));
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "meta volume {}: host identity unreadable at re-check ({e}); \
+                         skipping this beat",
+                        self.path.display()
+                    );
+                    return;
+                }
+            }
+            match rsv_call(&rsv, |c| c.report()).await {
+                Ok(rep) => match rep.holder_key {
+                    Some(k) if k == self.pr_key => {}
+                    None => {
+                        // PTPL lapse: the target dropped the reservation
+                        // (power cycle) and nothing took it — re-prove
+                        // holdership.
+                        let key = self.pr_key;
+                        let re = async {
+                            rsv_call(&rsv, move |c| c.register(key)).await?;
+                            rsv_call(&rsv, move |c| c.acquire_write_exclusive(key)).await
+                        }
+                        .await;
+                        match re {
+                            Ok(()) => {
+                                self.pr_reacquires.fetch_add(1, Ordering::AcqRel);
+                                self.pr_active.store(true, Ordering::Release);
+                                log::warn!(
+                                    "meta volume {}: reservation holdership had lapsed \
+                                     (PTPL-less target power cycle?) — re-acquired \
+                                     (writer_guard_pr_reacquires); audit the fabric",
+                                    self.path.display()
+                                );
+                            }
+                            Err(e) => {
+                                self.guard_fail_stop(&format!(
+                                    "re-acquire after reservation lapse failed ({e}) — \
+                                     another mount may have taken the namespace"
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    Some(foreign) => {
+                        self.guard_fail_stop(&format!(
+                            "reservation is held by a foreign registrant \
+                             (key {foreign:#018x}) — this holder has been usurped"
+                        ));
+                        return;
+                    }
+                },
+                Err(e) => {
+                    log::warn!(
+                        "meta volume {}: reservation report failed at re-check ({e}); \
+                         retrying next beat",
+                        self.path.display()
+                    );
+                }
+            }
+        }
+        // B2: refresh the claim heartbeat (one staleness law with the
+        // client registrations).
+        if self.claimed.load(Ordering::Acquire) {
+            let claim = WriterClaim {
+                id: self.writer_id.clone(),
+                ts: unix_now_secs(),
+                pid: std::process::id(),
+                boot: self.boot_id.clone(),
+            };
+            if let Err(e) = Metadata::setxattr(self, 1, WRITER_CLAIM_XATTR, &claim.encode()).await {
+                log::warn!(
+                    "meta volume {}: writer_claim heartbeat refresh failed: {e}",
+                    self.path.display()
+                );
+            }
+        }
+    }
 
     /// The `squeezefs claim clear` admin verb body (design §5.0):
     /// operator-attested removal of a **stale** `writer_claim` on `path`.
     /// Refuses fresh claims, refuses when the volume is flock-held on this
     /// host or live-mounted anywhere (`format_preflight`-style live-check),
     /// and makes the removal durable before returning.
-    pub async fn claim_clear(_path: &Path) -> std::result::Result<ClaimClearOutcome, KvError> {
-        Ok(ClaimClearOutcome::NoClaim)
+    pub async fn claim_clear(path: &Path) -> std::result::Result<ClaimClearOutcome, KvError> {
+        // Layer A live-check: a held flock IS a live same-host mount.
+        let guard_fd = match Self::acquire_writer_flock(path) {
+            Ok(fd) => fd,
+            Err(FlockOutcome::Held) => {
+                return Err(KvError::Busy(format!(
+                    "{}: refusing to clear the writer claim — the volume is live-mounted \
+                     on this host (the writer lock is held). Unmount it first",
+                    path.display()
+                )));
+            }
+            Err(FlockOutcome::Io(e)) => {
+                return Err(KvError::Io(crate::error::SqueezefsError::Io(e)));
+            }
+        };
+        let mut inner = Self::open_inner(path).await?;
+        *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
+        let be = Arc::new(inner);
+        let now = unix_now_secs();
+
+        // Preflight-style live sweep: fresh client registrations mean a
+        // live mount somewhere — never clear under one.
+        let mut live: Vec<String> = Vec::new();
+        if let Ok(attrs) = be.listxattr(1).await {
+            for k in attrs.iter().filter(|k| k.starts_with("client:")) {
+                if let Ok(Some(val)) = be.getxattr(1, k).await {
+                    let fresh = serde_json::from_slice::<serde_json::Value>(&val)
+                        .ok()
+                        .and_then(|v| v.get("ts")?.as_u64())
+                        .map(|ts| {
+                            now.saturating_sub(ts) <= crate::fuse_client::CLIENT_STALE_TTL_SECS
+                        })
+                        .unwrap_or(false);
+                    if fresh {
+                        live.push(k.clone());
+                    }
+                }
+            }
+        }
+        if !live.is_empty() {
+            return Err(KvError::Busy(format!(
+                "{}: refusing to clear the writer claim — the volume has live client \
+                 registrations: {live:?}",
+                path.display()
+            )));
+        }
+
+        let raw = be
+            .getxattr(1, WRITER_CLAIM_XATTR)
+            .await
+            .map_err(KvError::Io)?;
+        let Some(raw) = raw else {
+            return Ok(ClaimClearOutcome::NoClaim);
+        };
+        let holder = WriterClaim::decode(&raw);
+        if let Some(c) = &holder {
+            if c.age_secs(now) <= crate::fuse_client::CLIENT_STALE_TTL_SECS {
+                return Err(KvError::Busy(format!(
+                    "{}: refusing to clear a FRESH writer claim{} — the holder heartbeated \
+                     within the {}s ttl and may be alive. Stop that writer (or wait for \
+                     the claim to expire), then retry",
+                    path.display(),
+                    holder_suffix(&Some((c.clone(), now))),
+                    crate::fuse_client::CLIENT_STALE_TTL_SECS,
+                )));
+            }
+        }
+        // Stale (or unattributable — clearable by the same attestation):
+        // remove durably: commit + barrier + checkpoint (this backend has
+        // no checkpoint task; drive the cycle explicitly).
+        Metadata::removexattr(&*be, 1, WRITER_CLAIM_XATTR).await?;
+        be.sync_device().await.map_err(KvError::Io)?;
+        be.checkpoint_now().await?;
+        log::info!(
+            "meta volume {}: writer claim cleared by operator attestation{}",
+            path.display(),
+            holder_suffix(&holder.clone().map(|c| (c, now))),
+        );
+        Ok(ClaimClearOutcome::Cleared(holder.unwrap_or(WriterClaim {
+            id: "<unparseable claim value>".to_string(),
+            ts: 0,
+            pid: 0,
+            boot: String::new(),
+        })))
     }
+}
+
+/// Run one synchronous reservation command off the async runtime
+/// (control-plane micro-ioctl on the real client, pure memory on the
+/// fake).
+async fn rsv_call<T, F>(
+    rsv: &Arc<dyn crate::meta_backend::reservation::ReservationClient>,
+    f: F,
+) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn crate::meta_backend::reservation::ReservationClient) -> std::io::Result<T>
+        + Send
+        + 'static,
+{
+    let rsv = rsv.clone();
+    tokio::task::spawn_blocking(move || f(rsv.as_ref()))
+        .await
+        .map_err(|e| std::io::Error::other(format!("reservation task join: {e}")))?
 }
 
 // ---------------------------------------------------------------------------

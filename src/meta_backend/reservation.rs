@@ -136,6 +136,304 @@ pub fn override_for(path: &Path) -> Option<Arc<dyn ReservationClient>> {
     overrides().lock().unwrap().get(path).cloned()
 }
 
+/// Resolve the reservation client the mount guard will drive for `path`
+/// (design §5.0 B1): the test override wins; otherwise probe the real
+/// device. Returns `Some` only when the namespace advertises reservation
+/// support (`RESCAP ≠ 0`) — everything else degrades to detection grade
+/// (`None`), **never** failing the mount. Blocking (one-shot ioctls);
+/// call off the async runtime.
+pub fn resolve_for_mount(path: &Path) -> Option<Arc<dyn ReservationClient>> {
+    let client: Arc<dyn ReservationClient> = match override_for(path) {
+        Some(c) => c,
+        None => NvmeReservationClient::open(path)?,
+    };
+    match client.rescap() {
+        Ok(cap) if cap != 0 => Some(client),
+        Ok(_) => {
+            log::info!(
+                "meta volume {}: namespace advertises no reservation support (RESCAP=0) \
+                 — single-writer guard degrades to detection grade (flock+claim)",
+                path.display()
+            );
+            None
+        }
+        Err(e) => {
+            log::debug!(
+                "meta volume {}: RESCAP probe failed ({e}) — detection grade",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The real client: NVMe passthru ioctls on the namespace fd.
+// ---------------------------------------------------------------------------
+
+/// `struct nvme_passthru_cmd` (uapi/linux/nvme_ioctl.h) — one layout for
+/// admin and I/O passthru.
+#[repr(C)]
+#[derive(Default)]
+struct NvmePassthruCmd {
+    opcode: u8,
+    flags: u8,
+    rsvd1: u16,
+    nsid: u32,
+    cdw2: u32,
+    cdw3: u32,
+    metadata: u64,
+    addr: u64,
+    metadata_len: u32,
+    data_len: u32,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+    cdw13: u32,
+    cdw14: u32,
+    cdw15: u32,
+    timeout_ms: u32,
+    result: u32,
+}
+
+/// `_IO('N', 0x40)` — returns the namespace id.
+const NVME_IOCTL_ID: libc::c_ulong = 0x4E40;
+/// `_IOWR('N', 0x41, struct nvme_admin_cmd)`.
+const NVME_IOCTL_ADMIN_CMD: libc::c_ulong = 0xC048_4E41;
+/// `_IOWR('N', 0x43, struct nvme_passthru_cmd)`.
+const NVME_IOCTL_IO_CMD: libc::c_ulong = 0xC048_4E43;
+
+/// NVMe opcodes (NVM command set + admin).
+const NVME_ADMIN_IDENTIFY: u8 = 0x06;
+const NVME_CMD_RESV_REGISTER: u8 = 0x0d;
+const NVME_CMD_RESV_REPORT: u8 = 0x0e;
+const NVME_CMD_RESV_ACQUIRE: u8 = 0x11;
+const NVME_CMD_RESV_RELEASE: u8 = 0x15;
+
+/// Reservation type: Write Exclusive (reads from all hosts, writes from
+/// the holder only — probes keep working, §5.0 B1 pt 2).
+const RTYPE_WRITE_EXCLUSIVE: u32 = 1;
+/// NVMe generic status: Reservation Conflict.
+const NVME_SC_RESERVATION_CONFLICT: i32 = 0x83;
+
+/// The passthru ioctls on a real NVMe namespace: `RESCAP` via Identify
+/// Namespace, Register / Acquire / Preempt / Release / Report as NVM I/O
+/// commands, and the host identity from the controller's sysfs (fabrics)
+/// or `/etc/nvme` (the nvme-cli convention the repo's connect path
+/// defers to, `nvmeof.rs`).
+#[derive(Debug)]
+pub struct NvmeReservationClient {
+    file: std::fs::File,
+    nsid: u32,
+}
+
+impl NvmeReservationClient {
+    /// Open `path` as an NVMe namespace: block device + answering
+    /// `NVME_IOCTL_ID`. `None` for regular files, loop devices, and
+    /// anything else that is not an NVMe namespace.
+    pub fn open(path: &Path) -> Option<Arc<Self>> {
+        use std::os::unix::fs::FileTypeExt;
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.file_type().is_block_device() {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .ok()?;
+        // SAFETY: NVME_IOCTL_ID takes no argument and returns the nsid
+        // (or -1/errno on non-NVMe nodes).
+        let rc = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&file), NVME_IOCTL_ID) };
+        if rc <= 0 {
+            return None;
+        }
+        Some(Arc::new(Self {
+            file,
+            nsid: rc as u32,
+        }))
+    }
+
+    fn fd(&self) -> i32 {
+        std::os::fd::AsRawFd::as_raw_fd(&self.file)
+    }
+
+    /// Issue one passthru command; maps the NVMe Reservation Conflict
+    /// status to the [`reservation_conflict_error`] class and every other
+    /// nonzero status / errno to a descriptive `io::Error`.
+    fn passthru(&self, ioctl: libc::c_ulong, cmd: &mut NvmePassthruCmd) -> io::Result<()> {
+        // SAFETY: cmd is a properly-initialized repr(C) struct whose
+        // addr/data_len name a live buffer for the command's transfer.
+        let rc = unsafe { libc::ioctl(self.fd(), ioctl, cmd as *mut NvmePassthruCmd) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            // Some paths surface the conflict as the mapped block-status
+            // errno rather than an NVMe status value.
+            if is_reservation_conflict(&e) {
+                return Err(reservation_conflict_error());
+            }
+            return Err(e);
+        }
+        if rc != 0 {
+            // Positive return = NVMe status (SCT/SC, sans phase); the
+            // reservation-conflict status is the arbitration signal.
+            if rc & 0x7ff == NVME_SC_RESERVATION_CONFLICT {
+                return Err(reservation_conflict_error());
+            }
+            return Err(io::Error::other(format!(
+                "nvme command 0x{:02x} failed with status 0x{rc:x}",
+                cmd.opcode
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reservation Register / Unregister / Replace share one shape:
+    /// 16 B payload `[crkey, nrkey]`, action in CDW10.
+    fn resv_register(&self, cdw10: u32, crkey: u64, nrkey: u64) -> io::Result<()> {
+        let mut data = [0u8; 16];
+        data[..8].copy_from_slice(&crkey.to_le_bytes());
+        data[8..].copy_from_slice(&nrkey.to_le_bytes());
+        let mut cmd = NvmePassthruCmd {
+            opcode: NVME_CMD_RESV_REGISTER,
+            nsid: self.nsid,
+            addr: data.as_mut_ptr() as u64,
+            data_len: data.len() as u32,
+            cdw10,
+            ..Default::default()
+        };
+        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)
+    }
+
+    /// Reservation Acquire / Preempt: 16 B payload `[crkey, prkey]`.
+    fn resv_acquire(&self, racqa: u32, crkey: u64, prkey: u64) -> io::Result<()> {
+        let mut data = [0u8; 16];
+        data[..8].copy_from_slice(&crkey.to_le_bytes());
+        data[8..].copy_from_slice(&prkey.to_le_bytes());
+        let mut cmd = NvmePassthruCmd {
+            opcode: NVME_CMD_RESV_ACQUIRE,
+            nsid: self.nsid,
+            addr: data.as_mut_ptr() as u64,
+            data_len: data.len() as u32,
+            cdw10: (RTYPE_WRITE_EXCLUSIVE << 8) | racqa,
+            ..Default::default()
+        };
+        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)
+    }
+}
+
+impl ReservationClient for NvmeReservationClient {
+    fn rescap(&self) -> io::Result<u8> {
+        // Identify Namespace (CNS 0): RESCAP is byte 31.
+        let mut data = vec![0u8; 4096];
+        let mut cmd = NvmePassthruCmd {
+            opcode: NVME_ADMIN_IDENTIFY,
+            nsid: self.nsid,
+            addr: data.as_mut_ptr() as u64,
+            data_len: data.len() as u32,
+            cdw10: 0, // CNS 0: Identify Namespace
+            ..Default::default()
+        };
+        self.passthru(NVME_IOCTL_ADMIN_CMD, &mut cmd)?;
+        Ok(data[31])
+    }
+
+    fn host_identity(&self) -> io::Result<HostIdentity> {
+        // The nvme-cli convention (the repo's connect path defers to it):
+        // /etc/nvme/hostnqn + /etc/nvme/hostid. Absent files read as
+        // empty — stability then means "still absent" at the re-check.
+        let read = |p: &str| -> String {
+            std::fs::read_to_string(p)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        Ok(HostIdentity {
+            hostnqn: read("/etc/nvme/hostnqn"),
+            hostid: read("/etc/nvme/hostid"),
+        })
+    }
+
+    fn register(&self, key: u64) -> io::Result<()> {
+        // RREGA 0 (register) + IEKEY (bit 3: ignore existing key — makes
+        // re-registration after a crash idempotent) + CPTPL 11b (bits
+        // 31:30: persist through power loss where supported).
+        let cptpl_set = 0b11u32 << 30;
+        match self.resv_register(cptpl_set | 0x8, 0, key) {
+            Ok(()) => Ok(()),
+            Err(e) if is_reservation_conflict(&e) => Err(e),
+            Err(_) => {
+                // Targets vary on IEKEY/CPTPL support (both are probed in
+                // the M1 root session): retry the plain shape.
+                self.resv_register(0x8, 0, key).or_else(|_| {
+                    // Last resort: no IEKEY (key not previously registered).
+                    self.resv_register(0, 0, key)
+                })
+            }
+        }
+    }
+
+    fn acquire_write_exclusive(&self, key: u64) -> io::Result<()> {
+        self.resv_acquire(0, key, 0)
+    }
+
+    fn preempt(&self, key: u64, victim_key: u64) -> io::Result<()> {
+        self.resv_acquire(1, key, victim_key)
+    }
+
+    fn release(&self, key: u64) -> io::Result<()> {
+        let mut data = [0u8; 8];
+        data.copy_from_slice(&key.to_le_bytes());
+        let mut cmd = NvmePassthruCmd {
+            opcode: NVME_CMD_RESV_RELEASE,
+            nsid: self.nsid,
+            addr: data.as_mut_ptr() as u64,
+            data_len: data.len() as u32,
+            cdw10: RTYPE_WRITE_EXCLUSIVE << 8, // RRELA 0: release
+            ..Default::default()
+        };
+        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)
+    }
+
+    fn report(&self) -> io::Result<ReservationReport> {
+        // Reservation Report: header (gen u32, rtype u8, regctl u16, ...)
+        // + regctl × 24 B registered-controller data structures.
+        let mut data = vec![0u8; 4096];
+        let numd = (data.len() / 4 - 1) as u32; // 0-based dword count
+        let mut cmd = NvmePassthruCmd {
+            opcode: NVME_CMD_RESV_REPORT,
+            nsid: self.nsid,
+            addr: data.as_mut_ptr() as u64,
+            data_len: data.len() as u32,
+            cdw10: numd,
+            cdw11: 0, // EDS 0: 24-byte registered-controller structures
+            ..Default::default()
+        };
+        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)?;
+        let rtype = data[4];
+        let regctl = u16::from_le_bytes([data[5], data[6]]) as usize;
+        let mut registered_keys = Vec::with_capacity(regctl);
+        let mut holder_key = None;
+        for i in 0..regctl {
+            let base = 24 + i * 24;
+            if base + 24 > data.len() {
+                break;
+            }
+            // Registered Controller Data Structure: cntlid u16, rcsts u8,
+            // rsvd, hostid u64, rkey u64.
+            let rcsts = data[base + 2];
+            let rkey = u64::from_le_bytes(data[base + 16..base + 24].try_into().unwrap());
+            registered_keys.push(rkey);
+            if rcsts & 0x1 != 0 && rtype != 0 {
+                holder_key = Some(rkey);
+            }
+        }
+        Ok(ReservationReport {
+            holder_key,
+            registered_keys,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // In-memory fake: one shared "namespace" (the reservation state lives in
 // the *device*), any number of per-"host" clients against it.

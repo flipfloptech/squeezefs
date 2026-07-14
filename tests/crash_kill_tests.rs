@@ -640,14 +640,17 @@ async fn test_rollback_race_seq_conditional() {
             }
         }
 
-        // RAM == replay (the §4.4 pt 4 theorem): a fresh mount of the
+        // RAM == replay (the §4.4 pt 4 theorem): a fresh PROBE of the
         // same bytes folds to exactly the live in-RAM state — the failed
         // writer's hole is dropped, the concurrent committed Δtime on the
-        // shared parent-key survives the rollback.
+        // shared parent-key survives the rollback. (open_probe, not open:
+        // `be` is still live-mounted, and the single-writer guard now
+        // refuses a second write mount of one volume — which is also why
+        // the old comment called this remount "read-only-in-spirit".)
         let d_live = squeezefs::meta_backend::kv::builder::digest_walk(&be.trees())
             .await
             .unwrap();
-        let replayed = KvMetaBackend::open(&vol).await.unwrap();
+        let replayed = KvMetaBackend::open_probe(&vol).await.unwrap();
         let d_replay = digest_backend(&replayed).await.unwrap();
         assert_eq!(
             d_live, d_replay,

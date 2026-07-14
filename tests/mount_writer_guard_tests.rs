@@ -1001,6 +1001,57 @@ async fn test_torn_claim_entry_recovers_and_reclaims() {
     be.shutdown().await.unwrap();
 }
 
+/// M1 acceptance harness — the bounded root nvmet session (design §5.0
+/// B1 pt 5 / OQ 4a): exercises the REAL passthru `ReservationClient`
+/// against the namespace named by `SQUEEZEFS_M1_ROOT_DEV` (the baseline's
+/// nvmet-loop recipe). Inert without the env var; run as root:
+///
+/// ```text
+/// sudo env SQUEEZEFS_M1_ROOT_DEV=/dev/nvmeXnY \
+///   <test-binary> --exact root_session_real_nvme_reservations --nocapture
+/// ```
+///
+/// Prints the RESCAP probe (settles OQ 4a for the target under test) and,
+/// when reservations are supported, validates register → acquire-WE →
+/// report → release end to end through our ioctl encoding.
+#[test]
+fn root_session_real_nvme_reservations() {
+    let Ok(dev) = std::env::var("SQUEEZEFS_M1_ROOT_DEV") else {
+        return;
+    };
+    use squeezefs::meta_backend::reservation::{NvmeReservationClient, ReservationClient};
+    let client = NvmeReservationClient::open(std::path::Path::new(&dev))
+        .expect("SQUEEZEFS_M1_ROOT_DEV must be an NVMe namespace block device");
+    let rescap = client.rescap().expect("Identify Namespace (RESCAP probe)");
+    println!("[m1-root] {dev}: RESCAP = {rescap:#04x}");
+    println!(
+        "[m1-root] host identity: {:?}",
+        client.host_identity().expect("host identity")
+    );
+    if rescap == 0 {
+        println!(
+            "[m1-root] target advertises NO reservation support — the guard degrades \
+             to detection grade on this namespace (design §5.0 table); the in-tree \
+             barrier-layer fence-injection tests carry the enforcement assertion"
+        );
+        return;
+    }
+    let key = 0x5155_4545_5A45_0001u64; // "QUEEZE" + 1
+    client.register(key).expect("reservation register");
+    client
+        .acquire_write_exclusive(key)
+        .expect("reservation acquire (Write Exclusive)");
+    let rep = client.report().expect("reservation report");
+    println!("[m1-root] post-acquire report: {rep:?}");
+    assert_eq!(rep.holder_key, Some(key), "we hold the WE reservation");
+    assert!(rep.registered_keys.contains(&key));
+    client.release(key).expect("reservation release");
+    let rep = client.report().expect("post-release report");
+    println!("[m1-root] post-release report: {rep:?}");
+    assert_eq!(rep.holder_key, None, "release cleared the reservation");
+    println!("[m1-root] register/acquire/report/release validated against {dev}");
+}
+
 /// Child branch for the two-process case: attempt a second write-mount of
 /// the volume named by `SQUEEZEFS_GUARD_VOL`. Exit code 3 = refused (the
 /// guard message is written to `SQUEEZEFS_GUARD_OUT`); exit 0 = mounted

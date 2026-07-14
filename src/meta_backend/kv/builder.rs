@@ -660,6 +660,11 @@ pub struct BuiltImage {
 /// order; tombstones and unfolded deltas excluded — so two states compare
 /// by user-visible content, not physical encoding. Used by the builder
 /// determinism tests and the torn-ledger fallback crash case.
+///
+/// The `writer_claim` record (PR M1, design-metadata-throughput §5.0) is
+/// **excluded**: it is per-mount guard state, unique to every mount *by
+/// design* (fresh writer id + heartbeat), not user-visible content — two
+/// replays of one filesystem under different mounts must digest equal.
 pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
     const WALK_PAGE: usize = 1024;
     let mut h = xxhash_rust::xxh3::Xxh3::new();
@@ -673,6 +678,13 @@ pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
             };
             cursor = key_successor(last_key);
             for (k, v) in &page {
+                if tree.tree_id() == TREE_XATTRS
+                    && XattrValue::decode(v)
+                        .map(|x| x.name == super::backend::WRITER_CLAIM_XATTR.as_bytes())
+                        .unwrap_or(false)
+                {
+                    continue; // mount-guard state, not filesystem content
+                }
                 h.update(&(k.len() as u64).to_le_bytes());
                 h.update(k);
                 h.update(&(v.len() as u64).to_le_bytes());
@@ -774,7 +786,15 @@ pub async fn format_preflight(
                 let ttl = crate::fuse_client::CLIENT_STALE_TTL_SECS;
                 let mut live = Vec::new();
                 if let Ok(attrs) = be.listxattr(ROOT_INO).await {
-                    for k in attrs.iter().filter(|k| k.starts_with("client:")) {
+                    // PR M1 (design-metadata-throughput §5.0): the live
+                    // sweep covers `client:* ∪ writer_claim` — the mount
+                    // guard's claim record marks a live writer exactly
+                    // like a registration marks a live client, under the
+                    // ONE staleness law (its JSON carries the same
+                    // `{"ts":…}` heartbeat this parser reads).
+                    for k in attrs.iter().filter(|k| {
+                        k.starts_with("client:") || k.as_str() == super::backend::WRITER_CLAIM_XATTR
+                    }) {
                         let fresh = match be.getxattr(ROOT_INO, k).await {
                             Ok(Some(val)) => parse_client_registration_ts(&val)
                                 .map(|ts| now.saturating_sub(ts) <= ttl)

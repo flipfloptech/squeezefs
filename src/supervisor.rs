@@ -122,12 +122,11 @@ impl SupervisorState {
 }
 
 /// Minor number of a `dev_t` — the id `/sys/fs/fuse/connections/` keys by
-/// (FUSE assigns each connection an anonymous block device; the mount
-/// root's `st_dev` minor is the connection id, the JuiceFS derivation).
+/// (FUSE assigns each connection an anonymous device; the mount root's
+/// `st_dev` minor is the connection id, the JuiceFS derivation). Uses the
+/// glibc extended encoding so >8-bit minors round-trip.
 pub fn minor_of_dev(dev: u64) -> u64 {
-    // RED scaffold.
-    let _ = dev;
-    0
+    libc::minor(dev) as u64
 }
 
 /// Resolve the FUSE connection id for a mounted path (stat → st_dev →
@@ -144,30 +143,58 @@ fn conn_dir(sysfs_root: &Path, conn_id: u64) -> PathBuf {
 }
 
 /// Read the connection's `waiting` count (requests blocked in the kernel).
-/// `None` when the file is missing/unreadable.
+/// `None` when the file is missing/unreadable/unparseable.
 pub fn connection_waiting(sysfs_root: &Path, conn_id: u64) -> Option<u64> {
-    // RED scaffold.
-    let _ = (sysfs_root, conn_id);
-    None
+    let raw = std::fs::read_to_string(conn_dir(sysfs_root, conn_id).join("waiting")).ok()?;
+    raw.trim().parse::<u64>().ok()
 }
 
 /// Write `1` to the connection's `abort` file — the kernel then fails all
 /// in-flight and future requests on this connection with ECONNABORTED,
 /// releasing blocked callers (the "unwedge"). Destructive by design: the
-/// mount is dead afterwards and must be remounted.
+/// mount is dead afterwards and must be remounted. Fails loudly when the
+/// connection directory is gone (already unmounted) or unwritable (needs
+/// root on the real sysfs).
 pub fn abort_fuse_connection(sysfs_root: &Path, conn_id: u64) -> io::Result<()> {
-    // RED scaffold: no write.
-    let _ = conn_dir(sysfs_root, conn_id);
-    Ok(())
+    std::fs::write(conn_dir(sysfs_root, conn_id).join("abort"), "1")
 }
 
 /// Best-effort daemon state dump for the escalation log: /proc status,
-/// wchan and per-task kernel stacks (stacks need root; unreadable pieces
-/// are skipped, never fatal).
+/// per-task wchan and kernel stacks (stacks need root; unreadable pieces
+/// are skipped, never fatal — the JuiceFS `printThreadsStack` shape).
 pub fn dump_daemon_state(pid: u32) -> String {
-    // RED scaffold.
-    let _ = pid;
-    String::new()
+    let mut out = format!("=== daemon state dump: pid {pid} ===\n");
+    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => out.push_str(&status),
+        Err(e) => {
+            out.push_str(&format!("/proc/{pid}/status unavailable: {e}\n"));
+            return out;
+        }
+    }
+    let tasks = match std::fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(t) => t,
+        Err(e) => {
+            out.push_str(&format!("/proc/{pid}/task unavailable: {e}\n"));
+            return out;
+        }
+    };
+    for task in tasks.flatten() {
+        let tid = task.file_name();
+        let tid = tid.to_string_lossy();
+        let base = task.path();
+        let comm = std::fs::read_to_string(base.join("comm")).unwrap_or_default();
+        let wchan = std::fs::read_to_string(base.join("wchan")).unwrap_or_default();
+        out.push_str(&format!(
+            "--- tid {tid} ({}) wchan={}\n",
+            comm.trim(),
+            wchan.trim()
+        ));
+        // Kernel stacks are root-only; skip silently when unreadable.
+        if let Ok(stack) = std::fs::read_to_string(base.join("stack")) {
+            out.push_str(&stack);
+        }
+    }
+    out
 }
 
 /// Probe the mount's `.stats` inode with a hard timeout. The stat runs on
@@ -187,4 +214,115 @@ pub fn probe_stats_inode(mountpoint: &Path, timeout: Duration) -> bool {
         .map(|_| ())
         .unwrap_or(());
     matches!(rx.recv_timeout(timeout), Ok(true))
+}
+
+/// Is the daemon PID still alive? (`kill(pid, 0)` — the supervisor exits
+/// when its child is gone; restarting is the operator's manual step.)
+fn daemon_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// The `squeezefs mount --supervise` parent loop (survey P1-B; JuiceFS
+/// `cmd/mount_unix.go` ladder minus the kill rungs — killing/restarting
+/// stays a manual runbook step, printed at escalation with the exact PID;
+/// this process never pattern-kills anything).
+///
+/// Runs until the supervised daemon exits. std-only by design: the parent
+/// never starts a tokio runtime.
+pub fn run_supervisor(
+    mountpoint: &Path,
+    daemon_pid: u32,
+    policy: SupervisorPolicy,
+    sysfs_root: &Path,
+) {
+    eprintln!(
+        "squeezefs-supervise: watching {} (daemon pid {daemon_pid}; probe every {:?}, \
+         escalate after {:?} unresponsive, abort {})",
+        mountpoint.display(),
+        policy.probe_interval,
+        policy.unresponsive_after,
+        if policy.write_abort {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    // Resolve the connection id NOW, while the mount answers stat —
+    // a wedged mount later would wedge the resolution too.
+    let conn_id = match fuse_connection_id(mountpoint) {
+        Ok(id) => {
+            eprintln!("squeezefs-supervise: FUSE connection id {id}");
+            Some(id)
+        }
+        Err(e) => {
+            eprintln!(
+                "squeezefs-supervise: WARNING: cannot resolve FUSE connection id ({e}); \
+                 the abort rung is disabled for this session"
+            );
+            None
+        }
+    };
+
+    let mut state = SupervisorState::new(Instant::now());
+    loop {
+        std::thread::sleep(policy.probe_interval);
+        if !daemon_alive(daemon_pid) {
+            eprintln!(
+                "squeezefs-supervise: daemon pid {daemon_pid} exited — supervisor \
+                 stopping (remount manually: squeezefs mount …)"
+            );
+            return;
+        }
+        let ok = probe_stats_inode(mountpoint, policy.probe_interval);
+        let now = Instant::now();
+        match state.observe(ok, now, &policy) {
+            SupervisorAction::None => {
+                if !ok {
+                    eprintln!(
+                        "squeezefs-supervise: probe of {}/.stats timed out (grace window)",
+                        mountpoint.display()
+                    );
+                }
+            }
+            SupervisorAction::Recovered => {
+                eprintln!(
+                    "squeezefs-supervise: mount {} recovered",
+                    mountpoint.display()
+                );
+            }
+            SupervisorAction::Escalate { unresponsive_for } => {
+                eprintln!(
+                    "squeezefs-supervise: mount {} UNRESPONSIVE for {:?} (threshold {:?}) — \
+                     dumping daemon state",
+                    mountpoint.display(),
+                    unresponsive_for,
+                    policy.unresponsive_after
+                );
+                eprintln!("{}", dump_daemon_state(daemon_pid));
+                if let Some(id) = conn_id {
+                    let waiting = connection_waiting(sysfs_root, id);
+                    eprintln!(
+                        "squeezefs-supervise: connection {id} waiting = {waiting:?} \
+                         (kernel callers blocked on the wedged daemon)"
+                    );
+                    if policy.write_abort && waiting.unwrap_or(0) > 0 {
+                        match abort_fuse_connection(sysfs_root, id) {
+                            Ok(()) => eprintln!(
+                                "squeezefs-supervise: WROTE {}/{id}/abort — blocked callers \
+                                 released with ECONNABORTED; the mount is dead. Manual \
+                                 recovery: kill the daemon BY PID (kill {daemon_pid}), \
+                                 `squeezefs umount <mountpoint>`, then remount",
+                                sysfs_root.display()
+                            ),
+                            Err(e) => eprintln!(
+                                "squeezefs-supervise: abort write failed ({e}) — run as \
+                                 root for the abort rung; manual: echo 1 > {}/{id}/abort",
+                                sysfs_root.display()
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

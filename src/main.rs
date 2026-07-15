@@ -205,6 +205,18 @@ enum Commands {
         #[arg(long)]
         daemon: bool,
 
+        /// Keep the parent process alive as an EXTERNAL mount watchdog
+        /// (requires --daemon): probes <mountpoint>/.stats every 5s
+        /// (SQUEEZEFS_SUPERVISE_INTERVAL_SECS); after 30s of sustained
+        /// unresponsiveness (SQUEEZEFS_SUPERVISE_UNRESPONSIVE_SECS) it
+        /// logs loudly, dumps daemon state, and — as root — writes
+        /// /sys/fs/fuse/connections/<id>/abort to release blocked
+        /// callers. Complements the in-daemon watchdog, which can log a
+        /// wedge but not clear one. Kill/restart stays manual (the
+        /// escalation prints the daemon PID and the exact commands).
+        #[arg(long, requires = "daemon")]
+        supervise: bool,
+
         /// Custom UID presented as the owner of files in the mount
         /// (default: current user or SUDO_UID). Presentation-only: staging
         /// /cache I/O still runs as the user executing `squeezefs mount`
@@ -1037,10 +1049,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Commands::Mount {
         ref args,
         daemon: true,
+        supervise,
         ref meta_lv,
         ..
     } = &cli.command
     {
+        let supervise = *supervise;
         // Resolve mountpoint just for the parent process printing/waiting
         let mountpoint_path = if let Some(ref _m_lvs) = meta_lv {
             if args.is_empty() {
@@ -1142,6 +1156,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mountpoint_path
                     );
                     libc::close(pipefd[0]);
+                    if supervise {
+                        // Survey P1-B (JuiceFS cmd/mount_unix.go precedent):
+                        // the parent stays alive as the external watchdog.
+                        // It knows the daemon PID from its own fork —
+                        // kill-by-PID discipline for free. std-only loop
+                        // (the parent never starts a tokio runtime).
+                        let env_secs = |key: &str, default: u64| {
+                            std::env::var(key)
+                                .ok()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .filter(|&s| s > 0)
+                                .unwrap_or(default)
+                        };
+                        let policy = squeezefs::supervisor::SupervisorPolicy {
+                            probe_interval: std::time::Duration::from_secs(env_secs(
+                                "SQUEEZEFS_SUPERVISE_INTERVAL_SECS",
+                                5,
+                            )),
+                            unresponsive_after: std::time::Duration::from_secs(env_secs(
+                                "SQUEEZEFS_SUPERVISE_UNRESPONSIVE_SECS",
+                                30,
+                            )),
+                            write_abort: true,
+                        };
+                        squeezefs::supervisor::run_supervisor(
+                            &mountpoint_path,
+                            pid as u32,
+                            policy,
+                            std::path::Path::new(squeezefs::supervisor::FUSE_CONNECTIONS_SYSFS),
+                        );
+                        std::process::exit(0);
+                    }
                     std::process::exit(0);
                 }
 
@@ -2155,6 +2201,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             subnqn: _,
 
             daemon: _,
+            supervise: _,
             uid,
             gid,
             p2p_addr,

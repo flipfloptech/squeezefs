@@ -7,10 +7,13 @@
 //! - Zero-copy-leg alignment matrix: 4 KiB-aligned request + `RangedDest`
 //!   ⇒ no bounce; any unaligned edge ⇒ exactly one counted bounce, bytes
 //!   still exact.
-//! - Amplification contract: N disjoint cold 4 KiB reads of ONE block ⇒
-//!   `get_obj` Δ = N (ranged ops count device reads by design, §5.6),
-//!   `ranged_read_bytes` ≈ N × 4 KiB, tier/hot unchanged (never
-//!   published).
+//! - Amplification contract (reshaped 2026-07-15 by the HYBRID I/O
+//!   directive): N disjoint cold 4 KiB FIRST touches across N DISTINCT
+//!   blocks ⇒ `get_obj` Δ = N (ranged ops count device reads by design,
+//!   §5.6), `ranged_read_bytes` ≈ N × 4 KiB, tier/hot unchanged. The old
+//!   one-block variant is superseded: a SECOND touch of one block now
+//!   ESCALATES to a ghost-admitted whole-block fetch by design — that
+//!   contract lives in tests/hybrid_io_tests.rs.
 //! - Ghost convergence: ranged fetches RECORD heat; a subsequent
 //!   whole-block fetch ghost-admits per §5.3 (publish + tier residency).
 //! - `SQUEEZEFS_READ_RANGED_THRESHOLD=0` kill switch.
@@ -197,9 +200,11 @@ fn tier_has(h: &H, key: &str) -> bool {
 /// ALL counter-asserting phases in one fn (process-global counters).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ranged_phases() {
-    // ---- Phase A: the amplification contract. N disjoint cold 4 KiB
-    // reads of ONE block ⇒ N ranged device ops of ~4 KiB each; the block
-    // is never fetched whole, never published to any tier.
+    // ---- Phase A: the amplification contract, first-touch form (hybrid
+    // I/O 2026-07-15). N disjoint cold 4 KiB FIRST touches across N
+    // DISTINCT blocks ⇒ N ranged device ops of ~4 KiB each; no block is
+    // fetched whole, nothing is published to any tier. (Second touches of
+    // ONE block escalate by design — pinned in tests/hybrid_io_tests.rs.)
     let h = make_with("524288", *b"ranged-a-pr6-v30", "rng_ns_a").await;
     let ino = create(&h, "rng_a").await;
     write_pattern(&h, ino, 12 * BS).await;
@@ -211,7 +216,8 @@ async fn ranged_phases() {
     let rb0 = METRICS.ranged_read_bytes.load(Ordering::Relaxed);
     let n = 8u64;
     for i in 0..n {
-        let off = 2 * BS + i * 32_768; // disjoint, 4 KiB-aligned, one block
+        // One 4 KiB-aligned touch per DISTINCT block (blocks 2..10).
+        let off = (2 + i) * BS + 32_768;
         let d = read_at(&h, ino, off, 4096).await;
         assert_eq!(d.len(), 4096);
         assert!(
@@ -222,9 +228,9 @@ async fn ranged_phases() {
     assert_eq!(
         METRICS.get_obj.load(Ordering::Relaxed) - g0,
         n,
-        "N disjoint cold 4 KiB reads of one block must issue exactly N \
-         device read ops (ranged ops count in get_obj by design, §5.6) — \
-         a whole-block fetch here is the 1024x amplification this PR kills"
+        "N cold 4 KiB FIRST touches must issue exactly N device read ops \
+         (ranged ops count in get_obj by design, §5.6) — a whole-block \
+         fetch on a first touch is the 1024x amplification R3 killed"
     );
     assert_eq!(
         METRICS.ranged_reads.load(Ordering::Relaxed) - rr0,
@@ -238,11 +244,12 @@ async fn ranged_phases() {
     );
     assert!(
         !tier_has(&h, &k2),
-        "ranged fills are NEVER published (whole-block tier-entry contract)"
+        "first-touch ranged fills are NEVER published (whole-block \
+         tier-entry contract + anti-pollution first-touch rule)"
     );
     assert!(
         h.fs.router.cache.hot_block.get_no_promote(&k2).is_none(),
-        "ranged fills never land in the hot tier either"
+        "first-touch ranged fills never land in the hot tier either"
     );
 
     // ---- Phase B: ghost convergence. The ranged touches above RECORDED
@@ -332,7 +339,10 @@ async fn ranged_phases() {
     // ---- Phase E: zero-copy-leg alignment matrix (direct primitive
     // calls). Aligned request + RangedDest ⇒ no bounce, DMA into the
     // dest; any unaligned edge ⇒ exactly one counted bounce, bytes exact,
-    // window padding never served.
+    // window padding never served. Each case runs against its OWN cold
+    // block: a second touch of one block now escalates to a whole-block
+    // fetch by design (hybrid I/O), which would short-circuit the bounce
+    // legs this matrix exists to exercise.
     drop(h3);
     let h4 = make_with("524288", *b"ranged-e-pr6-v30", "rng_ns_e").await;
     let ino_e = create(&h4, "rng_e").await;
@@ -389,8 +399,17 @@ async fn ranged_phases() {
         "aligned request + dest must take the zero-copy leg (no bounce)"
     );
 
-    // Unaligned offset ⇒ bounce; exact bytes; padding never served.
-    for (rel_start, len) in [(4097u64, 4096usize), (8192, 4095), (12_289, 5000)] {
+    // Unaligned offset ⇒ bounce; exact bytes; padding never served. One
+    // COLD block per case (blocks 2, 3, 4) — first touches never escalate.
+    for (blk, rel_start, len) in [
+        (2u32, 4097u64, 4096usize),
+        (3, 8192, 4095),
+        (4, 12_289, 5000),
+    ] {
+        let kb = map_e
+            .get(&blk)
+            .unwrap_or_else(|| panic!("block {blk} mapped"))
+            .clone();
         let b0 = METRICS
             .ranged_read_unaligned_bounces
             .load(Ordering::Relaxed);
@@ -399,9 +418,9 @@ async fn ranged_phases() {
             .router
             .get_block_range_for_index(
                 &path_e,
-                1,
+                blk,
                 rel_start..rel_start + len as u64,
-                Some(&k1),
+                Some(&kb),
                 None,
             )
             .await
@@ -411,8 +430,8 @@ async fn ranged_phases() {
         assert!(
             val.iter()
                 .enumerate()
-                .all(|(j, &x)| x == pat(BS + rel_start + j as u64)),
-            "bounce-leg content (rel_start={rel_start} len={len})"
+                .all(|(j, &x)| x == pat(blk as u64 * BS + rel_start + j as u64)),
+            "bounce-leg content (blk={blk} rel_start={rel_start} len={len})"
         );
         assert_eq!(
             METRICS

@@ -4201,6 +4201,39 @@ impl SqueezefsFilesystem {
         }
     }
 
+    /// D2.c (design-metadata-throughput §5.2, PR M5): re-seed an inode's
+    /// cached attrs from the RAM-authoritative backend instead of
+    /// invalidating them after a directory mutation.
+    ///
+    /// Why: the kernel invalidates its own parent-dir attrs on every
+    /// create/unlink/rename (`fuse_dir_changed`), and the next path walk's
+    /// permission check forces a GETATTR the daemon cannot suppress
+    /// (M2 measured 1.17/create and 1.82/unlink at ~45 µs each). The
+    /// daemon-side `attr_cache.invalidate(&parent)` made each of those a
+    /// contended backend fetch; refreshing here turns them into ~µs cache
+    /// hits with values that are exact (backend-authoritative, monotone
+    /// through the M6 pending-times fold — never a hand-rolled clock that
+    /// could regress on the next real fetch).
+    ///
+    /// Failure degrades to the pre-M5 invalidate (next getattr refetches).
+    async fn refresh_attr_cache(&self, ino: u64) {
+        let Some(backend) = self.meta_backend.as_ref() else {
+            self.attr_cache.invalidate(&ino);
+            return;
+        };
+        match backend.getattr(ino).await {
+            Ok(inode) => {
+                let attr = self.inode_to_file_attr(&inode);
+                self.attr_cache
+                    .insert(ino, (attr, std::time::Instant::now()));
+                METRICS
+                    .fuse_attr_cache_refreshes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => self.attr_cache.invalidate(&ino),
+        }
+    }
+
     /// Per-class dentry TTL (survey P1-C, the DAOS dir-vs-file split):
     /// directory dentries get `dir_entry` (their invalidation cost covers
     /// whole subtrees), everything else `entry`.
@@ -6120,8 +6153,13 @@ impl Filesystem for SqueezefsFilesystem {
             prof.mark_backend_done();
             let child_ino = backend_res.map_err(map_squeezefs_err)?;
             self.bump_dir_generation(parent);
-            self.attr_cache.invalidate(&parent);
-            self.attr_cache.invalidate(&child_ino);
+            // D2.c: refresh (not invalidate) — the kernel re-GETATTRs the
+            // parent on its next path walk (fuse_dir_changed) and the
+            // child for its post-unlink ctime bookkeeping; serve both
+            // from cache at ~µs instead of a contended backend fetch
+            // (M2: getattr 1.82/unlink @ 45 µs).
+            self.refresh_attr_cache(parent).await;
+            self.refresh_attr_cache(child_ino).await;
             // Defer destroy_inode until forget/release (see rmdir comment).
             Ok(())
         };
@@ -6172,10 +6210,15 @@ impl Filesystem for SqueezefsFilesystem {
             backend_res.map_err(map_squeezefs_err)?;
             self.bump_dir_generation(parent);
             self.bump_dir_generation(new_parent);
-            self.attr_cache.invalidate(&parent);
-            self.attr_cache.invalidate(&new_parent);
+            // D2.c: refresh (not invalidate) — post-M6 renames really move
+            // both parents' times, so the kernel revalidates them (+0.21
+            // fuse_ops/rename); keep those GETATTRs on the cache.
+            self.refresh_attr_cache(parent).await;
+            if new_parent != parent {
+                self.refresh_attr_cache(new_parent).await;
+            }
             if let Some(d_ino) = dest_ino {
-                self.attr_cache.invalidate(&d_ino);
+                self.refresh_attr_cache(d_ino).await;
                 // Reclaim overwritten target via forget, not here.
             }
             Ok(())
@@ -6236,13 +6279,16 @@ impl Filesystem for SqueezefsFilesystem {
 
             self.bump_dir_generation(parent);
             self.bump_dir_generation(new_parent);
-            self.attr_cache.invalidate(&parent);
-            self.attr_cache.invalidate(&new_parent);
+            // D2.c: refresh (not invalidate) — see `rename`.
+            self.refresh_attr_cache(parent).await;
+            if new_parent != parent {
+                self.refresh_attr_cache(new_parent).await;
+            }
             if let Some(s_ino) = src_ino {
-                self.attr_cache.invalidate(&s_ino);
+                self.refresh_attr_cache(s_ino).await;
             }
             if let Some(d_ino) = dest_ino {
-                self.attr_cache.invalidate(&d_ino);
+                self.refresh_attr_cache(d_ino).await;
                 // Overwritten target reclaimed on forget only (not RENAME_EXCHANGE).
             }
             Ok(())

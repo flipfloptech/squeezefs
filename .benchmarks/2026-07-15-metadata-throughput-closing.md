@@ -406,3 +406,38 @@ conveyor pass panics **0**; barriers/op 0.0006–0.0033 (default cadence).
   pre-program mechanism, charter attached). Cure it, re-run the targeted
   013/fsstress rig (NOT another full sweep — the inventory stands), and
   the beta gate flips on this report's evidence.
+
+---
+
+## Final status (amended 2026-07-15, PR M12 — program closure)
+
+- **FIND-M11-A: FIXED** at dev @ `e3342eb` (branch
+  `fix/writeback-fencing-livelock` off `1708d94`; evidence note
+  `.benchmarks/2026-07-15-find-m11a-fix.md`). Supersession-checked
+  writeback + generation-fresh merge credentials + capture-stamp removal +
+  verified orphan-discard; charter items i–iv all discharged. Repro suite
+  50/50 green (RED pre-fix with the exact incident signature); targeted
+  013 rig green ×3 plain + ×3 churn-amplified (`TIME_FACTOR=10
+  LOAD_FACTOR=3`); churn-unmount soak 10/10 (baseline failed at cycle 3
+  with the incident mechanism); unmount-kill soak 10/10. Per this report's
+  own gate language ("Cure it, re-run the targeted 013/fsstress rig — NOT
+  another full sweep"), **the beta verdict driver is cleared: the beta
+  gate flips on that evidence.**
+- **Residual board: unchanged**, except row 1 → **RESOLVED** (the fix) and
+  the fix note's new **row 7b** (generic/074 standalone-harness zeros
+  signature — A/B fail-fail on both binaries with daemons error-free,
+  gate-passed in-sweep with the same code ⇒ pre-existing environmental
+  class; artifacts in the fix note). Still standing as charters: row 2
+  (kernel-side one-dir levers), row 3 (mfunlink serialized-apply), row 4
+  (transport pop_timeout residual), row 5 (**iops-parity investigation**),
+  row 6 (KV-core allocation flood), row 7/7b (aio-dio + DIO families +
+  074 environmental), row 8 (**survey P2 board** — now committed at
+  `.agents/reference-clients-survey.md`), row 9 (**SPDK-targets
+  program**), row 10 (scratch drain-timeout class).
+- **Documentation closure (PR M12)**: `docs/design-metadata-throughput.md`
+  → Status **Implemented** (revision 3: landed-SHA table, actual landing
+  order M1→M2→M4→M6→M5→M7→M3→M9→M10, reviewer nit #17 fixed);
+  AGENTS.md gains the program summary, the multi-run test discipline, and
+  the reference-clients directive; README/QUICKSTART gain the writer-guard
+  guarantee-class table + `claim clear` runbook and the
+  `SQUEEZEFS_META_COMMIT_BATCH_*` / `SQUEEZEFS_OP_PROFILE` knobs.

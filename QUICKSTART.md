@@ -218,4 +218,14 @@ v3 **format-time** knobs (`README.md` → *Format Squeezefs Volume*): `--meta-no
 
 File-backed sandbox volumes (section 1) classify **physically** as `file-backed` (reported as `meta_volume_atomicity_physical` on the `.stats` inode) — purely informational: metadata integrity does not depend on it; the contract field `meta_volume_atomicity` reads `cow-checksummed`.
 
+### Single-writer mount guard
+
+Every write mount exclusively claims its metadata volume(s): a dedicated `flock` (same-host), an NVMe Persistent Reservation where the namespace supports it (cross-host enforcement), and a `writer_claim` heartbeat record. A second concurrent mount is **refused loudly, naming the holder** — there is no bypass flag. Same-host crashes reclaim instantly and automatically; after a cross-host crash on a volume **without** reservation support, clear the stale claim by operator attestation once you have verified the named holder is dead:
+
+```bash
+./target/release/squeezefs claim clear sqmeta:///tmp/squeezefs_meta.bin
+```
+
+Guarantee classes per substrate (and the full recovery runbook): `README.md` → *Single-writer mount guard*.
+
 > **Legacy format v2**: support was removed entirely. A v2 superblock refuses to mount ("no longer supported; reformat required"); reformat it to v3 with `squeezefs format --force` (destroys the old contents). The offline `squeezefs migrate` converter was deleted along with v2 support.

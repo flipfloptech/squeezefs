@@ -113,6 +113,10 @@ POSIX FUSE locks map to cluster leases on Metadata Volumes:
 * No dead code (non-negotiable) — see Non-Negotiables section.
 * Not uring: TLS peer paths (network). Staging mmap segments stay mmap by design.
 
+### Reference fast-FUSE clients (user directive, 2026-07-14)
+
+The **DAOS client** (`github.com/daos-stack/daos`, `src/client/` — dfuse / libdfs / libioil / libpil4dfs) and **JuiceFS** (`github.com/juicedata/juicefs`) are the designated reference fast-FUSE clients. **Consult them for perf/recovery patterns before designing new client-side machinery** — both independently converged on the levers the metadata-throughput program validated (negative-dentry TTLs, clean-handle FLUSH elision, submit batching, per-class kernel TTLs), and their recovery/ops machinery (external supervisor + FUSE-connection abort, fsck/dump/backup, cache-disk health FSM, seamless-upgrade fd handover) is the standing gap board. The full survey — findings classified HAVE / IN-PROGRAM / GAP / N/A with ranked P1/P2/P3 adoption boards and code anchors — lives at **`.agents/reference-clients-survey.md`**; extend it (same classification) when surveying them again.
+
 ### Metadata Cluster Topology
 
 * Keys for volume control use `fs_prefix` / `fs_key!` helpers.
@@ -127,10 +131,24 @@ Format v3 is the **only** on-disk metadata format. Legacy v2 support was removed
 * **Stats fields (stats inode):** `meta_format_version` (constant `"3"` per volume — kept because operators key on it); `meta_volume_atomicity` (contract class — constant `cow-checksummed`) alongside `meta_volume_atomicity_physical` (the informational hardware probe); and the `meta_kv_*` family — `node_cache_{hits,misses,evictions}`, `node_appends`, `node_{append,rewrite}_bytes`, `node_{compactions,splits}`, `journal_{bytes,entries,full_stalls}`, `checkpoints`, `commit_smo_retries`, `node_dropped_tail_bsets`, `dentry_collision_overflows`, `delta_orphans`, `replay_{entries,dropped_torn,ms}`, `free_extents`, `pending_free`. The retired v2-only counters (`meta_commit_sectors`, `meta_sector_lock_*`, `meta_inode_alloc_*`, `meta_tx_concurrency*`, `meta_quarantined_inodes`) no longer exist.
 * **Filesystem generation identity:** per-volume the v3 superblock `uuid` (random per `format` invocation), joined in volume order (`meta_backend::volume_set_generation`) — local staging is bound to it. (The v2-era `FormatConfig.fs_uuid` config stamp was deleted with v2; the superblock uuid is the sole generation identity.)
 
+### Metadata-throughput program (Implemented 2026-07)
+
+The 4.4× FUSE-layer metadata multiple was closed by the M1–M12 program — design + landed-SHA record `docs/design-metadata-throughput.md`, gate adjudication `.benchmarks/2026-07-15-metadata-throughput-closing.md`, beta-blocker fix `.benchmarks/2026-07-15-find-m11a-fix.md`. What is now load-bearing machinery (do not regress):
+
+* **Single-writer mount guard (D0)** — every write mount claims each meta volume: a **dedicated daemon-lifetime `flock`** (same-host, kernel-arbitrated, instant crash reclaim), **NVMe Persistent Reservations** Write-Exclusive where `RESCAP` advertises support (cross-host *enforcement* — a fenced holder fail-stops at its first post-fence journal barrier), and a **`writer_claim`** heartbeat record (identity + detection everywhere). **No bypass knob**; automatic cross-host takeover is disabled on non-PR substrates — recovery is dead-pid proof → PR preempt → TTL → the attested **`squeezefs claim clear <sqmeta-uri>`** verb, in that order of automation. The guarantee-class table ships in README verbatim; the barrier-failure escalation governs journal-durability barriers only (the data-path writeback ladder stays retry-forever — see below).
+* **Commit conveyor (group commit v2, D5)** — all user commits on a volume enqueue `{staged records, Arc<[DlmGuard]>, oneshot}`; a detached, panic-guarded per-volume **pass task** drains a batch and runs one admission → union-leaf-lock pass → **N ordinary checksummed entries** in one contiguous reservation → one write → one barrier. **One tx = one checksummed journal entry is unchanged** (zero on-disk format change; whole-tx atomicity + torn-write immunity transfer verbatim). Queue entries co-own their tx's DLM guards until terminal outcome — a dropped committer future cannot strand isolation.
+* **Journal-entry economy (D4)** — rename is one whole-tx entry (incl. parent Δtimes); the kernel's SETATTR ctime/mtime echo is absorbed, not committed; unlink destroys ride batched `destroy_inodes`. Measured **≈ 1.0 entries/op rename/unlink** (gate G4 ≤ 1.05) — regressions show in `meta_kv_journal_entries` per-op ratios.
+* **Fold overlay + snapshot memo (D7)** — record folds serve from fold-forward overlay heads and immutable-snapshot memos (fold algebra untouched, property-tested equivalence; replay rides the same fold). `InodeDelta::decode` fell off the profile (26.3 % → < 0.5 % of daemon CPU); memo/overlay bytes are charged to the node-cache budget.
+* **Watchdog, not per-op timeouts (D1.b)** — handlers no longer wrap in `tokio::time::timeout` (that expiry *dropped* futures mid-`commit_tx` — the ring-budget/reservation-wedge vector). A deadline watchdog logs overdue ops loudly (`fuse_op_watchdog_overdue`); ring-admission parking past the threshold escalates via the `disabled_volumes` fail-stop lattice; barrier waits keep bounded errors. Do not reintroduce per-op timeout wrappers.
+* **Round-trip + transport economy (D2/D3)** — clean-handle FLUSH/RELEASE fast paths, `FOPEN_NOFLUSH`, kernel-side negative-entry caching, refresh-instead-of-invalidate parent attrs (fuse_ops/create 5.18 → ~4.0); over-uring COMMIT_AND_FETCH submits batch per drain (`io_uring_enter`/create 31 → ~9). SQPOLL on the queue rings exists as a knob and measured **not recommended** (M10; README posture note).
+* **Supersession-aware never-lossy writeback (FIND-M11-A fix)** — flush units re-validate staged ownership per attempt and present the ino's *current* DLM generation; fencing-stale units resolve as contractual no-ops, verified-NotFound (reclaimed-ino) units discard their orphans, and everything genuinely transient still retries forever. "Stale fencing tokens discard staged work" is the **remount** contract, not a license to drop live acked custody.
+* **Env/mount knobs added:** `SQUEEZEFS_META_COMMIT_BATCH_TXS` (default 64) / `SQUEEZEFS_META_COMMIT_BATCH_BYTES` (default 256 KiB, clamped to the ring's admissible capacity) — conveyor batch caps; `SQUEEZEFS_OP_PROFILE=1` — per-op phase histograms + the under-`i_rwsem` estimator (zero cost off); per-class kernel TTLs `-o attr_timeout/entry_timeout/dir_entry_timeout/negative_timeout` / `SQUEEZEFS_FUSE_{ATTR,ENTRY,DIR_ENTRY,NEGATIVE}_TTL_MS` (default 1 s each); `mount --daemon --supervise` external watchdog (+ `SQUEEZEFS_SUPERVISE_{INTERVAL,UNRESPONSIVE}_SECS`) with FUSE-connection abort.
+* **Stats families added (stats inode):** `writer_guard_{mode,fenced,pr_reacquires}`; `meta_commit_group_{size,bytes}`, `meta_conveyor_{leader_passes,pass_panics}`; `meta_kv_fold_{head_serves,memo_hits,memo_misses,memo_bytes}`; `meta_kv_times_echo_{absorbed,pending,drained,drain_commits}`; `fuse_op_phase_ns` / `fuse_create_under_lock_ns` / `fuse_op_watchdog_overdue`; `fuse_{flush,release}_clean_fastpath`, `fuse_lookup_negative_replies`, `fuse_attr_cache_refreshes`; `transport_commit_batch*`; `meta_reclaim_gather_*`; `writeback_{superseded_noops,stale_token_retries,orphan_discards}`.
+
 ### Error Handling & Crash Recovery
 
-* FUSE op timeouts; staging recovery on remount (`recover_staging`) with fence + layout checks.
-* Stale fencing tokens discard staged work; missing inode meta discards orphan active blocks.
+* FUSE op deadline **watchdog** (per-op `tokio::time::timeout` wrappers were retired in M4 — overdue ops are logged loudly, ring-admission parking escalates to `disabled_volumes`); staging recovery on remount (`recover_staging`) with fence + layout checks.
+* Stale fencing tokens discard staged work (the **remount** contract); missing inode meta discards orphan active blocks. Live writeback units apply the same law supersession-aware (FIND-M11-A fix): fencing-stale ⇒ verified no-op, reclaimed-ino NotFound ⇒ verified orphan-discard, transient ⇒ retry forever (never-lossy).
 * Write verification is **opt-in** (`--write-verification`, optional sample rate).
 * **Metadata crash contract**: whole-transaction atomicity + torn-write immunity **by construction** (v3 CoW KV — see Metadata format section + `docs/design-cow-kv-metadata.md` §4.10; the historical D0/D1/D2 ladder it replaced is `docs/design-wal-crash-consistency.md` §3).
 * Mount probes each meta volume's sector atomicity (sysfs) — purely informational, surfaced as `meta_volume_atomicity_physical` while the contract field `meta_volume_atomicity` reads `cow-checksummed`. (The `--strict-meta-atomicity` flag only ever gated v2 volumes and was deleted with them.)
@@ -144,7 +162,7 @@ Always acquire in this order; **never invert** (P1-9):
 3. `BLOCK_FLUSH_LOCKS` (per block) — active-block mutation
 4. MetaLV metadata-transaction locks, in sub-order:
    - **4a.** DLM `I{ino}` / `D{parent:name}` (per-object; `DlmLockManager`).
-   - **4b.** (design-cow-kv-metadata §4.9 4b): **per-node write locks — the commit path takes leaf locks only, in ascending NodeId order, deduped, lock-then-revalidate-then-retry against SMOs; interior-node locks belong exclusively to the serialized per-volume checkpoint/SMO task (parent-then-child), which is what keeps the two lock populations acyclic. Node locks are never held across device I/O (commit apply is RAM-only; the journal entry write happens after unlock; writeback freezes under the lock and appends outside it; SMOs reserve in-window and write after release) and never held while waiting on ring space (ring admission happens before any node lock — §4.4 pt 5; the checkpoint task's own admissions never park, they drain-and-retry).**
+   - **4b.** (design-cow-kv-metadata §4.9 4b): **per-node write locks — the commit path takes leaf locks only, in ascending NodeId order, deduped, lock-then-revalidate-then-retry against SMOs; interior-node locks belong exclusively to the serialized per-volume checkpoint/SMO task (parent-then-child), which is what keeps the two lock populations acyclic. Node locks are never held across device I/O (commit apply is RAM-only; the journal entry write happens after unlock; writeback freezes under the lock and appends outside it; SMOs reserve in-window and write after release) and never held while waiting on ring space (ring admission happens before any node lock — §4.4 pt 5; the checkpoint task's own admissions never park, they drain-and-retry).** Since the M7 commit conveyor (design-metadata-throughput §5.5), the leaf-lock **taker** population is exactly {the per-volume conveyor **pass task**, the checkpoint/SMO task}: user committers take no node locks — they enqueue and park on oneshots, each queue entry co-owning its tx's 4a DLM guards until terminal outcome, and the pass takes the batch's **union** leaf set under the same 4b discipline while it *holds-but-never-acquires* DLM guards (no new wait-for edges; see `src/stripe_locks.rs`).
    - **4c.** The journal reservation — a wait-free atomic, not a lock; ordered inside 4b by protocol, it imposes no ordering edges.
 
 **Must not:**
@@ -214,6 +232,7 @@ Before touching any code:
 - Determine `Send`/`Sync` requirements for all shared state.
 - Identify async boundaries — which types must implement `Future`, which tasks cross `.await` points.
 - **I/O path:** does this touch FUSE, NVMe, or local files? If yes, plan the **io_uring** design — not a classical shortcut.
+- **New client-side machinery?** Check the reference fast-FUSE clients first (DAOS client, JuiceFS — `.agents/reference-clients-survey.md`) for a proven pattern before inventing one.
 
 Produce a brief execution plan:
 
@@ -477,6 +496,11 @@ fstests/LTP are **wall-clock-bound** (fixed-duration fsx/fsstress soaks, mount-c
 2. **Targeted fix loop** — per failure *family* (cluster related failures; one root cause often spans several tests): tests-first fix → verify the single case with `sudo tests/run_fstests.sh generic/NNN` (minutes) → merge.
 3. **One final sweep** — a single full `-g auto` after the last fix (and nightly thereafter) to catch fix interactions.
 
+**Multi-run discipline (counted runs: soaks, ×N repro suites, acceptance medians):**
+1. **A deterministic or attributable failure on any early run aborts the count** — stop, fix, then **restart the count from zero**. Runs completed before the fix verified the old binary; they are not creditable toward the fixed one's acceptance.
+2. **Completing the remaining rolls is legitimate only as *declared* rate/signature gathering** — measuring how often a flake fires or capturing its tape for attribution — and must be labeled as such in the evidence note, never counted as acceptance.
+3. **Acceptance counts always restart post-fix** (e.g. "green ×10" means ten consecutive greens of the final binary, not eight-before plus two-after).
+
 ---
 
 ## Benchmarks & Profiling
@@ -547,7 +571,7 @@ Use coz/dhat **after** a known-good cargo test gate, against a representative mo
 
 ## Stats surface
 
-Mounted volumes expose process metrics under the virtual **stats** inode (JSON), including layout mix, bg admission, uring queue-full, and lease acquire outcomes. Prefer these for live regression signals over ad-hoc logging. Per-volume metadata format + durability fields (`meta_format_version`, `meta_volume_atomicity[_physical]`) and the `meta_kv_*` family are listed under **Metadata format: v3 CoW KV (the only format)**.
+Mounted volumes expose process metrics under the virtual **stats** inode (JSON), including layout mix, bg admission, uring queue-full, and lease acquire outcomes. Prefer these for live regression signals over ad-hoc logging. Per-volume metadata format + durability fields (`meta_format_version`, `meta_volume_atomicity[_physical]`) and the `meta_kv_*` family are listed under **Metadata format: v3 CoW KV (the only format)**; the metadata-throughput program's families (`writer_guard_*`, `meta_commit_group_*` / `meta_conveyor_*`, `meta_kv_fold_*`, `meta_kv_times_echo_*`, `fuse_op_phase_ns` / `fuse_create_under_lock_ns` / `fuse_op_watchdog_overdue`, `transport_commit_batch*`, `writeback_{superseded_noops,stale_token_retries,orphan_discards}`) are listed under **Metadata-throughput program (Implemented 2026-07)**.
 
 **Read-path program families** (`docs/design-read-path.md` §Observability — semantics + regression thresholds there): `singleflight_waiter_result_serves` (R1a cohort serves); `hot_block_{hits,misses,evictions,probation_drops,dehydrate_skips,current_bytes}` (R4 RAM tier); `read_fill_publishes_skipped` / `read_tier_admissions` / `read_tier_admission_ghost_hits` / `read_tier_admission_mode` (R1b second-touch admission — skipped ≈ streamed cold blocks); `prefetch_{issued,completed,wasted,inflight_bytes,window_hwm,foreground_waits,evicted_unconsumed,active_streams}` (R2 pipeline — `evicted_unconsumed` is the refetch-spiral detector); `ranged_{reads,read_bytes,read_unaligned_bounces,read_rebinds}` (R3 — `ranged_read_bytes` vs user bytes is the rand-4k amplification bound; `get_obj` counts ranged ops by design); `mem_budget_{bytes,pressure_bytes,gauge_sum_bytes,unreclaimable_bytes,level,yellow_events,red_events,hard_backstops,backstop_active,tier_publish_paused,floors_clamped,dehydrate_paused,components{…}}` + `read_tier_publishes_paused` + `parked_gate_{waits,self_flushes,timeouts}` (R5 authority — red_events with no OOM is the designed outcome under pressure; `hard_backstops`/`parked_gate_timeouts` growing on quiet workloads means a convergence regression, §5.7 Red semantics).
 
@@ -572,6 +596,7 @@ While this file is the combined one source of truth for agents and contributors:
 
 - `README.md` / `QUICKSTART.md` — user-facing CLI, NVMe-oF, and bare-metal setup.
 - `.agents/walkthrough.md` — notes on the transparent compression / encryption implementation.
+- `.agents/reference-clients-survey.md` — the DAOS-client + JuiceFS reference fast-FUSE client survey (see **Reference fast-FUSE clients** above).
 - `docs/PROFILING_AND_GATES.md` (historical) — content now consolidated here.
 
 ---

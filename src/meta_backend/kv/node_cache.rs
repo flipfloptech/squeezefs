@@ -686,16 +686,16 @@ impl NodeSnapshot {
                 }
             }),
         };
-        if newest_overlay.is_none() {
+        // Memo-eligible = the key HAS base records (a no-record fold is
+        // free — no decodes — can never hit, and would only churn the
+        // fixed-capacity cells; the create storm's ENOENT dentry probes
+        // are that class, and counting them as misses would drown the
+        // §9 acceptance hit-rate in noise).
+        if newest_overlay.is_none() && !bg.is_empty() {
             super::META_KV_FOLD_MEMO_MISSES.fetch_add(1, Ordering::Relaxed);
-            // Populate unless the key has no records at all: pure absence
-            // costs the fold nothing to recompute (no decodes) and would
-            // only churn the fixed-capacity cells.
-            if !bg.is_empty() {
-                let horizon = self.base.entries[bg.start].seq;
-                self.memo
-                    .populate(Bytes::copy_from_slice(key), look.clone(), horizon);
-            }
+            let horizon = self.base.entries[bg.start].seq;
+            self.memo
+                .populate(Bytes::copy_from_slice(key), look.clone(), horizon);
         }
         Ok(look)
     }

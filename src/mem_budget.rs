@@ -531,10 +531,11 @@ impl MemBudget {
         }
     }
 
-    /// Production tick: resolve the budget (flag → env → cgroup × 0.8
-    /// re-read NOW → 70 % RAM), sample RSS + the cgroup unreclaimable
-    /// set, delegate.
-    pub fn tick(&self) {
+    /// Resolve the budget NOW with the sampler's exact §5.7 order (flag →
+    /// env → cgroup `memory.max` × 0.8 → 70 % RAM). Mount-time consumers
+    /// (the L1 transport payload-buffer cap) size against this so their
+    /// footprint agrees with what the 1 Hz sampler will enforce.
+    pub fn resolve_budget_now(&self) -> u64 {
         let flag = match self.flag_budget.load(Relaxed) {
             0 => None,
             v => Some(v),
@@ -543,9 +544,15 @@ impl MemBudget {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(|mb| mb * 1024 * 1024);
-        let budget = resolve_budget_from(flag, env, read_cgroup_memory_max(), system_ram_bytes());
+        resolve_budget_from(flag, env, read_cgroup_memory_max(), system_ram_bytes())
+    }
+
+    /// Production tick: resolve the budget (flag → env → cgroup × 0.8
+    /// re-read NOW → 70 % RAM), sample RSS + the cgroup unreclaimable
+    /// set, delegate.
+    pub fn tick(&self) {
         self.tick_inner(
-            budget,
+            self.resolve_budget_now(),
             read_rss_bytes(),
             read_cgroup_unreclaimable().unwrap_or(0),
         );
@@ -570,6 +577,23 @@ pub static MEM_BUDGET: Lazy<MemBudget> = Lazy::new(MemBudget::new);
 #[inline]
 pub fn level() -> Level {
     MEM_BUDGET.level()
+}
+
+/// L1 (IOPS-parity program) transport payload-buffer cap ceiling: even
+/// on huge budgets, never pin more than this in registered
+/// FUSE-over-io_uring payload arenas (256 possible CPUs × depth 32 ×
+/// 1 MiB would be 8 GiB uncapped).
+pub const TRANSPORT_BUFFER_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The L1 transport payload-buffer cap: an eighth of the resolved memory
+/// budget, ceilinged at [`TRANSPORT_BUFFER_CAP_CEILING`]. The
+/// FUSE-over-io_uring geometry degrades its per-queue depth from the
+/// desired 32 toward the pre-L1 floor of 4 to fit under this cap
+/// (`TransportGeometry` in the vendored fuse3), so small-RAM boxes keep
+/// (at worst) yesterday's shipped arena footprint while the measured
+/// 316k-IOPS geometry ships by default everywhere else.
+pub fn transport_buffer_cap(budget_bytes: u64) -> u64 {
+    (budget_bytes / 8).min(TRANSPORT_BUFFER_CAP_CEILING)
 }
 
 /// One-atomic-load disk-tier publish gate (the finding-#2 escalation) —

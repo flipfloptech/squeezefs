@@ -21,8 +21,16 @@
 //!
 //! Tuning only:
 //! ```text
-//! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=4     # optional, per-queue depth
-//! SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES=N      # optional, default = min(nproc, 8)
+//! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=N     # optional, per-queue depth (clamp
+//!                                            # 1..32); wins verbatim over the
+//!                                            # payload-buffer budget. Default =
+//!                                            # the L1 policy: desired 32,
+//!                                            # degraded to the buffer cap,
+//!                                            # floor 4 (see TransportGeometry)
+//! SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES=N      # testing only, default = kernel
+//!                                            # possible CPUs (clamp 1..512);
+//!                                            # fewer than possible CPUs never
+//!                                            # becomes ready
 //! SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS=N   # optional (§5.3 D3.b): SQPOLL the
 //!                                            # queue rings — ONE shared kernel
 //!                                            # poller (qid 0 leader, ATTACH_WQ
@@ -564,6 +572,222 @@ pub fn transport_lease_stats() -> (u64, u64, u64, u64) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// L1 transport-concurrency policy (IOPS-parity program, 2026-07-15,
+// `.benchmarks/2026-07-15-iops-parity-decomposition.md`)
+//
+// Random-4k iodepth workloads offer hundreds of in-flight requests; two
+// kernel-side gates multiply on delivery: the per-queue ring depth and the
+// INIT-negotiated `max_background`. Measured on the user's exact elbencho
+// line: depth 16 alone +2.2×, max_background 256 alone +0×, BOTH 44k → 316k
+// IOPS (7.2×, device-true). The policy below ships that class by DEFAULT
+// while a payload-buffer budget keeps small-RAM boxes at (or gracefully
+// near) the pre-L1 footprint. Every knob stays an override with unchanged
+// semantics.
+// ---------------------------------------------------------------------------
+
+/// Desired per-queue depth when the payload-buffer budget allows it — the
+/// measured-best configuration (QD32 + mb256 = 316k on the decomposition
+/// box) and the existing clamp ceiling.
+pub const Q_DEPTH_DESIRED: usize = 32;
+/// Never degrade below the pre-L1 shipped default: at floor the payload
+/// arena is exactly yesterday's footprint (queues × 4 × payload_sz), so no
+/// box regresses below the behavior it already ran.
+pub const Q_DEPTH_FLOOR: usize = 4;
+/// `max_background` floor: the intent of the historical (dead-letter)
+/// `max_background=64` mount-option string — never ship less delivered
+/// background concurrency than that on any geometry.
+pub const MAX_BACKGROUND_FLOOR: u16 = 64;
+/// `max_background` ceiling: the measured 316k-class value. Beyond 256 is
+/// unmeasured; the row scales with `max_background` once depth is open, so
+/// raising this requires new evidence, not a bigger constant.
+pub const MAX_BACKGROUND_CEILING: u16 = 256;
+/// Absolute payload-arena cap when the embedder gives no budget-derived
+/// cap (and the ceiling of the SqueezeFS-side `min(budget/8, 2 GiB)`
+/// formula): keeps huge-CPU boxes from pinning silly registered-buffer
+/// totals (256 possible CPUs × 32 × 1 MiB would be 8 GiB uncapped).
+pub const TRANSPORT_BUFFER_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Fallback payload-buffer cap for embedders that pass no cap through
+/// [`crate::MountOptions::transport_buffer_cap_bytes`]: an eighth of
+/// physical RAM, ceilinged — the same shape SqueezeFS derives from its
+/// resolved memory budget.
+fn default_buffer_cap() -> u64 {
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let page_sz = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+    if pages <= 0 || page_sz <= 0 {
+        // Cannot size RAM: fall back to the floor geometry (depth 4).
+        return 0;
+    }
+    ((pages as u64).saturating_mul(page_sz as u64) / 8).min(TRANSPORT_BUFFER_CAP_CEILING)
+}
+
+/// The resolved per-session transport geometry + INIT background limits.
+/// Resolved ONCE per session (in `Session::init_filesystem`, before the
+/// INIT reply is serialized) and passed unchanged into
+/// [`FuseOverUring::try_start`], so the limits the kernel was told always
+/// match the rings that got registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportGeometry {
+    /// Queue count — kernel possible CPUs (`num_possible_cpus()` on the
+    /// kernel side); `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` is a
+    /// testing-only override (fewer queues than possible CPUs never
+    /// becomes ready).
+    pub nqueues: usize,
+    /// Per-queue ring depth (see [`Self::resolve`] for the policy).
+    pub depth: usize,
+    /// Per-entry payload buffer size:
+    /// max(FUSE_MIN_READ_BUFFER, max_write, max_pages × page).
+    pub payload_sz: usize,
+    /// INIT-reply `max_background`.
+    pub max_background: u16,
+    /// INIT-reply `congestion_threshold`.
+    pub congestion_threshold: u16,
+}
+
+impl TransportGeometry {
+    /// Resolve the session geometry: environment + sysconf inputs, then
+    /// the pure [`Self::plan`].
+    pub fn resolve(
+        max_write: usize,
+        buffer_cap_bytes: Option<u64>,
+        max_background_override: Option<u16>,
+        congestion_threshold_override: Option<u16>,
+    ) -> Self {
+        // Kernel fuse_uring_create() uses num_possible_cpus() for
+        // ring->nr_queues and is_ring_ready() requires EVERY queue (except
+        // the current) to have ≥ 1 entry. Registering fewer queues means
+        // the kernel never switches off the classical path → permanent
+        // hang. Override only for testing; production must match the
+        // kernel.
+        let kernel_nqueues = {
+            let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+            if n > 0 {
+                n as usize
+            } else {
+                std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4)
+            }
+        };
+        let env_queues = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let env_depth = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let geom = Self::plan(
+            kernel_nqueues,
+            env_queues,
+            env_depth,
+            max_write,
+            buffer_cap_bytes.unwrap_or_else(default_buffer_cap),
+            max_background_override,
+            congestion_threshold_override,
+        );
+        if geom.nqueues < kernel_nqueues {
+            warn!(
+                "SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES={} < kernel possible CPUs \
+                 ({kernel_nqueues}); FUSE-over-io_uring will never become ready",
+                geom.nqueues
+            );
+        }
+        geom
+    }
+
+    /// The pure policy core (unit-tested):
+    ///
+    /// - `nqueues`: env override clamped 1..512, else kernel possible CPUs.
+    /// - `payload_sz`: must be ≥ kernel `ring->max_payload_sz` =
+    ///   max(FUSE_MIN_READ_BUFFER, max_write, max_pages × PAGE_SIZE)
+    ///   (fs/fuse/dev_uring.c; kernel clamps max_pages to
+    ///   fuse_max_pages_limit = 256).
+    /// - `depth`: env override wins verbatim (clamped 1..[`Q_DEPTH_DESIRED`]
+    ///   — explicit operator intent bypasses the budget); otherwise
+    ///   clamp(cap / (nqueues × payload_sz), [`Q_DEPTH_FLOOR`],
+    ///   [`Q_DEPTH_DESIRED`]). The floor keeps the arena at the pre-L1
+    ///   footprint even when the cap is smaller — that is yesterday's
+    ///   shipped posture, never a regression.
+    /// - `max_background`: override (> 0) wins, else
+    ///   clamp(nqueues × depth, [`MAX_BACKGROUND_FLOOR`],
+    ///   [`MAX_BACKGROUND_CEILING`]) — scaled with delivered ring capacity.
+    /// - `congestion_threshold`: override (> 0) wins, else ¾ of
+    ///   `max_background` (the kernel's own default ratio).
+    fn plan(
+        kernel_nqueues: usize,
+        env_queues: Option<usize>,
+        env_depth: Option<usize>,
+        max_write: usize,
+        buffer_cap_bytes: u64,
+        max_background_override: Option<u16>,
+        congestion_threshold_override: Option<u16>,
+    ) -> Self {
+        const FUSE_MIN_READ_BUFFER: usize = 8192;
+        const KERNEL_MAX_PAGES_LIMIT: usize = 256;
+        let page = 4096usize;
+        let payload_sz = max_write
+            .max(FUSE_MIN_READ_BUFFER)
+            .max(KERNEL_MAX_PAGES_LIMIT * page);
+
+        let nqueues = env_queues.unwrap_or(kernel_nqueues).clamp(1, 512);
+
+        let depth = match env_depth {
+            Some(d) => d.clamp(1, Q_DEPTH_DESIRED),
+            None => {
+                let per_queue = nqueues as u64 * payload_sz as u64;
+                usize::try_from(buffer_cap_bytes / per_queue)
+                    .unwrap_or(Q_DEPTH_DESIRED)
+                    .clamp(Q_DEPTH_FLOOR, Q_DEPTH_DESIRED)
+            }
+        };
+
+        let max_background = match max_background_override {
+            Some(mb) if mb > 0 => mb,
+            _ => u16::try_from(nqueues.saturating_mul(depth))
+                .unwrap_or(MAX_BACKGROUND_CEILING)
+                .clamp(MAX_BACKGROUND_FLOOR, MAX_BACKGROUND_CEILING),
+        };
+        let congestion_threshold = match congestion_threshold_override {
+            Some(ct) if ct > 0 => ct,
+            _ => max_background / 4 * 3,
+        };
+
+        Self {
+            nqueues,
+            depth,
+            payload_sz,
+            max_background,
+            congestion_threshold,
+        }
+    }
+
+    /// Total registered payload-arena bytes this geometry pins.
+    pub fn total_payload_bytes(&self) -> u64 {
+        self.nqueues as u64 * self.depth as u64 * self.payload_sz as u64
+    }
+}
+
+// Session geometry gauges (stats inode: `transport_{queues,q_depth,
+// payload_buffer_bytes,max_background}`) — stored by `try_start` when the
+// rings register. The arena is session-lifetime registered memory: the
+// gauge is a level, not a counter, and returns to describe whatever
+// session is live.
+static GEOM_QUEUES: AtomicU64 = AtomicU64::new(0);
+static GEOM_DEPTH: AtomicU64 = AtomicU64::new(0);
+static GEOM_PAYLOAD_SZ: AtomicU64 = AtomicU64::new(0);
+static GEOM_MAX_BACKGROUND: AtomicU64 = AtomicU64::new(0);
+
+/// Resolved transport geometry of the live session:
+/// `(queues, depth, payload_sz, total_payload_buffer_bytes,
+/// max_background)`. Zeros until a session arms.
+pub fn over_uring_geometry() -> (u64, u64, u64, u64, u64) {
+    let q = GEOM_QUEUES.load(Ordering::Relaxed);
+    let d = GEOM_DEPTH.load(Ordering::Relaxed);
+    let p = GEOM_PAYLOAD_SZ.load(Ordering::Relaxed);
+    let mb = GEOM_MAX_BACKGROUND.load(Ordering::Relaxed);
+    (q, d, p, q * d * p, mb)
+}
+
 /// Best-effort: turn on kernel `fuse.enable_uring` so REGISTER is accepted.
 /// Returns whether the parameter reads as enabled after the attempt.
 pub fn ensure_kernel_fuse_uring_enabled() -> io::Result<bool> {
@@ -591,7 +815,11 @@ pub fn ensure_kernel_fuse_uring_enabled() -> io::Result<bool> {
 }
 
 impl FuseOverUring {
-    pub fn try_start(fuse_fd: RawFd, max_write: usize) -> io::Result<Arc<Self>> {
+    /// Start the queue rings for a session with an ALREADY-RESOLVED
+    /// geometry (see [`TransportGeometry::resolve`] — resolved once in
+    /// `Session::init_filesystem` so the INIT reply's background limits
+    /// and the registered rings can never disagree).
+    pub fn try_start(fuse_fd: RawFd, geom: TransportGeometry) -> io::Result<Arc<Self>> {
         if !ensure_kernel_fuse_uring_enabled()? {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -599,50 +827,17 @@ impl FuseOverUring {
                  (need CAP_SYS_ADMIN / root: echo Y > /sys/module/fuse/parameters/enable_uring)",
             ));
         }
-        // Kernel fuse_uring_create() uses num_possible_cpus() for ring->nr_queues and
-        // is_ring_ready() requires EVERY queue (except the current) to have ≥1 entry.
-        // Registering fewer queues than that means the kernel never switches off the
-        // classical path while we stop reading it → permanent hang.
-        // Override only for testing; production must match the kernel.
-        let kernel_nqueues = {
-            let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
-            if n > 0 {
-                n as usize
-            } else {
-                std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(4)
-            }
-        };
-        let nqueues = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(kernel_nqueues)
-            .clamp(1, 512);
-        if nqueues < kernel_nqueues {
-            warn!(
-                "SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES={nqueues} < kernel possible CPUs \
-                 ({kernel_nqueues}); FUSE-over-io_uring will never become ready"
-            );
-        }
-        // Per-queue ring depth. depth=1 is enough for kernel readiness but leaves no
-        // slack when a COMMIT is in flight and a new request arrives on the same
-        // CPU — under pjdfstest-style forget/open storms that contributed to stalls.
-        // depth=4 keeps memory modest (nqueues * depth * payload_sz).
-        let depth = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4usize)
-            .clamp(1, 32);
-        // Must be >= kernel ring->max_payload_sz:
-        //   max(FUSE_MIN_READ_BUFFER, max_write, max_pages * PAGE_SIZE)
-        // (fs/fuse/dev_uring.c). Kernel clamps max_pages to fuse_max_pages_limit (256).
-        const FUSE_MIN_READ_BUFFER: usize = 8192;
-        const KERNEL_MAX_PAGES_LIMIT: usize = 256;
-        let page = 4096usize;
-        let payload_sz = max_write
-            .max(FUSE_MIN_READ_BUFFER)
-            .max(KERNEL_MAX_PAGES_LIMIT * page);
+        let TransportGeometry {
+            nqueues,
+            depth,
+            payload_sz,
+            max_background,
+            ..
+        } = geom;
+        GEOM_QUEUES.store(nqueues as u64, Ordering::Relaxed);
+        GEOM_DEPTH.store(depth as u64, Ordering::Relaxed);
+        GEOM_PAYLOAD_SZ.store(payload_sz as u64, Ordering::Relaxed);
+        GEOM_MAX_BACKGROUND.store(max_background as u64, Ordering::Relaxed);
 
         let mut inbound = Vec::with_capacity(nqueues);
         for _ in 0..nqueues {
@@ -1824,6 +2019,116 @@ mod tests {
     #[test]
     fn test_write_opcode_matches_abi() {
         assert_eq!(FUSE_WRITE_OPCODE, 16, "linux/fuse.h FUSE_WRITE");
+    }
+
+    // -----------------------------------------------------------------
+    // L1 transport-concurrency policy (pure core). MiB payload = the
+    // SqueezeFS shape (max_write 1 MiB = 256 kernel pages).
+    // -----------------------------------------------------------------
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn plan(
+        nq: usize,
+        env_q: Option<usize>,
+        env_d: Option<usize>,
+        cap: u64,
+        mb: Option<u16>,
+        ct: Option<u16>,
+    ) -> TransportGeometry {
+        TransportGeometry::plan(nq, env_q, env_d, 1024 * 1024, cap, mb, ct)
+    }
+
+    /// Ample budget ⇒ the measured 316k-class defaults: depth 32,
+    /// max_background 256, congestion 192, on a 32-CPU geometry.
+    #[test]
+    fn test_plan_default_ample_budget_is_measured_class() {
+        let g = plan(32, None, None, 2 * GIB, None, None);
+        assert_eq!(g.nqueues, 32);
+        assert_eq!(g.depth, 32, "desired depth under an ample cap");
+        assert_eq!(g.payload_sz, 1024 * 1024);
+        assert_eq!(g.total_payload_bytes(), GIB);
+        assert_eq!(g.max_background, 256, "clamp(32×32, 64, 256)");
+        assert_eq!(g.congestion_threshold, 192, "¾ of max_background");
+    }
+
+    /// The budget degrades depth exactly (integer division), floor 4 —
+    /// the pre-L1 shipped posture even when the cap is smaller than the
+    /// floor's arena.
+    #[test]
+    fn test_plan_budget_degrades_depth_gracefully() {
+        // 819 MiB cap on 32 queues × 1 MiB ⇒ depth 25 (the 8G-cage row).
+        let g = plan(32, None, None, 819 * MIB, None, None);
+        assert_eq!(g.depth, 25);
+        assert_eq!(g.max_background, 256, "32×25=800 clamps to 256");
+        // 128 MiB cap ⇒ exactly the floor.
+        let g = plan(32, None, None, 128 * MIB, None, None);
+        assert_eq!(g.depth, 4, "floor = pre-L1 default");
+        assert_eq!(g.max_background, 128, "32×4 within [64,256]");
+        assert_eq!(g.congestion_threshold, 96);
+        // Cap 0 (unknown RAM) ⇒ still the floor, never below.
+        let g = plan(32, None, None, 0, None, None);
+        assert_eq!(g.depth, 4);
+        // Few-CPU box, small cap: 4 queues, 179 MiB ⇒ desired 32 fits.
+        let g = plan(4, None, None, 179 * MIB, None, None);
+        assert_eq!(g.depth, 32);
+        assert_eq!(g.max_background, 128, "4×32 = 128");
+        // Huge-CPU box under the 2 GiB ceiling: 256 queues ⇒ depth 8.
+        let g = plan(256, None, None, 2 * GIB, None, None);
+        assert_eq!(g.depth, 8);
+        assert_eq!(g.total_payload_bytes(), 2 * GIB);
+        assert_eq!(g.max_background, 256);
+    }
+
+    /// Env depth wins verbatim over the cap (explicit operator intent),
+    /// with the existing 1..32 clamp semantics unchanged.
+    #[test]
+    fn test_plan_env_depth_override_wins() {
+        let g = plan(32, None, Some(6), 0, None, None);
+        assert_eq!(g.depth, 6, "env bypasses the budget cap");
+        assert_eq!(g.max_background, 192, "32×6 = 192 within [64,256]");
+        assert_eq!(plan(32, None, Some(64), 2 * GIB, None, None).depth, 32);
+        assert_eq!(plan(32, None, Some(0), 2 * GIB, None, None).depth, 1);
+    }
+
+    /// Queue-count semantics unchanged: kernel possible CPUs by default,
+    /// env override clamped 1..512; max_background floor holds on tiny
+    /// geometries.
+    #[test]
+    fn test_plan_queues_and_background_floor() {
+        let g = plan(32, Some(1), Some(4), 2 * GIB, None, None);
+        assert_eq!(g.nqueues, 1);
+        assert_eq!(g.max_background, 64, "1×4 = 4 floors to 64");
+        assert_eq!(g.congestion_threshold, 48);
+        assert_eq!(plan(32, Some(4096), None, 2 * GIB, None, None).nqueues, 512);
+        assert_eq!(plan(32, Some(0), None, 2 * GIB, None, None).nqueues, 1);
+    }
+
+    /// Explicit INIT-limit overrides win; 0 means "not set" (kernel
+    /// semantics) and falls through to policy.
+    #[test]
+    fn test_plan_background_overrides() {
+        let g = plan(32, None, None, 2 * GIB, Some(96), Some(80));
+        assert_eq!(g.max_background, 96);
+        assert_eq!(g.congestion_threshold, 80);
+        // Override mb only: ct derives from the OVERRIDDEN mb.
+        let g = plan(32, None, None, 2 * GIB, Some(100), None);
+        assert_eq!(g.max_background, 100);
+        assert_eq!(g.congestion_threshold, 75);
+        // Zero overrides are ignored.
+        let g = plan(32, None, None, 2 * GIB, Some(0), Some(0));
+        assert_eq!(g.max_background, 256);
+        assert_eq!(g.congestion_threshold, 192);
+    }
+
+    /// payload_sz respects the kernel minimum even for small max_write —
+    /// the arena math (and therefore the depth degradation) is anchored
+    /// to the real registered size, not the caller's max_write.
+    #[test]
+    fn test_plan_payload_floor_governs_arena() {
+        let g = TransportGeometry::plan(8, None, None, 4096, 32 * MIB, None, None);
+        assert_eq!(g.payload_sz, 256 * 4096, "kernel max_pages floor");
+        assert_eq!(g.depth, 4, "32 MiB / (8 × 1 MiB) = 4");
     }
 
     /// Arena buffers: one stable, 4096-aligned, zeroed allocation per ring

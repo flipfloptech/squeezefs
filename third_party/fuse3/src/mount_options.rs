@@ -45,6 +45,21 @@ pub struct MountOptions {
     pub(crate) write_back: bool,
     pub(crate) force_readdir_plus: bool,
 
+    // Transport concurrency (L1 IOPS-parity program). These are
+    // daemon-level values consumed by the INIT reply / the
+    // FUSE-over-io_uring geometry resolver — never passed to mount(2).
+    /// Override the INIT-reply `max_background` (0/None = policy default:
+    /// clamp(queues × depth, 64, 256)).
+    pub(crate) max_background: Option<u16>,
+    /// Override the INIT-reply `congestion_threshold` (0/None = ¾ of
+    /// `max_background`).
+    pub(crate) congestion_threshold: Option<u16>,
+    /// Cap on total FUSE-over-io_uring payload-arena bytes
+    /// (queues × depth × payload_sz). The embedder derives this from its
+    /// memory budget (SqueezeFS: min(mem_budget / 8, 2 GiB)); unset falls
+    /// back to min(RAM / 8, 2 GiB).
+    pub(crate) transport_buffer_cap_bytes: Option<u64>,
+
     // Other FUSE mount options
     // default 40000
     #[cfg(target_os = "linux")]
@@ -175,6 +190,37 @@ impl MountOptions {
     /// set custom options for fuse filesystem, the custom options will be used in mount
     pub fn custom_options(&mut self, custom_options: impl Into<OsString>) -> &mut Self {
         self.custom_options = Some(custom_options.into());
+
+        self
+    }
+
+    /// Override the INIT-reply `max_background` (kernel cap on queued
+    /// background requests — async DIO, readahead, writeback). Default is
+    /// the L1 policy: clamp(over-uring queues × depth, 64, 256). Values
+    /// of 0 are ignored (the kernel treats 0 as "keep default").
+    pub fn max_background(&mut self, max_background: u16) -> &mut Self {
+        if max_background > 0 {
+            self.max_background = Some(max_background);
+        }
+
+        self
+    }
+
+    /// Override the INIT-reply `congestion_threshold`. Default is ¾ of
+    /// `max_background` (the kernel's own ratio). Values of 0 are ignored.
+    pub fn congestion_threshold(&mut self, congestion_threshold: u16) -> &mut Self {
+        if congestion_threshold > 0 {
+            self.congestion_threshold = Some(congestion_threshold);
+        }
+
+        self
+    }
+
+    /// Cap the total FUSE-over-io_uring payload-arena bytes; the per-queue
+    /// ring depth degrades from its desired 32 toward the floor of 4 to
+    /// fit (see `TransportGeometry` in the fuse-over-uring module).
+    pub fn transport_buffer_cap_bytes(&mut self, cap: u64) -> &mut Self {
+        self.transport_buffer_cap_bytes = Some(cap);
 
         self
     }

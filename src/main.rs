@@ -4051,8 +4051,12 @@ pub fn tune_system() -> Result<(), std::io::Error> {
                         );
                     }
                     if is_root {
-                        let _ = std::fs::write(max_bg_path, "64\n");
-                        let _ = std::fs::write(cong_path, "48\n");
+                        // L1 policy ceiling (IOPS-parity program): mounts
+                        // now negotiate up to 256/192 at INIT — `tune`
+                        // must never LOWER a live connection back to the
+                        // pre-L1 64/48.
+                        let _ = std::fs::write(max_bg_path, "256\n");
+                        let _ = std::fs::write(cong_path, "192\n");
                     }
                 }
 

@@ -2124,6 +2124,15 @@ impl SqueezefsFilesystem {
             0u64,
             serde_json::Map::<String, serde_json::Value>::new(),
         );
+        // L1 transport geometry gauges (IOPS-parity program): the live
+        // session's over-uring ring shape, its registered payload-arena
+        // bytes (queues × depth × payload_sz — the RSS the depth policy
+        // budgets), and the INIT-reply max_background actually negotiated.
+        #[cfg(target_os = "linux")]
+        let (t_queues, t_depth, _t_payload_sz, t_buffer_bytes, t_max_background) =
+            fuse3::over_uring_geometry();
+        #[cfg(not(target_os = "linux"))]
+        let (t_queues, t_depth, t_buffer_bytes, t_max_background) = (0u64, 0u64, 0u64, 0u64);
 
         // PR K7 (design §10): the `meta_kv_*` family is emitted only when
         // a metadata volume is mounted (v3 is the only metadata format).
@@ -2254,6 +2263,10 @@ impl SqueezefsFilesystem {
                 "transport_leases_outstanding": t_outstanding,
                 "transport_lease_max_age_ms": t_max_age,
                 "transport_classical_sideband": t_classical_sideband,
+                "transport_queues": t_queues,
+                "transport_q_depth": t_depth,
+                "transport_payload_buffer_bytes": t_buffer_bytes,
+                "transport_max_background": t_max_background,
                 "transport_commit_batch": serde_json::Value::Object(t_cb_hist),
                 "transport_commit_batch_flushes": t_cb_flushes,
                 "transport_commit_batch_commits": t_cb_commits,
@@ -4891,6 +4904,21 @@ impl Filesystem for SqueezefsFilesystem {
                         }),
                     ));
                 }
+                // L1: the FUSE-over-io_uring payload arenas — registered,
+                // session-lifetime buffers the kernel copies payloads
+                // through. Sized AT MOUNT by `transport_buffer_cap`
+                // (budget/8, ≤ 2 GiB) and never resized, so they cannot
+                // shed: weight 0 + no-op shed = attribution only, but the
+                // bytes are anon (pressure-carrying), unlike the mmap
+                // tiers. Gauge reads 0 until the session arms.
+                #[cfg(target_os = "linux")]
+                MEM_BUDGET.register(Component::new(
+                    "transport_payload_buffers",
+                    0,
+                    0,
+                    Arc::new(|| fuse3::over_uring_geometry().3),
+                    Arc::new(|_| {}),
+                ));
                 MEM_BUDGET.register(Component::new(
                     "buffer_pool",
                     16 * 4 * MIB,
@@ -7893,10 +7921,47 @@ pub async fn start_mount<P: AsRef<Path>>(
                     if key == "fsname" {
                         options.fs_name(val);
                     }
+                    // L1 (IOPS-parity program): `-o max_background=` /
+                    // `-o congestion_threshold=` are DAEMON-level INIT-reply
+                    // overrides (pre-L1 they were dead letters — filtered
+                    // from the kernel mount string and never reaching the
+                    // INIT reply, which hardcoded 12/9). Unset, the policy
+                    // default is clamp(queues × depth, 64, 256) and ¾ of it.
+                    if key == "max_background" {
+                        match val.parse::<u16>() {
+                            Ok(v) if v > 0 => {
+                                options.max_background(v);
+                            }
+                            _ => warn!("ignoring invalid -o max_background={val}"),
+                        }
+                    }
+                    if key == "congestion_threshold" {
+                        match val.parse::<u16>() {
+                            Ok(v) if v > 0 => {
+                                options.congestion_threshold(v);
+                            }
+                            _ => warn!("ignoring invalid -o congestion_threshold={val}"),
+                        }
+                    }
                 }
             }
         }
     }
+
+    // L1 payload-arena budget: an eighth of the §5.7-resolved memory
+    // budget, ceilinged at 2 GiB. The FUSE-over-io_uring geometry resolver
+    // degrades per-queue ring depth from the desired 32 toward the pre-L1
+    // floor of 4 to fit under this cap — small-RAM boxes keep yesterday's
+    // footprint, everything else ships the measured 316k-IOPS geometry by
+    // default.
+    let mem_budget = crate::mem_budget::MEM_BUDGET.resolve_budget_now();
+    let transport_cap = crate::mem_budget::transport_buffer_cap(mem_budget);
+    options.transport_buffer_cap_bytes(transport_cap);
+    info!(
+        "Transport payload-buffer cap: {} MiB (memory budget {} MiB)",
+        transport_cap / (1024 * 1024),
+        mem_budget / (1024 * 1024)
+    );
 
     if is_root {
         let filtered_opts = if let Some(ref opts) = custom_opts {
@@ -7910,8 +7975,13 @@ pub async fn start_mount<P: AsRef<Path>>(
             let parsed = parse_custom_options(&opts);
             options.custom_options(parsed);
         } else {
-            // default custom option
-            options.custom_options("max_read=1048576,max_write=1048576,max_pages=256,max_readahead=4194304,max_background=64,congestion_threshold=48,async_read");
+            // Default custom options. (`max_background`/`congestion_threshold`
+            // are NOT mount-string options — they live in the INIT reply and
+            // default to the L1 policy above; the historical tokens here were
+            // dead letters, filtered before reaching the kernel.)
+            options.custom_options(
+                "max_read=1048576,max_write=1048576,max_pages=256,max_readahead=4194304,async_read",
+            );
         }
     }
 

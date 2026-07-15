@@ -227,15 +227,23 @@ impl FuseConnection {
 
     /// Start kernel FUSE-over-io_uring workers after FUSE_INIT. Required transport.
     /// Shared with multi-queue clones via [`clone_connection`].
+    ///
+    /// `geom` is the session geometry resolved by
+    /// [`super::fuse_over_uring::TransportGeometry::resolve`] BEFORE the
+    /// INIT reply was serialized — the rings registered here always match
+    /// the `max_background`/`congestion_threshold` the kernel was told.
     #[cfg(target_os = "linux")]
-    pub fn enable_fuse_over_uring(&self, max_write: usize) -> io::Result<()> {
+    pub fn enable_fuse_over_uring(
+        &self,
+        geom: super::fuse_over_uring::TransportGeometry,
+    ) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         // Already enabled (e.g. race with another enable call)
         if self.over_uring.lock().unwrap().is_some() {
             return Ok(());
         }
         let fd = self.as_fd().as_raw_fd();
-        let pool = super::fuse_over_uring::FuseOverUring::try_start(fd, max_write).map_err(|e| {
+        let pool = super::fuse_over_uring::FuseOverUring::try_start(fd, geom).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!(

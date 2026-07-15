@@ -1432,13 +1432,38 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
         let flags2 = 0u32;
 
+        // L1 (IOPS-parity program): resolve the session transport geometry
+        // BEFORE serializing the INIT reply, so the `max_background` /
+        // `congestion_threshold` the kernel learns here always describe the
+        // FUSE-over-io_uring rings that step 2 below will register. The
+        // classical DEFAULT_MAX_BACKGROUND=12 was one of the two
+        // multiplicative in-flight gates (with per-queue depth 4) that held
+        // rand-4k iodepth workloads to ~18 effective of 256 offered.
+        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+        let transport_geom = crate::raw::connection::fuse_over_uring::TransportGeometry::resolve(
+            reply.max_write.get() as usize,
+            self.mount_options.transport_buffer_cap_bytes,
+            self.mount_options.max_background,
+            self.mount_options.congestion_threshold,
+        );
+        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+        let (max_background, congestion_threshold) = (
+            transport_geom.max_background,
+            transport_geom.congestion_threshold,
+        );
+        // Non-over-uring builds keep the classical libfuse-era defaults
+        // (max_background 12, congestion ¾ of it) — the L1 policy is an
+        // over-uring geometry statement and does not apply without rings.
+        #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
+        let (max_background, congestion_threshold) = (12u16, 9u16);
+
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead: init_in.max_readahead,
             flags: reply_flags,
-            max_background: DEFAULT_MAX_BACKGROUND,
-            congestion_threshold: DEFAULT_CONGESTION_THRESHOLD,
+            max_background,
+            congestion_threshold,
             max_write: reply.max_write.get(),
             time_gran: DEFAULT_TIME_GRAN,
             max_pages: DEFAULT_MAX_PAGES,
@@ -1490,7 +1515,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         //    sideband session `inner_mount` keeps on the primary connection.
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
-            fuse_connection.enable_fuse_over_uring(reply.max_write.get() as usize)?;
+            fuse_connection.enable_fuse_over_uring(transport_geom)?;
             if let Some(pool) = fuse_connection.over_uring.lock().unwrap().clone() {
                 pool.mark_ready();
             }

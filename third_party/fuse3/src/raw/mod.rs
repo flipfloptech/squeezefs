@@ -14,8 +14,8 @@ pub use request::Request;
 pub use session::{kernel_init_info, KernelInit, MountHandle, Session, tpc_spawn, tpc_thread_count};
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::{
-    over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_sessions_active,
-    over_uring_stats, transport_lease_stats, COMMIT_BATCH_LABELS,
+    over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_geometry,
+    over_uring_sessions_active, over_uring_stats, transport_lease_stats, COMMIT_BATCH_LABELS,
 };
 
 pub(crate) type FuseData = Either<Vec<u8>, (Vec<u8>, Bytes, Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>)>;

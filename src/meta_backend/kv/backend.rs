@@ -1465,16 +1465,17 @@ impl KvMetaBackend {
     /// per-component cap can see the sum" (§5.7) applies to it like every
     /// other consumer.
     pub fn node_cache_gauge(&self) -> (u64, u64) {
-        let node_size = self.cache.config().layout.node_size() as u64;
-        let mut nodes = 0u64;
+        // PR M9 (§5.7): the byte half is the cache's own budget gauge —
+        // extents + overlay (records + folded heads) + snapshot memo
+        // bytes — so the mem-budget `kv_node_cache` component sees the
+        // same accounting `SQUEEZEFS_META_NODE_CACHE_MB` enforces.
         let mut dirty = 0u64;
         self.node_cache().for_each_node(|n| {
-            nodes += 1;
             if n.dirty_floor() != u64::MAX {
                 dirty += 1;
             }
         });
-        (nodes * node_size, dirty)
+        (self.node_cache().cached_bytes(), dirty)
     }
 
     /// R5 shed lever (never-lossy by construction): wake the checkpoint
@@ -2793,11 +2794,13 @@ impl KvMetaBackend {
                         .iter()
                         .zip(entry_leaves)
                         .filter(|(_, leaf)| leaf.addr() == node.addr())
-                        .map(|((_, r), _)| OwnedRec {
-                            key: Bytes::copy_from_slice(&r.key),
-                            seq: r.seq,
-                            kind: r.kind,
-                            value: Bytes::copy_from_slice(&r.value),
+                        .map(|((_, r), _)| {
+                            OwnedRec::new(
+                                Bytes::copy_from_slice(&r.key),
+                                r.seq,
+                                r.kind,
+                                Bytes::copy_from_slice(&r.value),
+                            )
                         })
                         .collect();
                     if group.is_empty() {
@@ -3280,12 +3283,12 @@ impl KvMetaBackend {
                     .expect("leaf is locked");
                 leaves[i].apply_locked(
                     &mut guards[gi],
-                    vec![OwnedRec {
-                        key: Bytes::copy_from_slice(&r.key),
-                        seq: r.seq,
-                        kind: r.kind,
-                        value: Bytes::copy_from_slice(&r.value),
-                    }],
+                    vec![OwnedRec::new(
+                        Bytes::copy_from_slice(&r.key),
+                        r.seq,
+                        r.kind,
+                        Bytes::copy_from_slice(&r.value),
+                    )],
                 )?;
             }
             drop(guards);

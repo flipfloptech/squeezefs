@@ -2417,6 +2417,28 @@ impl SqueezefsFilesystem {
                     "meta_kv_delta_orphans".into(),
                     load(&meta_kv::META_KV_DELTA_ORPHANS),
                 );
+                // PR M9 (design-metadata-throughput §5.7 D7 / §9):
+                // record-fold slimming — overlay-head serves (D7.a),
+                // snapshot fold-memo hit rate (D7.b; the create-storm hit
+                // rate is the acceptance number), and the memo-bytes
+                // gauge that rides the node-cache budget (the tiny-budget
+                // storm gate reads it).
+                metrics.insert(
+                    "meta_kv_fold_head_serves".into(),
+                    load(&meta_kv::META_KV_FOLD_HEAD_SERVES),
+                );
+                metrics.insert(
+                    "meta_kv_fold_memo_hits".into(),
+                    load(&meta_kv::META_KV_FOLD_MEMO_HITS),
+                );
+                metrics.insert(
+                    "meta_kv_fold_memo_misses".into(),
+                    load(&meta_kv::META_KV_FOLD_MEMO_MISSES),
+                );
+                metrics.insert(
+                    "meta_kv_fold_memo_bytes".into(),
+                    load(&meta_kv::META_KV_FOLD_MEMO_BYTES),
+                );
                 // PR M6 (design-metadata-throughput §5.4 D4): the
                 // SETATTR-echo absorber — echoes absorbed with zero
                 // entries, batched drain commits (the amortized residual

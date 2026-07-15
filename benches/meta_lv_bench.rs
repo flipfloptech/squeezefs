@@ -334,10 +334,14 @@ fn bench_kv_tree(c: &mut Criterion) {
         });
     });
 
-    // Cold point lookup: a 2-node budget forces demand paging (leaf
+    // Cold point lookup: a 3-node budget forces demand paging (leaf
     // eviction) on nearly every probe — one 256 KiB uring read + snapshot
-    // build per miss.
-    let (_cold_file, _cold_cache, cold_tree, _cold_ctx) = build_volume(2);
+    // build per miss. (3, not 2, since PR M9: a node's charge is extent +
+    // overlay + memo bytes, so pinned-interior + one dirty leaf already
+    // fills a 2-node budget during the build and the writer's freshly
+    // loaded leaf would evict-livelock — the §5.7 accounting needs one
+    // slot of headroom here; probes still miss on nearly every stride.)
+    let (_cold_file, _cold_cache, cold_tree, _cold_ctx) = build_volume(3);
     group.bench_function("point_lookup_cold_demand_page", |b| {
         let mut i = 0u64;
         b.to_async(&rt).iter(|| {

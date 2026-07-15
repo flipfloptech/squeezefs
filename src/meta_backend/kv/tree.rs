@@ -254,7 +254,7 @@ impl KvTree {
             cache.durable_tail(),
         )
         .await?;
-        let node = CachedNode::from_loaded(loaded, true)?;
+        let node = CachedNode::from_loaded(loaded, true, cache.charge_gauge())?;
         cache.publish(node);
         Ok(Self {
             tree_id,
@@ -496,12 +496,7 @@ impl KvTree {
         };
         leaf.apply_locked(
             &mut guard,
-            vec![OwnedRec {
-                key: Bytes::copy_from_slice(key),
-                seq,
-                kind,
-                value,
-            }],
+            vec![OwnedRec::new(Bytes::copy_from_slice(key), seq, kind, value)],
         )?;
         let over_threshold = guard.overlay_bytes() >= self.cache.config().writeback_delta_bytes;
         drop(guard);
@@ -977,7 +972,11 @@ impl KvTree {
         for (dst, _) in &written {
             let loaded = load_node(&cfg.path, layout, *dst, durable_tail).await?;
             let pinned = node.level() > 0 || (self.is_root(node) && written.len() == 1);
-            successors.push(CachedNode::from_loaded(loaded, pinned)?);
+            successors.push(CachedNode::from_loaded(
+                loaded,
+                pinned,
+                self.cache.charge_gauge(),
+            )?);
         }
 
         // A multi-way replacement of the root needs a new root above the
@@ -1022,7 +1021,11 @@ impl KvTree {
             )
             .await?;
             let loaded = load_node(&cfg.path, layout, dst, durable_tail).await?;
-            Some(CachedNode::from_loaded(loaded, true)?)
+            Some(CachedNode::from_loaded(
+                loaded,
+                true,
+                self.cache.charge_gauge(),
+            )?)
         } else {
             None
         };
@@ -1174,18 +1177,20 @@ impl KvTree {
                     let recs: Vec<OwnedRec> = successors
                         .iter()
                         .enumerate()
-                        .map(|(i, s)| OwnedRec {
-                            key: Bytes::copy_from_slice(s.max_key()),
-                            seq: match &smo_entry {
-                                // The first `successors.len()` journal
-                                // records ARE the pointer records, in
-                                // successor order — RAM apply and replay
-                                // must carry identical seqs.
-                                Some((_, recs, _)) => recs[i].1.seq,
-                                None => self.next_seq(),
-                            },
-                            kind: RecordKind::Put,
-                            value: Bytes::from(encode_interior_value(s.addr(), s.node_seq())),
+                        .map(|(i, s)| {
+                            OwnedRec::new(
+                                Bytes::copy_from_slice(s.max_key()),
+                                match &smo_entry {
+                                    // The first `successors.len()` journal
+                                    // records ARE the pointer records, in
+                                    // successor order — RAM apply and replay
+                                    // must carry identical seqs.
+                                    Some((_, recs, _)) => recs[i].1.seq,
+                                    None => self.next_seq(),
+                                },
+                                RecordKind::Put,
+                                Bytes::from(encode_interior_value(s.addr(), s.node_seq())),
+                            )
                         })
                         .collect();
                     parent.apply_locked(pg, recs)?;

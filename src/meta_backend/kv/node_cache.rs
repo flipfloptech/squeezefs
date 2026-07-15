@@ -39,13 +39,15 @@ use super::node::{
     encode_bset_frame, load_node, AppendDest, LoadedNode, NodeLayout, BSET_FRAME_LEN,
 };
 use super::node_state_core::NodeState;
-use super::record::{fold_newest_first, Folded, Record, RecordKind, RecordRef};
+use super::record::{
+    fold_forward, fold_newest_first, Folded, FoldedHead, Record, RecordKind, RecordRef,
+};
 use super::KvError;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Default node-cache budget: 512 MiB (§3 / §4.5 — the
 /// `SQUEEZEFS_META_NODE_CACHE_MB` default; plumbed as a parameter until
@@ -331,9 +333,35 @@ pub struct OwnedRec {
     pub seq: u64,
     pub kind: RecordKind,
     pub value: Bytes,
+    /// PR M9 (§5.7 D7.a): the materialized folded head — `fold(this
+    /// record ∪ everything older for the key)` — riding **the newest**
+    /// overlay record of each key only ([`CachedNode::apply_locked`]
+    /// clears the previous newest's head as it supersedes it; older
+    /// records keep `None`). `None` also means "invalidated — fall back
+    /// to the from-scratch fold" (mid-range rollback removal, §4.4 pt 4).
+    /// Never serialized: the freeze path writes [`Self::to_record`],
+    /// which drops it — on-disk economics unchanged.
+    pub(crate) folded: Option<FoldedHead>,
 }
 
+/// Fixed per-head charge beyond the owned value buffer (the enum + the
+/// `Option` framing inside the record) — the §5.7 budget accounting's
+/// overhead constant.
+const FOLD_HEAD_OVERHEAD: usize = std::mem::size_of::<Option<FoldedHead>>();
+
 impl OwnedRec {
+    /// A fresh record entering [`CachedNode::apply_locked`] (the head is
+    /// materialized there, under the node write lock).
+    pub fn new(key: Bytes, seq: u64, kind: RecordKind, value: Bytes) -> Self {
+        Self {
+            key,
+            seq,
+            kind,
+            value,
+            folded: None,
+        }
+    }
+
     /// Borrow as the fold algebra's view.
     pub fn record_ref(&self) -> RecordRef<'_> {
         RecordRef {
@@ -342,6 +370,14 @@ impl OwnedRec {
             kind: self.kind,
             value: &self.value,
         }
+    }
+
+    /// The §5.7 budget charge of this record's head (0 when none).
+    fn head_bytes(&self) -> usize {
+        self.folded
+            .as_ref()
+            .map(|h| FOLD_HEAD_OVERHEAD + h.owned_bytes())
+            .unwrap_or(0)
     }
 
     /// Copy into the K1 owned record (bset build / append input).
@@ -364,6 +400,141 @@ pub enum LiveLookup {
     Tombstone,
     /// No records for the key in this node.
     Absent,
+}
+
+impl LiveLookup {
+    /// The head-serve projection (D7.a): a stored [`FoldedHead`] as the
+    /// read path's outcome — `Bytes` clones are refcounts, zero-copy.
+    fn from_head(h: &FoldedHead) -> Self {
+        match h {
+            FoldedHead::Live { value, .. } => LiveLookup::Live(value.clone()),
+            FoldedHead::Tombstone => LiveLookup::Tombstone,
+            FoldedHead::Absent => LiveLookup::Absent,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The snapshot fold memo (PR M9, design-metadata-throughput §5.7 D7.b).
+// ---------------------------------------------------------------------------
+
+/// One populated memo cell: `key → (folded outcome, horizon seq)`.
+/// `horizon` is the newest record seq the fold consumed — with memos
+/// scoped to one immutable snapshot it is vacuously current, and the
+/// debug assert on every hit *pins that immutability*: if snapshots ever
+/// mutate in place, debug builds explode here instead of serving stale
+/// folds.
+#[derive(Debug)]
+struct MemoCell {
+    key: Bytes,
+    look: LiveLookup,
+    horizon: u64,
+}
+
+/// The bounded per-node fold memo living on the **immutable** arc-swap'd
+/// snapshot (§5.7 D7.b): [`FOLD_MEMO_CAPACITY`] populate-once
+/// `OnceLock` cells, first-come. Probes are latch-free (`OnceLock::get`
+/// is an atomic load); populates race only on the same cell, arbitrated
+/// by `OnceLock::set` (the loser re-checks and claims the next cell). The
+/// memo is race-free by construction — every populate of one key computes
+/// the same deterministic fold of the same immutable snapshot — and it
+/// **dies with the snapshot at the next swap** (every RAM apply publishes
+/// a fresh snapshot with an empty memo).
+///
+/// Memory: `bytes` tracks this memo's charge (keys + owned folded values
+/// + a fixed per-cell overhead); populate adds it to both the global
+/// `meta_kv_fold_memo_bytes` gauge and the owning cache's budget charge,
+/// and [`Drop`] subtracts exactly what was added — the §5.7 accounting is
+/// Drop-owned and leak-free.
+struct FoldMemo {
+    cells: [OnceLock<MemoCell>; FOLD_MEMO_CAPACITY],
+    /// Bytes this memo has charged (subtracted on drop).
+    bytes: AtomicU64,
+    /// The owning cache's budget gauge (`NodeCache::cached_bytes`).
+    charge: Arc<AtomicU64>,
+}
+
+/// Fixed per-cell charge beyond the key and any owned value buffer.
+const MEMO_CELL_OVERHEAD: usize = std::mem::size_of::<MemoCell>();
+
+impl FoldMemo {
+    fn new(charge: Arc<AtomicU64>) -> Self {
+        Self {
+            cells: std::array::from_fn(|_| OnceLock::new()),
+            bytes: AtomicU64::new(0),
+            charge,
+        }
+    }
+
+    /// Latch-free probe: scan the (≤ [`FOLD_MEMO_CAPACITY`]) populated
+    /// cells for `key`. Cells may populate out of order under racing
+    /// claims, so every slot is inspected — 8 `Bytes` compares on 8–16 B
+    /// keys, no decodes, no locks.
+    fn probe(&self, key: &[u8]) -> Option<&MemoCell> {
+        self.cells
+            .iter()
+            .filter_map(|c| c.get())
+            .find(|c| c.key[..] == *key)
+    }
+
+    /// Populate-once claim: first empty cell wins; a same-key racer's
+    /// duplicate is prevented by the post-loss re-check (both computed
+    /// byte-identical folds — immutability — so even the unreachable
+    /// duplicate would be benign). A full memo drops the entry — the
+    /// fixed capacity IS the §5.7 per-node memory bound.
+    fn populate(&self, key: Bytes, look: LiveLookup, horizon: u64) {
+        let charge = key.len()
+            + MEMO_CELL_OVERHEAD
+            + match &look {
+                // The owned-fold case charges its buffer; plain-Put /
+                // tombstone outcomes refcount snapshot memory the node
+                // already pays for.
+                LiveLookup::Live(v) => v.len(),
+                LiveLookup::Tombstone | LiveLookup::Absent => 0,
+            };
+        let mut cell = MemoCell { key, look, horizon };
+        for slot in &self.cells {
+            match slot.set(cell) {
+                Ok(()) => {
+                    let charge = charge as u64;
+                    self.bytes.fetch_add(charge, Ordering::AcqRel);
+                    self.charge.fetch_add(charge, Ordering::AcqRel);
+                    super::META_KV_FOLD_MEMO_BYTES.fetch_add(charge, Ordering::AcqRel);
+                    return;
+                }
+                Err(back) => {
+                    // Lost the claim: if the winner memoized OUR key,
+                    // we're done; otherwise try the next cell.
+                    if slot.get().is_some_and(|c| c.key == back.key) {
+                        return;
+                    }
+                    cell = back;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FoldMemo {
+    fn drop(&mut self) {
+        let bytes = self.bytes.load(Ordering::Acquire);
+        if bytes > 0 {
+            self.charge.fetch_sub(bytes, Ordering::AcqRel);
+            super::META_KV_FOLD_MEMO_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+impl std::fmt::Debug for FoldMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FoldMemo")
+            .field(
+                "populated",
+                &self.cells.iter().filter(|c| c.get().is_some()).count(),
+            )
+            .field("bytes", &self.bytes.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 /// Published open-delta records newer than the last `stable` re-merge:
@@ -389,6 +560,10 @@ pub struct NodeSnapshot {
     /// seq inversion (replayed original seqs at mount).
     stable: Arc<Vec<OwnedRec>>,
     tail: Arc<Vec<OwnedRec>>,
+    /// PR M9 (§5.7 D7.b): the bounded populate-once fold memo for
+    /// bset-resident keys. Fresh (empty) on every snapshot publish; dies
+    /// with this snapshot — see [`FoldMemo`].
+    memo: FoldMemo,
 }
 
 impl NodeSnapshot {
@@ -440,15 +615,56 @@ impl NodeSnapshot {
         newest
     }
 
-    /// Fold one key with the single K1 algebra: overlay runs newest-first
-    /// (tail, then stable — see the run ordering invariant on the struct),
-    /// then base group (already `(seq desc)`), zero-copy value return.
-    /// The gather is a chained iterator — no per-fold allocation (PR K7:
-    /// two Vecs per fold showed up in every chain probe behind every
-    /// lookup/create/unlink).
+    /// Fold one key — **the D7 slimmed read path** (PR M9, §5.7):
+    ///
+    /// 1. **Overlay head serve (D7.a)**: the newest open-delta record of
+    ///    the key carries a materialized folded head (kept current at
+    ///    apply time under the node write lock) — zero record decodes.
+    /// 2. **Memo serve (D7.b)**: an overlay-absent (bset-resident) key
+    ///    probes this snapshot's populate-once memo cells — latch-free,
+    ///    zero decodes.
+    /// 3. **From-scratch fold**: the single K1 algebra over the chained
+    ///    gather (no per-fold allocation — PR K7), exactly as before D7;
+    ///    memo-eligible outcomes populate a cell for the next read.
+    ///
+    /// The fold FUNCTION is untouched (design-cow-kv-metadata §4.2); the
+    /// head/memo paths only change *when* it runs — pinned equivalent by
+    /// the R7 proptest guard (`tests/kv_fold_slimming_tests.rs`).
     pub fn lookup(&self, key: &[u8]) -> Result<LiveLookup, KvError> {
         let tg = Self::run_group(&self.tail, key);
         let sg = Self::run_group(&self.stable, key);
+
+        // (1) D7.a: the newest overlay record for the key (tail ≥ stable
+        // per key — the run-precedence invariant above).
+        let newest_overlay = if !tg.is_empty() {
+            Some(&self.tail[tg.end - 1])
+        } else if !sg.is_empty() {
+            Some(&self.stable[sg.end - 1])
+        } else {
+            None
+        };
+        if let Some(newest) = newest_overlay {
+            if let Some(head) = &newest.folded {
+                super::META_KV_FOLD_HEAD_SERVES.fetch_add(1, Ordering::Relaxed);
+                return Ok(LiveLookup::from_head(head));
+            }
+        } else {
+            // (2) D7.b: bset-resident key — probe the snapshot memo.
+            if let Some(cell) = self.memo.probe(key) {
+                super::META_KV_FOLD_MEMO_HITS.fetch_add(1, Ordering::Relaxed);
+                // Immutability pin: the memoized horizon must still be
+                // this snapshot's newest seq for the key (see MemoCell).
+                debug_assert_eq!(
+                    self.newest_seq_of(key),
+                    Some(cell.horizon),
+                    "snapshot mutated under a memo (immutability violated)"
+                );
+                return Ok(cell.look.clone());
+            }
+        }
+
+        // (3) From-scratch fold (head invalidated, or first fold of a
+        // bset-resident key).
         let bg = self.base.group_bounds(key);
         let gather = tg
             .clone()
@@ -456,20 +672,32 @@ impl NodeSnapshot {
             .map(|i| self.tail[i].record_ref())
             .chain(sg.clone().rev().map(|i| self.stable[i].record_ref()))
             .chain(bg.clone().map(|i| self.base.record_ref(i)));
-        match fold_newest_first(gather)? {
-            Folded::Absent => Ok(LiveLookup::Absent),
-            Folded::Tombstone { .. } => Ok(LiveLookup::Tombstone),
-            Folded::Put { value, .. } => Ok(LiveLookup::Live(match value {
+        let look = match fold_newest_first(gather)? {
+            Folded::Absent => LiveLookup::Absent,
+            Folded::Tombstone { .. } => LiveLookup::Tombstone,
+            Folded::Put { value, .. } => LiveLookup::Live(match value {
                 std::borrow::Cow::Owned(v) => Bytes::from(v),
                 std::borrow::Cow::Borrowed(v) => {
-                    self.materialize(tg, sg, bg, v).ok_or_else(|| {
+                    self.materialize(tg, sg, bg.clone(), v).ok_or_else(|| {
                         KvError::Corrupt(
                             "folded borrow does not match any gathered record".to_string(),
                         )
                     })?
                 }
-            })),
+            }),
+        };
+        if newest_overlay.is_none() {
+            super::META_KV_FOLD_MEMO_MISSES.fetch_add(1, Ordering::Relaxed);
+            // Populate unless the key has no records at all: pure absence
+            // costs the fold nothing to recompute (no decodes) and would
+            // only churn the fixed-capacity cells.
+            if !bg.is_empty() {
+                let horizon = self.base.entries[bg.start].seq;
+                self.memo
+                    .populate(Bytes::copy_from_slice(key), look.clone(), horizon);
+            }
         }
+        Ok(look)
     }
 
     /// Map a fold's borrowed value back to its provider for a zero-copy
@@ -598,6 +826,11 @@ pub struct NodeDirty {
     overlay: Vec<OwnedRec>,
     /// Encoded size of `overlay` (writeback threshold input).
     overlay_bytes: usize,
+    /// PR M9 (§5.7): bytes of materialized folded heads riding `overlay`
+    /// records (the D7.a overlay-head charge — maintained alongside
+    /// `overlay_bytes` under the same lock; no second synchronization
+    /// regime, per risk R7's mitigation).
+    head_bytes: usize,
     /// Publish mirrors of `overlay`, split so the per-apply snapshot swap
     /// clones only a bounded tail (PR K7): `merge(snap_stable, snap_tail)
     /// == overlay` at every publish point. `snap_stable` is Arc-shared
@@ -616,6 +849,13 @@ pub struct NodeDirty {
     frozen: Option<FrozenDelta>,
     /// Node-relative offset of the unwritten tail (advances per append).
     tail_offset: usize,
+    /// PR M9 (§5.7): what this open delta currently contributes to the
+    /// owning cache's budget charge (`overlay_bytes + head_bytes` as of
+    /// the last [`Self::resync_charge`]) — diffed on every locked
+    /// mutation, subtracted exactly on drop.
+    charged: u64,
+    /// The owning cache's budget gauge (`NodeCache::cached_bytes`).
+    charge: Arc<AtomicU64>,
 }
 
 /// A frozen-but-unwritten delta (§4.6 pt 1 snapshot-then-write).
@@ -655,19 +895,55 @@ impl NodeDirty {
 
     /// Take the open delta (the §4.6 "delta that accumulated during the
     /// build") — SMO-only, under the child's write lock; the records move
-    /// into the successors' open deltas. Published snapshots are immutable
-    /// and keep serving the pre-swap view (the mirrors are cleared but no
-    /// new snapshot is published here — §4.6: "snapshot left intact").
+    /// into the successors' open deltas (their heads ride along: the
+    /// successor base folds identically for every moved key — the K1
+    /// compaction theorem — so a head valid here is valid there). The
+    /// budget charge moves with them: released here, re-charged by the
+    /// successor's `apply_locked`. Published snapshots are immutable and
+    /// keep serving the pre-swap view (the mirrors are cleared but no new
+    /// snapshot is published here — §4.6: "snapshot left intact").
     pub fn take_overlay(&mut self) -> Vec<OwnedRec> {
         self.overlay_bytes = 0;
+        self.head_bytes = 0;
         self.snap_stable = Arc::new(Vec::new());
         self.snap_tail.clear();
-        std::mem::take(&mut self.overlay)
+        let out = std::mem::take(&mut self.overlay);
+        self.resync_charge();
+        out
     }
 
     /// Node-relative unwritten-tail offset.
     pub fn tail_offset(&self) -> usize {
         self.tail_offset
+    }
+
+    /// PR M9 (§5.7): bring the cache budget gauge in line with this open
+    /// delta's current bytes (`overlay + heads`). Called at the end of
+    /// every locked mutation; drop subtracts the residue exactly.
+    fn resync_charge(&mut self) {
+        let new = (self.overlay_bytes + self.head_bytes) as u64;
+        match new.cmp(&self.charged) {
+            std::cmp::Ordering::Greater => {
+                self.charge.fetch_add(new - self.charged, Ordering::AcqRel);
+            }
+            std::cmp::Ordering::Less => {
+                self.charge.fetch_sub(self.charged - new, Ordering::AcqRel);
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        self.charged = new;
+    }
+}
+
+impl Drop for NodeDirty {
+    fn drop(&mut self) {
+        // §5.7 accounting is Drop-owned: whatever this open delta still
+        // charges leaves the gauge with it (eviction drops clean nodes —
+        // charge 0; unmount / supersede-replacement drop the object with
+        // whatever residue remains).
+        if self.charged > 0 {
+            self.charge.fetch_sub(self.charged, Ordering::AcqRel);
+        }
     }
 }
 
@@ -693,6 +969,10 @@ pub struct CachedNode {
     /// checkpoint task swaps it out per flush pass and restores it if the
     /// pass fails — the tail rule takes the min over these floors.
     dirty_floor: AtomicU64,
+    /// PR M9 (§5.7): the owning cache's budget gauge — handed to every
+    /// snapshot's [`FoldMemo`] and the open delta's charge accounting so
+    /// a node's charged size is `extent + overlay + memo` bytes.
+    charge: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for CachedNode {
@@ -713,8 +993,14 @@ impl CachedNode {
     /// load), taking ownership of the verified extent buffer zero-copy.
     /// Born clean; an SMO successor inherits the displaced open delta via
     /// [`Self::apply_locked`] under the SMO's lock window (the §4.6
-    /// "bounded second merge").
-    pub fn from_loaded(loaded: LoadedNode, pinned: bool) -> Result<Arc<Self>, KvError> {
+    /// "bounded second merge"). `charge` is the owning cache's budget
+    /// gauge ([`NodeCache::cached_bytes`] — §5.7: overlay + memo bytes
+    /// ride the node-cache budget).
+    pub fn from_loaded(
+        loaded: LoadedNode,
+        pinned: bool,
+        charge: Arc<AtomicU64>,
+    ) -> Result<Arc<Self>, KvError> {
         let (header, buf, bset_ranges, tail_offset) = loaded.into_parts();
         let sources: Vec<Bytes> = bset_ranges.iter().map(|r| buf.slice(r.clone())).collect();
         let base = Arc::new(RecordIndex::build(sources)?);
@@ -730,19 +1016,24 @@ impl CachedNode {
                 base,
                 stable: Arc::new(Vec::new()),
                 tail: Arc::new(Vec::new()),
+                memo: FoldMemo::new(charge.clone()),
             }),
             dirty: tokio::sync::RwLock::new(NodeDirty {
                 overlay: Vec::new(),
                 overlay_bytes: 0,
+                head_bytes: 0,
                 snap_stable: Arc::new(Vec::new()),
                 snap_tail: Vec::new(),
                 max_applied_seq: 0,
                 frozen: None,
                 tail_offset,
+                charged: 0,
+                charge: charge.clone(),
             }),
             ref_bit: AtomicBool::new(true),
             pinned: AtomicBool::new(pinned),
             dirty_floor: AtomicU64::new(u64::MAX),
+            charge,
         }))
     }
 
@@ -812,6 +1103,18 @@ impl CachedNode {
     /// assigned inside this lock window (§4.4 pt 2 ordering). Errors with
     /// the lifecycle word's verdict if the node was superseded — callers
     /// revalidate first, so this is the caught-bug path, not control flow.
+    ///
+    /// **PR M9 (§5.7 D7.a)**: each applied record's folded head is
+    /// materialized here — one [`fold_forward`] step against the previous
+    /// head, under the very lock the committer already holds ("one fold
+    /// at write replaces N folds at N reads"). The head rides only the
+    /// **newest** record per key (the superseded head below it is
+    /// cleared); a per-key seq inversion (mount-replay interleavings —
+    /// unreachable through the gated paths, guarded anyway) invalidates
+    /// the stale heads above it instead of guessing. A record arriving
+    /// with a head already attached (an SMO moving the displaced overlay
+    /// into its successor) keeps it — the successor base folds
+    /// identically for that key (the K1 compaction theorem).
     pub fn apply_locked(
         &self,
         guard: &mut NodeDirty,
@@ -823,13 +1126,65 @@ impl CachedNode {
                 self.addr
             )));
         }
-        for rec in records {
+        for mut rec in records {
             // §4.6 pt 2: every applied record lowers the not-yet-durable
             // floor; the checkpoint's tail rule reads it back.
             self.dirty_floor.fetch_min(rec.seq, Ordering::AcqRel);
             let pos = guard
                 .overlay
                 .partition_point(|r| (&r.key[..], r.seq) <= (&rec.key[..], rec.seq));
+            // End of the whole key group: rec is the key's newest record
+            // iff nothing of the same key sorts above its insertion point.
+            let gend = guard.overlay.partition_point(|r| r.key[..] <= rec.key[..]);
+            let key_newest = pos == gend;
+            let prev_is_same_key = pos > 0 && guard.overlay[pos - 1].key[..] == rec.key[..];
+
+            // D7.a head materialization: fold-forward against the folded
+            // outcome of everything older than `rec` for this key.
+            if rec.folded.is_none() {
+                let prev_head: Result<FoldedHead, KvError> = if prev_is_same_key {
+                    match &guard.overlay[pos - 1].folded {
+                        Some(h) => Ok(h.clone()),
+                        // Invalidated below (rollback residue): one cold
+                        // re-fold over the authoritative overlay group +
+                        // the base — under the lock, so exact.
+                        None => {
+                            let glo = guard.overlay.partition_point(|r| r.key[..] < rec.key[..]);
+                            self.fold_below_locked(&guard.overlay[glo..pos], &rec.key)
+                        }
+                    }
+                } else {
+                    // No overlay records below: the fold below rec is the
+                    // base fold (the published snapshot's base is current
+                    // under this lock; its memo may already carry it).
+                    self.fold_below_locked(&[], &rec.key)
+                };
+                rec.folded = match prev_head {
+                    Ok(prev) => fold_forward(&prev, rec.kind, &rec.value).ok(),
+                    // A corrupt base/delta surfaces at read time exactly
+                    // as before D7 — the apply itself never changes
+                    // semantics over it.
+                    Err(_) => None,
+                };
+            }
+            // Single-head-per-key: the superseded newest below loses its
+            // head (never read again — lookups take the group's newest).
+            if prev_is_same_key {
+                let hb = guard.overlay[pos - 1].head_bytes();
+                guard.head_bytes -= hb;
+                guard.overlay[pos - 1].folded = None;
+            }
+            // Per-key inversion guard: records above `rec` folded without
+            // it — their heads are stale. Invalidate; reads fall back to
+            // the from-scratch fold (byte-identical by the §4.2 theorem).
+            if !key_newest {
+                for i in pos..gend {
+                    let hb = guard.overlay[i].head_bytes();
+                    guard.head_bytes -= hb;
+                    guard.overlay[i].folded = None;
+                }
+            }
+            guard.head_bytes += rec.head_bytes();
             guard.overlay_bytes += rec.record_ref().encoded_len();
             // Run-precedence guard: mount replay applies ORIGINAL seqs,
             // which may sort below records already published (idempotent
@@ -865,13 +1220,62 @@ impl CachedNode {
             guard.overlay.len(),
             "publish mirrors must partition the authoritative overlay"
         );
+        guard.resync_charge();
         let cur = self.snapshot.load();
         self.snapshot.store(Arc::new(NodeSnapshot {
             base: cur.base.clone(),
             stable: guard.snap_stable.clone(),
             tail: Arc::new(guard.snap_tail.clone()),
+            memo: FoldMemo::new(self.charge.clone()),
         }));
         Ok(())
+    }
+
+    /// Writer-side fold of "everything older than the record being
+    /// applied" for one key: the given (authoritative, lock-held) overlay
+    /// group below it, newest-first, then the current base group. With no
+    /// overlay records below, the published snapshot's memo may already
+    /// carry the base fold — probed without touching the D7.b read
+    /// counters (this is the write path). Cold by construction: it runs
+    /// once per key per invalidation/freeze cycle, never per read.
+    fn fold_below_locked(
+        &self,
+        overlay_below: &[OwnedRec],
+        key: &[u8],
+    ) -> Result<FoldedHead, KvError> {
+        let cur = self.snapshot.load();
+        if overlay_below.is_empty() {
+            if let Some(cell) = cur.memo.probe(key) {
+                return Ok(match &cell.look {
+                    LiveLookup::Live(v) => FoldedHead::Live {
+                        value: v.clone(),
+                        decoded: None,
+                    },
+                    LiveLookup::Tombstone => FoldedHead::Tombstone,
+                    LiveLookup::Absent => FoldedHead::Absent,
+                });
+            }
+        }
+        let bg = cur.base.group_bounds(key);
+        let gather = overlay_below
+            .iter()
+            .rev()
+            .map(|r| r.record_ref())
+            .chain(bg.map(|i| cur.base.record_ref(i)));
+        Ok(match fold_newest_first(gather)? {
+            Folded::Absent => FoldedHead::Absent,
+            Folded::Tombstone { .. } => FoldedHead::Tombstone,
+            Folded::Put { value, .. } => FoldedHead::Live {
+                value: match value {
+                    std::borrow::Cow::Owned(v) => Bytes::from(v),
+                    // Cold path: one copy beats threading source
+                    // provenance through the fold (the head then serves
+                    // refcounted for its whole life).
+                    std::borrow::Cow::Borrowed(v) => Bytes::copy_from_slice(v),
+                },
+                decoded: None,
+            },
+        })
     }
 
     /// Current §4.6 pt 2 dirty floor (`u64::MAX` = clean of un-durable
@@ -916,20 +1320,36 @@ impl CachedNode {
         });
         let removed = before - guard.overlay.len();
         if removed > 0 {
+            // D7.a stale-head guard (§4.4 pt 4 / risk R7): a surviving
+            // record NEWER than the removed range folded the removed
+            // records into its materialized head — the concurrent-Δtime
+            // rollback race shape. Invalidate those heads; reads fall
+            // back to the from-scratch fold over the survivors (older
+            // survivors' heads folded nothing that was removed and stay).
+            let glo = guard.overlay.partition_point(|r| r.key[..] < *key);
+            let gend = guard.overlay.partition_point(|r| r.key[..] <= *key);
+            for i in glo..gend {
+                if guard.overlay[i].seq > lo {
+                    guard.overlay[i].folded = None;
+                }
+            }
             guard.overlay_bytes = guard
                 .overlay
                 .iter()
                 .map(|r| r.record_ref().encoded_len())
                 .sum();
+            guard.head_bytes = guard.overlay.iter().map(|r| r.head_bytes()).sum();
             // Rollback is cold: resync the publish mirrors with a full
             // re-merge and publish the corrected view.
             guard.snap_stable = Arc::new(guard.overlay.clone());
             guard.snap_tail.clear();
+            guard.resync_charge();
             let cur = self.snapshot.load();
             self.snapshot.store(Arc::new(NodeSnapshot {
                 base: cur.base.clone(),
                 stable: guard.snap_stable.clone(),
                 tail: Arc::new(Vec::new()),
+                memo: FoldMemo::new(self.charge.clone()),
             }));
         }
         removed
@@ -970,8 +1390,13 @@ impl CachedNode {
         let base = Arc::new(cur.base.extend_with(bset_image)?);
         guard.overlay.clear();
         guard.overlay_bytes = 0;
+        // D7.a: the heads freeze away with their records (the overlay is
+        // the head's home — §5.7); the first post-freeze read repopulates
+        // through the D7.b memo instead.
+        guard.head_bytes = 0;
         guard.snap_stable = Arc::new(Vec::new());
         guard.snap_tail.clear();
+        guard.resync_charge();
         let frozen = FrozenDelta {
             records: Arc::new(records),
             horizon,
@@ -982,6 +1407,7 @@ impl CachedNode {
             base,
             stable: Arc::new(Vec::new()),
             tail: Arc::new(Vec::new()),
+            memo: FoldMemo::new(self.charge.clone()),
         }));
         Ok(Some(frozen))
     }
@@ -1020,7 +1446,13 @@ pub struct NodeCache {
     /// node counts). Stale entries (evicted/superseded nodes) fall out on
     /// pop.
     clock: scc::Queue<u64>,
-    cached_bytes: AtomicU64,
+    /// The budget gauge (§4.5 + PR M9 §5.7): Σ mapped extents (charged at
+    /// publish, released at evict/retire) **+ overlay bytes incl. folded
+    /// heads + snapshot memo bytes** — the latter two owned by
+    /// [`NodeDirty`]/[`FoldMemo`] through this shared handle (Drop-exact;
+    /// a dying snapshot's memo bytes leave when its readers do). Arc'd so
+    /// nodes charge without a back-reference cycle.
+    cached_bytes: Arc<AtomicU64>,
     /// The durable journal tail (§4.5 torn-tail classifier input, §4.2
     /// tombstone elision floor). K6b's checkpoint advances it; tests drive
     /// it directly.
@@ -1055,10 +1487,17 @@ impl NodeCache {
             map: scc::HashMap::default(),
             inflight: scc::HashMap::default(),
             clock: scc::Queue::default(),
-            cached_bytes: AtomicU64::new(0),
+            cached_bytes: Arc::new(AtomicU64::new(0)),
             durable_tail: AtomicU64::new(0),
             retired: scc::HashSet::default(),
         })
+    }
+
+    /// The shared budget gauge — what [`CachedNode::from_loaded`] takes so
+    /// overlay/memo bytes charge this cache (§5.7). Crate-internal: the
+    /// tree layer builds SMO successors and fresh roots itself.
+    pub(crate) fn charge_gauge(&self) -> Arc<AtomicU64> {
+        self.cached_bytes.clone()
     }
 
     /// The cache's placement/policy config.
@@ -1170,7 +1609,7 @@ impl NodeCache {
             if self.retired.contains_sync(&addr) {
                 return Ok(None);
             }
-            let node = CachedNode::from_loaded(loaded, false)?;
+            let node = CachedNode::from_loaded(loaded, false, self.cached_bytes.clone())?;
             if node.level() > 0 {
                 node.pin(); // §4.5: interior nodes always pinned.
             }

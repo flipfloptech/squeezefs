@@ -8,6 +8,7 @@
 //! records, carry a leading varint version tag for future extension.
 
 use super::KvError;
+use bytes::Bytes;
 use std::borrow::Cow;
 
 // ---------------------------------------------------------------------------
@@ -902,6 +903,115 @@ pub fn compact_fold(
 }
 
 // ---------------------------------------------------------------------------
+// The fold-forward step (PR M9, design-metadata-throughput §5.7 D7.a).
+// ---------------------------------------------------------------------------
+
+/// The owned, materialized outcome of folding one key — the D7.a overlay
+/// head riding the newest open-delta record, and the writer-side carry
+/// between applies. The `Bytes` payload makes head serves zero-copy
+/// (refcount clones); `decoded` carries the already-decoded inode value
+/// across delta applies so the fold-forward step is one
+/// [`InodeDelta::apply`], never a re-decode of the base (§5.7 "the
+/// writer-side cost is one `InodeDelta::apply` against the previous head
+/// (already decoded)").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldedHead {
+    /// The key folds to a live value. `decoded` is `Some` exactly when
+    /// the head was produced by delta application (a fresh owned buffer);
+    /// a plain-`Put` head borrows the record's own bytes and defers the
+    /// decode to the first delta that needs it.
+    Live {
+        value: Bytes,
+        decoded: Option<InodeValue>,
+    },
+    /// A tombstone shadows the key.
+    Tombstone,
+    /// No underlying `Put` — orphaned delta(s) only (§4.2 counted no-op).
+    Absent,
+}
+
+impl FoldedHead {
+    /// Heap bytes this head OWNS beyond its enum footprint: the folded
+    /// value buffer when it was materialized by delta application (a
+    /// plain-`Put` head refcounts the record's existing buffer — no new
+    /// heap). The §5.7 budget accounting charges exactly this plus a
+    /// fixed per-head overhead.
+    pub fn owned_bytes(&self) -> usize {
+        match self {
+            FoldedHead::Live {
+                value,
+                decoded: Some(_),
+            } => value.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// Fold ONE newer record onto the folded outcome of everything older —
+/// **the §4.2 algebra run incrementally** (design-metadata-throughput
+/// §5.7 D7.a). Given `prev == fold(history)` and `rec.seq >` every seq in
+/// `history`, `fold_forward(prev, rec) == fold(rec ∪ history)`:
+///
+/// - `Put` ⇒ the new value (LWW — shadows everything below);
+/// - `Delete` ⇒ tombstone (shadows everything below);
+/// - `Delta` onto a live head ⇒ [`InodeDelta::apply`] onto the decoded
+///   base (decoding it first only if the head was a borrowed plain-`Put`);
+/// - `Delta` onto a tombstone ⇒ still the tombstone (the scan hits the
+///   `Delete` before any `Put` — §4.2's "collected deltas discarded");
+/// - `Delta` onto absent ⇒ still absent (the Δ-without-base counted
+///   no-op, one count per orphaned record — matching
+///   [`fold_newest_first`]).
+///
+/// Decode failures surface as [`KvError::Corrupt`] exactly like the
+/// from-scratch fold would at read time; callers that must not change
+/// apply-path semantics (the node cache) map them to "no head — fall back
+/// to the read-time fold", which reproduces today's behavior byte-for-
+/// byte. The equivalence property `fold_forward ≡ fold_newest_first` over
+/// randomized histories is pinned by proptest below and by
+/// `tests/kv_fold_slimming_tests.rs` end-to-end (risk R7).
+pub fn fold_forward(
+    prev: &FoldedHead,
+    kind: RecordKind,
+    value: &Bytes,
+) -> Result<FoldedHead, KvError> {
+    match kind {
+        RecordKind::Put => Ok(FoldedHead::Live {
+            value: value.clone(),
+            decoded: None,
+        }),
+        RecordKind::Delete => Ok(FoldedHead::Tombstone),
+        RecordKind::Delta => match prev {
+            FoldedHead::Live { value: v, decoded } => {
+                let mut base = match decoded {
+                    Some(iv) => *iv,
+                    None => {
+                        // One base decode, then the decoded value rides
+                        // the head for every later delta (§5.7).
+                        super::META_KV_FOLD_RECORD_DECODES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        InodeValue::decode(v)?
+                    }
+                };
+                super::META_KV_FOLD_RECORD_DECODES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                InodeDelta::decode(value)?.apply(&mut base);
+                Ok(FoldedHead::Live {
+                    value: Bytes::from(base.encode()),
+                    decoded: Some(base),
+                })
+            }
+            FoldedHead::Tombstone => Ok(FoldedHead::Tombstone),
+            FoldedHead::Absent => {
+                // Δ-without-base (§4.2): a counted no-op — counted here,
+                // at materialization, instead of at every read.
+                super::META_KV_DELTA_ORPHANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(FoldedHead::Absent)
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Readdir cookie contract (design §5.1).
 // ---------------------------------------------------------------------------
 
@@ -1693,6 +1803,78 @@ mod tests {
 
         // Empty group is a no-op.
         assert_eq!(compact_fold(&[], 0).expect("fold"), None);
+    }
+
+    // -- the fold-forward step (PR M9 §5.7 D7.a: incremental ≡ from-scratch) --
+
+    /// One random history step for the fold-forward equivalence property.
+    fn arb_step() -> impl proptest::strategy::Strategy<Value = (RecordKind, Vec<u8>)> {
+        use proptest::prelude::*;
+        prop_oneof![
+            any::<u64>().prop_map(|s| (RecordKind::Put, iv(s).encode())),
+            (any::<u64>(), any::<u64>())
+                .prop_map(|(m, c)| (RecordKind::Delta, InodeDelta::times(m, c).encode())),
+            any::<u64>().prop_map(|c| (RecordKind::Delta, InodeDelta::ctime(c).encode())),
+            proptest::strategy::Just((RecordKind::Delete, Vec::new())),
+        ]
+    }
+
+    proptest::proptest! {
+        /// **The D7.a theorem-preservation pin (risk R7)**: iterating
+        /// [`fold_forward`] oldest → newest over ANY record history equals
+        /// the from-scratch [`fold_newest_first`] over the same history —
+        /// the fold FUNCTION is untouched; only *when* it runs changes.
+        #[test]
+        fn fold_forward_matches_fold_newest_first(
+            steps in proptest::collection::vec(arb_step(), 1..24)
+        ) {
+            let records: Vec<Record> = steps
+                .iter()
+                .enumerate()
+                .map(|(i, (kind, value))| Record {
+                    key: k(),
+                    seq: i as u64 + 1,
+                    kind: *kind,
+                    value: value.clone(),
+                })
+                .collect();
+
+            // Incremental: fold_forward oldest → newest.
+            let mut head = FoldedHead::Absent;
+            for r in &records {
+                head = fold_forward(&head, r.kind, &Bytes::from(r.value.clone()))
+                    .expect("valid history never errors");
+            }
+
+            // From-scratch: THE algebra, newest-first.
+            let from_scratch =
+                fold_newest_first(records.iter().rev().map(|r| r.record_ref()))
+                    .expect("valid history never errors");
+
+            // Byte-equal on the user-visible projection AND on the
+            // tombstone/absent distinction (stronger than live_value).
+            match (&head, &from_scratch) {
+                (FoldedHead::Live { value, decoded }, Folded::Put { value: v, .. }) => {
+                    proptest::prop_assert_eq!(
+                        value.as_ref(),
+                        v.as_ref(),
+                        "fold-forward head must byte-equal the from-scratch fold"
+                    );
+                    // The carried decoded value re-encodes to the same bytes.
+                    if let Some(iv) = decoded {
+                        let re_encoded = iv.encode();
+                        proptest::prop_assert_eq!(re_encoded.as_slice(), value.as_ref());
+                    }
+                }
+                (FoldedHead::Tombstone, Folded::Tombstone { .. }) => {}
+                (FoldedHead::Absent, Folded::Absent) => {}
+                (h, f) => {
+                    return Err(proptest::test_runner::TestCaseError::fail(format!(
+                        "fold-forward outcome {h:?} diverges from from-scratch {f:?}"
+                    )));
+                }
+            }
+        }
     }
 
     // -- the replay-reproduces-RAM theorem (§4.2: one fold, tested once) ------

@@ -2750,8 +2750,8 @@ impl DataRouter {
     /// `None` short-circuits to a hole.
     ///
     /// `device_true` (hybrid-I/O escape): the fetch bypasses every cache
-    /// tier and the single-flight — [`Self::fetch_block_device_true`] —
-    /// while keeping this exact binding proof. Default-path callers pass
+    /// tier and the single-flight (`fetch_block_device_true`) while
+    /// keeping this exact binding proof. Default-path callers pass
     /// `false`.
     pub async fn get_block_for_index(
         &self,

@@ -21,10 +21,17 @@
 //!
 //! Tuning only:
 //! ```text
-//! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=4   # optional, per-queue depth
-//! SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES=N    # optional, default = min(nproc, 8)
-//! SQUEEZEFS_TRANSPORT_DEBUG=1              # per-request transport tracing to
-//!                                          # stderr (stuck-request forensics)
+//! SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=4     # optional, per-queue depth
+//! SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES=N      # optional, default = min(nproc, 8)
+//! SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS=N   # optional (§5.3 D3.b): SQPOLL the
+//!                                            # queue rings — ONE shared kernel
+//!                                            # poller (qid 0 leader, ATTACH_WQ
+//!                                            # followers), idle timeout N ms.
+//!                                            # Default off = plain rings.
+//! SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU=C       # optional: pin that one poller
+//!                                            # (leader pin governs the group)
+//! SQUEEZEFS_TRANSPORT_DEBUG=1                # per-request transport tracing to
+//!                                            # stderr (stuck-request forensics)
 //! ```
 //!
 //! # Design (hardened)
@@ -310,6 +317,10 @@ pub struct FuseOverUring {
     inbound: Vec<Arc<InboundQueue>>,
     /// unique → (qid, ent_idx, commit_id)
     pending: Mutex<HashMap<u64, (u16, u16, u64)>>,
+    /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
+    /// knob unset = plain rings). See [`SqpollGroup`] for the one-poller
+    /// leader/attach topology.
+    sqpoll: Option<SqpollGroup>,
     queues: Vec<QueueHandle>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     fuse_fd: RawFd,
@@ -659,6 +670,21 @@ impl FuseOverUring {
             commit_rxs.push(commit_rx);
         }
 
+        // §5.3 D3.b: SQPOLL posture, read once per session from the same
+        // knobs the classical INIT/notify rings honor. Knob unset ⇒ None ⇒
+        // the workers build today's plain rings.
+        let sqpoll = SqpollConfig::from_env().map(|cfg| {
+            info!(
+                "FUSE-over-io_uring SQPOLL enabled for queue rings: idle={}ms cpu={:?} — \
+                 one shared kernel poller (qid 0 leader, ATTACH_WQ followers)",
+                cfg.idle_ms, cfg.cpu
+            );
+            SqpollGroup {
+                cfg,
+                leader: OnceLock::new(),
+            }
+        });
+
         let pool = Arc::new(Self {
             // Critical: stay not-ready until every queue has submitted REGISTER.
             // Otherwise the session stops classical /dev/fuse reads while the kernel
@@ -669,6 +695,7 @@ impl FuseOverUring {
             nqueues: nqueues as u16,
             inbound,
             pending: Mutex::new(HashMap::new()),
+            sqpoll,
             queues: queue_handles,
             workers: Mutex::new(Vec::new()),
             fuse_fd,
@@ -754,12 +781,25 @@ impl FuseOverUring {
             pool.workers.lock().unwrap().push(h);
         }
 
+        // Session-log evidence line: sqpoll=off (knob unset), sqpoll=idle=<ms>
+        // (poller live; cpu appended when pinned), or sqpoll=declined (kernel
+        // refused; plain rings).
+        let sqpoll_state = match &pool.sqpoll {
+            None => "off".to_string(),
+            Some(group) => match group.leader.get() {
+                Some(Some(_)) => match group.cfg.cpu {
+                    Some(cpu) => format!("idle={}ms,cpu={cpu}", group.cfg.idle_ms),
+                    None => format!("idle={}ms", group.cfg.idle_ms),
+                },
+                _ => "declined".to_string(),
+            },
+        };
         eprintln!(
-            "FUSE-over-io_uring registered: queues={nqueues} depth={depth} payload_sz={payload_sz} fd={fuse_fd}"
+            "FUSE-over-io_uring registered: queues={nqueues} depth={depth} payload_sz={payload_sz} fd={fuse_fd} sqpoll={sqpoll_state}"
         );
         info!(
             "FUSE-over-io_uring registered: queues={nqueues} depth={depth} \
-             payload_sz={payload_sz} fd={fuse_fd}"
+             payload_sz={payload_sz} fd={fuse_fd} sqpoll={sqpoll_state}"
         );
         Ok(pool)
     }
@@ -947,6 +987,14 @@ impl SqpollConfig {
         let cpu = cpu.and_then(|raw| raw.trim().parse::<u32>().ok());
         Some(Self { idle_ms, cpu })
     }
+
+    /// Read the session posture from the classical knobs, once, at
+    /// [`FuseOverUring::try_start`].
+    fn from_env() -> Option<Self> {
+        let idle = std::env::var("SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS").ok();
+        let cpu = std::env::var("SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU").ok();
+        Self::parse(idle.as_deref(), cpu.as_deref())
+    }
 }
 
 /// One SQPOLL coordination slot per session (multi-queue policy, §5.3
@@ -970,16 +1018,15 @@ struct SqpollGroup {
     leader: OnceLock<Option<RawFd>>,
 }
 
-/// Build one queue ring per the session's SQPOLL posture. `sqpoll == None`
-/// (knob unset) is the default path: exactly today's SQE128 builder.
-fn build_queue_ring(
-    sq_entries: u32,
-    _qid: u16,
-    _sqpoll: Option<&SqpollGroup>,
-    _active: &AtomicBool,
-) -> io::Result<Ring> {
-    // RED stand-in: reproduces the current SQPOLL-less queue ring for every
-    // role (the D3.b contract tests fail against this).
+/// How long a follower waits for the leader's SQPOLL outcome before
+/// degrading to a plain ring. The leader publishes within its worker's
+/// first microseconds; 10 s stays well inside `try_start`'s 30 s REGISTER
+/// deadline even on a badly oversubscribed box.
+const SQPOLL_LEADER_WAIT: Duration = Duration::from_secs(10);
+
+/// The knob-unset queue-ring builder — today's SQE128 ring, and the
+/// landing spot for every SQPOLL refusal (warn-and-degrade).
+fn build_plain_queue_ring(sq_entries: u32) -> io::Result<Ring> {
     IoUring::<squeue::Entry128, cqueue::Entry>::builder()
         .setup_cqsize(sq_entries * 2)
         .build(sq_entries)
@@ -988,6 +1035,96 @@ fn build_queue_ring(
                 "SQE128 IoUring build(sq={sq_entries}): {e} — need IORING_SETUP_SQE128"
             ))
         })
+}
+
+/// Build one queue ring per the session's SQPOLL posture (§5.3 D3.b).
+///
+/// `sqpoll == None` (knob unset) is the default path: exactly today's
+/// SQE128 builder, byte-identical, no coordination. With the knob set the
+/// [`SqpollGroup`] topology applies — qid 0 creates the single poller,
+/// every other qid attaches — and any SQPOLL refusal (EPERM on
+/// locked-down boxes, attach on a dead leader, leader-wait deadline)
+/// degrades loudly to the plain ring instead of failing the mount,
+/// mirroring the classical rings' knob semantics. The worker's submit
+/// paths need no SQPOLL awareness: the io-uring crate folds
+/// `IORING_ENTER_SQ_WAKEUP` into `submit`/`submit_and_wait` when the
+/// poller has gone idle.
+fn build_queue_ring(
+    sq_entries: u32,
+    qid: u16,
+    sqpoll: Option<&SqpollGroup>,
+    active: &AtomicBool,
+) -> io::Result<Ring> {
+    let Some(group) = sqpoll else {
+        return build_plain_queue_ring(sq_entries);
+    };
+    if qid == 0 {
+        // Leader: create THE kernel poller (idle timeout + optional pin).
+        let mut builder = IoUring::<squeue::Entry128, cqueue::Entry>::builder();
+        builder
+            .setup_cqsize(sq_entries * 2)
+            .setup_sqpoll(group.cfg.idle_ms);
+        if let Some(cpu) = group.cfg.cpu {
+            builder.setup_sqpoll_cpu(cpu);
+        }
+        match builder.build(sq_entries) {
+            Ok(ring) => {
+                let _ = group.leader.set(Some(ring.as_raw_fd()));
+                info!(
+                    "fuse-over-uring qid=0: SQPOLL poller created (idle={}ms cpu={:?}); \
+                     other queues attach via ATTACH_WQ",
+                    group.cfg.idle_ms, group.cfg.cpu
+                );
+                Ok(ring)
+            }
+            Err(e) => {
+                warn!(
+                    "fuse-over-uring qid=0: kernel declined SQPOLL ({e}); \
+                     plain rings for every queue this session"
+                );
+                let _ = group.leader.set(None);
+                build_plain_queue_ring(sq_entries)
+            }
+        }
+    } else {
+        // Follower: wait (bounded) for the leader outcome, then attach to
+        // its poller. Never create a second poller.
+        let deadline = Instant::now() + SQPOLL_LEADER_WAIT;
+        let leader_fd = loop {
+            if let Some(outcome) = group.leader.get() {
+                break *outcome;
+            }
+            if !active.load(Ordering::Acquire) {
+                break None;
+            }
+            if Instant::now() > deadline {
+                warn!(
+                    "fuse-over-uring qid={qid}: leader SQPOLL outcome not published \
+                     within {SQPOLL_LEADER_WAIT:?}; plain ring"
+                );
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let Some(fd) = leader_fd else {
+            return build_plain_queue_ring(sq_entries);
+        };
+        let mut builder = IoUring::<squeue::Entry128, cqueue::Entry>::builder();
+        builder
+            .setup_cqsize(sq_entries * 2)
+            .setup_sqpoll(group.cfg.idle_ms)
+            .setup_attach_wq(fd);
+        match builder.build(sq_entries) {
+            Ok(ring) => Ok(ring),
+            Err(e) => {
+                warn!(
+                    "fuse-over-uring qid={qid}: SQPOLL ATTACH_WQ(fd={fd}) declined ({e}); \
+                     plain ring"
+                );
+                build_plain_queue_ring(sq_entries)
+            }
+        }
+    }
 }
 
 struct Ent {
@@ -1078,14 +1215,9 @@ fn queue_worker(
     let _ = core_affinity::set_for_current(core_affinity::CoreId { id: qid as usize });
 
     let sq_entries = (depth as u32 + 8).next_power_of_two().max(16);
-    let mut ring: Ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
-        .setup_cqsize(sq_entries * 2)
-        .build(sq_entries)
-        .map_err(|e| {
-            io::Error::other(format!(
-                "SQE128 IoUring build(sq={sq_entries}): {e} — need IORING_SETUP_SQE128"
-            ))
-        })?;
+    // §5.3 D3.b: plain SQE128 ring by default; SQPOLL leader/attach
+    // topology when the session knobs opted in (see `build_queue_ring`).
+    let mut ring: Ring = build_queue_ring(sq_entries, qid, pool.sqpoll.as_ref(), &pool.active)?;
 
     ring.submitter()
         .register_files(&[pool.fuse_fd, wake_fd])
@@ -1785,6 +1917,7 @@ mod tests {
     /// `transport_commit_batch` histogram.
     #[test]
     fn test_commit_pushes_defer_to_one_flush() {
+        let _guard = sqpoll_test_guard();
         let (mut ring, _efd) = batch_test_ring(16);
         let (fl0, cm0, snap0) = over_uring_commit_batch_stats();
         let mut batch = SubmitBatch::default();
@@ -1835,6 +1968,7 @@ mod tests {
     /// are recorded as their own (partial) batches.
     #[test]
     fn test_batched_push_sq_full_submits_and_continues() {
+        let _guard = sqpoll_test_guard();
         let (mut ring, _efd) = batch_test_ring(4); // deliberately tiny SQ
         let (fl0, cm0, _) = over_uring_commit_batch_stats();
         let mut batch = SubmitBatch::default();
@@ -1919,6 +2053,20 @@ mod tests {
 
     // ---- §5.3 D3.b (S3): SQPOLL on the over-uring queue rings ----
 
+    /// Tests that observe process-global transport state serialize here:
+    /// `cargo test` runs tests on parallel threads by default, and both the
+    /// `iou-sqp-*` poller population (D3.b) and the `transport_commit_batch`
+    /// counters (D3.a) are process-wide — concurrent tests cross-contaminate
+    /// each other's deltas. (The repo gate's `--test-threads=1` never races;
+    /// this keeps a bare `cargo test` honest too.)
+    static PROCESS_GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn sqpoll_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Count this process's kernel SQPOLL poller threads (`iou-sqp-<tgid>`
     /// comm) — the one-poller policy's observable.
     fn count_sqpoll_pollers() -> usize {
@@ -1934,6 +2082,26 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// Ring-ctx teardown is asynchronous in the kernel, so a poller from a
+    /// just-dropped test ring can linger briefly. Bounded-poll until the
+    /// count is stable (0 short-circuits) and return it as the baseline.
+    fn settle_pollers() -> usize {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut last = count_sqpoll_pollers();
+        let mut stable_since = Instant::now();
+        while Instant::now() < deadline && last != 0 {
+            std::thread::sleep(Duration::from_millis(10));
+            let now = count_sqpoll_pollers();
+            if now != last {
+                last = now;
+                stable_since = Instant::now();
+            } else if stable_since.elapsed() > Duration::from_millis(200) {
+                break;
+            }
+        }
+        last
     }
 
     fn sqpoll_group(idle_ms: u32, cpu: Option<u32>) -> SqpollGroup {
@@ -2002,8 +2170,9 @@ mod tests {
     /// "default off = byte-identical" contract.
     #[test]
     fn test_sqpoll_default_off_builds_plain_rings() {
+        let _guard = sqpoll_test_guard();
         let active = AtomicBool::new(true);
-        let before = count_sqpoll_pollers();
+        let before = settle_pollers();
         for qid in [0u16, 1, 7] {
             let ring = build_queue_ring(16, qid, None, &active).expect("plain build");
             assert!(
@@ -2027,9 +2196,10 @@ mod tests {
     /// keeps working on leader and attached rings alike.
     #[test]
     fn test_sqpoll_one_shared_poller_across_queue_rings() {
+        let _guard = sqpoll_test_guard();
         let group = sqpoll_group(50, None);
         let active = AtomicBool::new(true);
-        let before = count_sqpoll_pollers();
+        let before = settle_pollers();
 
         let leader = build_queue_ring(16, 0, Some(&group), &active).expect("leader build");
         if !leader.params().is_setup_sqpoll() {
@@ -2085,10 +2255,11 @@ mod tests {
     /// warn-and-degrade like the classical rings.
     #[test]
     fn test_sqpoll_followers_fall_back_plain_when_leader_declined() {
+        let _guard = sqpoll_test_guard();
         let group = sqpoll_group(50, None);
         group.leader.set(None).expect("fresh slot");
         let active = AtomicBool::new(true);
-        let before = count_sqpoll_pollers();
+        let before = settle_pollers();
         let ring = build_queue_ring(16, 3, Some(&group), &active)
             .expect("fallback must not fail the mount");
         assert!(
@@ -2107,6 +2278,7 @@ mod tests {
     /// never a mount failure, never a private poller.
     #[test]
     fn test_sqpoll_attach_failure_falls_back_plain() {
+        let _guard = sqpoll_test_guard();
         let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(efd >= 0);
         let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
@@ -2116,7 +2288,7 @@ mod tests {
             .set(Some(efd_owned.as_raw_fd()))
             .expect("fresh slot");
         let active = AtomicBool::new(true);
-        let before = count_sqpoll_pollers();
+        let before = settle_pollers();
         let ring = build_queue_ring(16, 1, Some(&group), &active)
             .expect("attach failure must degrade, not error");
         assert!(

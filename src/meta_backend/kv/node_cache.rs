@@ -672,11 +672,23 @@ impl NodeSnapshot {
             .map(|i| self.tail[i].record_ref())
             .chain(sg.clone().rev().map(|i| self.stable[i].record_ref()))
             .chain(bg.clone().map(|i| self.base.record_ref(i)));
+        // Memo scope (§5.7 D7.b: "for bset-resident DELTAS"): a fold that
+        // had to decode-and-apply deltas returns `Cow::Owned` — exactly
+        // the re-decode tax the memo exists to kill. Plain-`Put` folds
+        // (borrowed, zero decodes), tombstone scans, no-record probes
+        // (the create storm's ENOENT dentry lookups), and orphan-absents
+        // are already free — populating them would burn the fixed cells,
+        // pay a per-lookup key alloc, and (measured) tax the distinct-key
+        // hot-lookup path for zero possible win.
+        let mut delta_materialized = false;
         let look = match fold_newest_first(gather)? {
             Folded::Absent => LiveLookup::Absent,
             Folded::Tombstone { .. } => LiveLookup::Tombstone,
             Folded::Put { value, .. } => LiveLookup::Live(match value {
-                std::borrow::Cow::Owned(v) => Bytes::from(v),
+                std::borrow::Cow::Owned(v) => {
+                    delta_materialized = true;
+                    Bytes::from(v)
+                }
                 std::borrow::Cow::Borrowed(v) => {
                     self.materialize(tg, sg, bg.clone(), v).ok_or_else(|| {
                         KvError::Corrupt(
@@ -686,12 +698,9 @@ impl NodeSnapshot {
                 }
             }),
         };
-        // Memo-eligible = the key HAS base records (a no-record fold is
-        // free — no decodes — can never hit, and would only churn the
-        // fixed-capacity cells; the create storm's ENOENT dentry probes
-        // are that class, and counting them as misses would drown the
-        // §9 acceptance hit-rate in noise).
-        if newest_overlay.is_none() && !bg.is_empty() {
+        if newest_overlay.is_none() && delta_materialized {
+            // Misses count exactly where a populate follows, so
+            // hits/(hits+misses) reads as the D7.b effectiveness rate.
             super::META_KV_FOLD_MEMO_MISSES.fetch_add(1, Ordering::Relaxed);
             let horizon = self.base.entries[bg.start].seq;
             self.memo
@@ -1140,31 +1149,47 @@ impl CachedNode {
             let prev_is_same_key = pos > 0 && guard.overlay[pos - 1].key[..] == rec.key[..];
 
             // D7.a head materialization: fold-forward against the folded
-            // outcome of everything older than `rec` for this key.
+            // outcome of everything older than `rec` for this key. `Put`
+            // and `Delete` shadow everything below (§4.2 LWW / tombstone
+            // rules), so their heads are self-defining — the fold-below
+            // is fetched only for `Delta`, the one kind that folds into
+            // prior state (and the storm shape D7.a exists for).
             if rec.folded.is_none() {
-                let prev_head: Result<FoldedHead, KvError> = if prev_is_same_key {
-                    match &guard.overlay[pos - 1].folded {
-                        Some(h) => Ok(h.clone()),
-                        // Invalidated below (rollback residue): one cold
-                        // re-fold over the authoritative overlay group +
-                        // the base — under the lock, so exact.
-                        None => {
-                            let glo = guard.overlay.partition_point(|r| r.key[..] < rec.key[..]);
-                            self.fold_below_locked(&guard.overlay[glo..pos], &rec.key)
+                rec.folded = match rec.kind {
+                    RecordKind::Put => Some(FoldedHead::Live {
+                        value: rec.value.clone(),
+                        decoded: None,
+                    }),
+                    RecordKind::Delete => Some(FoldedHead::Tombstone),
+                    RecordKind::Delta => {
+                        let prev_head: Result<FoldedHead, KvError> = if prev_is_same_key {
+                            match &guard.overlay[pos - 1].folded {
+                                Some(h) => Ok(h.clone()),
+                                // Invalidated below (rollback residue):
+                                // one cold re-fold over the authoritative
+                                // overlay group + the base — under the
+                                // lock, so exact.
+                                None => {
+                                    let glo =
+                                        guard.overlay.partition_point(|r| r.key[..] < rec.key[..]);
+                                    self.fold_below_locked(&guard.overlay[glo..pos], &rec.key)
+                                }
+                            }
+                        } else {
+                            // No overlay records below: the fold below rec
+                            // is the base fold (the published snapshot's
+                            // base is current under this lock; its memo
+                            // may already carry it).
+                            self.fold_below_locked(&[], &rec.key)
+                        };
+                        match prev_head {
+                            Ok(prev) => fold_forward(&prev, rec.kind, &rec.value).ok(),
+                            // A corrupt base/delta surfaces at read time
+                            // exactly as before D7 — the apply itself
+                            // never changes semantics over it.
+                            Err(_) => None,
                         }
                     }
-                } else {
-                    // No overlay records below: the fold below rec is the
-                    // base fold (the published snapshot's base is current
-                    // under this lock; its memo may already carry it).
-                    self.fold_below_locked(&[], &rec.key)
-                };
-                rec.folded = match prev_head {
-                    Ok(prev) => fold_forward(&prev, rec.kind, &rec.value).ok(),
-                    // A corrupt base/delta surfaces at read time exactly
-                    // as before D7 — the apply itself never changes
-                    // semantics over it.
-                    Err(_) => None,
                 };
             }
             // Single-head-per-key: the superseded newest below loses its

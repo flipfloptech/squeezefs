@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -913,6 +913,82 @@ impl Drop for FuseOverUring {
 }
 
 type Ring = IoUring<squeue::Entry128, cqueue::Entry>;
+
+/// §5.3 D3.b (S3) — SQPOLL posture for the over-uring queue rings, parsed
+/// once per session from the **same env knobs** the classical INIT/notify
+/// rings honor (`SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS` / `_CPU`,
+/// `connection/tokio.rs` semantics verbatim): idle unset / `0` /
+/// unparsable ⇒ `None` ⇒ plain queue rings — today's behavior,
+/// byte-identical; a bad `_CPU` value degrades to "unpinned", never to
+/// "off". Knob-only: no code path depends on SQPOLL being on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SqpollConfig {
+    /// `IORING_SETUP_SQPOLL` idle timeout (ms) — the poller sleeps after
+    /// this long without SQEs and the next submit wakes it (crate-handled
+    /// `IORING_ENTER_SQ_WAKEUP`).
+    idle_ms: u32,
+    /// Optional `IORING_SETUP_SQ_AFF` pin for **the one shared poller**
+    /// (see [`SqpollGroup`] — the leader ring's pin governs; the kernel
+    /// ignores attached rings' cpu params by design).
+    cpu: Option<u32>,
+}
+
+impl SqpollConfig {
+    /// `tokio.rs` knob semantics, extracted for the queue rings: idle must
+    /// parse > 0 to enable; cpu is honored when parseable (CPU 0 is a real
+    /// CPU — the CLI's "0 disables pinning" convention is applied by
+    /// `squeezefs mount` *before* the env reaches fuse3).
+    fn parse(idle_ms: Option<&str>, cpu: Option<&str>) -> Option<Self> {
+        let idle_ms = idle_ms?
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|idle| *idle > 0)?;
+        let cpu = cpu.and_then(|raw| raw.trim().parse::<u32>().ok());
+        Some(Self { idle_ms, cpu })
+    }
+}
+
+/// One SQPOLL coordination slot per session (multi-queue policy, §5.3
+/// D3.b): **exactly one kernel poller total**, whatever
+/// `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` says. The qid-0 ring is the
+/// *leader* — it creates the poller (`IDLE_MS` idle, optional `_CPU` pin)
+/// and publishes its ring fd here; every other queue ring *attaches* to
+/// that poller via `IORING_SETUP_ATTACH_WQ` (shared-sqpoll, kernel ≥ 5.12).
+/// Naive per-queue SQPOLL would burn up to `nqueues` (≤ 32 by knob clamp,
+/// up to 512 raw) cores; the attach topology bounds the burn at one poller
+/// regardless of queue count, and makes `_CPU` unambiguous: it pins *the*
+/// poller.
+struct SqpollGroup {
+    cfg: SqpollConfig,
+    /// Leader outcome: `Some(fd)` = leader SQPOLL ring built, attach to it;
+    /// `None` = the kernel declined SQPOLL (EPERM on locked-down boxes,
+    /// EINVAL on pre-SQPOLL kernels) and the leader fell back to a plain
+    /// ring — every follower then builds plain too. Fallback is
+    /// warn-and-degrade, mirroring the classical rings' knob semantics: an
+    /// opt-in accelerator must never fail the mount.
+    leader: OnceLock<Option<RawFd>>,
+}
+
+/// Build one queue ring per the session's SQPOLL posture. `sqpoll == None`
+/// (knob unset) is the default path: exactly today's SQE128 builder.
+fn build_queue_ring(
+    sq_entries: u32,
+    _qid: u16,
+    _sqpoll: Option<&SqpollGroup>,
+    _active: &AtomicBool,
+) -> io::Result<Ring> {
+    // RED stand-in: reproduces the current SQPOLL-less queue ring for every
+    // role (the D3.b contract tests fail against this).
+    IoUring::<squeue::Entry128, cqueue::Entry>::builder()
+        .setup_cqsize(sq_entries * 2)
+        .build(sq_entries)
+        .map_err(|e| {
+            io::Error::other(format!(
+                "SQE128 IoUring build(sq={sq_entries}): {e} — need IORING_SETUP_SQE128"
+            ))
+        })
+}
 
 struct Ent {
     header: Box<FuseUringReqHeader>,
@@ -1839,5 +1915,230 @@ mod tests {
         let r = unsafe { libc::read(efd_owned.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
         assert_eq!(r, 8, "lease drop with a parked commit must fire the eventfd");
         assert!(state.try_unpark(), "commit releasable after the drop");
+    }
+
+    // ---- §5.3 D3.b (S3): SQPOLL on the over-uring queue rings ----
+
+    /// Count this process's kernel SQPOLL poller threads (`iou-sqp-<tgid>`
+    /// comm) — the one-poller policy's observable.
+    fn count_sqpoll_pollers() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .map(|tasks| {
+                tasks
+                    .flatten()
+                    .filter(|t| {
+                        std::fs::read_to_string(t.path().join("comm"))
+                            .map(|c| c.trim_start().starts_with("iou-sqp"))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn sqpoll_group(idle_ms: u32, cpu: Option<u32>) -> SqpollGroup {
+        SqpollGroup {
+            cfg: SqpollConfig { idle_ms, cpu },
+            leader: OnceLock::new(),
+        }
+    }
+
+    /// Knob parsing carries the classical rings' semantics verbatim
+    /// (`tokio.rs`): idle must parse > 0 to enable; a bad `_CPU` degrades
+    /// to unpinned, never to off; `_CPU` alone never enables SQPOLL.
+    #[test]
+    fn test_sqpoll_config_parse_matches_classical_knob_semantics() {
+        assert_eq!(SqpollConfig::parse(None, None), None, "unset ⇒ off");
+        assert_eq!(
+            SqpollConfig::parse(Some("0"), Some("2")),
+            None,
+            "idle 0 ⇒ off (the tokio.rs `> 0` filter)"
+        );
+        assert_eq!(
+            SqpollConfig::parse(Some("nope"), None),
+            None,
+            "unparsable idle ⇒ off"
+        );
+        assert_eq!(
+            SqpollConfig::parse(None, Some("3")),
+            None,
+            "_CPU alone never enables SQPOLL"
+        );
+        assert_eq!(
+            SqpollConfig::parse(Some("50"), None),
+            Some(SqpollConfig {
+                idle_ms: 50,
+                cpu: None
+            })
+        );
+        assert_eq!(
+            SqpollConfig::parse(Some(" 50 "), Some("3")),
+            Some(SqpollConfig {
+                idle_ms: 50,
+                cpu: Some(3)
+            }),
+            "whitespace-tolerant, pin honored"
+        );
+        assert_eq!(
+            SqpollConfig::parse(Some("50"), Some("0")),
+            Some(SqpollConfig {
+                idle_ms: 50,
+                cpu: Some(0)
+            }),
+            "CPU 0 is a real CPU (the CLI's '0 disables' runs before the env reaches fuse3)"
+        );
+        assert_eq!(
+            SqpollConfig::parse(Some("50"), Some("x")),
+            Some(SqpollConfig {
+                idle_ms: 50,
+                cpu: None
+            }),
+            "bad _CPU ⇒ unpinned, idle still honored"
+        );
+    }
+
+    /// Knob unset ⇒ every queue ring builds exactly as today: no SQPOLL
+    /// flag, no poller thread, no leader coordination — the D3.b
+    /// "default off = byte-identical" contract.
+    #[test]
+    fn test_sqpoll_default_off_builds_plain_rings() {
+        let active = AtomicBool::new(true);
+        let before = count_sqpoll_pollers();
+        for qid in [0u16, 1, 7] {
+            let ring = build_queue_ring(16, qid, None, &active).expect("plain build");
+            assert!(
+                !ring.params().is_setup_sqpoll(),
+                "qid={qid}: knob unset must not set IORING_SETUP_SQPOLL"
+            );
+        }
+        assert_eq!(
+            count_sqpoll_pollers(),
+            before,
+            "knob unset must not spawn poller threads"
+        );
+    }
+
+    /// The D3.b multi-queue policy: with the knobs set, qid 0 is the
+    /// LEADER — it creates the single kernel poller and publishes its ring
+    /// fd — and every other queue ATTACHES to that poller via
+    /// `IORING_SETUP_ATTACH_WQ`. N queue rings share exactly ONE
+    /// `iou-sqp-*` thread (a per-queue poller would burn up to 32 cores),
+    /// and `register_files` (the worker's Fixed(0)/Fixed(1) prerequisite)
+    /// keeps working on leader and attached rings alike.
+    #[test]
+    fn test_sqpoll_one_shared_poller_across_queue_rings() {
+        let group = sqpoll_group(50, None);
+        let active = AtomicBool::new(true);
+        let before = count_sqpoll_pollers();
+
+        let leader = build_queue_ring(16, 0, Some(&group), &active).expect("leader build");
+        if !leader.params().is_setup_sqpoll() {
+            // Kernel declined SQPOLL (EPERM on locked-down boxes). The
+            // decline contract still holds: the leader must have published
+            // None so followers fall back plain instead of waiting.
+            eprintln!("kernel declined SQPOLL; skipping one-poller assertions");
+            assert_eq!(
+                group.leader.get(),
+                Some(&None),
+                "declined leader must publish None for the followers"
+            );
+            return;
+        }
+        assert_eq!(
+            count_sqpoll_pollers(),
+            before + 1,
+            "leader creates exactly one poller"
+        );
+        assert_eq!(
+            group.leader.get().copied(),
+            Some(Some(leader.as_raw_fd())),
+            "leader must publish its ring fd for the followers to attach to"
+        );
+
+        let f1 = build_queue_ring(16, 1, Some(&group), &active).expect("follower 1");
+        let f2 = build_queue_ring(16, 2, Some(&group), &active).expect("follower 2");
+        assert!(
+            f1.params().is_setup_sqpoll() && f2.params().is_setup_sqpoll(),
+            "followers must ride SQPOLL (attached), not silently build plain"
+        );
+        assert_eq!(
+            count_sqpoll_pollers(),
+            before + 1,
+            "followers ATTACH to the leader's poller — one iou-sqp thread \
+             total, never one per queue"
+        );
+
+        // The worker registers /dev/fuse + wake fd on every ring right
+        // after build; pin that registration works on SQPOLL rings.
+        let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(efd >= 0);
+        let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
+        for (name, ring) in [("leader", &leader), ("f1", &f1), ("f2", &f2)] {
+            ring.submitter()
+                .register_files(&[efd_owned.as_raw_fd()])
+                .unwrap_or_else(|e| panic!("register_files on SQPOLL ring {name}: {e}"));
+        }
+    }
+
+    /// Leader declined (published `None`) ⇒ followers build plain rings —
+    /// never a private poller, never an error: the knob is
+    /// warn-and-degrade like the classical rings.
+    #[test]
+    fn test_sqpoll_followers_fall_back_plain_when_leader_declined() {
+        let group = sqpoll_group(50, None);
+        group.leader.set(None).expect("fresh slot");
+        let active = AtomicBool::new(true);
+        let before = count_sqpoll_pollers();
+        let ring = build_queue_ring(16, 3, Some(&group), &active)
+            .expect("fallback must not fail the mount");
+        assert!(
+            !ring.params().is_setup_sqpoll(),
+            "declined group ⇒ plain follower rings"
+        );
+        assert_eq!(
+            count_sqpoll_pollers(),
+            before,
+            "a declined group must never spawn a private poller"
+        );
+    }
+
+    /// A follower whose ATTACH_WQ target is not an io_uring (leader ring
+    /// gone, fd reused) falls back to a plain ring — warn-and-degrade,
+    /// never a mount failure, never a private poller.
+    #[test]
+    fn test_sqpoll_attach_failure_falls_back_plain() {
+        let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(efd >= 0);
+        let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
+        let group = sqpoll_group(50, None);
+        group
+            .leader
+            .set(Some(efd_owned.as_raw_fd()))
+            .expect("fresh slot");
+        let active = AtomicBool::new(true);
+        let before = count_sqpoll_pollers();
+        let ring = build_queue_ring(16, 1, Some(&group), &active)
+            .expect("attach failure must degrade, not error");
+        assert!(
+            !ring.params().is_setup_sqpoll(),
+            "un-attachable leader fd ⇒ plain follower ring"
+        );
+        assert_eq!(count_sqpoll_pollers(), before);
+    }
+
+    /// Pool shutdown while a follower is still waiting for the leader
+    /// outcome ⇒ immediate plain build — a mount torn down mid-setup must
+    /// not park worker threads on the leader deadline.
+    #[test]
+    fn test_sqpoll_follower_shutdown_builds_plain_without_wait() {
+        let group = sqpoll_group(50, None); // leader never publishes
+        let active = AtomicBool::new(false); // pool already shut down
+        let t0 = Instant::now();
+        let ring = build_queue_ring(16, 1, Some(&group), &active).expect("plain build");
+        assert!(!ring.params().is_setup_sqpoll());
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "inactive pool must short-circuit the leader wait"
+        );
     }
 }

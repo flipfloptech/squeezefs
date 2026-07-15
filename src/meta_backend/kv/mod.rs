@@ -169,6 +169,113 @@ pub static META_KV_TIMES_ECHO_DRAIN_COMMITS: AtomicU64 = AtomicU64::new(0);
 /// Surfaced as `meta_kv_times_echo_drained`.
 pub static META_KV_TIMES_ECHO_DRAINED: AtomicU64 = AtomicU64::new(0);
 
+/// PR M7 (design-metadata-throughput §5.5 D5): transactions per conveyor
+/// batch — the group-formation histogram the G3 gate reads
+/// (`meta_commit_group_size`; strict-mode median ≥ 4 under the 8-writer
+/// storm is a gate input, ≈ 1 means the conveyor regressed to the
+/// baseline's measured failure mode). Buckets are **exact for 1–8** so a
+/// median-≥4 verdict never rides bucket rounding, then power-of-two up
+/// to the 64-tx cap.
+pub static META_COMMIT_GROUP_SIZE: CommitGroupSizeHistogram = CommitGroupSizeHistogram::new();
+
+/// Entry bytes drained per conveyor batch, summed (`meta_commit_group_bytes`
+/// with [`META_CONVEYOR_LEADER_PASSES`] gives mean batch fill vs the
+/// `SQUEEZEFS_META_COMMIT_BATCH_BYTES` cap).
+pub static META_COMMIT_GROUP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Conveyor batch passes executed (`meta_conveyor_leader_passes` — one per
+/// drained batch; pairs with the group-size histogram total).
+pub static META_CONVEYOR_LEADER_PASSES: AtomicU64 = AtomicU64::new(0);
+
+/// Conveyor pass panics contained by the §5.5 panic guard
+/// (`meta_conveyor_pass_panics`): > 0 means a batch failed LOUD — budget
+/// released, reservation completed-as-abandoned, oneshots failed EIO,
+/// journal-failure lattice bumped — never a silent `completed_upto` wedge.
+pub static META_CONVEYOR_PASS_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// The conveyor group-size histogram (design-metadata-throughput §9):
+/// exact buckets 1–8 (the G3 median band), then ≤16 / ≤32 / ≤64 / >64.
+pub struct CommitGroupSizeHistogram {
+    buckets: [AtomicU64; 12],
+}
+
+/// Bucket labels for [`CommitGroupSizeHistogram`] (stats-JSON keys).
+pub const COMMIT_GROUP_SIZE_LABELS: [&str; 12] = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "<=16", "<=32", "<=64", ">64",
+];
+
+impl CommitGroupSizeHistogram {
+    #[allow(clippy::new_without_default)] // static-initializer const fn
+    pub const fn new() -> Self {
+        Self {
+            buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+        }
+    }
+
+    fn bucket_index(n: usize) -> usize {
+        match n {
+            0 => 0, // empty batches are never recorded; clamp defensively
+            1..=8 => n - 1,
+            9..=16 => 8,
+            17..=32 => 9,
+            33..=64 => 10,
+            _ => 11,
+        }
+    }
+
+    /// Record one drained batch of `n` transactions.
+    pub fn record(&self, n: usize) {
+        use std::sync::atomic::Ordering;
+        self.buckets[Self::bucket_index(n)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bucket snapshot in [`COMMIT_GROUP_SIZE_LABELS`] order.
+    pub fn snapshot(&self) -> [u64; 12] {
+        use std::sync::atomic::Ordering;
+        std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed))
+    }
+
+    /// Total batches recorded.
+    pub fn total(&self) -> u64 {
+        self.snapshot().iter().sum()
+    }
+
+    /// Conservative median group size: the **lower bound** of the bucket
+    /// containing the middle sample (exact for sizes 1–8), so a G3
+    /// "median ≥ 4" verdict can never be inflated by bucket rounding.
+    /// `None` when nothing was recorded.
+    pub fn median_lower_bound(&self) -> Option<u64> {
+        const LOWER: [u64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 33, 65];
+        let snap = self.snapshot();
+        let total: u64 = snap.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let mid = total.div_ceil(2);
+        let mut seen = 0u64;
+        for (i, &c) in snap.iter().enumerate() {
+            seen += c;
+            if seen >= mid {
+                return Some(LOWER[i]);
+            }
+        }
+        None
+    }
+}
+
 /// Successful `commit_tx` executions per **construction site** of the
 /// committed [`backend::KvMetaBackend`] transaction — the
 /// metadata-throughput program's D4.a "debug hook counting `commit_tx`

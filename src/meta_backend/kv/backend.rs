@@ -101,6 +101,41 @@ const JOURNAL_FAILURE_LATCH: u64 = 3;
 /// stall IS the scenario under test, not a coordination primitive).
 pub static TEST_COMMIT_ADMITTED_STALL_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test seam (PR M7 §5.5 D5): hold the conveyor pass at a protocol stage
+/// so arrivals accumulate deterministically (no sleep-based batching in
+/// tests — the hold IS the scenario). `0` = off (one relaxed load per
+/// pass iteration); [`TEST_CONVEYOR_HOLD_PRE_DRAIN`] parks the pass
+/// before it drains a batch (entries queue up behind it);
+/// [`TEST_CONVEYOR_HOLD_PRE_FANOUT`] parks it after the batch is written,
+/// acked and barriered but before results fan out (the cancel-pre-fanout
+/// stage). Release via [`test_conveyor_hold_release`].
+pub static TEST_CONVEYOR_HOLD_STAGE: AtomicU64 = AtomicU64::new(0);
+
+/// [`TEST_CONVEYOR_HOLD_STAGE`] value: park the pass before draining.
+pub const TEST_CONVEYOR_HOLD_PRE_DRAIN: u64 = 1;
+
+/// [`TEST_CONVEYOR_HOLD_STAGE`] value: park the pass after the batch's
+/// write/ack/barrier, before per-tx result fan-out.
+pub const TEST_CONVEYOR_HOLD_PRE_FANOUT: u64 = 2;
+
+/// The parked-pass wake for [`TEST_CONVEYOR_HOLD_STAGE`] (register-recheck
+/// discipline — a stale release can never strand a pass).
+static TEST_CONVEYOR_HOLD_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
+/// Release every pass parked on [`TEST_CONVEYOR_HOLD_STAGE`] (callers
+/// store `0` first; the notify wakes the register-recheck loop).
+pub fn test_conveyor_hold_release() {
+    TEST_CONVEYOR_HOLD_NOTIFY.notify_waiters();
+}
+
+/// Test seam (PR M7 §5.5 D5, the per-tx isolation leg): a conveyor batch
+/// member staging any record on `inode_key(ino)` fails at RAM-apply time
+/// with a synthetic error — the "poisoned tx" the isolation contract
+/// says must fail ALONE while the rest of its batch commits. `0` = off
+/// (one relaxed load per applied tx).
+pub static TEST_CONVEYOR_POISON_APPLY_INO: AtomicU64 = AtomicU64::new(0);
+
 /// `SQUEEZEFS_TIMEOUT` as the D1.b watchdog/escalation threshold
 /// (design-metadata-throughput §6): read per `open` (control-plane —
 /// never on an op path), default 30 s. Deliberately NOT process-memoized:
@@ -981,6 +1016,14 @@ impl KvMetaBackend {
     /// which computes physical entry offsets to arm write faults.
     pub fn journal_ring(&self) -> &JournalRing {
         &self.ring
+    }
+
+    /// PR M7 (§5.5 D5): user transactions enqueued on this volume's
+    /// commit conveyor and not yet drained by a pass — the conformance
+    /// suite's enqueue-sequencing probe and a stats gauge (a queue that
+    /// grows on a quiet mount means the pass wedged).
+    pub fn conveyor_pending_len(&self) -> usize {
+        0
     }
 
     /// §4.8 monotonic ino allocation: one `fetch_add`, no reuse, no

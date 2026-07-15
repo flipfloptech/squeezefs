@@ -52,6 +52,7 @@ fn test_lease_metrics_fields_exist() {
     let _ = METRICS
         .writeback_stale_token_retries
         .load(Ordering::Relaxed);
+    let _ = METRICS.writeback_orphan_discards.load(Ordering::Relaxed);
     let _ = METRICS.layout_staged_writes.load(Ordering::Relaxed);
     let _ = METRICS.layout_striped_writes.load(Ordering::Relaxed);
 }

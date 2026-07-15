@@ -134,14 +134,22 @@ async fn test_destroy_is_idempotent_across_queue_invocations() {
 }
 
 /// Contract 2: teardown flushing returns an aggregated summary with bounded
-/// error samples — orphan blocks (deleted inodes) count as failures without
-/// a log line each.
+/// error samples, and orphan blocks (deleted inodes) are VERIFIED-and-
+/// DISCARDED as clean resolutions — never a log line each, never a leaked
+/// entry. (FIND-M11-A superseded the old fail-and-leave shape: 300 leaked
+/// orphans kept `staged_writes_in_flight` pinned, so destroy's drain-wait
+/// spun its full budget on entries nothing could ever remove — the
+/// recovery contract "missing inode meta discards orphan active blocks"
+/// now applies live at teardown.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_teardown_flush_aggregates_failures() {
     let (fs, _req, _b, _m) = make().await;
+    let discards_before = squeezefs::fuse_client::METRICS
+        .writeback_orphan_discards
+        .load(std::sync::atomic::Ordering::Relaxed);
 
-    // 300 orphan active blocks: inodes never existed, so every flush fails
-    // (NotFound) — exactly the deleted-files-at-unmount shape.
+    // 300 orphan active blocks: inodes never existed, so every flush's
+    // merge hits NotFound — exactly the deleted-files-at-unmount shape.
     for i in 0..300u32 {
         assert!(fs.router.cache.nvme.put_active_block(
             &format!("active_block:inode_87{i:04}:block_0"),
@@ -152,12 +160,47 @@ async fn test_teardown_flush_aggregates_failures() {
 
     let summary = fs.flush_all_staged_blocks_to_backend().await;
     assert_eq!(summary.attempted, 300, "all orphans attempted");
-    assert_eq!(summary.flushed, 0, "orphans cannot flush");
-    assert_eq!(summary.failed, 300, "all orphans counted as failures");
+    assert_eq!(
+        summary.flushed, 300,
+        "orphans resolve as verified discards, not failures: {:?}",
+        summary.error_samples
+    );
+    assert_eq!(summary.failed, 0, "no orphan may surface as a failure");
     assert!(
         summary.error_samples.len() <= 3,
         "error samples must be bounded (got {})",
         summary.error_samples.len()
+    );
+    let leaked: Vec<String> = fs
+        .router
+        .cache
+        .nvme
+        .list_staged_files()
+        .into_iter()
+        .filter(|k| k.starts_with("active_block:"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "orphan entries must DRAIN at teardown (the FIND-M11-A drain-wait \
+         wedge): {leaked:?}"
+    );
+    assert_eq!(
+        fs.router
+            .cache
+            .nvme
+            .staged_writes_in_flight
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "staged_writes_in_flight must reach 0 so destroy's drain-wait is \
+         bounded"
+    );
+    let discards_after = squeezefs::fuse_client::METRICS
+        .writeback_orphan_discards
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        discards_after >= discards_before + 300,
+        "each orphan discard must be counted \
+         (before {discards_before}, after {discards_after})"
     );
 }
 

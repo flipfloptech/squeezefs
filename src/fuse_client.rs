@@ -1204,6 +1204,12 @@ pub struct Metrics {
     /// the flush unit). Sustained growth on a quiet mount = the
     /// constant-writeback livelock regressing.
     pub writeback_stale_token_retries: Align64<AtomicU64>,
+    /// Orphan staged custody discarded by the flush unit after VERIFYING
+    /// the inode record is gone (unlink+reclaim raced the flush; monotonic
+    /// inos never come back) — the recovery contract's "missing inode meta
+    /// discards orphan active blocks", applied live instead of the
+    /// NotFound retry spin (FIND-M11-A's second face).
+    pub writeback_orphan_discards: Align64<AtomicU64>,
     /// Copy-on-write duplications of an active-block accumulation buffer
     /// forced by a live reader snapshot (zero-copy write-path design §5.2).
     /// Sequential streams never pay this; spikes mean read/write contention
@@ -2227,6 +2233,7 @@ impl SqueezefsFilesystem {
                 "writeback_retry_exhaustions": METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed),
                 "writeback_superseded_noops": METRICS.writeback_superseded_noops.load(Ordering::Relaxed),
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
+                "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
                 "active_block_cow_copies": METRICS.active_block_cow_copies.load(Ordering::Relaxed),
                 "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
@@ -8521,6 +8528,15 @@ async fn flush_single_active_block(
     flush_one_active_block(ino, b, owner_token, router, is_striped).await
 }
 
+/// `Io(NotFound)` classification for the flush unit's superseded-by-delete
+/// disposition (the v3 backend's `not_found` shape — "Inode N not found").
+/// Callers must pair it with an authoritative attr re-probe before
+/// discarding custody (see the merge-error arm in
+/// [`flush_one_active_block`]).
+fn is_inode_not_found(e: &SqueezefsError) -> bool {
+    matches!(e, SqueezefsError::Io(ioe) if ioe.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// ONE ATOMIC PER-BLOCK FLUSH UNIT: upload staged active block `b` and merge
 /// it into the map. Two delayed-merge hazards force its shape (the
 /// generic/075.2 stale-data / lost-write family):
@@ -8683,6 +8699,35 @@ async fn flush_one_active_block(
                 // superseded fencing token between release and reopen)
                 // leaks one published block of device space.
                 let _ = block_allocator.free_block(offset).await;
+                // NotFound face of FIND-M11-A: the merge's layout save
+                // fails `Io(NotFound "Inode N not found")` when the ino
+                // was unlinked + reclaimed after this block staged (the
+                // delete sweep misses indices invisible to the persisted
+                // layout). The record can never come back (v3 inos are
+                // monotonic — no reuse), so retrying is the observed
+                // NotFound spin storm. VERIFY the inode is truly gone with
+                // an authoritative attr probe — a NotFound from a flaky
+                // block/device read must keep retrying (never-lossy) — and
+                // only then discard the orphan staged custody: the
+                // recovery contract's "missing inode meta discards orphan
+                // active blocks", applied live. Never resurrect a dead
+                // inode; drain the entry so teardown stays bounded.
+                if is_inode_not_found(&e) {
+                    if let Some(backend) = router.meta_backend.get() {
+                        if matches!(backend.getattr(ino).await, Err(ref ge) if is_inode_not_found(ge))
+                        {
+                            METRICS
+                                .writeback_orphan_discards
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = router
+                                .cache
+                                .nvme
+                                .remove_active_block_async(cache_key.clone())
+                                .await;
+                            return Ok(());
+                        }
+                    }
+                }
                 return Err(e);
             }
         };

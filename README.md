@@ -238,6 +238,7 @@ Random-4k iodepth workloads are gated by two multiplicative kernel-side limits: 
 - **Per-queue depth** (`SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH`, clamp 1..32): default is **32 degraded to the payload-buffer cap** `min(mem-budget/8, 2 GiB)` with floor 4 (the pre-L1 posture — small-RAM boxes keep yesterday's footprint). An explicit value wins verbatim over the cap. Payload arenas cost `queues × depth × ~1 MiB` of registered anon memory — gauged as `transport_payload_buffer_bytes` in `.stats` and attributed to the memory budget as the `transport_payload_buffers` component.
 - **Queues** (`SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES`, testing only): pinned to kernel **possible CPUs** — registering fewer never becomes ready (kernel readiness requirement).
 - **`-o max_background=N` / `-o congestion_threshold=N`**: INIT-reply overrides; defaults `clamp(queues × depth, 64, 256)` and ¾ of it. Also runtime-writable per live connection via fusectl: `echo 256 | sudo tee /sys/fs/fuse/connections/<minor>/max_background`.
+- **Known trade (FIND-L1-A)**: dedicated *high-concurrency O_DIRECT streaming-write* mounts (≥ 13 concurrent sequential writers) currently convoy in the daemon write path once `max_background` stops throttling them (−25 % on that one shape, measured `t16 × 1 MiB`); `-o max_background=12` restores the old throttle per mount until the write-path follow-up lands (`.benchmarks/2026-07-15-l1-transport-concurrency.md`).
 
 ### FUSE io_uring SQPOLL (mount env; measured — leave unset)
 

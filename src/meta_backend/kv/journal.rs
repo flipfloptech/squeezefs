@@ -483,15 +483,18 @@ impl JournalRing {
             + geo.in_page_off(pos)
     }
 
-    /// Write one entry's bytes into its reserved range: the committer's own
-    /// bytes, one `uring_fs` submission (`write_at` for a page-local entry,
-    /// `write_at_batch` for multi-page — §4.4 pt 3), including the 24 B
+    /// Build one entry's write ops into `ops`: payload segments + the 24 B
     /// header of every page whose first logical byte the reservation owns
-    /// (§4.4 pt 2). `res.len` must equal [`entry_len_for`] of `records`.
-    pub async fn write_entry(
+    /// (§4.4 pt 2). Shared by [`Self::write_entry`] and
+    /// [`Self::write_entries_batch`], so a conveyor batch member's bytes
+    /// are **by construction** identical to a solo commit's (the §5.5
+    /// batch-of-1 equivalence). `res.len` must equal [`entry_len_for`] of
+    /// `records`.
+    fn entry_ops(
         &self,
         res: &Reservation,
         records: &[(u8, Record)],
+        ops: &mut Vec<(u64, bytes::Bytes)>,
     ) -> Result<(), KvError> {
         let geo = self.core.geometry();
         let payload = encode_entry_payload(records);
@@ -518,7 +521,6 @@ impl JournalRing {
         // within one batch carries no durability meaning (unordered
         // writeback is the crash model either way); this order lets the
         // torn-batch shim exercise payload-landed/header-lost shapes.
-        let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
         let mut consumed = 0usize;
         for seg in geo.segments(res.start, res.len) {
             let file_off =
@@ -546,7 +548,19 @@ impl JournalRing {
                 bytes::Bytes::copy_from_slice(&hdr),
             ));
         }
+        Ok(())
+    }
 
+    /// Write one entry's bytes into its reserved range: the committer's own
+    /// bytes, one `uring_fs` submission (`write_at` for a page-local entry,
+    /// `write_at_batch` for multi-page — §4.4 pt 3).
+    pub async fn write_entry(
+        &self,
+        res: &Reservation,
+        records: &[(u8, Record)],
+    ) -> Result<(), KvError> {
+        let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
+        self.entry_ops(res, records, &mut ops)?;
         if ops.len() == 1 {
             let (off, data) = ops.pop().expect("one op");
             crate::uring_fs::write_at(&self.path, off, data).await?;
@@ -557,6 +571,44 @@ impl JournalRing {
         // pages (headers included) — one half of the v3 device-byte story.
         super::META_KV_JOURNAL_BYTES.fetch_add(res.len, std::sync::atomic::Ordering::Relaxed);
         super::META_KV_JOURNAL_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// PR M7 (design-metadata-throughput §5.5 D5): write a conveyor
+    /// batch's entries — **N ordinary checksummed entries** at
+    /// back-to-back reservations inside one registered range — as ONE
+    /// `uring_fs` submission (zero on-disk format change: each part is
+    /// byte-identical to a [`Self::write_entry`] of the same
+    /// reservation, and replay is byte-for-byte today's walk; a torn
+    /// member drops that tx only).
+    ///
+    /// Parts must be non-overlapping and each sized exactly
+    /// ([`entry_len_for`] == `res.len`), but need not be contiguous —
+    /// a rolled-back member's sub-range is simply absent (the §4.4 pt 4
+    /// unwritten hole; its page headers are written iff some surviving
+    /// part owns the page's first byte).
+    ///
+    /// The caller owns registration/completion of the covering
+    /// reservation (the pass completes it on BOTH outcomes — the
+    /// commit_entry discipline, batch edition).
+    pub async fn write_entries_batch(
+        &self,
+        parts: &[(Reservation, &[(u8, Record)])],
+    ) -> Result<(), KvError> {
+        let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
+        for (res, records) in parts {
+            self.entry_ops(res, records, &mut ops)?;
+        }
+        if ops.len() == 1 {
+            let (off, data) = ops.pop().expect("one op");
+            crate::uring_fs::write_at(&self.path, off, data).await?;
+        } else {
+            crate::uring_fs::write_at_batch(&self.path, ops).await?;
+        }
+        let bytes: u64 = parts.iter().map(|(r, _)| r.len).sum();
+        super::META_KV_JOURNAL_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        super::META_KV_JOURNAL_ENTRIES
+            .fetch_add(parts.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

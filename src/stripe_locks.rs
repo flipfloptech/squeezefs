@@ -30,6 +30,22 @@
 ///      after release) **and never held while waiting on ring space**
 ///      (ring admission happens before any node lock — §4.4 pt 5; the
 ///      checkpoint task's own admissions never park, they drain-and-retry).
+///
+///      **PR M7 (metadata-throughput §5.5 D5) — the commit conveyor
+///      refinement**: the leaf-lock TAKER population shrinks to exactly
+///      {the per-volume conveyor **pass task**, the checkpoint/SMO task}
+///      — user committers no longer take node locks at all; they enqueue
+///      `{records, Arc<[DlmGuard]>, oneshot}` and park on the fan-out.
+///      The pass takes the batch's UNION leaf set under the same 4b
+///      discipline (ascending, deduped, whole-set drop-all-and-relock on
+///      SMO revalidation failure) and **holds — but never acquires — DLM
+///      guards** (level 4a): each queue entry co-owns its transaction's
+///      I/D guard set until that tx's terminal outcome (post-ack /
+///      post-rollback), so guard holders never wait on anything the
+///      checkpoint drain needs (it takes no DLM locks, ever) and the
+///      §4.4 pt 5 / R10 acyclicity argument transfers with the taker
+///      population renamed. Batch ring admission still precedes every
+///      node lock (one Σ-admission per batch).
 ///    - c. **format v2**: sector locks (`sector_locks`) — commit-time
 ///      RMW+apply, acquired in **ascending sector-offset order** (total order
 ///      ⇒ deadlock-free) and only at commit, never taken while holding a DLM

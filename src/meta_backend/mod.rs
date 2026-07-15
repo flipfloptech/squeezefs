@@ -214,8 +214,15 @@ impl RoutedMetaBackend {
     }
 
     /// Rename fragment: pure dentry removal on one volume (the caller
-    /// holds the D-guard).
-    async fn remove_dentry_routed(&self, idx: usize, local_parent: Ino, name: &str) -> Result<()> {
+    /// holds the D-guard; `guards` is its Arc'd set — PR M7 Issue 13:
+    /// multi-commit ops clone one set per sequential commit).
+    async fn remove_dentry_routed(
+        &self,
+        idx: usize,
+        local_parent: Ino,
+        name: &str,
+        guards: std::sync::Arc<[dlm::DlmGuard]>,
+    ) -> Result<()> {
         let out = self.volumes[idx]
             // PR M6 D4.b: cross-volume rename fragments carry the POSIX
             // parent-time update (rename holds both parents EXCLUSIVE).
@@ -223,6 +230,7 @@ impl RoutedMetaBackend {
                 local_parent,
                 name,
                 kv::backend::RoutedParentUpdate::ExclusiveTimes,
+                guards,
             )
             .await;
         if out.is_err() {
@@ -240,6 +248,7 @@ impl RoutedMetaBackend {
         global_child: Ino,
         name: &str,
         ft_bits: u32,
+        guards: std::sync::Arc<[dlm::DlmGuard]>,
     ) -> Result<()> {
         let out = self.volumes[idx]
             .routed_add_dentry(
@@ -250,6 +259,7 @@ impl RoutedMetaBackend {
                 // PR M6 D4.b: parent times ride the fragment (exclusive
                 // parent I-guard held by the rename).
                 kv::backend::RoutedParentUpdate::ExclusiveTimes,
+                guards,
             )
             .await;
         if out.is_err() {
@@ -261,9 +271,16 @@ impl RoutedMetaBackend {
     /// Rename fragment (PR M6 D4.b): stamp the moved/exchanged inode's
     /// ctime when it lives on a DIFFERENT volume than the dentry surgery
     /// (the same-volume path stages it inside the rename tx).
-    async fn touch_ctime_routed(&self, idx: usize, local_ino: Ino) -> Result<()> {
+    async fn touch_ctime_routed(
+        &self,
+        idx: usize,
+        local_ino: Ino,
+        guards: std::sync::Arc<[dlm::DlmGuard]>,
+    ) -> Result<()> {
         self.check_volume_enabled(idx)?;
-        let out = self.volumes[idx].routed_touch_ctime(local_ino).await;
+        let out = self.volumes[idx]
+            .routed_touch_ctime(local_ino, guards)
+            .await;
         if out.is_err() {
             self.mirror_volume_failure(idx);
         }
@@ -276,9 +293,10 @@ impl RoutedMetaBackend {
         idx: usize,
         local_parent: Ino,
         delta: i64,
+        guards: std::sync::Arc<[dlm::DlmGuard]>,
     ) -> Result<()> {
         let out = self.volumes[idx]
-            .routed_parent_nlink_delta(local_parent, delta)
+            .routed_parent_nlink_delta(local_parent, delta, guards)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(idx);
@@ -289,8 +307,15 @@ impl RoutedMetaBackend {
     /// Rename fragment: destination-inode replacement accounting —
     /// ENOTEMPTY probe for directories, nlink dec + ctime (best-effort on
     /// a missing inode).
-    async fn dest_replace_routed(&self, idx: usize, local_dest: Ino) -> Result<()> {
-        let out = self.volumes[idx].routed_dest_replace(local_dest).await;
+    async fn dest_replace_routed(
+        &self,
+        idx: usize,
+        local_dest: Ino,
+        guards: std::sync::Arc<[dlm::DlmGuard]>,
+    ) -> Result<()> {
+        let out = self.volumes[idx]
+            .routed_dest_replace(local_dest, guards)
+            .await;
         if out.is_err() {
             self.mirror_volume_failure(idx);
         }
@@ -511,7 +536,7 @@ impl Metadata for RoutedMetaBackend {
         // creates run concurrently, while the shared lock still serializes
         // against any exclusive parent mutator (mkdir/setattr/unlink/
         // rename) — design §3.8.
-        let _parent_guard = if is_dir {
+        let parent_guard = if is_dir {
             self.volumes[parent_v_idx]
                 .dlm()
                 .lock_inode_exclusive(local_parent)
@@ -522,19 +547,29 @@ impl Metadata for RoutedMetaBackend {
                 .lock_inode_shared(local_parent)
                 .await
         };
-        let _dentry_guard = self.volumes[parent_v_idx]
+        let dentry_guard = self.volumes[parent_v_idx]
             .dlm()
             .lock_dentry_exclusive(local_parent, name)
             .await;
+        // PR M7 (Issue 13): the op's guard set travels with each commit
+        // (cloned per fragment for the cross-volume shape).
+        let guards: std::sync::Arc<[dlm::DlmGuard]> =
+            std::sync::Arc::from(vec![parent_guard, dentry_guard]);
 
         if parent_v_idx == target_v_idx {
             // Same-volume create: ONE whole-tx journal entry with the
             // routed semantics (design §4.4).
             let be = &self.volumes[target_v_idx];
             let out = be
-                .routed_create_local(local_parent, name, mode, uid, gid, |local| {
-                    self.make_global_ino(local, target_v_idx)
-                })
+                .routed_create_local(
+                    local_parent,
+                    name,
+                    mode,
+                    uid,
+                    gid,
+                    |local| self.make_global_ino(local, target_v_idx),
+                    guards,
+                )
                 .await;
             if out.is_err() {
                 self.mirror_volume_failure(target_v_idx);
@@ -569,7 +604,7 @@ impl Metadata for RoutedMetaBackend {
             let target_be = &self.volumes[target_v_idx];
             let new_local_ino = target_be.allocate_ino();
             let minted = target_be
-                .routed_mint_inode(new_local_ino, final_mode, uid, final_gid)
+                .routed_mint_inode(new_local_ino, final_mode, uid, final_gid, guards.clone())
                 .await;
             if minted.is_err() {
                 self.mirror_volume_failure(target_v_idx);
@@ -603,6 +638,7 @@ impl Metadata for RoutedMetaBackend {
                     global_child_ino,
                     final_mode & libc::S_IFMT,
                     update,
+                    guards.clone(),
                 )
                 .await;
             if out.is_err() {
@@ -631,7 +667,7 @@ impl Metadata for RoutedMetaBackend {
         // touches only the parent's mtime/ctime — SHARED parent, so
         // same-directory delete storms overlap. Directory removal mutates
         // parent nlink — EXCLUSIVE.
-        let (file_type, global_child_ino, child_v_idx, local_child, parent_shared, _guards) = loop {
+        let (file_type, global_child_ino, child_v_idx, local_child, parent_shared, guards) = loop {
             let phase1 = self.volumes[parent_v_idx]
                 .dlm()
                 .lock_many(
@@ -724,6 +760,9 @@ impl Metadata for RoutedMetaBackend {
                 .await?
             {
                 Some((cur_child, _)) if cur_child == global_child_ino => {
+                    // PR M7 (Issue 13): Arc the op's guard set — each
+                    // commit below co-owns it.
+                    let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(guards);
                     break (
                         file_type,
                         global_child_ino,
@@ -743,7 +782,14 @@ impl Metadata for RoutedMetaBackend {
             // semantics.
             let be = &self.volumes[parent_v_idx];
             let out = be
-                .routed_unlink_local(local_parent, name, local_child, is_dir, parent_shared)
+                .routed_unlink_local(
+                    local_parent,
+                    name,
+                    local_child,
+                    is_dir,
+                    parent_shared,
+                    guards,
+                )
                 .await;
             if out.is_err() {
                 self.mirror_volume_failure(parent_v_idx);
@@ -760,7 +806,7 @@ impl Metadata for RoutedMetaBackend {
                 kv::backend::RoutedParentUpdate::ExclusiveTimes
             };
             let out = self.volumes[parent_v_idx]
-                .routed_remove_dentry(local_parent, name, update)
+                .routed_remove_dentry(local_parent, name, update, guards.clone())
                 .await;
             if out.is_err() {
                 self.mirror_volume_failure(parent_v_idx);
@@ -769,7 +815,7 @@ impl Metadata for RoutedMetaBackend {
 
             // Child side: nlink discipline (dir ⇒ 0) + ctime.
             let out = self.volumes[child_v_idx]
-                .routed_nlink_adjust(local_child, -1, is_dir)
+                .routed_nlink_adjust(local_child, -1, is_dir, guards.clone())
                 .await;
             if out.is_err() {
                 self.mirror_volume_failure(child_v_idx);
@@ -837,6 +883,9 @@ impl Metadata for RoutedMetaBackend {
             );
         }
 
+        // PR M7 (Issue 13): Arc the op's guard set for its commit(s).
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(_guards);
+
         if self
             .find_dentry_routed(parent_v_idx, local_parent, new_name)
             .await?
@@ -852,7 +901,7 @@ impl Metadata for RoutedMetaBackend {
             // parent times).
             let be = &self.volumes[parent_v_idx];
             let out = be
-                .routed_link_local(local_parent, new_name, local_child, ino)
+                .routed_link_local(local_parent, new_name, local_child, ino, guards)
                 .await;
             if out.is_err() {
                 self.mirror_volume_failure(parent_v_idx);
@@ -861,7 +910,7 @@ impl Metadata for RoutedMetaBackend {
         } else {
             // Child side: nlink+1 + ctime.
             let out = self.volumes[child_v_idx]
-                .routed_nlink_adjust(local_child, 1, false)
+                .routed_nlink_adjust(local_child, 1, false, guards.clone())
                 .await;
             if out.is_err() {
                 self.mirror_volume_failure(child_v_idx);
@@ -888,6 +937,7 @@ impl Metadata for RoutedMetaBackend {
                     ino,
                     child_inode.mode & libc::S_IFMT,
                     kv::backend::RoutedParentUpdate::ExclusiveTimes,
+                    guards.clone(),
                 )
                 .await;
             if out.is_err() {
@@ -960,6 +1010,11 @@ impl Metadata for RoutedMetaBackend {
             }
         }
 
+        // PR M7 (Issue 13): Arc the op's guard set — the same-volume
+        // one-tx shape takes it once; the cross-volume fragments clone it
+        // per sequential commit.
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(_guards);
+
         let old_dentry_opt = self
             .find_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
             .await?;
@@ -1009,7 +1064,8 @@ impl Metadata for RoutedMetaBackend {
                 if dest_v_idx == old_parent_v_idx {
                     dest_local = Some(local_dest);
                 } else {
-                    self.dest_replace_routed(dest_v_idx, local_dest).await?;
+                    self.dest_replace_routed(dest_v_idx, local_dest, guards.clone())
+                        .await?;
                 }
             }
             let out = be
@@ -1021,6 +1077,7 @@ impl Metadata for RoutedMetaBackend {
                     flags,
                     src_local,
                     dest_local,
+                    guards.clone(),
                 )
                 .await;
             if out.is_err() {
@@ -1029,10 +1086,10 @@ impl Metadata for RoutedMetaBackend {
             out?;
             // Remote moved/exchanged inode ctime fragments.
             if let Some((v, l)) = src_remote {
-                self.touch_ctime_routed(v, l).await?;
+                self.touch_ctime_routed(v, l, guards.clone()).await?;
             }
             if let Some((v, l)) = dest_remote {
-                self.touch_ctime_routed(v, l).await?;
+                self.touch_ctime_routed(v, l, guards.clone()).await?;
             }
             Ok(())
         } else if flags & libc::RENAME_EXCHANGE != 0 {
@@ -1047,9 +1104,9 @@ impl Metadata for RoutedMetaBackend {
             // volume renames were never transactional across volumes).
             // PR M6 D4.b: each fragment carries its parent's time update;
             // the swapped inodes' ctimes follow as their own fragments.
-            self.remove_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
+            self.remove_dentry_routed(old_parent_v_idx, local_old_parent, old_name, guards.clone())
                 .await?;
-            self.remove_dentry_routed(new_parent_v_idx, local_new_parent, new_name)
+            self.remove_dentry_routed(new_parent_v_idx, local_new_parent, new_name, guards.clone())
                 .await?;
             self.insert_dentry_routed(
                 new_parent_v_idx,
@@ -1057,6 +1114,7 @@ impl Metadata for RoutedMetaBackend {
                 old_child,
                 new_name,
                 old_ft,
+                guards.clone(),
             )
             .await?;
             self.insert_dentry_routed(
@@ -1065,11 +1123,12 @@ impl Metadata for RoutedMetaBackend {
                 new_child,
                 old_name,
                 new_ft,
+                guards.clone(),
             )
             .await?;
             for child in [old_child, new_child] {
                 let (v, l) = self.route_ino(child);
-                self.touch_ctime_routed(v, l).await?;
+                self.touch_ctime_routed(v, l, guards.clone()).await?;
             }
 
             Ok(())
@@ -1086,34 +1145,56 @@ impl Metadata for RoutedMetaBackend {
                 if is_dir {
                     // Directory move across parents: nlink shift on each
                     // side (best-effort).
-                    self.parent_nlink_delta_routed(old_parent_v_idx, local_old_parent, -1)
-                        .await?;
-                    self.parent_nlink_delta_routed(new_parent_v_idx, local_new_parent, 1)
-                        .await?;
+                    self.parent_nlink_delta_routed(
+                        old_parent_v_idx,
+                        local_old_parent,
+                        -1,
+                        guards.clone(),
+                    )
+                    .await?;
+                    self.parent_nlink_delta_routed(
+                        new_parent_v_idx,
+                        local_new_parent,
+                        1,
+                        guards.clone(),
+                    )
+                    .await?;
                 }
 
                 // Destination replacement: settle its inode, then remove
                 // its dentry.
                 if let Some((dest_ino, _dest_ft)) = new_dentry_opt {
                     let (dest_v_idx, local_dest) = self.route_ino(dest_ino);
-                    self.dest_replace_routed(dest_v_idx, local_dest).await?;
-                    self.remove_dentry_routed(new_parent_v_idx, local_new_parent, new_name)
+                    self.dest_replace_routed(dest_v_idx, local_dest, guards.clone())
                         .await?;
+                    self.remove_dentry_routed(
+                        new_parent_v_idx,
+                        local_new_parent,
+                        new_name,
+                        guards.clone(),
+                    )
+                    .await?;
                 }
 
-                self.remove_dentry_routed(old_parent_v_idx, local_old_parent, old_name)
-                    .await?;
+                self.remove_dentry_routed(
+                    old_parent_v_idx,
+                    local_old_parent,
+                    old_name,
+                    guards.clone(),
+                )
+                .await?;
                 self.insert_dentry_routed(
                     new_parent_v_idx,
                     local_new_parent,
                     old_child,
                     new_name,
                     old_ft,
+                    guards.clone(),
                 )
                 .await?;
                 // PR M6 D4.b: the moved inode's ctime fragment.
                 let (v, l) = self.route_ino(old_child);
-                self.touch_ctime_routed(v, l).await?;
+                self.touch_ctime_routed(v, l, guards.clone()).await?;
                 Ok(())
             } else {
                 Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -1155,12 +1236,14 @@ impl Metadata for RoutedMetaBackend {
     ) -> Result<Inode> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx]
-            .dlm()
-            .lock_inode_exclusive(local_ino)
-            .await;
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(vec![
+            self.volumes[v_idx]
+                .dlm()
+                .lock_inode_exclusive(local_ino)
+                .await,
+        ]);
         let out = self.volumes[v_idx]
-            .setattr_locked(local_ino, mode, uid, gid, size, atime, mtime, ctime)
+            .setattr_locked(local_ino, mode, uid, gid, size, atime, mtime, ctime, guards)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -1181,12 +1264,14 @@ impl Metadata for RoutedMetaBackend {
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx]
-            .dlm()
-            .lock_inode_exclusive(local_ino)
-            .await;
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(vec![
+            self.volumes[v_idx]
+                .dlm()
+                .lock_inode_exclusive(local_ino)
+                .await,
+        ]);
         let out = self.volumes[v_idx]
-            .setxattr_locked(local_ino, name, value)
+            .setxattr_locked(local_ino, name, value, guards)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -1197,12 +1282,14 @@ impl Metadata for RoutedMetaBackend {
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx]
-            .dlm()
-            .lock_inode_exclusive(local_ino)
-            .await;
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(vec![
+            self.volumes[v_idx]
+                .dlm()
+                .lock_inode_exclusive(local_ino)
+                .await,
+        ]);
         let out = self.volumes[v_idx]
-            .removexattr_locked(local_ino, name)
+            .removexattr_locked(local_ino, name, guards)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);

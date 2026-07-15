@@ -2337,6 +2337,42 @@ impl SqueezefsFilesystem {
                     "meta_kv_journal_entries".into(),
                     load(&meta_kv::META_KV_JOURNAL_ENTRIES),
                 );
+                // PR M7 (design-metadata-throughput §5.5/§9): conveyor
+                // group formation — txs per batch (exact 1–8 buckets so
+                // the G3 median ≥ 4 gate reads straight off the stats
+                // surface), batch bytes vs the caps, pass count, and the
+                // panic-guard tripwire (> 0 ⇒ a batch failed LOUD; never
+                // a silent completed_upto wedge).
+                metrics.insert(
+                    "meta_commit_group_size".into(),
+                    serde_json::Value::Object(
+                        crate::meta_backend::kv::COMMIT_GROUP_SIZE_LABELS
+                            .iter()
+                            .zip(meta_kv::META_COMMIT_GROUP_SIZE.snapshot())
+                            .map(|(label, n)| (label.to_string(), serde_json::Value::from(n)))
+                            .collect(),
+                    ),
+                );
+                metrics.insert(
+                    "meta_commit_group_size_median_lb".into(),
+                    serde_json::Value::from(
+                        meta_kv::META_COMMIT_GROUP_SIZE
+                            .median_lower_bound()
+                            .unwrap_or(0),
+                    ),
+                );
+                metrics.insert(
+                    "meta_commit_group_bytes".into(),
+                    load(&meta_kv::META_COMMIT_GROUP_BYTES),
+                );
+                metrics.insert(
+                    "meta_conveyor_leader_passes".into(),
+                    load(&meta_kv::META_CONVEYOR_LEADER_PASSES),
+                );
+                metrics.insert(
+                    "meta_conveyor_pass_panics".into(),
+                    load(&meta_kv::META_CONVEYOR_PASS_PANICS),
+                );
                 metrics.insert(
                     "meta_kv_checkpoints".into(),
                     load(&meta_kv::META_KV_CHECKPOINTS),

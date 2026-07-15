@@ -162,7 +162,9 @@ async fn conservation_audit(routed: &Arc<RoutedMetaBackend>, kv: &Arc<KvMetaBack
     routed
         .create(1, &probe_name, libc::S_IFREG | 0o644, 0, 0)
         .await
-        .unwrap_or_else(|e| panic!("{ctx_owned}: volume must accept commits after the scenario: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("{ctx_owned}: volume must accept commits after the scenario: {e}")
+        });
 }
 
 fn unique_suffix() -> u32 {
@@ -231,13 +233,13 @@ async fn group_forms_under_held_pass() {
 
     let delta = snap_delta(&hist_before, &META_COMMIT_GROUP_SIZE.snapshot());
     assert_eq!(
-        txs_at_least(&delta),
-        16,
-        "all 16 txs must flow through recorded batches; got {delta:?}"
+        delta[8], 1,
+        "a single 16-tx batch must form behind the held pass (<=16 bucket); got {delta:?}"
     );
     assert!(
-        delta[8] >= 1,
-        "a single 16-tx batch must form behind the held pass (<=16 bucket); got {delta:?}"
+        delta.iter().sum::<u64>() <= 2,
+        "16 held txs must not fragment into many batches (≤ 1 ambient singleton \
+         tolerated); got {delta:?}"
     );
     let passes = META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed) - passes_before;
     assert!(
@@ -523,7 +525,11 @@ async fn cancel_post_enqueue_same_key_blocks_until_terminal() {
     // X enqueues {records, guards, oneshot} and parks on the oneshot.
     let x = {
         let routed = routed.clone();
-        tokio::spawn(async move { routed.create(1, "dup_key", libc::S_IFREG | 0o644, 0, 0).await })
+        tokio::spawn(async move {
+            routed
+                .create(1, "dup_key", libc::S_IFREG | 0o644, 0, 0)
+                .await
+        })
     };
     poll_until("X enqueued behind the held pass", || {
         kv.conveyor_pending_len() >= 1
@@ -539,7 +545,11 @@ async fn cancel_post_enqueue_same_key_blocks_until_terminal() {
     // the queue entry's guards live.
     let y = {
         let routed = routed.clone();
-        tokio::spawn(async move { routed.create(1, "dup_key", libc::S_IFREG | 0o644, 0, 0).await })
+        tokio::spawn(async move {
+            routed
+                .create(1, "dup_key", libc::S_IFREG | 0o644, 0, 0)
+                .await
+        })
     };
     // Y must not finish, and must NOT co-queue, while the pass is held:
     // structural exclusion, not scheduling luck.
@@ -583,7 +593,11 @@ async fn cancel_mid_pass_conserves_and_commits() {
     TEST_COMMIT_ADMITTED_STALL_MS.store(1200, Ordering::SeqCst);
     let x = {
         let routed = routed.clone();
-        tokio::spawn(async move { routed.create(1, "mid_pass", libc::S_IFREG | 0o644, 0, 0).await })
+        tokio::spawn(async move {
+            routed
+                .create(1, "mid_pass", libc::S_IFREG | 0o644, 0, 0)
+                .await
+        })
     };
     // The pass has admitted (Σ > 0) and is stalling inside the hazard
     // window the M4 seam pins.
@@ -613,15 +627,18 @@ async fn cancel_pre_fanout_is_harmless() {
 
     let x = {
         let routed = routed.clone();
-        tokio::spawn(async move { routed.create(1, "pre_fan", libc::S_IFREG | 0o644, 0, 0).await })
+        tokio::spawn(async move {
+            routed
+                .create(1, "pre_fan", libc::S_IFREG | 0o644, 0, 0)
+                .await
+        })
     };
     // The batch's entry has landed but X is still parked on its oneshot
     // (the pass is held pre-fanout).
-    let x_probe = {
-        let entries_before = entries_before;
-        move || META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed) > entries_before
-    };
-    poll_until("batch written while pass held pre-fanout", x_probe).await;
+    poll_until("batch written while pass held pre-fanout", || {
+        META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed) > entries_before
+    })
+    .await;
     assert!(
         !x.is_finished(),
         "X must still be parked on its oneshot while the pass is held pre-fanout"

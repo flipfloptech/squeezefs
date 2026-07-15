@@ -51,6 +51,7 @@ pub mod backend;
 pub mod bset;
 pub mod builder;
 pub mod checkpoint;
+pub mod conveyor_core;
 pub mod journal;
 pub mod journal_core;
 pub mod node;
@@ -158,8 +159,13 @@ pub static META_KV_TIMES_ECHO_ABSORBED: AtomicU64 = AtomicU64::new(0);
 /// Pending-times drain transactions committed (ONE journal entry each,
 /// carrying every pending refinement that still advances its inode).
 /// The honest residual G4 pays for the echo: ≈ drain cadence, amortized
-/// across every absorbed echo in the window — and the named counter the
-/// M7 conveyor inherits if it ever folds drains into user batches.
+/// across every absorbed echo in the window. **PR M7 disposition (the
+/// M6 hand-off)**: drain commits are ordinary `commit_tx` transactions,
+/// so they ride the conveyor like every user commit — when a drain's
+/// arrival overlaps user traffic it co-batches into the same pass
+/// (one lock window, one write, one barrier) with zero dedicated
+/// machinery; this counter keeps counting drain *transactions* either
+/// way (the fold shows up in `meta_commit_group_size`, not here).
 /// Surfaced as `meta_kv_times_echo_drain_commits`.
 pub static META_KV_TIMES_ECHO_DRAIN_COMMITS: AtomicU64 = AtomicU64::new(0);
 

@@ -38,8 +38,9 @@
 
 use super::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
 use super::checkpoint::{read_newest_ledger, LedgerRecord};
+use super::conveyor_core::ConveyorCore;
 use super::journal::{checkpoint_reserve_bytes, entry_len_for, untag, JournalRing};
-use super::journal_core::AdmissionClass;
+use super::journal_core::{AdmissionClass, Reservation};
 use super::node::{key_successor, NodeLayout};
 use super::node_cache::{
     CachedNode, LiveLookup, NodeCache, NodeCacheConfig, OwnedRec, DEFAULT_WRITEBACK_DELTA_BYTES,
@@ -55,7 +56,7 @@ use super::tree::{decode_interior_value, KvTree, RootPtr, SmoContext, SmoJournal
 use super::KvError;
 use crate::error::Result;
 use crate::meta_backend::atomicity::META_VOLUME_ATOMICITY_COW;
-use crate::meta_backend::dlm::{DlmLockManager, LockMode};
+use crate::meta_backend::dlm::{DlmGuard, DlmLockManager, LockMode};
 use crate::meta_backend::sync_coalescer::SyncCoalescer;
 use crate::meta_backend::{DirEntry, Ino, Inode, Metadata};
 use bytes::Bytes;
@@ -152,6 +153,31 @@ fn squeezefs_timeout_env() -> std::time::Duration {
 /// Commit-path retry budget against SMO revalidation races (§4.6: SMOs
 /// are rare and serialized, so the loop is short; exhaustion is a bug).
 const COMMIT_RETRY_BUDGET: usize = 256;
+
+/// PR M7 (design-metadata-throughput §5.5 D5): conveyor batch caps —
+/// the pass drains whatever is queued, bounded by these (NO timers;
+/// jbd2's no-wait batch shape). Env-tunable per mount (`§6 API` row);
+/// read at `open` like every backend knob.
+pub const COMMIT_BATCH_TXS_ENV: &str = "SQUEEZEFS_META_COMMIT_BATCH_TXS";
+pub const COMMIT_BATCH_BYTES_ENV: &str = "SQUEEZEFS_META_COMMIT_BATCH_BYTES";
+const DEFAULT_COMMIT_BATCH_TXS: usize = 64;
+const DEFAULT_COMMIT_BATCH_BYTES: u64 = 256 * 1024;
+
+fn commit_batch_txs_env() -> usize {
+    std::env::var(COMMIT_BATCH_TXS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_COMMIT_BATCH_TXS)
+}
+
+fn commit_batch_bytes_env() -> u64 {
+    std::env::var(COMMIT_BATCH_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_COMMIT_BATCH_BYTES)
+}
 
 /// PR M6: pending-times drain batch — inos per DLM `lock_many` set / per
 /// drain transaction (the `destroy_inodes` batching shape).
@@ -271,6 +297,27 @@ pub struct KvMetaBackend {
     journal_failures: AtomicU64,
     /// `meta_kv_journal_full_stalls` (§4.4 pt 5): ring-admission parks.
     stalls: AtomicU64,
+    // ---- PR M7: the §5.5 D5 commit conveyor ----
+    /// The per-volume conveyor: all user commits enqueue here; a
+    /// leader-elect committer spawns the detached pass task that drains
+    /// batches (loom-modeled core, `conveyor_core.rs`). Behind its own
+    /// `Arc`: the pass task owns the queue/leadership word directly and
+    /// holds the *backend* only per batch (Weak between batches), so a
+    /// dropped-without-shutdown backend releases its writer flock the
+    /// moment the last user `Arc` dies — never parked behind an idling
+    /// pass (the drop-then-reopen replay pattern).
+    conveyor: Arc<ConveyorCore<QueuedTx>>,
+    /// `Weak` self-reference the pass tasks upgrade per batch (set once,
+    /// immediately after `Arc::new`, on every open path — the
+    /// checkpoint-task `Weak` discipline).
+    conveyor_self: std::sync::OnceLock<Weak<KvMetaBackend>>,
+    /// `SQUEEZEFS_META_COMMIT_BATCH_TXS` (default 64), read at open.
+    batch_max_txs: usize,
+    /// `SQUEEZEFS_META_COMMIT_BATCH_BYTES` (default 256 KiB) clamped to
+    /// the ring's user-admissible capacity, so one Σ-admission can
+    /// always eventually succeed (a batch larger than the admissible
+    /// ring would park forever — the liveness clamp).
+    batch_max_bytes: u64,
     /// PR M4 (design-metadata-throughput §5.1 D1.b): `SQUEEZEFS_TIMEOUT`
     /// read once at open (control-plane; default 30 s). Two consumers:
     /// the ring-admission park-escalation rung (audit row 2 — parked
@@ -463,6 +510,9 @@ impl KvMetaBackend {
             format!("{}\u{0}{}", inner.writer_id, inner.boot_id).as_bytes(),
         );
         let be = Arc::new(inner);
+        // PR M7: pass-task spawn identity — set before the FIRST commit
+        // (the writer-claim tx below already rides the conveyor).
+        let _ = be.conveyor_self.set(Arc::downgrade(&be));
         be.trace_guard_event("flock_acquired");
 
         // (3)+(4)+(5) The claim gate: decision, PR acquisition, claim
@@ -486,7 +536,11 @@ impl KvMetaBackend {
     /// process has live-mounted therefore cannot corrupt it. Dropping the
     /// returned backend releases everything (there is no task to join).
     pub async fn open_probe(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
-        Ok(Arc::new(Self::open_inner(path).await?))
+        let be = Arc::new(Self::open_inner(path).await?);
+        // PR M7: probes never mutate, but the conveyor identity is part
+        // of construction (a commit without it fails loud, never UB).
+        let _ = be.conveyor_self.set(Arc::downgrade(&be));
+        Ok(be)
     }
 
     async fn open_inner(path: &Path) -> std::result::Result<Self, KvError> {
@@ -676,6 +730,17 @@ impl KvMetaBackend {
         // K6b wiring: strict/deferred mode, the SMO context with the
         // production journal hooks, and the checkpoint-state scaffolding
         // the background task drives.
+        //
+        // PR M7 liveness clamp (§4.4 pt 5 shape, batch edition): a batch's
+        // one Σ-admission must always be satisfiable once the drain
+        // catches up, so the byte cap never exceeds the ring's
+        // user-admissible capacity (every individual entry ≤ the 128 KiB
+        // whole-entry cap already fits by the ring-size floor).
+        let batch_max_bytes = {
+            let user_capacity = (sb.journal_pages() * super::journal::JOURNAL_PAGE_DATA_LEN)
+                .saturating_sub(checkpoint_reserve_bytes(sb.journal.len));
+            commit_batch_bytes_env().min(user_capacity.max(1))
+        };
         let strict = crate::meta_backend::resolve_flush_interval_ms() == 0;
         let read_only = sb.unknown_ro() != 0;
         let sync = Arc::new(SyncCoalescer::new());
@@ -710,6 +775,10 @@ impl KvMetaBackend {
             failed: AtomicBool::new(false),
             journal_failures: AtomicU64::new(0),
             stalls: AtomicU64::new(0),
+            conveyor: Arc::new(ConveyorCore::new()),
+            conveyor_self: std::sync::OnceLock::new(),
+            batch_max_txs: commit_batch_txs_env(),
+            batch_max_bytes,
             timeout_threshold: squeezefs_timeout_env(),
             smo,
             retire_seq,
@@ -1023,7 +1092,7 @@ impl KvMetaBackend {
     /// suite's enqueue-sequencing probe and a stats gauge (a queue that
     /// grows on a quiet mount means the pass wedged).
     pub fn conveyor_pending_len(&self) -> usize {
-        0
+        self.conveyor.pending()
     }
 
     /// §4.8 monotonic ino allocation: one `fetch_add`, no reuse, no
@@ -1238,7 +1307,7 @@ impl KvMetaBackend {
                 .iter()
                 .map(|&ino| (ino, LockMode::Exclusive))
                 .collect();
-            let _guards = self.dlm.lock_many(&lock_plan, &[]).await;
+            let guards: Arc<[DlmGuard]> = Arc::from(self.dlm.lock_many(&lock_plan, &[]).await);
 
             let mut tx = KvTx::new();
             let mut records = 0u64;
@@ -1271,6 +1340,7 @@ impl KvMetaBackend {
             if !tx.is_empty() {
                 // A drain failure keeps the refinements parked (the next
                 // trigger retries); fsync-path callers surface the error.
+                tx.hold_guards(guards.clone());
                 self.commit_tx(tx).await?;
                 super::META_KV_TIMES_ECHO_DRAIN_COMMITS.fetch_add(1, Ordering::Relaxed);
                 super::META_KV_TIMES_ECHO_DRAINED.fetch_add(records, Ordering::Relaxed);
@@ -1934,6 +2004,10 @@ impl KvMetaBackend {
         let mut inner = Self::open_inner(path).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
         let be = Arc::new(inner);
+        // PR M7: conveyor identity before the clear's removexattr commit
+        // (every `Arc::new(Self)` site wires it — the commit path fails
+        // loud otherwise).
+        let _ = be.conveyor_self.set(Arc::downgrade(&be));
         let now = unix_now_secs();
 
         // Preflight-style live sweep: fresh client registrations mean a
@@ -2043,6 +2117,16 @@ pub(super) struct KvTx {
     /// into *named* committers (`meta_kv_commit_sites` on the stats
     /// inode; the OQ-1 pin in `tests/meta_entry_economy_tests.rs`).
     site: &'static std::panic::Location<'static>,
+    /// PR M7 (Issue 13, §5.5 revision 2): the tx's DLM I/D guard set,
+    /// **co-owned by the conveyor queue entry** from enqueue to the tx's
+    /// terminal outcome (post-ack on success, post-rollback on failure).
+    /// A dropped committer future drops only its own frame's refs — the
+    /// entry's ref keeps same-key exclusion alive structurally. Multi-
+    /// commit ops clone one set per sequential `commit_tx`. Empty only
+    /// for commits whose exclusion is architectural rather than
+    /// DLM-borne (the pre-arm writer-claim tx — single-writer window by
+    /// the flock; compensation records — checkpoint-class).
+    guards: Arc<[DlmGuard]>,
 }
 
 impl KvTx {
@@ -2051,7 +2135,15 @@ impl KvTx {
         Self {
             staged: Vec::new(),
             site: std::panic::Location::caller(),
+            guards: Arc::from(Vec::new()),
         }
+    }
+
+    /// Attach the transaction's DLM guard set (see the `guards` field —
+    /// the routed ops hand their held set here; multi-commit ops clone
+    /// the same `Arc` per commit).
+    fn hold_guards(&mut self, guards: Arc<[DlmGuard]>) {
+        self.guards = guards;
     }
 
     fn stage_put(&mut self, tree_id: u8, key: impl Into<Vec<u8>>, value: impl Into<Bytes>) {
@@ -2083,6 +2175,123 @@ struct UndoKey {
     tree_id: u8,
     key: Vec<u8>,
     pre: LiveLookup,
+}
+
+/// One transaction on the commit conveyor (PR M7, §5.5 D5): the encoded
+/// records, the exact entry length, the D4.a attribution site, the
+/// co-owned DLM guard set, and the committer's result channel.
+struct QueuedTx {
+    /// The tx's records, seqs stamped by the pass inside the lock window.
+    recs: Vec<(u8, Record)>,
+    /// Exact journal entry length ([`entry_len_for`]) — the Σ-admission
+    /// and the drain byte cap read it.
+    len: u64,
+    /// D4.a: the `KvTx` construction site (counted on success).
+    site: &'static std::panic::Location<'static>,
+    /// Issue 13 (§5.5 revision 2): the tx's DLM I/D guards, held by THIS
+    /// entry until the tx's terminal outcome — dropped with the entry at
+    /// fan-out (post-result-send on success, post-rollback on failure).
+    /// Never read, only owned: the RAII hold IS the same-key exclusion.
+    _guards: Arc<[DlmGuard]>,
+    /// Fan-out channel. A dead receiver (dropped committer future) is
+    /// harmless — semantically identical to timeout-fires-after-commit.
+    done: tokio::sync::oneshot::Sender<std::result::Result<(), KvError>>,
+}
+
+/// The §5.5 panic guard: pipeline state that must never be dropped on
+/// the floor, armed for the whole batch pass. Every NORMAL path (success
+/// and failure alike) empties it; [`Drop`] therefore fires with content
+/// only when the pass unwinds (panic) or the detached task is torn down
+/// mid-await (runtime shutdown) — and then performs the all-sync §5.5
+/// cleanup: release the un-transferred `Admission`, `complete()` any
+/// registered reservation as **abandoned** (the §4.4 pt 4
+/// unwritten-range mechanism — replay's checksum walk drops it), fail
+/// the batch's oneshots with EIO, fail out anything still queued behind
+/// the dead leader, release leadership, and escalate loud. A batch can
+/// fail; `completed_upto` can never wedge.
+struct PassSentinel<'a> {
+    be: &'a Arc<KvMetaBackend>,
+    /// Batch members not yet at their terminal outcome.
+    entries: Vec<QueuedTx>,
+    /// Members WITH their terminal outcome computed, awaiting fan-out
+    /// (the pass task sends these after releasing the backend ref).
+    outcomes: Vec<(QueuedTx, std::result::Result<(), KvError>)>,
+    /// Σ admission, held from admit until transfer to the reservation.
+    admission: Option<super::journal_core::Admission>,
+    /// The registered batch reservation, held until the pass completes it.
+    reservation: Option<Reservation>,
+    /// Records are applied to RAM and neither journaled nor rolled back
+    /// (the span where RAM would silently diverge from replay): a panic
+    /// here additionally fail-stops the volume — reads are
+    /// RAM-authoritative and writeback would make the divergence durable;
+    /// with `failed` latched the checkpoint task idles and the divergence
+    /// dies at remount.
+    applied_unrolled: bool,
+}
+
+impl Drop for PassSentinel<'_> {
+    fn drop(&mut self) {
+        if self.entries.is_empty()
+            && self.outcomes.is_empty()
+            && self.admission.is_none()
+            && self.reservation.is_none()
+        {
+            return;
+        }
+        // Computed-but-unsent outcomes are REAL terminal results (their
+        // effects are committed/rolled back) — deliver them even on the
+        // unwind path.
+        for (q, outcome) in self.outcomes.drain(..) {
+            let _ = q.done.send(outcome);
+        }
+        super::META_CONVEYOR_PASS_PANICS.fetch_add(1, Ordering::Relaxed);
+        if let Some(res) = self.reservation.take() {
+            // Abandoned, never wedged: the range stays unwritten; replay
+            // drops it at the checksum walk (§4.4 pt 4).
+            self.be.ring.complete(&res);
+        }
+        if let Some(adm) = self.admission.take() {
+            self.be.ring.core().release(adm);
+        }
+        let batch_n = self.entries.len();
+        for q in self.entries.drain(..) {
+            let _ = q.done.send(Err(KvError::Io(self.be.eio(
+                "commit conveyor pass panicked — batch failed loud (§5.5 panic guard)",
+            ))));
+        }
+        if self.applied_unrolled && !self.be.failed.swap(true, Ordering::AcqRel) {
+            log::error!(
+                "meta volume {}: conveyor pass panicked AFTER RAM apply — volume marked \
+                 FAILED (RAM diverges from replay for the failed batch; mutations return \
+                 EIO until remount, checkpoint ticks idle, the divergence dies with the \
+                 process)",
+                self.be.path.display()
+            );
+        }
+        // The pass dies holding leadership: fail out everything queued
+        // behind it and release, so later committers are never stranded
+        // behind a dead leader (post-release arrivals elect fresh passes).
+        let mut stranded_n = 0usize;
+        loop {
+            for q in self.be.conveyor.drain(usize::MAX, u64::MAX) {
+                stranded_n += 1;
+                let _ = q.done.send(Err(KvError::Io(self.be.eio(
+                    "commit conveyor leader panicked before this tx was drained — retry \
+                     after the volume recovers",
+                ))));
+            }
+            if !self.be.conveyor.unlead_and_recheck() {
+                break;
+            }
+        }
+        self.be.note_journal_failure();
+        log::error!(
+            "meta volume {}: conveyor pass panic contained — {batch_n} batch member(s) \
+             failed EIO, {stranded_n} queued tx(s) failed out, budget released, \
+             reservation abandoned (meta_conveyor_pass_panics)",
+            self.be.path.display()
+        );
+    }
 }
 
 /// How a routed dentry mutation updates its parent directory (the v2
@@ -2152,33 +2361,30 @@ impl KvMetaBackend {
         }
     }
 
-    /// **The §4.4 commit pipeline.** Every mutating op stages a [`KvTx`]
-    /// and lands here:
+    /// **The §4.4 commit pipeline, conveyor edition (PR M7 —
+    /// design-metadata-throughput §5.5 D5).** Every mutating op stages a
+    /// [`KvTx`] and lands here. The committer:
     ///
-    /// 1. exact entry size from the staged records (the §4.1 writer-side
-    ///    128 KiB guard);
-    /// 2. **pre-lock ring admission** — parks holding NO node locks
-    ///    (counted in `meta_kv_journal_full_stalls`), woken by
-    ///    `reusable_upto` advances (§4.4 pt 5);
-    /// 3. resolve every record's leaf, lock the deduped set in
-    ///    **ascending NodeId order**, revalidate under the locks
-    ///    (not superseded, key in range) — stale ⇒ unlock, re-resolve,
-    ///    retry (§4.6, counted);
-    /// 4. capture per-key pre-images (the rollback's undo);
-    /// 5. **reserve inside the locks** (one `fetch_add`; seq_i = start+i)
-    ///    and apply to the in-RAM deltas — reservation and apply share
-    ///    the lock window, so per-key journal-seq order equals RAM apply
-    ///    order (§4.4 pt 2) and the checkpoint's flush pass (which takes
-    ///    the same node locks) can never observe a reservation whose
-    ///    records it cannot see;
-    /// 6. unlock; write the entry bytes — the committer's own
-    ///    `write_at`/`write_at_batch` (§4.4 pt 3);
-    /// 7. wait for the completed-prefix watermark to cover this entry
-    ///    (chain-reachability: predecessors' bytes must be in page cache
-    ///    before this tx acks — the K3 barrier observation), then barrier
-    ///    per flush mode (strict = coalesced fdatasync; deferred = flag
-    ///    the flusher);
-    /// 8. on write failure: **seq-conditional rollback** + escalation.
+    /// 1. encodes its records and computes the exact entry size (the
+    ///    §4.1 writer-side 128 KiB guard) — a tx that fails HERE fails
+    ///    alone, before joining any batch;
+    /// 2. enqueues `{records, Arc<[DlmGuard]>, oneshot}` on the
+    ///    per-volume conveyor and leader-elects — **no await between the
+    ///    two**, so a cancelled committer future can never strand a
+    ///    queued entry leaderless. The election winner spawns the
+    ///    **detached, panic-guarded pass task** ([`Self::conveyor_pass`])
+    ///    and then parks on its own oneshot like every follower;
+    /// 3. awaits its result. Dropping this future at the await drops
+    ///    only the oneshot receiver and this frame's `Arc` refs — the
+    ///    queue entry co-owns the guard set, so same-key exclusion
+    ///    survives until the pass reaches the tx's terminal outcome
+    ///    (§5.5 revision 2, Issue 13).
+    ///
+    /// The batch pipeline itself — one Σ admission, union leaf locks,
+    /// contiguous per-tx reservations, one `write_at_batch`, one barrier
+    /// — is [`Self::run_batch`]; a batch of 1 runs today's per-tx
+    /// pipeline stages byte-for-byte (the degenerate case IS the
+    /// pre-conveyor code path).
     async fn commit_tx(&self, tx: KvTx) -> std::result::Result<(), KvError> {
         if tx.is_empty() {
             return Ok(());
@@ -2186,8 +2392,9 @@ impl KvMetaBackend {
         // D4.a attribution: the construction site this (about-to-be-
         // committed) tx counts against on success.
         let site = tx.site;
-        // (1) Exact size before any lock (§4.4 pt 5).
-        let mut recs: Vec<(u8, Record)> = tx
+        // (1) Exact size before anything is queued (§4.4 pt 5) — an
+        // oversized / undecodable tx fails ALONE, never inside a batch.
+        let recs: Vec<(u8, Record)> = tx
             .staged
             .into_iter()
             .map(|(tree_id, key, kind, value)| {
@@ -2214,75 +2421,233 @@ impl KvMetaBackend {
         }
         let len = entry_len_for(&recs)?;
 
-        // (2) Admission — park holding nothing the drain needs, with the
-        // D1.b escalation rung (design-metadata-throughput §5.1, audit
-        // row 2): a wedged-not-failed drain never notifies, so each park
-        // is time-bounded (the liveness re-check must not depend on a
-        // wake) and cumulative parked time ≥ `timeout_threshold` logs
-        // loud + trips `note_journal_failure` once per crossing. Repeated
-        // crossings latch `failed` (JOURNAL_FAILURE_LATCH — ~3× threshold
-        // for a solo committer, ~1× under real op concurrency where every
-        // parked committer crosses); the loop's flag re-check then fails
-        // this op with EIO and the routed layer mirrors the volume into
-        // `disabled_volumes`. Self-arbitrating: any other committer's
-        // entry-write success resets `journal_failures` (step 7), so a
-        // merely starved-but-alive volume logs loud without fail-stopping.
-        let adm = {
-            let threshold = self.timeout_threshold;
-            let mut parked_since: Option<std::time::Instant> = None;
-            loop {
-                if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
-                    break adm;
+        // (2) Enqueue + leader-elect. The pass task holds the QUEUE
+        // strongly but the backend only weakly (upgraded per batch): an
+        // idle pass must never keep a dropped-without-shutdown backend —
+        // and its writer flock — alive past the last user `Arc`. Resolve
+        // the identity BEFORE enqueueing so a broken wiring fails loud
+        // with nothing queued (unreachable by construction — set at
+        // every open path before the first commit).
+        let weak = self.conveyor_self.get().cloned().ok_or_else(|| {
+            KvError::Corrupt(
+                "conveyor identity missing (commit before open wiring?) — refusing \
+                     to enqueue a tx no pass task could ever drain"
+                    .to_string(),
+            )
+        })?;
+        let (done, rx) = tokio::sync::oneshot::channel();
+        self.conveyor.enqueue(
+            QueuedTx {
+                recs,
+                len,
+                site,
+                _guards: tx.guards,
+                done,
+            },
+            len,
+        );
+        if self.conveyor.try_lead() {
+            // Detached (§5.5 lifecycle): no client-visible cancellation
+            // can drop the pass mid-flight; the journal's accounting is
+            // unforgiving (a dropped Admission leaks budget forever, an
+            // uncompleted reservation wedges completed_upto).
+            let conveyor = Arc::clone(&self.conveyor);
+            tokio::spawn(Self::conveyor_pass_task(conveyor, weak));
+        }
+
+        // (3) Park on the fan-out. A closed channel means the pass died
+        // between drain and fan-out — the panic sentinel already failed
+        // the batch loud (EIO here is the belt, not the mechanism).
+        match rx.await {
+            Ok(out) => out,
+            Err(_) => Err(KvError::Io(self.eio(
+                "commit conveyor pass dropped its result channel (pass panic — batch \
+                 failed loud)",
+            ))),
+        }
+    }
+
+    /// The detached conveyor pass task (§5.5): drain whatever is queued
+    /// — bounded by the tx/byte caps, NO timers — and run the batch
+    /// pipeline once per drain; on an empty drain release leadership and
+    /// re-check (the `conveyor_core` no-lost-wakeup protocol). Exactly
+    /// one pass task runs per volume at any time (leader uniqueness,
+    /// loom-modeled).
+    ///
+    /// Holds the backend **per batch only** (Weak between batches) and
+    /// fans results out AFTER releasing it: a committer woken by its
+    /// result can drop the last user `Arc` and immediately re-open the
+    /// volume — the writer flock is never parked behind this task.
+    async fn conveyor_pass_task(conveyor: Arc<ConveyorCore<QueuedTx>>, weak: Weak<KvMetaBackend>) {
+        loop {
+            // Test seam: hold the pass pre-drain so arrivals accumulate
+            // deterministically (register-recheck; zero-cost when unarmed).
+            while TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_PRE_DRAIN {
+                let notified = TEST_CONVEYOR_HOLD_NOTIFY.notified();
+                if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) != TEST_CONVEYOR_HOLD_PRE_DRAIN
+                {
+                    break;
                 }
-                self.stalls.fetch_add(1, Ordering::Relaxed);
-                let notified = self.ring_space_notified();
-                if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
-                    break adm;
+                notified.await;
+            }
+            let Some(be) = weak.upgrade() else {
+                // Backend dropped without shutdown. Live committers hold
+                // `&self`, so none exist; queued entries can only be
+                // dropped-committer residue — fail them out (dead
+                // receivers; the sends are the belt) and release
+                // leadership. Guards are self-contained owned locks and
+                // release with the entries.
+                loop {
+                    for q in conveyor.drain(usize::MAX, u64::MAX) {
+                        let _ = q.done.send(Err(KvError::Corrupt(
+                            "meta volume dropped with transactions still queued".to_string(),
+                        )));
+                    }
+                    if !conveyor.unlead_and_recheck() {
+                        return;
+                    }
                 }
-                // Re-check liveness flags after each park so shutdown/failure
-                // cannot strand a parked committer.
-                if self.is_shutting_down() || self.is_failed() {
-                    return Err(KvError::Io(
-                        self.eio("commit aborted while parked for ring space"),
-                    ));
+            };
+            let batch = conveyor.drain(be.batch_max_txs, be.batch_max_bytes);
+            if batch.is_empty() {
+                drop(be); // never park on leadership holding the backend
+                if !conveyor.unlead_and_recheck() {
+                    return;
                 }
-                let since = *parked_since.get_or_insert_with(std::time::Instant::now);
-                let until_crossing = threshold
-                    .saturating_sub(since.elapsed())
-                    .max(std::time::Duration::from_millis(10));
-                // Dropping `notified` on tick expiry only unregisters this
-                // waiter; the re-registration + try_admit recheck at the
-                // loop top preserves the register-recheck-await shape.
-                let _ = tokio::time::timeout(until_crossing, notified).await;
-                if since.elapsed() >= threshold {
-                    log::error!(
-                        "meta volume {}: committer parked {} ms (≥ {} ms) waiting for \
-                         journal-ring admission ({len} B) — the drain is not advancing \
-                         (wedged-not-failed class); escalating through the journal-failure \
-                         lattice (D1.b audit row 2)",
-                        self.path.display(),
-                        since.elapsed().as_millis(),
-                        threshold.as_millis(),
-                    );
-                    self.note_journal_failure();
-                    parked_since = None;
+                continue;
+            }
+            let outcomes = be.run_batch(batch).await;
+            // Release the backend BEFORE waking committers: a woken
+            // committer may own the last user `Arc` and re-open.
+            drop(be);
+
+            // Pre-fanout test seam (the cancel-pre-fanout stage — held
+            // with the backend already released).
+            while TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_PRE_FANOUT
+            {
+                let notified = TEST_CONVEYOR_HOLD_NOTIFY.notified();
+                if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) != TEST_CONVEYOR_HOLD_PRE_FANOUT
+                {
+                    break;
                 }
-                if self.is_shutting_down() || self.is_failed() {
-                    return Err(KvError::Io(
-                        self.eio("commit aborted while parked for ring space"),
-                    ));
+                notified.await;
+            }
+
+            // (9) Fan out per-tx results; each entry's guard set is
+            // released at ITS terminal outcome — post-result-send on
+            // success, post-rollback on failure (which already ran
+            // inside the pipeline).
+            for (q, outcome) in outcomes {
+                let _ = q.done.send(outcome);
+            }
+        }
+    }
+
+    /// One conveyor batch through the §4.4 pipeline (§5.5: "runs the
+    /// pipeline ONCE for the batch"), under the panic sentinel. Never
+    /// errs — it returns every member's terminal outcome for the caller
+    /// to fan out (after releasing the backend ref), each exactly once.
+    async fn run_batch(
+        self: &Arc<Self>,
+        batch: Vec<QueuedTx>,
+    ) -> Vec<(QueuedTx, std::result::Result<(), KvError>)> {
+        super::META_CONVEYOR_LEADER_PASSES.fetch_add(1, Ordering::Relaxed);
+        super::META_COMMIT_GROUP_SIZE.record(batch.len());
+        super::META_COMMIT_GROUP_BYTES
+            .fetch_add(batch.iter().map(|q| q.len).sum::<u64>(), Ordering::Relaxed);
+
+        // Issue-13 structural invariant, debug-asserted (it must be
+        // UNFIREABLE now: a conflicting same-key writer cannot co-queue
+        // because the earlier tx's D/I guards are alive inside the queue
+        // until its terminal outcome). The sanctioned exception is
+        // shared-parent Δtime merge records, whose LWW-by-seq semantics
+        // are order-independent (§4.4 pt 6).
+        #[cfg(debug_assertions)]
+        {
+            let mut seen: std::collections::HashMap<(u8, &[u8]), (usize, RecordKind)> =
+                std::collections::HashMap::new();
+            for (qi, q) in batch.iter().enumerate() {
+                for (tree_id, r) in &q.recs {
+                    match seen.entry((*tree_id, r.key.as_slice())) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert((qi, r.kind));
+                        }
+                        std::collections::hash_map::Entry::Occupied(o) => {
+                            let (prev_qi, prev_kind) = *o.get();
+                            debug_assert!(
+                                prev_qi == qi
+                                    || (prev_kind == RecordKind::Delta
+                                        && r.kind == RecordKind::Delta),
+                                "same-key co-queue exclusion violated: tree {tree_id} key \
+                                 {:02x?} staged by batch members {prev_qi} and {qi} with \
+                                 non-merge kinds {prev_kind:?}/{:?} — a DLM guard was \
+                                 released before its tx's terminal outcome",
+                                r.key,
+                                r.kind,
+                            );
+                        }
+                    }
                 }
             }
-        };
+        }
 
-        // Test seam (PR M4 D1.b — the `TEST_TIER_PUBLISH_DELAY_MS`
-        // precedent: one relaxed load per commit, zero-cost when unset, no
-        // `#[cfg(test)]` fork of the production path): an artificial stall
-        // INSIDE the cancellation hazard window — `adm` is held, nothing
-        // reserved yet — so the watchdog suite can hold a live commit here
-        // long enough to prove (a) no per-op `timeout()` drops this future
-        // any more (a drop here leaks the admission's ring budget forever)
-        // and (b) the overdue op is visible to the watchdog scan.
+        // Panic sentinel (§5.5 lifecycle): if the pipeline unwinds — or
+        // the runtime tears the detached task down mid-await — the Drop
+        // impl releases the un-transferred Admission, completes any
+        // registered reservation as abandoned, fails the remaining
+        // oneshots with EIO and escalates. All-sync cleanup; a batch can
+        // fail loud but can never wedge `completed_upto`.
+        let mut sentinel = PassSentinel {
+            be: self,
+            entries: batch,
+            outcomes: Vec::new(),
+            admission: None,
+            reservation: None,
+            applied_unrolled: false,
+        };
+        self.run_batch_pipeline(&mut sentinel).await;
+        debug_assert!(
+            sentinel.entries.is_empty()
+                && sentinel.admission.is_none()
+                && sentinel.reservation.is_none(),
+            "the batch pipeline must reach a terminal outcome for every entry on every \
+             non-panic path (the sentinel is for unwinds only)"
+        );
+        std::mem::take(&mut sentinel.outcomes)
+    }
+
+    /// The batch pipeline body. Mutates the sentinel as protocol stages
+    /// pass so an unwind at ANY await leaves exactly the right cleanup
+    /// state; on every normal path (success and failure alike) it fans
+    /// out per-tx results and empties the sentinel itself.
+    async fn run_batch_pipeline(&self, s: &mut PassSentinel<'_>) {
+        // Inherited liveness re-checks (§5.5: "the shutdown/failure-flag
+        // re-checks it inherits from commit_tx's admission loop").
+        if self.is_shutting_down() || self.is_failed() {
+            let e = self.eio_str("commit aborted: volume is shutting down or failed");
+            self.fail_batch(s, &e);
+            return;
+        }
+
+        let total_len: u64 = s.entries.iter().map(|q| q.len).sum();
+
+        // (2) ONE Σ ring admission for the batch (AdmissionClass::User),
+        // BEFORE any node lock (§4.4 pt 5) — parks holding nothing the
+        // drain needs (the queue entries' DLM guards are held exactly
+        // the way today's parked committers hold theirs; the checkpoint
+        // drain takes no DLM locks, ever), with the D1.b park-escalation
+        // rung moved verbatim from the per-tx pipeline.
+        match self.admit_user_budget(total_len).await {
+            Ok(adm) => s.admission = Some(adm),
+            Err(e) => {
+                self.fail_batch(s, &e);
+                return;
+            }
+        }
+
+        // Test seam (PR M4 D1.b, same protocol position as the per-tx
+        // pipeline: admission held, nothing reserved — the historical
+        // budget-leak hazard window, now owned by the detached pass).
         {
             let stall = TEST_COMMIT_ADMITTED_STALL_MS.load(Ordering::Relaxed);
             if stall > 0 {
@@ -2290,36 +2655,64 @@ impl KvMetaBackend {
             }
         }
 
-        // (3–5) The locked window, with revalidate/retry.
+        // (3–5) The union locked window, with the whole-set
+        // drop-all-and-relock retry (§5.5 lock-order analysis: never
+        // re-resolving one member while holding the others' locks).
         let mut attempt = 0usize;
-        let (res, undo) = loop {
+        let (res, undo, failed) = loop {
             attempt += 1;
             if attempt > COMMIT_RETRY_BUDGET {
+                let adm = s.admission.take().expect("admission held until reserve");
                 self.ring.core().release(adm);
-                return Err(KvError::Corrupt(
+                let e = KvError::Corrupt(
                     "commit retry budget exhausted (revalidation never passed — SMO \
                      protocol bug)"
                         .to_string(),
-                ));
+                );
+                self.fail_batch(s, &e);
+                return;
             }
-            // Latch-free resolution: record index → leaf.
-            let mut leaves: Vec<Arc<CachedNode>> = Vec::with_capacity(recs.len());
-            for (tree_id, r) in &recs {
-                leaves.push(self.tree_by_id(*tree_id).resolve_leaf(&r.key).await?);
+            // Latch-free resolution: per-entry record index → leaf.
+            let mut leaves: Vec<Vec<Arc<CachedNode>>> = Vec::with_capacity(s.entries.len());
+            let mut resolve_err: Option<KvError> = None;
+            'resolve: for q in &s.entries {
+                let mut entry_leaves = Vec::with_capacity(q.recs.len());
+                for (tree_id, r) in &q.recs {
+                    match self.tree_by_id(*tree_id).resolve_leaf(&r.key).await {
+                        Ok(l) => entry_leaves.push(l),
+                        Err(e) => {
+                            resolve_err = Some(e);
+                            break 'resolve;
+                        }
+                    }
+                }
+                leaves.push(entry_leaves);
             }
-            // Deduped ascending-NodeId lock order (§4.4 pt 1).
-            let mut lock_set: Vec<Arc<CachedNode>> = leaves.clone();
+            if let Some(e) = resolve_err {
+                // Device-read class: the batch fails as a unit; nothing
+                // was reserved or applied.
+                let adm = s.admission.take().expect("admission held until reserve");
+                self.ring.core().release(adm);
+                self.fail_batch(s, &e);
+                return;
+            }
+            // Deduped ascending-NodeId lock order over the UNION
+            // (§4.4 pt 1 / §4.9 4b verbatim, over a union set).
+            let mut lock_set: Vec<Arc<CachedNode>> = leaves.iter().flatten().cloned().collect();
             lock_set.sort_by_key(|n| n.addr());
             lock_set.dedup_by_key(|n| n.addr());
             let mut guards = Vec::with_capacity(lock_set.len());
             for node in &lock_set {
                 guards.push(node.lock().write().await);
             }
-            // Revalidate under the locks (§4.6).
-            let stale = leaves.iter().zip(&recs).any(|(leaf, (_, r))| {
-                leaf.state().is_superseded()
-                    || r.key[..] < *leaf.min_key()
-                    || r.key[..] > *leaf.max_key()
+            // Revalidate EVERY member under the locks (§4.6); any stale
+            // leaf ⇒ drop ALL, re-resolve ALL, re-lock the union.
+            let stale = s.entries.iter().zip(&leaves).any(|(q, entry_leaves)| {
+                entry_leaves.iter().zip(&q.recs).any(|(leaf, (_, r))| {
+                    leaf.state().is_superseded()
+                        || r.key[..] < *leaf.min_key()
+                        || r.key[..] > *leaf.max_key()
+                })
             });
             if stale {
                 drop(guards);
@@ -2327,65 +2720,150 @@ impl KvMetaBackend {
                 continue;
             }
 
-            // (4) Pre-images, once per distinct (tree, key).
+            // (4) Pre-images, once per distinct (tree, key) across the
+            // WHOLE batch — first touch wins, so the batch-range rollback
+            // restores the pre-batch state exactly (same-key members are
+            // Δtime merge records by the co-queue invariant; their
+            // shared pre-image is the pre-batch fold).
             let mut undo: Vec<UndoKey> = Vec::new();
-            for (i, (tree_id, r)) in recs.iter().enumerate() {
-                if recs[..i]
-                    .iter()
-                    .any(|(t, p)| *t == *tree_id && p.key == r.key)
-                {
-                    continue;
+            {
+                let mut captured: std::collections::HashSet<(u8, Vec<u8>)> =
+                    std::collections::HashSet::new();
+                let mut cap_err: Option<KvError> = None;
+                'capture: for (q, entry_leaves) in s.entries.iter().zip(&leaves) {
+                    for ((tree_id, r), leaf) in q.recs.iter().zip(entry_leaves) {
+                        if !captured.insert((*tree_id, r.key.clone())) {
+                            continue;
+                        }
+                        match leaf.snapshot().lookup(&r.key) {
+                            Ok(pre) => undo.push(UndoKey {
+                                tree_id: *tree_id,
+                                key: r.key.clone(),
+                                pre,
+                            }),
+                            Err(e) => {
+                                cap_err = Some(e);
+                                break 'capture;
+                            }
+                        }
+                    }
                 }
-                let pre = leaves[i].snapshot().lookup(&r.key)?;
-                undo.push(UndoKey {
-                    tree_id: *tree_id,
-                    key: r.key.clone(),
-                    pre,
-                });
+                if let Some(e) = cap_err {
+                    drop(guards);
+                    let adm = s.admission.take().expect("admission held until reserve");
+                    self.ring.core().release(adm);
+                    self.fail_batch(s, &e);
+                    return;
+                }
             }
 
-            // (5) Reserve inside the window; stamp seqs; RAM apply.
+            // (5) ONE contiguous reservation inside the window; per-tx
+            // entry seqs stamped back-to-back (seq_k = start + Σ len_j,
+            // j < k); RAM apply in QUEUE order with per-tx undo. Same-
+            // window reservation+apply keeps per-key journal-seq order
+            // equal to RAM apply order (§4.4 pt 2) across the batch.
+            let adm = s.admission.take().expect("admission held until reserve");
             let res = self.ring.reserve_registered(adm);
-            for (i, (_t, r)) in recs.iter_mut().enumerate() {
-                r.seq = res.start + i as u64;
-            }
-            // Group the applies per lock-set entry so each node gets one
-            // apply + one snapshot swap.
-            for node in &lock_set {
-                let group: Vec<OwnedRec> = recs
-                    .iter()
-                    .zip(&leaves)
-                    .filter(|(_, leaf)| leaf.addr() == node.addr())
-                    .map(|((_, r), _)| OwnedRec {
-                        key: Bytes::copy_from_slice(&r.key),
-                        seq: r.seq,
-                        kind: r.kind,
-                        value: Bytes::copy_from_slice(&r.value),
-                    })
-                    .collect();
-                if group.is_empty() {
-                    continue;
+            s.reservation = Some(res);
+            {
+                let mut seq_cursor = res.start;
+                for q in s.entries.iter_mut() {
+                    for (i, (_t, r)) in q.recs.iter_mut().enumerate() {
+                        r.seq = seq_cursor + i as u64;
+                    }
+                    seq_cursor += q.len;
                 }
-                let gi = lock_set
-                    .iter()
-                    .position(|n| n.addr() == node.addr())
-                    .expect("node is in its own lock set");
-                node.apply_locked(&mut guards[gi], group)?;
             }
-            // Writeback pressure (§4.6 pt 1's SECOND trigger: "when a
-            // node's dirty delta exceeds a bset worth") — flagged inside
-            // the window, drained by the checkpoint task.
+            // Apply per tx, grouped per node within the tx (one apply +
+            // one snapshot swap per touched node per tx). A member whose
+            // apply fails is rolled OUT of the window immediately —
+            // records removed under the still-held locks (no freeze can
+            // interleave: writeback takes these same node locks) — and
+            // fails alone; the batch survives (§5.5 isolation).
+            let mut failed: Vec<(usize, KvError)> = Vec::new();
+            let poison = TEST_CONVEYOR_POISON_APPLY_INO.load(Ordering::Relaxed);
+            let mut seq_cursor = res.start;
+            for (qi, (q, entry_leaves)) in s.entries.iter().zip(&leaves).enumerate() {
+                let entry_start = seq_cursor;
+                seq_cursor += q.len;
+                let mut apply_err: Option<KvError> = None;
+                for node in &lock_set {
+                    let group: Vec<OwnedRec> = q
+                        .recs
+                        .iter()
+                        .zip(entry_leaves)
+                        .filter(|(_, leaf)| leaf.addr() == node.addr())
+                        .map(|((_, r), _)| OwnedRec {
+                            key: Bytes::copy_from_slice(&r.key),
+                            seq: r.seq,
+                            kind: r.kind,
+                            value: Bytes::copy_from_slice(&r.value),
+                        })
+                        .collect();
+                    if group.is_empty() {
+                        continue;
+                    }
+                    let gi = lock_set
+                        .iter()
+                        .position(|n| n.addr() == node.addr())
+                        .expect("node is in its own lock set");
+                    if let Err(e) = node.apply_locked(&mut guards[gi], group) {
+                        apply_err = Some(e);
+                        break;
+                    }
+                }
+                // Test seam: poison AFTER the apply so the in-window
+                // removal machinery is exercised for real.
+                if apply_err.is_none()
+                    && poison != 0
+                    && q.recs
+                        .iter()
+                        .any(|(t, r)| *t == TREE_INODES && r.key[..] == inode_key(poison)[..])
+                {
+                    apply_err = Some(KvError::Corrupt(
+                        "TEST_CONVEYOR_POISON_APPLY_INO armed apply fault".to_string(),
+                    ));
+                }
+                if let Some(e) = apply_err {
+                    // In-window removal of exactly this member's records
+                    // (already-applied prefix included; never-applied
+                    // keys remove as no-ops).
+                    for ((tree_id, r), leaf) in q.recs.iter().zip(entry_leaves) {
+                        let _ = tree_id;
+                        let gi = lock_set
+                            .iter()
+                            .position(|n| n.addr() == leaf.addr())
+                            .expect("leaf is locked");
+                        leaf.remove_overlay_records_locked(
+                            &mut guards[gi],
+                            &r.key,
+                            entry_start,
+                            entry_start + q.len,
+                        );
+                    }
+                    failed.push((qi, e));
+                }
+            }
+            // Surviving members' records are now applied to RAM and not
+            // yet journaled — the exact span the panic sentinel's
+            // fail-stop covers (RAM would diverge from replay).
+            s.applied_unrolled = s.entries.len() > failed.len();
+            // Writeback pressure (§4.6 pt 1's SECOND trigger) — flagged
+            // inside the window, drained by the checkpoint task.
             let mut threshold_crossed = false;
             for (gi, node) in lock_set.iter().enumerate() {
                 if guards[gi].overlay_bytes() >= self.cache.config().writeback_delta_bytes {
-                    let (tree_id, _) = recs
+                    let tree_id = s
+                        .entries
                         .iter()
                         .zip(&leaves)
+                        .flat_map(|(q, entry_leaves)| q.recs.iter().zip(entry_leaves))
                         .find(|(_, leaf)| leaf.addr() == node.addr())
-                        .map(|((t, _), _)| (*t, ()))
-                        .expect("group nonempty implies a record");
-                    self.tree_by_id(tree_id).enqueue_maintenance(node.addr());
-                    threshold_crossed = true;
+                        .map(|((t, _), _)| *t);
+                    if let Some(tree_id) = tree_id {
+                        self.tree_by_id(tree_id).enqueue_maintenance(node.addr());
+                        threshold_crossed = true;
+                    }
                 }
             }
             drop(guards);
@@ -2393,53 +2871,124 @@ impl KvMetaBackend {
                 // Wake the task for a maintenance-only pass NOW (appends,
                 // no barrier/ledger — those stay on cadence): letting the
                 // open delta balloon for a whole tick makes every commit's
-                // RAM apply pay O(delta) — the K7 create-row cliff. The
-                // permit coalesces storms into one pending wake.
+                // RAM apply pay O(delta) — the K7 create-row cliff.
                 self.ckpt_wake.notify_one();
             }
-            break (res, undo);
+            break (res, undo, failed);
         };
 
-        // (6–8) The committer's own bytes, outside every lock.
-        match self.ring.commit_entry(&res, &recs).await {
+        // (6) The pass's own bytes, outside every lock: the surviving
+        // members' entries — N ORDINARY checksummed entries in the one
+        // contiguous reservation, one `write_at_batch` submission. A
+        // failed member's sub-range stays unwritten (the §4.4 pt 4
+        // unwritten-hole mechanism; replay's checksum walk drops it).
+        let write_out = {
+            let mut parts: Vec<(Reservation, &[(u8, Record)])> = Vec::new();
+            let mut seq_cursor = res.start;
+            for (qi, q) in s.entries.iter().enumerate() {
+                let start = seq_cursor;
+                seq_cursor += q.len;
+                if failed.iter().any(|(fi, _)| *fi == qi) {
+                    continue;
+                }
+                parts.push((Reservation { start, len: q.len }, &q.recs));
+            }
+            if parts.is_empty() {
+                Ok(())
+            } else {
+                self.ring.write_entries_batch(&parts).await
+            }
+        };
+        // Completion is unconditional and pass-owned (commit_entry's
+        // guarantee, batch edition): a reservation that never completes
+        // would wedge the completed-prefix watermark. An unwritten /
+        // failed range still completes — it is an abandoned hole.
+        let res = s.reservation.take().expect("reservation registered");
+        self.ring.complete(&res);
+
+        match write_out {
             Ok(()) => {
-                // D4.a: one successful commit_tx = one journal entry,
-                // counted against the tx's construction site (an scc
-                // bucket read + relaxed fetch_add — noise against the
-                // pipeline's own cost, and per COMMIT, not per FUSE op).
-                super::note_commit_site(site);
-                // D0 chain-reachability: this tx is findable only through
-                // its predecessors — wait for the completed prefix.
+                // (7) One completed-prefix wait covers every member
+                // (their entries all end at-or-before the batch end;
+                // chain-reachability per the K3 barrier observation).
                 self.ring.wait_completed_upto(res.end()).await;
                 self.journal_failures.store(0, Ordering::Release);
-                if self.strict {
-                    // Strict-0 group commit (§4.6 pt 4): the coalesced
-                    // barrier covers this entry AND every prior in-flight
-                    // journal write (registration follows completion —
-                    // the K3 fsync-barrier ordering observation).
-                    self.sync_device().await.map_err(KvError::Io)?;
-                } else {
-                    self.needs_flush.store(true, Ordering::Release);
+                // A skipped member left an unwritten hole in front of
+                // acked survivors: checkpoint past it BEFORE acking, so
+                // an immediate crash cannot strand chain-reachability of
+                // what we are about to ack (§4.4 pt 4's hole discipline,
+                // applied batch-mid).
+                let mut hole_err: Option<String> = None;
+                if !failed.is_empty() {
+                    if let Err(ck) = self.checkpoint_now().await {
+                        log::error!(
+                            "meta volume {}: post-isolation checkpoint could not cover the \
+                             batch hole: {ck} (volume escalating; failing the survivors \
+                             loud rather than acking unreachable entries)",
+                            self.path.display()
+                        );
+                        self.note_journal_failure();
+                        hole_err = Some(format!(
+                            "batch hole checkpoint failed after a member rollback: {ck}"
+                        ));
+                    }
                 }
-                Ok(())
+                let barrier_out = if hole_err.is_none() && self.strict {
+                    // (8) Strict-0 group commit: ONE coalesced fdatasync
+                    // for the whole batch (§4.6 pt 4 / §5.5 — the G3
+                    // mechanism: the barrier leaves the throughput path).
+                    self.sync_device().await.map_err(KvError::Io)
+                } else {
+                    if hole_err.is_none() {
+                        self.needs_flush.store(true, Ordering::Release);
+                    }
+                    Ok(())
+                };
+                s.applied_unrolled = false;
+
+                // Terminal outcomes, in queue order (the pass task fans
+                // them out after releasing the backend ref).
+                let mut failed = failed;
+                for (qi, q) in std::mem::take(&mut s.entries).into_iter().enumerate() {
+                    if let Some(pos) = failed.iter().position(|(fi, _)| *fi == qi) {
+                        let (_, e) = failed.swap_remove(pos);
+                        s.outcomes.push((q, Err(e)));
+                        continue;
+                    }
+                    let outcome = match (&hole_err, &barrier_out) {
+                        (Some(msg), _) => Err(KvError::Io(self.eio(msg))),
+                        (None, Err(e)) => Err(self.clone_kv_error(e)),
+                        (None, Ok(())) => {
+                            // D4.a: one successful commit_tx = one journal
+                            // entry against the tx's construction site.
+                            super::note_commit_site(q.site);
+                            Ok(())
+                        }
+                    };
+                    s.outcomes.push((q, outcome));
+                }
             }
             Err(e) => {
                 log::warn!(
-                    "meta volume {}: journal entry write failed (seq {}): {e} — rolling back",
+                    "meta volume {}: batch journal write failed (seqs [{}, {})): {e} — \
+                     rolling back {} member(s)",
                     self.path.display(),
-                    res.seq()
+                    res.start,
+                    res.end(),
+                    s.entries.len(),
                 );
+                // (8') Whole-batch rollback: the §4.4 pt 4 seq-conditional
+                // machinery reused over the batch's contiguous range with
+                // the first-touch pre-images (each member's records carry
+                // seqs inside [start, end), so removal + skip-if-newer
+                // compensation compose exactly as for one tx).
                 self.rollback_failed_tx(res.start, res.end(), &undo).await;
+                s.applied_unrolled = false;
                 self.note_journal_failure();
-                // The reserved range is now a PERMANENT hole in the ring:
-                // any acked entry that shares its page is chain-reachable
-                // only through it (§4.1 discovery loses same-page
-                // successors of a dead chain). Restore replay ≡ RAM by
-                // forcing a checkpoint PAST the hole — the §4.4 pt 5
-                // minimal-checkpoint progress theorem guarantees it needs
-                // zero ring bytes, so it runs even on a sick device's
-                // full ring. If the device refuses this too, the volume
-                // is escalating to fail-stop anyway.
+                // The reserved range is now a PERMANENT hole in the ring
+                // (§4.1 discovery loses same-page successors of a dead
+                // chain): checkpoint past it — zero ring bytes by the
+                // §4.4 pt 5 progress theorem.
                 if let Err(ck) = self.checkpoint_now().await {
                     log::error!(
                         "meta volume {}: post-failure checkpoint could not drain the \
@@ -2448,9 +2997,108 @@ impl KvMetaBackend {
                     );
                     self.note_journal_failure();
                 }
-                Err(e)
+                let mut failed = failed;
+                for (qi, q) in std::mem::take(&mut s.entries).into_iter().enumerate() {
+                    let outcome = if let Some(pos) = failed.iter().position(|(fi, _)| *fi == qi) {
+                        let (_, member_e) = failed.swap_remove(pos);
+                        Err(member_e)
+                    } else {
+                        Err(self.clone_kv_error(&e))
+                    };
+                    s.outcomes.push((q, outcome));
+                }
             }
         }
+    }
+
+    /// The §4.4 pt 5 user ring admission with the D1.b park-escalation
+    /// rung, extracted verbatim from the per-tx pipeline (PR M7 moves it
+    /// into the pass; the semantics — park holding nothing the drain
+    /// needs, time-bounded liveness re-checks, `note_journal_failure`
+    /// per threshold crossing, flag re-check after every park — are
+    /// unchanged and pinned by the M4 watchdog suite).
+    async fn admit_user_budget(
+        &self,
+        len: u64,
+    ) -> std::result::Result<super::journal_core::Admission, KvError> {
+        let threshold = self.timeout_threshold;
+        let mut parked_since: Option<std::time::Instant> = None;
+        loop {
+            if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
+                return Ok(adm);
+            }
+            self.stalls.fetch_add(1, Ordering::Relaxed);
+            let notified = self.ring_space_notified();
+            if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
+                return Ok(adm);
+            }
+            // Re-check liveness flags after each park so shutdown/failure
+            // cannot strand a parked pass (its queued txs fail out below).
+            if self.is_shutting_down() || self.is_failed() {
+                return Err(KvError::Io(
+                    self.eio("commit aborted while parked for ring space"),
+                ));
+            }
+            let since = *parked_since.get_or_insert_with(std::time::Instant::now);
+            let until_crossing = threshold
+                .saturating_sub(since.elapsed())
+                .max(std::time::Duration::from_millis(10));
+            // Dropping `notified` on tick expiry only unregisters this
+            // waiter; the re-registration + try_admit recheck at the
+            // loop top preserves the register-recheck-await shape.
+            let _ = tokio::time::timeout(until_crossing, notified).await;
+            if since.elapsed() >= threshold {
+                log::error!(
+                    "meta volume {}: conveyor pass parked {} ms (≥ {} ms) waiting for \
+                     journal-ring admission ({len} B) — the drain is not advancing \
+                     (wedged-not-failed class); escalating through the journal-failure \
+                     lattice (D1.b audit row 2)",
+                    self.path.display(),
+                    since.elapsed().as_millis(),
+                    threshold.as_millis(),
+                );
+                self.note_journal_failure();
+                parked_since = None;
+            }
+            if self.is_shutting_down() || self.is_failed() {
+                return Err(KvError::Io(
+                    self.eio("commit aborted while parked for ring space"),
+                ));
+            }
+        }
+    }
+
+    /// Fail every remaining batch member with (a clone of) one error —
+    /// the batch-as-a-unit failure paths (pre-reserve). The outcomes are
+    /// terminal: nothing was reserved or applied for these members.
+    fn fail_batch(&self, s: &mut PassSentinel<'_>, e: &KvError) {
+        for q in std::mem::take(&mut s.entries) {
+            let err = self.clone_kv_error(e);
+            s.outcomes.push((q, Err(err)));
+        }
+    }
+
+    /// Per-member error instances for fan-out (`KvError` is not `Clone`;
+    /// errno fidelity is preserved for the `Io` class, message fidelity
+    /// for the rest — these are terminal error paths, never hot).
+    fn clone_kv_error(&self, e: &KvError) -> KvError {
+        match e {
+            KvError::Io(crate::error::SqueezefsError::Io(ioe)) => {
+                KvError::Io(crate::error::SqueezefsError::Io(match ioe.raw_os_error() {
+                    Some(raw) => std::io::Error::from_raw_os_error(raw),
+                    None => std::io::Error::new(ioe.kind(), ioe.to_string()),
+                }))
+            }
+            KvError::Io(other) => KvError::Io(crate::error::SqueezefsError::Io(
+                std::io::Error::other(other.to_string()),
+            )),
+            other => KvError::Corrupt(other.to_string()),
+        }
+    }
+
+    /// `eio` over an owned message (the batch paths format contexts).
+    fn eio_str(&self, what: &str) -> KvError {
+        KvError::Io(self.eio(what))
     }
 
     /// A notified-future handle on the ring's space notify (private
@@ -2853,7 +3501,7 @@ impl KvMetaBackend {
         }
         let lock_plan: Vec<(u64, LockMode)> =
             inos.iter().map(|&ino| (ino, LockMode::Exclusive)).collect();
-        let _guards = self.dlm.lock_many(&lock_plan, &[]).await;
+        let guards: Arc<[DlmGuard]> = Arc::from(self.dlm.lock_many(&lock_plan, &[]).await);
 
         let mut tx = KvTx::new();
         let mut doomed = 0usize;
@@ -2887,6 +3535,7 @@ impl KvMetaBackend {
         crate::fuse_client::METRICS
             .meta_reclaim_batch_size
             .record(doomed);
+        tx.hold_guards(guards.clone());
         self.commit_tx(tx).await?;
         // PR M6: a destroyed corpse's pending times refinement is moot —
         // GC it under the exclusive locks (the drain would drop it on the
@@ -2942,6 +3591,7 @@ impl KvMetaBackend {
         uid: u32,
         gid: u32,
         global_of: impl FnOnce(Ino) -> Ino,
+        guards: Arc<[DlmGuard]>,
     ) -> Result<Inode> {
         self.write_gate()?;
         if self.find_dentry(local_parent, name).await?.is_some() {
@@ -2990,6 +3640,7 @@ impl KvMetaBackend {
         // (SHARED parent): the §4.4 pt 6 Δtime merge record.
         self.stage_parent_update(&mut tx, local_parent, !is_dir, i64::from(is_dir), now)
             .await?;
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(Self::to_inode(global_ino, &child))
     }
@@ -3001,6 +3652,7 @@ impl KvMetaBackend {
         mode: u32,
         uid: u32,
         gid: u32,
+        guards: Arc<[DlmGuard]>,
     ) -> Result<InodeValue> {
         self.write_gate()?;
         let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
@@ -3019,6 +3671,7 @@ impl KvMetaBackend {
         };
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(local_ino), v.encode());
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(v)
     }
@@ -3032,6 +3685,7 @@ impl KvMetaBackend {
         global_child: Ino,
         ft_mode_bits: u32,
         parent_update: RoutedParentUpdate,
+        guards: Arc<[DlmGuard]>,
     ) -> Result<()> {
         self.write_gate()?;
         let mut tx = KvTx::new();
@@ -3058,6 +3712,7 @@ impl KvMetaBackend {
                     .await?
             }
         }
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3072,6 +3727,7 @@ impl KvMetaBackend {
         local_child: Ino,
         is_dir: bool,
         parent_shared: bool,
+        guards: Arc<[DlmGuard]>,
     ) -> Result<()> {
         self.write_gate()?;
         let Some((dkey, _d)) = self.find_dentry_pos(local_parent, name).await? else {
@@ -3102,6 +3758,7 @@ impl KvMetaBackend {
         }
         child.ctime = now;
         tx.stage_put(TREE_INODES, inode_key(local_child), child.encode());
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3113,6 +3770,7 @@ impl KvMetaBackend {
         local_parent: Ino,
         name: &str,
         parent_update: RoutedParentUpdate,
+        guards: Arc<[DlmGuard]>,
     ) -> Result<()> {
         self.write_gate()?;
         let Some((dkey, _d)) = self.find_dentry_pos(local_parent, name).await? else {
@@ -3139,6 +3797,7 @@ impl KvMetaBackend {
                     .await?
             }
         }
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3153,6 +3812,7 @@ impl KvMetaBackend {
         name: &str,
         local_child: Ino,
         global_child: Ino,
+        guards: Arc<[DlmGuard]>,
     ) -> Result<Inode> {
         self.write_gate()?;
         let mut child = self
@@ -3178,6 +3838,7 @@ impl KvMetaBackend {
         );
         self.stage_parent_update(&mut tx, local_parent, false, 0, now)
             .await?;
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(Self::to_inode(global_child, &child))
     }
@@ -3191,6 +3852,7 @@ impl KvMetaBackend {
         local_child: Ino,
         delta: i64,
         is_dir_unlink: bool,
+        guards: Arc<[DlmGuard]>,
     ) -> Result<InodeValue> {
         self.write_gate()?;
         let mut v = self
@@ -3212,6 +3874,7 @@ impl KvMetaBackend {
         v.ctime = Self::now_ns();
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(local_child), v.encode());
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(v)
     }
@@ -3219,7 +3882,12 @@ impl KvMetaBackend {
     /// Parent-side directory nlink delta (routed rename of a directory
     /// across parents), best-effort like the v2 arm (`if let Ok`) —
     /// times untouched, exactly the v2 rename's nlink shift.
-    pub async fn routed_parent_nlink_delta(&self, local_parent: Ino, delta: i64) -> Result<()> {
+    pub async fn routed_parent_nlink_delta(
+        &self,
+        local_parent: Ino,
+        delta: i64,
+        guards: Arc<[DlmGuard]>,
+    ) -> Result<()> {
         self.write_gate()?;
         let Some(mut pv) = self.read_inode_value(local_parent).await? else {
             return Ok(());
@@ -3235,6 +3903,7 @@ impl KvMetaBackend {
         }
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(local_parent), pv.encode());
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3261,6 +3930,7 @@ impl KvMetaBackend {
         flags: u32,
         src_local: Option<Ino>,
         dest_local: Option<Ino>,
+        guards: Arc<[DlmGuard]>,
     ) -> Result<()> {
         self.write_gate()?;
         let old_pos = self.find_dentry_pos(local_old_parent, old_name).await?;
@@ -3403,6 +4073,7 @@ impl KvMetaBackend {
                 tx.stage_delta(TREE_INODES, inode_key(src), &InodeDelta::ctime(now));
             }
         }
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3412,7 +4083,7 @@ impl KvMetaBackend {
     /// rename's dentry surgery (per-volume fragments — cross-volume
     /// renames were never transactional across volumes). Best-effort on a
     /// missing inode, like every routed rename fragment.
-    pub async fn routed_touch_ctime(&self, local_ino: Ino) -> Result<()> {
+    pub async fn routed_touch_ctime(&self, local_ino: Ino, guards: Arc<[DlmGuard]>) -> Result<()> {
         self.write_gate()?;
         if self.read_inode_value(local_ino).await?.is_none() {
             return Ok(());
@@ -3423,6 +4094,7 @@ impl KvMetaBackend {
             inode_key(local_ino),
             &InodeDelta::ctime(Self::now_ns()),
         );
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3430,7 +4102,11 @@ impl KvMetaBackend {
     /// Rename-replace destination handling when the destination inode
     /// lives on ANOTHER volume: ENOTEMPTY probe + nlink dec + ctime (the
     /// v2 arm's `if let Ok` best-effort shape).
-    pub async fn routed_dest_replace(&self, local_dest: Ino) -> Result<()> {
+    pub async fn routed_dest_replace(
+        &self,
+        local_dest: Ino,
+        guards: Arc<[DlmGuard]>,
+    ) -> Result<()> {
         self.write_gate()?;
         let Some(mut dv) = self.read_inode_value(local_dest).await? else {
             return Ok(());
@@ -3446,6 +4122,7 @@ impl KvMetaBackend {
         dv.ctime = Self::now_ns();
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(local_dest), dv.encode());
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3455,7 +4132,7 @@ impl KvMetaBackend {
     /// fsync/release writeback shape.
     pub async fn set_layout_and_size(&self, ino: Ino, layout: &[u8], size: u64) -> Result<()> {
         self.write_gate()?;
-        let _guard = self.dlm.lock_inode_exclusive(ino).await;
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
         let mut v = self
             .read_inode_value(ino)
             .await?
@@ -3475,6 +4152,7 @@ impl KvMetaBackend {
             .encode()?,
         );
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3514,6 +4192,7 @@ impl KvMetaBackend {
         atime: Option<u64>,
         mtime: Option<u64>,
         ctime: Option<u64>,
+        guards: Arc<[DlmGuard]>,
     ) -> Result<Inode> {
         self.write_gate()?;
         let mut v = self
@@ -3584,6 +4263,7 @@ impl KvMetaBackend {
         }
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         // The committed Put carries (or intentionally supersedes) the
         // refinement — retire it so a dead echo never max-folds over an
@@ -3594,7 +4274,13 @@ impl KvMetaBackend {
 
     /// The setxattr body with the DLM I-guard already held (see
     /// [`Self::setattr_locked`] for the re-entrancy rationale).
-    pub async fn setxattr_locked(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+    pub async fn setxattr_locked(
+        &self,
+        ino: Ino,
+        name: &str,
+        value: &[u8],
+        guards: Arc<[DlmGuard]>,
+    ) -> Result<()> {
         self.write_gate()?;
         let cap = self.cache.config().layout.record_value_cap();
         // The value rides an XattrValue envelope (name + lengths); keep
@@ -3615,12 +4301,18 @@ impl KvMetaBackend {
             // D1.c single-copy staging (no intermediate name/value Vecs).
             XattrValue::encode_parts(name.as_bytes(), value)?,
         );
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
 
     /// The removexattr body with the DLM I-guard already held.
-    pub async fn removexattr_locked(&self, ino: Ino, name: &str) -> Result<()> {
+    pub async fn removexattr_locked(
+        &self,
+        ino: Ino,
+        name: &str,
+        guards: Arc<[DlmGuard]>,
+    ) -> Result<()> {
         self.write_gate()?;
         let tx0 = KvTx::new();
         let (existing, key) = self.xattr_slot(&tx0, ino, name).await?;
@@ -3632,6 +4324,7 @@ impl KvMetaBackend {
         }
         let mut tx = tx0;
         tx.stage_delete(TREE_XATTRS, key);
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3664,8 +4357,10 @@ impl Metadata for KvMetaBackend {
         gid: u32,
     ) -> Result<Inode> {
         self.write_gate()?;
-        let _parent_guard = self.dlm.lock_inode_exclusive(parent).await;
-        let _dentry_guard = self.dlm.lock_dentry_exclusive(parent, name).await;
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![
+            self.dlm.lock_inode_exclusive(parent).await,
+            self.dlm.lock_dentry_exclusive(parent, name).await,
+        ]);
 
         if self.find_dentry(parent, name).await?.is_some() {
             return Err(crate::error::SqueezefsError::InvalidOperation(
@@ -3710,6 +4405,7 @@ impl Metadata for KvMetaBackend {
         );
         self.stage_parent_update(&mut tx, parent, false, 0, now)
             .await?;
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(Self::to_inode(ino, &child))
     }
@@ -3746,10 +4442,11 @@ impl Metadata for KvMetaBackend {
             } else {
                 &[(parent, LockMode::Exclusive), (ino, LockMode::Exclusive)]
             };
-            let _full = self
-                .dlm
-                .lock_many(inode_set, &[(parent, name, LockMode::Exclusive)])
-                .await;
+            let full: Arc<[DlmGuard]> = Arc::from(
+                self.dlm
+                    .lock_many(inode_set, &[(parent, name, LockMode::Exclusive)])
+                    .await,
+            );
             match self.find_dentry_pos(parent, name).await? {
                 Some((cur_key, cur)) if cur.child_ino == ino && cur_key == dkey => {}
                 _ => continue, // dentry changed under us — rediscover
@@ -3769,6 +4466,7 @@ impl Metadata for KvMetaBackend {
             }
             child.ctime = now;
             tx.stage_put(TREE_INODES, inode_key(ino), child.encode());
+            tx.hold_guards(full);
             self.commit_tx(tx).await?;
             return Ok(ino);
         }
@@ -3778,16 +4476,17 @@ impl Metadata for KvMetaBackend {
     /// check, nlink+1 + ctime, parent-time full update — one entry.
     async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode> {
         self.write_gate()?;
-        let _guards = self
-            .dlm
-            .lock_many(
-                &[
-                    (new_parent, LockMode::Exclusive),
-                    (ino, LockMode::Exclusive),
-                ],
-                &[(new_parent, new_name, LockMode::Exclusive)],
-            )
-            .await;
+        let guards: Arc<[DlmGuard]> = Arc::from(
+            self.dlm
+                .lock_many(
+                    &[
+                        (new_parent, LockMode::Exclusive),
+                        (ino, LockMode::Exclusive),
+                    ],
+                    &[(new_parent, new_name, LockMode::Exclusive)],
+                )
+                .await,
+        );
 
         if self.find_dentry(new_parent, new_name).await?.is_some() {
             return Err(crate::error::SqueezefsError::InvalidOperation(
@@ -3813,6 +4512,7 @@ impl Metadata for KvMetaBackend {
         );
         self.stage_parent_update(&mut tx, new_parent, false, 0, now)
             .await?;
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(Self::to_inode(ino, &child))
     }
@@ -3836,19 +4536,20 @@ impl Metadata for KvMetaBackend {
                 std::io::Error::from_raw_os_error(libc::EINVAL),
             ));
         }
-        let _guards = self
-            .dlm
-            .lock_many(
-                &[
-                    (old_parent, LockMode::Exclusive),
-                    (new_parent, LockMode::Exclusive),
-                ],
-                &[
-                    (old_parent, old_name, LockMode::Exclusive),
-                    (new_parent, new_name, LockMode::Exclusive),
-                ],
-            )
-            .await;
+        let guards: Arc<[DlmGuard]> = Arc::from(
+            self.dlm
+                .lock_many(
+                    &[
+                        (old_parent, LockMode::Exclusive),
+                        (new_parent, LockMode::Exclusive),
+                    ],
+                    &[
+                        (old_parent, old_name, LockMode::Exclusive),
+                        (new_parent, new_name, LockMode::Exclusive),
+                    ],
+                )
+                .await,
+        );
 
         let old_pos = self.find_dentry_pos(old_parent, old_name).await?;
         let new_pos = self.find_dentry_pos(new_parent, new_name).await?;
@@ -3900,6 +4601,7 @@ impl Metadata for KvMetaBackend {
                 DentryValue::encode_parts(old_d.child_ino, old_d.file_type, new_name.as_bytes())?,
             );
         }
+        tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
     }
@@ -3927,8 +4629,8 @@ impl Metadata for KvMetaBackend {
         ctime: Option<u64>,
     ) -> Result<Inode> {
         self.write_gate()?;
-        let _guard = self.dlm.lock_inode_exclusive(ino).await;
-        self.setattr_locked(ino, mode, uid, gid, size, atime, mtime, ctime)
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        self.setattr_locked(ino, mode, uid, gid, size, atime, mtime, ctime, guards)
             .await
     }
 
@@ -3941,16 +4643,16 @@ impl Metadata for KvMetaBackend {
     /// over v2's 3 × 8 KiB blocks).
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
         self.write_gate()?;
-        let _guard = self.dlm.lock_inode_exclusive(ino).await;
-        self.setxattr_locked(ino, name, value).await
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        self.setxattr_locked(ino, name, value, guards).await
     }
 
     /// Remove one xattr; absent names fail loud with the v2 NotFound
     /// shape.
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
         self.write_gate()?;
-        let _guard = self.dlm.lock_inode_exclusive(ino).await;
-        self.removexattr_locked(ino, name).await
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        self.removexattr_locked(ino, name, guards).await
     }
 
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {

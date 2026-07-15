@@ -48,6 +48,18 @@
 //!   accepted dirt (§4.5 dirty pinning); freeze-swap conserves records
 //!   across a racing apply (frozen + open == applied, dirty bit exact);
 //!   at most one freeze is ever in flight.
+//! - [`conveyor_core`]: the per-volume commit conveyor's leader-election
+//!   / queue / drain core (metadata-throughput design §5.5 D5, PR M7) —
+//!   invariants: leader uniqueness (two racing electors never both win);
+//!   no lost wakeups (after any enqueue+elect vs drain+unlead
+//!   interleaving, no entry is left queued with no leader responsible
+//!   for it — the release-then-recheck theorem); FIFO apply order;
+//!   budget conservation across committer-future drops (an entry's byte
+//!   budget is drained exactly once no matter when its committer
+//!   disappears); and guard-lifetime ≥ staged-record-lifetime under an
+//!   enqueued-then-dropped committer (Issue 13: the queue entry co-owns
+//!   the DLM guard set, so same-key exclusion survives the committer's
+//!   death until the pass's terminal outcome for that tx).
 //!
 //! Models run only under `--cfg loom` (see `tests/run_loom.sh`); a plain
 //! `cargo test` here compiles the cores against std atomics and runs
@@ -55,6 +67,8 @@
 
 #[path = "../../src/meta_backend/kv/alloc_ext_core.rs"]
 pub mod alloc_ext_core;
+#[path = "../../src/meta_backend/kv/conveyor_core.rs"]
+pub mod conveyor_core;
 #[path = "../../src/cow_core.rs"]
 pub mod cow_core;
 #[path = "../../src/gauge_core.rs"]
@@ -73,7 +87,8 @@ pub mod refcount_core;
 #[cfg(all(test, loom))]
 mod models {
     use crate::{
-        alloc_ext_core, gauge_core, incarnation_core, journal_core, lease_core, node_state_core,
+        alloc_ext_core, conveyor_core, gauge_core, incarnation_core, journal_core, lease_core,
+        node_state_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
@@ -1014,6 +1029,278 @@ mod models {
             );
             assert!(st.is_freezing(), "the winner's freeze is in flight");
             assert!(!st.is_dirty(), "the swap cleared the dirty bit");
+        });
+    }
+    /// Conveyor invariant #1 (metadata-throughput §5.5, PR M7): leader
+    /// uniqueness — two committers racing enqueue+elect produce exactly
+    /// one leader; the loser's entry is guaranteed drained by SOMEONE
+    /// (either the winner's pass or its own later election after the
+    /// winner unleads — modeled by running the winner's full pass loop).
+    #[test]
+    fn conveyor_leader_unique_and_loser_entry_drained() {
+        loom::model(|| {
+            let c: Arc<conveyor_core::ConveyorCore<u32>> =
+                Arc::new(conveyor_core::ConveyorCore::new());
+
+            let t = {
+                let c = Arc::clone(&c);
+                thread::spawn(move || {
+                    c.enqueue(2, 1);
+                    c.try_lead()
+                })
+            };
+            c.enqueue(1, 1);
+            let mine = c.try_lead();
+            let theirs = t.join().unwrap();
+
+            assert!(
+                mine || theirs,
+                "with entries queued, at least one elector must win"
+            );
+            assert!(
+                !(mine && theirs),
+                "two racing electors must never both hold leadership"
+            );
+
+            // The winner's pass loop (drain-until-empty + release-then-
+            // recheck) must account for BOTH entries — the loser parked
+            // on its oneshot and will never elect again.
+            let mut drained = 0usize;
+            loop {
+                let batch = c.drain(64, u64::MAX);
+                if batch.is_empty() {
+                    if !c.unlead_and_recheck() {
+                        break;
+                    }
+                    continue;
+                }
+                drained += batch.len();
+            }
+            assert_eq!(drained, 2, "every enqueued entry must drain exactly once");
+            assert_eq!(c.pending(), 0);
+        });
+    }
+
+    /// Conveyor invariant #2 (§5.5): no lost wakeups — a committer whose
+    /// election fails against a leader that is concurrently finishing
+    /// (empty drain → unlead → recheck) is never stranded: either the
+    /// leader's release-then-recheck re-elects it to drain the new entry,
+    /// or the committer's own election won and it runs a pass. The
+    /// interleaving where BOTH decline is the lost wakeup this model
+    /// forbids.
+    #[test]
+    fn conveyor_no_lost_wakeup_across_unlead() {
+        loom::model(|| {
+            let c: Arc<conveyor_core::ConveyorCore<u32>> =
+                Arc::new(conveyor_core::ConveyorCore::new());
+
+            // A live leader with an empty queue, about to retire.
+            assert!(c.try_lead(), "seed leader");
+
+            // Committer thread: enqueue + elect (the §5.5 two-step, no
+            // await between). If it wins, it drains its own entry.
+            let committer = {
+                let c = Arc::clone(&c);
+                thread::spawn(move || {
+                    c.enqueue(7, 1);
+                    if c.try_lead() {
+                        let mut got = 0usize;
+                        loop {
+                            let batch = c.drain(64, u64::MAX);
+                            if batch.is_empty() {
+                                if !c.unlead_and_recheck() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            got += batch.len();
+                        }
+                        got
+                    } else {
+                        0
+                    }
+                })
+            };
+
+            // Leader thread: empty drain → release-then-recheck loop.
+            let mut leader_got = 0usize;
+            loop {
+                let batch = c.drain(64, u64::MAX);
+                if batch.is_empty() {
+                    if !c.unlead_and_recheck() {
+                        break;
+                    }
+                    continue;
+                }
+                leader_got += batch.len();
+            }
+
+            let committer_got = committer.join().unwrap();
+            assert_eq!(
+                leader_got + committer_got,
+                1,
+                "the enqueued entry must be drained exactly once (leader {leader_got}, \
+                 committer {committer_got}) — zero is a lost wakeup, two is a double drain"
+            );
+            assert_eq!(c.pending(), 0, "nothing may remain queued");
+        });
+    }
+
+    /// Conveyor invariant #3 (§5.5 / §4.4 pt 2 transfer): FIFO — entries
+    /// drain in enqueue order even when the drain races a producer, and
+    /// a capped drain takes a strict prefix (never reorders around the
+    /// cap).
+    #[test]
+    fn conveyor_fifo_apply_order_under_race() {
+        loom::model(|| {
+            let c: Arc<conveyor_core::ConveyorCore<u32>> =
+                Arc::new(conveyor_core::ConveyorCore::new());
+            c.enqueue(1, 1);
+            c.enqueue(2, 1);
+
+            // Racing producer.
+            let t = {
+                let c = Arc::clone(&c);
+                thread::spawn(move || c.enqueue(3, 1))
+            };
+
+            // Capped drain: a strict FIFO prefix.
+            let first = c.drain(2, u64::MAX);
+            assert_eq!(first, vec![1, 2], "drain must return the FIFO prefix");
+            t.join().unwrap();
+            let rest = c.drain(64, u64::MAX);
+            assert_eq!(rest, vec![3], "the racing entry drains after the prefix");
+        });
+    }
+
+    /// Conveyor invariant #4 (§5.5 lifecycle): budget conservation across
+    /// committer-future drops — an entry's byte budget reaches the drain
+    /// exactly once whether or not its committer is still alive. The
+    /// committer thread dies right after enqueue+elect (its result
+    /// channel token drops); the detached pass (modeled inline) must
+    /// still see every byte, and the modeled budget cell settles to
+    /// exactly the drained sum.
+    #[test]
+    fn conveyor_budget_conserved_across_committer_drop() {
+        loom::model(|| {
+            let c: Arc<conveyor_core::ConveyorCore<(u32, u64)>> =
+                Arc::new(conveyor_core::ConveyorCore::new());
+            let drained_budget = Arc::new(AtomicU64::new(0));
+
+            // Committer A: enqueues 3 budget-bytes and DIES (thread ends
+            // — the committer-future drop; its entry must survive it).
+            let a = {
+                let c = Arc::clone(&c);
+                thread::spawn(move || {
+                    c.enqueue((10, 3), 3);
+                    c.try_lead()
+                })
+            };
+            // Committer B: enqueues 5 and stays only long enough to elect.
+            c.enqueue((20, 5), 5);
+            let b_led = c.try_lead();
+            let a_led = a.join().unwrap();
+
+            // Whoever won leadership runs the pass; if both failed there
+            // is a live leader by definition — impossible here (fresh
+            // core), so exactly one won.
+            assert!(a_led ^ b_led, "exactly one elector wins a fresh core");
+            let mut drained = 0usize;
+            loop {
+                let batch = c.drain(64, u64::MAX);
+                if batch.is_empty() {
+                    if !c.unlead_and_recheck() {
+                        break;
+                    }
+                    continue;
+                }
+                for (_, len) in batch {
+                    drained_budget.fetch_add(len, Ordering::Relaxed);
+                    drained += 1;
+                }
+            }
+            assert_eq!(drained, 2, "both entries drain despite A's death");
+            assert_eq!(
+                drained_budget.load(Ordering::Relaxed),
+                8,
+                "budget bytes are conserved across the committer drop (3 + 5)"
+            );
+            assert_eq!(c.pending(), 0);
+        });
+    }
+
+    /// Conveyor invariant #5 (§5.5 revision 2, Issue 13): guard-lifetime
+    /// ≥ staged-record-lifetime under an enqueued-then-dropped committer.
+    /// The guard set is an `Arc` co-owned by the queue entry; the
+    /// committer's own clone dropping (thread death) must leave the
+    /// entry's clone alive — observable as a strong count that never
+    /// falls to 1's release while the record sits queued, and the guard
+    /// is released only at the pass's terminal outcome for that entry.
+    #[test]
+    fn conveyor_guard_outlives_dropped_committer_until_terminal() {
+        loom::model(|| {
+            /// Stands in for one DLM guard: releasing (the last `Arc`
+            /// clone dropping) flips the observable flag — the moment a
+            /// same-key writer could proceed.
+            struct GuardToken {
+                released: Arc<AtomicBool>,
+            }
+            impl Drop for GuardToken {
+                fn drop(&mut self) {
+                    self.released.store(true, Ordering::SeqCst);
+                }
+            }
+            struct Entry {
+                _guard: Arc<GuardToken>, // stands in for Arc<[DlmGuard]>
+            }
+            let c: Arc<conveyor_core::ConveyorCore<Entry>> =
+                Arc::new(conveyor_core::ConveyorCore::new());
+            let released = Arc::new(AtomicBool::new(false));
+            let guard = Arc::new(GuardToken {
+                released: Arc::clone(&released),
+            });
+
+            // Committer: enqueue {records + guard clone}, elect, DIE (the
+            // dropped-committer case — its own clone dies with it).
+            let committer = {
+                let c = Arc::clone(&c);
+                thread::spawn(move || {
+                    c.enqueue(
+                        Entry {
+                            _guard: Arc::clone(&guard),
+                        },
+                        1,
+                    );
+                    let led = c.try_lead();
+                    drop(guard); // the committer frame's own ref dies
+                    led
+                })
+            };
+            let led = committer.join().unwrap();
+            assert!(led, "sole elector must win");
+
+            // The committer is DEAD; its records sit queued. Issue 13:
+            // the guard must still be held (the queue entry co-owns it).
+            assert!(
+                !released.load(Ordering::SeqCst),
+                "guard released while its records were still queued — same-key \
+                 exclusion lost (the Issue-13 bug)"
+            );
+
+            // The pass drains and reaches the tx's terminal outcome: ONLY
+            // then does the guard release.
+            let batch = c.drain(64, u64::MAX);
+            assert_eq!(batch.len(), 1);
+            assert!(
+                !released.load(Ordering::SeqCst),
+                "guard must be held through the pass until the terminal outcome"
+            );
+            drop(batch); // terminal outcome: entry dropped post-fanout
+            assert!(
+                released.load(Ordering::SeqCst),
+                "guard must be released at the terminal outcome (no leak)"
+            );
+            assert!(!c.unlead_and_recheck());
         });
     }
 }

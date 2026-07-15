@@ -383,10 +383,128 @@ fn bench_kv_tree(c: &mut Criterion) {
     group.finish();
 }
 
+/// PR M9 micro-benches (design-metadata-throughput §5.7 D7): the **hot
+/// parent-key probe** — the create storm's dominant fold shape (a parent
+/// inode `Put` accumulating one Δtime per create until compaction), in its
+/// three read regimes:
+///
+/// - `overlay_head`: the chain is in the open delta — D7.a serves the
+///   materialized folded head (zero decodes);
+/// - `bset_resident_memo`: the chain froze into the node's bset log —
+///   D7.b's snapshot memo serves repeat folds (zero decodes after the
+///   first);
+/// - `from_scratch_fold`: the same records folded through the raw §4.2
+///   algebra every time — the pre-M9 per-read price, kept as the in-tip
+///   comparator (and the shape `InodeDelta::decode` charged 7.9 % of
+///   daemon CPU for in the baseline profile).
+fn bench_kv_fold(c: &mut Criterion) {
+    use squeezefs::meta_backend::kv::record::{fold_newest_first, RecordKind};
+
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("kv_fold");
+    const DELTAS: u64 = 16;
+
+    // One single-leaf volume; the hot parent key with a Put + Δtime chain.
+    let file = NamedTempFile::new().expect("temp volume");
+    let node_size = DEFAULT_NODE_SIZE;
+    file.as_file()
+        .set_len(64 * node_size as u64)
+        .expect("size volume");
+    let cache = NodeCache::new(NodeCacheConfig {
+        path: file.path().to_path_buf(),
+        layout: NodeLayout::new(node_size).expect("layout"),
+        heap_base: 0,
+        budget_bytes: 64 * node_size as u64,
+        writeback_delta_bytes: usize::MAX, // freezes are driven explicitly
+    });
+    let alloc = Arc::new(ExtentAllocator::format(64, 0, 4096));
+    let mut ctx = SmoContext::new(alloc);
+    let seq = Arc::new(AtomicU64::new(0));
+    let key = inode_key(42);
+
+    let parent = InodeValue {
+        mode: 0o40755,
+        uid: 1000,
+        gid: 1000,
+        nlink: 2,
+        flags: 0,
+        flags2: 0,
+        size: 4096,
+        atime: 1,
+        mtime: 2,
+        ctime: 3,
+    };
+    let (tree, overlay_leaf) = rt.block_on(async {
+        let tree = KvTree::create(cache.clone(), &mut ctx, TREE_INODES, seq.clone())
+            .await
+            .expect("create");
+        let leaf = tree.resolve_leaf(&key).await.expect("resolve");
+        tree.apply_at(
+            &leaf,
+            &key,
+            RecordKind::Put,
+            bytes::Bytes::from(parent.encode()),
+        )
+        .await
+        .expect("put");
+        for t in 1..=DELTAS {
+            tree.apply_at(
+                &leaf,
+                &key,
+                RecordKind::Delta,
+                bytes::Bytes::from(InodeDelta::times(t, t).encode()),
+            )
+            .await
+            .expect("delta");
+        }
+        (tree, leaf)
+    });
+
+    // Regime 1: open-delta chain — D7.a overlay head.
+    let overlay_snap = overlay_leaf.snapshot();
+    group.bench_function("hot_parent_key_probe_overlay_head", |b| {
+        b.iter(|| black_box(overlay_snap.lookup(black_box(&key)).expect("lookup")));
+    });
+
+    // Regime 2: bset-resident chain — D7.b memo (steady-state repeat fold
+    // on one held immutable snapshot, the stat-storm shape).
+    let memo_snap = rt.block_on(async {
+        let mut guard = overlay_leaf.lock().write().await;
+        overlay_leaf
+            .freeze_locked(&mut guard, &cache.config().layout)
+            .expect("freeze");
+        drop(guard);
+        assert!(cache.append_frozen(&overlay_leaf).await.expect("append"));
+        overlay_leaf.snapshot()
+    });
+    group.bench_function("hot_parent_key_probe_bset_resident_memo", |b| {
+        b.iter(|| black_box(memo_snap.lookup(black_box(&key)).expect("lookup")));
+    });
+    drop(tree);
+
+    // Regime 3: the raw from-scratch algebra over the same chain — what
+    // every read paid before D7.
+    let mut records: Vec<Record> = vec![Record::put(key.to_vec(), 1, parent.encode())];
+    for t in 1..=DELTAS {
+        records.push(Record::delta(key.to_vec(), 1 + t, &InodeDelta::times(t, t)));
+    }
+    records.reverse(); // newest-first, the fold input contract
+    group.bench_function("hot_parent_key_probe_from_scratch_fold", |b| {
+        b.iter(|| {
+            let folded = fold_newest_first(black_box(&records).iter().map(|r| r.record_ref()))
+                .expect("fold");
+            black_box(folded.live_value().map(<[u8]>::len))
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_kv_meta_metadata,
     bench_kv_bset,
-    bench_kv_tree
+    bench_kv_tree,
+    bench_kv_fold
 );
 criterion_main!(benches);

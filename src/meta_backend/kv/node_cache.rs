@@ -57,6 +57,12 @@ pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// bset worth" — one 4 KiB append page).
 pub const DEFAULT_WRITEBACK_DELTA_BYTES: usize = 4096;
 
+/// PR M9 (design-metadata-throughput §5.7 D7.b): fixed per-node snapshot
+/// fold-memo capacity — populate-once cells on the immutable snapshot,
+/// first-come. Small and fixed by design ("the hot-parent-key case needs
+/// 1"); the per-node memory bound the §5.7 budget accounting relies on.
+pub const FOLD_MEMO_CAPACITY: usize = 8;
+
 /// Placement + policy for one volume's node cache. Everything is a
 /// parameter by design: the superblock/CLI plumbing is PR K6a's.
 #[derive(Debug, Clone)]

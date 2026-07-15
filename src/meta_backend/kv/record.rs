@@ -842,6 +842,13 @@ where
                         seq: r.seq,
                     });
                 }
+                // PR M9 decode pin (§5.7): one count per record decoded —
+                // the base Put plus every collected delta. Overlay-head /
+                // memo serves must keep this at zero on the read path.
+                super::META_KV_FOLD_RECORD_DECODES.fetch_add(
+                    1 + deltas.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let mut base = InodeValue::decode(r.value)?;
                 // Ascending seq order: oldest delta first, newest last wins.
                 for d in deltas.iter().rev() {

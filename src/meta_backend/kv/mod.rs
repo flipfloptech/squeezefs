@@ -175,6 +175,48 @@ pub static META_KV_TIMES_ECHO_DRAIN_COMMITS: AtomicU64 = AtomicU64::new(0);
 /// Surfaced as `meta_kv_times_echo_drained`.
 pub static META_KV_TIMES_ECHO_DRAINED: AtomicU64 = AtomicU64::new(0);
 
+/// PR M9 (design-metadata-throughput §5.7 D7.a): point lookups served
+/// straight from the **fold-forward overlay head** — the materialized
+/// folded value riding the newest open-delta record of the key, kept
+/// current at apply time under the node write lock the committer already
+/// holds. Zero record decodes on this path; the create storm's hot parent
+/// inode probe lands here between freezes. Surfaced as
+/// `meta_kv_fold_head_serves` (design §9).
+pub static META_KV_FOLD_HEAD_SERVES: AtomicU64 = AtomicU64::new(0);
+
+/// PR M9 (§5.7 D7.b): snapshot fold-memo hits — a bset-resident key's
+/// fold served from the immutable snapshot's populate-once memo cells
+/// (zero decodes; latch-free probe). The create-storm hit rate
+/// (`hits / (hits + misses)`) is the acceptance number. Surfaced as
+/// `meta_kv_fold_memo_hits` (design §9).
+pub static META_KV_FOLD_MEMO_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// PR M9 (§5.7 D7.b): memo-eligible folds that ran from scratch (key not
+/// in the snapshot's memo cells yet — first fold after a snapshot swap,
+/// or the fixed [`node_cache::FOLD_MEMO_CAPACITY`] cells were exhausted).
+/// Surfaced as `meta_kv_fold_memo_misses` (design §9).
+pub static META_KV_FOLD_MEMO_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// PR M9 (§5.7 D7 memory accounting): **gauge** — bytes currently held by
+/// snapshot fold-memo cells across every live snapshot (keys + owned
+/// folded values + fixed per-cell overhead). Charged/discharged exactly
+/// (populate adds; the memo's `Drop` subtracts when its snapshot dies at
+/// the next swap or eviction), and the same bytes ride the node-cache
+/// budget (`SQUEEZEFS_META_NODE_CACHE_MB`) through `NodeCache::
+/// cached_bytes`. The M9 tiny-budget storm gate reads this: eviction must
+/// keep it bounded. Surfaced as `meta_kv_fold_memo_bytes` (design §9).
+pub static META_KV_FOLD_MEMO_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// PR M9 (§5.7): record decodes performed by fold execution — one count
+/// per `InodeValue`/`InodeDelta` decode inside [`record::fold_newest_first`]
+/// and [`record::fold_forward`]. **The D7 acceptance pin**: an overlay-head
+/// or memo serve must move this by exactly zero (the RED-first
+/// zero-decode contract in `tests/kv_fold_slimming_tests.rs`); the
+/// baseline's 16 %-of-daemon-CPU re-decode tax is this counter's rate.
+/// Deliberately not on the stats JSON (design §9 names the four
+/// `meta_kv_fold_*` fields above; this is the tests' and profiler's pin).
+pub static META_KV_FOLD_RECORD_DECODES: AtomicU64 = AtomicU64::new(0);
+
 /// PR M7 (design-metadata-throughput §5.5 D5): transactions per conveyor
 /// batch — the group-formation histogram the G3 gate reads
 /// (`meta_commit_group_size`; strict-mode median ≥ 4 under the 8-writer

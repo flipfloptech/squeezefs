@@ -425,6 +425,221 @@ async fn test_kill9_remount_soak_v3() {
 }
 
 // ===========================================================================
+// PR M7 (design-metadata-throughput §5.5 D5): the kill-9 soak with real
+// GROUP FORMATION — the serial child above exercises batch-of-1; this
+// child runs 3 concurrent lanes in one shared parent (SHARED parent
+// I-stripe ⇒ co-queueable Δtime writers), so kill-9 lands on multi-tx
+// conveyor batches: contiguous multi-entry reservations, one
+// write_at_batch in flight, per-tx acks. Same ledger protocol per lane
+// (names are lane-unique), same D0 / whole-tx / idempotence assertions.
+// ===========================================================================
+
+/// Child branch for the BATCHED soak rounds: 3 concurrent churn lanes
+/// through the routed backend (the mount shape — shared parent stripe).
+#[test]
+fn crash_child_entry_v3_batched() {
+    if std::env::var("SQUEEZEFS_CRASH_CHILD_V3_BATCHED").is_err() {
+        return;
+    }
+    let vol = std::path::PathBuf::from(std::env::var("SQUEEZEFS_CRASH_VOL").unwrap());
+    let ledger = std::path::PathBuf::from(std::env::var("SQUEEZEFS_CRASH_LEDGER").unwrap());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let be = KvMetaBackend::open(&vol).await.unwrap();
+        let routed = std::sync::Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
+
+        let mut lanes = Vec::new();
+        for lane in 0..3u32 {
+            let routed = routed.clone();
+            let be = be.clone();
+            let ledger = ledger.clone();
+            lanes.push(tokio::spawn(async move {
+                let mut i: u64 = 0;
+                loop {
+                    let name = format!("l{lane}-f{i}");
+                    ledger_append(&ledger, &format!("start create {name}"));
+                    let ino = match routed.create(1, &name, libc::S_IFREG | 0o644, 0, 0).await {
+                        Ok(f) => f.ino,
+                        Err(_) => break, // volume full mid-kill window
+                    };
+                    be.sync_device().await.unwrap();
+                    ledger_append(&ledger, &format!("ack create {name} {ino}"));
+
+                    ledger_append(&ledger, &format!("start setxattr {ino} user.crash v{i}"));
+                    routed
+                        .setxattr(ino, "user.crash", format!("v{i}").as_bytes())
+                        .await
+                        .unwrap();
+                    be.sync_device().await.unwrap();
+                    ledger_append(&ledger, &format!("ack setxattr {ino} user.crash v{i}"));
+
+                    if i.is_multiple_of(3) {
+                        ledger_append(&ledger, &format!("start unlink {name}"));
+                        routed.unlink(1, &name).await.unwrap();
+                        be.sync_device().await.unwrap();
+                        ledger_append(&ledger, &format!("ack unlink {name} {ino}"));
+
+                        ledger_append(&ledger, &format!("start destroy {ino}"));
+                        routed.destroy_inodes(&[ino]).await.unwrap();
+                        be.sync_device().await.unwrap();
+                        ledger_append(&ledger, &format!("ack destroy {ino}"));
+                    }
+                    i += 1;
+                }
+            }));
+        }
+        for l in lanes {
+            let _ = l.await;
+        }
+        std::future::pending::<()>().await
+    });
+}
+
+/// The batched-commit kill-9 soak: identical invariants to
+/// [`test_kill9_remount_soak_v3`] — D0 acked durability, whole-tx
+/// atomicity, acked-unlink permanence, watermark clearance, replay
+/// idempotence — under kill windows that interrupt live multi-tx
+/// conveyor batches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kill9_remount_soak_v3_batched() {
+    let rounds: u32 = std::env::var("SQUEEZEFS_CRASH_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let exe = std::env::current_exe().expect("test binary path");
+
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = dir.path().join("crash-batched.v3.meta");
+        let ledger = dir.path().join("ledger.log");
+        {
+            let f = std::fs::File::create(&vol).unwrap();
+            f.set_len(V3_VOL_SIZE).unwrap();
+            format_v3(&vol, V3_VOL_SIZE, &v3_format_opts())
+                .await
+                .unwrap();
+        }
+
+        let mut child = Command::new(&exe)
+            .args([
+                "--exact",
+                "crash_child_entry_v3_batched",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("SQUEEZEFS_CRASH_CHILD_V3_BATCHED", "1")
+            .env("SQUEEZEFS_CRASH_VOL", &vol)
+            .env("SQUEEZEFS_CRASH_LEDGER", &ledger)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn v3 batched crash child");
+
+        // First-ack anchor + jittered kill (the serial soak's rationale).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut acked_seen = false;
+        while std::time::Instant::now() < deadline {
+            if ledger.exists()
+                && std::fs::read_to_string(&ledger)
+                    .map(|s| s.lines().any(|l| l.starts_with("ack ")))
+                    .unwrap_or(false)
+            {
+                acked_seen = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            acked_seen,
+            "round {round}: the batched child never acked an op in 60 s — conveyor dead"
+        );
+        let jitter: u64 = {
+            use rand::Rng;
+            rand::thread_rng().gen_range(5..=50)
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+        child.kill().expect("SIGKILL batched child");
+        let _ = child.wait();
+
+        let m = parse_ledger(&ledger);
+        let m1 = KvMetaBackend::open(&vol)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: batched remount failed loud: {e}"));
+
+        // Whole-tx atomicity across batch members: every dentry resolves.
+        let listing = m1.readdir(1, 0, usize::MAX).await.unwrap();
+        for d in &listing {
+            let got = m1.getattr(d.ino).await.unwrap_or_else(|e| {
+                panic!(
+                    "round {round}: dentry '{}' names ino {} with no inode record \
+                     (torn batch member split a tx): {e}",
+                    d.name, d.ino
+                )
+            });
+            assert_eq!(got.ino, d.ino);
+        }
+
+        // D0 acked durability per lane-unique name.
+        for (name, ino, expect) in acked_expectations(&m) {
+            match expect {
+                Expect::Present(xattr) => {
+                    let found = m1.lookup(1, &name).await.unwrap_or_else(|e| {
+                        panic!(
+                            "round {round}: acked create '{name}' lost after a mid-batch \
+                             kill-9: {e}"
+                        )
+                    });
+                    assert_eq!(found.ino, ino);
+                    if let Some(val) = xattr {
+                        let stored = m1
+                            .getxattr(ino, "user.crash")
+                            .await
+                            .expect("xattr read")
+                            .unwrap_or_else(|| {
+                                panic!("round {round}: acked xattr on ino {ino} lost")
+                            });
+                        assert_eq!(stored, val.as_bytes());
+                    }
+                }
+                Expect::Absent => {
+                    assert!(
+                        m1.lookup(1, &name).await.is_err(),
+                        "round {round}: acked unlink '{name}' resurrected"
+                    );
+                }
+                Expect::Unknown => {}
+            }
+        }
+        if let Some(max_acked) = m.acked_inos.iter().max() {
+            assert!(m1.next_ino() > *max_acked, "round {round}: watermark low");
+        }
+
+        // Replay idempotence under batches.
+        let d1 = digest_backend(&m1).await.unwrap();
+        m1.shutdown()
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: post-crash shutdown failed: {e}"));
+        drop(m1);
+        let m2 = KvMetaBackend::open(&vol)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: second remount failed: {e}"));
+        assert_eq!(
+            m2.replay_stats().entries,
+            0,
+            "round {round}: clean shutdown must leave an empty replay window"
+        );
+        let d2 = digest_backend(&m2).await.unwrap();
+        assert_eq!(d1, d2, "round {round}: replay-twice digests diverge");
+        m2.shutdown().await.unwrap();
+    }
+}
+
+// ===========================================================================
 // PR M1 (design-metadata-throughput §5.0): kill-9 after arm ⇒ same-host
 // instant reclaim. The killed daemon leaves a heartbeat-FRESH writer_claim
 // (10 s cadence vs 45 s TTL) — the remount must reclaim it immediately via
@@ -602,22 +817,45 @@ async fn test_rollback_race_seq_conditional() {
         let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
         squeezefs::uring_fs::clear_faults();
 
-        // Exactly one op takes the armed offset (the checkpoint cadence
-        // is parked, so no other reservation can absorb it): the first
-        // reservation's entry covers the head byte and fails; the
-        // second's range starts past it and commits.
+        // The armed head offset is taken by the FIRST batch the conveyor
+        // writes (the checkpoint cadence is parked, so no other
+        // reservation can absorb it). PR M7 makes the failure population
+        // arrival-dependent: if the two creates co-batched, the batch's
+        // one `write_at_batch` takes the fault and BOTH roll back (§5.5:
+        // write failure fails every batch member — the whole-batch
+        // seq-conditional rollback); if they landed in separate batches,
+        // the first fails and the second commits at a clean offset.
+        // Either way at least one fails and never zero.
         let failed: Vec<&str> = [("a", &ra), ("b", &rb)]
             .iter()
             .filter(|(_, r)| r.is_err())
             .map(|(n, _)| *n)
             .collect();
-        assert_eq!(
-            failed.len(),
-            1,
-            "round {round}: exactly one racing create must take the armed ring-head fault \
-             (got a={ra:?} b={rb:?})"
+        assert!(
+            (1..=2).contains(&failed.len()),
+            "round {round}: the armed ring-head fault must fail the first batch — one \
+             member (split batches) or both (co-batched) (got a={ra:?} b={rb:?})"
         );
         failures_seen += failed.len() as u32;
+
+        // Keep the round genuinely SPORADIC (fail-success alternation):
+        // when both racers co-batched, the round had no successful user
+        // commit, and three such rounds back-to-back are three
+        // consecutive write failures — which correctly latches fail-stop
+        // (a volume cannot tell per-round faults from a dying device).
+        // The pre-M7 shape always interleaved a success; restore it.
+        routed
+            .create(
+                parent,
+                &format!("spacer-{round}"),
+                libc::S_IFREG | 0o644,
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("round {round}: post-fault spacer create must succeed: {e}")
+            });
 
         // The survivor resolves; the failed name does not (rolled back).
         for (name, res) in [

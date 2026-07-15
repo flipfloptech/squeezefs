@@ -1648,3 +1648,419 @@ async fn test_rename_one_entry_atomicity_power_cut() {
     );
     drop(restore);
 }
+
+// ---------------------------------------------------------------------------
+// PR M7 — the conveyor batch crash contract (design-metadata-throughput
+// §5.5 D5, riding the §4.10 harness). A conveyor batch is N ORDINARY
+// checksummed entries in one contiguous reservation, written as ONE
+// `write_at_batch`: replay is byte-for-byte today's walk, so a torn batch
+// member drops THAT tx only — identical to the pre-conveyor independent-
+// committers exposure (§4.10 caveat (a) neither grows nor shrinks). The
+// cases below pin exactly that: torn FIRST / MIDDLE / LAST member, a
+// batch spanning the ring wrap, the deterministic co-batched rollback
+// race (whole-batch §4.4 pt 4 rollback under a live same-key Δtime), and
+// replay-twice digest equality over batched commits.
+// ---------------------------------------------------------------------------
+
+/// Write a 3-member conveyor batch (one contiguous reservation, one
+/// `write_entries_batch` submission) of `lens`-sized entries with inos
+/// 101/102/103, returning the per-member reservations.
+async fn kv_write_batch3(
+    ring: &JournalRing,
+    lens: [u64; 3],
+) -> [squeezefs::meta_backend::kv::journal_core::Reservation; 3] {
+    let total: u64 = lens.iter().sum();
+    let adm = ring
+        .core()
+        .try_admit(total, AdmissionClass::User)
+        .expect("test ring must admit the batch");
+    let batch = ring.core().reserve(adm);
+    let mut parts_res = [Reservation { start: 0, len: 0 }; 3];
+    let mut cursor = batch.start;
+    for (i, len) in lens.into_iter().enumerate() {
+        parts_res[i] = Reservation { start: cursor, len };
+        cursor += len;
+    }
+    let recs: Vec<Vec<(u8, Record)>> = (0..3)
+        .map(|i| kv_sized_records(101 + i as u64, lens[i], 0xC1 + i as u8, parts_res[i].seq()))
+        .collect();
+    let parts: Vec<(Reservation, &[(u8, Record)])> = parts_res
+        .iter()
+        .zip(&recs)
+        .map(|(r, recs)| (*r, recs.as_slice()))
+        .collect();
+    ring.write_entries_batch(&parts)
+        .await
+        .expect("clean batch write");
+    parts_res
+}
+
+/// M7 crash case: torn FIRST batch member — its bytes lost to unordered
+/// writeback while its batch-mates' pages persisted. Replay drops exactly
+/// that tx, resyncs at the next page, and recovers the middle and last
+/// members (plus a later solo entry). One confirmed drop is counted.
+/// (Members are page-sized so each starts a page: batch entries follow
+/// the SAME §4.1 chain/resync rules as independent committers' — a torn
+/// entry's same-page successors are unreachable until the next verified
+/// page header, exactly the pre-M7 exposure; the same-page variant below
+/// pins that unchanged rule inside a batch.)
+#[tokio::test]
+async fn test_kv_batch_torn_first_member_drops_alone() {
+    let f = kv_ring_file(8);
+    let ring = JournalRing::new(f.path(), 0, 8, 0);
+    let page = JOURNAL_PAGE_DATA_LEN;
+
+    let parts = kv_write_batch3(&ring, [page, page, page]).await;
+    let _later = kv_append(&ring, 200, 1000, 0xD0).await;
+
+    kv_smash(f.path(), kv_phys(&ring, parts[0].start + 40), 16).await;
+
+    let (_, recovery) = JournalRing::recover(f.path(), 0, 8, 0, 0)
+        .await
+        .expect("never loud");
+    assert_eq!(
+        kv_recovered_inos(&recovery),
+        vec![102, 103, 200],
+        "the torn FIRST member drops alone; its batch-mates replay whole"
+    );
+    assert_eq!(recovery.dropped_torn, 1, "one confirmed drop-and-resync");
+}
+
+/// M7 crash case: torn MIDDLE batch member — batch-mates on both sides
+/// replay whole.
+#[tokio::test]
+async fn test_kv_batch_torn_middle_member_drops_alone() {
+    let f = kv_ring_file(8);
+    let ring = JournalRing::new(f.path(), 0, 8, 0);
+    let page = JOURNAL_PAGE_DATA_LEN;
+
+    let parts = kv_write_batch3(&ring, [page, page, page]).await;
+    let _later = kv_append(&ring, 200, 1000, 0xD0).await;
+
+    kv_smash(f.path(), kv_phys(&ring, parts[1].start + 40), 16).await;
+
+    let (_, recovery) = JournalRing::recover(f.path(), 0, 8, 0, 0)
+        .await
+        .expect("never loud");
+    assert_eq!(
+        kv_recovered_inos(&recovery),
+        vec![101, 103, 200],
+        "the torn MIDDLE member drops alone; first and last replay whole"
+    );
+    assert_eq!(recovery.dropped_torn, 1, "one confirmed drop-and-resync");
+}
+
+/// M7 crash case, the SAME-PAGE variant: a torn member's same-page batch
+/// successor is unreachable (chain-only discovery inside a page — §4.1),
+/// while the next page-start member replays. This is byte-for-byte the
+/// pre-M7 independent-committers exposure (§4.10 caveat (a) "un-acked
+/// holes were always possible across txs" — the members here were never
+/// barrier-acked); batching neither grows nor shrinks it.
+#[tokio::test]
+async fn test_kv_batch_torn_member_same_page_successor_follows_chain_rule() {
+    let f = kv_ring_file(8);
+    let ring = JournalRing::new(f.path(), 0, 8, 0);
+
+    // 101 [0,1500) + 102 [1500,3000) share page 0; 103 [3000,3000+page)
+    // continues; the later solo entry starts a fresh page.
+    let parts = kv_write_batch3(&ring, [1500, 1500, JOURNAL_PAGE_DATA_LEN]).await;
+    let _later = kv_append(&ring, 200, 1000, 0xD0).await;
+
+    kv_smash(f.path(), kv_phys(&ring, parts[0].start + 40), 16).await;
+
+    let (_, recovery) = JournalRing::recover(f.path(), 0, 8, 0, 0)
+        .await
+        .expect("never loud");
+    assert_eq!(
+        kv_recovered_inos(&recovery),
+        vec![200],
+        "the torn member's same-page successors die with the chain (the standing \
+         §4.1 rule); the next page-start entry replays"
+    );
+    assert!(
+        recovery.dropped_torn >= 1,
+        "the mid-log damage is a counted drop"
+    );
+}
+
+/// M7 crash case: torn LAST batch member with nothing after it — the
+/// trailing-tear shape: earlier members replay, the tear reads as
+/// end-of-log (dropped_torn stays 0 — the §4.1 clean-unmount alert
+/// accounting), and the recovered head resumes before the torn member.
+#[tokio::test]
+async fn test_kv_batch_torn_last_member_is_end_of_log() {
+    let f = kv_ring_file(8);
+    let ring = JournalRing::new(f.path(), 0, 8, 0);
+
+    let parts = kv_write_batch3(&ring, [1500, 1500, 1500]).await;
+
+    kv_smash(f.path(), kv_phys(&ring, parts[2].start + 40), 16).await;
+
+    let (_, recovery) = JournalRing::recover(f.path(), 0, 8, 0, 0)
+        .await
+        .expect("never loud");
+    assert_eq!(
+        kv_recovered_inos(&recovery),
+        vec![101, 102],
+        "the torn LAST member drops alone; earlier members replay whole"
+    );
+    assert_eq!(
+        recovery.head_pos,
+        parts[1].end(),
+        "the recovered head resumes before the torn trailing member"
+    );
+    assert_eq!(
+        recovery.dropped_torn, 0,
+        "a trailing tear is end-of-log, never a counted drop"
+    );
+}
+
+/// M7 crash case: a batch spanning the ring WRAP (lap 0 → lap 1) replays
+/// every member — the contiguous reservation's logical positions map
+/// through the wrap exactly like a solo multi-page entry's.
+#[tokio::test]
+async fn test_kv_batch_spanning_ring_wrap_replays_whole() {
+    let f = kv_ring_file(4); // capacity 4 × 4072 = 16288
+    let ring = JournalRing::new(f.path(), 0, 4, 0);
+
+    // Fill most of lap 0, retire it (checkpoint-durable), so the batch
+    // below wraps into lap 1.
+    let a = kv_append(&ring, 1, 6000, 0xE1).await;
+    let b = kv_append(&ring, 2, 6000, 0xE2).await;
+    ring.advance_reusable_upto(b.end());
+    let _ = a;
+
+    let parts = kv_write_batch3(&ring, [2000, 2000, 2000]).await;
+    assert!(
+        ring.core().geometry().lap(parts[2].end() - 1) > 0,
+        "the batch must actually cross into lap 1 (test geometry)"
+    );
+
+    // Mount from the durable tail (the pre-batch ledger state).
+    let (_, recovery) = JournalRing::recover(f.path(), 0, 4, 0, b.end())
+        .await
+        .expect("never loud");
+    assert_eq!(
+        kv_recovered_inos(&recovery),
+        vec![101, 102, 103],
+        "every member of the wrap-spanning batch replays"
+    );
+    assert_eq!(recovery.dropped_torn, 0);
+}
+
+/// M7 crash case: the DETERMINISTIC co-batched rollback race (the §4.4
+/// pt 4 mid-batch shape). Two same-parent creates are forced into ONE
+/// batch (held pass), both staging Δtime merge records on the same
+/// parent-inode key; the batch's single write takes an armed fault, the
+/// whole-batch seq-conditional rollback runs, and RAM == replay — the
+/// parent's committed pre-batch state stands, neither create is visible,
+/// and the volume neither leaks budget nor wedges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_kv_batch_mid_rollback_race_ram_equals_replay() {
+    use squeezefs::meta_backend::kv::backend::{
+        test_conveyor_hold_release, KvMetaBackend, TEST_CONVEYOR_HOLD_PRE_DRAIN,
+        TEST_CONVEYOR_HOLD_STAGE,
+    };
+    use squeezefs::meta_backend::kv::builder::{digest_walk, format_v3, FormatV3Options};
+    use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
+
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            TEST_CONVEYOR_HOLD_STAGE.store(0, std::sync::atomic::Ordering::SeqCst);
+            test_conveyor_hold_release();
+            uring_fs::clear_faults();
+        }
+    }
+    // Park the checkpoint cadence (the probe-digest discipline of the
+    // crash_kill rollback-race test).
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+
+    let dir = tempfile::tempdir().unwrap();
+    let vol = dir.path().join("batch-rollback.v3.meta");
+    std::fs::File::create(&vol)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    format_v3(
+        &vol,
+        64 * 1024 * 1024,
+        &FormatV3Options {
+            node_size: 64 * 1024,
+            journal_len_override: Some(1024 * 1024),
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .unwrap();
+    let be = KvMetaBackend::open(&vol).await.unwrap();
+    let routed = std::sync::Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
+    let parent = routed
+        .create(1, "racedir", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+
+    // Hold the pass; co-queue two same-parent creates (both stage the
+    // §4.4 pt 6 Δtime merge record on the parent key — the sanctioned
+    // same-key co-queue); arm a persistent write error at the batch's
+    // head byte; release.
+    TEST_CONVEYOR_HOLD_STAGE.store(
+        TEST_CONVEYOR_HOLD_PRE_DRAIN,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let a = {
+        let r = routed.clone();
+        tokio::spawn(async move {
+            r.create(parent, "race-a", libc::S_IFREG | 0o644, 0, 0)
+                .await
+        })
+    };
+    let b = {
+        let r = routed.clone();
+        tokio::spawn(async move {
+            r.create(parent, "race-b", libc::S_IFREG | 0o644, 0, 0)
+                .await
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while be.conveyor_pending_len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both creates must co-queue behind the held pass"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let head = be.journal_ring().core().head();
+    let geo = *be.journal_ring().core().geometry();
+    let phys = be.superblock().journal.start
+        + geo.page_index(head) * JOURNAL_PAGE_LEN
+        + JOURNAL_PAGE_HDR_LEN
+        + geo.in_page_off(head);
+    uring_fs::arm_sector_write_error(phys);
+    TEST_CONVEYOR_HOLD_STAGE.store(0, std::sync::atomic::Ordering::SeqCst);
+    test_conveyor_hold_release();
+
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+    uring_fs::clear_faults();
+    assert!(
+        ra.is_err() && rb.is_err(),
+        "the co-batched write failure must fail BOTH members (whole-batch rollback); \
+         got a={ra:?} b={rb:?}"
+    );
+    assert!(
+        routed.lookup(parent, "race-a").await.is_err()
+            && routed.lookup(parent, "race-b").await.is_err(),
+        "rolled-back members must not be visible"
+    );
+
+    // RAM == replay (§4.4 pt 4, batch edition): the failed batch's hole
+    // was checkpointed past; a probe of the same bytes folds to the live
+    // state exactly.
+    let d_live = digest_walk(&be.trees()).await.unwrap();
+    let probe = KvMetaBackend::open_probe(&vol).await.unwrap();
+    let d_replay = digest_backend(&probe).await.unwrap();
+    assert_eq!(
+        d_live, d_replay,
+        "live RAM and replay diverged after the whole-batch rollback"
+    );
+
+    // Conservation: no admission leak, no watermark wedge, volume alive.
+    assert_eq!(be.journal_ring().core().admitted(), 0);
+    assert!(be.journal_ring().completed_upto() >= be.journal_ring().core().head());
+    routed
+        .create(parent, "post-race", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("volume must serve after the rolled-back batch");
+}
+
+/// M7 crash case: replay-twice digest equality under BATCHED commits — a
+/// concurrent storm (real group formation), then two independent probes
+/// of the same bytes must fold to identical digests, both equal to the
+/// live RAM state (replay idempotence, §4.10, batch edition).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_kv_batched_commits_replay_twice_digest_equal() {
+    use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+    use squeezefs::meta_backend::kv::builder::{digest_walk, format_v3, FormatV3Options};
+    use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
+
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+
+    let dir = tempfile::tempdir().unwrap();
+    let vol = dir.path().join("batch-replay.v3.meta");
+    std::fs::File::create(&vol)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    format_v3(
+        &vol,
+        64 * 1024 * 1024,
+        &FormatV3Options {
+            node_size: 64 * 1024,
+            journal_len_override: Some(1024 * 1024),
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .unwrap();
+    let be = KvMetaBackend::open(&vol).await.unwrap();
+    let routed = std::sync::Arc::new(RoutedMetaBackend::new(vec![be.clone()]));
+
+    // 8-writer storm: creates, renames, unlinks — real arrival
+    // concurrency, real batches.
+    let mut tasks = Vec::new();
+    for w in 0..8u32 {
+        let r = routed.clone();
+        tasks.push(tokio::spawn(async move {
+            for i in 0..32u32 {
+                let name = format!("w{w}-f{i}");
+                r.create(1, &name, libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .expect("storm create");
+                if i % 3 == 0 {
+                    let renamed = format!("w{w}-r{i}");
+                    r.rename(1, &name, 1, &renamed, 0).await.expect("rename");
+                    r.unlink(1, &renamed).await.expect("unlink");
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.expect("storm worker");
+    }
+    // Group formation actually happened (the storm is the point).
+    assert!(
+        squeezefs::meta_backend::kv::META_COMMIT_GROUP_SIZE
+            .snapshot()
+            .iter()
+            .skip(1)
+            .sum::<u64>()
+            > 0,
+        "the storm must have produced at least one multi-tx batch"
+    );
+
+    let d_live = digest_walk(&be.trees()).await.unwrap();
+    let p1 = KvMetaBackend::open_probe(&vol).await.unwrap();
+    let d1 = digest_backend(&p1).await.unwrap();
+    drop(p1);
+    let p2 = KvMetaBackend::open_probe(&vol).await.unwrap();
+    let d2 = digest_backend(&p2).await.unwrap();
+    assert_eq!(d1, d2, "replay must be idempotent (two probes, one digest)");
+    assert_eq!(
+        d_live, d1,
+        "live RAM and replay diverged under batched commits"
+    );
+}

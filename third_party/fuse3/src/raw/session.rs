@@ -66,6 +66,48 @@ use crate::raw::FuseData;
 use crate::MountOptions;
 use crate::{Errno, SetAttr};
 
+/// Kernel-advertised FUSE INIT capabilities, published by `handle_init`
+/// before the filesystem's own `init` hook runs so capability probes
+/// (e.g. FOPEN_NOFLUSH support = minor ≥ 35, atomic-open-class scans)
+/// can consult the negotiated protocol from the daemon side.
+///
+/// `flags` is the full 64-bit capability word: classical `flags` in bits
+/// 0..31 and the fuse ≥ 7.36 extended `flags2` in bits 32..63 (the
+/// `FUSE_INIT_EXT` layout — `FUSE_OVER_IO_URING` is bit 41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelInit {
+    /// Kernel FUSE protocol major (7 on every supported kernel).
+    pub major: u32,
+    /// Kernel FUSE protocol minor (e.g. 45 for Linux 7.1-class kernels).
+    pub minor: u32,
+    /// Folded 64-bit init capability word (`flags | flags2 << 32`).
+    pub flags: u64,
+}
+
+impl KernelInit {
+    /// Fold the classical `flags` word and the extended `flags2` word
+    /// into the uapi's 64-bit capability layout (`flags2` carries bits
+    /// 32..63 — e.g. `FUSE_OVER_IO_URING` = 1u64 << 41 arrives as bit 9
+    /// of `flags2`).
+    pub fn new(major: u32, minor: u32, flags: u32, flags2: u32) -> Self {
+        Self {
+            major,
+            minor,
+            flags: (flags as u64) | ((flags2 as u64) << 32),
+        }
+    }
+}
+
+/// One kernel per process: the first session's INIT wins (every mount in
+/// a process talks to the same kernel, so the values are identical).
+static KERNEL_INIT: std::sync::OnceLock<KernelInit> = std::sync::OnceLock::new();
+
+/// The kernel INIT capabilities negotiated by this process's first FUSE
+/// session; `None` until a session has processed `FUSE_INIT`.
+pub fn kernel_init_info() -> Option<KernelInit> {
+    KERNEL_INIT.get().copied()
+}
+
 /// A Future which returns when a file system is unmounted
 ///
 /// when drop the [`MountHandle`], it will unmount Filesystem in background task, if user want to
@@ -1150,6 +1192,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         fuse_connection: &FuseConnection,
         fs: &FS,
     ) -> IoResult<NonZeroU32> {
+        // fuse_init_in is deserialized as the 16-byte classical prefix;
+        // fuse ≥ 7.36 kernels send the extended struct whose `flags2`
+        // (init flag bits 32..63) sits at byte offset 16, valid when
+        // FUSE_INIT_EXT is set in `flags`. Read it manually so the
+        // published KernelInit carries the full 64-bit capability word.
         let init_in = match get_bincode_config().deserialize::<fuse_init_in>(data) {
             Err(err) => {
                 error!(
@@ -1182,6 +1229,21 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         };
 
         debug!("fuse_init {:?}", init_in);
+
+        // Publish the kernel's advertised capabilities BEFORE calling
+        // `fs.init` below, so the filesystem's own init hook can consult
+        // `kernel_init_info()` (capability probes / log lines).
+        let init_flags2: u32 = if init_in.flags & FUSE_INIT_EXT > 0 && data.len() >= 20 {
+            u32::from_le_bytes(data[16..20].try_into().expect("4-byte slice"))
+        } else {
+            0
+        };
+        let _ = KERNEL_INIT.set(KernelInit::new(
+            init_in.major,
+            init_in.minor,
+            init_in.flags,
+            init_flags2,
+        ));
 
         let mut reply_flags = 0;
 
@@ -4853,4 +4915,26 @@ fn splice_reply(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod kernel_init_tests {
+    use super::*;
+
+    /// The extended-init fold must place `flags2` at bits 32..63 — the
+    /// uapi layout the daemon's capability probes (FOPEN_NOFLUSH minor
+    /// gate, atomic-open-class scan) read. FUSE_OVER_IO_URING (1u64<<41)
+    /// arrives as bit 9 of flags2 and is the placement witness.
+    #[test]
+    fn kernel_init_folds_flags2_into_high_bits() {
+        let ki = KernelInit::new(7, 45, 0x8000_0001, 1 << 9);
+        assert_eq!(ki.major, 7);
+        assert_eq!(ki.minor, 45);
+        assert_eq!(ki.flags & 0xFFFF_FFFF, 0x8000_0001, "classical flags in bits 0..31");
+        assert_eq!(
+            ki.flags & (1u64 << 41),
+            1u64 << 41,
+            "flags2 bit 9 must land at capability bit 41 (FUSE_OVER_IO_URING)"
+        );
+    }
 }

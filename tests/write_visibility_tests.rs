@@ -620,6 +620,11 @@ async fn delete_file_purges_staged_active_blocks() {
 //    behavior bit-for-bit (data visible after flush, durable after fsync).
 //    Observability contract: the fast path (and only the fast path) counts
 //    `fuse_flush_clean_fastpath` / `fuse_release_clean_fastpath`.
+//
+//    NOTE: the counter-delta assertions read process-global METRICS and are
+//    exact under the sanctioned gate (`--test-threads=1`, per AGENTS.md);
+//    parallel in-binary runs can interleave other tests' flushes into the
+//    deltas (same posture as the writeback_retry_exhaustions tests).
 // ---------------------------------------------------------------------------
 
 fn flush_fast_count() -> u64 {

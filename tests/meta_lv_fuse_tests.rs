@@ -115,9 +115,14 @@ async fn test_metalv_fuse_integration() {
         pid: 1234,
     };
 
-    // 1. FUSE lookup non-existent should fail
-    let lookup_res = fs.lookup(req, 1, OsStr::new("hello.txt")).await;
-    assert!(lookup_res.is_err());
+    // 1. FUSE lookup non-existent: a MISS is a cacheable negative entry
+    // (nodeid 0 + negative TTL) since PR M5 (D2.b), not a bare errno —
+    // the kernel caches it as a negative dentry.
+    let lookup_res = fs
+        .lookup(req, 1, OsStr::new("hello.txt"))
+        .await
+        .expect("miss must be a negative-entry reply");
+    assert_eq!(lookup_res.attr.ino, 0, "negative entry encodes nodeid 0");
 
     // 2. FUSE create file
     let create_res = fs
@@ -174,8 +179,16 @@ async fn test_metalv_fuse_integration() {
     .await
     .unwrap();
 
-    // Verify lookup of old name fails, and new succeeds
-    assert!(fs.lookup(req, 1, OsStr::new("hello.txt")).await.is_err());
+    // Verify lookup of old name misses (negative entry since PR M5),
+    // and new succeeds
+    assert_eq!(
+        fs.lookup(req, 1, OsStr::new("hello.txt"))
+            .await
+            .unwrap()
+            .attr
+            .ino,
+        0
+    );
     let lookup_renamed = fs
         .lookup(req, 1, OsStr::new("hello_renamed.txt"))
         .await
@@ -240,20 +253,41 @@ async fn test_metalv_fuse_integration() {
     assert_eq!(&*read_res.data, b"hello_renamed.txt");
 
     fs.unlink(req, 1, OsStr::new("my_symlink")).await.unwrap();
-    assert!(fs.lookup(req, 1, OsStr::new("my_symlink")).await.is_err());
+    assert_eq!(
+        fs.lookup(req, 1, OsStr::new("my_symlink"))
+            .await
+            .unwrap()
+            .attr
+            .ino,
+        0,
+        "post-unlink miss is a negative entry (PR M5)"
+    );
 
     // 11. FUSE rmdir
     fs.rmdir(req, 1, OsStr::new("my_dir")).await.unwrap();
-    assert!(fs.lookup(req, 1, OsStr::new("my_dir")).await.is_err());
+    assert_eq!(
+        fs.lookup(req, 1, OsStr::new("my_dir"))
+            .await
+            .unwrap()
+            .attr
+            .ino,
+        0,
+        "post-rmdir miss is a negative entry (PR M5)"
+    );
 
     // 10. FUSE unlink the renamed file
     fs.unlink(req, 1, OsStr::new("hello_renamed.txt"))
         .await
         .unwrap();
-    assert!(fs
-        .lookup(req, 1, OsStr::new("hello_renamed.txt"))
-        .await
-        .is_err());
+    assert_eq!(
+        fs.lookup(req, 1, OsStr::new("hello_renamed.txt"))
+            .await
+            .unwrap()
+            .attr
+            .ino,
+        0,
+        "post-unlink miss is a negative entry (PR M5)"
+    );
 
     // 12. Read CONFIG_INODE virtual file to verify health values
     let config_sz_attr = fs.getattr(req, CONFIG_INODE, None, 0).await.unwrap();

@@ -1370,6 +1370,30 @@ fn as_timestamp(ns: u64) -> Timestamp {
     Timestamp::new((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as u32)
 }
 
+/// D1.d (design-metadata-throughput §5.1, PR M5): per-inode open-handle
+/// state — the open count plus the dirty bit data-mutating ops set
+/// (write / truncate / fallocate / copy_file_range dest). FLUSH/RELEASE
+/// consult the bit to elide lease acquisition, buffer scans and the
+/// per-close background flush spawn on never-dirtied handles.
+///
+/// The bit is per-INODE (regular-file handles are minted as `fh == ino`),
+/// which is exact for the create-storm shape (one handle per file) and
+/// conservative for multi-handle opens: any dirty handle keeps every
+/// handle of that inode on the full path until the open count returns to
+/// zero. `add_open` resets the bit on the 0→1 transition — safe because a
+/// dirty close already handed its unflushed state to the background
+/// flush path (and fsync remains the durable barrier), so a later clean
+/// open-close pair has nothing new to flush.
+///
+/// `dirty` is atomic so the write hot path marks it through a SHARED map
+/// guard (no dashmap shard write lock on the data path — the zero-copy /
+/// latch-free rule).
+#[derive(Debug, Default)]
+pub struct OpenEntry {
+    count: usize,
+    dirty: std::sync::atomic::AtomicBool,
+}
+
 pub enum PosixLock {
     Local,
     Global(Box<crate::dlm::LockLease>),
@@ -1400,6 +1424,28 @@ const MAX_ACTIVE_BLOCK_BUFFERS: usize = 256;
 /// kernels ignore unknown open flags, so advertising it is always safe.
 const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 
+/// Kernel ABI (include/uapi/linux/fuse.h, fuse ≥ 7.35 / Linux ≥ 5.16):
+/// open-reply flag telling the kernel to elide the FLUSH request on close
+/// of this handle — D2.a (design-metadata-throughput §5.2, PR M5), the
+/// −1.0 round trip of the create-storm shape.
+///
+/// Semantics review (the design's §5.2 D2.a argument, pinned by
+/// `tests/write_visibility_tests.rs`):
+/// - SqueezeFS FLUSH is already a **soft** flush (see `flush`: "sync_all/
+///   fsync is the durable barrier"), so no durability contract weakens.
+/// - Close-to-open visibility across *mounts* is moot under the M1
+///   single-writer guard; within one mount, read-your-writes rides the
+///   write path's own visibility machinery.
+/// - Handles that dirty after open lose nothing: FLUSH's work was already
+///   a no-op for clean handles (D1.d), and dirty handles keep their
+///   close-time flush via RELEASE's background path + fsync (the kernel
+///   still writes back dirty pages before RELEASE under writeback cache).
+///
+/// Older kernels ignore unknown open flags, so advertising is always safe
+/// (the FOPEN_PARALLEL_DIRECT_WRITES precedent); the INIT probe in `init`
+/// logs whether the running kernel is NOFLUSH-capable (fuse ≥ 7.35).
+const FOPEN_NOFLUSH: u32 = 1 << 5;
+
 /// Open/create reply flags for REGULAR files (the virtual .stats/.config
 /// opens reply `FOPEN_DIRECT_IO` separately — see `open`). Parallel direct
 /// writes are safe under this daemon's lock model: the write handler
@@ -1407,9 +1453,10 @@ const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 /// per-block `BLOCK_FLUSH_LOCKS` for data merges (lock order P1), so
 /// kernel-parallel submission cannot reorder a block's merges; extending
 /// writes stay kernel-exclusive regardless (fuse_dio_lock's past-EOF
-/// check), preserving size-extension ordering.
+/// check), preserving size-extension ordering. NOFLUSH rides every
+/// regular open/create reply — every handle is OPENED clean (D2.a).
 const fn regular_open_reply_flags() -> u32 {
-    FOPEN_PARALLEL_DIRECT_WRITES
+    FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES
 }
 
 #[derive(Debug, Clone)]
@@ -1530,7 +1577,7 @@ pub struct SqueezefsFilesystem {
     pub session_connection: std::sync::Arc<
         arc_swap::ArcSwap<Option<std::sync::Arc<fuse3::raw::connection::FuseConnection>>>,
     >,
-    pub open_inodes: std::sync::Arc<dashmap::DashMap<u64, usize, ahash::RandomState>>,
+    pub open_inodes: std::sync::Arc<dashmap::DashMap<u64, OpenEntry, ahash::RandomState>>,
     /// Per-class kernel cache TTLs (attr / entry / dir-entry / negative).
     /// Per-mount (DAOS per-container model): env-seeded at construction,
     /// mount-option-overridden in `start_mount`, direct-set in tests.
@@ -1699,24 +1746,47 @@ impl SqueezefsFilesystem {
     }
 
     pub fn add_open(&self, ino: u64) {
-        let mut entry = self.open_inodes.entry(ino).or_insert(0);
-        *entry += 1;
+        let mut entry = self.open_inodes.entry(ino).or_default();
+        if entry.count == 0 {
+            // 0→1: a fresh open generation starts clean (any prior dirty
+            // close already scheduled its background flush — see
+            // [`OpenEntry`]).
+            entry.dirty.store(false, Ordering::Release);
+        }
+        entry.count += 1;
     }
 
     pub fn remove_open(&self, ino: u64) {
         if let Some(mut entry) = self.open_inodes.get_mut(&ino) {
-            if *entry > 0 {
-                *entry -= 1;
+            if entry.count > 0 {
+                entry.count -= 1;
             }
         }
     }
 
     pub fn is_open(&self, ino: u64) -> bool {
         if let Some(entry) = self.open_inodes.get(&ino) {
-            *entry > 0
+            entry.count > 0
         } else {
             false
         }
+    }
+
+    /// D1.d: mark this inode's open generation dirty (a data-mutating op
+    /// ran). Shared map guard + atomic store — no shard write lock on the
+    /// data hot path. Inodes mutated without a tracked open (defensive:
+    /// the kernel should never order it that way) get an entry so the bit
+    /// is never lost.
+    pub fn mark_handle_dirty(&self, ino: u64) {
+        if let Some(entry) = self.open_inodes.get(&ino) {
+            entry.dirty.store(true, Ordering::Release);
+            return;
+        }
+        self.open_inodes
+            .entry(ino)
+            .or_default()
+            .dirty
+            .store(true, Ordering::Release);
     }
 
     /// D1.d: has any data-mutating op (write / truncate / fallocate /
@@ -1724,9 +1794,11 @@ impl SqueezefsFilesystem {
     /// rose from zero? FLUSH/RELEASE on a never-dirtied handle take the
     /// fast path (no lease acquire, no buffer scan, no background flush
     /// spawn).
-    pub fn handle_dirty(&self, _ino: u64) -> bool {
-        // RED scaffold: pre-M5 behavior treated every handle as dirty.
-        true
+    pub fn handle_dirty(&self, ino: u64) -> bool {
+        self.open_inodes
+            .get(&ino)
+            .map(|e| e.dirty.load(Ordering::Acquire))
+            .unwrap_or(false)
     }
 
     pub fn queue_reclaim_inode(&self, ino: u64) {
@@ -4129,6 +4201,17 @@ impl SqueezefsFilesystem {
         }
     }
 
+    /// Per-class dentry TTL (survey P1-C, the DAOS dir-vs-file split):
+    /// directory dentries get `dir_entry` (their invalidation cost covers
+    /// whole subtrees), everything else `entry`.
+    fn entry_ttl_for(&self, kind: FileType) -> Duration {
+        if kind == FileType::Directory {
+            self.kernel_ttls.dir_entry
+        } else {
+            self.kernel_ttls.entry
+        }
+    }
+
     fn inode_to_file_attr(&self, inode: &crate::meta_backend::Inode) -> FileAttr {
         FileAttr {
             ino: inode.ino,
@@ -4249,7 +4332,10 @@ impl SqueezefsFilesystem {
 
     async fn get_attr_internal(&self, ino: u64) -> Result<FileAttr, SqueezefsError> {
         let mut attr = match self.attr_cache.get(&ino) {
-            Some((attr, cached_at)) if cached_at.elapsed() < Duration::from_secs(1) => attr,
+            // Daemon-side freshness window follows the attr TTL knob: an
+            // operator raising the kernel-facing TTL accepts the same
+            // staleness bound daemon-side.
+            Some((attr, cached_at)) if cached_at.elapsed() < self.kernel_ttls.attr => attr,
             _ => {
                 let backend = self.meta_backend.as_ref().ok_or_else(|| {
                     SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
@@ -4444,6 +4530,63 @@ impl Filesystem for SqueezefsFilesystem {
             "squeezefs: mount ready (version {}, exe hint: rebuild target/release and reinstall)",
             env!("CARGO_PKG_VERSION")
         );
+
+        // D2.a probe + D2.d atomic-open probe (measurement only — design
+        // §5.2, PR M5): log what the kernel advertised at FUSE_INIT.
+        // fuse3 publishes the negotiated init word before calling us.
+        if let Some(ki) = fuse3::raw::kernel_init_info() {
+            let noflush_capable = ki.major > 7 || (ki.major == 7 && ki.minor >= 35);
+            // Every init capability bit named by this box's uapi
+            // (include/uapi/linux/fuse.h through protocol 7.45) sits in
+            // bits 0..=41; none is an atomic-open-class capability (the
+            // patch lineage folding the pre-create LOOKUP into CREATE is
+            // out of tree). Bits above the known set are surfaced so a
+            // future kernel offering new capabilities is *seen*, not
+            // silently ignored — that is the D2.d measurement.
+            const KNOWN_INIT_BITS: u64 = (1u64 << 42) - 1;
+            let unknown_bits = ki.flags & !KNOWN_INIT_BITS;
+            let atomic_open_msg = if unknown_bits != 0 {
+                format!(
+                    "UNKNOWN init capability bits {unknown_bits:#x} advertised — \
+                     investigate whether an atomic-open-class capability is among \
+                     them (D2.d adoption follow-up)"
+                )
+            } else {
+                "atomic-open-class capability: not advertised (no such bit through \
+                 uapi 7.45; D2.d records absence)"
+                    .to_string()
+            };
+            info!(
+                "FUSE kernel protocol {}.{} (init flags {:#x}): FOPEN_NOFLUSH {} \
+                 (clean-close FLUSH elision, D2.a); {}",
+                ki.major,
+                ki.minor,
+                ki.flags,
+                if noflush_capable {
+                    "honored (kernel ≥ 7.35)"
+                } else {
+                    "IGNORED by this kernel (< 7.35) — clean closes still send FLUSH; \
+                     the D1.d fast path absorbs them"
+                },
+                atomic_open_msg
+            );
+            eprintln!(
+                "squeezefs: FUSE kernel {}.{} — FOPEN_NOFLUSH {}; {}",
+                ki.major,
+                ki.minor,
+                if noflush_capable {
+                    "honored"
+                } else {
+                    "ignored (<7.35)"
+                },
+                atomic_open_msg
+            );
+        } else {
+            info!(
+                "FUSE kernel INIT info not published by transport — capability \
+                 probes (D2.a/D2.d) unavailable this session"
+            );
+        }
 
         if let Some(ref backend) = self.meta_backend {
             if let Ok(Some(val)) = backend.getxattr(1, "user.squeezefs.format_config").await {
@@ -4796,13 +4939,32 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             Ok(ReplyEntry {
-                ttl: Duration::from_secs(1),
+                ttl: self.entry_ttl_for(attr.kind),
                 attr,
                 generation: 1,
             })
         };
 
-        let res = lookup_future.await;
+        // D2.b (§5.2, PR M5): a miss becomes a CACHEABLE negative entry
+        // (nodeid 0 + negative TTL) instead of a bare ENOENT, so the
+        // kernel's dcache absorbs repeated-miss round trips (PATH walks,
+        // stat retries, rename-dest probes of recurring names). Honest
+        // scope, per the design: unique-name create storms look up each
+        // name once — this moves the trailing-op mix and real-workload
+        // miss traffic, not the mdstorm create row. `negative_timeout=0`
+        // restores the bare-errno reply. Only the ENOENT class converts;
+        // every other error keeps its shape.
+        let res = match lookup_future.await {
+            Err(errno)
+                if errno == Errno::from(libc::ENOENT) && !self.kernel_ttls.negative.is_zero() =>
+            {
+                METRICS
+                    .fuse_lookup_negative_replies
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(ReplyEntry::negative(self.kernel_ttls.negative))
+            }
+            other => other,
+        };
         // Under-`i_rwsem` estimator: this LOOKUP (hit or ENOENT probe) may
         // be the one the kernel holds the parent lock across into CREATE.
         prof.note_lookup_arrival(parent, &name_str);
@@ -4875,7 +5037,7 @@ impl Filesystem for SqueezefsFilesystem {
             let attr = attr_res.map_err(map_squeezefs_err)?;
 
             Ok(ReplyAttr {
-                ttl: Duration::from_secs(1),
+                ttl: self.kernel_ttls.attr,
                 attr,
             })
         };
@@ -4919,7 +5081,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.bump_dir_generation(parent);
             self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
-                ttl: Duration::from_secs(1),
+                ttl: self.entry_ttl_for(attr.kind),
                 attr,
                 generation: 1,
             })
@@ -4982,7 +5144,7 @@ impl Filesystem for SqueezefsFilesystem {
             // Keep parent attr in cache; only dir_entry listing is stale.
             self.add_open(inode.ino);
             Ok(ReplyCreated {
-                ttl: Duration::from_secs(1),
+                ttl: self.entry_ttl_for(attr.kind),
                 attr,
                 generation: 1,
                 fh: inode.ino,
@@ -5373,6 +5535,9 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EACCES));
         }
 
+        // D1.d: this open generation now has flushable state.
+        self.mark_handle_dirty(ino);
+
         // Record writeback queue depth
         let queue_depth = self.writeback_queue_cap - self.writeback_tx.capacity();
         METRICS.writeback_queue_depth.record(queue_depth);
@@ -5574,7 +5739,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.bump_dir_generation(parent);
             self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
-                ttl: Duration::from_secs(1),
+                ttl: self.entry_ttl_for(attr.kind),
                 attr,
                 generation: 1,
             })
@@ -5641,6 +5806,11 @@ impl Filesystem for SqueezefsFilesystem {
 
         if ino == CONFIG_INODE {
             return Err(Errno::from(libc::EACCES));
+        }
+
+        // D1.d: truncate mutates data/size — dirty the open generation.
+        if set_attr.size.is_some() {
+            self.mark_handle_dirty(ino);
         }
 
         let prof = OpProf::begin(FuseOpKind::Setattr, ino);
@@ -5789,7 +5959,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache
                 .insert(ino, (attr, std::time::Instant::now()));
             Ok(ReplyAttr {
-                ttl: Duration::from_secs(1),
+                ttl: self.kernel_ttls.attr,
                 attr,
             })
         };
@@ -5846,7 +6016,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.bump_dir_generation(parent);
             self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
-                ttl: Duration::from_secs(1),
+                ttl: self.entry_ttl_for(attr.kind),
                 attr,
                 generation: 1,
             })
@@ -5918,7 +6088,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.attr_cache.invalidate(&new_parent);
             self.bump_dir_generation(new_parent);
             return Ok(ReplyEntry {
-                ttl: Duration::from_secs(1),
+                ttl: self.entry_ttl_for(attr.kind),
                 attr,
                 generation: 1,
             });
@@ -6208,8 +6378,8 @@ impl Filesystem for SqueezefsFilesystem {
                         inode: parent,
                         generation: 1,
                         attr,
-                        entry_ttl: Duration::from_secs(1),
-                        attr_ttl: Duration::from_secs(1),
+                        entry_ttl: self.kernel_ttls.dir_entry,
+                        attr_ttl: self.kernel_ttls.attr,
                         offset: 1,
                     });
                 }
@@ -6235,8 +6405,8 @@ impl Filesystem for SqueezefsFilesystem {
                         inode: parent_parent,
                         generation: 1,
                         attr,
-                        entry_ttl: Duration::from_secs(1),
-                        attr_ttl: Duration::from_secs(1),
+                        entry_ttl: self.kernel_ttls.dir_entry,
+                        attr_ttl: self.kernel_ttls.attr,
                         offset: 2,
                     });
                 }
@@ -6257,8 +6427,8 @@ impl Filesystem for SqueezefsFilesystem {
                         inode: d.ino,
                         generation: 1,
                         attr,
-                        entry_ttl: Duration::from_secs(1),
-                        attr_ttl: Duration::from_secs(1),
+                        entry_ttl: self.entry_ttl_for(attr.kind),
+                        attr_ttl: self.kernel_ttls.attr,
                         offset: cookie as i64,
                     });
                 }
@@ -6345,6 +6515,10 @@ impl Filesystem for SqueezefsFilesystem {
             "FUSE copy_file_range: src_ino = {}, off_in = {}, dest_ino = {}, off_out = {}, length = {}",
             inode, off_in, inode_out, off_out, length
         );
+
+        // D1.d: the DESTINATION gains flushable state (the source is
+        // read-only here).
+        self.mark_handle_dirty(inode_out);
 
         let src_path = format!("inode_{}", inode);
         let dest_path = format!("inode_{}", inode_out);
@@ -6720,6 +6894,20 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let prof = OpProf::begin(FuseOpKind::Flush, ino);
+
+        // D1.d (§5.1, PR M5): a never-dirtied open generation has nothing
+        // to flush — skip the lease acquire (a DLM map hit + possible
+        // acquire) and the memory-buffer scan entirely. On kernels that
+        // honor FOPEN_NOFLUSH (D2.a) this request usually never arrives;
+        // when it does (older kernels, kernel-internal callers), it is
+        // ~free. The prof still drops → the rig's op count stays exact.
+        if !self.handle_dirty(ino) {
+            METRICS
+                .fuse_flush_clean_fastpath
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+
         prof.mark_backend_start();
         let fencing_token = self
             .get_or_acquire_lease(ino)
@@ -6755,26 +6943,39 @@ impl Filesystem for SqueezefsFilesystem {
 
         let prof = OpProf::begin(FuseOpKind::Release, ino);
         prof.mark_backend_start();
-        // Non-blocking: schedule layout/active flush in background so close is
-        // cheap. fsync still waits. Staging mmap retains data for same-session reads.
-        if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
-            let fs = self.clone();
-            crate::bg_admit::spawn_bg(async move {
-                let _ = fs.flush_memory_buffers_for_inode(ino, fencing_token).await;
-                let _ = fs.flush_active_blocks_with_retry(ino, fencing_token).await;
-                let file_path = crate::keys::inode_path(ino);
-                let _ = fs
-                    .router
-                    .persist_dirty_layout_if_needed(&file_path, fencing_token)
-                    .await;
-            });
-        }
 
-        if let Err(e) = self.complete_active_multipart_upload_if_any(ino).await {
-            error!(
-                "FUSE Release: Failed to complete multipart upload for inode {}: {:?}",
-                ino, e
-            );
+        // D1.d (§5.1, PR M5): a never-dirtied open generation skips the
+        // lease acquire and the per-close background flush task — there is
+        // nothing to flush. Lease/lock/open-count/reclaim bookkeeping
+        // below still runs (cheap map ops, all correctness-bearing).
+        let clean = !self.handle_dirty(ino);
+        if clean {
+            METRICS
+                .fuse_release_clean_fastpath
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Non-blocking: schedule layout/active flush in background so
+            // close is cheap. fsync still waits. Staging mmap retains data
+            // for same-session reads.
+            if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
+                let fs = self.clone();
+                crate::bg_admit::spawn_bg(async move {
+                    let _ = fs.flush_memory_buffers_for_inode(ino, fencing_token).await;
+                    let _ = fs.flush_active_blocks_with_retry(ino, fencing_token).await;
+                    let file_path = crate::keys::inode_path(ino);
+                    let _ = fs
+                        .router
+                        .persist_dirty_layout_if_needed(&file_path, fencing_token)
+                        .await;
+                });
+            }
+
+            if let Err(e) = self.complete_active_multipart_upload_if_any(ino).await {
+                error!(
+                    "FUSE Release: Failed to complete multipart upload for inode {}: {:?}",
+                    ino, e
+                );
+            }
         }
 
         // If there's a cached lease, release it and remove it from our active_leases map
@@ -6871,6 +7072,10 @@ impl Filesystem for SqueezefsFilesystem {
             "FUSE Fallocate: ino = {}, offset = {}, length = {}, mode = {}",
             ino, offset, length, mode
         );
+        // D1.d: every supported fallocate mode can mutate data or size —
+        // dirty the open generation (conservative for pure KEEP_SIZE
+        // preallocation, which our sparse backend treats as a no-op).
+        self.mark_handle_dirty(ino);
         const PUNCH_HOLE: u32 = libc::FALLOC_FL_PUNCH_HOLE as u32;
         const KEEP_SIZE: u32 = libc::FALLOC_FL_KEEP_SIZE as u32;
         const ZERO_RANGE: u32 = libc::FALLOC_FL_ZERO_RANGE as u32;
@@ -7441,7 +7646,14 @@ pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {
         let opt_trimmed = opt.trim();
         if !opt_trimmed.is_empty() {
             let key = opt_trimmed.split('=').next().unwrap_or("").trim();
-            if key == "entry_timeout" || key == "attr_timeout" || key == "negative_timeout" {
+            // TTL options are DAEMON-level (survey P1-C): consumed into
+            // `KernelCacheTtls` by `start_mount`, never passed to the
+            // kernel mount(2) string (which would reject them).
+            if key == "entry_timeout"
+                || key == "attr_timeout"
+                || key == "negative_timeout"
+                || key == "dir_entry_timeout"
+            {
                 continue;
             }
             if !custom_opts.is_empty() {
@@ -7474,13 +7686,29 @@ pub fn filter_kernel_mount_options(opts: &str) -> String {
 /// Start FUSE mount daemon using fuse3.
 pub async fn start_mount<P: AsRef<Path>>(
     mountpoint: P,
-    fs: SqueezefsFilesystem,
+    mut fs: SqueezefsFilesystem,
     uid: u32,
     gid: u32,
     writeback: bool,
     allow_other: bool,
     custom_opts: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Survey P1-C: consume operator TTL overrides (`-o attr_timeout=…`,
+    // `entry_timeout=`, `dir_entry_timeout=`, `negative_timeout=`) into
+    // the per-mount TTL config. Pre-M5 these keys were silently DROPPED;
+    // they are still stripped from the kernel option string below (they
+    // are daemon-level), but their values now take effect.
+    if let Some(ref opts) = custom_opts {
+        fs.kernel_ttls = fs.kernel_ttls.with_mount_options(opts);
+        info!(
+            "Kernel cache TTLs for this mount: attr {:?}, entry {:?}, dir-entry {:?}, negative {:?}",
+            fs.kernel_ttls.attr,
+            fs.kernel_ttls.entry,
+            fs.kernel_ttls.dir_entry,
+            fs.kernel_ttls.negative
+        );
+    }
+
     let mut options = MountOptions::default();
     let is_root = unsafe { libc::getuid() } == 0;
     if is_root {
@@ -8512,16 +8740,42 @@ mod tests {
              different capability"
         );
         assert_eq!(
-            regular_open_reply_flags(),
+            regular_open_reply_flags() & FOPEN_PARALLEL_DIRECT_WRITES,
             FOPEN_PARALLEL_DIRECT_WRITES,
-            "regular files must advertise exactly parallel direct writes \
-             (no FOPEN_DIRECT_IO — the page-cache path stays enabled)"
+            "regular files must advertise parallel direct writes"
         );
         assert_eq!(
             regular_open_reply_flags() & 1,
             0,
             "FOPEN_DIRECT_IO must stay reserved for the virtual \
              .stats/.config inodes"
+        );
+    }
+
+    /// D2.a (design-metadata-throughput §5.2, PR M5): regular-file
+    /// open/create replies must advertise FOPEN_NOFLUSH (kernel ABI bit
+    /// 1 << 5, fuse ≥ 7.35 / Linux ≥ 5.16) so the kernel elides the FLUSH
+    /// round trip on close of clean handles — the −1.0 op of G7's
+    /// 5.18 → ≤ 4.2 ledger. Safe on every kernel: pre-7.35 kernels ignore
+    /// unknown open flags; SqueezeFS FLUSH is already soft (fsync is the
+    /// durable barrier), the M1 single-writer guard closes the
+    /// cross-mount coherence class, and later-dirtied handles keep their
+    /// close-time flush via RELEASE's background path.
+    #[test]
+    fn regular_open_reply_advertises_noflush() {
+        assert_eq!(
+            FOPEN_NOFLUSH,
+            1 << 5,
+            "kernel ABI value for FOPEN_NOFLUSH is 1 << 5 \
+             (include/uapi/linux/fuse.h); any other value advertises a \
+             different capability"
+        );
+        assert_eq!(
+            regular_open_reply_flags(),
+            FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES,
+            "regular files must advertise exactly NOFLUSH + parallel \
+             direct writes (no FOPEN_DIRECT_IO — the page-cache path \
+             stays enabled)"
         );
     }
 

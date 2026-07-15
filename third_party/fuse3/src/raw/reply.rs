@@ -95,6 +95,54 @@ pub struct ReplyEntry {
     pub generation: u64,
 }
 
+impl ReplyEntry {
+    /// A **negative** entry: tells the kernel the name does not exist and
+    /// lets it cache that fact as a negative dentry for `ttl` (uapi
+    /// `fuse_lookup_name`: "Zero nodeid is same as -ENOENT, but with
+    /// valid timeout"). Repeated lookups of the missing name are then
+    /// served from the dcache without a round trip until the TTL expires;
+    /// a create through the same dcache converts the dentry to positive.
+    ///
+    /// Encoding: `nodeid` (= `attr.ino`) 0 with `entry_valid` = `ttl`.
+    /// The kernel never reads the attribute body of a negative entry
+    /// (`fuse_lookup_name` bails on `!outarg->nodeid` before any attr
+    /// validation), so the zeroed placeholder attr is inert on the wire.
+    ///
+    /// A `ttl` of zero is legal but pointless (the dentry expires
+    /// immediately) — callers wanting uncached ENOENT semantics should
+    /// reply `Errno(ENOENT)` instead.
+    pub fn negative(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            attr: FileAttr {
+                ino: 0,
+                size: 0,
+                blocks: 0,
+                atime: Timestamp::new(0, 0),
+                mtime: Timestamp::new(0, 0),
+                ctime: Timestamp::new(0, 0),
+                #[cfg(target_os = "macos")]
+                crtime: Timestamp::new(0, 0),
+                kind: FileType::RegularFile,
+                perm: 0,
+                nlink: 0,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                #[cfg(target_os = "macos")]
+                flags: 0,
+                blksize: 0,
+            },
+            generation: 0,
+        }
+    }
+
+    /// True when this entry is the negative form (`nodeid` 0).
+    pub fn is_negative(&self) -> bool {
+        self.attr.ino == 0
+    }
+}
+
 impl From<ReplyEntry> for fuse_entry_out {
     fn from(entry: ReplyEntry) -> Self {
         let attr = entry.attr;
@@ -438,5 +486,43 @@ impl From<ReplyCopyFileRange> for fuse_write_out {
             size: copied.copied as u32,
             _padding: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D2.b (SqueezeFS metadata-throughput PR M5): the negative entry
+    /// form must encode exactly as the kernel's negative-dentry contract
+    /// requires — `nodeid` 0 with a valid `entry_valid` timeout
+    /// (fs/fuse/dir.c `fuse_lookup_name`: "Zero nodeid is same as
+    /// -ENOENT, but with valid timeout"). Any nonzero nodeid is a live
+    /// inode reference; any zero timeout downgrades to uncached ENOENT.
+    #[test]
+    fn negative_entry_encodes_nodeid_zero_with_entry_ttl() {
+        let ttl = Duration::new(1, 500_000_000);
+        let entry = ReplyEntry::negative(ttl);
+        assert!(entry.is_negative());
+
+        let out: fuse_entry_out = entry.into();
+        assert_eq!(out.nodeid, 0, "negative entries are nodeid 0 on the wire");
+        assert_eq!(out.generation, 0, "negative entries carry generation 0");
+        assert_eq!(out.entry_valid, 1);
+        assert_eq!(out.entry_valid_nsec, 500_000_000);
+    }
+
+    /// Positive entries keep their nodeid — the negative form must never
+    /// leak into the ordinary conversion.
+    #[test]
+    fn positive_entry_keeps_nodeid() {
+        let mut entry = ReplyEntry::negative(Duration::from_secs(1));
+        entry.attr.ino = 42;
+        entry.generation = 7;
+        assert!(!entry.is_negative());
+
+        let out: fuse_entry_out = entry.into();
+        assert_eq!(out.nodeid, 42);
+        assert_eq!(out.generation, 7);
     }
 }

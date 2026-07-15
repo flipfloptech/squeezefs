@@ -161,6 +161,12 @@ pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
 /// map_alignment field is valid
 pub const FUSE_MAP_ALIGNMENT: u32 = 1 << 26;
 
+/// extended fuse_init_in request (fuse ≥ 7.36): `flags2` at byte offset
+/// 16 carries init flag bits 32..63 (`FUSE_OVER_IO_URING` = bit 41 lives
+/// there). `handle_init` folds it into the published `KernelInit`
+/// capability word.
+pub const FUSE_INIT_EXT: u32 = 1 << 30;
+
 #[cfg(target_os = "macos")]
 pub const FUSE_ALLOCATE: u32 = 1 << 27;
 #[cfg(target_os = "macos")]
@@ -813,8 +819,8 @@ pub struct fuse_access_in {
 #[derive(Debug, Deserialize)]
 #[allow(non_camel_case_types)]
 pub struct fuse_init_in {
-    pub(crate) _major: u32,
-    pub(crate) _minor: u32,
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
     pub max_readahead: u32,
     pub flags: u32,
 }

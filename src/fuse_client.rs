@@ -1426,8 +1426,15 @@ const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 
 /// Kernel ABI (include/uapi/linux/fuse.h, fuse ≥ 7.35 / Linux ≥ 5.16):
 /// open-reply flag telling the kernel to elide the FLUSH request on close
-/// of this handle — D2.a (design-metadata-throughput §5.2, PR M5), the
-/// −1.0 round trip of the create-storm shape.
+/// of this handle — D2.a (design-metadata-throughput §5.2, PR M5).
+///
+/// **Scope, verified against the running kernel's own header and a live
+/// probe (M5 acceptance)**: the kernel honors this bit only WITHOUT
+/// writeback cache ("don't flush data cache on close (unless
+/// FUSE_WRITEBACK_CACHE)") — so it covers `--no-writeback` mounts, while
+/// the default writeback-cache config gets its −1.0 FLUSH round trip from
+/// the **clean-handle ENOSYS latch** in `flush` (`fc->no_flush`, the
+/// standard FUSE optional-op protocol honored by every kernel line).
 ///
 /// Semantics review (the design's §5.2 D2.a argument, pinned by
 /// `tests/write_visibility_tests.rs`):
@@ -1436,14 +1443,15 @@ const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 /// - Close-to-open visibility across *mounts* is moot under the M1
 ///   single-writer guard; within one mount, read-your-writes rides the
 ///   write path's own visibility machinery.
-/// - Handles that dirty after open lose nothing: FLUSH's work was already
-///   a no-op for clean handles (D1.d), and dirty handles keep their
-///   close-time flush via RELEASE's background path + fsync (the kernel
-///   still writes back dirty pages before RELEASE under writeback cache).
+/// - Handles that dirty after open lose nothing: the kernel still writes
+///   back dirty pages at close (`fuse_flush` runs `write_inode_now` and
+///   reports filemap errors BEFORE its no_flush/NOFLUSH cuts), and dirty
+///   handles keep their close-time daemon flush via RELEASE's background
+///   path + fsync.
 ///
 /// Older kernels ignore unknown open flags, so advertising is always safe
 /// (the FOPEN_PARALLEL_DIRECT_WRITES precedent); the INIT probe in `init`
-/// logs whether the running kernel is NOFLUSH-capable (fuse ≥ 7.35).
+/// logs the kernel's capability split.
 const FOPEN_NOFLUSH: u32 = 1 << 5;
 
 /// Open/create reply flags for REGULAR files (the virtual .stats/.config
@@ -4591,15 +4599,16 @@ impl Filesystem for SqueezefsFilesystem {
             };
             info!(
                 "FUSE kernel protocol {}.{} (init flags {:#x}): FOPEN_NOFLUSH {} \
-                 (clean-close FLUSH elision, D2.a); {}",
+                 (D2.a; under writeback cache the elision switch is the clean-FLUSH \
+                 ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); {}",
                 ki.major,
                 ki.minor,
                 ki.flags,
                 if noflush_capable {
-                    "honored (kernel ≥ 7.35)"
+                    "advertised + honored on non-writeback opens (kernel ≥ 7.35)"
                 } else {
-                    "IGNORED by this kernel (< 7.35) — clean closes still send FLUSH; \
-                     the D1.d fast path absorbs them"
+                    "IGNORED by this kernel (< 7.35) — the D1.d fast path + ENOSYS \
+                     latch still apply"
                 },
                 atomic_open_msg
             );
@@ -4608,7 +4617,7 @@ impl Filesystem for SqueezefsFilesystem {
                 ki.major,
                 ki.minor,
                 if noflush_capable {
-                    "honored"
+                    "advertised (wb-cache elision = clean-FLUSH ENOSYS latch)"
                 } else {
                     "ignored (<7.35)"
                 },
@@ -6941,17 +6950,28 @@ impl Filesystem for SqueezefsFilesystem {
 
         let prof = OpProf::begin(FuseOpKind::Flush, ino);
 
-        // D1.d (§5.1, PR M5): a never-dirtied open generation has nothing
-        // to flush — skip the lease acquire (a DLM map hit + possible
-        // acquire) and the memory-buffer scan entirely. On kernels that
-        // honor FOPEN_NOFLUSH (D2.a) this request usually never arrives;
-        // when it does (older kernels, kernel-internal callers), it is
-        // ~free. The prof still drops → the rig's op count stays exact.
+        // D1.d + D2.a (§5.1/§5.2, PR M5): a never-dirtied open generation
+        // has nothing to flush — skip the lease acquire (a DLM map hit +
+        // possible acquire) and the memory-buffer scan entirely, and reply
+        // **ENOSYS**: under writeback cache (this daemon's default) the
+        // kernel ignores FOPEN_NOFLUSH (uapi fuse.h: "don't flush data
+        // cache on close (unless FUSE_WRITEBACK_CACHE)" — verified against
+        // the running 7.1.3 kernel's own header and a live probe), and its
+        // honored elision switch is the ENOSYS latch (`fc->no_flush`):
+        // every later close skips the FLUSH round trip connection-wide
+        // while dirty-page writeback + error reporting at close are
+        // untouched (fuse_flush runs write_inode_now / fuse_sync_writes /
+        // filemap_check_errors BEFORE the no_flush check, and converts
+        // this ENOSYS itself to success — close(2) never sees it).
+        // Dirty handles lose nothing: their FLUSH work was soft (fsync is
+        // the durable barrier) and their close-time daemon flush rides
+        // RELEASE's background path. The prof still drops → the rig's op
+        // count stays exact.
         if !self.handle_dirty(ino) {
             METRICS
                 .fuse_flush_clean_fastpath
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return Err(Errno::from(libc::ENOSYS));
         }
 
         prof.mark_backend_start();

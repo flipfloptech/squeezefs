@@ -643,6 +643,23 @@ async fn flush(h: &H, ino: u64) {
     h.fs.flush(h.req, ino, ino, 0).await.unwrap();
 }
 
+/// D2.a under writeback cache (kernel-verified on 7.1.3: uapi fuse.h —
+/// "FOPEN_NOFLUSH: don't flush data cache on close (unless
+/// FUSE_WRITEBACK_CACHE)", and the smoke probe measured FLUSH still
+/// arriving 1/close with the bit advertised): the kernel's honored
+/// elision switch under wb-cache is the ENOSYS reply, which latches
+/// `fc->no_flush` — the kernel keeps flushing dirty pages at close
+/// (`write_inode_now` runs BEFORE the latch check) but stops sending the
+/// FLUSH round trip. A CLEAN handle's flush must therefore reply ENOSYS
+/// (and count the fast path).
+async fn flush_clean(h: &H, ino: u64) {
+    let err =
+        h.fs.flush(h.req, ino, ino, 0)
+            .await
+            .expect_err("clean-handle FLUSH must reply ENOSYS (latches kernel no_flush)");
+    assert_eq!(libc::c_int::from(err), -libc::ENOSYS);
+}
+
 async fn release(h: &H, ino: u64) {
     h.fs.release(h.req, ino, ino, 0, 0, false).await.unwrap();
 }
@@ -661,7 +678,7 @@ async fn clean_handle_flush_release_take_fast_path() {
     let ino = create(&h, "clean_fast").await;
 
     let f0 = flush_fast_count();
-    flush(&h, ino).await;
+    flush_clean(&h, ino).await;
     assert_eq!(
         flush_fast_count() - f0,
         1,
@@ -684,7 +701,7 @@ async fn clean_handle_flush_release_take_fast_path() {
     open(&h, ino).await;
     let f1 = flush_fast_count();
     let r1 = release_fast_count();
-    flush(&h, ino).await;
+    flush_clean(&h, ino).await;
     release(&h, ino).await;
     assert_eq!(flush_fast_count() - f1, 1, "read-only reopen stays clean");
     assert_eq!(release_fast_count() - r1, 1, "read-only reopen stays clean");
@@ -781,7 +798,7 @@ async fn reopen_after_dirty_close_is_clean_again() {
     open(&h, ino).await; // open count 0 -> 1 resets the dirty bit
     let f0 = flush_fast_count();
     let r0 = release_fast_count();
-    flush(&h, ino).await;
+    flush_clean(&h, ino).await;
     release(&h, ino).await;
     assert_eq!(
         flush_fast_count() - f0,

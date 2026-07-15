@@ -30,6 +30,11 @@
 //!    re-acquire storm racing the writeback worker) must CONVERGE once the
 //!    churn quiesces: staged active blocks drain, newest bytes durable and
 //!    readable, teardown summary clean.
+//! 5. A unit whose inode was unlinked + reclaimed after staging is
+//!    superseded by the delete: verify-then-discard the orphan staged
+//!    entry (the recovery contract's "missing inode meta discards orphan
+//!    active blocks", applied live) — never a NotFound retry storm, never
+//!    a resurrected dead inode.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -37,6 +42,7 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
+use squeezefs::meta_backend::Metadata;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
@@ -420,6 +426,111 @@ async fn teardown_force_flush_drains_stale_token_entries_bounded() {
         read_range(&h, ino, BLOCK_SIZE, 2048).await,
         payload,
         "teardown flush corrupted block 1"
+    );
+}
+
+/// Contract 5 (the NotFound face of the same ladder break — surfaced by the
+/// churn-amplified 013 rig: `Io(NotFound "Inode N not found")` cycling
+/// attempts 0→3 forever, 48 spins for one ino until process exit): a unit
+/// whose inode was unlinked + reclaimed after staging is SUPERSEDED BY THE
+/// DELETE. Its merge fails NotFound on every retry (the inode record is
+/// gone; v3 inos are never reused), so the unit must verify the inode is
+/// truly absent and DISCARD the orphan staged entry ("missing inode meta
+/// discards orphan active blocks" — the recovery contract, applied live)
+/// instead of spinning forever.
+///
+/// The leak shape that strands the entry past delete_file's own sweep is
+/// the incident's: the RAM meta entry is gone (evicted / invalidated), the
+/// backend layout was never persisted (deferred), so the sweep derives
+/// size 0 and misses the staged block's index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaimed_inode_unit_discards_orphan_staging_no_spin() {
+    let _serial = serial().await;
+    let h = make("m11a_reclaimed").await;
+    let ino = create(&h, "reclaimed.bin").await;
+
+    write_at(&h, ino, 0, &vec![0x11u8; 4097]).await;
+    // Stage a block PAST the persisted size (block 5; the persisted layout
+    // covers 4097 bytes = blocks 0..=1): its size extension lives only in
+    // the RAM dirty entry (deferred persist).
+    write_at(&h, ino, 5 * BLOCK_SIZE, &vec![0xDDu8; 2048]).await;
+    let token = h.dlm.get_fencing_token_ino(ino);
+    h.fs.flush_memory_buffers_for_inode(ino, token)
+        .await
+        .expect("stage block 5");
+    let key = squeezefs::keys::active_block(ino, 5).to_string();
+    assert!(
+        h.nvme.get_staged_fencing_token(&key).is_some(),
+        "harness: block 5 must be staged"
+    );
+
+    // The incident's sweep-miss shape: the RAM meta entry (the only holder
+    // of the extended size) is evicted, so delete_file derives the block
+    // sweep from the persisted 4097-byte layout and misses block 5.
+    h.fs.router.metadata_cache.invalidate(&ino);
+
+    // Close + unlink + reclaim (the fsstress open/write/close/unlink
+    // grammar): the inode record is destroyed (monotonic inos — never
+    // reused); the staged entry for block 1 survives the sweep.
+    h.fs.release(h.req, ino, 0, 0, 0, false)
+        .await
+        .expect("release");
+    h.fs.unlink(h.req, 1, OsStr::new("reclaimed.bin"))
+        .await
+        .expect("unlink");
+    h.fs.reclaim_orphaned_batch(vec![ino]).await;
+    let attr_post_reclaim =
+        h.fs.meta_backend
+            .as_ref()
+            .expect("meta backend")
+            .getattr(ino)
+            .await;
+    assert!(
+        attr_post_reclaim.is_err(),
+        "harness: reclaim must have destroyed the inode record: \
+         {attr_post_reclaim:?}"
+    );
+    assert!(
+        h.nvme.get_staged_fencing_token(&key).is_some(),
+        "harness: the leaked orphan staged entry is the repro precondition \
+         (delete_file's sweep must have missed block 5)"
+    );
+
+    // Worker on: the unit must resolve by discarding the orphan — never
+    // spin NotFound forever, never resurrect metadata for a dead inode.
+    h.fs.init(h.req).await.expect("fuse init");
+    let nvme = h.nvme.clone();
+    let key_probe = key.clone();
+    let discarded = wait_until(
+        move || nvme.get_staged_fencing_token(&key_probe).is_none(),
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        discarded,
+        "FIND-M11-A (NotFound face): orphan staged {key} for reclaimed ino \
+         {ino} still present after 15 s — the writeback unit is cycling \
+         Io(NotFound) through the retry ladder instead of discarding \
+         superseded-by-delete custody"
+    );
+    assert_eq!(
+        h.nvme
+            .staged_writes_in_flight
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "orphan discard must drain staged_writes_in_flight (bounded \
+         teardown)"
+    );
+    // The dead inode must NOT have been resurrected by the flush.
+    let attr =
+        h.fs.meta_backend
+            .as_ref()
+            .expect("meta backend")
+            .getattr(ino)
+            .await;
+    assert!(
+        attr.is_err(),
+        "flushing a reclaimed inode's orphan block resurrected it: {attr:?}"
     );
 }
 

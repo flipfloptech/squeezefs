@@ -441,7 +441,7 @@ Single-copy variant of the old flow: prefetch writes the tier, foreground reads 
 
 ### E. FUSE_LSEEK-style kernel readahead tuning / raising `max_read` beyond 1 MiB
 
-**Rejected**: H2 was falsified for reads (one round trip per 1 MiB, shared inode lock, never kernel-serialized); O_DIRECT ignores readahead entirely; `max_read`/`max_pages` beyond 1 MiB trades payload-buffer memory (per uring ent) for round trips the pipeline already hides. The +29 % H5 queue-depth observation stays operator guidance (`SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=16`), not a default (8× payload memory per queue).
+**Rejected**: H2 was falsified for reads (one round trip per 1 MiB, shared inode lock, never kernel-serialized); O_DIRECT ignores readahead entirely; `max_read`/`max_pages` beyond 1 MiB trades payload-buffer memory (per uring ent) for round trips the pipeline already hides. The +29 % H5 queue-depth observation stays operator guidance (`SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH=16`), not a default (8× payload memory per queue). *(Superseded 2026-07-15 by IOPS-parity lever L1: budget-degraded depth-32 + INIT `max_background` scaling are now the defaults, with the payload-memory concern answered by the `min(mem_budget/8, 2 GiB)` sizing policy — `.benchmarks/2026-07-15-l1-transport-concurrency.md`.)*
 
 ### F. Fix rand-4k by shrinking the stripe block size
 

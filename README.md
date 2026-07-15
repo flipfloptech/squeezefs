@@ -231,6 +231,14 @@ Defaults are the measured sweet spot — override only with a live-counter reaso
 - `SQUEEZEFS_READ_RANGED_THRESHOLD` (default `262144`, `0` disables): reads at or under this size on passthrough (uncompressed/unencrypted) volumes fetch only their 4 KiB-aligned device window instead of the whole block — the rand-4k amplification kill (≈1000× → ~1.0×). Compressed/encrypted volumes always fetch whole blocks (decode requirement).
 - `--mem-budget <size>` (mount flag) / `SQUEEZEFS_MEM_BUDGET_MB`: the daemon's joint memory budget. Unset, the budget follows cgroup v2 `memory.max` × 0.8 (re-read every second — a runtime-lowered cage tightens the budget live), else 70 % of RAM. Under pressure the daemon sheds (early flushes, cache clamps, prefetch pause) instead of OOMing; watch `mem_budget_level`/`mem_budget_red_events` in `.stats`.
 
+### FUSE transport in-flight concurrency (defaults are the L1 policy; knobs are overrides)
+
+Random-4k iodepth workloads are gated by two multiplicative kernel-side limits: the FUSE-over-io_uring per-queue ring depth and the INIT-negotiated `max_background`. Opening both measured **44k → 316k IOPS (7.2×, device-true)** on `elbencho --rand -t 16 -b 4k --iodepth 16 --direct` (`.benchmarks/2026-07-15-iops-parity-decomposition.md`); since L1 that class is the **default** — no knobs required:
+
+- **Per-queue depth** (`SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH`, clamp 1..32): default is **32 degraded to the payload-buffer cap** `min(mem-budget/8, 2 GiB)` with floor 4 (the pre-L1 posture — small-RAM boxes keep yesterday's footprint). An explicit value wins verbatim over the cap. Payload arenas cost `queues × depth × ~1 MiB` of registered anon memory — gauged as `transport_payload_buffer_bytes` in `.stats` and attributed to the memory budget as the `transport_payload_buffers` component.
+- **Queues** (`SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES`, testing only): pinned to kernel **possible CPUs** — registering fewer never becomes ready (kernel readiness requirement).
+- **`-o max_background=N` / `-o congestion_threshold=N`**: INIT-reply overrides; defaults `clamp(queues × depth, 64, 256)` and ¾ of it. Also runtime-writable per live connection via fusectl: `echo 256 | sudo tee /sys/fs/fuse/connections/<minor>/max_background`.
+
 ### FUSE io_uring SQPOLL (mount env; measured — leave unset)
 
 - `SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS` (default unset = **off**): opts every FUSE-side io_uring into kernel submission-queue polling with the given idle timeout — the classical `/dev/fuse` INIT/notify/sideband rings (one poller each) **and** the FUSE-over-io_uring queue rings, which share **one** poller for all queues (qid 0 creates it, the rest attach via `IORING_SETUP_ATTACH_WQ`; a kernel that declines SQPOLL degrades loudly to plain rings, never failing the mount).

@@ -29,10 +29,11 @@ If over-uring or block uring misbehaves: **debug and fix uring** — never reint
 | `SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS` | Enable SQPOLL with idle timeout (ms) |
 | `SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU` | Pin SQPOLL kernel thread |
 | `SQUEEZEFS_FUSE_IO_URING_ENTRIES` | SQ depth for classical FUSE rings (INIT/notify) |
-| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | Entries per FUSE-over-io_uring queue (default 4) |
-| `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` | Number of queues (default `min(nproc, 8)`, max 32) |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` | Entries per FUSE-over-io_uring queue — explicit value wins verbatim (clamp 1..32). **Default = L1 policy** (2026-07-15 IOPS-parity): desired **32**, degraded to fit the payload-buffer cap `min(mem_budget/8, 2 GiB)`, floor 4 (= pre-L1 posture) |
+| `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` | Number of queues (**testing only**; default = kernel **possible CPUs**, clamp 1..512 — fewer than possible CPUs never becomes ready) |
+| `-o max_background=N` / `-o congestion_threshold=N` | Mount-level INIT-reply overrides. Defaults: `clamp(queues × depth, 64, 256)` and ¾ of it (pre-L1 the INIT reply hardcoded 12/9 — one of the two multiplicative in-flight gates; runtime-writable per connection via fusectl) |
 
-Mount always enables FUSE-over-io_uring after INIT (required). Expects: "FUSE-over-io_uring ready..." and "transport enabled for this session".
+Mount always enables FUSE-over-io_uring after INIT (required). Expects: "FUSE-over-io_uring ready..." and "transport enabled for this session". Transport geometry + INIT limits are gauged on the stats inode (`transport_{queues,q_depth,payload_buffer_bytes,max_background}`), and the payload arenas ride the R5 memory budget as the non-sheddable `transport_payload_buffers` component. Evidence: `.benchmarks/2026-07-15-iops-parity-decomposition.md` (44k → 316k measured) + `.benchmarks/2026-07-15-l1-transport-concurrency.md` (defaults acceptance).
 
 **io_uring coverage**
 

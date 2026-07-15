@@ -182,7 +182,9 @@ sudo ./target/release/squeezefs tune
 ```
 - **`vm.dirty_ratio = 40`** & **`vm.dirty_background_ratio = 10`**: Aggressively buffers writes in memory before flushing.
 - **`net.core.rmem_max`** & **`net.core.wmem_max` to `67108864` (64MB)**: Expands TCP socket buffers for massive parallel streams.
-- **FUSE Connection Limits**: Increases `max_background` to `64` and `congestion_threshold` to `48` to prevent FUSE queue starvation.
+- **FUSE Connection Limits**: Raises live connections to the L1 policy ceiling — `max_background = 256` and `congestion_threshold = 192` (mounts negotiate these at INIT by default since the IOPS-parity program; `tune` only matters for connections mounted by older binaries, and never lowers a new mount).
+
+> **Runtime trick**: `max_background`/`congestion_threshold` are writable per live FUSE connection without a remount — `echo 256 | sudo tee /sys/fs/fuse/connections/<minor>/max_background` (find `<minor>` via `stat -c %d <mountpoint>` minor number). The IOPS-parity investigation used exactly this to prove `max_background` gates FUSE-over-io_uring traffic too.
 
 ---
 

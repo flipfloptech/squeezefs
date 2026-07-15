@@ -446,32 +446,59 @@ impl SubmitBatch {
     }
 }
 
-/// Push one FUSE uring cmd SQE with batch accounting.
-///
-/// RED-STAGE STAND-IN (PR M3): this currently reproduces the queue worker's
-/// per-message shape — push + immediate `ring.submit()` — so the batching
-/// contract tests fail against it. The S2 restructure replaces the body
-/// with push-only (deferred single flush) + SQ-full submit-and-continue.
+/// Push one FUSE uring cmd SQE with batch accounting — **no submit**. The
+/// syscall is shared: the loop-bottom `submit_and_wait(1)` (or an explicit
+/// [`flush_submit`]) carries every SQE pushed since the last flush (§5.3
+/// D3.a). SQ-full is absorbed by submit-and-continue: flush the queued
+/// SQEs (which records the partial commit batch) and retry the push once —
+/// only a push that fails right after a successful flush is a real error.
 fn push_cmd_batched(
     ring: &mut Ring,
-    _batch: &mut SubmitBatch,
+    batch: &mut SubmitBatch,
     cmd_op: u32,
     qid: u16,
     commit_id: u64,
     iov: Option<(*const libc::iovec, u32)>,
     user_data: u64,
 ) -> io::Result<()> {
-    push_cmd(ring, cmd_op, qid, commit_id, iov, user_data)?;
-    ring.submit()?;
+    if push_cmd(ring, cmd_op, qid, commit_id, iov, user_data).is_err() {
+        // `push` only fails on a full SQ (§5.3 D3.a SQ-full rule).
+        flush_submit(ring, batch)?;
+        push_cmd(ring, cmd_op, qid, commit_id, iov, user_data)?;
+    }
+    batch.pending += 1;
+    if cmd_op == FUSE_IO_URING_CMD_COMMIT_AND_FETCH {
+        batch.commits += 1;
+    }
+    Ok(())
+}
+
+/// Re-arm the wake-fd PollAdd (`user_data = u64::MAX`) with the same batch
+/// accounting and SQ-full handling as [`push_cmd_batched`]; submitted by
+/// the next flush. Lost-wake-safe by level-triggered eventfd semantics: a
+/// signal raised before the (deferred) submit completes the poll the
+/// moment it is armed.
+fn push_poll_batched(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<()> {
+    let entry = Entry128::from(
+        opcode::PollAdd::new(types::Fixed(1), libc::POLLIN as _)
+            .build()
+            .user_data(u64::MAX),
+    );
+    // SAFETY: a PollAdd SQE references no user memory.
+    if unsafe { ring.submission().push(&entry) }.is_err() {
+        flush_submit(ring, batch)?;
+        // SAFETY: as above.
+        unsafe { ring.submission().push(&entry) }
+            .map_err(|_| io::Error::other("sq full (poll)"))?;
+    }
+    batch.pending += 1;
     Ok(())
 }
 
 /// Flush every pushed-but-unsubmitted SQE with ONE `ring.submit()`,
 /// recording the commit batch it carries. Returns the submitted count.
-///
-/// RED-STAGE STAND-IN (PR M3): submits without recording — the batching
-/// accounting lands with the S2 restructure.
-fn flush_submit(ring: &mut Ring, _batch: &mut SubmitBatch) -> io::Result<usize> {
+fn flush_submit(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<usize> {
+    batch.note_flush();
     ring.submit()
 }
 // §5.4 transport payload-lease observability (SqueezeFS stats inode).
@@ -1064,44 +1091,26 @@ fn queue_worker(
         .map_err(|e| io::Error::other(format!("submit REGISTER batch: {e}")))?;
     pool.queues_registered.fetch_add(1, Ordering::AcqRel);
 
+    // §5.3 D3.a (S2) submit economy: the passes below PUSH their SQEs
+    // (commits, poll re-arms, re-REGISTERs) through the batched helpers and
+    // share ONE syscall — the loop-bottom `submit_and_wait(1)` flushes the
+    // batch on its way into the wait (one `io_uring_enter` = submission +
+    // wait). Only the syscall is shared: the §5.4 lease re-arm gate still
+    // runs per ent *before* its SQE is pushed.
+    let mut batch = SubmitBatch::default();
+
     while pool.active.load(Ordering::Relaxed) {
-        // Drain commits for this queue only (no demux). §5.4 re-arm gate: a
-        // COMMIT_AND_FETCH both writes the reply into the ent payload and
-        // re-arms the registered buffers for the kernel — never legal while
-        // a payload lease is live. Gate every commit; park the message when
-        // leased and rely on the lease drop's eventfd wake.
-        while let Ok(msg) = commit_rx.try_recv() {
-            let idx = msg.ent_idx as usize;
-            if idx >= ents.len() {
-                warn!("fuse-over-uring qid={qid}: commit for bad ent {idx}");
-                continue;
-            }
-            match lease_states[idx].try_commit() {
-                CommitGate::Ready => {
-                    xport_dbg!("[XPORT] commit qid={qid} ent={idx} cid={}", msg.commit_id);
-                    apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
-                    push_cmd(
-                        &mut ring,
-                        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
-                        qid,
-                        msg.commit_id,
-                        None,
-                        idx as u64,
-                    )?;
-                    ring.submit()?;
-                }
-                CommitGate::Parked => {
-                    xport_dbg!("[XPORT] commit-parked qid={qid} ent={idx} cid={}", msg.commit_id);
-                    debug_assert!(
-                        parked_msgs[idx].is_none(),
-                        "two commits parked for one ring ent"
-                    );
-                    TRANSPORT_PARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
-                    parked_msgs[idx] = Some(msg);
-                }
-            }
-        }
-        // Drain eventfd
+        // Drain the eventfd FIRST. The wake-fd PollAdd re-arm is deferred to
+        // the loop-bottom submit_and_wait (S2), so during the passes below
+        // the poll may be unarmed — consuming a wake AFTER scanning its
+        // producer would strand that producer until an unrelated event (a
+        // stuck FUSE reply). Order closes it: every wake producer publishes
+        // its state BEFORE writing the eventfd (submit_reply: channel send →
+        // write; lease drop: refs release → write; shutdown: active store →
+        // write), so a wake consumed here means the state is already visible
+        // to the drains below — and any wake arriving AFTER this drain
+        // leaves the counter nonzero, which completes the (level-triggered)
+        // PollAdd the moment submit_and_wait arms it.
         let mut buf = [0u8; 8];
         loop {
             let n = unsafe { libc::read(wake_fd, buf.as_mut_ptr().cast(), 8) };
@@ -1120,6 +1129,43 @@ fn queue_worker(
             }
         }
 
+        // Drain commits for this queue only (no demux). §5.4 re-arm gate: a
+        // COMMIT_AND_FETCH both writes the reply into the ent payload and
+        // re-arms the registered buffers for the kernel — never legal while
+        // a payload lease is live. Gate every commit; park the message when
+        // leased and rely on the lease drop's eventfd wake.
+        while let Ok(msg) = commit_rx.try_recv() {
+            let idx = msg.ent_idx as usize;
+            if idx >= ents.len() {
+                warn!("fuse-over-uring qid={qid}: commit for bad ent {idx}");
+                continue;
+            }
+            match lease_states[idx].try_commit() {
+                CommitGate::Ready => {
+                    xport_dbg!("[XPORT] commit qid={qid} ent={idx} cid={}", msg.commit_id);
+                    apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
+                    push_cmd_batched(
+                        &mut ring,
+                        &mut batch,
+                        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                        qid,
+                        msg.commit_id,
+                        None,
+                        idx as u64,
+                    )?;
+                }
+                CommitGate::Parked => {
+                    xport_dbg!("[XPORT] commit-parked qid={qid} ent={idx} cid={}", msg.commit_id);
+                    debug_assert!(
+                        parked_msgs[idx].is_none(),
+                        "two commits parked for one ring ent"
+                    );
+                    TRANSPORT_PARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
+                    parked_msgs[idx] = Some(msg);
+                }
+            }
+        }
+
         // Parked scan (runs on every wake path — lease-drop eventfd, new
         // CQEs, commit sends — and always before the worker can sleep in
         // submit_and_wait): un-park and commit every ent whose lease is
@@ -1130,15 +1176,15 @@ fn queue_worker(
                 let msg = parked_msgs[idx].take().expect("checked is_some");
                 xport_dbg!("[XPORT] commit-unparked qid={qid} ent={idx} cid={}", msg.commit_id);
                 apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
-                push_cmd(
+                push_cmd_batched(
                     &mut ring,
+                    &mut batch,
                     FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
                     qid,
                     msg.commit_id,
                     None,
                     idx as u64,
                 )?;
-                ring.submit()?;
             }
         }
 
@@ -1147,6 +1193,9 @@ fn queue_worker(
             break;
         }
 
+        // ONE syscall for everything pushed above: submit_and_wait both
+        // flushes the batch (recorded here) and parks for the next event.
+        batch.note_flush();
         match ring.submit_and_wait(1) {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
@@ -1245,15 +1294,15 @@ fn queue_worker(
                     out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
                     out[8..16].copy_from_slice(&cid.to_le_bytes());
                     apply_reply(&mut ents[ent_idx], &out, &Bytes::new());
-                    let _ = push_cmd(
+                    let _ = push_cmd_batched(
                         &mut ring,
+                        &mut batch,
                         FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
                         qid,
                         cid,
                         None,
                         ent_idx as u64,
                     );
-                    let _ = ring.submit();
                 } else {
                     warn!(
                         "fuse-over-uring qid={qid} ent={ent_idx}: unique=0 commit_id=0; re-REGISTER"
@@ -1322,22 +1371,23 @@ fn queue_worker(
                 });
                 // FORGET payloads are copies (never leased) and this ent's
                 // previous commit passed the refs == 0 gate: the immediate
-                // auto-commit below cannot alias a live lease.
+                // auto-commit below cannot alias a live lease. Its SQE rides
+                // the shared loop-bottom flush like every other commit.
                 debug_assert!(!lease_states[ent_idx].leased());
                 let mut out = [0u8; 16];
                 out[0..4].copy_from_slice(&16u32.to_le_bytes());
                 // error = 0
                 out[8..16].copy_from_slice(&unique.to_le_bytes());
                 apply_reply(&mut ents[ent_idx], &out, &Bytes::new());
-                push_cmd(
+                push_cmd_batched(
                     &mut ring,
+                    &mut batch,
                     FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
                     qid,
                     commit_id,
                     None,
                     ent_idx as u64,
                 )?;
-                ring.submit()?;
                 pool.stats_replies.fetch_add(1, Ordering::Relaxed);
                 STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -1366,26 +1416,22 @@ fn queue_worker(
             break;
         }
         if need_repoll {
-            let poll_e = opcode::PollAdd::new(types::Fixed(1), libc::POLLIN as _)
-                .build()
-                .user_data(u64::MAX);
-            let _ = unsafe { ring.submission().push(&Entry128::from(poll_e)) };
-            let _ = ring.submit();
+            let _ = push_poll_batched(&mut ring, &mut batch);
         }
         // Never re-REGISTER after a disconnect; only while still active.
         if !resubmit.is_empty() && pool.active.load(Ordering::Relaxed) {
             for ent_idx in resubmit {
-                let ent = &ents[ent_idx];
-                let _ = push_cmd(
+                let iov_ptr = ents[ent_idx].iov.as_ptr();
+                let _ = push_cmd_batched(
                     &mut ring,
+                    &mut batch,
                     FUSE_IO_URING_CMD_REGISTER,
                     qid,
                     0,
-                    Some((ent.iov.as_ptr(), 2)),
+                    Some((iov_ptr, 2)),
                     ent_idx as u64,
                 );
             }
-            let _ = ring.submit();
         }
     }
     // Final drain of parked messages plus any pending commits (including the
@@ -1440,8 +1486,9 @@ fn queue_worker(
             // the reply has no body beyond the 16-byte fuse_out_header.
             apply_reply(&mut ents[idx], &out, &Bytes::new());
         }
-        let _ = push_cmd(
+        let _ = push_cmd_batched(
             &mut ring,
+            &mut batch,
             FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
             qid,
             msg.commit_id,
@@ -1450,8 +1497,17 @@ fn queue_worker(
         );
         final_commits += 1;
     }
+    // A loop exit between the drain passes and the loop-bottom
+    // submit_and_wait leaves applied replies pushed but unsubmitted; flush
+    // them together with the final commits — teardown must not drop a reply
+    // that was already applied to its ent.
+    batch.note_flush();
     if final_commits > 0 {
         let _ = ring.submit_and_wait(final_commits);
+    } else {
+        // No final commits: still flush anything a truncated last pass (or
+        // an EINTR'd submit) left in the SQ — a no-op enter when none.
+        let _ = ring.submit();
     }
     debug!("fuse-over-uring qid={qid} worker exit");
     Ok(())

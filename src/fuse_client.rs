@@ -2086,6 +2086,27 @@ impl SqueezefsFilesystem {
         let t_classical_sideband = fuse3::over_uring_classical_sideband();
         #[cfg(not(target_os = "linux"))]
         let t_classical_sideband = 0u64;
+        // D3.a (design-metadata-throughput §5.3/§9): COMMIT_AND_FETCH SQEs
+        // per queue-worker ring flush. Mean batch (commits / flushes) ≈ 1
+        // under storm load means the S2 submit batching regressed to
+        // per-message syscalls. Buckets export zero-valued pre-session so
+        // operators can always key on the field.
+        #[cfg(target_os = "linux")]
+        let (t_cb_flushes, t_cb_commits, t_cb_hist) = {
+            let (flushes, commits, buckets) = fuse3::over_uring_commit_batch_stats();
+            let hist: serde_json::Map<String, serde_json::Value> = fuse3::COMMIT_BATCH_LABELS
+                .iter()
+                .zip(buckets)
+                .map(|(label, count)| ((*label).to_string(), serde_json::Value::from(count)))
+                .collect();
+            (flushes, commits, hist)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (t_cb_flushes, t_cb_commits, t_cb_hist) = (
+            0u64,
+            0u64,
+            serde_json::Map::<String, serde_json::Value>::new(),
+        );
 
         // PR K7 (design §10): the `meta_kv_*` family is emitted only when
         // a metadata volume is mounted (v3 is the only metadata format).
@@ -2213,6 +2234,9 @@ impl SqueezefsFilesystem {
                 "transport_leases_outstanding": t_outstanding,
                 "transport_lease_max_age_ms": t_max_age,
                 "transport_classical_sideband": t_classical_sideband,
+                "transport_commit_batch": serde_json::Value::Object(t_cb_hist),
+                "transport_commit_batch_flushes": t_cb_flushes,
+                "transport_commit_batch_commits": t_cb_commits,
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),

@@ -208,3 +208,85 @@ async fn stats_snapshot_getattr_size_matches_served_bytes_under_churn() {
             .expect("release .stats");
     }
 }
+
+/// D3.a (PR M3, design-metadata-throughput §9): the `transport_commit_batch`
+/// histogram — COMMIT_AND_FETCH SQEs per queue-worker ring flush — is wired
+/// to the `.stats` JSON with the labeled-bucket convention
+/// (`meta_commit_group_size` precedent: exact 1–8, then power-of-two), plus
+/// the flush/commit totals whose ratio is the mean batch size. The buckets
+/// must be PRESENT (zero-valued) even before any over-uring session exists —
+/// operators key on the field, and "≈ 1 under load ⇒ batching regressed" is
+/// only checkable when the surface always exports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transport_commit_batch_stats_surface() {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::dlm::DlmClient;
+    use squeezefs::fuse_client::SqueezefsFilesystem;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::DataRouter;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    let dlm = DlmClient::new("local").unwrap();
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), "commit_batch_stats_test")
+            .await
+            .unwrap(),
+    );
+    let s = tempfile::tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+
+    let json: serde_json::Value =
+        serde_json::from_str(&fs.generate_stats_json().await).expect("stats JSON parses");
+    let metrics = json
+        .get("metrics")
+        .and_then(|m| m.as_object())
+        .expect("stats carries a metrics object");
+
+    let hist = metrics
+        .get("transport_commit_batch")
+        .and_then(|h| h.as_object())
+        .expect("metrics.transport_commit_batch histogram object (design §9, D3.a)");
+    for label in [
+        "1", "2", "3", "4", "5", "6", "7", "8", "<=16", "<=32", ">32",
+    ] {
+        assert!(
+            hist.get(label).is_some_and(|v| v.is_u64()),
+            "transport_commit_batch bucket '{label}' must always export \
+             (zero-valued before any session)"
+        );
+    }
+    assert!(
+        metrics
+            .get("transport_commit_batch_flushes")
+            .is_some_and(|v| v.is_u64()),
+        "flush total exports (mean batch size = commits / flushes)"
+    );
+    assert!(
+        metrics
+            .get("transport_commit_batch_commits")
+            .is_some_and(|v| v.is_u64()),
+        "commit total exports (mean batch size = commits / flushes)"
+    );
+}

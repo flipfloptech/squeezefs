@@ -345,6 +345,135 @@ static STATS_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static STATS_REPLIES: AtomicU64 = AtomicU64::new(0);
 static STATS_CQE_ERR: AtomicU64 = AtomicU64::new(0);
 static STATS_REGISTER: AtomicU64 = AtomicU64::new(0);
+// D3.a (S2) transport submit economy (SqueezeFS metadata-throughput design
+// §5.3): COMMIT_AND_FETCH SQEs per ring flush. ≈ 1 under load means the
+// queue-worker batching regressed to submit-per-message.
+static TRANSPORT_COMMIT_BATCH: CommitBatchHistogram = CommitBatchHistogram::new();
+static TRANSPORT_COMMIT_FLUSHES: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_COMMITS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// Bucket labels for [`CommitBatchHistogram`] (stats-JSON keys, exported by
+/// [`over_uring_commit_batch_stats`]). Exact for batch sizes 1–8, then
+/// power-of-two up to the per-queue depth cap (`Q_DEPTH` clamps at 32).
+pub const COMMIT_BATCH_LABELS: [&str; 11] = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "<=16", "<=32", ">32",
+];
+
+/// `transport_commit_batch` histogram (design §9): COMMIT_AND_FETCH SQEs
+/// carried by one `io_uring_enter` flush of a queue worker. Exact buckets
+/// 1–8 so a "≈ 1 under load ⇒ batching regressed" verdict never rides
+/// bucket rounding (the `meta_commit_group_size` convention).
+pub struct CommitBatchHistogram {
+    buckets: [AtomicU64; 11],
+}
+
+impl CommitBatchHistogram {
+    const fn new() -> Self {
+        Self {
+            buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+        }
+    }
+
+    fn bucket_index(n: usize) -> usize {
+        match n {
+            0 => 0, // empty batches are never recorded; clamp defensively
+            1..=8 => n - 1,
+            9..=16 => 8,
+            17..=32 => 9,
+            _ => 10,
+        }
+    }
+
+    /// Record one flush that carried `n ≥ 1` COMMIT_AND_FETCH SQEs.
+    fn record(&self, n: usize) {
+        self.buckets[Self::bucket_index(n)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bucket snapshot in [`COMMIT_BATCH_LABELS`] order.
+    pub fn snapshot(&self) -> [u64; 11] {
+        std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed))
+    }
+}
+
+/// D3.a batch accounting: `(flushes, commits, buckets)` — ring flushes that
+/// carried ≥ 1 COMMIT_AND_FETCH SQE, total COMMIT_AND_FETCH SQEs submitted,
+/// and the per-flush batch-size histogram in [`COMMIT_BATCH_LABELS`] order.
+/// `commits / flushes` is the mean batch size; ≈ 1 under storm load means
+/// the queue-worker submit batching regressed (design §9).
+pub fn over_uring_commit_batch_stats() -> (u64, u64, [u64; 11]) {
+    (
+        TRANSPORT_COMMIT_FLUSHES.load(Ordering::Relaxed),
+        TRANSPORT_COMMITS_SUBMITTED.load(Ordering::Relaxed),
+        TRANSPORT_COMMIT_BATCH.snapshot(),
+    )
+}
+
+/// Per-queue-worker pending-SQE flush accounting (D3.a S2). Every SQE push
+/// in the worker loop routes through [`push_cmd_batched`] /
+/// [`push_poll_batched`]; [`flush_submit`] (or the loop-bottom
+/// `submit_and_wait`) is the single syscall that carries them.
+#[derive(Default)]
+struct SubmitBatch {
+    /// SQEs pushed since the last flush (all opcodes).
+    pending: u32,
+    /// COMMIT_AND_FETCH SQEs among `pending`.
+    commits: u32,
+}
+
+impl SubmitBatch {
+    /// Note that a flush syscall is about to carry the pending SQEs:
+    /// record the commit batch size and reset the counters.
+    fn note_flush(&mut self) {
+        if self.commits > 0 {
+            TRANSPORT_COMMIT_BATCH.record(self.commits as usize);
+            TRANSPORT_COMMIT_FLUSHES.fetch_add(1, Ordering::Relaxed);
+            TRANSPORT_COMMITS_SUBMITTED.fetch_add(self.commits as u64, Ordering::Relaxed);
+        }
+        self.pending = 0;
+        self.commits = 0;
+    }
+}
+
+/// Push one FUSE uring cmd SQE with batch accounting.
+///
+/// RED-STAGE STAND-IN (PR M3): this currently reproduces the queue worker's
+/// per-message shape — push + immediate `ring.submit()` — so the batching
+/// contract tests fail against it. The S2 restructure replaces the body
+/// with push-only (deferred single flush) + SQ-full submit-and-continue.
+fn push_cmd_batched(
+    ring: &mut Ring,
+    _batch: &mut SubmitBatch,
+    cmd_op: u32,
+    qid: u16,
+    commit_id: u64,
+    iov: Option<(*const libc::iovec, u32)>,
+    user_data: u64,
+) -> io::Result<()> {
+    push_cmd(ring, cmd_op, qid, commit_id, iov, user_data)?;
+    ring.submit()?;
+    Ok(())
+}
+
+/// Flush every pushed-but-unsubmitted SQE with ONE `ring.submit()`,
+/// recording the commit batch it carries. Returns the submitted count.
+///
+/// RED-STAGE STAND-IN (PR M3): submits without recording — the batching
+/// accounting lands with the S2 restructure.
+fn flush_submit(ring: &mut Ring, _batch: &mut SubmitBatch) -> io::Result<usize> {
+    ring.submit()
+}
 // §5.4 transport payload-lease observability (SqueezeFS stats inode).
 static TRANSPORT_PAYLOAD_LEASES: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_PARKED_COMMITS: AtomicU64 = AtomicU64::new(0);
@@ -1467,6 +1596,155 @@ mod tests {
         let mut buf = [0u8; 8];
         let r = unsafe { libc::read(efd_owned.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
         assert_eq!(r, 8, "dup'ed wake fd must signal the queue eventfd");
+    }
+
+    /// D3.a batch accounting: exact buckets 1–8, then ≤16 / ≤32 / >32,
+    /// snapshot order matching [`COMMIT_BATCH_LABELS`].
+    #[test]
+    fn test_commit_batch_histogram_buckets() {
+        let h = CommitBatchHistogram::new();
+        h.record(1);
+        h.record(1);
+        h.record(4);
+        h.record(8);
+        h.record(9);
+        h.record(16);
+        h.record(17);
+        h.record(32);
+        h.record(33);
+        h.record(4096);
+        let snap = h.snapshot();
+        assert_eq!(COMMIT_BATCH_LABELS.len(), snap.len());
+        let idx = |l: &str| {
+            COMMIT_BATCH_LABELS
+                .iter()
+                .position(|&x| x == l)
+                .expect("label")
+        };
+        assert_eq!(snap[idx("1")], 2, "two singleton batches");
+        assert_eq!(snap[idx("4")], 1);
+        assert_eq!(snap[idx("8")], 1);
+        assert_eq!(snap[idx("<=16")], 2, "9 and 16 share the ≤16 bucket");
+        assert_eq!(snap[idx("<=32")], 2, "17 and 32 share the ≤32 bucket");
+        assert_eq!(snap[idx(">32")], 2, "33 and 4096 overflow to >32");
+        assert_eq!(snap.iter().sum::<u64>(), 10, "every record lands once");
+    }
+
+    /// Build a worker-shaped SQE128 ring with an eventfd registered at
+    /// Fixed(0) — uring cmds against it complete as error CQEs, which is
+    /// all the submit-accounting tests need (submission itself succeeds).
+    fn batch_test_ring(sq_entries: u32) -> (Ring, OwnedFd) {
+        let ring: Ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
+            .setup_cqsize(64)
+            .build(sq_entries)
+            .expect("SQE128 ring (need IORING_SETUP_SQE128)");
+        let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(efd >= 0);
+        let owned = unsafe { OwnedFd::from_raw_fd(efd) };
+        ring.submitter()
+            .register_files(&[owned.as_raw_fd()])
+            .expect("register eventfd as Fixed(0)");
+        (ring, owned)
+    }
+
+    /// The S2 contract (design-metadata-throughput §5.3 D3.a): a drain pass
+    /// PUSHES its COMMIT_AND_FETCH SQEs — no per-message submit — and ONE
+    /// flush syscall carries the whole batch, recording its size in the
+    /// `transport_commit_batch` histogram.
+    #[test]
+    fn test_commit_pushes_defer_to_one_flush() {
+        let (mut ring, _efd) = batch_test_ring(16);
+        let (fl0, cm0, snap0) = over_uring_commit_batch_stats();
+        let mut batch = SubmitBatch::default();
+        for i in 0..4u64 {
+            push_cmd_batched(
+                &mut ring,
+                &mut batch,
+                FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                0,
+                i + 1,
+                None,
+                i,
+            )
+            .expect("batched push");
+        }
+        assert_eq!(
+            ring.submission().len(),
+            4,
+            "batched pushes must stay queued in the SQ — a drained SQ here \
+             means the worker is still burning one io_uring_enter per commit \
+             message (the 31-syscalls/create shape)"
+        );
+        let submitted = flush_submit(&mut ring, &mut batch).expect("flush");
+        assert_eq!(submitted, 4, "one flush submits the whole batch");
+        assert_eq!(ring.submission().len(), 0, "flush drained the SQ");
+        let (fl1, cm1, snap1) = over_uring_commit_batch_stats();
+        assert_eq!(fl1 - fl0, 1, "one commit-carrying flush recorded");
+        assert_eq!(cm1 - cm0, 4, "four COMMIT_AND_FETCH SQEs recorded");
+        let b4 = COMMIT_BATCH_LABELS.iter().position(|&l| l == "4").unwrap();
+        assert_eq!(
+            snap1[b4] - snap0[b4],
+            1,
+            "the flush lands one sample in the exact '4' bucket"
+        );
+
+        // A flush with no pending commits records nothing (pure waits and
+        // poll re-arms must not dilute the batch histogram).
+        let submitted = flush_submit(&mut ring, &mut batch).expect("empty flush");
+        assert_eq!(submitted, 0);
+        let (fl2, cm2, _) = over_uring_commit_batch_stats();
+        assert_eq!(fl2, fl1, "commit-less flush not recorded");
+        assert_eq!(cm2, cm1);
+    }
+
+    /// SQ-full during a batched push flushes what's queued and continues
+    /// (§5.3 D3.a SQ-full rule: submit-and-continue) — every push succeeds,
+    /// every commit is counted exactly once, and the intermediate flushes
+    /// are recorded as their own (partial) batches.
+    #[test]
+    fn test_batched_push_sq_full_submits_and_continues() {
+        let (mut ring, _efd) = batch_test_ring(4); // deliberately tiny SQ
+        let (fl0, cm0, _) = over_uring_commit_batch_stats();
+        let mut batch = SubmitBatch::default();
+        for i in 0..10u64 {
+            push_cmd_batched(
+                &mut ring,
+                &mut batch,
+                FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                0,
+                i + 1,
+                None,
+                i,
+            )
+            .expect("SQ-full must flush-and-continue, never error");
+        }
+        let tail = flush_submit(&mut ring, &mut batch).expect("final flush");
+        assert!(tail >= 1, "the tail flush carries the remainder");
+        assert_eq!(ring.submission().len(), 0);
+        let (fl1, cm1, _) = over_uring_commit_batch_stats();
+        assert_eq!(
+            cm1 - cm0,
+            10,
+            "all 10 commits submitted and counted exactly once across \
+             intermediate SQ-full flushes + the tail flush"
+        );
+        assert!(
+            fl1 - fl0 >= 3,
+            "10 pushes through a 4-deep SQ need ≥ 3 flushes (got {})",
+            fl1 - fl0
+        );
+
+        // The kernel really consumed them: 10 CQEs arrive (as error
+        // completions — an eventfd has no ->uring_cmd — which is exactly
+        // what the accounting must be indifferent to).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = 0usize;
+        while seen < 10 && Instant::now() < deadline {
+            let mut cq = ring.completion();
+            cq.sync();
+            seen += cq.count();
+        }
+        assert_eq!(seen, 10, "every batched SQE reached the kernel");
     }
 
     /// A dropped payload lease releases its ref, records the outstanding

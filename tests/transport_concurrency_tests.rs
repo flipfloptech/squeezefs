@@ -125,9 +125,10 @@ impl Mount {
                 panic!(
                     "stats inode missing `{name}` — the L1 transport geometry \
                      gauges are not plumbed (metrics keys = {:?})",
-                    stats["metrics"]
-                        .as_object()
-                        .map(|o| o.keys().filter(|k| k.starts_with("transport")).collect::<Vec<_>>())
+                    stats["metrics"].as_object().map(|o| o
+                        .keys()
+                        .filter(|k| k.starts_with("transport"))
+                        .collect::<Vec<_>>())
                 )
             })
             .as_u64()
@@ -183,7 +184,10 @@ impl Mount {
                     .collect::<Vec<_>>()
                     .join("\n")
             );
-            let _ = Command::new("fusermount3").arg("-uz").arg(&self.mnt).status();
+            let _ = Command::new("fusermount3")
+                .arg("-uz")
+                .arg(&self.mnt)
+                .status();
         }
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -201,7 +205,10 @@ impl Mount {
 
 impl Drop for Mount {
     fn drop(&mut self) {
-        let _ = Command::new("fusermount3").arg("-uz").arg(&self.mnt).status();
+        let _ = Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&self.mnt)
+            .status();
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.base);
@@ -394,7 +401,10 @@ fn test_small_budget_mount_degrades_q_depth_gracefully() {
         arena <= cap.max(q * 4 * PAYLOAD_SZ),
         "arena {arena} B exceeds the budget cap {cap} B beyond the depth-4 floor"
     );
-    assert!(depth >= 4, "depth must never degrade below the pre-L1 default");
+    assert!(
+        depth >= 4,
+        "depth must never degrade below the pre-L1 default"
+    );
     assert_eq!(mount.fusectl_u64("max_background"), mb);
     assert_eq!(mount.fusectl_u64("congestion_threshold"), ct);
 

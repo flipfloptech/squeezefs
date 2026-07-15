@@ -173,6 +173,17 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
 
 To get up and running quickly or deploy directly onto physical bare-metal hardware over NVMe-oF, see the [QUICKSTART.md](QUICKSTART.md) guide.
 
+### The vs-JuiceFS scoreboard (release gate)
+
+`tests/run_vs_juicefs.sh` is the standing **"beat-JuiceFS" scoreboard**: a re-runnable, matched-conditions A/B harness that measures SqueezeFS against JuiceFS on the same substrate (both durable stores in one non-tmpfs directory), matched cache budgets (one `SQUEEZEFS_VS_CACHE_MB` knob drives our `--mem-budget` and their `--cache-size`/`--buffer-size`), identical elbencho drivers, across **three regimes** — R1 as-deployed (all cache layers live, dataset 2–4× cache), R2 device-true (their `--cache-size 0` + tight cage, our `-o direct_device_true`, both **verified by counters per row**), R3 cold-cache (full drops, first pass) — × the 6-shape workload grid (seq write/read 1 MiB, rand read/write 4k at `t16 iodepth16 --direct`, stat storm, del storm).
+
+```bash
+tests/run_vs_juicefs.sh                      # full scoreboard (~30–60 min, quiet-gated)
+SQUEEZEFS_VS_SMOKE=1 tests/run_vs_juicefs.sh # 30s-class micro-grid plumbing proof (per-commit tier)
+```
+
+**The gate:** the run emits a win/loss table (+ machine TSV + per-row raw logs, counter snapshots, and diskstats evidence) and **exits nonzero if SqueezeFS loses any row** (loss = < 0.95× JuiceFS; INVALID/unverified rows count as losses). `SQUEEZEFS_VS_ALLOW_LOSS="R1.foo,..."` exempts named rows for known-loss tracking — every allowed loss must have an attribution + follow-up in the current `.benchmarks` scoreboard report. Cadence: **per-release** (with the acceptance suites) and after any perf-relevant landing; the inaugural baseline is `.benchmarks/2026-07-15-vs-juicefs-scoreboard.md`.
+
 ### `df` / statfs semantics
 
 A mounted SqueezeFS reports honest, cheap numbers to `statfs(2)` (`df`): **total** is the formatted capacity — the summed data-backend size, or the lower explicit `--capacity` quota chosen at format (the effective limit you experience); **used/free** track the bytes currently allocated on the striped block backends, maintained by the block allocators at alloc/free time (no metadata transactions or device I/O on the statfs path). Tiny inline payloads live in the metadata volume and staged-but-unpromoted small writes in the local NVMe staging dirs, so those transient bytes appear in `df` as their blocks promote via writeback rather than instantaneously; deletes return space after background reclaim completes. Inode columns (`df -i`) report the format inode quota against the v3 monotonic, no-reuse inode watermark — `IFree` is remaining create headroom, and deleting files does not raise it.

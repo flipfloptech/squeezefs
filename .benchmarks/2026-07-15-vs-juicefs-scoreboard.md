@@ -143,6 +143,25 @@ acked-create-loss evidence (drain-then-detach ordering + the mmap-region
 teardown class). These two rows are NOT allow-listed: they must go green when
 the SIGBUS charter lands — that is the gate doing its job.
 
+## FIND-VS-B — standing dev cargo-gate failure surfaced by this branch's merge gate (NOT a scoreboard row)
+
+Running the required cargo gate for this (Rust-free) branch surfaced
+`staged_rmw_storm_is_pool_backed_recycling_and_byte_exact`
+(`tests/staged_rmw_alloc_tests.rs:167`) failing **deterministically** —
+`staged_rmw_pooled_seeds` Δ = **100 of 200 ops** (exactly half the storm's
+RMW seeds took the ring-miss leg instead of the pooled ring-hit leg; ×4
+repeats, with and without `--all-features`). **Reproduced bit-for-bit on a
+pristine `abfde00` worktree** — a dev-baseline deviation from the pooled-seed
+contract (`0ca1e9a`/`e4a8434` lineage), pre-dating this branch (which
+contains zero Rust). Every other suite green under `--no-fail-fast`
+(single-failure inventory), bench smoke green, clippy/fmt/doc green.
+Environmental note for the re-bisect: the failure emerged in a session whose
+shell ran with `ulimit -n 2048` initially (fd-starved runs fail earlier in
+`data_path_correctness` with EMFILE — raise to ≥ 65536 before gating; the
+staged-RMW failure persists either way). Filed like the L1 report's
+generic/074 row: **standing dev regression to re-bisect**, treatment
+precedent "identical failure on baseline ⇒ deviation pre-dates the branch."
+
 ## Gate posture for releases (until the follow-ups land)
 
 ```bash

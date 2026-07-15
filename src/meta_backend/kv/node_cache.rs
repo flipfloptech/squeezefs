@@ -1712,6 +1712,18 @@ impl NodeCache {
     /// dirty/serializing nodes are pinned by [`NodeState::try_evict`]'s
     /// clean-only CAS; interior/root pins are skipped outright. Bounded to
     /// two laps so an all-pinned cache cannot spin.
+    ///
+    /// **Externally-held nodes are skipped** (PR M9 tiny-budget finding):
+    /// evicting a node some task still holds an `Arc` to frees **no
+    /// memory** — the holder keeps node + snapshot alive by refcount —
+    /// while severing the mapping, which forces the commit path's
+    /// resolve → lock → revalidate window into reload-thrash (under a
+    /// budget below the working set, all the way to its bounded-retry
+    /// EINVAL). The sweep is only allowed to reclaim what dropping the
+    /// map reference would actually free: `strong_count == 2` (the map's
+    /// reference + the sweep's own probe). Racing grabs after the CAS
+    /// keep the object alive by refcount exactly as before — this gate
+    /// narrows eviction, never weakens it.
     fn evict_to_budget(&self) {
         let mut attempts = 2 * (self.map.len() + 1);
         while self.cached_bytes.load(Ordering::Acquire) > self.cfg.budget_bytes && attempts > 0 {
@@ -1726,6 +1738,13 @@ impl NodeCache {
             }
             if node.ref_bit.swap(false, Ordering::AcqRel) {
                 self.clock.push(addr); // second chance
+                continue;
+            }
+            if Arc::strong_count(&node) > 2 {
+                // Held outside the cache (a resolver mid-commit, a
+                // traversal, a checkpoint walk): reclaims nothing now —
+                // re-enter the clock and try again once released.
+                self.clock.push(addr);
                 continue;
             }
             if node.state().try_evict() {

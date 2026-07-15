@@ -992,6 +992,93 @@ async fn tiny_budget_eviction_bounds_memo_gauge() {
     );
 }
 
+/// Tiny-budget liveness (the M9 acceptance storm's finding): evicting a
+/// node someone still HOLDS frees no memory — the holder's `Arc` keeps
+/// the node and its snapshot alive — but severs the mapping and forces
+/// the holder into a resolve→evict→reload retry. Under a budget smaller
+/// than the working set (where §5.7's overlay/memo charge keeps the
+/// cache persistently one byte over), that turned the commit path's
+/// bounded revalidation retry into a loud EINVAL at storm scale.
+/// Eviction must skip externally-held nodes (physically honest: nothing
+/// would be freed) and reclaim them once released.
+#[tokio::test]
+async fn eviction_skips_externally_held_nodes() {
+    const BUDGET_NODES: u64 = 1;
+    let file = NamedTempFile::new().expect("temp volume");
+    file.as_file()
+        .set_len(8 * NODE_SIZE as u64)
+        .expect("size volume");
+    let layout = NodeLayout::new(NODE_SIZE).expect("layout");
+    let cache = NodeCache::new(NodeCacheConfig {
+        path: file.path().to_path_buf(),
+        layout,
+        heap_base: 0,
+        budget_bytes: BUDGET_NODES * NODE_SIZE as u64,
+        writeback_delta_bytes: usize::MAX,
+    });
+    for ext in 0..6u64 {
+        let addr = ext * NODE_SIZE as u64;
+        let ino = 100 + ext;
+        write_node(
+            file.path(),
+            &layout,
+            &NodeWriteParams {
+                node_addr: addr,
+                node_seq: ext + 1,
+                tree_id: TREE_INODES,
+                level: 0,
+                min_key: &inode_key(ino),
+                max_key: &inode_key(ino),
+            },
+            &[Record::put(inode_key(ino).to_vec(), 1, iv(ino).encode())],
+            1,
+        )
+        .await
+        .expect("write node");
+    }
+
+    // Hold node 0 (the commit path's resolve→lock shape), then churn the
+    // 1-node budget with five more loads — every publish sweeps.
+    let held = cache
+        .load(0)
+        .await
+        .expect("load")
+        .expect("extent never retired");
+    for ext in 1..6u64 {
+        let _ = cache
+            .load(ext * NODE_SIZE as u64)
+            .await
+            .expect("load")
+            .expect("extent never retired");
+    }
+    assert!(
+        cache.contains(held.addr()),
+        "an externally-held node must survive budget sweeps (evicting it frees nothing)"
+    );
+    assert!(
+        !held.state().is_superseded(),
+        "an externally-held node must not be severed by eviction"
+    );
+    // Its mapping still serves — no reload, no retry loop.
+    assert_eq!(
+        live_bytes(&held.snapshot().lookup(&inode_key(100)).expect("fold")),
+        Some(iv(100).encode())
+    );
+
+    // Released, it becomes an ordinary victim: more churn reclaims it.
+    drop(held);
+    for lap in 0..4u64 {
+        for ext in 1..6u64 {
+            let _ = cache.load(ext * NODE_SIZE as u64).await.expect("load");
+        }
+        if !cache.contains(0) {
+            break;
+        }
+        assert!(lap < 3, "a released clean node must eventually evict");
+    }
+    assert!(!cache.contains(0), "released node reclaimed by the sweep");
+}
+
 // ---------------------------------------------------------------------------
 // Reference-fold sanity (the harness itself is under test here: the mirror
 // must reproduce the §4.2 fold on a known history).

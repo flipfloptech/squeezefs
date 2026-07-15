@@ -277,24 +277,25 @@ cotenants() {
 }
 
 # House 3-poll quiet gate: QUIET_POLLS consecutive polls, QUIET_SECS apart,
-# each requiring no builds (comm-exact), load1 under threshold, Tctl < 80.
-# Never blocks forever: after ~10 min the row proceeds flagged DIRTY(gate).
+# each requiring no co-tenants (comm-exact builds/pytest/foreign elbencho)
+# and Tctl < 80. load1 is RECORDED in the honesty line but does not gate
+# per-row — back-to-back rows inherit our own decaying loadavg (smoke-run
+# finding); the load threshold is a SESSION-START precondition instead.
+# Never blocks forever: after ~5 min the row proceeds flagged DIRTY(gate).
 quiet_gate() { # -> sets ROW_DIRTY_PRE
     ROW_DIRTY_PRE=""
-    local tries=0 streak=0 tctl load cot
+    local tries=0 streak=0 tctl cot
     while [ "$streak" -lt "$QUIET_POLLS" ]; do
         cot="$(cotenants)"
-        load="$(cut -d' ' -f1 /proc/loadavg)"
         tctl="$(tctl_read)"
         if [ -z "$cot" ] &&
-            python3 -c "exit(0 if float('$load') < float('$QUIET_LOAD') else 1)" &&
             python3 -c "exit(0 if float('${tctl:-0}') < 80 else 1)"; then
             streak=$((streak + 1))
         else
             streak=0
             tries=$((tries + 1))
             if [ "$tries" -ge 60 ]; then
-                ROW_DIRTY_PRE="DIRTY(gate:${cot}load=$load,tctl=${tctl:-na})"
+                ROW_DIRTY_PRE="DIRTY(gate:${cot}tctl=${tctl:-na}),"
                 log "quiet-gate never settled — proceeding $ROW_DIRTY_PRE"
                 return 0
             fi
@@ -303,6 +304,22 @@ quiet_gate() { # -> sets ROW_DIRTY_PRE
         fi
         [ "$streak" -lt "$QUIET_POLLS" ] && sleep "$QUIET_SECS"
     done
+}
+
+# Session-start precondition: the box must be genuinely idle before the first
+# timed row (SQUEEZEFS_VS_QUIET_LOAD on load1). Proceeds DIRTY after ~5 min.
+session_quiet_gate() {
+    local i load
+    for i in $(seq 1 60); do
+        load="$(cut -d' ' -f1 /proc/loadavg)"
+        if [ -z "$(cotenants)" ] &&
+            python3 -c "exit(0 if float('$load') < float('$QUIET_LOAD') else 1)"; then
+            return 0
+        fi
+        [ "$i" = "1" ] && log "waiting for idle box (load1=$load, threshold $QUIET_LOAD)..."
+        sleep "$QUIET_SECS"
+    done
+    log "WARN: box never went idle (load1=$load) — proceeding; rows carry honesty lines"
 }
 
 drop_caches() { # root-tolerant; returns 0 if the page cache actually dropped
@@ -350,6 +367,11 @@ sqz_mount() { # <tag> <cage_mb> [extra mount args...]
     local tag="$1" memmax="$2"
     shift 2
     local logf="$ART/logs/sqz_mount_${tag}.log"
+    # Defense in depth: never hand the daemon a stale/ENOTCONN mountpoint.
+    if ! stat "$SQZ_MNT" >/dev/null 2>&1; then
+        fusermount3 -uz "$SQZ_MNT" 2>/dev/null || umount -l "$SQZ_MNT" 2>/dev/null || true
+        sleep 0.5
+    fi
     cage_cmd "$memmax" "sqz-$tag"
     pin_cmd
     # shellcheck disable=SC2094 # --log-file is a path arg, not a read
@@ -381,6 +403,15 @@ sqz_umount() {
         mountpoint -q "$SQZ_MNT" || break
         sleep 0.2
     done
+    # Stale ENOTCONN attachment: the documented pre-existing teardown-SIGBUS
+    # class (L1 report) can crash the daemon mid-drain and leave the kernel
+    # mount half-dead; the next mount refuses it LOUD. Detach lazily (the
+    # mount.fuse.squeezefs precedent) so the grid keeps filling.
+    if ! stat "$SQZ_MNT" >/dev/null 2>&1; then
+        log "WARN: stale ENOTCONN mountpoint after unmount (teardown-SIGBUS class) — lazy-detaching"
+        fusermount3 -uz "$SQZ_MNT" 2>/dev/null || umount -l "$SQZ_MNT" 2>/dev/null || true
+        sleep 0.5
+    fi
     # Wait for the daemon to drain; kill by PID only as last resort.
     for i in $(seq 1 300); do
         [ -n "$SQZ_PID" ] && [ -d "/proc/$SQZ_PID" ] || break
@@ -482,6 +513,10 @@ jfs_umount() {
     done
     mountpoint -q "$JFS_MNT" &&
         "$JUICEFS_BIN" umount --force "$JFS_MNT" >/dev/null 2>&1
+    if ! stat "$JFS_MNT" >/dev/null 2>&1; then
+        fusermount3 -uz "$JFS_MNT" 2>/dev/null || umount -l "$JFS_MNT" 2>/dev/null || true
+        sleep 0.5
+    fi
     for i in $(seq 1 300); do
         [ -n "$JFS_PID" ] && [ -d "/proc/$JFS_PID" ] || break
         sleep 0.2
@@ -667,7 +702,8 @@ ensure_dataset() { # <mnt> — untimed prep when seq_write_1m isn't in the grid
     mkdir -p "$mnt/vsdata"
     log "prep: creating dataset (untimed)"
     pin_cmd
-    "${PIN_ARGV[@]}" "$ELBENCHO_BIN" -w -t "$THREADS" -s "${FILE_MB}m" -b 1m \
+    timeout -k 10 $((ROW_TIMEOUT * 2)) \
+        "${PIN_ARGV[@]}" "$ELBENCHO_BIN" -w -t "$THREADS" -s "${FILE_MB}m" -b 1m \
         --direct "${DATA_FILES[@]}" >"$ART/logs/prep_dataset.$RANDOM.log" 2>&1 ||
         die "dataset prep failed"
 }
@@ -678,7 +714,8 @@ ensure_tree() { # <mnt> — untimed prep for stat/del storms
     mkdir -p "$mnt/vstree"
     log "prep: creating tree ($((THREADS * TREE_DIRS * TREE_FILES)) files, untimed)"
     pin_cmd
-    "${PIN_ARGV[@]}" "$ELBENCHO_BIN" -w -d -t "$THREADS" -n "$TREE_DIRS" \
+    timeout -k 10 $((ROW_TIMEOUT * 2)) \
+        "${PIN_ARGV[@]}" "$ELBENCHO_BIN" -w -d -t "$THREADS" -n "$TREE_DIRS" \
         -N "$TREE_FILES" -s 4k "$mnt/vstree" >"$ART/logs/prep_tree.$RANDOM.log" 2>&1 ||
         die "tree prep failed"
 }
@@ -740,11 +777,32 @@ mount_for_regime() { # <regime> <system> <tag>
         # R2: cache-size 0, cache-dir stays on the substrate, tight cage to
         # defeat the file:// object store's kernel page-cache serve (the
         # decomposition-report mechanism — JuiceFS has no device-true knob).
-        # buffer-size capped to half the cage for OOM headroom.
-        R2) jfs_mount "$tag" "$R2_JFS_CAGE_MB" 0 \
-            "$((CACHE_MB < R2_JFS_CAGE_MB / 2 ? CACHE_MB : R2_JFS_CAGE_MB / 2))" ;;
+        # buffer-size = their shipped default 300M, exactly the
+        # decomposition's forced-device-serve row config; larger buffers
+        # OOM-loop the daemon inside the tight cage (smoke-run finding).
+        R2) jfs_mount "$tag" "$R2_JFS_CAGE_MB" 0 300 ;;
         *) jfs_mount "$tag" "$CAGE_MB" "$CACHE_MB" "$CACHE_MB" ;;
         esac
+    fi
+}
+
+# A daemon death mid-grid (e.g. cage OOM) must cost ONE flagged remount and
+# keep the scoreboard filling — never abort the remaining rows (the row that
+# died still records rc!=0/NA and gates). PIDs are refreshed every call:
+# `juicefs mount -d` runs a supervisor that can respawn the daemon silently.
+ensure_alive() { # <regime> <system> <tag>
+    local regime="$1" sys="$2" tag="$3" mnt
+    if [ "$sys" = "sqz" ]; then mnt="$SQZ_MNT"; else mnt="$JFS_MNT"; fi
+    if ! mountpoint -q "$mnt" 2>/dev/null || ! stat "$mnt" >/dev/null 2>&1; then
+        log "WARN: $sys mount dead before $tag — remounting once (row flagged)"
+        ROW_DIRTY_COLD="${ROW_DIRTY_COLD}DIRTY(remounted-dead-daemon),"
+        if [ "$sys" = "sqz" ]; then sqz_umount; else jfs_umount; fi
+        mount_for_regime "$regime" "$sys" "remount_${tag}"
+    fi
+    if [ "$sys" = "sqz" ]; then
+        SQZ_PID="$(pgrep -f "squeezefs mount sqmeta://$SQZ_DIR" | head -1)"
+    else
+        JFS_PID="$(pgrep -f "juicefs mount.*$JFS_MNT" | head -1)"
     fi
 }
 
@@ -757,7 +815,8 @@ cold_reset() { # <regime> <system> <tag> — R3 full drop + remount before a row
     fi
     if ! drop_caches; then
         COLD_DEGRADED=1
-        ROW_DIRTY_COLD="DIRTY(no-page-drop)," # page cache survived: not cold
+        # page cache survived: not cold
+        ROW_DIRTY_COLD="${ROW_DIRTY_COLD}DIRTY(no-page-drop),"
     fi
     mount_for_regime "$regime" "$sys" "$tag"
 }
@@ -775,6 +834,7 @@ run_regime_system() { # <regime> <system>
         mnt="$JFS_MNT"
     fi
     for wl in $WORKLOADS; do
+        ensure_alive "$regime" "$sys" "${regime}_${wl}"
         if [ "$regime" = "R3" ]; then
             # Cold-cache: prep state warm, then full drop + remount, then the
             # timed first pass.
@@ -787,6 +847,17 @@ run_regime_system() { # <regime> <system>
             *)
                 ensure_dataset "$mnt"
                 cold_reset "$regime" "$sys" "${regime}_${wl}"
+                ;;
+            esac
+        elif [ "$regime" = "R2" ]; then
+            # Device-true reads must not inherit residual page cache from the
+            # dataset-writing pass (the objstore files were just written —
+            # smoke-run finding: seq_read GETs served from page cache at 1.00x
+            # GET amplification but zero device reads). Best-effort drop; the
+            # per-row VERIFY line remains the authority.
+            case "$wl" in
+            seq_read_1m | rand_read_4k)
+                drop_caches || ROW_DIRTY_COLD="${ROW_DIRTY_COLD}FLAG(no-page-drop),"
                 ;;
             esac
         fi
@@ -865,6 +936,7 @@ main() {
     [ "$SMOKE" = "1" ] && log "SMOKE MODE: micro-grid, gate disabled"
 
     trap cleanup EXIT
+    session_quiet_gate
 
     local regime sys
     for regime in $REGIMES; do

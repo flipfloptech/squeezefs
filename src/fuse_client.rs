@@ -1098,6 +1098,13 @@ pub struct Metrics {
     /// Ranged serves that hit binding/incarnation movement and re-resolved
     /// (the 074-family discipline on the ranged path).
     pub ranged_read_rebinds: Align64<AtomicU64>,
+    /// Hybrid I/O (user directive 2026-07-15): ranged second touches whose
+    /// ghost evidence escalated to one whole-block fetch + admission —
+    /// rand-4k re-read heat converging to RAM. ≈ 0 on a re-read-heavy
+    /// random workload means the evidence-based admission regressed;
+    /// growing on a pure one-pass scan means the ghost window is
+    /// misclassifying (collisions — check `read_tier_admission_ghost_hits`).
+    pub ranged_read_ghost_escalations: Align64<AtomicU64>,
     /// R5 (§5.7 Yellow row): dehydration-worker victims dropped because the
     /// memory authority paused dehydration entirely (protected included —
     /// disk-tier warmth is the cheapest sacrifice under memory pressure).
@@ -1156,6 +1163,17 @@ pub struct Metrics {
     pub read_tier_admission_ghost_hits: Align64<AtomicU64>,
     pub read_streams_classified: Align64<AtomicU64>,
     pub read_odirect_requests: Align64<AtomicU64>,
+    /// Hybrid I/O (user directive 2026-07-15): O_DIRECT requests served
+    /// from the single-block RAM/NVMe tier fast paths (the 416–492k IOPS
+    /// class signature — ≈ 0 on a warm O_DIRECT workload means the hybrid
+    /// serve side regressed); O_DIRECT-initiated ranged second touches
+    /// whose ghost evidence escalated to a whole-block admission; and
+    /// device-true diagnostic reads (`-o direct_device_true` /
+    /// `SQUEEZEFS_DIRECT_DEVICE_TRUE` — adoption signal for the escape:
+    /// > 0 on a mount that should be hybrid means the escape is armed).
+    pub read_odirect_tier_serves: Align64<AtomicU64>,
+    pub read_odirect_ghost_admits: Align64<AtomicU64>,
+    pub read_device_true_reads: Align64<AtomicU64>,
     /// R2 pipeline (docs/design-read-path.md §5.5): issued/completed/
     /// wasted account every prefetch task (wasted >> 0 = abandonment or
     /// mis-detection); inflight_bytes is the live gauge; window_hwm the
@@ -2174,6 +2192,7 @@ impl SqueezefsFilesystem {
                 "ranged_read_bytes": METRICS.ranged_read_bytes.load(Ordering::Relaxed),
                 "ranged_read_unaligned_bounces": METRICS.ranged_read_unaligned_bounces.load(Ordering::Relaxed),
                 "ranged_read_rebinds": METRICS.ranged_read_rebinds.load(Ordering::Relaxed),
+                "ranged_read_ghost_escalations": METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed),
                 "mem_budget_bytes": crate::mem_budget::MEM_BUDGET.budget_bytes(),
                 "mem_budget_pressure_bytes": crate::mem_budget::MEM_BUDGET.pressure_bytes(),
                 "mem_budget_gauge_sum_bytes": crate::mem_budget::MEM_BUDGET.gauge_sum_bytes(),
@@ -2218,6 +2237,10 @@ impl SqueezefsFilesystem {
                 "read_tier_admission_ghost_hits": METRICS.read_tier_admission_ghost_hits.load(Ordering::Relaxed),
                 "read_streams_classified": METRICS.read_streams_classified.load(Ordering::Relaxed),
                 "read_odirect_requests": METRICS.read_odirect_requests.load(Ordering::Relaxed),
+                "read_odirect_tier_serves": METRICS.read_odirect_tier_serves.load(Ordering::Relaxed),
+                "read_odirect_ghost_admits": METRICS.read_odirect_ghost_admits.load(Ordering::Relaxed),
+                "read_device_true_reads": METRICS.read_device_true_reads.load(Ordering::Relaxed),
+                "direct_device_true": self.router.direct_device_true(),
                 "read_tier_admission_mode": format!("{:?}", self.router.tier_admission),
                 "prefetch_issued": METRICS.prefetch_issued.load(Ordering::Relaxed),
                 "prefetch_completed": METRICS.prefetch_completed.load(Ordering::Relaxed),
@@ -2838,7 +2861,7 @@ impl SqueezefsFilesystem {
             if let Some(bk) = old_block_key {
                 existing = self
                     .router
-                    .get_block_for_index(file_path, b, Some(&bk))
+                    .get_block_for_index(file_path, b, Some(&bk), false)
                     .await?;
             }
         }
@@ -5423,16 +5446,21 @@ impl Filesystem for SqueezefsFilesystem {
             "FUSE Read: ino = {}, fh = {}, offset = {}, size = {}, flags = {:#x}",
             ino, fh, offset, size, flags
         );
-        // R1b classifier inputs (§5.3): the kernel sends the file's open
-        // flags on every READ; O_DIRECT is counted here, and the request
-        // feeds the file's offset lanes. Both are advisory/observability
-        // in PR 4 (the publish decision is ghost-driven at the fill site);
-        // PR 5's pipeline and PR 6's ranged dispatch build on them.
-        if flags & (libc::O_DIRECT as u32) != 0 {
+        // R1b classifier inputs (§5.3) + hybrid I/O (user directive
+        // 2026-07-15): the kernel sends the file's open flags on every
+        // READ; O_DIRECT is counted here and handed to the routing layer
+        // as the per-request `ReadClassHint` — under the DEFAULT hybrid
+        // policy it only labels observability (O_DIRECT serves/admits
+        // exactly like buffered), and combined with the mount-scoped
+        // `direct_device_true` escape it selects the strictly device-true
+        // diagnostic path.
+        let odirect = flags & (libc::O_DIRECT as u32) != 0;
+        if odirect {
             METRICS
                 .read_odirect_requests
                 .fetch_add(1, Ordering::Relaxed);
         }
+        let read_hint = crate::routing::ReadClassHint { odirect };
 
         if ino == CONFIG_INODE {
             let bytes = if let Some(cached) = self.open_virtual_files.get(&fh) {
@@ -5668,9 +5696,13 @@ impl Filesystem for SqueezefsFilesystem {
             .map(|(ptr, _sz)| ptr);
 
         // Backend / cache read without holding the inode lock (readers scale).
-        let read_future =
-            self.router
-                .read_file_range_zero_copy(&file_path, offset, read_len as u32, dest_addr);
+        let read_future = self.router.read_file_range_zero_copy(
+            &file_path,
+            offset,
+            read_len as u32,
+            dest_addr,
+            read_hint,
+        );
         prof.mark_backend_start();
         let read_res = read_future.await;
         prof.mark_backend_done();
@@ -6917,7 +6949,13 @@ impl Filesystem for SqueezefsFilesystem {
         // chunk has been consumed below.
         let (src_data, _src_backing) = self
             .router
-            .read_file_range_zero_copy(&src_path, off_in, effective_len as u32, None)
+            .read_file_range_zero_copy(
+                &src_path,
+                off_in,
+                effective_len as u32,
+                None,
+                crate::routing::ReadClassHint::default(),
+            )
             .await
             .map_err(map_squeezefs_err)?;
         let phys = src_data.len();
@@ -7839,11 +7877,14 @@ pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {
             let key = opt_trimmed.split('=').next().unwrap_or("").trim();
             // TTL options are DAEMON-level (survey P1-C): consumed into
             // `KernelCacheTtls` by `start_mount`, never passed to the
-            // kernel mount(2) string (which would reject them).
+            // kernel mount(2) string (which would reject them). So is the
+            // hybrid-I/O `direct_device_true` escape (consumed into the
+            // router by `start_mount`).
             if key == "entry_timeout"
                 || key == "attr_timeout"
                 || key == "negative_timeout"
                 || key == "dir_entry_timeout"
+                || key == "direct_device_true"
             {
                 continue;
             }
@@ -7914,6 +7955,20 @@ pub async fn start_mount<P: AsRef<Path>>(
         for opt in opts.split(',') {
             let opt_trimmed = opt.trim();
             if !opt_trimmed.is_empty() {
+                // Hybrid I/O diagnostic escape (user directive 2026-07-15):
+                // `-o direct_device_true` restores strictly device-true
+                // O_DIRECT reads (no tier serve, no admission) — the
+                // measurement/diagnostic posture for the `.benchmarks`
+                // amplification methodology. Daemon-level: stripped from
+                // the kernel option strings like the TTL keys.
+                if opt_trimmed == "direct_device_true" {
+                    fs.router.set_direct_device_true(true);
+                    info!(
+                        "Hybrid I/O escape armed (-o direct_device_true): O_DIRECT reads \
+                         bypass the read tiers — no serve, no admission (device-true \
+                         diagnostic/measurement mode)"
+                    );
+                }
                 let parts: Vec<&str> = opt_trimmed.splitn(2, '=').collect();
                 if parts.len() == 2 {
                     let key = parts[0].trim();

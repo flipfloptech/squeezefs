@@ -18,6 +18,10 @@
 //!    single-flight, which ghost-admits (protected hot put + validated NVMe
 //!    publish) — re-read heat converges to RAM. Counted:
 //!    `ranged_read_ghost_escalations` / `read_odirect_ghost_admits`.
+//!    Re-admission churn is bounded by a per-key escalation COOLDOWN
+//!    (~32–64 s window): beyond-tier working sets degrade to device-true
+//!    ranged reads between windows instead of re-fetching + re-publishing
+//!    4 MiB per eviction.
 //! 3. BUDGET AUTHORITY UNCHANGED: mem-budget Red pauses the escalation
 //!    (admission), never correctness; heat recording continues.
 //! 4. DIAGNOSTIC ESCAPE (`-o direct_device_true` /
@@ -260,7 +264,9 @@ async fn hybrid_phases() {
     // table exists to prevent).
     let g0 = METRICS.get_obj.load(Ordering::Relaxed);
     let rr0 = METRICS.ranged_reads.load(Ordering::Relaxed);
-    let esc0 = METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed);
+    let esc0 = METRICS
+        .ranged_read_ghost_escalations
+        .load(Ordering::Relaxed);
     let d = read_flags(&h, ino, 5 * BS + 8192, 4096, OD).await;
     assert!(d.iter().all(|&x| x == 6), "first-touch content");
     assert_eq!(
@@ -274,7 +280,9 @@ async fn hybrid_phases() {
         "first touch is a ranged window read (device-true, 1.00×)"
     );
     assert_eq!(
-        METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed),
+        METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed),
         esc0,
         "first touch must NOT escalate"
     );
@@ -287,14 +295,19 @@ async fn hybrid_phases() {
     // The warm-up arithmetic pinned: 2 device ops for the block's whole
     // lifetime, everything after is RAM.
     let g0 = METRICS.get_obj.load(Ordering::Relaxed);
-    let esc0 = METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed);
+    let esc0 = METRICS
+        .ranged_read_ghost_escalations
+        .load(Ordering::Relaxed);
     let oga0 = METRICS.read_odirect_ghost_admits.load(Ordering::Relaxed);
     let d = read_flags(&h, ino, BS, 4096, OD).await; // touch 1: record
     assert!(d.iter().all(|&x| x == 2));
     let d = read_flags(&h, ino, BS + 32_768, 4096, OD).await; // touch 2: escalate
     assert!(d.iter().all(|&x| x == 2));
     assert_eq!(
-        METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed) - esc0,
+        METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed)
+            - esc0,
         1,
         "the second touch within the ghost window escalates to ONE \
          whole-block fetch (evidence-based admission)"
@@ -325,18 +338,58 @@ async fn hybrid_phases() {
         "post-admission O_DIRECT reads serve from RAM — device flat"
     );
 
+    // ---- Phase C2: escalation-churn bound (the cooldown). A key that
+    // just escalated must NOT re-escalate within the cooldown window even
+    // if its admitted copy is evicted while its ghost entry is still hot
+    // — on working sets beyond the tiers every eviction would otherwise
+    // re-fetch + re-publish 4 MiB per ranged touch (the R-5 spiral class
+    // in tier form). Between windows the workload degrades to the
+    // device-true ranged path.
+    h.fs.router.cache.purge_block_key(&k1); // simulate eviction of the admitted copy
+    let esc0 = METRICS
+        .ranged_read_ghost_escalations
+        .load(Ordering::Relaxed);
+    let g0 = METRICS.get_obj.load(Ordering::Relaxed);
+    let rr0 = METRICS.ranged_reads.load(Ordering::Relaxed);
+    for i in 0..3u64 {
+        let d = read_flags(&h, ino, BS + 131_072 + i * 4096, 4096, OD).await;
+        assert!(d.iter().all(|&x| x == 2), "cooldown-window content");
+    }
+    assert_eq!(
+        METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed),
+        esc0,
+        "a just-escalated key must not re-escalate within the cooldown \
+         window (bounded re-admission churn)"
+    );
+    assert_eq!(
+        METRICS.ranged_reads.load(Ordering::Relaxed) - rr0,
+        3,
+        "cooled-down touches stay ranged device reads"
+    );
+    assert_eq!(
+        METRICS.get_obj.load(Ordering::Relaxed) - g0,
+        3,
+        "cooled-down touches are device-true windows"
+    );
+
     // ---- Phase D: budget-Red pauses the escalation (admission rides the
     // existing mem-budget arbitration; heat RECORDING continues, exactly
     // like the whole-block fill site under the §5.7 publish pause).
     squeezefs::mem_budget::MEM_BUDGET.force_level_for_test(squeezefs::mem_budget::Level::Red);
     let g0 = METRICS.get_obj.load(Ordering::Relaxed);
-    let esc0 = METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed);
+    let esc0 = METRICS
+        .ranged_read_ghost_escalations
+        .load(Ordering::Relaxed);
     let d = read_flags(&h, ino, 2 * BS, 4096, OD).await; // touch 1 (records)
     assert!(d.iter().all(|&x| x == 3));
     let d = read_flags(&h, ino, 2 * BS + 32_768, 4096, OD).await; // ghost hit, Red
     assert!(d.iter().all(|&x| x == 3));
     assert_eq!(
-        METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed),
+        METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed),
         esc0,
         "Red pauses O_DIRECT admission: a ghost hit must NOT escalate"
     );
@@ -347,11 +400,16 @@ async fn hybrid_phases() {
     );
     assert!(!tier_has(&h, &k2), "nothing admitted under Red");
     squeezefs::mem_budget::MEM_BUDGET.force_level_for_test(squeezefs::mem_budget::Level::Green);
-    let esc0 = METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed);
+    let esc0 = METRICS
+        .ranged_read_ghost_escalations
+        .load(Ordering::Relaxed);
     let d = read_flags(&h, ino, 2 * BS + 65_536, 4096, OD).await; // Green: escalate
     assert!(d.iter().all(|&x| x == 3));
     assert_eq!(
-        METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed) - esc0,
+        METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed)
+            - esc0,
         1,
         "back at Green the recorded heat admits on the next touch"
     );
@@ -359,13 +417,18 @@ async fn hybrid_phases() {
 
     // ---- Phase E: buffered traffic rides the SAME policy (hybrid is not
     // O_DIRECT-special-cased): second buffered 4k touch escalates too.
-    let esc0 = METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed);
+    let esc0 = METRICS
+        .ranged_read_ghost_escalations
+        .load(Ordering::Relaxed);
     let d = read_at(&h, ino, 3 * BS, 4096).await; // touch 1
     assert!(d.iter().all(|&x| x == 4));
     let d = read_at(&h, ino, 3 * BS + 32_768, 4096).await; // touch 2
     assert!(d.iter().all(|&x| x == 4));
     assert_eq!(
-        METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed) - esc0,
+        METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed)
+            - esc0,
         1,
         "buffered ranged misses use the same evidence-based admission"
     );
@@ -441,7 +504,9 @@ async fn escape_direct_device_true_is_device_true() {
     // NO-PUBLISH + NO-GHOST: repeated O_DIRECT 4k touches of one cold
     // block never escalate, never admit, never record.
     let g0 = METRICS.get_obj.load(Ordering::Relaxed);
-    let esc0 = METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed);
+    let esc0 = METRICS
+        .ranged_read_ghost_escalations
+        .load(Ordering::Relaxed);
     for i in 0..4u64 {
         let off = BS + i * 32_768;
         let d = read_flags(&h, ino, off, 4096, OD).await;
@@ -453,7 +518,9 @@ async fn escape_direct_device_true_is_device_true() {
         "escape mode: N O_DIRECT touches = N device reads (1.00×, forever)"
     );
     assert_eq!(
-        METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed),
+        METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed),
         esc0,
         "escape mode: no escalation"
     );
@@ -476,12 +543,16 @@ async fn escape_direct_device_true_is_device_true() {
     // only the one after that admits.
     h.fs.router.set_direct_device_true(false);
     assert!(!h.fs.router.direct_device_true());
-    let esc0 = METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed);
+    let esc0 = METRICS
+        .ranged_read_ghost_escalations
+        .load(Ordering::Relaxed);
     let g0 = METRICS.get_obj.load(Ordering::Relaxed);
     let d = read_flags(&h, ino, BS + 200_704, 4096, OD).await; // first touch
     assert!(d.iter().all(|&x| x == 0x12));
     assert_eq!(
-        METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed),
+        METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed),
         esc0,
         "escape-mode touches recorded no ghost heat — hybrid restart is a \
          first touch"
@@ -489,7 +560,10 @@ async fn escape_direct_device_true_is_device_true() {
     let d = read_flags(&h, ino, BS + 233_472, 4096, OD).await; // second touch
     assert!(d.iter().all(|&x| x == 0x12));
     assert_eq!(
-        METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed) - esc0,
+        METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed)
+            - esc0,
         1,
         "hybrid resumes verbatim once the escape is dropped"
     );
@@ -516,9 +590,8 @@ async fn mount_option_is_daemon_level_and_stripped() {
     );
     assert!(parsed.contains("allow_other") && parsed.contains("max_read=1048576"));
 
-    let filtered = squeezefs::fuse_client::filter_kernel_mount_options(
-        "direct_device_true,max_read=1048576",
-    );
+    let filtered =
+        squeezefs::fuse_client::filter_kernel_mount_options("direct_device_true,max_read=1048576");
     assert!(
         !filtered.contains("direct_device_true"),
         "root-path kernel options must not carry the daemon flag"

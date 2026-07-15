@@ -186,6 +186,8 @@ sudo ./target/release/squeezefs tune
 
 > **Runtime trick**: `max_background`/`congestion_threshold` are writable per live FUSE connection without a remount — `echo 256 | sudo tee /sys/fs/fuse/connections/<minor>/max_background` (find `<minor>` via `stat -c %d <mountpoint>` minor number). The IOPS-parity investigation used exactly this to prove `max_background` gates FUSE-over-io_uring traffic too.
 
+> **Benchmarking O_DIRECT (hybrid I/O)**: by default O_DIRECT reads serve from and warm SqueezeFS's own read tiers (kernel page cache stays bypassed) — repeated `--direct` read rows measure the *hybrid* posture and converge to RAM speed. For **device-path / amplification measurement** (the `.benchmarks` methodology rows), mount with `-o direct_device_true`: O_DIRECT reads then hit the device every time, admit nothing, and `squeezefs bench --direct` prints `direct-I/O posture: device-true` in its header. Buffered I/O is unaffected either way.
+
 ---
 
 ## 5. Metadata Durability Knobs

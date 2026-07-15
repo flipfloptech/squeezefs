@@ -957,6 +957,9 @@ pub struct DataRouterInner {
     pub(crate) stream_gauge: StreamActivityGauge,
     /// R1b ghost table — second-touch admission memory for >256 KiB fills.
     pub(crate) ghost: std::sync::Arc<GhostTable>,
+    /// Hybrid-I/O escalation cooldown — bounds ranged re-admission churn
+    /// on working sets beyond the tiers (see the type doc).
+    pub(crate) escalation_cooldown: std::sync::Arc<EscalationCooldown>,
     /// R1b disk-tier admission mode (env-resolved once; hot-budget-0
     /// auto-degrades SecondTouch to Always).
     pub tier_admission: TierAdmission,
@@ -965,6 +968,15 @@ pub struct DataRouterInner {
     /// only their 4 KiB-aligned window (`SQUEEZEFS_READ_RANGED_THRESHOLD`,
     /// default 262144; 0 = kill switch).
     pub(crate) ranged_threshold: u64,
+    /// Hybrid I/O diagnostic escape (user directive 2026-07-15;
+    /// `-o direct_device_true` / `SQUEEZEFS_DIRECT_DEVICE_TRUE=1`): when
+    /// set, O_DIRECT READ requests are strictly device-true — no tier
+    /// serve, no admission (ghost/hot/read_lru/NVMe), no pipeline
+    /// classification — the `.benchmarks` amplification-methodology
+    /// ruler. Buffered traffic is unaffected. AtomicBool (one relaxed
+    /// load per striped read) because the mount option is parsed after
+    /// router construction (`start_mount`).
+    pub(crate) direct_device_true: std::sync::atomic::AtomicBool,
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
     pub prefetcher: std::sync::Arc<IoUringPrefetcher>,
@@ -1084,6 +1096,64 @@ impl GhostTable {
             }
         }
         hit
+    }
+}
+
+/// Hybrid-I/O escalation cooldown (user directive 2026-07-15): a fixed
+/// 2¹⁶-slot direct-mapped array of `AtomicU32` tags recording block keys
+/// whose ranged second touch was recently ESCALATED to a whole-block
+/// admission. Same shape as [`GhostTable`] but with WALL-CLOCK two-epoch
+/// sliding windows (32 s epochs ⇒ a key re-escalates at most every
+/// ~32–64 s): the ghost proves *reuse*, the cooldown bounds *churn*. On a
+/// working set that FITS the tiers, an admitted block stays resident, its
+/// touches never reach the ranged dispatch again, and the cooldown entry
+/// ages out unused — convergence then zero overhead. On a set far BEYOND
+/// the tiers, admitted blocks are evicted and re-touched while their
+/// ghost entries are still hot; without this bound every such touch would
+/// re-fetch + re-publish 4 MiB (the read-path program's R-5 spiral class
+/// in tier form — the 16.9 GiB tax resurrected as churn). With it,
+/// re-admission is bounded to ≈ `keys/32s` and the workload degrades to
+/// the device-true ranged path between windows. Deliberately
+/// racy-tolerant single-word `Relaxed` atomics (a lost update = one extra
+/// or one delayed escalation, never a correctness event); no cross-word
+/// invariant ⇒ no loom model required.
+pub(crate) struct EscalationCooldown {
+    slots: Box<[std::sync::atomic::AtomicU32]>,
+}
+
+impl EscalationCooldown {
+    const SLOTS: usize = 1 << 16;
+    const EPOCH_SECS: u64 = 32;
+
+    fn new() -> Self {
+        let mut v = Vec::with_capacity(Self::SLOTS);
+        v.resize_with(Self::SLOTS, || std::sync::atomic::AtomicU32::new(0));
+        Self {
+            slots: v.into_boxed_slice(),
+        }
+    }
+
+    fn epoch_now() -> u32 {
+        (StreamLanes::now_ms() / (Self::EPOCH_SECS * 1000)) as u32
+    }
+
+    /// True iff `block_key` was escalation-recorded within the current or
+    /// previous wall-clock epoch (⇒ the caller must NOT escalate again).
+    pub(crate) fn recently_escalated(&self, block_key: &str) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let hash = xxhash_rust::xxh3::xxh3_64(block_key.as_bytes());
+        let slot = (hash as usize) & (Self::SLOTS - 1);
+        let epoch = Self::epoch_now();
+        let seen = self.slots[slot].load(Relaxed);
+        seen == GhostTable::tag(hash, epoch) || seen == GhostTable::tag(hash, epoch.wrapping_sub(1))
+    }
+
+    /// Record an escalation of `block_key` (current epoch).
+    pub(crate) fn record(&self, block_key: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let hash = xxhash_rust::xxh3::xxh3_64(block_key.as_bytes());
+        let slot = (hash as usize) & (Self::SLOTS - 1);
+        self.slots[slot].store(GhostTable::tag(hash, Self::epoch_now()), Relaxed);
     }
 }
 
@@ -1235,6 +1305,22 @@ unsafe impl Send for RangedDest {}
 pub(crate) struct LaneRef<'a> {
     pub(crate) lane: &'a StreamLane,
     pub(crate) streaming: bool,
+}
+
+/// Per-request read classifier hint (hybrid I/O, user directive
+/// 2026-07-15; the §5.3 `ReadClassHint` the design named): the FUSE read
+/// handler hands the routing layer the request's O_DIRECT bit
+/// (`fuse_read_in.flags`). Under the DEFAULT hybrid policy the bit only
+/// labels observability (`read_odirect_tier_serves` /
+/// `read_odirect_ghost_admits`) — O_DIRECT and buffered ride the same
+/// serve/admission machinery. Combined with the mount-scoped
+/// `direct_device_true` escape it selects the strictly device-true
+/// diagnostic path. Internal readers (copy_file_range, RMW seeds) pass
+/// `default()`.
+#[derive(Clone, Copy, Default)]
+pub struct ReadClassHint {
+    /// The request rode an O_DIRECT file description.
+    pub odirect: bool,
 }
 
 impl StreamLanes {
@@ -1700,6 +1786,20 @@ impl DataRouter {
             }),
             Err(_) => 262_144,
         };
+        // Hybrid I/O diagnostic escape (env half; `-o direct_device_true`
+        // sets it post-construction from `start_mount`). "1"/"true" arms.
+        let direct_device_true = std::env::var("SQUEEZEFS_DIRECT_DEVICE_TRUE")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
+        if direct_device_true {
+            log::info!(
+                "Hybrid I/O escape armed (SQUEEZEFS_DIRECT_DEVICE_TRUE): O_DIRECT reads \
+                 bypass the read tiers — no serve, no admission (device-true diagnostic)"
+            );
+        }
 
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
@@ -1744,8 +1844,10 @@ impl DataRouter {
                     .time_to_live(std::time::Duration::from_secs(30))
                     .build(),
                 ghost: std::sync::Arc::new(GhostTable::new()),
+                escalation_cooldown: std::sync::Arc::new(EscalationCooldown::new()),
                 tier_admission,
                 ranged_threshold,
+                direct_device_true: std::sync::atomic::AtomicBool::new(direct_device_true),
                 prefetch_window_cap,
                 prefetch_share_pct,
                 stream_gauge: StreamActivityGauge::new(),
@@ -1802,6 +1904,20 @@ impl DataRouter {
                 )
             });
         self.crypto.get().unwrap_or(&*DEFAULT_CRYPTO)
+    }
+
+    /// Arm/disarm the hybrid-I/O diagnostic escape (`-o direct_device_true`
+    /// parses in `start_mount`, after construction; the env half resolves
+    /// in `new`). See the field doc for the contract.
+    pub fn set_direct_device_true(&self, on: bool) {
+        self.direct_device_true
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the device-true diagnostic escape is armed (mount-scoped).
+    pub fn direct_device_true(&self) -> bool {
+        self.direct_device_true
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn read_nvme_block(&self, block_key: &str) -> Result<bytes::Bytes> {
@@ -2581,6 +2697,32 @@ impl DataRouter {
         Ok(keys.pop().and_then(|(_, k)| k))
     }
 
+    /// Hybrid-I/O diagnostic fetch (the `direct_device_true` escape): one
+    /// whole-block DEVICE fetch carrying the validated-fill incarnation
+    /// discipline with ZERO cache interaction — no tier/hot/read_lru
+    /// probes or puts, no single-flight registration (N concurrent
+    /// diagnostic readers = N device reads, by contract: the measurement
+    /// must see the device, not each other), no ghost recording, and no
+    /// cache_hits/cache_misses accounting (a diagnostic must not perturb
+    /// the live policy's signals). Decode (`process_read`) still applies —
+    /// transform volumes serve plaintext. The returned bool is the same
+    /// serve-validity verdict as `get_cached_or_fetch_block_traced`:
+    /// incarnation stable before the read and unchanged after.
+    async fn fetch_block_device_true(
+        &self,
+        block_key: &str,
+    ) -> Result<(crate::cache::pool::ReadBlockValue, bool)> {
+        let tracked = self.backend_router.key_incarnation_tracked(block_key);
+        let before = self.backend_router.fill_incarnation(block_key);
+        let bytes = self.fetch_block_from_remote(block_key).await?;
+        let serve_valid = !tracked
+            || before.is_some_and(|bf| self.backend_router.fill_incarnation_still(block_key, bf));
+        Ok((
+            crate::cache::pool::ReadBlockValue::Bytes(bytes),
+            serve_valid,
+        ))
+    }
+
     /// BINDING-VALIDATED striped block serve — the reused-key stale-fill fix
     /// (the `8e3995e` follow-up). Block keys are device-offset strings; the
     /// incarnation seqlock validates KEY↔CONTENT for cache publishes but
@@ -2606,11 +2748,17 @@ impl DataRouter {
     ///
     /// `resolved_key` is the caller's (possibly stale) map resolution;
     /// `None` short-circuits to a hole.
+    ///
+    /// `device_true` (hybrid-I/O escape): the fetch bypasses every cache
+    /// tier and the single-flight — [`Self::fetch_block_device_true`] —
+    /// while keeping this exact binding proof. Default-path callers pass
+    /// `false`.
     pub async fn get_block_for_index(
         &self,
         file_path: &str,
         b: u32,
         resolved_key: Option<&str>,
+        device_true: bool,
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
         // Each retry re-resolves against the freshest map, so consecutive
         // failures require back-to-back whole COW-rewrite cycles of this one
@@ -2622,9 +2770,12 @@ impl DataRouter {
             let Some(cur_key) = key else {
                 return Ok(None);
             };
-            let (val, incarnation_valid) = self
-                .get_cached_or_fetch_block_traced(&cur_key, false)
-                .await?;
+            let (val, incarnation_valid) = if device_true {
+                self.fetch_block_device_true(&cur_key).await?
+            } else {
+                self.get_cached_or_fetch_block_traced(&cur_key, false)
+                    .await?
+            };
             // Recheck the binding only AFTER the bytes are in hand: the
             // proof needs (movement between snapshot and serve) ⇒ (word
             // changed), which only holds when the recheck follows the read.
@@ -2677,14 +2828,26 @@ impl DataRouter {
     /// exhaustion pressure. `Ok(None)` = the block is a hole in the
     /// current map (the caller serves zeros).
     ///
-    /// NEVER PUBLISHED: a partial payload must not exist under a
-    /// whole-block tier key (tier/hot entries are whole-block by contract
-    /// — a short entry would serve truncated bytes to a larger read).
-    /// Ranged fills serve their caller only; re-read heat is RECORDED in
-    /// the ghost table (never consulted for ranged dispatch — the pinned
-    /// N-disjoint-reads amplification contract forbids self-escalation),
-    /// so a subsequent whole-block fetch ghost-admits per §5.3 and
-    /// genuinely hot ranges converge to cached whole blocks.
+    /// NEVER PUBLISHED as a partial: a partial payload must not exist
+    /// under a whole-block tier key (tier/hot entries are whole-block by
+    /// contract — a short entry would serve truncated bytes to a larger
+    /// read). Ranged fills serve their caller only.
+    ///
+    /// GHOST-EVIDENCE ADMISSION (hybrid I/O, user directive 2026-07-15 —
+    /// supersedes the record-only stance): under `second-touch` the
+    /// dispatch consults the ghost table. A FIRST touch stays a
+    /// device-true window read (record, no admit — streaming/pollution
+    /// protection unchanged); a SECOND touch within the two-epoch window
+    /// ESCALATES to one whole-block fetch through the single-flight,
+    /// whose own fill-site ghost check admits it (protected hot put +
+    /// today's validated NVMe publish) — rand-4k re-read heat converges
+    /// to RAM instead of staying device-bound forever. The escalation is
+    /// an ADMISSION and rides the mem-budget authority: Red pauses it
+    /// (heat recording continues, mirroring the §5.7 publish-pause
+    /// semantics at the whole-block fill site). `always`/`never` keep
+    /// their verbatim escape-hatch semantics (no ghost interaction, no
+    /// escalation). The `direct_device_true` escape skips ALL of it —
+    /// no record, no escalation, pure window reads.
     ///
     /// Device windows are rounded outward to the conservative 4096-byte
     /// LBA (approved OQ #1). `dest` is offered only on the zero-copy leg
@@ -2695,7 +2858,8 @@ impl DataRouter {
     ///
     /// NOT single-flighted by design (§5.6): deduping 4 KiB fetches under
     /// a 4 MiB block key would serialize independent sub-reads for no
-    /// byte savings.
+    /// byte savings. (The escalated whole-block fetch IS single-flighted —
+    /// concurrent second-touchers of one block dedupe to one device fetch.)
     pub async fn get_block_range_for_index(
         &self,
         file_path: &str,
@@ -2703,9 +2867,46 @@ impl DataRouter {
         rel_range: std::ops::Range<u64>,
         resolved_key: Option<&str>,
         dest: Option<RangedDest>,
+        hint: ReadClassHint,
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
         const MAX_REBINDS: usize = 8;
         const LBA: u64 = 4096;
+        let device_true = self.direct_device_true() && hint.odirect;
+        // Hybrid second-touch escalation (see doc comment). Checked ONCE
+        // per request against the resolved key — the check itself records
+        // the touch (the primitive's old success-site record moved here),
+        // so first touches keep exactly one ghost interaction per read.
+        if !device_true && self.tier_admission == TierAdmission::SecondTouch {
+            if let Some(k) = resolved_key {
+                let ghost_hit = self.ghost.check_and_record(k);
+                if ghost_hit
+                    && crate::mem_budget::level() != crate::mem_budget::Level::Red
+                    && !self.escalation_cooldown.recently_escalated(k)
+                {
+                    // Cooldown (churn bound, see EscalationCooldown): a
+                    // key escalates at most once per ~32–64 s window —
+                    // fitting working sets converge once and stop
+                    // touching this dispatch; beyond-tier sets degrade to
+                    // the device-true ranged path between windows instead
+                    // of re-fetching + re-publishing 4 MiB per eviction
+                    // (the R-5 spiral class in tier form).
+                    self.escalation_cooldown.record(k);
+                    METRICS
+                        .ranged_read_ghost_escalations
+                        .fetch_add(1, Ordering::Relaxed);
+                    if hint.odirect {
+                        METRICS
+                            .read_odirect_ghost_admits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    let whole = self
+                        .get_block_for_index(file_path, b, resolved_key, false)
+                        .await?;
+                    return Ok(whole
+                        .map(|val| Self::slice_whole_for_ranged(val, &rel_range, dest.as_ref())));
+                }
+            }
+        }
         let block_size = self.block_size.load(Ordering::Relaxed);
         let req_len = (rel_range.end - rel_range.start) as usize;
         debug_assert!(req_len > 0, "empty ranged request");
@@ -2768,12 +2969,9 @@ impl DataRouter {
                     .is_some_and(|bf| self.backend_router.fill_incarnation_still(&cur_key, bf));
             let current = self.current_block_binding(file_path, b).await?;
             if incarnation_ok && current.as_deref() == Some(cur_key.as_str()) {
-                // §5.6 heat capture: record-only (see doc comment). Only
-                // meaningful under second-touch; always/never keep their
-                // verbatim escape-hatch semantics.
-                if self.tier_admission == TierAdmission::SecondTouch {
-                    let _ = self.ghost.check_and_record(&cur_key);
-                }
+                // Heat capture moved to the dispatch check above (one
+                // ghost interaction per read; the device-true escape
+                // records nothing by contract).
                 let value = match &dest {
                     Some(d) => {
                         // Served == window == request; the dest region is
@@ -2809,38 +3007,52 @@ impl DataRouter {
 
         // Exhaustion pressure (§5.6): fall back to the whole-block
         // validated loop — single-flighted, decode-correct, and immune to
-        // per-window churn — and slice the request out. With a dest the
-        // slice is copied in and the tail zeroed (reused-payload replay
-        // rule at the copy site).
+        // per-window churn — and slice the request out. Under the
+        // device-true escape the fallback keeps the escape's contract
+        // (cache-free, publish-free fetch). With a dest the slice is
+        // copied in and the tail zeroed (reused-payload replay rule at
+        // the copy site).
         let whole = self
-            .get_block_for_index(file_path, b, key.as_deref())
+            .get_block_for_index(file_path, b, key.as_deref(), device_true)
             .await?;
-        Ok(whole.map(|val| {
-            let start = std::cmp::min(rel_range.start as usize, val.len());
-            let end = std::cmp::min(rel_range.end as usize, val.len());
-            match &dest {
-                Some(d) => {
-                    let len = end - start;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(val[start..end].as_ptr(), d.ptr, len);
-                        if len < req_len {
-                            std::ptr::write_bytes(d.ptr.add(len), 0, req_len - len);
-                        }
+        Ok(whole.map(|val| Self::slice_whole_for_ranged(val, &rel_range, dest.as_ref())))
+    }
+
+    /// Serve a ranged request out of a whole-block value (the escalation
+    /// and exhaustion-fallback tail of [`Self::get_block_range_for_index`]).
+    /// With a dest the slice is copied in and the tail zeroed — the
+    /// reused-payload replay rule at the copy site; short blocks (EOF
+    /// tails, holes-after-truncate) zero-fill the remainder.
+    fn slice_whole_for_ranged(
+        val: crate::cache::pool::ReadBlockValue,
+        rel_range: &std::ops::Range<u64>,
+        dest: Option<&RangedDest>,
+    ) -> crate::cache::pool::ReadBlockValue {
+        let req_len = (rel_range.end - rel_range.start) as usize;
+        let start = std::cmp::min(rel_range.start as usize, val.len());
+        let end = std::cmp::min(rel_range.end as usize, val.len());
+        match dest {
+            Some(d) => {
+                let len = end - start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(val[start..end].as_ptr(), d.ptr, len);
+                    if len < req_len {
+                        std::ptr::write_bytes(d.ptr.add(len), 0, req_len - len);
                     }
-                    crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from_owner(
-                        crate::cache::pool::UringBufOwner {
-                            ptr: d.ptr,
-                            len: req_len,
-                        },
-                    ))
                 }
-                None => {
-                    let mut out = vec![0u8; req_len];
-                    out[..end - start].copy_from_slice(&val[start..end]);
-                    crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from(out))
-                }
+                crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from_owner(
+                    crate::cache::pool::UringBufOwner {
+                        ptr: d.ptr,
+                        len: req_len,
+                    },
+                ))
             }
-        }))
+            None => {
+                let mut out = vec![0u8; req_len];
+                out[..end - start].copy_from_slice(&val[start..end]);
+                crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from(out))
+            }
+        }
     }
 
     pub async fn fetch_metadata(&self, file_path: &str) -> Result<CachedMetadata> {
@@ -4224,7 +4436,12 @@ impl DataRouter {
                         // result (persistent corruption). A hole rebind
                         // seeds zeros.
                         match router_clone
-                            .get_block_for_index(&file_path_clone, b, old_block_key.as_deref())
+                            .get_block_for_index(
+                                &file_path_clone,
+                                b,
+                                old_block_key.as_deref(),
+                                false,
+                            )
                             .await?
                         {
                             Some(crate::cache::pool::ReadBlockValue::Pooled(p)) => p,
@@ -4348,6 +4565,7 @@ impl DataRouter {
         offset: u64,
         size: u32,
         dest_addr: Option<u64>,
+        hint: ReadClassHint,
     ) -> Result<(
         bytes::Bytes,
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
@@ -4625,12 +4843,27 @@ impl DataRouter {
                         let block_keys = self
                             .load_striped_block_keys(file_path, &meta, start_block, end_block)
                             .await?;
+                        // Hybrid-I/O diagnostic escape (user directive
+                        // 2026-07-15): device-true O_DIRECT requests skip
+                        // the classifier/pipeline (prefetch fills are
+                        // publishes an escape-mode reader would never
+                        // consume — 2x amplification otherwise), skip
+                        // every tier serve probe, and dispatch straight
+                        // to a validated device read below. Overlay
+                        // probes above stay — RYW correctness is never
+                        // diagnostic-optional.
+                        let device_true = self.direct_device_true() && hint.odirect;
+                        if device_true {
+                            METRICS
+                                .read_device_true_reads
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         // §5.5 pipeline driver — once per request, before
                         // the serve probes: consume bookkeeping, growth on
                         // foreground-wait (key already in the single-
                         // flight = the reader caught the pipeline), and
                         // the windowed top-up.
-                        {
+                        if !device_true {
                             let first_key = block_keys.first().and_then(|(_, k)| k.as_deref());
                             let will_wait = first_key.is_some_and(|k| {
                                 self.inflight_block_reads.read_sync(k, |_, _| ()).is_some()
@@ -4655,7 +4888,7 @@ impl DataRouter {
                             // on free), so binding currency alone validates
                             // the serve. `Bytes` refcount hit; the reply
                             // slice is the only copy.
-                            if let Some(ref b_key) = b_key_opt {
+                            if let Some(b_key) = b_key_opt.as_ref().filter(|_| !device_true) {
                                 if let Some(hot) = self.cache.hot_block.get_no_promote(b_key) {
                                     let start = std::cmp::min(slice_start as usize, hot.len());
                                     let end = std::cmp::min(
@@ -4689,6 +4922,15 @@ impl DataRouter {
                                     {
                                         METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                                         METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
+                                        if hint.odirect {
+                                            // Hybrid I/O: O_DIRECT serves
+                                            // from OUR tiers by directive
+                                            // (kernel page cache stays
+                                            // bypassed kernel-side).
+                                            METRICS
+                                                .read_odirect_tier_serves
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                         return Ok((data, None));
                                     }
                                     METRICS
@@ -4709,7 +4951,7 @@ impl DataRouter {
                             // bytes, so binding currency alone validates the
                             // serve). On movement the validated loop below
                             // re-resolves and overwrites the dest.
-                            if let Some(ref b_key) = b_key_opt {
+                            if let Some(b_key) = b_key_opt.as_ref().filter(|_| !device_true) {
                                 if let Some(guard) =
                                     self.cache.nvme.get_cached_read_block_range_zero_copy(
                                         b_key,
@@ -4744,6 +4986,11 @@ impl DataRouter {
                                         .as_deref()
                                         == Some(b_key.as_str())
                                     {
+                                        if hint.odirect {
+                                            METRICS
+                                                .read_odirect_tier_serves
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                         return Ok((data, None));
                                     }
                                     METRICS
@@ -4759,12 +5006,21 @@ impl DataRouter {
                             // R3 ranged dispatch (§5.6) — strictly after the
                             // overlay/hot/tier probes missed: passthrough,
                             // small, non-streaming requests fetch only their
-                            // 4 KiB-aligned window. Never published, never
-                            // single-flighted; full fill discipline inside
-                            // the primitive. Hole ⇒ zeros, same as the
-                            // whole-block arm below.
+                            // 4 KiB-aligned window. First touches are never
+                            // published nor single-flighted; a second touch
+                            // within the ghost window escalates inside the
+                            // primitive (hybrid I/O). Hole ⇒ zeros, same as
+                            // the whole-block arm below.
+                            //
+                            // Device-true escape: EVERY request size takes
+                            // this window path on passthrough volumes (the
+                            // eligibility policy is for the default mode) —
+                            // exactly the requested bytes, device-true,
+                            // publish-free; the primitive skips the ghost.
                             if b_key_opt.is_some()
-                                && self.ranged_eligible(file_path, slice_len as u64)
+                                && ((device_true && self.get_crypto().is_passthrough())
+                                    || (!device_true
+                                        && self.ranged_eligible(file_path, slice_len as u64)))
                             {
                                 let rel = slice_start..slice_start + slice_len as u64;
                                 let aligned = slice_start % 4096 == 0
@@ -4787,6 +5043,7 @@ impl DataRouter {
                                         rel,
                                         b_key_opt.as_deref(),
                                         rdest,
+                                        hint,
                                     )
                                     .await?;
                                 match served {
@@ -4945,11 +5202,17 @@ impl DataRouter {
                                         match resolved {
                                             Some(r) => Some(r),
                                             None => {
+                                                // Device-true on a transform
+                                                // volume reaches here (decode
+                                                // requires the whole block):
+                                                // the fetch stays cache-free
+                                                // and publish-free.
                                                 let val = self
                                                     .get_block_for_index(
                                                         file_path,
                                                         start_block,
                                                         Some(b_key),
+                                                        device_true,
                                                     )
                                                     .await?;
                                                 match (val, dest_addr) {
@@ -5052,21 +5315,32 @@ impl DataRouter {
                     let block_keys = self
                         .load_striped_block_keys(file_path, &meta, start_block, end_block)
                         .await?;
+                    // Hybrid-I/O diagnostic escape: same contract as the
+                    // single-block arm (no classifier/pipeline, no tier
+                    // serves, no admission — validated device reads only).
+                    let device_true = self.direct_device_true() && hint.odirect;
+                    if device_true {
+                        METRICS
+                            .read_device_true_reads
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     // §5.5: multi-block reads advance the pipeline past
                     // end_block (consume span + top-up). The consume-time
                     // detector probes the first block's key like the
                     // single-block arm.
-                    self.pipeline_touch(
-                        file_path,
-                        &meta,
-                        block_size,
-                        offset,
-                        (end_offset - offset).max(1),
-                        start_block,
-                        end_block,
-                        false,
-                        block_keys.first().and_then(|(_, k)| k.as_deref()),
-                    );
+                    if !device_true {
+                        self.pipeline_touch(
+                            file_path,
+                            &meta,
+                            block_size,
+                            offset,
+                            (end_offset - offset).max(1),
+                            start_block,
+                            end_block,
+                            false,
+                            block_keys.first().and_then(|(_, k)| k.as_deref()),
+                        );
+                    }
 
                     let final_len = (end_offset - offset) as usize;
                     let (raw_ptr, final_buf_opt) = if let Some(dest) = dest_addr {
@@ -5132,7 +5406,10 @@ impl DataRouter {
                                 }
                                 actual_copy
                             } else if b_key_opt.is_some()
-                                && router.ranged_eligible(&file_path_clone, copy_len as u64)
+                                && ((device_true && router.get_crypto().is_passthrough())
+                                    || (!device_true
+                                        && router
+                                            .ranged_eligible(&file_path_clone, copy_len as u64)))
                             {
                                 // R3 (§5.6), multi-block per-block leg: this
                                 // block's slice is small/passthrough/non-
@@ -5141,6 +5418,9 @@ impl DataRouter {
                                 // guaranteed 4 KiB-aligned per block). Same
                                 // fill discipline inside the primitive;
                                 // Ok(None) = hole ⇒ the zero-fill below.
+                                // Device-true escape: every per-block slice
+                                // takes the window path on passthrough
+                                // volumes (single-block arm contract).
                                 match router
                                     .get_block_range_for_index(
                                         &file_path_clone,
@@ -5148,6 +5428,7 @@ impl DataRouter {
                                         rel_start as u64..(rel_start + copy_len) as u64,
                                         b_key_opt.as_deref(),
                                         None,
+                                        hint,
                                     )
                                     .await?
                                 {
@@ -5168,7 +5449,12 @@ impl DataRouter {
                                     None => 0,
                                 }
                             } else if let Some(downloaded) = router
-                                .get_block_for_index(&file_path_clone, b_idx, b_key_opt.as_deref())
+                                .get_block_for_index(
+                                    &file_path_clone,
+                                    b_idx,
+                                    b_key_opt.as_deref(),
+                                    device_true,
+                                )
                                 .await?
                             {
                                 // Binding-validated serve (reused-key stale-fill

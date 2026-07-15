@@ -179,7 +179,13 @@ async fn reader_loop(
         let ino = ino_src.load(Ordering::Acquire);
         let file_path = squeezefs::keys::inode_path(ino);
         let (data, _backing) = router
-            .read_file_range_zero_copy(&file_path, 0, len as u32, None)
+            .read_file_range_zero_copy(
+                &file_path,
+                0,
+                len as u32,
+                None,
+                squeezefs::routing::ReadClassHint::default(),
+            )
             .await
             .unwrap_or_else(|e| panic!("[{tag}] read errored during identity churn: {e:?}"));
         if data.len() != len {
@@ -502,7 +508,13 @@ async fn striped_pressure_storm_reads_never_stale_or_zeros() {
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Acquire) {
                     let (data, _b) = router
-                        .read_file_range_zero_copy(&file_path, off, 1024, None)
+                        .read_file_range_zero_copy(
+                            &file_path,
+                            off,
+                            1024,
+                            None,
+                            squeezefs::routing::ReadClassHint::default(),
+                        )
                         .await
                         .unwrap_or_else(|e| panic!("[rc5-striped] read errored: {e:?}"));
                     assert_eq!(data.len(), 1024, "[rc5-striped] short read of live data");

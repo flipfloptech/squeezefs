@@ -1321,7 +1321,39 @@ fn print_header(mount: &Path, mode: &BenchMode, resolved: &ResolvedShape, inv: &
             );
         }
     }
+    let uses_direct = match mode {
+        BenchMode::Suite => true,
+        BenchMode::Phases(_) => inv.direct,
+    };
+    if uses_direct {
+        print_direct_posture(mount);
+    }
     println!("{}", sep.bold());
+}
+
+/// Hybrid I/O (user directive 2026-07-15): O_DIRECT reads serve from and
+/// admit into the SqueezeFS read tiers by default, so `--direct` rows on a
+/// default mount measure the HYBRID posture (tier serves once warm), not
+/// the raw device path. The amplification/device-path methodology keeps
+/// its ruler via the mount-scoped escape: `-o direct_device_true` (or
+/// `SQUEEZEFS_DIRECT_DEVICE_TRUE=1` on the daemon). The bench sniffs the
+/// mount's `.stats` inode and prints which ruler the rows carry — a
+/// measurement note, never a gate (non-SqueezeFS mounts read as unknown).
+fn print_direct_posture(mount: &Path) {
+    let posture = std::fs::read_to_string(mount.join(".stats"))
+        .ok()
+        .map(|s| {
+            if s.contains("\"direct_device_true\": true")
+                || s.contains("\"direct_device_true\":true")
+            {
+                "device-true (-o direct_device_true): O_DIRECT rows measure the DEVICE path"
+            } else {
+                "hybrid (default): O_DIRECT rows may serve from the read tiers once warm; \
+                 mount with -o direct_device_true for device-path/amplification measurement"
+            }
+        })
+        .unwrap_or("unknown (.stats not readable — not a SqueezeFS v3 mount root?)");
+    println!("  direct-I/O posture: {posture}");
 }
 
 fn fmt_coverage(res: &PhaseResult) -> String {

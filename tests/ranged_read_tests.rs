@@ -41,7 +41,7 @@ use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
 use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
-use squeezefs::routing::{DataRouter, RangedDest};
+use squeezefs::routing::{DataRouter, RangedDest, ReadClassHint};
 use std::ffi::OsStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -371,6 +371,7 @@ async fn ranged_phases() {
                 ptr: dest_ptr,
                 cap: 16384,
             }),
+            ReadClassHint::default(),
         )
         .await
         .unwrap()
@@ -422,6 +423,7 @@ async fn ranged_phases() {
                 rel_start..rel_start + len as u64,
                 Some(&kb),
                 None,
+                ReadClassHint::default(),
             )
             .await
             .unwrap()
@@ -530,7 +532,13 @@ async fn raw_dest_leg_refuses_transform_configs() {
     // trigger shape (slice_start == 0 && slice_len == block_size && dest).
     let (data, _backing) =
         h.fs.router
-            .read_file_range_zero_copy(&path, 2 * block, block as u32, Some(dest_ptr as u64))
+            .read_file_range_zero_copy(
+                &path,
+                2 * block,
+                block as u32,
+                Some(dest_ptr as u64),
+                ReadClassHint::default(),
+            )
             .await
             .unwrap();
     assert_eq!(data.len(), block as usize);

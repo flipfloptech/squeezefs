@@ -195,6 +195,8 @@ Primary: after the fetch + (per-policy) publishes + final still-check, `let _ = 
 
 #### Admission decision (per >256 KiB validated fill; runs where the publish decision sits today, `routing.rs:1363`)
 
+> **Superseded in part (2026-07-15, hybrid I/O user directive — "hybrid I/O between buffered and O_DIRECT, best of both worlds, regardless of if the user is requesting O_DIRECT or not"):** O_DIRECT is **not** an admission class distinct from buffered anywhere in the shipped code — the flag labels observability only (`read_odirect_requests`, `read_odirect_tier_serves`, `read_odirect_ghost_admits`). O_DIRECT reads serve from every tier on hit (binding-validated like all serves) and their misses ride the same ghost second-touch admission as buffered. Additionally the §5.6 record-only stance for ranged misses is superseded: a ranged **second touch** within the ghost window now **escalates** to one whole-block ghost-admitted fetch (`ranged_read_ghost_escalations`), Red-paused via the mem-budget authority and churn-bounded by a per-key **escalation cooldown** (two-epoch wall-clock window, ~32–64 s — fitting working sets converge once; beyond-tier sets degrade to the device-true ranged path between windows instead of re-fetching + re-publishing 4 MiB per eviction, the R-5 spiral class in tier form). The pre-hybrid device-true posture survives as the mount-scoped diagnostic escape **`-o direct_device_true`** / `SQUEEZEFS_DIRECT_DEVICE_TRUE=1` (strict O_DIRECT no-serve + no-admit + no-ghost — the `.benchmarks` amplification-methodology ruler; buffered unaffected). Contracts: `tests/hybrid_io_tests.rs`; evidence: `.benchmarks/2026-07-15-hybrid-io.md`.
+
 | Fill class | Hot RAM tier (R4) | NVMe disk tier publish |
 |---|---|---|
 | **Streaming** (detector) or **O_DIRECT first touch** (flags) | put, **probation** | **skip** — the tax kill. `read_fill_publishes_skipped++` |
@@ -333,6 +335,11 @@ Sequential 1 MiB requests therefore keep the whole-block single-flight path (ded
 /// caller only; re-read heat is captured by the ghost table, whose second
 /// touch admits a WHOLE-block fetch + publish (§5.3) so genuinely hot
 /// sub-block ranges converge to cached whole blocks.
+/// [2026-07-15 hybrid I/O: the convergence is now SELF-DRIVEN — the ranged
+/// dispatch itself consults the ghost and escalates the second touch to
+/// that whole-block admitted fetch (the shipped record-only stance and its
+/// one-block N-reads amplification pin are superseded; first touches keep
+/// the N-distinct-blocks amplification contract verbatim).]
 pub async fn get_block_range_for_index(
     &self,
     file_path: &str,
@@ -470,6 +477,7 @@ New stats-inode fields (`generate_stats_json`, `fuse_client.rs:1071` region), pe
 | `read_streams_classified`, `read_odirect_requests` | classifier inputs (flags plumb + detector) |
 | `prefetch_issued`, `prefetch_completed`, `prefetch_wasted`, `prefetch_inflight_bytes`, `prefetch_window_hwm`, `prefetch_foreground_waits`, `prefetch_evicted_unconsumed`, `prefetch_active_streams` | R2: wasted ≫ 0 ⇒ abandonment/mis-detection; foreground_waits drive window growth and should decay to ~0 in steady state; **evicted_unconsumed is the refetch-spiral detector** (AIMD collapse trigger, §5.5) — sustained growth = hot budget too small for the stream population; **active_streams exposes the contention-scaling denominator** (two-epoch activity gauge, §5.5) — a value stuck above the plausible reader count would indicate the leak class the gauge design precludes |
 | `ranged_reads`, `ranged_read_bytes`, `ranged_read_unaligned_bounces`, `ranged_read_rebinds` | R3 adoption + amplification numerator; bounces ≫ 0 on O_DIRECT ⇒ alignment probe wrong |
+| `ranged_read_ghost_escalations`, `read_odirect_tier_serves`, `read_odirect_ghost_admits`, `read_device_true_reads`, `direct_device_true` | Hybrid I/O (2026-07-15 directive): ranged second-touch → whole-block admissions (≈ 0 on re-read-heavy random workloads = admission regressed); O_DIRECT-labeled serve/admit adoption; device-true diagnostic reads + mode flag (> 0 / `true` on a mount that should be hybrid = the escape is armed) |
 | `mem_budget_bytes`, `mem_budget_level`, `mem_budget_yellow_events`, `mem_budget_red_events`, `mem_budget_sheds{component}` | R5; red_events with no OOM is the designed outcome under pressure |
 | `mem_budget_unreclaimable_bytes`, `mem_budget_hard_backstops`, `mem_budget_backstop_active`, `mem_budget_tier_publish_paused`, `read_tier_publishes_paused`, `parked_gate_waits`, `parked_gate_self_flushes`, `parked_gate_timeouts` | §5.7 Red-semantics escalations (finding #2): the unreclaimable arm and its three responses. `hard_backstops` or `parked_gate_timeouts` growing on a quiet workload = convergence regression; `parked_gate_waits`/`parked_gate_self_flushes` > 0 is designed behavior under genuine Red |
 

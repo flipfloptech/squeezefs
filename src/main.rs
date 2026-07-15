@@ -345,7 +345,11 @@ enum Commands {
         rand: bool,
         /// O_DIRECT I/O — requires -b to be a multiple of 4096 and -s to be a
         /// multiple of -b (loud errors otherwise). The suite's I/O passes are
-        /// always O_DIRECT.
+        /// always O_DIRECT. NOTE (hybrid I/O): on a default mount O_DIRECT
+        /// reads serve from the SqueezeFS read tiers once warm — for
+        /// device-path/amplification measurement mount with
+        /// `-o direct_device_true` (the bench header prints which posture
+        /// the rows carry).
         #[arg(long)]
         direct: bool,
         /// Wall-clock time box in seconds for rand read/write passes

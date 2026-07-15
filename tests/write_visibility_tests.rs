@@ -465,6 +465,7 @@ async fn multiblock_read_zeroes_hole_into_reused_dest() {
                 read_off,
                 read_len as u32,
                 Some(dest.as_mut_ptr() as u64),
+                squeezefs::routing::ReadClassHint::default(),
             )
             .await
             .unwrap();

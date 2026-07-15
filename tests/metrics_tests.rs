@@ -48,6 +48,10 @@ fn test_lease_metrics_fields_exist() {
     let _ = METRICS.lease_acquire_ok.load(Ordering::Relaxed);
     let _ = METRICS.lease_acquire_fail.load(Ordering::Relaxed);
     let _ = METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed);
+    let _ = METRICS.writeback_superseded_noops.load(Ordering::Relaxed);
+    let _ = METRICS
+        .writeback_stale_token_retries
+        .load(Ordering::Relaxed);
     let _ = METRICS.layout_staged_writes.load(Ordering::Relaxed);
     let _ = METRICS.layout_striped_writes.load(Ordering::Relaxed);
 }

@@ -1193,6 +1193,17 @@ pub struct Metrics {
     pub lease_acquire_fail: Align64<AtomicU64>,
     /// Writeback path: durable flush hard failures (sticky).
     pub writeback_retry_exhaustions: Align64<AtomicU64>,
+    /// Writeback units resolved as SUPERSEDED no-ops (staged stamp no
+    /// longer matches the unit's token: a newer write re-staged the block
+    /// and owns its custody chain). The healthy churn outcome — the
+    /// FIND-M11-A contract that stale units resolve instead of livelock.
+    pub writeback_superseded_noops: Align64<AtomicU64>,
+    /// `FencingTokenExpired` failures that reached the retry ladder — a
+    /// TRANSIENT generation-bump race post-FIND-M11-A (the merge
+    /// credential is read fresh per attempt; superseded units no-op inside
+    /// the flush unit). Sustained growth on a quiet mount = the
+    /// constant-writeback livelock regressing.
+    pub writeback_stale_token_retries: Align64<AtomicU64>,
     /// Copy-on-write duplications of an active-block accumulation buffer
     /// forced by a live reader snapshot (zero-copy write-path design §5.2).
     /// Sequential streams never pay this; spikes mean read/write contention
@@ -2214,6 +2225,8 @@ impl SqueezefsFilesystem {
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),
                 "writeback_retry_exhaustions": METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed),
+                "writeback_superseded_noops": METRICS.writeback_superseded_noops.load(Ordering::Relaxed),
+                "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "active_block_cow_copies": METRICS.active_block_cow_copies.load(Ordering::Relaxed),
                 "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
@@ -2912,8 +2925,7 @@ impl SqueezefsFilesystem {
                 // extended order), so holding the block guard is legal.
                 // The RAM copy stays parked (readable) until the durable
                 // merge has published.
-                upload_active_block_bytes(ino, b, staging_copy, fencing_token, &self.router)
-                    .await?;
+                upload_active_block_bytes(ino, b, staging_copy, &self.router).await?;
                 self.active_block_buffers.remove(&key);
                 drop(block_guard);
             }
@@ -3620,7 +3632,6 @@ impl SqueezefsFilesystem {
             flush_due_active_blocks_for_inode(
                 ino,
                 block_indices,
-                fencing_token,
                 &self.router,
                 &self.dlm,
                 &self.active_inode_locks,
@@ -3691,10 +3702,12 @@ impl SqueezefsFilesystem {
                     "Writeback queue full; synchronous flush for ino {} block {}",
                     r.ino, r.block_idx
                 );
+                // The unit never enters the queue: its custody transfers to
+                // this authoritative flush of the block's newest staged
+                // state (owner_token = None).
                 flush_due_active_blocks_for_inode(
                     r.ino,
                     vec![r.block_idx],
-                    r.fencing_token,
                     &self.router,
                     &self.dlm,
                     &self.active_inode_locks,
@@ -3975,14 +3988,7 @@ impl SqueezefsFilesystem {
                             data.fill_complement_from(image.as_deref().unwrap_or(&[]));
                         }
                         data.zero_complete();
-                        match upload_active_block_bytes(
-                            ino,
-                            b,
-                            data.snapshot(),
-                            fencing_token,
-                            &self.router,
-                        )
-                        .await
+                        match upload_active_block_bytes(ino, b, data.snapshot(), &self.router).await
                         {
                             Ok(()) => {
                                 METRICS
@@ -4115,9 +4121,7 @@ impl SqueezefsFilesystem {
                 // not strand dirty RAM — upload the block durably right now
                 // (the escalation merges via the shared primitive, legal
                 // under the block guard per the P1-9 extended order).
-                if let Err(e) =
-                    upload_active_block_bytes(ino, b, staging_copy, fencing_token, &self.router)
-                        .await
+                if let Err(e) = upload_active_block_bytes(ino, b, staging_copy, &self.router).await
                 {
                     error!(
                         "Dismount durable upload failed for ino {} block {}: {:?}",
@@ -4210,12 +4214,16 @@ impl SqueezefsFilesystem {
                     .await?
                     .unwrap_or_default();
                 let is_striped = meta.file_type == "striped";
-                let fencing_token = dlm_clone.get_fencing_token_ino(ino);
 
+                // Authoritative dismount sweep (owner_token = None): flush
+                // whatever is staged regardless of the generation it was
+                // stamped under — acked custody bytes must reach the
+                // backend, and the entry must DRAIN so destroy's
+                // staged-drain wait is bounded (FIND-M11-A).
                 flush_single_active_block(
                     ino,
                     b,
-                    fencing_token,
+                    None,
                     &router_clone,
                     &dlm_clone,
                     &locks_clone,
@@ -8283,7 +8291,7 @@ async fn run_constant_writeback_worker(
             match flush_single_active_block(
                 req.ino,
                 req.block_idx,
-                req.fencing_token,
+                Some(req.fencing_token),
                 &router_clone,
                 &dlm_clone,
                 &locks_clone,
@@ -8293,6 +8301,16 @@ async fn run_constant_writeback_worker(
             {
                 Ok(()) => {}
                 Err(e) => {
+                    if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
+                        // Post-FIND-M11-A this is a TRANSIENT acquire-race
+                        // (generation bumped between the merge-credential
+                        // read and the merge's revalidation) — superseded
+                        // units no-op inside the flush unit and never get
+                        // here. Sustained growth = the livelock regressing.
+                        METRICS
+                            .writeback_stale_token_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     log::error!(
                         "Constant Writeback: Failed to flush block {} of inode {} (attempt {}): {:?}",
                         req.block_idx,
@@ -8322,8 +8340,16 @@ async fn run_constant_writeback_worker(
 ///   here, and dropping the unit would orphan its staged bytes' durability
 ///   promise. `Closed` means shutdown — teardown's force-flush owns the
 ///   staged data from there.
-/// - Genuinely superseded units (fencing/NotFound) never reach this ladder:
-///   the flush unit itself resolves them as clean no-ops.
+/// - Genuinely superseded units never reach this ladder: the flush unit
+///   itself resolves them as clean no-ops — a missing staged source
+///   (flushed/truncated/newer-write-took-RAM-authority) and a re-staged
+///   stamp (`owner_token` mismatch, `writeback_superseded_noops`) both
+///   return `Ok`. Enforced since FIND-M11-A: the unit's staging-era
+///   fencing token is ONLY the supersession test; the merge presents the
+///   ino's current generation, so `FencingTokenExpired` here is a
+///   transient bump race (`writeback_stale_token_retries`), never a
+///   permanently-stale token cycling at capped backoff (the incident_013
+///   kill-9 livelock).
 async fn requeue_or_hard_fail(
     requeue_tx: &tokio::sync::mpsc::Sender<WritebackRequest>,
     mut req: WritebackRequest,
@@ -8378,6 +8404,10 @@ async fn requeue_or_hard_fail(
 /// that block's `BLOCK_FLUSH_LOCKS`), streamed with bounded concurrency.
 /// Distinct blocks merge independently (the §5.3 primitive serializes map
 /// RMW under `INODE_META_LOCKS`); a missing staged source is a clean no-op.
+/// An AUTHORITATIVE sweep (`owner_token = None`): it owns whatever is
+/// staged for each block right now — fsync's durability barrier and the
+/// queue-full fallback both flush the newest staged state, and any queued
+/// unit for a block flushed here resolves as a no-op (source gone).
 ///
 /// Deliberately takes NO `active_inode_locks` guard: per-block atomicity
 /// (hazard 1) and the layout-prune epoch (hazard 2) carry the correctness,
@@ -8387,7 +8417,6 @@ async fn requeue_or_hard_fail(
 async fn flush_due_active_blocks_for_inode(
     ino: u64,
     block_indices: Vec<u32>,
-    fencing_token: u64,
     router: &DataRouter,
     _dlm: &DlmClient,
     _active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
@@ -8399,14 +8428,11 @@ async fn flush_due_active_blocks_for_inode(
     let is_striped = meta.file_type == "striped";
 
     let router_clone = router.clone();
-    let mut flushes =
-        stream::iter(block_indices.into_iter().map(move |block_idx| {
-            let router = router_clone.clone();
-            async move {
-                flush_one_active_block(ino, block_idx, fencing_token, &router, is_striped).await
-            }
-        }))
-        .buffer_unordered(8);
+    let mut flushes = stream::iter(block_indices.into_iter().map(move |block_idx| {
+        let router = router_clone.clone();
+        async move { flush_one_active_block(ino, block_idx, None, &router, is_striped).await }
+    }))
+    .buffer_unordered(8);
 
     while let Some(res) = flushes.next().await {
         res?;
@@ -8426,11 +8452,17 @@ async fn flush_due_active_blocks_for_inode(
 /// backpressure regime in which both fire concurrently. Callers may hold
 /// the victim's `BLOCK_FLUSH_LOCKS` (P1-9 extended order: block locks →
 /// INODE_META_LOCKS).
+///
+/// Custody path (FIND-M11-A discipline): the merge presents the ino's
+/// CURRENT DLM generation, read at merge time — its callers (fsync's
+/// buffer flush, dismount's RAM flush) move already-acked bytes, and an
+/// op-start token snapshot going stale mid-flush must degrade to a
+/// transient retryable error at worst, never a permanently-stale hard
+/// failure that strands dirty RAM at dismount.
 async fn upload_active_block_bytes(
     ino: u64,
     b: u32,
     block_bytes: bytes::Bytes,
-    fencing_token: u64,
     router: &DataRouter,
 ) -> Result<(), SqueezefsError> {
     let processed_block = router
@@ -8446,35 +8478,47 @@ async fn upload_active_block_bytes(
     block_allocator.publish_block(offset);
     let stored_block_key = router.backend_router.persist_block_key(&be_id, offset);
 
+    let merge_token = router.dlm.get_fencing_token_ino(ino);
     let entries = [(b, stored_block_key)];
-    let displaced = router
+    let merge_res = router
         .merge_block_mappings(
             ino,
             crate::routing::BlockMapOp::Merge(&entries),
             0,
             crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
-            fencing_token,
+            merge_token,
         )
-        .await?;
+        .await;
+    let displaced = match merge_res {
+        Ok(d) => d,
+        Err(e) => {
+            // The uploaded block never reached the map: free it before
+            // propagating (same leak rule as flush_one_active_block).
+            let _ = block_allocator.free_block(offset).await;
+            return Err(e);
+        }
+    };
     for bk in displaced {
         let _ = router.backend_router.free_block(&bk).await;
     }
     Ok(())
 }
 
-/// Writeback-worker entry: the inode READ guard (fsync-vs-write ordering
-/// courtesy) around the atomic per-block unit.
+/// Writeback-worker / teardown entry: the inode READ guard (fsync-vs-write
+/// ordering courtesy) around the atomic per-block unit. `owner_token` per
+/// [`flush_one_active_block`]: `Some(unit token)` for queued writeback
+/// units, `None` for authoritative sweeps.
 async fn flush_single_active_block(
     ino: u64,
     b: u32,
-    fencing_token: u64,
+    owner_token: Option<u64>,
     router: &DataRouter,
     _dlm: &DlmClient,
     active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
     is_striped: bool,
 ) -> Result<(), SqueezefsError> {
     let _inode_guard = active_inode_locks.get_inode_lock(ino).read().await;
-    flush_one_active_block(ino, b, fencing_token, router, is_striped).await
+    flush_one_active_block(ino, b, owner_token, router, is_striped).await
 }
 
 /// ONE ATOMIC PER-BLOCK FLUSH UNIT: upload staged active block `b` and merge
@@ -8499,10 +8543,36 @@ async fn flush_single_active_block(
 ///    revalidated inside the merge's critical section; on mismatch the
 ///    orphaned upload is freed and the flush re-captures — after a prune the
 ///    purged source is gone, so the retry no-ops.
+///
+/// FENCING / SUPERSESSION (FIND-M11-A, the constant-writeback livelock):
+/// `owner_token` is the SUPERSESSION test, never the merge credential.
+///
+/// - `Some(T)`: a writeback unit claiming the staging it enqueued with —
+///   `T` is the token stamped on the entry at `put_active_block` time. If
+///   the entry's CURRENT stamp differs, a newer write re-staged this block
+///   (every re-stage pairs with its own custody chain: a queued unit or the
+///   fsync/teardown sweeps), so this unit is genuinely superseded and
+///   resolves as a clean no-op — the ladder-doc contract.
+/// - `None`: an authoritative sweep (fsync-family, queue-full fallback,
+///   dismount force-flush) that owns whatever is staged NOW.
+///
+/// The MERGE presents the ino's *current* DLM generation, read fresh per
+/// attempt — never a token snapshotted at staging time. Staged custody
+/// bytes are acked data from this mount's own writes (single writer per
+/// volume by the mount-owner guard), and the generation only moves when
+/// this same process re-acquires the lease (open/close churn) — a
+/// staging-era snapshot goes permanently stale and livelocked the ladder
+/// (27 k+ error storms, kill-9 unmounts; incident_013). Cross-node/-mount
+/// staleness is governed where it always was: lease acquisition, fencing
+/// checks on the foreground write paths, and `recover_staging`'s
+/// generation binding ("stale fencing tokens discard staged work" is the
+/// remount contract, not a license to drop live acked custody). A racing
+/// bump between the read and the merge's internal revalidation surfaces
+/// as a TRANSIENT `FencingTokenExpired` that the retry ladder converges.
 async fn flush_one_active_block(
     ino: u64,
     b: u32,
-    fencing_token: u64,
+    owner_token: Option<u64>,
     router: &DataRouter,
     is_striped: bool,
 ) -> Result<(), SqueezefsError> {
@@ -8515,21 +8585,32 @@ async fn flush_one_active_block(
         METRICS.block_lock_wait.record(start_block_lock.elapsed());
 
         let capture_epoch = crate::routing::layout_prune_epoch(ino);
-        // Existence probe WITHOUT holding a shard guard across the meta-I/O
-        // allocate below: the §5.5 DMA source is a staging-shard READ guard,
-        // and a task suspended on `allocate_block().await` while holding it
-        // parks every subsequent shard access behind parking_lot's queued-
-        // writer fairness until the executor has no worker left to resume
-        // this task — the observed total-wedge under the fsx-075 harness.
-        // Allocate first (no guard), then take the source; the only await
-        // under the guard is the DMA itself, whose request owns the guard.
-        if router
-            .cache
-            .nvme
-            .read_staged_zero_copy(&cache_key)
-            .is_none()
-        {
-            return Ok(());
+        // Existence + ownership probe WITHOUT holding a shard guard across
+        // the meta-I/O allocate below: the §5.5 DMA source is a staging-
+        // shard READ guard, and a task suspended on `allocate_block().await`
+        // while holding it parks every subsequent shard access behind
+        // parking_lot's queued-writer fairness until the executor has no
+        // worker left to resume this task — the observed total-wedge under
+        // the fsx-075 harness. Allocate first (no guard), then take the
+        // source; the only await under the guard is the DMA itself, whose
+        // request owns the guard.
+        let staged_token = match router.cache.nvme.get_staged_fencing_token(&cache_key) {
+            Some(t) => t,
+            // Gone (flushed / truncated / newer write took RAM authority):
+            // nothing to flush.
+            None => return Ok(()),
+        };
+        if let Some(owner) = owner_token {
+            if staged_token != owner {
+                // Superseded: a newer write re-staged this block under a
+                // newer stamp and owns its custody chain. Resolve as the
+                // contractual no-op instead of feeding the retry ladder a
+                // permanently stale unit.
+                METRICS
+                    .writeback_superseded_noops
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
         }
 
         let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
@@ -8577,6 +8658,12 @@ async fn flush_one_active_block(
         // displaced-from-current keys the primitive returns — the old
         // start-of-call `old_block_key` free was exactly the stale-snapshot
         // anti-pattern the routing merge comment forbids.
+        //
+        // The merge credential is the ino's CURRENT generation, read at the
+        // last responsible moment (see the fencing/supersession doc above):
+        // supersession was already decided by the staged stamp, and a
+        // staging-era snapshot here is the FIND-M11-A livelock.
+        let merge_token = router.dlm.get_fencing_token_ino(ino);
         let entries = [(b, stored_block_key.clone())];
         let merge_res = router
             .merge_block_mappings_if_epoch(
@@ -8584,7 +8671,7 @@ async fn flush_one_active_block(
                 crate::routing::BlockMapOp::Merge(&entries),
                 0,
                 crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
-                fencing_token,
+                merge_token,
                 Some(capture_epoch),
             )
             .await;
@@ -8631,17 +8718,22 @@ async fn flush_one_active_block(
         }
 
         // ONLY remove active write block from cache if it hasn't been
-        // modified by a newer write. spawn_blocking: the shard WRITE lock
-        // must never park an async worker (see the probe comment above —
-        // this exact remove was a parked frame in the observed wedge).
+        // modified by a newer write — keyed on the CAPTURE-TIME staged
+        // stamp, never the merge credential: teardown/fsync sweeps flush
+        // under the current generation while the entry carries its
+        // staging-era stamp, and comparing against the presented token
+        // leaked every such entry (`staged_writes_in_flight` never drained
+        // — the FIND-M11-A unmount drain-wait wedge). spawn_blocking: the
+        // shard WRITE lock must never park an async worker (see the probe
+        // comment above — this exact remove was a parked frame in the
+        // observed wedge).
         {
             let nvme = router.cache.nvme.clone();
             let key = cache_key.clone();
-            let token = fencing_token;
             tokio::task::spawn_blocking(move || {
                 let current_token = nvme.get_staged_fencing_token(&key);
                 if let Some(tok) = current_token {
-                    if tok == token {
+                    if tok == staged_token {
                         nvme.remove_active_block(&key);
                     }
                 } else {

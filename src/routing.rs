@@ -1510,6 +1510,25 @@ pub fn block_mapping_form(mapping_str: &str) -> &'static str {
     }
 }
 
+/// **The single W1 predicate-1 source** (design-random-small-writes §5.1,
+/// review Issue 19): `true` ⇔ `mapping_str` is the **undecorated 2-part
+/// whole-block form** — the shape `persist_block_key` emits for every
+/// ordinary striped block (bare `offset` / `be://offset` strings), which
+/// `parse_block_mapping` returns as `(bk, 0, block_size, exact == false)`.
+///
+/// Polarity note (normative): eligibility must **NOT** be keyed on the
+/// `exact` flag — `exact == true` marks precisely the decorated 3-part
+/// `bk:off:len` form (promoted staged files, the *ineligible* population);
+/// a predicate demanding it would patch nothing, the loss dataset
+/// included. Call sites use THIS helper, never raw flag polarity; the
+/// decorated form counts `patch_ineligible_decorated` and holes (unmapped)
+/// count `patch_ineligible_unmapped`.
+pub fn is_whole_block_mapping(mapping_str: &str) -> bool {
+    // RED scaffolding (PR RW2): wired by the implementation commit.
+    let _ = mapping_str;
+    false
+}
+
 impl DataRouter {
     pub fn set_meta_backend(
         &self,

@@ -1063,6 +1063,25 @@ impl NvmeStaging {
         admitted
     }
 
+    /// **Lock-free staged-existence probe** (design-random-small-writes
+    /// §5.1 predicate 2 / review Issue 10): does a staged `active_block:`
+    /// entry exist for `key`? Served from a latch-free occupancy index —
+    /// the W1 patch hot path must NOT inherit the per-write
+    /// `spawn_blocking` + staging-shard-WRITE-lock hop (the H1 class), and
+    /// `NvmeCache::contains`'s `read_recursive` still parks behind an
+    /// ACTIVE writer's ms-class critical section.
+    ///
+    /// Coherence contract (conservative-present — the corruption-safe
+    /// direction): any window in which a staged entry EXISTS for `key` has
+    /// the key present in the index (false positives are harmless — the
+    /// caller falls back to the accumulation path; a false NEGATIVE would
+    /// let a patch race a pending writeback flush of stale staged bytes).
+    pub fn has_staged_active_block(&self, key: &str) -> bool {
+        // RED scaffolding (PR RW2): wired by the implementation commit.
+        let _ = key;
+        false
+    }
+
     /// Remove a packed active block write from staging_nvme_cache.
     pub fn remove_active_block(&self, key: &str) -> Option<Vec<u8>> {
         let val = self.read_staged(key);

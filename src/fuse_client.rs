@@ -264,6 +264,34 @@ pub fn op_profile_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("SQUEEZEFS_OP_PROFILE").is_ok_and(|v| v == "1"))
 }
 
+/// `SQUEEZEFS_PATCH_MAX_BYTES` cell (design-random-small-writes §6): max
+/// length of a W1 sole-owner in-place patch. Default **512 KiB**; `0`
+/// disables the patch path — the A/B lever for acceptance runs (and the
+/// pin lever for tests that document the patch-INELIGIBLE accumulation
+/// pipeline), not an operational escape hatch. Env is read once
+/// (memoized — never on the per-op path); the atomic cell keeps the
+/// A/B flip runtime-settable via [`set_patch_max_bytes`].
+fn patch_max_bytes_cell() -> &'static AtomicU64 {
+    static CELL: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_PATCH_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(512 * 1024);
+        AtomicU64::new(v)
+    })
+}
+
+/// Current W1 patch length cap in bytes (`0` = patch path disabled).
+pub fn patch_max_bytes() -> u64 {
+    patch_max_bytes_cell().load(Ordering::Relaxed)
+}
+
+/// Set the W1 patch length cap (the §6 A/B lever; tests/acceptance).
+pub fn set_patch_max_bytes(v: u64) {
+    patch_max_bytes_cell().store(v, Ordering::Relaxed);
+}
+
 /// Op types the registry attributes — the mdstorm-visible request mix
 /// plus every op class that lost its per-op `timeout()` wrapper to the
 /// D1.b watchdog (read/write/readdir/link-family/fsync can all park on
@@ -1764,6 +1792,60 @@ pub struct Metrics {
     /// H3 evidence: `ALIGNED_BUF_POOL` handouts that missed the recycle
     /// queue and paid the mmap/page-fault allocation path.
     pub aligned_pool_misses: Align64<AtomicU64>,
+    // -----------------------------------------------------------------
+    // RW2 W1 sole-owner extent patch (docs/design-random-small-writes.md
+    // §5.1/§5.4). `patch_writes`/`patch_write_bytes` count in-place
+    // sub-block DMAs (device cost per op: ONE LBA-aligned write, zero
+    // reads, zero meta, zero staging); the `patch_ineligible_*` family is
+    // the predicate's decision ledger — every striped small-write that
+    // does NOT patch counts exactly one bucket (its FIRST failing
+    // predicate, in the documented order), so
+    // Σ(patch_writes + patch_ineligible_*) reconciles against striped
+    // write_file_staged invocations. Regression semantics (§9):
+    // `patch_ineligible_*` growing on a shape that should patch =
+    // predicate rot; `patch_edge_rmw_reads` > 0 = alignment/predicate
+    // regression BY DEFINITION (v1 is aligned-only — the counter exists
+    // for the phase-2 edge path and is a G-RW2 gate clause at 0).
+    // -----------------------------------------------------------------
+    /// Sole-owner in-place patches (one aligned sub-block DMA each).
+    pub patch_writes: Align64<AtomicU64>,
+    /// User bytes delivered by patches (== Σ patched lengths).
+    pub patch_write_bytes: Align64<AtomicU64>,
+    /// Phase-2 unaligned-edge RMW seed reads. **Must stay 0 in v1**
+    /// (aligned-only): any growth is an alignment/predicate regression
+    /// (G-RW2 gate clause).
+    pub patch_edge_rmw_reads: Align64<AtomicU64>,
+    /// Predicate 1 failures: target block unmapped (hole / not striped /
+    /// no inline map entry — indirect-mapped files fall here too).
+    pub patch_ineligible_unmapped: Align64<AtomicU64>,
+    /// Predicate 1 failures: decorated `bk:off:len` mapping (promoted
+    /// staged / spill / clip publishes) — patching must never scribble
+    /// relative to a decorated window.
+    pub patch_ineligible_decorated: Align64<AtomicU64>,
+    /// Predicate 5 failures: offset or length not 4096-LBA-aligned
+    /// (v1 disposition — today's accumulation path).
+    pub patch_ineligible_unaligned: Align64<AtomicU64>,
+    /// Predicate 2 failures: a RAM `ActiveBlockBuf` or staged
+    /// `active_block:` entry owns the block (accumulation in progress —
+    /// merge into it, today's path).
+    pub patch_ineligible_overlay: Align64<AtomicU64>,
+    /// Predicate 4 failures: block refcount != 1 (clone-shared — CoW).
+    pub patch_ineligible_shared: Align64<AtomicU64>,
+    /// Predicate 3 failures: compressed/encrypted volume (a transform
+    /// image cannot be patched in place).
+    pub patch_ineligible_transform: Align64<AtomicU64>,
+    /// Predicate 6 failures: stream-adjacent (offset == the ino's
+    /// previous write end) — sequential streams keep the whole-block
+    /// write-through economy.
+    pub patch_ineligible_adjacent: Align64<AtomicU64>,
+    /// Predicate 5 size/window failures: length > `SQUEEZEFS_PATCH_MAX_BYTES`,
+    /// the request spans blocks, or the write EXTENDS the file (i_size
+    /// must grow ⇒ a meta commit is owed ⇒ ineligible) — the size/window
+    /// class, one bucket by design (§5.4 family list).
+    pub patch_ineligible_oversize: Align64<AtomicU64>,
+    /// Patch DMA failures (EIO surfaced to exactly this write; tiers
+    /// purged + incarnation re-stabilized — nothing acked, nothing lost).
+    pub patch_dma_errors: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -2751,6 +2833,20 @@ impl SqueezefsFilesystem {
                 "write_block_revisits": METRICS.write_block_revisits.load(Ordering::Relaxed),
                 "staging_sibling_probes": METRICS.staging_sibling_probes.load(Ordering::Relaxed),
                 "aligned_pool_misses": METRICS.aligned_pool_misses.load(Ordering::Relaxed),
+                // RW2 W1 sole-owner extent patch families (design-random-
+                // small-writes §5.4 — the decision ledger + gate tripwires).
+                "patch_writes": METRICS.patch_writes.load(Ordering::Relaxed),
+                "patch_write_bytes": METRICS.patch_write_bytes.load(Ordering::Relaxed),
+                "patch_edge_rmw_reads": METRICS.patch_edge_rmw_reads.load(Ordering::Relaxed),
+                "patch_ineligible_unmapped": METRICS.patch_ineligible_unmapped.load(Ordering::Relaxed),
+                "patch_ineligible_decorated": METRICS.patch_ineligible_decorated.load(Ordering::Relaxed),
+                "patch_ineligible_unaligned": METRICS.patch_ineligible_unaligned.load(Ordering::Relaxed),
+                "patch_ineligible_overlay": METRICS.patch_ineligible_overlay.load(Ordering::Relaxed),
+                "patch_ineligible_shared": METRICS.patch_ineligible_shared.load(Ordering::Relaxed),
+                "patch_ineligible_transform": METRICS.patch_ineligible_transform.load(Ordering::Relaxed),
+                "patch_ineligible_adjacent": METRICS.patch_ineligible_adjacent.load(Ordering::Relaxed),
+                "patch_ineligible_oversize": METRICS.patch_ineligible_oversize.load(Ordering::Relaxed),
+                "patch_dma_errors": METRICS.patch_dma_errors.load(Ordering::Relaxed),
                 "active_block_memset_elided_bytes": METRICS.active_block_memset_elided_bytes.load(Ordering::Relaxed),
                 "meta_device_syncs": METRICS.meta_device_syncs.load(Ordering::Relaxed),
                 "meta_sync_requests": METRICS.meta_sync_requests.load(Ordering::Relaxed),

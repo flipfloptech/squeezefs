@@ -134,6 +134,17 @@ impl BlockAllocator {
         }
     }
 
+    /// Read-only refcount accessor (design-random-small-writes §5.1
+    /// predicate 4 / review Issue 10 — RW2 adds it; only
+    /// [`Self::increment_refcount`] existed before). `None` = untracked
+    /// offset (never allocated by this process / already freed) — callers
+    /// must treat it as NOT provably sole-owned.
+    pub fn refcount(&self, offset: u64) -> Option<u32> {
+        // RED scaffolding (PR RW2): wired by the implementation commit.
+        let _ = offset;
+        None
+    }
+
     pub fn volume_id(&self) -> &str {
         &self._volume_id
     }

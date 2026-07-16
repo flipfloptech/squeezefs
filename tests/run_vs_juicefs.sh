@@ -40,7 +40,16 @@
 #   tests/run_vs_juicefs.sh                    # full scoreboard (~30-60 min)
 #   SQUEEZEFS_VS_SMOKE=1 tests/run_vs_juicefs.sh   # micro-grid plumbing proof
 #   SQUEEZEFS_VS_REGIMES="R2" tests/run_vs_juicefs.sh
-#   SQUEEZEFS_VS_ALLOW_LOSS="R1.rand_write_4k" tests/run_vs_juicefs.sh
+#   SQUEEZEFS_VS_ALLOW_LOSS="R1.seq_write_1m,R3.seq_write_1m" tests/run_vs_juicefs.sh
+#
+# STANDING ALLOWLIST (the scoreboard's debt ledger — G-RW5): exactly the
+# two seq-write ACK-semantics artifact rows above (R1/R3 compare an
+# acked-into-cache JuiceFS number against SqueezeFS's device-included ACK;
+# the device-true R2 row is an honest SqueezeFS W — scoreboard report
+# §Loss 1). The three R{1,2,3}.rand_write_4k rows left the ledger the day
+# PR RW2's W1 sole-owner extent patch landed (design-random-small-writes
+# G-RW5; acceptance: .benchmarks/2026-07-17-rw2-sole-owner-patch.md).
+# RW6's durability-leveled seq-write mode would take the remainder to 0.
 #
 # Exit code: 0 = no loss rows (gate green); 1 = at least one LOSS/INVALID row
 # not covered by SQUEEZEFS_VS_ALLOW_LOSS; 2 = harness/setup failure.

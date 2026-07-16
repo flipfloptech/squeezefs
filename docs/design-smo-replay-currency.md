@@ -1,6 +1,18 @@
 # Design decision: SMO routing currency vs the checkpoint tail — closing the FIND-VS-A acked-loss residual
 
-**Status: Approved** (writer/reviewer consensus, 2 review rounds, 11 issues resolved).
+**Status: Implemented** (2026-07-16; approved at writer/reviewer consensus, 2 review rounds, 11 issues
+resolved). All three fix branches + the PR 5 acceptance gate landed on `dev`:
+
+| Program row | Branch | Commits (dev) | Evidence |
+|---|---|---|---|
+| PR 1 scaffolding + 1(a)/(c) + PR 2 (C′ two-phase replay) | `fix/kv-smo-two-phase-replay` | `0b6555d..89ea158` | `.benchmarks/2026-07-16-smo-two-phase-replay.md` |
+| PR 1(d) + PR 3 (FIND-SMO-TAIL entry-start floors) | `fix/kv-mid-entry-tail-floors` | `5a82ff7..f41a0eb` | `.benchmarks/2026-07-16-mid-entry-tail-fix.md` |
+| PR 1(b) + PR 4 (Option A coverage-gated pending-free) | `fix/kv-pending-free-coverage` | `0377431..9f4bf2c` | `.benchmarks/2026-07-16-pending-free-coverage-fix.md` |
+| PR 5 (acceptance gate + closure) | `docs/smo-program-closure` (this branch) | follows `9f4bf2c` | `.benchmarks/2026-07-16-smo-program-closing.md` — the ×10 joint storm soak (acked-loss == 0 AND refusals == 0 AND `dropped_torn == 0`, 5 full-mask + 5 `taskset 0-15`), suites, doc deltas |
+
+Normative deltas folded into `docs/design-cow-kv-metadata.md`: §4.6 (two-phase replay bullet; pt 2
+entry-start floor rounding), §4.7 (coverage-gated pending-free + at-cap force-cycle), §4.10 (SMO-window
+closure note).
 
 **Revision 2** (folds the round-1 review, `/tmp/grok-design-smo/review.md` — all 8 issues addressed;
 the C′+A recommendation is unchanged and the reviewer concurs).

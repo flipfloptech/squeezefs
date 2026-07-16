@@ -434,6 +434,52 @@ pub struct PendingStagedWrite {
     pub padded_size: u64,
 }
 
+/// Same-key replace framing slack for [`shard_plan`]: two copies' key
+/// frames (4 KiB each), metadata/pad frames (4 KiB each), and 4 KiB
+/// placement alignment per copy, rounded up with margin.
+const SHARD_REPLACE_SLACK: u64 = 64 * 1024;
+
+/// Plan the per-device shard count for a segment ring of
+/// `per_device_capacity` bytes holding entries up to `max_entry_bytes`.
+///
+/// Invariant (FIND-VS-B): a shard must fit a same-key crash-safe REPLACE
+/// of a block-size-class entry. [`crate::tiering::nvme::NvmeShard::reserve_and_write`]
+/// keeps the existing copy live while its replacement is placed (torn-write
+/// immunity — never overwrite the sole copy in place), so the shard needs
+/// `2 × entry + framing` headroom. Below that the refusal is *structural*:
+/// every re-stage of a near-block-size staged file fails regardless of how
+/// idle the ring is, and the write path degrades to a per-op durable spill
+/// / device-RMW-seed alternation — the deterministic
+/// `staged_rmw_pooled_seeds` 100-of-200 storm signature, first visible on
+/// ≥ 17-core boxes where `next_power_of_two(cores)` doubled the shard
+/// count and halved shard capacity to exactly one entry.
+///
+/// The configured capacity budget is authoritative and never inflated
+/// (the pre-fix sizing silently grew the ring to `shards × 4 MiB`);
+/// the shard count adapts downward instead — fewer, larger shards trade
+/// lock granularity for a structurally functional ring. Halving from a
+/// power-of-two default preserves the power-of-two invariant
+/// [`crate::tiering::nvme::NvmeCache::new`] asserts; the floor is one
+/// shard (a sub-headroom total budget degrades to the designed loud
+/// spill path, it does not brick construction).
+///
+/// Tiny pools (< 10 MiB/device) are one whole-pool shard unconditionally:
+/// splitting them gains no lock parallelism worth having and shrinks the
+/// largest admissible entry below shapes callers legitimately stage
+/// (pre-fix behavior, pinned by the shard-full contract in
+/// `tests/staging_budget_tests.rs`).
+fn shard_plan(per_device_capacity: u64, default_shards: usize, max_entry_bytes: u64) -> usize {
+    if per_device_capacity < 10 * 1024 * 1024 {
+        return 1;
+    }
+    let min_shard = 2 * max_entry_bytes + SHARD_REPLACE_SLACK;
+    let mut shards = std::cmp::max(default_shards, 1);
+    while shards > 1 && per_device_capacity / (shards as u64) < min_shard {
+        shards /= 2;
+    }
+    shards
+}
+
 impl NvmeStaging {
     /// `fs_generation` binds every staging dir to the mounted filesystem
     /// generation (`meta_backend::volume_set_generation`): the generation
@@ -512,65 +558,48 @@ impl NvmeStaging {
         // thread's mask — the Hang-1 sizing poison (see `crate::cpu`).
         let cores = crate::cpu::process_parallelism();
         let default_shards = std::cmp::max(cores.next_power_of_two(), 16);
-
-        let (read_shards, actual_max_read_bytes) = if max_read_bytes < 10 * 1024 * 1024 {
-            (1, max_read_bytes)
-        } else {
-            #[cfg(test)]
-            {
-                let mut shards = default_shards;
-                while shards > 16 && max_read_bytes / (shards as u64) < 4 * 1024 * 1024 {
-                    shards /= 2;
-                }
-                (shards, max_read_bytes)
-            }
-            #[cfg(not(test))]
-            {
-                let min_required = (default_shards * 4 * 1024 * 1024) as u64;
-                (default_shards, std::cmp::max(max_read_bytes, min_required))
-            }
-        };
+        let max_entry_bytes = crate::routing::default_block_size();
 
         let read_cache_dirs_refs: Vec<&std::path::Path> =
             read_cache_dirs.iter().map(|p| p.as_path()).collect();
-        let read_capacities = if staging_dirs.is_empty() {
-            vec![actual_max_read_bytes as usize]
-        } else {
-            let read_cap = actual_max_read_bytes as usize / staging_dirs.len();
-            vec![read_cap; staging_dirs.len()]
-        };
+        let read_device_count = std::cmp::max(staging_dirs.len(), 1);
+        let read_shards = shard_plan(
+            max_read_bytes / read_device_count as u64,
+            default_shards,
+            max_entry_bytes,
+        );
+        let read_capacities =
+            vec![(max_read_bytes as usize) / read_device_count; read_device_count];
         let read_nvme_cache = Arc::new(crate::tiering::nvme::NvmeCache::new(
             &read_cache_dirs_refs,
             &read_capacities,
             read_shards,
         )?);
 
-        let (write_shards, actual_max_write_bytes) = if max_write_bytes < 10 * 1024 * 1024 {
-            (1, max_write_bytes)
-        } else {
-            #[cfg(test)]
-            {
-                let mut shards = default_shards;
-                while shards > 16 && max_write_bytes / (shards as u64) < 4 * 1024 * 1024 {
-                    shards /= 2;
-                }
-                (shards, max_write_bytes)
-            }
-            #[cfg(not(test))]
-            {
-                let min_required = (default_shards * 4 * 1024 * 1024) as u64;
-                (default_shards, std::cmp::max(max_write_bytes, min_required))
-            }
-        };
-
         let staging_dirs_refs: Vec<&std::path::Path> =
             staging_segment_dirs.iter().map(|p| p.as_path()).collect();
-        let write_capacities = if staging_dirs.is_empty() {
-            vec![actual_max_write_bytes as usize]
-        } else {
-            let write_cap = actual_max_write_bytes as usize / staging_dirs.len();
-            vec![write_cap; staging_dirs.len()]
-        };
+        let write_device_count = std::cmp::max(staging_dirs.len(), 1);
+        let per_device_write_capacity = max_write_bytes / write_device_count as u64;
+        let write_shards = shard_plan(per_device_write_capacity, default_shards, max_entry_bytes);
+        if !staging_dirs.is_empty()
+            && per_device_write_capacity < 2 * max_entry_bytes + SHARD_REPLACE_SLACK
+        {
+            // Even one whole device ring cannot re-stage a block-size-class
+            // entry in place (same-key replace holds two copies): every such
+            // re-stage will take the durable spill path. Loud once at
+            // construction — the per-op spill warn downstream is rate-limited
+            // and easy to misread as transient pressure.
+            log::warn!(
+                "staging budget {} B/device is below the same-key replace headroom for \
+                 {} B block-size-class entries ({} B needed): near-block-size staged \
+                 files will spill durably on every rewrite",
+                per_device_write_capacity,
+                max_entry_bytes,
+                2 * max_entry_bytes + SHARD_REPLACE_SLACK,
+            );
+        }
+        let write_capacities =
+            vec![(max_write_bytes as usize) / write_device_count; write_device_count];
         let staging_nvme_cache = Arc::new(crate::tiering::nvme::NvmeCache::new(
             &staging_dirs_refs,
             &write_capacities,
@@ -617,8 +646,8 @@ impl NvmeStaging {
 
         let staging = Self {
             staging_dirs: staging_dirs.clone(),
-            max_write_bytes: actual_max_write_bytes,
-            max_read_bytes: actual_max_read_bytes,
+            max_write_bytes,
+            max_read_bytes,
             block_allocator: block_allocator.clone(),
             nvme_writer: nvme_writer.clone(),
             backend_router,
@@ -1522,5 +1551,84 @@ impl NvmeStaging {
 
     pub fn max_read_bytes(&self) -> u64 {
         self.max_read_bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shard_plan, SHARD_REPLACE_SLACK};
+
+    const MIB: u64 = 1024 * 1024;
+    const ENTRY: u64 = 4 * MIB; // default block size class
+
+    /// FIND-VS-B geometry: the storm fixture (128 MiB staging, 4 MiB
+    /// blocks) must never be planned into structural same-key-replace
+    /// refusal, no matter how wide the box is. Pre-fix,
+    /// `default_shards = next_power_of_two(25 cores) = 32` yielded 4 MiB
+    /// shards — exactly one entry, zero replace headroom — and every
+    /// re-stage spilled durably (the deterministic pooled_seeds 100/200
+    /// signature).
+    #[test]
+    fn shard_plan_replace_headroom_invariant_across_box_widths() {
+        let min_shard = 2 * ENTRY + SHARD_REPLACE_SLACK;
+        for default_shards in [16usize, 32, 64, 128, 512] {
+            for capacity_mib in [10u64, 64, 100, 128, 256, 500, 1024, 4096, 65536] {
+                let capacity = capacity_mib * MIB;
+                let shards = shard_plan(capacity, default_shards, ENTRY);
+                assert!(shards >= 1, "never zero shards");
+                assert!(
+                    shards.is_power_of_two(),
+                    "NvmeCache::new asserts power-of-two shard counts, got {shards}"
+                );
+                assert!(
+                    shards == 1 || capacity / shards as u64 >= min_shard,
+                    "structural replace refusal planned back in: {capacity} B / \
+                     {shards} shards (default {default_shards}) < {min_shard} B floor"
+                );
+            }
+        }
+    }
+
+    /// The exact pre-fix failure geometry: 128 MiB budget on a 32-shard
+    /// (≥ 17-core) box must plan shards large enough to hold two live
+    /// copies of a 4 MiB-class entry.
+    #[test]
+    fn shard_plan_find_vs_b_geometry_holds_two_copies() {
+        let shards = shard_plan(128 * MIB, 32, ENTRY);
+        assert_eq!(
+            shards, 8,
+            "128 MiB / 8 = 16 MiB shards (two copies + slack)"
+        );
+        assert!(128 * MIB / shards as u64 >= 2 * ENTRY + SHARD_REPLACE_SLACK);
+    }
+
+    /// Production-scale budgets keep the full default shard fan-out — the
+    /// plan only narrows when the budget cannot carry it.
+    #[test]
+    fn shard_plan_large_budgets_keep_default_fanout() {
+        assert_eq!(shard_plan(500 * MIB, 32, ENTRY), 32);
+        assert_eq!(shard_plan(64 * 1024 * MIB, 512, ENTRY), 512);
+    }
+
+    /// The configured budget is authoritative: sub-headroom totals floor at
+    /// one shard (degrading to the loud spill path) instead of inflating
+    /// the operator's disk budget the way the pre-fix sizing did.
+    #[test]
+    fn shard_plan_tiny_budgets_floor_at_one_shard_never_inflate() {
+        assert_eq!(shard_plan(MIB, 16, ENTRY), 1);
+        assert_eq!(shard_plan(0, 16, ENTRY), 1);
+        assert_eq!(shard_plan(6 * MIB, 32, ENTRY), 1);
+    }
+
+    /// Tiny pools stay one whole-pool shard even when the block-size class
+    /// is small enough that the replace-headroom floor alone would permit
+    /// splitting: the largest admissible entry must remain the whole pool
+    /// (the `tests/staging_budget_tests.rs` shard-full contract stages
+    /// 300 KiB entries into a 1 MiB pool under a 64 KiB block class).
+    #[test]
+    fn shard_plan_tiny_pools_stay_whole_even_for_small_entries() {
+        assert_eq!(shard_plan(MIB, 32, 64 * 1024), 1);
+        // At/above the tiny-pool bound the headroom floor governs again.
+        assert_eq!(shard_plan(10 * MIB, 32, 64 * 1024), 32);
     }
 }

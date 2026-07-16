@@ -1461,6 +1461,21 @@ impl Drop for InflightBlockReadGuard {
     }
 }
 
+/// Process-default block size: `SQUEEZEFS_DEFAULT_BLOCK_SIZE` or 4 MiB.
+///
+/// This is the construction-time default [`DataRouter::new`] seeds
+/// `block_size` with (a mount may raise it later via
+/// [`DataRouter::set_block_size`] at FUSE init). The staging shard plan
+/// ([`crate::cache::nvme`]) sizes its same-key replace headroom against
+/// this value: staged entries are block-size-class by construction, so the
+/// plan and the router must agree on the default.
+pub fn default_block_size() -> u64 {
+    std::env::var("SQUEEZEFS_DEFAULT_BLOCK_SIZE")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(4 * 1024 * 1024)
+}
+
 impl DataRouter {
     pub fn set_meta_backend(
         &self,
@@ -1713,11 +1728,8 @@ impl DataRouter {
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     ) -> Self {
-        let default_block_size = std::env::var("SQUEEZEFS_DEFAULT_BLOCK_SIZE")
-            .ok()
-            .and_then(|val| val.parse::<u64>().ok())
-            .unwrap_or(4 * 1024 * 1024);
-        let block_size = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(default_block_size));
+        let block_size =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(default_block_size()));
         let backend_router = std::sync::Arc::new(BackendRouter::new(
             block_allocator.clone(),
             nvme_writer.clone(),

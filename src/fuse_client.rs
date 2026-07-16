@@ -879,9 +879,16 @@ pub enum BlockLockSite {
     Punch = 4,
     /// `drop_active_block_overlays_beyond` (truncate prune).
     OverlayPrune = 5,
+    /// The READ path's deferred-seed materialize (single-block read hitting
+    /// an item-B deferred buffer) — a reader convoying with writers is
+    /// attribution the H2b audit must see.
+    ReadSeed = 6,
+    /// `DataRouter::write_file`'s staged/inline-promotion block-0 guard
+    /// (the FIND-VS-B staged-layout sibling shape).
+    StagedWrite = 7,
 }
 
-const BLOCK_LOCK_SITES: usize = 6;
+const BLOCK_LOCK_SITES: usize = 8;
 const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "write_checkout",
     "spill_victim",
@@ -889,6 +896,8 @@ const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "flush_exit",
     "punch",
     "overlay_prune",
+    "read_seed",
+    "staged_write",
 ];
 
 struct WriteProfState {
@@ -1122,6 +1131,36 @@ pub fn block_lock_stripe_audit_json() -> serde_json::Value {
 /// `fuse_write_inflight` stats payload.
 pub fn write_inflight_json() -> serde_json::Value {
     WRITE_PROF.inflight_writes.to_json()
+}
+
+/// §1.2 driver attribution for the flush-exit staging/upload legs
+/// (design-random-small-writes review Issue 4): the R5-pressure parked
+/// drain and the fsync/close family move bytes through the SAME primitive
+/// (`flush_memory_buffers_for_inode`) — the ledger must know which driver
+/// paid, because on the loss shape the durable-upload stream is
+/// drain-driven, never fsync-driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushDriver {
+    /// fsync / FLUSH / close-background family.
+    FsyncClose,
+    /// The R5-pressure parked drain (`drain_parked_toward`).
+    ParkedDrain,
+}
+
+impl FlushDriver {
+    fn staging_put_bytes_counter(self) -> &'static AtomicU64 {
+        match self {
+            FlushDriver::FsyncClose => &METRICS.staging_put_bytes_flush,
+            FlushDriver::ParkedDrain => &METRICS.staging_put_bytes_drain,
+        }
+    }
+
+    fn writeback_enqueued_counter(self) -> &'static AtomicU64 {
+        match self {
+            FlushDriver::FsyncClose => &METRICS.writeback_enqueued_flush,
+            FlushDriver::ParkedDrain => &METRICS.writeback_enqueued_drain,
+        }
+    }
 }
 
 /// P1-8: how long the FUSE write path holds the per-inode write lock.
@@ -3296,6 +3335,9 @@ impl SqueezefsFilesystem {
         file_path: &str,
         b: u32,
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>, SqueezefsError> {
+        // RW1: the seed-fetch phase (the item-B RMW read, all drivers —
+        // per-driver BYTE attribution happens at the call sites).
+        let wp_seed = write_phase_start();
         let mut block_map_id = None;
         let mut block_map = None;
         let seed_ino = crate::routing::parse_inode_from_path(file_path);
@@ -3331,6 +3373,7 @@ impl SqueezefsFilesystem {
                     .await?;
             }
         }
+        write_phase_record(WritePhase::SeedFetch, wp_seed);
         Ok(existing)
     }
 
@@ -3338,6 +3381,21 @@ impl SqueezefsFilesystem {
         &self,
         ino: u64,
         fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        self.flush_memory_buffers_driven(ino, fencing_token, FlushDriver::FsyncClose)
+            .await
+    }
+
+    /// [`Self::flush_memory_buffers_for_inode`] with the RW1 §1.2 driver
+    /// tag: the parked drain calls this directly so the ledger attributes
+    /// its staging puts + writeback requests to the DRAIN driver (the loss
+    /// shape's actual durable-upload driver), while every fsync/close
+    /// caller rides the public wrapper's `FsyncClose` attribution.
+    async fn flush_memory_buffers_driven(
+        &self,
+        ino: u64,
+        fencing_token: u64,
+        driver: FlushDriver,
     ) -> Result<(), SqueezefsError> {
         let mut keys_to_flush = Vec::new();
         for r in self.active_block_buffers.iter() {
@@ -3357,8 +3415,7 @@ impl SqueezefsFilesystem {
             // zero-complete Fresh buffers so recycled pool bytes never
             // reach staging or the device, and serialize against a
             // concurrent write's checkout of the same block.
-            let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
-            let block_guard = block_lock.lock().await;
+            let block_guard = block_lock_acquire(ino, b, BlockLockSite::FlushExit).await;
             // OVERLAY NEVER INVISIBLE (the QUICK 075/112 transient): the
             // buffer stays PARKED across every await on this exit —
             // concurrent single-block reads (kernel readahead, AIO) keep
@@ -3389,6 +3446,10 @@ impl SqueezefsFilesystem {
                         return Err(e);
                     }
                 };
+                METRICS.flush_seed_read_bytes.fetch_add(
+                    image.as_deref().map(|d| d.len()).unwrap_or(0) as u64,
+                    Ordering::Relaxed,
+                );
                 if let Some(mut entry) = self.active_block_buffers.get_mut(&key) {
                     entry
                         .value_mut()
@@ -3408,13 +3469,19 @@ impl SqueezefsFilesystem {
             let nvme_clone = self.router.cache.nvme.clone();
             let key_clone = key.clone();
             let staging_snapshot = staging_copy.clone();
+            let put_len = staging_copy.len() as u64;
+            let wp_put = write_phase_start();
             let admitted = tokio::task::spawn_blocking(move || {
                 nvme_clone.put_active_block(&key_clone, &staging_snapshot, fencing_token)
             })
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+            write_phase_record(WritePhase::StagingPut, wp_put);
 
             if admitted {
+                driver
+                    .staging_put_bytes_counter()
+                    .fetch_add(put_len, Ordering::Relaxed);
                 // Authority transferred: the staged copy is identical and
                 // router reads serve it — the RAM copy can go.
                 self.active_block_buffers.remove(&key);
@@ -3426,6 +3493,9 @@ impl SqueezefsFilesystem {
                     attempts: 0,
                 };
                 self.enqueue_writeback(req).await?;
+                driver
+                    .writeback_enqueued_counter()
+                    .fetch_add(1, Ordering::Relaxed);
             } else {
                 // Staging refused (never-lossy backpressure): this is the
                 // fsync path, so make the block durable right now. The
@@ -3435,6 +3505,9 @@ impl SqueezefsFilesystem {
                 // The RAM copy stays parked (readable) until the durable
                 // merge has published.
                 upload_active_block_bytes(ino, b, staging_copy, &self.router).await?;
+                METRICS
+                    .durable_upload_bytes_escalation
+                    .fetch_add(put_len, Ordering::Relaxed);
                 self.active_block_buffers.remove(&key);
                 drop(block_guard);
             }
@@ -3495,16 +3568,24 @@ impl SqueezefsFilesystem {
 
             futures.push(async move {
                 // 0. Acquire Block-level Lock to prevent concurrent modification to the same block
-                let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b as u32);
-                let start_block_lock = std::time::Instant::now();
-                let block_guard = block_lock.lock().await;
-                METRICS.block_lock_wait.record(start_block_lock.elapsed());
+                // (RW1: per-site wait attribution — the write_checkout site;
+                // the returned wait keeps feeding the always-on global
+                // histogram so the FIND-L1-A baseline series stays
+                // comparable.)
+                let (block_guard, lock_waited) =
+                    block_lock_acquire_timed(ino, b as u32, BlockLockSite::WriteCheckout).await;
+                METRICS.block_lock_wait.record(lock_waited);
 
                 // 1. Get existing block data (either from memory cache, NVMe staging cache, or read from backend/cache)
+                let wp_checkout = write_phase_start();
                 let mut block_data =
                     if let Some((_, buf)) = self.active_block_buffers.remove(&cache_key) {
+                        // RW1 ledger: an overlay already owned this block —
+                        // the §1.2 block-revisit discount, quantified.
+                        METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
                         buf
                     } else if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
+                        METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
                     } else if !needs_existing_data {
                         // Fresh entry: no existing data for this block, so the
@@ -3531,6 +3612,7 @@ impl SqueezefsFilesystem {
                             .fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::deferred(block_size as usize)
                     };
+                write_phase_record(WritePhase::Checkout, wp_checkout);
 
                 // ONE-AUTHORITY INVARIANT (generic/075.2): per block, the
                 // newest content lives in exactly one overlay — the RAM
@@ -3556,11 +3638,29 @@ impl SqueezefsFilesystem {
                 // harness, every worker parked in NvmeShard lock_shared/
                 // lock_exclusive).
                 {
+                    // RW1: the H1 probe counter (fires per checkout, staged
+                    // sibling or not — the pure-overhead face) + the §1.2
+                    // bucket-4 churn ledger (a revisit discarding the staged
+                    // image an earlier spill already paid for).
+                    let wp_sibling = write_phase_start();
+                    METRICS
+                        .staging_sibling_probes
+                        .fetch_add(1, Ordering::Relaxed);
                     let nvme = self.router.cache.nvme.clone();
                     let key = cache_key.clone();
-                    tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
-                        .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let removed =
+                        tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
+                            .await
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    if let Some(prev) = removed {
+                        METRICS
+                            .restage_churn_removes
+                            .fetch_add(1, Ordering::Relaxed);
+                        METRICS
+                            .restage_churn_bytes
+                            .fetch_add(prev.len() as u64, Ordering::Relaxed);
+                    }
+                    write_phase_record(WritePhase::SiblingRemove, wp_sibling);
                 }
 
                 // 2. Merge the request slice. `make_mut` mutates only
@@ -3594,6 +3694,10 @@ impl SqueezefsFilesystem {
                             Ok(img) => img,
                             Err(e) => return Err(e),
                         };
+                        METRICS.write_path_seed_read_bytes.fetch_add(
+                            image.as_deref().map(|d| d.len()).unwrap_or(0) as u64,
+                            Ordering::Relaxed,
+                        );
                         let Some((_, reowned)) = self.active_block_buffers.remove(&cache_key)
                         else {
                             unreachable!(
@@ -3604,9 +3708,11 @@ impl SqueezefsFilesystem {
                         block_data.fill_complement_from(image.as_deref().unwrap_or(&[]));
                     }
                 }
+                let wp_merge = write_phase_start();
                 block_data.record_write(rel_start, rel_start + slice_len);
                 block_data.make_mut()[rel_start..rel_start + slice_len]
                     .copy_from_slice(file_data_slice);
+                write_phase_record(WritePhase::MergeCopy, wp_merge);
 
                 // 3. Write-through when the block is content-complete
                 // (normative trigger — byte-identical to the old staging
@@ -3633,6 +3739,10 @@ impl SqueezefsFilesystem {
                             .insert(cache_key.clone(), block_data);
                         match self.fetch_seed_image(&file_path, b as u32).await {
                             Ok(image) => {
+                                METRICS.write_path_seed_read_bytes.fetch_add(
+                                    image.as_deref().map(|d| d.len()).unwrap_or(0) as u64,
+                                    Ordering::Relaxed,
+                                );
                                 let Some((_, reowned)) =
                                     self.active_block_buffers.remove(&cache_key)
                                 else {
@@ -3689,6 +3799,8 @@ impl SqueezefsFilesystem {
                             let cache_key_clone = cache_key.clone();
                             let fencing_token_val = fencing_token;
                             let block_snapshot = block_data.snapshot();
+                            let put_len = block_snapshot.len() as u64;
+                            let wp_put = write_phase_start();
                             let admitted = tokio::task::spawn_blocking(move || {
                                 nvme_clone.put_active_block(
                                     &cache_key_clone,
@@ -3698,10 +3810,14 @@ impl SqueezefsFilesystem {
                             })
                             .await
                             .map_err(|e| std::io::Error::other(e.to_string()))?;
+                            write_phase_record(WritePhase::StagingPut, wp_put);
 
                             std::mem::drop(block_guard);
 
                             if admitted {
+                                METRICS
+                                    .staging_put_bytes_wt_fallback
+                                    .fetch_add(put_len, Ordering::Relaxed);
                                 let req = WritebackRequest {
                                     ino,
                                     block_idx: b as u32,
@@ -3709,23 +3825,30 @@ impl SqueezefsFilesystem {
                                     attempts: 0,
                                 };
                                 self.enqueue_writeback(req).await?;
+                                METRICS
+                                    .writeback_enqueued_wt_fallback
+                                    .fetch_add(1, Ordering::Relaxed);
                             } else {
                                 // Staging refused too (never-lossy
                                 // backpressure): keep the block in RAM like
                                 // a partial block; fsync's buffer flush
                                 // re-attempts staging or uploads it durably.
+                                let wp_park = write_phase_start();
                                 self.insert_active_block_buffer(
                                     cache_key.clone(),
                                     block_data,
                                     fencing_token,
                                 )
                                 .await;
+                                write_phase_record(WritePhase::ParkSpill, wp_park);
                             }
                         }
                     }
                 } else {
+                    let wp_park = write_phase_start();
                     self.insert_active_block_buffer(cache_key.clone(), block_data, fencing_token)
                         .await;
+                    write_phase_record(WritePhase::ParkSpill, wp_park);
                     std::mem::drop(block_guard);
                 }
 
@@ -3793,8 +3916,7 @@ impl SqueezefsFilesystem {
                     // Whole block → hole. Drop the RAM + staged active-block
                     // copy under the block lock (serialize against a racing
                     // flush) before it is unmapped + freed below.
-                    let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b as u32);
-                    let block_guard = block_lock.lock().await;
+                    let block_guard = block_lock_acquire(ino, b as u32, BlockLockSite::Punch).await;
                     let key = crate::keys::active_block(ino, b).to_string();
                     self.active_block_buffers.remove(&key);
                     // Blocking-pool hop: shard WRITE lock (invariant rule 2).
@@ -3872,8 +3994,7 @@ impl SqueezefsFilesystem {
             }
         }
         for b in dead {
-            let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
-            let _block_guard = block_lock.lock().await;
+            let _block_guard = block_lock_acquire(ino, b, BlockLockSite::OverlayPrune).await;
             let key = crate::keys::active_block(ino, b as u64).to_string();
             self.active_block_buffers.remove(&key);
             // spawn_blocking: the staging-shard WRITE lock must never park
@@ -4014,6 +4135,10 @@ impl SqueezefsFilesystem {
         plaintext: bytes::Bytes,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
+        // RW1 H2 hold-time split: the device leg (crypto → allocate → DMA)
+        // vs the map-merge leg below — both under the caller's held block
+        // lock.
+        let wp_dma = write_phase_start();
         // Passthrough returns the same `Bytes` (0 copy); non-passthrough
         // transforms into a fresh buffer (§5.7).
         let processed = self
@@ -4031,6 +4156,7 @@ impl SqueezefsFilesystem {
             let _ = block_allocator.free_block(offset).await;
             return Err(e);
         }
+        write_phase_record(WritePhase::UploadDma, wp_dma);
         // Publish after the device write (incarnation ordering). No
         // `read_lru.put` for the striped hot path — deliberately mirroring
         // `flush_single_active_block`'s `!is_striped` gate: a 10 GiB stream
@@ -4059,6 +4185,7 @@ impl SqueezefsFilesystem {
         // least that large.
         let min_size = (b as u64 + 1) * self.router.block_size.load(Ordering::Relaxed);
         let entries = [(b, new_key)];
+        let wp_merge = write_phase_start();
         let displaced = match self
             .router
             .merge_block_mappings(
@@ -4078,6 +4205,7 @@ impl SqueezefsFilesystem {
                 return Err(e);
             }
         };
+        write_phase_record(WritePhase::UploadMapMerge, wp_merge);
         // Free displaced keys only after the new map is published (durable +
         // cached), so no reader can resolve a block to a key we are freeing.
         for bk in displaced {
@@ -4273,7 +4401,7 @@ impl SqueezefsFilesystem {
                     continue;
                 };
                 let _ = self
-                    .flush_memory_buffers_for_inode(ino, fencing_token)
+                    .flush_memory_buffers_driven(ino, fencing_token, FlushDriver::ParkedDrain)
                     .await;
                 // Wake Red-gated writers after every inode flush — space
                 // frees incrementally, admission resumes incrementally.
@@ -4354,8 +4482,10 @@ impl SqueezefsFilesystem {
                 let Ok(_victim_guard) = victim_lock.try_lock() else {
                     // Contended (possibly by this very caller's shard): a
                     // writer/flusher owns this block right now — skip it.
+                    block_lock_try_note(BlockLockSite::SpillVictim, v_ino, v_b, false);
                     continue;
                 };
+                block_lock_try_note(BlockLockSite::SpillVictim, v_ino, v_b, true);
                 // OVERLAY NEVER INVISIBLE: the victim stays PARKED across
                 // every await (seed fetch + staging put) — readers keep
                 // serving it; the held victim lock excludes mutators.
@@ -4372,6 +4502,15 @@ impl SqueezefsFilesystem {
                     let Ok(image) = self.fetch_seed_image(&file_path, v_b).await else {
                         continue;
                     };
+                    // RW1 ledger bucket 1, read leg: the foreground writer
+                    // materializing a VICTIM's deferred RMW seed — the §1.2
+                    // "spill seed" device read.
+                    if let Some(img) = image.as_deref() {
+                        METRICS.spill_seed_reads.fetch_add(1, Ordering::Relaxed);
+                        METRICS
+                            .spill_seed_read_bytes
+                            .fetch_add(img.len() as u64, Ordering::Relaxed);
+                    }
                     if let Some(mut entry) = self.active_block_buffers.get_mut(&spill_key) {
                         entry
                             .value_mut()
@@ -4385,7 +4524,9 @@ impl SqueezefsFilesystem {
                     }
                     None => continue,
                 };
+                let spill_len = snapshot.len() as u64;
                 // Blocking-pool hop: shard WRITE lock (invariant rule 2).
+                let wp_put = write_phase_start();
                 let admitted = self
                     .router
                     .cache
@@ -4393,6 +4534,15 @@ impl SqueezefsFilesystem {
                     .put_active_block_async(spill_key.clone(), snapshot, fencing_token)
                     .await
                     .unwrap_or(false);
+                write_phase_record(WritePhase::StagingPut, wp_put);
+                if admitted {
+                    // RW1 ledger bucket 1, write leg: the inline victim
+                    // spill's staging put.
+                    METRICS.spill_staging_puts.fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .spill_staging_put_bytes
+                        .fetch_add(spill_len, Ordering::Relaxed);
+                }
                 if !admitted {
                     // Staging refused (never-lossy backpressure): keep the
                     // buffer in RAM — exceeding the soft cap beats losing
@@ -4486,6 +4636,10 @@ impl SqueezefsFilesystem {
                             let Ok(image) = self.fetch_seed_image(&file_path, b).await else {
                                 return;
                             };
+                            METRICS.flush_seed_read_bytes.fetch_add(
+                                image.as_deref().map(|d| d.len()).unwrap_or(0) as u64,
+                                Ordering::Relaxed,
+                            );
                             let Some((_, reowned)) = self.active_block_buffers.remove(&cache_key)
                             else {
                                 unreachable!(
@@ -4497,12 +4651,20 @@ impl SqueezefsFilesystem {
                             data.fill_complement_from(image.as_deref().unwrap_or(&[]));
                         }
                         data.zero_complete();
-                        match upload_active_block_bytes(ino, b, data.snapshot(), &self.router).await
+                        let self_flush_snapshot = data.snapshot();
+                        let self_flush_len = self_flush_snapshot.len() as u64;
+                        match upload_active_block_bytes(ino, b, self_flush_snapshot, &self.router)
+                            .await
                         {
                             Ok(()) => {
                                 METRICS
                                     .parked_gate_self_flushes
                                     .fetch_add(1, Ordering::Relaxed);
+                                // RW1 ledger bucket 3: the Red parked-gate
+                                // self-flush's durable upload.
+                                METRICS
+                                    .durable_upload_bytes_self_flush
+                                    .fetch_add(self_flush_len, Ordering::Relaxed);
                                 // A staler STAGED image under this key (an
                                 // earlier spill) must not outlive the newer
                                 // durable merge — same fencing-checked
@@ -4559,8 +4721,7 @@ impl SqueezefsFilesystem {
             // Stage/upload exit under the victim's block lock (§5.3 exit 2;
             // normal await — teardown holds no other block locks):
             // zero-complete Fresh buffers before they leave RAM.
-            let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
-            let block_guard = block_lock.lock().await;
+            let block_guard = block_lock_acquire(ino, b, BlockLockSite::FlushExit).await;
             // OVERLAY NEVER INVISIBLE: the buffer stays PARKED across every
             // await here too — teardown races the last reads/FORGETs, and
             // the same transparency rules apply (see
@@ -4579,6 +4740,10 @@ impl SqueezefsFilesystem {
                 let file_path = crate::keys::inode_path(ino);
                 match self.fetch_seed_image(&file_path, b).await {
                     Ok(image) => {
+                        METRICS.flush_seed_read_bytes.fetch_add(
+                            image.as_deref().map(|d| d.len()).unwrap_or(0) as u64,
+                            Ordering::Relaxed,
+                        );
                         if let Some(mut entry) = self.active_block_buffers.get_mut(&key) {
                             entry
                                 .value_mut()
@@ -4610,6 +4775,7 @@ impl SqueezefsFilesystem {
             let nvme_clone = self.router.cache.nvme.clone();
             let key_clone = key.clone();
             let staging_snapshot = staging_copy.clone();
+            let put_len = staging_copy.len() as u64;
             let admitted = match tokio::task::spawn_blocking(move || {
                 nvme_clone.put_active_block(&key_clone, &staging_snapshot, fencing_token)
             })
@@ -4637,10 +4803,16 @@ impl SqueezefsFilesystem {
                         ino, b, e
                     );
                 } else {
+                    METRICS
+                        .durable_upload_bytes_escalation
+                        .fetch_add(put_len, Ordering::Relaxed);
                     self.active_block_buffers.remove(&key);
                 }
                 continue;
             }
+            METRICS
+                .staging_put_bytes_teardown
+                .fetch_add(put_len, Ordering::Relaxed);
             // Authority transferred stage-then-remove (identical copy).
             self.active_block_buffers.remove(&key);
             drop(block_guard);
@@ -4656,6 +4828,10 @@ impl SqueezefsFilesystem {
                     "Failed to enqueue writeback during dismount for ino {}: {:?}",
                     ino, e
                 );
+            } else {
+                METRICS
+                    .writeback_enqueued_teardown
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         info!("FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.");
@@ -6066,8 +6242,9 @@ impl Filesystem for SqueezefsFilesystem {
                         // await — the §5.5 executor-starvation wedge
                         // class). On a failed fetch the buffer is parked
                         // unchanged (never-lossy) and the read fails loud.
-                        let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, start_block as u32);
-                        let _block_guard = block_lock.lock().await;
+                        let _block_guard =
+                            block_lock_acquire(ino, start_block as u32, BlockLockSite::ReadSeed)
+                                .await;
                         let still_deferred = self
                             .active_block_buffers
                             .get(&cache_key)
@@ -6207,9 +6384,16 @@ impl Filesystem for SqueezefsFilesystem {
         let queue_depth = self.writeback_queue_cap - self.writeback_tx.capacity();
         METRICS.writeback_queue_depth.record(queue_depth);
 
+        // RW1: sample the concurrent WRITE-handler depth (rig-armed only) —
+        // the §12 OQ2 instrument. RAII: released at handler return.
+        let _write_inflight = WriteInflight::enter();
+
         let prof = OpProf::begin(FuseOpKind::Write, ino);
         let write_future = async {
             prof.mark_backend_start();
+            // RW1 route-classify stamp: backend entry → striped dispatch
+            // (recorded only on the striped branch below).
+            let wp_route = write_phase_start();
             let lock = self.get_inode_lock_ref(ino);
             let start_wait = std::time::Instant::now();
             let guard = lock.write().await;
@@ -6348,6 +6532,7 @@ impl Filesystem for SqueezefsFilesystem {
                 // I/O (P1-8); per-block BLOCK_FLUSH_LOCKS serialize the
                 // data path.
                 drop(guard);
+                write_phase_record(WritePhase::RouteClassify, wp_route);
                 if let Err(e) = self
                     .write_file_staged(ino, offset, data.clone(), old_size, fencing_token)
                     .await
@@ -9186,10 +9371,11 @@ async fn flush_one_active_block(
     let cache_key = crate::keys::active_block(ino, b as u64).to_string();
 
     for _attempt in 0..8 {
-        let block_lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
-        let start_block_lock = std::time::Instant::now();
-        let _block_guard = block_lock.lock().await;
-        METRICS.block_lock_wait.record(start_block_lock.elapsed());
+        // RW1: the writeback_flush lock site; the returned wait keeps
+        // feeding the always-on global histogram (FIND-L1-A comparability).
+        let (_block_guard, lock_waited) =
+            block_lock_acquire_timed(ino, b, BlockLockSite::WritebackFlush).await;
+        METRICS.block_lock_wait.record(lock_waited);
 
         let capture_epoch = crate::routing::layout_prune_epoch(ino);
         // Existence + ownership probe WITHOUT holding a shard guard across
@@ -9237,6 +9423,7 @@ async fn flush_one_active_block(
         // seed (not-yet-striped files only, cold path) is a bounded real copy
         // taken while the source is alive; striped flushes never put.
         let lru_copy = (!is_striped).then(|| block_data_source.detached_copy());
+        let upload_len = block_data_source.len() as u64;
 
         // Consumes the source (crypto transform severs the guard pre-DMA;
         // passthrough DMAs straight off the staging mmap). The guard is provably
@@ -9257,6 +9444,12 @@ async fn flush_one_active_block(
             return Err(e);
         }
         block_allocator.publish_block(offset);
+        // RW1 ledger: the flush unit's durable-upload leg (queued units AND
+        // fsync/queue-full sweeps — the drivers are visible at the enqueue
+        // counters).
+        METRICS
+            .durable_upload_bytes_writeback
+            .fetch_add(upload_len, Ordering::Relaxed);
 
         let stored_block_key = router.backend_router.persist_block_key(&be_id, offset);
 

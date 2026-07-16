@@ -426,10 +426,16 @@ impl AlignedBufPool {
     /// Take a 4096-aligned buffer of [`Self::buf_size`] without wrapping in
     /// `Bytes` (P2-4: nvme unaligned write path recycles via [`Self::recycle`]).
     pub fn alloc_raw(self: &Arc<Self>) -> *mut u8 {
-        let ptr = self
-            .queue
-            .pop()
-            .unwrap_or_else(|| alloc_pooled(self.buf_size));
+        let ptr = self.queue.pop().unwrap_or_else(|| {
+            // RW1 H3 evidence (design-random-small-writes §5.3): a handout
+            // that missed the recycle queue pays the mmap/page-fault
+            // allocation path — the pool-exhaustion counter the ≥13-writer
+            // convoy forensics read.
+            crate::fuse_client::METRICS
+                .aligned_pool_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            alloc_pooled(self.buf_size)
+        });
         debug_assert_eq!(
             ptr as usize % POOLED_BUF_ALIGN,
             0,

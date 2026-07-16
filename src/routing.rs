@@ -3760,8 +3760,16 @@ impl DataRouter {
             || (meta.file_type == "inline"
                 && end_offset > crate::fuse_client::MAX_INLINE_SIZE as usize)
         {
-            let block_lock = crate::fuse_client::BLOCK_FLUSH_LOCKS.get_lock(ino, 0);
-            Some(block_lock.lock().await)
+            // RW1: the staged_write lock site (the FIND-VS-B staged-layout
+            // sibling shape) — same lock, rig-attributed.
+            Some(
+                crate::fuse_client::block_lock_acquire(
+                    ino,
+                    0,
+                    crate::fuse_client::BlockLockSite::StagedWrite,
+                )
+                .await,
+            )
         } else {
             None
         };

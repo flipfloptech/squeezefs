@@ -671,17 +671,86 @@ impl KvMetaBackend {
             opened.next().expect("three trees"),
         );
 
-        // 5b. Read-only replay into the cache: original seqs, per-key LWW
-        // (§4.2 replay fold); allocator records were already consumed by
-        // the K4 load. Level-tagged interior-pointer records (the K6b SMO
-        // journaling, §4.6) route to their interior node — "replay applies
-        // the pointer record first"; an unroutable pointer (the mounted
-        // ledger predates a root growth) drops sound-and-silent (the
-        // window never fails a mount loud).
+        // 5b. Read-only replay into the cache, TWO-PHASE (Option C′,
+        // docs/design-smo-replay-currency.md §2/§4): routing must not
+        // evolve UNDER the content walk. Single-pass seq-order replay
+        // routed each content record through the structure *as it stood
+        // at that entry* — a record whose seq races an SMO's build window
+        // (reserved before the in-lock flip reservation) descended the
+        // pre-flip route into the predecessor, and the higher-seq flip
+        // then abandoned that lineage: acked, in-window, replayed
+        // "cleanly", and lost (sub-mechanism (i) stranding — the
+        // FIND-VS-A 0.4–0.9 % acked-create residual).
+        //
+        // Phase 1 — every interior/routing record first, ordered by
+        // (level DESC, then seq): upper flips route lower ones (a leaf-
+        // SMO flip is itself "content" to the interior it applies to —
+        // pure-seq phase 1 would strand it exactly as (i) strands leaf
+        // content). Per-key LWW by seq is unchanged, so a flip already
+        // folded into a successor interior's image re-applies idempotent;
+        // an unroutable pointer (the mounted ledger predates a root
+        // growth) still drops sound-and-silent. Root swaps journal no
+        // pointer records — those windows replay through the old
+        // structure by design (the C′ carve-out; Option A owns them).
+        //
+        // Phase 2 — content records (original seqs, unchanged per-key
+        // LWW gate) through the now-FINAL routing: every record folds
+        // into the node covering its key in the final structure, whose
+        // durable image the SMO barriered before its flip could exist.
+        //
+        // §4.4 pt 4 holes stay dropped in both phases by construction:
+        // each phase walks the SAME `recovery.entries` the checksummed
+        // chain scan materialized — a rolled-back tx's reserved-but-
+        // unwritten range never parses into it, so neither phase can see
+        // half a tx (one tx = one checksummed entry, §4.10). Replay-twice
+        // digest equality holds over the phased order: replay is
+        // read-only into the cache and (level DESC, seq) over the same
+        // materialized entries is a deterministic total order. Allocator
+        // records were already consumed by the K4 load, untouched here.
+        //
+        // Stranded predecessor *objects* can remain mapped-but-unrouted
+        // in the cache until clock eviction — bytes only, bounded by the
+        // window's SMO count (design §2 C′ residuals).
+        let mut interior: Vec<(u8, u8, &Record)> = Vec::new();
+        for entry in &recovery.entries {
+            for (tag, rec) in &entry.records {
+                let (tree_id, level) = untag(*tag);
+                if level > 0 && matches!(tree_id, TREE_INODES | TREE_DENTRIES | TREE_XATTRS) {
+                    interior.push((tree_id, level, rec));
+                }
+            }
+        }
+        interior.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.seq.cmp(&b.2.seq)));
+        for (tree_id, level, rec) in interior {
+            let tree = match tree_id {
+                TREE_INODES => &inodes,
+                TREE_DENTRIES => &dentries,
+                TREE_XATTRS => &xattrs,
+                _ => unreachable!("phase 1 collects only the three mounted trees"),
+            };
+            // Keep post-mount node-seq mints above every child
+            // incarnation a replayed pointer names.
+            if rec.kind == RecordKind::Put {
+                if let Ok((_addr, child_seq)) = decode_interior_value(&rec.value) {
+                    seq.fetch_max(child_seq, Ordering::AcqRel);
+                }
+            }
+            tree.apply_replayed_interior(
+                &rec.key,
+                level,
+                rec.seq,
+                rec.kind,
+                Bytes::copy_from_slice(&rec.value),
+            )
+            .await?;
+        }
         let mut max_replayed_ino: u64 = 0;
         for entry in &recovery.entries {
             for (tag, rec) in &entry.records {
                 let (tree_id, level) = untag(*tag);
+                if level > 0 {
+                    continue; // phase 1 applied it
+                }
                 let tree = match tree_id {
                     TREE_INODES => &inodes,
                     TREE_DENTRIES => &dentries,
@@ -689,24 +758,6 @@ impl KvMetaBackend {
                     TREE_ALLOC_RESERVED => continue,
                     _ => continue,
                 };
-                if level > 0 {
-                    // Keep post-mount node-seq mints above every child
-                    // incarnation a replayed pointer names.
-                    if rec.kind == RecordKind::Put {
-                        if let Ok((_addr, child_seq)) = decode_interior_value(&rec.value) {
-                            seq.fetch_max(child_seq, Ordering::AcqRel);
-                        }
-                    }
-                    tree.apply_replayed_interior(
-                        &rec.key,
-                        level,
-                        rec.seq,
-                        rec.kind,
-                        Bytes::copy_from_slice(&rec.value),
-                    )
-                    .await?;
-                    continue;
-                }
                 if tree_id == TREE_INODES {
                     if let Ok(ino) = decode_inode_key(&rec.key) {
                         max_replayed_ino = max_replayed_ino.max(ino);

@@ -34,6 +34,9 @@
 #   SQUEEZEFS_L1A_SHAPE=rand SQUEEZEFS_L1A_TVALUES="8 16" tests/l1a_sweep.sh
 #
 # Env knobs (all optional):
+#   SQUEEZEFS_L1A_BIN       squeezefs binary (default $REPO/target/release/
+#                           squeezefs) — RW3's historical-pair attribution
+#                           points this at a detached-worktree build
 #   SQUEEZEFS_L1A_DIR       sandbox root (default /var/tmp/squeezefs_l1a;
 #                           tmpfs refused; /mnt/squeezefs + ~/tmp/nvme refused)
 #   SQUEEZEFS_L1A_TVALUES   writer counts        (default "8 12 13 16")
@@ -117,8 +120,8 @@ SUB_FSTYPE="$(stat -f -c %T "$DIR" 2>/dev/null || echo unknown)"
 [ "$SUB_FSTYPE" = "tmpfs" ] && die "sandbox on tmpfs defeats device evidence — pick a disk path"
 mkdir -p "$ART/logs" "$ART/rows"
 
-SQZ_BIN="$REPO_DIR/target/release/squeezefs"
-[ -x "$SQZ_BIN" ] || die "release binary missing — cargo build --release first"
+SQZ_BIN="${SQUEEZEFS_L1A_BIN:-$REPO_DIR/target/release/squeezefs}"
+[ -x "$SQZ_BIN" ] || die "squeezefs binary missing at $SQZ_BIN — cargo build --release first (or fix SQUEEZEFS_L1A_BIN)"
 ELBENCHO_BIN="$(command -v elbencho || true)"
 [ -n "$ELBENCHO_BIN" ] || die "elbencho not found in PATH"
 

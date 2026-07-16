@@ -432,7 +432,12 @@ async fn mid_entry_tail_multi_leaf_tx_partial_flush_survives_crash() {
     let mut fill_mode_flip = 0u32;
     let burst = |kv: Arc<KvMetaBackend>, flip: u32| async move {
         for j in 0..24u32 {
-            let mode = libc::S_IFREG | if (flip + j) % 2 == 0 { 0o640 } else { 0o600 };
+            let mode = libc::S_IFREG
+                | if (flip + j).is_multiple_of(2) {
+                    0o640
+                } else {
+                    0o600
+                };
             kv.setattr(fill_ino, Some(mode), None, None, None, None, None, None)
                 .await
                 .expect("fill setattr acked");

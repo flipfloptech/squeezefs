@@ -75,7 +75,7 @@ const RETRY_BUDGET: usize = 256;
 /// Test seam (docs/design-smo-replay-currency.md §6 PR 1; the
 /// `TEST_CONVEYOR_POISON_APPLY_INO` precedent): arm with a tree id
 /// (`TREE_INODES`/`TREE_DENTRIES`/`TREE_XATTRS`) to park the next
-/// [`smo_replace`] on that tree **in its build window** — after the
+/// `smo_replace` on that tree **in its build window** — after the
 /// successor images are written and loaded back, before the §4.6
 /// parent-then-child lock window — so a test can inject racing commits
 /// whose journal reservations land *below* the SMO's in-lock flip
@@ -84,8 +84,6 @@ const RETRY_BUDGET: usize = 256;
 /// `take_overlay()` leftovers whose RAM copies die with the process,
 /// while single-pass replay routes them to the abandoned predecessor.
 /// `0` = off; unarmed cost is one relaxed load per SMO.
-///
-/// [`smo_replace`]: KvTree::smo_replace
 pub static TEST_SMO_BUILD_PAUSE_TREE: AtomicU64 = AtomicU64::new(0);
 
 /// While an SMO is parked on [`TEST_SMO_BUILD_PAUSE_TREE`], the paused
@@ -507,13 +505,18 @@ impl KvTree {
     /// The shared lock-window protocol behind [`Self::apply_at`] (fresh
     /// seq assigned inside the window) and [`Self::apply_replayed`] (the
     /// record's journal seq reproduced — mount replay, PR K6a).
+    ///
+    /// `replay` carries `(record seq, entry start)`: the floor
+    /// contribution rounds DOWN to the record's journal-entry start
+    /// (FIND-SMO-TAIL §1b — see [`CachedNode::apply_locked`]). A fresh
+    /// single-record apply is its own entry start.
     async fn apply_at_seq(
         &self,
         leaf: &Arc<CachedNode>,
         key: &[u8],
         kind: RecordKind,
         value: Bytes,
-        replay_seq: Option<u64>,
+        replay: Option<(u64, u64)>,
     ) -> Result<ApplyOutcome, KvError> {
         let mut guard = leaf.lock().write().await;
         if leaf.state().is_superseded() || key < leaf.min_key() || key > leaf.max_key() {
@@ -521,8 +524,8 @@ impl KvTree {
             super::META_KV_COMMIT_SMO_RETRIES.fetch_add(1, Ordering::Relaxed);
             return Ok(ApplyOutcome::Stale);
         }
-        let seq = match replay_seq {
-            Some(seq) => {
+        let (seq, floor) = match replay {
+            Some((seq, entry_start)) => {
                 // Per-key LWW replay gate (§4.2 "replay fold"): an
                 // old-ledger mount (mid-checkpoint kill) reads node bsets
                 // that already MATERIALIZED part of the replay window —
@@ -539,13 +542,17 @@ impl KvTree {
                 if leaf.snapshot().newest_seq_of(key).is_some_and(|n| n >= seq) {
                     return Ok(ApplyOutcome::Applied);
                 }
-                seq
+                (seq, entry_start)
             }
-            None => self.seq.fetch_add(1, Ordering::AcqRel) + 1,
+            None => {
+                let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
+                (seq, seq)
+            }
         };
         leaf.apply_locked(
             &mut guard,
             vec![OwnedRec::new(Bytes::copy_from_slice(key), seq, kind, value)],
+            floor,
         )?;
         let over_threshold = guard.overlay_bytes() >= self.cache.config().writeback_delta_bytes;
         drop(guard);
@@ -562,19 +569,22 @@ impl KvTree {
     /// history, so replay never mints fresh seqs. The tree's shared seq
     /// counter is floored above the replayed seq so post-replay
     /// assignments (K6b commits; K5-style test mutations) stay newer.
+    /// `entry_start` is the record's journal-entry start — the floor
+    /// contribution (FIND-SMO-TAIL §1b rounding).
     pub async fn apply_replayed(
         &self,
         key: &[u8],
         seq: u64,
         kind: RecordKind,
         value: Bytes,
+        entry_start: u64,
     ) -> Result<(), KvError> {
         self.check_key(key)?;
         self.seq.fetch_max(seq, Ordering::AcqRel);
         for _ in 0..RETRY_BUDGET {
             let leaf = self.resolve_leaf(key).await?;
             match self
-                .apply_at_seq(&leaf, key, kind, value.clone(), Some(seq))
+                .apply_at_seq(&leaf, key, kind, value.clone(), Some((seq, entry_start)))
                 .await?
             {
                 ApplyOutcome::Applied => return Ok(()),
@@ -608,6 +618,7 @@ impl KvTree {
         seq: u64,
         kind: RecordKind,
         value: Bytes,
+        entry_start: u64,
     ) -> Result<bool, KvError> {
         self.check_interior_key(key)?;
         self.seq.fetch_max(seq, Ordering::AcqRel);
@@ -617,7 +628,7 @@ impl KvTree {
         for _ in 0..RETRY_BUDGET {
             let target = self.descend(key, level).await?;
             match self
-                .apply_at_seq(&target, key, kind, value.clone(), Some(seq))
+                .apply_at_seq(&target, key, kind, value.clone(), Some((seq, entry_start)))
                 .await?
             {
                 ApplyOutcome::Applied => return Ok(true),
@@ -1227,6 +1238,15 @@ impl KvTree {
                 outcome.was_freezing,
                 "SMO node must hold its frozen delta until the swap"
             );
+            // Leftover floor (FIND-SMO-TAIL §1b): the moved records'
+            // entry starts are not carried on `OwnedRec`, but the
+            // predecessor's floor lower-bounds every one of them (each
+            // fold at its apply rounded to its entry start, and the
+            // floor was restored before this SMO), so the successors
+            // inherit it. The raw min-seq backstop can only engage if
+            // the predecessor's floor was somehow MAX with a non-empty
+            // overlay — never weaker than the pre-§1b behavior.
+            let pred_floor = node.dirty_floor();
             for succ in &successors {
                 let mut sg = succ.lock().write().await;
                 let mine: Vec<OwnedRec> = leftovers
@@ -1235,7 +1255,9 @@ impl KvTree {
                     .cloned()
                     .collect();
                 if !mine.is_empty() {
-                    succ.apply_locked(&mut sg, mine)?;
+                    let floor =
+                        pred_floor.min(mine.iter().map(|r| r.seq).min().unwrap_or(u64::MAX));
+                    succ.apply_locked(&mut sg, mine, floor)?;
                 }
             }
 
@@ -1314,7 +1336,12 @@ impl KvTree {
                             )
                         })
                         .collect();
-                    parent.apply_locked(pg, recs)?;
+                    // The flips are the entry's records 0..n, so the
+                    // first flip's seq IS the entry start (`res.start`
+                    // under the K6b hooks) — SMO floors already pin at
+                    // the §1b boundary.
+                    let flip_floor = recs.first().map(|r| r.seq).unwrap_or(u64::MAX);
+                    parent.apply_locked(pg, recs, flip_floor)?;
                 }
                 (Some(_), None) => unreachable!("parent guard taken with parent"),
             }

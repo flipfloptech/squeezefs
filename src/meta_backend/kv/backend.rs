@@ -711,17 +711,22 @@ impl KvMetaBackend {
         // Stranded predecessor *objects* can remain mapped-but-unrouted
         // in the cache until clock eviction — bytes only, bounded by the
         // window's SMO count (design §2 C′ residuals).
-        let mut interior: Vec<(u8, u8, &Record)> = Vec::new();
+        // Each replayed record's floor contribution is its ENTRY start
+        // (`ReplayedEntry::seq` — FIND-SMO-TAIL §1b rounding): replay
+        // reproduces record seqs, so it must reproduce the floor
+        // discipline too, or a post-replay checkpoint could re-mint a
+        // mid-entry tail from the replayed window's own records.
+        let mut interior: Vec<(u8, u8, u64, &Record)> = Vec::new();
         for entry in &recovery.entries {
             for (tag, rec) in &entry.records {
                 let (tree_id, level) = untag(*tag);
                 if level > 0 && matches!(tree_id, TREE_INODES | TREE_DENTRIES | TREE_XATTRS) {
-                    interior.push((tree_id, level, rec));
+                    interior.push((tree_id, level, entry.seq, rec));
                 }
             }
         }
-        interior.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.seq.cmp(&b.2.seq)));
-        for (tree_id, level, rec) in interior {
+        interior.sort_by(|a, b| b.1.cmp(&a.1).then(a.3.seq.cmp(&b.3.seq)));
+        for (tree_id, level, entry_start, rec) in interior {
             let tree = match tree_id {
                 TREE_INODES => &inodes,
                 TREE_DENTRIES => &dentries,
@@ -741,6 +746,7 @@ impl KvMetaBackend {
                 rec.seq,
                 rec.kind,
                 Bytes::copy_from_slice(&rec.value),
+                entry_start,
             )
             .await?;
         }
@@ -768,6 +774,7 @@ impl KvMetaBackend {
                     rec.seq,
                     rec.kind,
                     Bytes::copy_from_slice(&rec.value),
+                    entry.seq,
                 )
                 .await?;
             }
@@ -2891,7 +2898,11 @@ impl KvMetaBackend {
                         .iter()
                         .position(|n| n.addr() == node.addr())
                         .expect("node is in its own lock set");
-                    if let Err(e) = node.apply_locked(&mut guards[gi], group) {
+                    // FIND-SMO-TAIL §1b: the floor contribution is the
+                    // member's ENTRY START, not its records' raw seqs —
+                    // a leaf holding only rec[j>0] of this multi-leaf tx
+                    // must not pin the checkpoint tail mid-entry.
+                    if let Err(e) = node.apply_locked(&mut guards[gi], group, entry_start) {
                         apply_err = Some(e);
                         break;
                     }
@@ -3370,6 +3381,9 @@ impl KvMetaBackend {
                         r.kind,
                         Bytes::copy_from_slice(&r.value),
                     )],
+                    // §1b floor rounding: the whole compensation tx is
+                    // one entry starting at `res.start`.
+                    res.start,
                 )?;
             }
             drop(guards);

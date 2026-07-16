@@ -38,7 +38,15 @@
 //! the tail back; records applied after the pass visited their node carry
 //! reservations ≥ H by the same argument, and their floors re-lower the
 //! min. The tail is always an entry boundary (H is the next reservation
-//! start; floors and inflight starts are entry starts).
+//! start; inflight starts are entry starts; and floors round DOWN to
+//! entry starts — FIND-SMO-TAIL, docs/design-smo-replay-currency.md §1b:
+//! record seqs are `entry_start + i` across a multi-leaf tx, so folding
+//! raw seqs let a leaf holding only `rec[j>0]` — its sibling flushed or
+//! reserve-skip floor-restored — pin the tail STRICTLY INSIDE the entry,
+//! which replay's chain walk (parsing AT the tail) dropped with
+//! collateral entries to the resync point. Every `apply_locked` now
+//! folds the member's entry start; SMO flips already pinned at
+//! `res.start`).
 //!
 //! ## R10: the drain always makes progress
 //!

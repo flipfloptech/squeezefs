@@ -1113,6 +1113,21 @@ impl CachedNode {
     /// the lifecycle word's verdict if the node was superseded — callers
     /// revalidate first, so this is the caught-bug path, not control flow.
     ///
+    /// `floor` is the §4.6 pt 2 dirty-floor contribution, **rounded DOWN
+    /// to the records' journal-entry start** (FIND-SMO-TAIL,
+    /// docs/design-smo-replay-currency.md §1b): record seqs are stamped
+    /// `entry_start + i` across a multi-leaf tx, so folding raw
+    /// `rec.seq` let a node holding only `rec[j>0]` pin the checkpoint
+    /// tail STRICTLY INSIDE the entry — replay parses at the tail and a
+    /// mid-entry tail drops the entry's ≥-tail acked records plus
+    /// collateral entries to the resync point. Callers pass the entry
+    /// start (conveyor members, replay applies) or an already-boundary
+    /// seq (SMO flips pin at `res.start`; single-record commits are
+    /// their own entry start; an SMO's leftover move passes the
+    /// predecessor's floor, itself entry-start-rounded). A lower tail
+    /// only lengthens the replay window — absorbed idempotently by the
+    /// per-key LWW replay gate.
+    ///
     /// **PR M9 (§5.7 D7.a)**: each applied record's folded head is
     /// materialized here — one [`fold_forward`] step against the previous
     /// head, under the very lock the committer already holds ("one fold
@@ -1128,6 +1143,7 @@ impl CachedNode {
         &self,
         guard: &mut NodeDirty,
         records: Vec<OwnedRec>,
+        floor: u64,
     ) -> Result<(), KvError> {
         if self.state.mark_dirty().is_err() {
             return Err(KvError::Corrupt(format!(
@@ -1135,10 +1151,19 @@ impl CachedNode {
                 self.addr
             )));
         }
+        // §4.6 pt 2: every apply lowers the not-yet-durable floor; the
+        // checkpoint's tail rule reads it back. The floor is RING-
+        // POSITION domain (the tail must keep the records' journal entry
+        // inside the replay window until they are durable-covered) —
+        // production record seqs coincide with positions (`entry_start +
+        // i`), but the on-disk contract only requires per-key LWW order,
+        // and replayed window entries may legitimately carry fold-domain
+        // seqs below their entry position (K6a-era committers) — the
+        // entry start is the coverage target either way.
+        if !records.is_empty() {
+            self.dirty_floor.fetch_min(floor, Ordering::AcqRel);
+        }
         for mut rec in records {
-            // §4.6 pt 2: every applied record lowers the not-yet-durable
-            // floor; the checkpoint's tail rule reads it back.
-            self.dirty_floor.fetch_min(rec.seq, Ordering::AcqRel);
             let pos = guard
                 .overlay
                 .partition_point(|r| (&r.key[..], r.seq) <= (&rec.key[..], rec.seq));

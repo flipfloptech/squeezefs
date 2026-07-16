@@ -81,13 +81,23 @@ impl<L: Default, const N: usize> StripeLocks<L, N> {
 
     #[inline]
     pub fn get_lock(&self, ino: u64, key: u32) -> &L {
+        &self.locks[self.block_shard_index(ino, key)]
+    }
+
+    /// The shard index `get_lock(ino, key)` maps to — the same splitmix64
+    /// mix, exposed for the RW1 stripe-collision audit
+    /// (docs/design-random-small-writes.md §5.3 H2b): attributing a wait to
+    /// cross-key stripe collision vs same-key contention requires naming the
+    /// ACTUAL lock instance two distinct `(ino, key)` pairs can share.
+    #[inline]
+    pub fn block_shard_index(&self, ino: u64, key: u32) -> usize {
         let mut x = ino ^ ((key as u64) << 32);
         x ^= x >> 30;
         x = x.wrapping_mul(0xbf58476d1ce4e5b9);
         x ^= x >> 27;
         x = x.wrapping_mul(0x94d049bb133111eb);
         x ^= x >> 31;
-        &self.locks[(x as usize) % N]
+        (x as usize) % N
     }
 
     #[inline]

@@ -1476,6 +1476,40 @@ pub fn default_block_size() -> u64 {
         .unwrap_or(4 * 1024 * 1024)
 }
 
+/// RW1 mapping-form sanity classifier (docs/design-random-small-writes.md
+/// §5.1 predicate 1 / review Issue 19 — the polarity tripwire, permanent).
+///
+/// Classifies a striped `block_map` entry's FORM for the attribution rig's
+/// pinned sanity line:
+///
+/// * `"undecorated-2part"` — `persist_block_key`'s bare offset strings
+///   (`offset` / `be://offset`), which `DataRouter::parse_block_mapping`
+///   returns with `exact == false`: the whole-block form every ordinary
+///   striped block carries — the W1-eligible population.
+/// * `"decorated-3part"` — `bk:off:len` (promoted staged / spill / clip
+///   publishes; `exact == true`, `len` load-bearing): the W1-INELIGIBLE
+///   population (`patch_ineligible_decorated` in RW2).
+///
+/// Diagnostic only: RW2's `is_whole_block_mapping()` will be the single
+/// eligibility predicate source; this classifier exists so the rig PRINTS
+/// the fixture's actual form and the Issue-19 class of polarity inversion
+/// (a predicate keyed on `exact == true` would patch NOTHING, the loss
+/// dataset included) is caught at rig time, forever.
+pub fn block_mapping_form(mapping_str: &str) -> &'static str {
+    // The base key may itself contain `://` (non-default backends); the
+    // decoration is parsed strictly AFTER that prefix — the same rule as
+    // `parse_block_mapping`.
+    let rest = match mapping_str.find("://") {
+        Some(pos) => &mapping_str[pos + 3..],
+        None => mapping_str,
+    };
+    match rest.split(':').count() {
+        1 => "undecorated-2part",
+        3 => "decorated-3part",
+        _ => "unknown",
+    }
+}
+
 impl DataRouter {
     pub fn set_meta_backend(
         &self,

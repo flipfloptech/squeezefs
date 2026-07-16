@@ -775,8 +775,354 @@ pub(crate) fn check_component_name_len(name: &std::ffi::OsStr) -> Result<(), Err
     }
 }
 
-pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
+/// `BLOCK_FLUSH_LOCKS` stripe count — shared with the RW1 stripe-collision
+/// audit table, which must be sized to the ACTUAL lock population.
+pub const BLOCK_LOCK_STRIPES: usize = 4096;
+
+pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<tokio::sync::Mutex<()>, BLOCK_LOCK_STRIPES>> =
     Lazy::new(|| StripeLocks::new());
+
+// ===========================================================================
+// RW1 write-path attribution rig (docs/design-random-small-writes.md PR RW1;
+// §5.3 W3 rig extension; §5.4 observability)
+//
+// Extends the M2 rig with the striped-write cost anatomy the rand-write
+// program's forensics run on:
+//
+//  1. **Write sub-phase histograms** (`fuse_write_phase_ns`): route-classify
+//     → checkout (buffer acquire) → staged-sibling remove (the per-write
+//     spawn_blocking hop, H1) → merge copy → seed fetch (item-B RMW
+//     materialization, all drivers) → upload DMA / upload map-merge (H2
+//     hold-time split) → park/spill → staging put.
+//  2. **Per-site `BLOCK_FLUSH_LOCKS` wait attribution** (`block_lock_wait_by_
+//     site`): the FIND-L1-A `block_lock_wait` tail, split by acquiring call
+//     site (checkout vs spill-victim vs writeback-flush vs flush-exit vs
+//     punch vs overlay-prune).
+//  3. **The H2b stripe-collision audit** (`block_lock_stripe_audit`):
+//     contended acquisitions classified CROSS-KEY (a different (ino, block)
+//     key holds the shared stripe — the splitmix-spread/stripe-count defect
+//     signature) vs SAME-KEY (true per-block serialization), plus the
+//     waiters-at-arrival depth. Diagnostic-grade by design: the holder word
+//     is the stripe's LAST acquirer (release does not clear it), so one
+//     racing sample can misclassify — same contract as the M2 estimator
+//     tables; never memory-unsafe, never affects any op's reply.
+//  4. **The in-flight WRITE histogram** (`fuse_write_inflight`): concurrent
+//     WRITE handler depth at each arrival — the §12 OQ2 answer (does the
+//     kernel actually dispatch ≥ iodepth×threads concurrent WRITEs).
+//
+// Cost contract (the M2 memoized-gate pattern, pinned by
+// `tests/rand_write_rig_off_tests.rs`): with `SQUEEZEFS_OP_PROFILE` unset
+// every helper here is one memoized atomic load + branch — no `Instant`
+// reads, no atomics touched, no histogram writes, and the stats JSON surface
+// is byte-identical to pre-RW1. The always-on §1.2 device-byte LEDGER
+// counters live in [`Metrics`] instead (one relaxed `fetch_add` on
+// 4 MiB-class paths — the red gate consumes them without profile mode).
+// ===========================================================================
+
+/// Striped-write sub-phases (`fuse_write_phase_ns` — design §5.3 W3 list).
+/// `repr(usize)` indexes the histogram table directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum WritePhase {
+    /// Write handler backend entry → `write_file_staged` dispatch (lease +
+    /// layout classification — the striped route decision).
+    RouteClassify = 0,
+    /// Block lock held → RMW base owned (parked buffer / staged copy /
+    /// fresh / deferred).
+    Checkout = 1,
+    /// The per-write staged-sibling `spawn_blocking` remove hop (H1).
+    SiblingRemove = 2,
+    /// `record_write` + `make_mut` + payload slice copy.
+    MergeCopy = 3,
+    /// `fetch_seed_image` — the deferred RMW seed materialization, every
+    /// driver (gap / trigger / spill victim / flush exits / parked gate).
+    SeedFetch = 4,
+    /// `upload_full_block` crypto → allocate → DMA (H2 hold-time, device
+    /// leg).
+    UploadDma = 5,
+    /// `upload_full_block` block-map merge (H2 hold-time, conveyor leg).
+    UploadMapMerge = 6,
+    /// `insert_active_block_buffer` — park incl. the inline victim-spill
+    /// loop and the Red parked-gate.
+    ParkSpill = 7,
+    /// `put_active_block` staging writes (spill / flush / fallback).
+    StagingPut = 8,
+}
+
+const WRITE_PHASES: usize = 9;
+const WRITE_PHASE_NAMES: [&str; WRITE_PHASES] = [
+    "route_classify",
+    "checkout",
+    "sibling_remove",
+    "merge_copy",
+    "seed_fetch",
+    "upload_dma",
+    "upload_map_merge",
+    "park_spill",
+    "staging_put",
+];
+
+/// `BLOCK_FLUSH_LOCKS` acquiring call-site classes (`block_lock_wait_by_site`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum BlockLockSite {
+    /// `write_file_staged` per-block checkout (the write hot path).
+    WriteCheckout = 0,
+    /// `insert_active_block_buffer` victim `try_lock` (contended = skip,
+    /// counted separately — a blocking acquire can self-deadlock, §5.3).
+    SpillVictim = 1,
+    /// `flush_one_active_block` (writeback worker / fsync flush units).
+    WritebackFlush = 2,
+    /// `flush_memory_buffers_for_inode` / teardown stage-exit sweeps.
+    FlushExit = 3,
+    /// `punch_hole_range` whole-block drop arm.
+    Punch = 4,
+    /// `drop_active_block_overlays_beyond` (truncate prune).
+    OverlayPrune = 5,
+}
+
+const BLOCK_LOCK_SITES: usize = 6;
+const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
+    "write_checkout",
+    "spill_victim",
+    "writeback_flush",
+    "flush_exit",
+    "punch",
+    "overlay_prune",
+];
+
+struct WriteProfState {
+    /// `fuse_write_phase_ns` histograms, [`WritePhase`]-indexed.
+    phases: [LatencyHistogram; WRITE_PHASES],
+    /// `block_lock_wait_by_site` histograms, [`BlockLockSite`]-indexed
+    /// (every profiled acquisition, contended or not).
+    site_waits: [LatencyHistogram; BLOCK_LOCK_SITES],
+    /// Contended waits whose stripe's last acquirer was a DIFFERENT
+    /// (ino, block) key — the H2b cross-key collision class.
+    cross_key_waits: LatencyHistogram,
+    /// Contended waits on the waiter's own key — true block serialization.
+    same_key_waits: LatencyHistogram,
+    /// Waiters already parked on the stripe at arrival (contended
+    /// acquisitions only) — the convoy-depth distribution.
+    stripe_waiters: QueueDepthHistogram,
+    /// Concurrent WRITE handler depth sampled at each WRITE arrival.
+    inflight_writes: QueueDepthHistogram,
+    /// Spill-victim `try_lock` refusals (the contended-skip arm).
+    spill_victim_lock_skips: AtomicU64,
+    /// Last-acquirer key word per stripe (0 = never acquired). Written on
+    /// every profiled acquisition; NEVER cleared on release — "last
+    /// acquirer" semantics, diagnostic-grade (see the module comment).
+    stripe_holders: Vec<AtomicU64>,
+    /// Live parked waiters per stripe (profiled contended acquisitions).
+    stripe_wait_depth: Vec<AtomicU64>,
+    /// Live WRITE handler gauge feeding `inflight_writes`.
+    write_gauge: AtomicU64,
+}
+
+static WRITE_PROF: Lazy<WriteProfState> = Lazy::new(|| WriteProfState {
+    phases: std::array::from_fn(|_| LatencyHistogram::default()),
+    site_waits: std::array::from_fn(|_| LatencyHistogram::default()),
+    cross_key_waits: LatencyHistogram::default(),
+    same_key_waits: LatencyHistogram::default(),
+    stripe_waiters: QueueDepthHistogram::default(),
+    inflight_writes: QueueDepthHistogram::default(),
+    spill_victim_lock_skips: AtomicU64::new(0),
+    stripe_holders: (0..BLOCK_LOCK_STRIPES).map(|_| AtomicU64::new(0)).collect(),
+    stripe_wait_depth: (0..BLOCK_LOCK_STRIPES).map(|_| AtomicU64::new(0)).collect(),
+    write_gauge: AtomicU64::new(0),
+});
+
+/// Nonzero identity word for a `(ino, block)` key in the stripe audit —
+/// the same splitmix64 mix the lock table spreads on, `| 1` so 0 stays the
+/// "never acquired" sentinel. Two distinct keys colliding on one WORD is a
+/// ~2⁻⁶³ diagnostic misclassification, not a correctness event.
+#[inline]
+fn stripe_key64(ino: u64, b: u32) -> u64 {
+    let mut x = ino ^ ((b as u64) << 32);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    x | 1
+}
+
+/// Phase-stamp start: ONE memoized load + branch when the rig is off (no
+/// clock read — the M2 cost contract).
+#[inline]
+pub fn write_phase_start() -> Option<std::time::Instant> {
+    if op_profile_enabled() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    }
+}
+
+/// Record a write sub-phase span started by [`write_phase_start`]. No-op
+/// (no clock read, no histogram touch) when the start was rig-off `None`.
+#[inline]
+pub fn write_phase_record(phase: WritePhase, started: Option<std::time::Instant>) {
+    if let Some(t0) = started {
+        WRITE_PROF.phases[phase as usize].record(t0.elapsed());
+    }
+}
+
+/// Profile-armed `BLOCK_FLUSH_LOCKS` acquisition: per-site wait histogram +
+/// the H2b collision classification. `try_lock` first — its success arm is
+/// the same one-CAS fast path `lock()` takes, so semantics and uncontended
+/// cost are unchanged; the contended arm classifies against the stripe's
+/// last-acquirer word BEFORE parking, then falls into the ordinary FIFO
+/// `lock().await`.
+async fn block_lock_acquire_prof(
+    lock: &tokio::sync::Mutex<()>,
+    site: BlockLockSite,
+    ino: u64,
+    b: u32,
+) -> (tokio::sync::MutexGuard<'_, ()>, Duration) {
+    let key = stripe_key64(ino, b);
+    let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, b);
+    let t0 = std::time::Instant::now();
+    let guard = match lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            let holder = WRITE_PROF.stripe_holders[stripe].load(Ordering::Relaxed);
+            let depth = WRITE_PROF.stripe_wait_depth[stripe].fetch_add(1, Ordering::Relaxed) + 1;
+            WRITE_PROF.stripe_waiters.record(depth as usize);
+            let g = lock.lock().await;
+            WRITE_PROF.stripe_wait_depth[stripe].fetch_sub(1, Ordering::Relaxed);
+            let waited = t0.elapsed();
+            if holder != 0 && holder != key {
+                WRITE_PROF.cross_key_waits.record(waited);
+            } else {
+                WRITE_PROF.same_key_waits.record(waited);
+            }
+            g
+        }
+    };
+    let waited = t0.elapsed();
+    WRITE_PROF.stripe_holders[stripe].store(key, Ordering::Relaxed);
+    WRITE_PROF.site_waits[site as usize].record(waited);
+    (guard, waited)
+}
+
+/// Acquire block `(ino, b)`'s `BLOCK_FLUSH_LOCKS` stripe with RW1 per-site
+/// attribution, returning the guard and the measured wait — for the two
+/// HISTORICAL sites (write checkout, writeback flush) that always timed
+/// their wait into the global `block_lock_wait` histogram: the rig-off path
+/// is exactly today's `Instant` + `lock().await` sequence, and the caller
+/// keeps recording the returned wait into the global histogram so the
+/// FIND-L1-A baseline series stays comparable.
+pub async fn block_lock_acquire_timed(
+    ino: u64,
+    b: u32,
+    site: BlockLockSite,
+) -> (tokio::sync::MutexGuard<'static, ()>, Duration) {
+    let lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
+    if !op_profile_enabled() {
+        let t0 = std::time::Instant::now();
+        let g = lock.lock().await;
+        return (g, t0.elapsed());
+    }
+    block_lock_acquire_prof(lock, site, ino, b).await
+}
+
+/// [`block_lock_acquire_timed`] for the sites that never timed their wait:
+/// the rig-off path is a bare `lock().await` — ZERO clock reads (the M2
+/// contract; these sites paid none before RW1 and pay none after).
+pub async fn block_lock_acquire(
+    ino: u64,
+    b: u32,
+    site: BlockLockSite,
+) -> tokio::sync::MutexGuard<'static, ()> {
+    let lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
+    if !op_profile_enabled() {
+        return lock.lock().await;
+    }
+    block_lock_acquire_prof(lock, site, ino, b).await.0
+}
+
+/// Note a spill-victim `try_lock` outcome (the one site whose contended arm
+/// SKIPS instead of waiting — §5.3 mandatory try_lock): acquisitions update
+/// the stripe holder word + site histogram (zero wait by construction),
+/// refusals count `spill_victim_lock_skips`. No-op when the rig is off.
+pub fn block_lock_try_note(site: BlockLockSite, ino: u64, b: u32, acquired: bool) {
+    if !op_profile_enabled() {
+        return;
+    }
+    if acquired {
+        let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, b);
+        WRITE_PROF.stripe_holders[stripe].store(stripe_key64(ino, b), Ordering::Relaxed);
+        WRITE_PROF.site_waits[site as usize].record(Duration::ZERO);
+    } else {
+        WRITE_PROF
+            .spill_victim_lock_skips
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII in-flight WRITE sample (`fuse_write_inflight`): entering samples the
+/// live WRITE-handler depth into the histogram; drop releases the gauge.
+/// Rig off: no atomics, no samples (the gauge itself stays untouched).
+pub struct WriteInflight {
+    armed: bool,
+}
+
+impl WriteInflight {
+    pub fn enter() -> WriteInflight {
+        if op_profile_enabled() {
+            let depth = WRITE_PROF.write_gauge.fetch_add(1, Ordering::Relaxed) + 1;
+            WRITE_PROF.inflight_writes.record(depth as usize);
+            WriteInflight { armed: true }
+        } else {
+            WriteInflight { armed: false }
+        }
+    }
+}
+
+impl Drop for WriteInflight {
+    fn drop(&mut self) {
+        if self.armed {
+            WRITE_PROF.write_gauge.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `fuse_write_phase_ns` stats payload: `{phase: histogram}`.
+pub fn write_profile_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pi, pname) in WRITE_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*pname).to_string(), WRITE_PROF.phases[pi].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
+/// `block_lock_wait_by_site` stats payload: `{site: histogram}`.
+pub fn block_lock_site_json() -> serde_json::Value {
+    let mut sites = serde_json::Map::new();
+    for (si, sname) in BLOCK_LOCK_SITE_NAMES.iter().enumerate() {
+        sites.insert((*sname).to_string(), WRITE_PROF.site_waits[si].to_json());
+    }
+    serde_json::Value::Object(sites)
+}
+
+/// `block_lock_stripe_audit` stats payload (the H2b deliverable):
+/// `{cross_key_waits, same_key_waits, waiters_at_arrival,
+/// spill_victim_lock_skips}`.
+pub fn block_lock_stripe_audit_json() -> serde_json::Value {
+    serde_json::json!({
+        "cross_key_waits": WRITE_PROF.cross_key_waits.to_json(),
+        "same_key_waits": WRITE_PROF.same_key_waits.to_json(),
+        "waiters_at_arrival": WRITE_PROF.stripe_waiters.to_json(),
+        "spill_victim_lock_skips": WRITE_PROF
+            .spill_victim_lock_skips
+            .load(Ordering::Relaxed),
+    })
+}
+
+/// `fuse_write_inflight` stats payload.
+pub fn write_inflight_json() -> serde_json::Value {
+    WRITE_PROF.inflight_writes.to_json()
+}
 
 /// P1-8: how long the FUSE write path holds the per-inode write lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1308,6 +1654,77 @@ pub struct Metrics {
     /// transient-zeros family). A live health signal, not an error: bounded
     /// retries that converge. Sustained growth without churn = investigate.
     pub staged_identity_retries: Align64<AtomicU64>,
+    // -----------------------------------------------------------------
+    // RW1 rand-write device-byte ledger (docs/design-random-small-writes.md
+    // §1.2 point 3–4 buckets — the corrected leg drivers). Always-on
+    // counters (one relaxed fetch_add on 4 MiB-class paths): the G-RW2 red
+    // gate reconciles per-op device bytes FROM these, keyed to the drivers
+    // — the inline victim spill, the R5-pressure parked drain, the Red
+    // parked-gate self-flush, and same-key re-stage churn — NEVER to the
+    // writeback queue (§1.2 Issue-4 correction: `enqueue_writeback` is
+    // fsync/dismount/fallback-driven and does not fire on the loss shape).
+    // -----------------------------------------------------------------
+    /// Bucket 1 read leg: deferred-seed materializations (`fetch_seed_image`
+    /// = one whole-block device read) forced by the INLINE VICTIM SPILL in
+    /// `insert_active_block_buffer` — the foreground writer paying a
+    /// victim's RMW seed.
+    pub spill_seed_reads: Align64<AtomicU64>,
+    pub spill_seed_read_bytes: Align64<AtomicU64>,
+    /// Bucket 1 write leg: victim images written to local staging by the
+    /// inline spill (admitted `put_active_block` bytes).
+    pub spill_staging_puts: Align64<AtomicU64>,
+    pub spill_staging_put_bytes: Align64<AtomicU64>,
+    /// Seed materializations forced at the flush/stage exits (parked drain,
+    /// fsync/close flush, teardown, Red parked-gate self-flush) — the
+    /// non-spill share of the read leg.
+    pub flush_seed_read_bytes: Align64<AtomicU64>,
+    /// Seed materializations inside `write_file_staged` itself (gap write /
+    /// partial-coverage trigger) — ~0 on the isolated-4k loss shape; growth
+    /// means the shape reaching the write path is not the modeled one.
+    pub write_path_seed_read_bytes: Align64<AtomicU64>,
+    /// Bucket 2 write leg: staging puts by driver. `drain` = the
+    /// R5-pressure parked drain (`drain_parked_toward`); `flush` = the
+    /// fsync/FLUSH/close family; `teardown` = dismount force-flush;
+    /// `wt_fallback` = write-through never-lossy staging fallback.
+    pub staging_put_bytes_drain: Align64<AtomicU64>,
+    pub staging_put_bytes_flush: Align64<AtomicU64>,
+    pub staging_put_bytes_teardown: Align64<AtomicU64>,
+    pub staging_put_bytes_wt_fallback: Align64<AtomicU64>,
+    /// Writeback-queue admissions by driver (the §1.2 attribution honesty
+    /// check: on the pure O_DIRECT rand shape the foreground write path
+    /// enqueues NOTHING — `wt_fallback` stays 0 and the queued durable
+    /// uploads trace to the drain/flush drivers).
+    pub writeback_enqueued_drain: Align64<AtomicU64>,
+    pub writeback_enqueued_flush: Align64<AtomicU64>,
+    pub writeback_enqueued_teardown: Align64<AtomicU64>,
+    pub writeback_enqueued_wt_fallback: Align64<AtomicU64>,
+    /// Durable-upload write leg by driver: `writeback` = the per-block
+    /// flush unit (`flush_one_active_block` — queued units AND fsync/
+    /// queue-full sweeps); `self_flush` = the Red parked-gate self-flush
+    /// (bucket 3); `escalation` = staging-refusal escalations at the
+    /// flush/teardown exits.
+    pub durable_upload_bytes_writeback: Align64<AtomicU64>,
+    pub durable_upload_bytes_self_flush: Align64<AtomicU64>,
+    pub durable_upload_bytes_escalation: Align64<AtomicU64>,
+    /// Bucket 4: same-key re-stage churn — a block revisit's checkout
+    /// removing the staged sibling whose bytes an earlier spill already
+    /// paid for (re-park + re-spill follows). `removes` counts staged
+    /// siblings actually present at checkout; `bytes` their staged size.
+    pub restage_churn_removes: Align64<AtomicU64>,
+    pub restage_churn_bytes: Align64<AtomicU64>,
+    /// Block revisits at checkout (an overlay — parked buffer or staged
+    /// sibling — already owned the block): quantifies the §1.2 block-revisit
+    /// discount (+12–26 % above the 12 MiB/op model on the scoreboard row).
+    pub write_block_revisits: Align64<AtomicU64>,
+    /// H1 evidence: the per-write staged-sibling `spawn_blocking` remove
+    /// hop, counted per striped-write checkout (fires whether or not
+    /// anything is staged — the pure-overhead face). The RW1 cost pin
+    /// asserts probes == striped block writes; RW3's lock-free probe flips
+    /// that pin when it elides the hop.
+    pub staging_sibling_probes: Align64<AtomicU64>,
+    /// H3 evidence: `ALIGNED_BUF_POOL` handouts that missed the recycle
+    /// queue and paid the mmap/page-fault allocation path.
+    pub aligned_pool_misses: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -2270,6 +2687,31 @@ impl SqueezefsFilesystem {
                 "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
                 "write_through_fallbacks": METRICS.write_through_fallbacks.load(Ordering::Relaxed),
+                // RW1 rand-write device-byte ledger (design-random-small-
+                // writes §1.2 buckets; always-on — the G-RW2 gate's
+                // attribution source).
+                "spill_seed_reads": METRICS.spill_seed_reads.load(Ordering::Relaxed),
+                "spill_seed_read_bytes": METRICS.spill_seed_read_bytes.load(Ordering::Relaxed),
+                "spill_staging_puts": METRICS.spill_staging_puts.load(Ordering::Relaxed),
+                "spill_staging_put_bytes": METRICS.spill_staging_put_bytes.load(Ordering::Relaxed),
+                "flush_seed_read_bytes": METRICS.flush_seed_read_bytes.load(Ordering::Relaxed),
+                "write_path_seed_read_bytes": METRICS.write_path_seed_read_bytes.load(Ordering::Relaxed),
+                "staging_put_bytes_drain": METRICS.staging_put_bytes_drain.load(Ordering::Relaxed),
+                "staging_put_bytes_flush": METRICS.staging_put_bytes_flush.load(Ordering::Relaxed),
+                "staging_put_bytes_teardown": METRICS.staging_put_bytes_teardown.load(Ordering::Relaxed),
+                "staging_put_bytes_wt_fallback": METRICS.staging_put_bytes_wt_fallback.load(Ordering::Relaxed),
+                "writeback_enqueued_drain": METRICS.writeback_enqueued_drain.load(Ordering::Relaxed),
+                "writeback_enqueued_flush": METRICS.writeback_enqueued_flush.load(Ordering::Relaxed),
+                "writeback_enqueued_teardown": METRICS.writeback_enqueued_teardown.load(Ordering::Relaxed),
+                "writeback_enqueued_wt_fallback": METRICS.writeback_enqueued_wt_fallback.load(Ordering::Relaxed),
+                "durable_upload_bytes_writeback": METRICS.durable_upload_bytes_writeback.load(Ordering::Relaxed),
+                "durable_upload_bytes_self_flush": METRICS.durable_upload_bytes_self_flush.load(Ordering::Relaxed),
+                "durable_upload_bytes_escalation": METRICS.durable_upload_bytes_escalation.load(Ordering::Relaxed),
+                "restage_churn_removes": METRICS.restage_churn_removes.load(Ordering::Relaxed),
+                "restage_churn_bytes": METRICS.restage_churn_bytes.load(Ordering::Relaxed),
+                "write_block_revisits": METRICS.write_block_revisits.load(Ordering::Relaxed),
+                "staging_sibling_probes": METRICS.staging_sibling_probes.load(Ordering::Relaxed),
+                "aligned_pool_misses": METRICS.aligned_pool_misses.load(Ordering::Relaxed),
                 "active_block_memset_elided_bytes": METRICS.active_block_memset_elided_bytes.load(Ordering::Relaxed),
                 "meta_device_syncs": METRICS.meta_device_syncs.load(Ordering::Relaxed),
                 "meta_sync_requests": METRICS.meta_sync_requests.load(Ordering::Relaxed),
@@ -2625,6 +3067,16 @@ impl SqueezefsFilesystem {
                     "fuse_op_profile_inflight".into(),
                     op_profile_inflight().into(),
                 );
+                // PR RW1 (design-random-small-writes §5.3/§5.4): the write
+                // rig's families ride the same armed-only contract — a
+                // disabled mount's stats surface stays byte-identical.
+                metrics.insert("fuse_write_phase_ns".into(), write_profile_phase_json());
+                metrics.insert("block_lock_wait_by_site".into(), block_lock_site_json());
+                metrics.insert(
+                    "block_lock_stripe_audit".into(),
+                    block_lock_stripe_audit_json(),
+                );
+                metrics.insert("fuse_write_inflight".into(), write_inflight_json());
             }
         }
 

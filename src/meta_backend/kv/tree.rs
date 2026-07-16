@@ -72,6 +72,55 @@ pub const KEY_SPACE_MAX: [u8; 32] = [0xFF; 32];
 /// so more than a handful of retries means a routing bug, failed loud.
 const RETRY_BUDGET: usize = 256;
 
+/// Test seam (docs/design-smo-replay-currency.md §6 PR 1; the
+/// `TEST_CONVEYOR_POISON_APPLY_INO` precedent): arm with a tree id
+/// (`TREE_INODES`/`TREE_DENTRIES`/`TREE_XATTRS`) to park the next
+/// [`smo_replace`] on that tree **in its build window** — after the
+/// successor images are written and loaded back, before the §4.6
+/// parent-then-child lock window — so a test can inject racing commits
+/// whose journal reservations land *below* the SMO's in-lock flip
+/// reservation. That is exactly the sub-mechanism (i) stranding shape
+/// (design §1): the racing records reach the successors only as
+/// `take_overlay()` leftovers whose RAM copies die with the process,
+/// while single-pass replay routes them to the abandoned predecessor.
+/// `0` = off; unarmed cost is one relaxed load per SMO.
+///
+/// [`smo_replace`]: KvTree::smo_replace
+pub static TEST_SMO_BUILD_PAUSE_TREE: AtomicU64 = AtomicU64::new(0);
+
+/// While an SMO is parked on [`TEST_SMO_BUILD_PAUSE_TREE`], the paused
+/// node's identity — the test reads the key range to target its racing
+/// commits. `None` whenever no SMO is parked. Written only on the armed
+/// path (zero cost unarmed).
+pub static TEST_SMO_BUILD_PAUSED: once_cell::sync::Lazy<
+    std::sync::Mutex<Option<TestSmoPauseInfo>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
+
+/// The parked-SMO wake for [`TEST_SMO_BUILD_PAUSE_TREE`] (register-recheck
+/// discipline — a stale release can never strand the SMO task).
+static TEST_SMO_BUILD_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
+/// Release an SMO parked on [`TEST_SMO_BUILD_PAUSE_TREE`] (disarms first;
+/// the notify wakes the register-recheck loop).
+pub fn test_smo_build_pause_release() {
+    TEST_SMO_BUILD_PAUSE_TREE.store(0, Ordering::SeqCst);
+    TEST_SMO_BUILD_NOTIFY.notify_waiters();
+}
+
+/// The paused SMO's identity published through [`TEST_SMO_BUILD_PAUSED`].
+#[derive(Debug, Clone)]
+pub struct TestSmoPauseInfo {
+    pub tree_id: u8,
+    pub level: u8,
+    /// Whether the node under replacement is the tree root (a root swap
+    /// journals no pointer records — design §2 C′ carve-out; the
+    /// stranding contract test requires `false`).
+    pub is_root: bool,
+    pub min_key: Vec<u8>,
+    pub max_key: Vec<u8>,
+}
+
 /// An interior record value: `(child_addr, child_seq)` (§4.2), 16 B LE.
 pub fn encode_interior_value(child_addr: u64, child_seq: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(16);
@@ -1012,6 +1061,31 @@ impl KvTree {
                 pinned,
                 self.cache.charge_gauge(),
             )?);
+        }
+
+        // Test seam (docs/design-smo-replay-currency.md §6 PR 1): park an
+        // armed build HERE — successor images are fixed on disk, no locks
+        // are held, and the flip's reservation is not yet taken — so user
+        // commits injected while parked reserve BELOW the flip's seq and
+        // reach the successors only as `take_overlay()` leftovers: the
+        // sub-mechanism (i) stranding window, held open deterministically.
+        // Unarmed cost: one relaxed load per SMO.
+        if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
+            *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = Some(TestSmoPauseInfo {
+                tree_id: self.tree_id,
+                level: node.level(),
+                is_root: self.is_root(node),
+                min_key: node.min_key().to_vec(),
+                max_key: node.max_key().to_vec(),
+            });
+            while TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
+                let notified = TEST_SMO_BUILD_NOTIFY.notified();
+                if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) != u64::from(self.tree_id) {
+                    break;
+                }
+                notified.await;
+            }
+            *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = None;
         }
 
         // A multi-way replacement of the root needs a new root above the

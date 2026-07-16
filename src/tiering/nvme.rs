@@ -244,7 +244,21 @@ impl NvmeShard {
             .truncate(false)
             .open(path)?;
 
-        file.set_len(capacity as u64)?;
+        // NEVER shrink an existing segment file (FIND-VS-A teardown
+        // SIGBUS): another process — or an earlier cache instance — may
+        // hold a live mmap of the full-size file, and `set_len` below its
+        // mapped length turns every beyond-EOF page access into
+        // `SIGBUS (BUS_ADRERR)`. The observed vector was the `squeezefs
+        // umount` CLI opening the LIVE daemon's segments with a smaller
+        // capacity: the daemon's teardown drain then faulted mid-flush and
+        // the truncation destroyed staged payload bytes. Growing is safe
+        // (extending never invalidates an existing mapping's pages); a
+        // larger-than-requested file keeps its length and the ring simply
+        // uses the first `capacity` bytes.
+        let existing = file.metadata()?.len();
+        if existing < capacity as u64 {
+            file.set_len(capacity as u64)?;
+        }
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
         Ok(Self {

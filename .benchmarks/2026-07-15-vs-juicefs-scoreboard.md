@@ -162,6 +162,15 @@ staged-RMW failure persists either way). Filed like the L1 report's
 generic/074 row: **standing dev regression to re-bisect**, treatment
 precedent "identical failure on baseline ⇒ deviation pre-dates the branch."
 
+**RESOLVED 2026-07-16** — root-caused and fixed on
+`fix/staged-rmw-pool-regression`: not a commit regression but a latent
+shard-geometry defect (since `e4a8434`) visible only off the 16-CPU
+taskset rail — `next_pow2(25 cores) = 32` shards drove staging shard
+capacity to exactly one entry, making the crash-safe same-key re-stage
+structurally impossible (per-op durable-spill alternation = the exact
+100/200 signature). Full tape, bisect table, fix, and acceptance:
+`.benchmarks/2026-07-16-find-vs-b-fix.md`.
+
 ## Gate posture for releases (until the follow-ups land)
 
 ```bash

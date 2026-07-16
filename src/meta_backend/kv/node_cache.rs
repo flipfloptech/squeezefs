@@ -1493,6 +1493,18 @@ pub struct NodeCache {
     /// already hold the superseded object's `Arc` keep reading its intact
     /// snapshot (§4.6) — this set only guards re-loads from disk.
     retired: scc::HashSet<u64>,
+    /// FIND-VS-A tail-rule fix: the min `dirty_floor` of every node whose
+    /// mapping LEFT this cache (SMO retire, eviction, publish-replace)
+    /// since the checkpoint task last drained it. The §4.6 pt 2 tail rule
+    /// walks LIVE nodes' floors — a floor that dies with its mapping
+    /// otherwise becomes invisible, the next ledger's `journal_tail_seq`
+    /// sails past its record seqs, and a crash before the covering state
+    /// is durably *reachable* loses acked commits (observed as the
+    /// scoreboard's post-crash ENOENT on 1–4 % of acked creates; forensics
+    /// in `.benchmarks/2026-07-16-find-vs-a-fix.md`). Draining it into the
+    /// tail computation keeps every such record inside the replay window
+    /// until a ledger record written AFTER its floor died covers it.
+    dying_floors: AtomicU64,
 }
 
 impl std::fmt::Debug for NodeCache {
@@ -1515,7 +1527,37 @@ impl NodeCache {
             cached_bytes: Arc::new(AtomicU64::new(0)),
             durable_tail: AtomicU64::new(0),
             retired: scc::HashSet::default(),
+            dying_floors: AtomicU64::new(u64::MAX),
         })
+    }
+
+    /// Fold a departing node's `dirty_floor` into the dying-floor
+    /// accumulator (see the field doc). `u64::MAX` (clean) is a no-op.
+    /// Crate-visible: the tree layer also folds ROOT-SWAP positions here
+    /// (the one routing change whose only durable form is the next ledger
+    /// record — FIND-VS-A).
+    pub(crate) fn note_dying_floor(&self, floor: u64) {
+        if floor != u64::MAX {
+            self.dying_floors.fetch_min(floor, Ordering::AcqRel);
+        }
+    }
+
+    /// Drain the dying-floor accumulator — the checkpoint task's tail
+    /// computation calls this once per cycle (after the flush pass) and
+    /// clamps `journal_tail_seq` to the result. Callers that fail to
+    /// write the covering ledger record must fold the value back
+    /// ([`Self::restore_dying_floors`]) so the next cycle still respects
+    /// it.
+    pub fn take_dying_floors(&self) -> u64 {
+        self.dying_floors.swap(u64::MAX, Ordering::AcqRel)
+    }
+
+    /// Fold a drained dying-floor value back after a failed ledger write
+    /// (the covering record never landed — see [`Self::take_dying_floors`]).
+    pub fn restore_dying_floors(&self, floor: u64) {
+        if floor != u64::MAX {
+            self.dying_floors.fetch_min(floor, Ordering::AcqRel);
+        }
     }
 
     /// The shared budget gauge — what [`CachedNode::from_loaded`] takes so
@@ -1670,9 +1712,30 @@ impl NodeCache {
         match self.map.entry_sync(addr) {
             scc::hash_map::Entry::Occupied(mut e) => {
                 // Replacing a mapping (an SMO successor over a stale
-                // demand-loaded object): sever the old one.
+                // demand-loaded object): sever the old one. Its floor —
+                // and any dirt the displaced object still held — must
+                // keep clamping the tail (FIND-VS-A: a floor that dies
+                // with its mapping otherwise lets the ledger tail pass
+                // un-covered acked records).
                 let old = e.get().clone();
-                let _ = old.state().supersede();
+                let outcome = old.state().supersede();
+                self.note_dying_floor(old.dirty_floor());
+                if let Ok(o) = outcome {
+                    if o.was_dirty || o.was_freezing {
+                        // Displaced RAM records cannot be carried here
+                        // (this is not the SMO path): loud, and the floor
+                        // fold above keeps them replay-covered.
+                        log::error!(
+                            "node cache publish over a NON-CLEAN mapping at {:#x} \
+                             (was_dirty={} was_freezing={} floor={}): displaced open-delta \
+                             records stay replay-covered via the dying-floor clamp",
+                            addr,
+                            o.was_dirty,
+                            o.was_freezing,
+                            old.dirty_floor()
+                        );
+                    }
+                }
                 *e.get_mut() = node;
             }
             scc::hash_map::Entry::Vacant(e) => {
@@ -1696,6 +1759,14 @@ impl NodeCache {
     /// the pending-free of the extent (§4.7). In-flight readers keep the
     /// object's snapshot alive by refcount (§4.6).
     pub fn retire(&self, node: &Arc<CachedNode>) {
+        // FIND-VS-A: the retiring node's floor leaves the live-floor walk
+        // with this mapping. Its records ARE durable in the successor
+        // images (barriered before the swap), but their *reachability*
+        // — SMO pointer records / the root the next ledger names — is not
+        // durably tied down until a ledger record written after this
+        // point. Clamping the next tail to the dead floor keeps every
+        // such record inside the replay window until then.
+        self.note_dying_floor(node.dirty_floor());
         self.retired.insert_sync(node.addr()).ok();
         if self
             .map
@@ -1748,6 +1819,13 @@ impl NodeCache {
                 continue;
             }
             if node.state().try_evict() {
+                // A state-clean node can still carry a floor: threshold
+                // maintenance appends its bytes (they are on disk) but
+                // only a checkpoint's barrier makes them durable-covered.
+                // The floor must survive the eviction (FIND-VS-A dying-
+                // floor clamp) or the tail could pass records whose
+                // appends a power-cut would still tear away.
+                self.note_dying_floor(node.dirty_floor());
                 if self
                     .map
                     .remove_if_sync(&addr, |v| Arc::ptr_eq(v, &node))

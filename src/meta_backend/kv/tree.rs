@@ -779,7 +779,13 @@ impl KvTree {
                 return Ok(());
             }
             // Log area full ⇒ compact / split (§4.6 pt 1; smo_replace
-            // owns the SMO counters).
+            // owns the SMO counters). Restore the taken floor FIRST
+            // (FIND-VS-A): the SMO retires this node, and `retire`'s
+            // dying-floor fold is what keeps the tail clamped to the
+            // frozen delta's records until a ledger record written after
+            // the swap covers them — a floor still parked in this frame's
+            // local would die silently with the object.
+            node.restore_dirty_floor(floor);
             let mut o = MaintenanceOutcome::default();
             self.smo_replace(ctx, &node, &mut o).await
         }
@@ -866,8 +872,37 @@ impl KvTree {
 
         // ---- Step 1: build successors from the frozen snapshot, no locks.
         let src = load_node(&cfg.path, layout, node.addr(), durable_tail).await?;
+        // FIND-VS-A fold-source guard: the successors are folded from THIS
+        // extent's on-disk log + THIS object's frozen delta. If the disk
+        // image belongs to a different incarnation (extent reuse racing a
+        // stale maintenance address) or its log view disagrees with the
+        // object's own append cursor, folding it would build successors
+        // missing acked records — the silent-loss shape the 2026-07-16
+        // storm forensics caught (split successors missing predecessor
+        // keys). Fail the SMO loud instead; the caller restores the floor
+        // and the next cycle retries against a coherent view.
         let extra: Vec<Record> = {
             let guard = node.lock().read().await;
+            if src.header().node_seq != node.node_seq() {
+                return Err(KvError::Corrupt(format!(
+                    "SMO fold-source incarnation mismatch at {:#x}: disk image has \
+                     node_seq {}, the live object is {} — refusing to fold a stale \
+                     source (acked records would be dropped)",
+                    node.addr(),
+                    src.header().node_seq,
+                    node.node_seq()
+                )));
+            }
+            if src.tail_offset() != guard.tail_offset() {
+                return Err(KvError::Corrupt(format!(
+                    "SMO fold-source log-view mismatch at {:#x}: disk walk ends at \
+                     {}, the live object's append cursor is at {} — refusing to fold \
+                     a diverged source (acked records would be dropped)",
+                    node.addr(),
+                    src.tail_offset(),
+                    guard.tail_offset()
+                )));
+            }
             guard.frozen_records()
         };
         // Fold the whole log + frozen delta with THE K1 algebra (§4.2).
@@ -1161,6 +1196,18 @@ impl KvTree {
                 (None, _) => {
                     // Root replacement: swap the root pointer inside the
                     // lock window (traversals are latch-free; ArcSwap).
+                    //
+                    // FIND-VS-A: a root swap is the ONE routing change
+                    // with no journaled pointer record and no parent
+                    // floor — its durable form is exclusively the next
+                    // ledger record's `tree_roots`. Clamp the next tail
+                    // to this swap's journal position (dying-floor fold)
+                    // so every commit applied under the new arrangement
+                    // — and the SMO records that rebuild the routing —
+                    // stays inside the replay window until a ledger
+                    // record naming the new root covers them.
+                    let swap_floor = smo_entry.as_ref().map(|(res, _, _)| res.start).unwrap_or(0);
+                    self.cache.note_dying_floor(swap_floor);
                     let (addr, seq) = match &new_root {
                         Some(r) => (r.addr(), r.node_seq()),
                         None => written[0],

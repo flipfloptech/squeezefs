@@ -333,6 +333,10 @@ pub struct KvMetaBackend {
     /// Last ledger seq written by a checkpoint (starts at the mounted
     /// record's seq).
     pub(super) checkpoint_seq: AtomicU64,
+    /// The `journal_tail_seq` of the last ledger record written (starts
+    /// at the mounted record's tail) — the §4.4 pt 4 hole discipline's
+    /// progress observable ([`Self::checkpoint_past`]).
+    pub(super) last_ledger_tail: AtomicU64,
     /// §4.7/§4.6 retire tag for SMO frees: always `checkpoint_seq + 1`
     /// (the NEXT ledger record); shared with the SMO hooks.
     pub(super) retire_seq: Arc<AtomicU64>,
@@ -758,6 +762,7 @@ impl KvMetaBackend {
             path: path.to_path_buf(),
             sb,
             checkpoint_seq: AtomicU64::new(ledger.seq),
+            last_ledger_tail: AtomicU64::new(ledger.journal_tail_seq),
             ledger,
             inodes,
             dentries,
@@ -1239,6 +1244,31 @@ impl KvMetaBackend {
     pub async fn checkpoint_now(&self) -> std::result::Result<(), KvError> {
         let mut smo = self.smo.lock().await;
         self.checkpoint_cycle(&mut smo, true).await
+    }
+
+    /// The §4.4 pt 4 hole discipline's checkpoint: cycle until the
+    /// written ledger tail reaches at least `pos` (the unwritten hole's
+    /// END), so replay's chain walk — which starts AT the tail — can
+    /// never enter the hole range behind it. One cycle usually suffices;
+    /// the FIND-VS-A dying-floor clamp can legitimately hold the first
+    /// cycle's tail below `pos` (a floor that died at an SMO retire /
+    /// root swap since the last ledger), in which case that cycle
+    /// discharges the floors and the next one clears the hole. Bounded:
+    /// floors drain in one cycle and in-flight reservations are finite,
+    /// so a stuck tail is a real defect — fail loud.
+    pub async fn checkpoint_past(&self, pos: u64) -> std::result::Result<(), KvError> {
+        let mut smo = self.smo.lock().await;
+        for _ in 0..8 {
+            self.checkpoint_cycle(&mut smo, true).await?;
+            if self.last_ledger_tail.load(Ordering::Acquire) >= pos {
+                return Ok(());
+            }
+        }
+        Err(KvError::Corrupt(format!(
+            "checkpoint tail failed to clear the journal hole ending at {pos} after 8 \
+             cycles (tail stuck at {}) — replay would walk into the hole",
+            self.last_ledger_tail.load(Ordering::Acquire)
+        )))
     }
 
     /// PR M6 (design-metadata-throughput §5.4 D4): live pending-times
@@ -2923,7 +2953,7 @@ impl KvMetaBackend {
                 // applied batch-mid).
                 let mut hole_err: Option<String> = None;
                 if !failed.is_empty() {
-                    if let Err(ck) = self.checkpoint_now().await {
+                    if let Err(ck) = self.checkpoint_past(res.end()).await {
                         log::error!(
                             "meta volume {}: post-isolation checkpoint could not cover the \
                              batch hole: {ck} (volume escalating; failing the survivors \
@@ -2992,7 +3022,7 @@ impl KvMetaBackend {
                 // (§4.1 discovery loses same-page successors of a dead
                 // chain): checkpoint past it — zero ring bytes by the
                 // §4.4 pt 5 progress theorem.
-                if let Err(ck) = self.checkpoint_now().await {
+                if let Err(ck) = self.checkpoint_past(res.end()).await {
                     log::error!(
                         "meta volume {}: post-failure checkpoint could not drain the \
                          journal hole: {ck} (volume escalating)",

@@ -683,8 +683,19 @@ impl KvMetaBackend {
         // durable (the §4.6 pt 3 pending-reclaim drains inside).
         self.sync_device().await.map_err(KvError::Io)?;
 
-        // ---- The tail rule (module docs; §4.6 pt 2).
-        let mut tail = h.min(self.journal_ring().min_inflight_start());
+        // ---- The tail rule (module docs; §4.6 pt 2), plus the FIND-VS-A
+        // dying-floor clamp: floors of nodes whose mappings LEFT the cache
+        // since the last drain (SMO retires, evictions, publish-replaces)
+        // are invisible to the live walk below, but their records' durable
+        // *reachability* is only tied down by a ledger record written
+        // after the departure — so they clamp this record's tail, keeping
+        // every such record inside the replay window. Drained here; folded
+        // back on any failure past this point (the ledger slot never
+        // landed, so the next cycle must still respect the floor).
+        let dying_floors = self.node_cache().take_dying_floors();
+        let mut tail = h
+            .min(self.journal_ring().min_inflight_start())
+            .min(dying_floors);
         self.node_cache().for_each_node(|n| {
             tail = tail.min(n.dirty_floor());
         });
@@ -722,13 +733,21 @@ impl KvMetaBackend {
             // on [`LedgerRecord::node_seq_watermark`].
             node_seq_watermark: inodes.node_seq_snapshot(),
         };
-        write_ledger_slot(
+        if let Err(e) = write_ledger_slot(
             self.device_path(),
             self.superblock().root_ledger.start,
             &rec,
         )
-        .await?;
+        .await
+        {
+            // The covering ledger record never landed: the drained dying
+            // floors are still uncovered — fold them back so the next
+            // cycle's tail keeps clamping to them (FIND-VS-A).
+            self.node_cache().restore_dying_floors(dying_floors);
+            return Err(e);
+        }
         self.checkpoint_seq.store(ckpt_seq, Ordering::Release);
+        self.last_ledger_tail.store(tail, Ordering::Release);
         // SMO frees from here on are retired by the NEXT record.
         self.retire_seq.store(ckpt_seq + 1, Ordering::Release);
         self.pending_reclaim.lock().unwrap().push((ckpt_seq, tail));

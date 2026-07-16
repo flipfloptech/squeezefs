@@ -13,13 +13,14 @@
 //!   (`drain_parked_toward`), the fsync/close flush family, and same-key
 //!   re-stage churn — and NEVER the foreground writeback queue
 //!   (`writeback_enqueued_wt_fallback == 0` on the shape).
-//! - **The standing-RED G-RW2 gate** (`#[ignore]`, run in acceptance /
-//!   flipped green by PR RW2's W1 patch): device write bytes ≤ 4× user
-//!   bytes, device read bytes ≤ 1× user bytes on the aligned rand-write
-//!   shape. Today the shape pays a whole-block RMW pipeline per 4 KiB op
-//!   (~2 blocks of device I/O per op at sandbox scale, 12 MiB/op at the
-//!   scoreboard's 4 MiB blocks), so the gate FAILS — reproducing the §1.2
-//!   arithmetic from counters is the point.
+//! - **The G-RW2 gate** (shipped standing-RED by RW1, **flipped green by
+//!   PR RW2's W1 sole-owner extent patch**, now per-commit): device write
+//!   bytes ≤ 4× user bytes, device read bytes ≤ 1× user bytes on the
+//!   aligned rand-write shape, plus the decision-ledger tripwires
+//!   (`patch_writes == ops`, `patch_edge_rmw_reads == 0`). The
+//!   accumulation-pipeline pins below run with the patch knob at 0 and
+//!   keep documenting the §1.2 RMW arithmetic every patch-ineligible
+//!   shape still pays.
 //! - **The mapping-form sanity line** (review Issue 19, permanent): the
 //!   fixture's freshly-striped block map carries the undecorated 2-part
 //!   whole-block form (`persist_block_key`'s bare offset strings) — printed
@@ -275,6 +276,12 @@ struct Ledger {
     write_block_revisits: u64,
     staging_sibling_probes: u64,
     write_through_bytes: u64,
+    /// RW2 W1 patch legs — the in-place DMAs are DEVICE writes and the
+    /// G-RW2 gate counts them; `edge_rmw_reads` must stay 0 (v1
+    /// aligned-only — a gate clause, not slack the ≤1× read bound absorbs).
+    patch_writes: u64,
+    patch_write_bytes: u64,
+    patch_edge_rmw_reads: u64,
 }
 
 fn ledger() -> Ledger {
@@ -302,6 +309,9 @@ fn ledger() -> Ledger {
         write_block_revisits: l(&METRICS.write_block_revisits),
         staging_sibling_probes: l(&METRICS.staging_sibling_probes),
         write_through_bytes: l(&METRICS.write_through_bytes),
+        patch_writes: l(&METRICS.patch_writes),
+        patch_write_bytes: l(&METRICS.patch_write_bytes),
+        patch_edge_rmw_reads: l(&METRICS.patch_edge_rmw_reads),
     }
 }
 
@@ -340,6 +350,9 @@ impl Ledger {
             write_block_revisits: self.write_block_revisits - before.write_block_revisits,
             staging_sibling_probes: self.staging_sibling_probes - before.staging_sibling_probes,
             write_through_bytes: self.write_through_bytes - before.write_through_bytes,
+            patch_writes: self.patch_writes - before.patch_writes,
+            patch_write_bytes: self.patch_write_bytes - before.patch_write_bytes,
+            patch_edge_rmw_reads: self.patch_edge_rmw_reads - before.patch_edge_rmw_reads,
         }
     }
 
@@ -348,7 +361,8 @@ impl Ledger {
         self.spill_seed_read_bytes + self.flush_seed_read_bytes + self.write_path_seed_read_bytes
     }
 
-    /// Device/staging write bytes the ledger attributes.
+    /// Device/staging write bytes the ledger attributes (incl. the RW2
+    /// in-place patch DMAs — device writes like any other).
     fn write_bytes(&self) -> u64 {
         self.spill_staging_put_bytes
             + self.staging_put_bytes_drain
@@ -359,6 +373,7 @@ impl Ledger {
             + self.durable_upload_bytes_self_flush
             + self.durable_upload_bytes_escalation
             + self.write_through_bytes
+            + self.patch_write_bytes
     }
 
     fn print(&self, label: &str, user_bytes: u64) {
@@ -397,6 +412,10 @@ impl Ledger {
             self.restage_churn_bytes,
             self.write_block_revisits,
             self.staging_sibling_probes,
+        );
+        eprintln!(
+            "  patch    : patch_writes {} ({} B) | edge_rmw_reads {}",
+            self.patch_writes, self.patch_write_bytes, self.patch_edge_rmw_reads,
         );
     }
 }
@@ -656,24 +675,21 @@ async fn ledger_buckets_reconcile_and_attribute_drivers() {
 // The standing-RED G-RW2 amplification gate
 // ---------------------------------------------------------------------------
 
-/// THE RED GATE (G-RW2, design-random-small-writes §2): on the aligned
-/// rand-write shape, device write bytes ≤ 4× user bytes and device read
-/// bytes ≤ 1× user bytes, measured FROM the attribution ledger.
+/// THE G-RW2 GATE (design-random-small-writes §2), **flipped green by PR
+/// RW2's W1 sole-owner extent patch**: on the aligned rand-write shape,
+/// device write bytes ≤ 4× user bytes and device read bytes ≤ 1× user
+/// bytes, measured FROM the attribution ledger — plus the gate's own
+/// decision-ledger tripwires (review Issue 7): `patch_writes` ≈ the row's
+/// op count (deviation = predicate rot) and `patch_edge_rmw_reads` == 0
+/// (v1 is aligned-only — the ≤1× read slack may not absorb one silently).
 ///
-/// Today this FAILS by construction — every 4 KiB op past the parked cap
-/// pays a whole-block seed read + a whole-block staging put inline (and the
-/// drain re-pays the parked backlog), reproducing the §1.2 arithmetic
-/// (~2 blocks/op ≈ 12 MiB/op at the scoreboard's 4 MiB blocks; R:W ≈ 1:2
-/// once the drain-driven durable leg is counted). PR RW2's W1 patch (one
-/// in-place 4 KiB DMA, zero reads, zero staging) flips it green.
-///
-/// `#[ignore]`: standing-red by design — the per-commit gate must stay
-/// green while the flip lives in a LATER PR (the kv_scale nightly-case
-/// convention). Run it in acceptance sessions:
-/// `cargo test --test rand_write_amp_tests -- --ignored --nocapture`.
+/// RW1 shipped this `#[ignore]`d standing-RED (the whole-block RMW
+/// pipeline paid ~2 blocks of device I/O per 4 KiB op — write 10.7×,
+/// read 8.0× at sandbox scale); the W1 patch pays ONE in-place 4 KiB DMA
+/// per op — zero seed reads, zero staging, zero writeback, zero meta —
+/// and the gate now runs at per-commit cadence, permanently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "standing-RED G-RW2 amplification gate — flips green when PR RW2 lands the W1 sole-owner extent patch; run explicitly in acceptance: cargo test --test rand_write_amp_tests -- --ignored --nocapture"]
-async fn standing_red_g_rw2_device_byte_ledger_on_rand_write_shape() {
+async fn g_rw2_device_byte_ledger_on_rand_write_shape() {
     rig_on();
     let _g = serial().await;
     let h = make("rw1_red").await;
@@ -720,12 +736,23 @@ async fn standing_red_g_rw2_device_byte_ledger_on_rand_write_shape() {
     let write_amp = d.write_bytes() as f64 / user_bytes as f64;
     assert!(
         write_amp <= 4.0 && read_amp <= 1.0,
-        "G-RW2 amplification gate (STANDING RED until PR RW2): device write \
-         bytes {write_amp:.1}x user (gate <= 4x), device read bytes \
-         {read_amp:.1}x user (gate <= 1x) — the whole-block RMW pipeline is \
-         alive: every 4 KiB op past the parked cap pays a {BS}-byte seed \
-         read + {BS}-byte staging put inline, plus the drain's re-stage of \
-         the parked backlog"
+        "G-RW2 amplification gate: device write bytes {write_amp:.1}x user \
+         (gate <= 4x), device read bytes {read_amp:.1}x user (gate <= 1x) — \
+         the whole-block RMW pipeline is back: a 4 KiB op is paying \
+         seed-read/staging/upload legs the W1 patch removed"
+    );
+
+    // The gate's decision-ledger tripwires (G-RW2 clauses, review Issue 7).
+    assert_eq!(
+        d.patch_writes, ops,
+        "patch_writes must equal the row's op count — every aligned \
+         isolated 4 KiB overwrite of a whole-block-mapped sole-owned block \
+         must ride the patch (deviation = predicate rot)"
+    );
+    assert_eq!(
+        d.patch_edge_rmw_reads, 0,
+        "patch_edge_rmw_reads must be 0 in v1 (aligned-only): any nonzero \
+         is an alignment/predicate regression BY DEFINITION"
     );
 }
 

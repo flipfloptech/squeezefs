@@ -347,3 +347,238 @@ async fn replay_twice_digest_stable_across_smo_windows() {
         "replay-twice digests diverge — the replay order is not deterministic"
     );
 }
+
+/// FIND-SMO-TAIL (docs/design-smo-replay-currency.md §1b, PR 1(d)):
+/// **mid-entry checkpoint tails from multi-leaf user-tx floors.**
+///
+/// Floors are raw *record* seqs (`dirty_floor.fetch_min(rec.seq)`,
+/// `node_cache.rs`) while the conveyor stamps per-record seqs
+/// `entry_start + i` across a multi-leaf tx. An `unlink` is exactly that
+/// shape: rec[0] (dentry Delete) lands on the DENTRIES leaf, rec[1]
+/// (parent Δtime) and rec[2] (child Put) land on the INODES leaf — so the
+/// INODES leaf's floor pins at `entry_start + 1`, strictly inside the
+/// entry. Flush the dentries leaf while the inodes leaf's floor is
+/// restored un-flushed (its log is full: freeze → append fails →
+/// `restore_dirty_floor` → compaction SMO retires it, folding the
+/// mid-entry floor into the dying-floor clamp) and the §4.6 pt 2 tail
+/// computes to `entry_start + 1` — violating the `checkpoint.rs` module-
+/// doc claim "the tail is always an entry boundary". Replay's chain walk
+/// starts parsing AT the tail (`journal.rs`), fails mid-entry, resyncs at
+/// the next page's first-entry offset, and drops the entry's own ≥-tail
+/// records plus every collateral entry up to the resync point — counted
+/// in `dropped_torn` once a later entry parses (acked commits made after
+/// the checkpoint are the collateral: their only durable copy is the
+/// journal window).
+///
+/// The construction is deterministic with no byte calibration: fill the
+/// INODES root leaf's log with same-key setattr bursts (compactions mark
+/// lifecycle boundaries), pre-position near-full, then probe with acked
+/// unlinks — every landed probe shrinks the remaining log area by one
+/// bset frame, so within a bounded number of probes one probe's freeze
+/// MUST fail and its compaction retires the leaf with the mid-entry
+/// floor. Post-SMO acked commits (> one journal page's worth) guarantee a
+/// later entry parses, confirming the drop.
+///
+/// Asserted JOINTLY (the §1b signature edge: a mid-entry tail on the
+/// newest entry can read `dropped_torn == 0`, so neither half alone is
+/// the contract): **no acked state is lost AND `dropped_torn == 0`**.
+/// RED on dev `89ea158` (`dropped_torn ≥ 1`, plus page-position-dependent
+/// acked loss); GREEN once floors round DOWN to entry starts (PR 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mid_entry_tail_multi_leaf_tx_partial_flush_survives_crash() {
+    // Park the checkpoint cadence (the crash_kill_tests precedent):
+    // cycles run only where this test drives them.
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+
+    let (routed, kv, file) = sandbox().await;
+
+    let smo_count = || {
+        squeezefs::meta_backend::kv::META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed)
+            + squeezefs::meta_backend::kv::META_KV_NODE_SPLITS.load(Ordering::Relaxed)
+    };
+
+    // Setup: probe files (unlink victims + survivors) and the fill file.
+    // The INODES tree stays depth 1 (root leaf) — a compaction of it is a
+    // root swap, which journals no pointer flips but still retires the
+    // node with its floor (the dying-floor fold): the §1b mechanism does
+    // not depend on tree depth, only on the floor domain.
+    let mut probe_names: Vec<String> = Vec::new();
+    for i in 0..80u32 {
+        let name = format!("probe{i:03}");
+        kv.create(1, &name, libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("setup create acked");
+        probe_names.push(name);
+    }
+    let fill_ino = kv
+        .create(1, "fillfile", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("fill create acked")
+        .ino;
+    kv.checkpoint_now().await.expect("setup checkpoint");
+
+    // One fill burst: 24 same-ino setattr Puts (each a 1-record tx —
+    // floors trivially at entry starts, so fills can never fake the RED)
+    // accumulated in the leaf's open overlay, then one checkpoint cycle
+    // freezing them into ONE bset append (~2.5 KiB — under the 4 KiB
+    // writeback threshold, so no maintenance wake interferes).
+    let mut fill_mode_flip = 0u32;
+    let burst = |kv: Arc<KvMetaBackend>, flip: u32| async move {
+        for j in 0..24u32 {
+            let mode = libc::S_IFREG | if (flip + j) % 2 == 0 { 0o640 } else { 0o600 };
+            kv.setattr(fill_ino, Some(mode), None, None, None, None, None, None)
+                .await
+                .expect("fill setattr acked");
+        }
+    };
+
+    // Lifecycle calibration: bursts-to-compaction measured on the SECOND
+    // lifecycle (steady-state base: the same folded records), then
+    // pre-position the third lifecycle near-full with K-2 bursts.
+    let mut k_bursts: Option<u64> = None;
+    let mut this_lifecycle = 0u64;
+    let mut lifecycles = 0u32;
+    for i in 0..400u64 {
+        assert!(i < 399, "fill lifecycles must converge within the budget");
+        let before = smo_count();
+        burst(kv.clone(), fill_mode_flip).await;
+        fill_mode_flip += 1;
+        kv.checkpoint_now().await.expect("fill checkpoint");
+        this_lifecycle += 1;
+        if smo_count() > before {
+            lifecycles += 1;
+            k_bursts = Some(this_lifecycle);
+            this_lifecycle = 0;
+            if lifecycles == 2 {
+                break;
+            }
+        }
+    }
+    let k = k_bursts.expect("a fill lifecycle completed");
+    assert!(k >= 3, "a 64 KiB leaf must absorb several ~2.5 KiB bursts");
+    let mut placed = 0u64;
+    while placed < k - 2 {
+        let before = smo_count();
+        burst(kv.clone(), fill_mode_flip).await;
+        fill_mode_flip += 1;
+        kv.checkpoint_now().await.expect("position checkpoint");
+        placed += 1;
+        if smo_count() > before {
+            placed = 0; // unexpected recycle: restart on the fresh leaf
+        }
+    }
+
+    // Probe loop: one acked multi-leaf unlink per cycle. A landed probe's
+    // freeze appends ~250 B (covered — benign); the leaf's remaining log
+    // area strictly shrinks, so a bounded number of probes reaches the
+    // §1b cycle: dentries leaf flushes rec[0], the inodes leaf's freeze
+    // (parent Δ + child Put) hits the full log, its floor — pinned at
+    // the tx's `entry_start + 1` — is restored, and the compaction SMO
+    // retires the leaf into the dying-floor fold: the written ledger's
+    // tail is strictly inside the unlink's journal entry.
+    let mut victim: Option<String> = None;
+    let mut unlinked: Vec<String> = Vec::new();
+    for name in probe_names.iter().take(60) {
+        kv.unlink(1, name).await.expect("probe unlink acked");
+        unlinked.push(name.clone());
+        let before = smo_count();
+        kv.checkpoint_now().await.expect("probe checkpoint");
+        if smo_count() > before {
+            victim = Some(name.clone());
+            break;
+        }
+    }
+    let victim = victim.expect(
+        "a probe unlink must trigger the log-full compaction within the probe budget \
+         (the leaf's remaining log area strictly shrinks per probe)",
+    );
+
+    // Post-SMO acked commits — the §1b collateral + drop confirmers.
+    // > 4 KiB of small entries guarantees at least one entry starts past
+    // the mid-entry tail's journal page: replay's resync parses it and
+    // confirms the dropped entry; the ones on the tail page itself are
+    // dropped with it (acked loss). None of these are flushed (no further
+    // checkpoint): their only durable copy is the journal window.
+    const MARKER: u32 = libc::S_IFREG | 0o751;
+    let survivors: Vec<String> = probe_names
+        .iter()
+        .filter(|n| !unlinked.contains(*n))
+        .take(40)
+        .cloned()
+        .collect();
+    assert!(
+        survivors.len() >= 24,
+        "enough survivor files must remain for the confirmer commits"
+    );
+    let mut marked: Vec<(String, u64)> = Vec::new();
+    for name in &survivors {
+        let ino = kv.lookup(1, name).await.expect("survivor present").ino;
+        kv.setattr(ino, Some(MARKER), None, None, None, None, None, None)
+            .await
+            .expect("confirmer setattr acked");
+        marked.push((name.clone(), ino));
+    }
+    for i in 0..4u32 {
+        kv.create(1, &format!("post{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("post-SMO create acked");
+    }
+
+    // Crash-equivalent reopen: page-cache bytes only, no shutdown. Both
+    // Arcs drop (the routed wrapper co-owns the backend — the in-process
+    // flock releases at the last drop).
+    drop(routed);
+    drop(kv);
+    let kv2 = reopen(file.path()).await;
+
+    // The JOINT §1b contract: no acked state lost AND a clean parse from
+    // the tail. Collect every violation before asserting so the RED
+    // output shows the whole signature.
+    let dropped_torn = kv2.replay_stats().dropped_torn;
+    let mut lost: Vec<String> = Vec::new();
+    for name in &unlinked {
+        if kv2.lookup(1, name).await.is_ok() {
+            lost.push(format!("{name}: acked unlink resurrected"));
+        }
+    }
+    for (name, ino) in &marked {
+        match kv2.getattr(*ino).await {
+            Ok(attr) if attr.mode == MARKER => {}
+            Ok(attr) => lost.push(format!(
+                "{name} (ino {ino}): acked MARKER mode lost (serves {:o})",
+                attr.mode
+            )),
+            Err(e) => lost.push(format!("{name} (ino {ino}): acked inode lost ({e:?})")),
+        }
+    }
+    for i in 0..4u32 {
+        let name = format!("post{i}");
+        if kv2.lookup(1, &name).await.is_err() {
+            lost.push(format!("{name}: acked post-SMO create lost"));
+        }
+    }
+    // The fill records were all checkpoint-covered below the tail: their
+    // durability is not §1b's to lose — presence is the sanity check.
+    let fill_attr = kv2.getattr(fill_ino).await.expect("fill inode present");
+    assert_eq!(
+        fill_attr.mode & libc::S_IFMT,
+        libc::S_IFREG,
+        "fill inode must stay a regular file"
+    );
+    assert!(
+        lost.is_empty() && dropped_torn == 0,
+        "FIND-SMO-TAIL (§1b): the checkpoint tail landed strictly inside the \
+         victim unlink's journal entry ('{victim}'), so replay parsed mid-entry, \
+         resynced at the next page, and dropped acked records \
+         (dropped_torn = {dropped_torn}, acked losses = {}): {:?}",
+        lost.len(),
+        &lost[..lost.len().min(16)]
+    );
+}

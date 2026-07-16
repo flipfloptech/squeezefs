@@ -3147,67 +3147,50 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             squeezefs::set_fs_prefix("squeezefs");
 
-            // 1. Try to read mountpoint/.config to resolve staging directories
-            let mut staging_dirs = Vec::new();
-            let config_path = mountpoint.join(".config");
-            if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-                if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                    if let Some(paths_str) = config_json["format"]["disk_cache_paths"].as_str() {
-                        if !paths_str.is_empty() {
-                            staging_dirs = paths_str.split(',').map(PathBuf::from).collect();
-                        }
-                    }
-                }
+            // Staged/active-write visibility is DAEMON-AUTHORITATIVE: read
+            // the mounted filesystem's virtual `.stats` file. This CLI must
+            // never open or map the daemon's live staging segment files —
+            // the historical implementation constructed a second `NvmeCache`
+            // over `staging_segment/` with a hardcoded 100 MiB budget, whose
+            // `set_len` truncated the live daemon's 128 MiB mmaps to
+            // 6.25 MiB/shard: every teardown-drain access beyond the new EOF
+            // then died with SIGBUS mid-flush and the truncation destroyed
+            // staged payload bytes (FIND-VS-A, the vs-JuiceFS scoreboard's
+            // teardown-SIGBUS class; evidence in
+            // `.benchmarks/2026-07-16-find-vs-a-fix.md`).
+            fn read_mount_staging_stats(mountpoint: &Path) -> Option<(usize, usize, u64)> {
+                let stats_str = std::fs::read_to_string(mountpoint.join(".stats")).ok()?;
+                let v: serde_json::Value = serde_json::from_str(&stats_str).ok()?;
+                let staged = v["nvme_staged_write_file_ids"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let active = v["active_writes"]
+                    .as_object()
+                    .map(|m| {
+                        m.values()
+                            .map(|blocks| blocks.as_array().map(|a| a.len()).unwrap_or(0))
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                let bytes = v["metrics"]["nvme_staging_current_bytes"]
+                    .as_u64()
+                    .unwrap_or(0);
+                Some((staged, active, bytes))
             }
 
-            // 3. Fall back to default staging directory
-            if staging_dirs.is_empty() {
-                staging_dirs = vec![get_default_staging_dir()];
-            }
-
-            // 4. Resolve dismount_wait limit (default: 10) and find active daemon PID
+            // Resolve dismount_wait limit (default: 10) and find active daemon PID
             let dismount_wait = 10;
             let mut daemon_pid: Option<u32> = None;
 
-            // 5. Count staged files and active writes from cache segments
-            let max_write_bytes = 100 * 1024 * 1024;
-
-            let mut caches = Vec::new();
-            for dir in &staging_dirs {
-                let staging_segment_dir = dir.join("staging_segment");
-                if staging_segment_dir.exists() {
-                    let write_cap = max_write_bytes as usize / staging_dirs.len();
-                    if let Ok(cache) = squeezefs::tiering::nvme::NvmeCache::new(
-                        &[staging_segment_dir.as_path()],
-                        &[write_cap],
-                        16,
-                    ) {
-                        if squeezefs::cache::nvme::dir_has_segment_data(&staging_segment_dir) {
-                            cache.recover_index();
-                        }
-                        caches.push(cache);
-                    }
-                }
-            }
-
-            let mut staged_count = 0;
-            let mut active_writes_count = 0;
-            for cache in &caches {
-                for key_bytes in cache.list_keys() {
-                    if let Ok(s) = String::from_utf8(key_bytes.to_vec()) {
-                        if s.starts_with("active_block:") {
-                            active_writes_count += 1;
-                        } else {
-                            staged_count += 1;
-                        }
-                    }
-                }
-            }
+            let initial_stats = read_mount_staging_stats(&mountpoint);
+            let (staged_count, active_writes_count, total_bytes_at_start) =
+                initial_stats.unwrap_or((0, 0, 0));
 
             let has_unflushed = staged_count > 0 || active_writes_count > 0;
             let mut choice = "continue"; // default non-interactive behavior
 
-            // 6. Prompt the user if not forced and stdin is a TTY
+            // Prompt the user if not forced and stdin is a TTY
             if has_unflushed && !force && std::io::stdin().is_terminal() {
                 println!(
                     "{}",
@@ -3225,7 +3208,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "  [w] Wait for staged files to drain/flush to NVMe-oF backend (recommended)"
                 );
-                println!("  [c] Continue/force unmount immediately (unsafe - may lose data)");
+                println!("  [c] Continue unmount now (staged data stays on disk; the next mount recovers it)");
                 println!("  [a] Abort unmount");
                 print!("Select option [w/c/a]: ");
                 let _ = std::io::stdout().flush();
@@ -3251,43 +3234,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
                 "wait" => {
-                    let mut total_bytes_at_start = 0;
-                    for cache in &caches {
-                        for key_bytes in cache.list_keys() {
-                            let is_active = if let Ok(s) = String::from_utf8(key_bytes.to_vec()) {
-                                s.starts_with("active_block:")
-                            } else {
-                                false
-                            };
-                            if !is_active {
-                                if let Some(guard) = cache.get(&key_bytes) {
-                                    let bytes =
-                                        &guard.guard.mmap[guard.offset..guard.offset + guard.len];
-                                    if bytes.len() >= 8 {
-                                        let meta_len = u64::from_be_bytes(
-                                            bytes[0..8].try_into().unwrap_or([0; 8]),
-                                        )
-                                            as usize;
-                                        if bytes.len() >= 8 + meta_len {
-                                            let original_size =
-                                                match serde_json::from_slice::<serde_json::Value>(
-                                                    &bytes[8..8 + meta_len],
-                                                ) {
-                                                    Ok(json) => json
-                                                        .get("original_size")
-                                                        .and_then(|v| v.as_u64())
-                                                        .unwrap_or(0)
-                                                        as usize,
-                                                    Err(_) => 0,
-                                                };
-                                            total_bytes_at_start += original_size as u64;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     println!("Waiting for staged writes to drain (limit: {}s). Press 's' and Enter to skip wait.", dismount_wait);
                     let start_wait = std::time::Instant::now();
                     let max_wait = std::time::Duration::from_secs(dismount_wait);
@@ -3302,8 +3248,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     });
 
                     let mut skipped = false;
-                    let mut current_staged = 0;
-                    let mut current_active = 0;
+                    let mut current_staged = staged_count;
+                    let mut current_active = active_writes_count;
 
                     loop {
                         while let Ok(msg) = rx.try_recv() {
@@ -3316,50 +3262,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
 
-                        current_staged = 0;
-                        let mut current_bytes = 0;
-                        current_active = 0;
-
-                        for cache in &caches {
-                            for key_bytes in cache.list_keys() {
-                                let is_active = if let Ok(s) = String::from_utf8(key_bytes.to_vec())
-                                {
-                                    s.starts_with("active_block:")
-                                } else {
-                                    false
-                                };
-                                if is_active {
-                                    current_active += 1;
-                                } else {
-                                    current_staged += 1;
-                                    if let Some(guard) = cache.get(&key_bytes) {
-                                        let bytes = &guard.guard.mmap
-                                            [guard.offset..guard.offset + guard.len];
-                                        if bytes.len() >= 8 {
-                                            let meta_len = u64::from_be_bytes(
-                                                bytes[0..8].try_into().unwrap_or([0; 8]),
-                                            )
-                                                as usize;
-                                            if bytes.len() >= 8 + meta_len {
-                                                let original_size = match serde_json::from_slice::<
-                                                    serde_json::Value,
-                                                >(
-                                                    &bytes[8..8 + meta_len]
-                                                ) {
-                                                    Ok(json) => json
-                                                        .get("original_size")
-                                                        .and_then(|v| v.as_u64())
-                                                        .unwrap_or(0)
-                                                        as usize,
-                                                    Err(_) => 0,
-                                                };
-                                                current_bytes += original_size as u64;
-                                            }
-                                        }
-                                    }
-                                }
+                        let current_bytes = match read_mount_staging_stats(&mountpoint) {
+                            Some((s, a, b)) => {
+                                current_staged = s;
+                                current_active = a;
+                                b
                             }
-                        }
+                            None => {
+                                // Mount gone / daemon unreachable: nothing
+                                // left to poll — proceed with the unmount.
+                                break;
+                            }
+                        };
 
                         if current_staged == 0 && current_active == 0 {
                             println!("\nAll staged files and active writes drained cleanly!");
@@ -3376,8 +3290,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let speed_mb = speed / (1024.0 * 1024.0);
 
                         let progress_pct = if total_bytes_at_start > 0 {
-                            100.0 * (total_bytes_at_start - current_bytes) as f64
-                                / total_bytes_at_start as f64
+                            100.0 * bytes_flushed as f64 / total_bytes_at_start as f64
                         } else {
                             100.0
                         };
@@ -3404,32 +3317,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         if skipped {
                             println!("\nWait skipped by user.");
                         }
-                        println!("{}", "WARNING: Dismounting with unflushed staged files or active writes will cause data loss!".red().bold());
-                        print!("Do you want to discard this data, clean up local cache, and remove incomplete metadata? [y/N]: ");
-                        let _ = std::io::stdout().flush();
-
-                        let mut confirmed = false;
-                        let timeout_fut =
-                            tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv());
-                        if let Ok(Some(msg)) = timeout_fut.await {
-                            if msg == "y" || msg == "yes" {
-                                confirmed = true;
-                            }
-                        }
-
-                        if confirmed {
-                            println!("Discarding unflushed data and cleaning up Redis metadata/local staging...");
-
-                            // 2. Remove all keys from cache
-                            for cache in &caches {
-                                for key_bytes in cache.list_keys() {
-                                    cache.remove(&key_bytes);
-                                }
-                            }
-                            println!("Local staging cache cleared successfully.");
-                        } else {
-                            println!("Unmount will continue, but staged files/metadata are left intact on disk/database.");
-                        }
+                        // The daemon owns every staged byte (never-lossy
+                        // teardown): its shutdown drain keeps flushing after
+                        // the unmount signal, and anything it cannot finish
+                        // is recovered by the next mount\'s staging recovery
+                        // (`recover_staging` + generation gate). This CLI
+                        // deliberately has NO discard path — mutating the
+                        // live daemon\'s segment files from a second process
+                        // was the FIND-VS-A teardown-SIGBUS vector.
+                        println!(
+                            "Unmount will continue; the daemon\'s teardown drain flushes what it \
+                             can and the next mount recovers the rest."
+                        );
                     }
                 }
                 _ => {

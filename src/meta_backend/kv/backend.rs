@@ -137,6 +137,15 @@ pub fn test_conveyor_hold_release() {
 /// (one relaxed load per applied tx).
 pub static TEST_CONVEYOR_POISON_APPLY_INO: AtomicU64 = AtomicU64::new(0);
 
+/// Test seam (docs/design-smo-replay-currency.md §6 PR 4, the at-cap
+/// rows): overrides [`PENDING_FREE_CAP`] at `open` so the §4.7 at-cap
+/// force-cycle protocol (admission headroom / forced `checkpoint_cycle` /
+/// bounded-retry-then-loud) is reachable at cargo scale — the production
+/// cap is 65,536 SMO retirements. `0` = off (one relaxed load per open —
+/// a control-plane path). Values must be ≥ 2 ([`super::alloc_ext_core`]'s
+/// Vyukov stamp-aliasing floor, hard-asserted there).
+pub static TEST_PENDING_FREE_CAP: AtomicU64 = AtomicU64::new(0);
+
 /// `SQUEEZEFS_TIMEOUT` as the D1.b watchdog/escalation threshold
 /// (design-metadata-throughput §6): read per `open` (control-plane —
 /// never on an op path), default 30 s. Deliberately NOT process-memoized:
@@ -607,13 +616,17 @@ impl KvMetaBackend {
 
         // 4b. Allocator: newest-valid A/B pages + replayed deltas (§4.7).
         let total_extents = sb.total_extents();
+        let pending_cap = match TEST_PENDING_FREE_CAP.load(Ordering::Relaxed) {
+            0 => PENDING_FREE_CAP,
+            n => n as usize,
+        };
         let alloc = Arc::new(
             ExtentAllocator::load(
                 path,
                 sb.alloc_bitmap.start,
                 total_extents,
                 compaction_reserve_extents(total_extents),
-                PENDING_FREE_CAP,
+                pending_cap,
                 ledger.seq,
                 &recovery.entries,
             )

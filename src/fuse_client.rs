@@ -2117,6 +2117,15 @@ pub struct SqueezefsFilesystem {
     active_block_buffers: std::sync::Arc<
         dashmap::DashMap<String, crate::cache::active_block::ActiveBlockBuf, ahash::RandomState>,
     >,
+    /// W1 §5.1 predicate 6 — the per-ino stream-adjacency word: the END
+    /// offset of the ino's most recent striped write (one relaxed `swap`
+    /// per write; latch-free `scc` map, shared across handler clones). A
+    /// write whose offset equals it is stream-adjacent and routes to the
+    /// accumulation path, so sequential small-block streams keep the
+    /// whole-block write-through economy (G-RW3's seq rows pin it). Purely
+    /// a routing heuristic: a false adjacency signal costs one
+    /// accumulation-path write, never correctness.
+    last_write_end: std::sync::Arc<scc::HashMap<u64, AtomicU64>>,
     /// §5.7 Red parked-buffer drain plumbing, shared across clones: the
     /// authority's shed closure AND the Red admission gate post a byte
     /// target + kick; one lazily-spawned worker runs
@@ -2196,6 +2205,7 @@ impl Clone for SqueezefsFilesystem {
             mountpoint: self.mountpoint.clone(),
             max_background_uploads: self.max_background_uploads,
             active_block_buffers: self.active_block_buffers.clone(),
+            last_write_end: self.last_write_end.clone(),
             parked_drain_target: self.parked_drain_target.clone(),
             parked_drain_kick: self.parked_drain_kick.clone(),
             parked_drain_progress: self.parked_drain_progress.clone(),
@@ -2289,6 +2299,7 @@ impl SqueezefsFilesystem {
             active_block_buffers: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            last_write_end: std::sync::Arc::new(scc::HashMap::new()),
             parked_drain_target: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             parked_drain_kick: std::sync::Arc::new(tokio::sync::Notify::new()),
             parked_drain_progress: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -3611,6 +3622,187 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
+    /// W1 §5.1 predicate 6: record this striped write's end offset in the
+    /// ino's stream word (one relaxed `swap`) and return the PREVIOUS end
+    /// (`None` on the ino's first write — never adjacent).
+    fn note_last_write_end(&self, ino: u64, offset: u64, len: u64) -> Option<u64> {
+        let end = offset + len;
+        match self.last_write_end.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(occ) => Some(occ.get().swap(end, Ordering::Relaxed)),
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(AtomicU64::new(end));
+                None
+            }
+        }
+    }
+
+    /// W1 sole-owner extent patch (docs/design-random-small-writes.md §5.1
+    /// — the in-place, sub-block, LBA-aligned DMA for isolated small
+    /// overwrites of exclusively-owned, passthrough, whole-block-mapped
+    /// striped blocks). Called with the block's [`BLOCK_FLUSH_LOCKS`]
+    /// guard HELD and the request-shape predicates (5: aligned / sized /
+    /// non-extending / single-block; 6: not stream-adjacent) already
+    /// passed. Runs the remaining predicates (2: no RAM/staged overlay —
+    /// lock-free probes; 3: passthrough; 1: undecorated whole-block
+    /// mapping, resolved from the authoritative cached map under the held
+    /// lock; 4: refcount == 1 re-checked AFTER the unstable-mark, per the
+    /// §5.1 clone/patch fence) and, when they hold, performs the patch:
+    ///
+    /// 1. `mark_incarnation_unstable` → `fence(SeqCst)` → refcount re-check
+    ///    ([`crate::block_allocator::BlockAllocator::begin_patch_sole_owner`]);
+    ///    any back-off `publish_block`s (content unchanged) and falls back.
+    /// 2. One DMA: `write_block(offset + rel, payload)` — the severed
+    ///    payload rides a pooled 4 KiB-aligned buffer (`WriteData::Aligned`
+    ///    by construction; opt-in write verification covers exactly the
+    ///    patched window inside `write_block`).
+    /// 3. `publish_block`; purge the key from every read tier
+    ///    (`purge_block_key`'s 4-arm law) + drop stale whole-file
+    ///    `read_lru`/`write_lru` entries — the `upload_full_block`
+    ///    invalidation set and ordering.
+    /// 4. ACK. **No allocate, no free, no block-map merge, no journal
+    ///    entry, no staging** — the map names the same key; size and
+    ///    layout are unchanged; mtime rides the attr-cache + times-echo
+    ///    absorber exactly as today.
+    ///
+    /// Failure: a failed DMA fails exactly THIS write (nothing acked,
+    /// nothing parked, nothing lost) — `publish_block` re-stabilizes and
+    /// the tiers are purged on the error path too, so no stale serve.
+    /// `Ok(false)` = predicate fallback (its `patch_ineligible_*` bucket
+    /// counted): the caller continues into today's accumulation path.
+    async fn try_sole_owner_patch(
+        &self,
+        ino: u64,
+        b: u32,
+        rel_start: u64,
+        payload: &[u8],
+        cache_key: &str,
+        file_path: &str,
+    ) -> Result<bool, SqueezefsError> {
+        // Predicate 2 — no accumulation overlay owns the block. Lock-free:
+        // dashmap probe + the staged occupancy index (review Issue 10 —
+        // never the spawn_blocking/shard-write-lock hop on this path).
+        if self.active_block_buffers.contains_key(cache_key)
+            || self.router.cache.nvme.has_staged_active_block(cache_key)
+        {
+            METRICS
+                .patch_ineligible_overlay
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        // Predicate 3 — passthrough only (a compressed/encrypted image
+        // cannot be patched in place).
+        if !self.router.get_crypto().is_passthrough() {
+            METRICS
+                .patch_ineligible_transform
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        // Predicate 1 — the mapping, resolved from the AUTHORITATIVE cached
+        // map under the held block lock (block `b`'s entry mutates only
+        // under this lock: write-through merges hold it, and writeback
+        // merges are excluded by predicate 2 — their staged source exists
+        // until after the merge publishes). Cache miss falls back to the
+        // backend, which the merge discipline keeps current for `b`.
+        let mapping = {
+            let cached = self
+                .router
+                .metadata_cache
+                .get(&ino)
+                .filter(|m| m.file_type == "striped");
+            let meta = match cached {
+                Some(m) => Some(m),
+                None => self
+                    .router
+                    .fetch_metadata(file_path)
+                    .await
+                    .ok()
+                    .filter(|m| m.file_type == "striped"),
+            };
+            meta.and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&b).cloned()))
+        };
+        let Some(mapping) = mapping else {
+            // Hole / not striped / indirect-mapped: nothing to patch.
+            METRICS
+                .patch_ineligible_unmapped
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        if !crate::routing::is_whole_block_mapping(&mapping) {
+            // Decorated `bk:off:len` (promoted staged): patch arithmetic
+            // must never scribble relative to a decorated window.
+            METRICS
+                .patch_ineligible_decorated
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let Ok((be_id, dev_offset)) = self.router.backend_router.parse_block_key(&mapping) else {
+            METRICS
+                .patch_ineligible_unmapped
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        let Ok((allocator, device)) = self.router.backend_router.get_backend(&be_id) else {
+            METRICS
+                .patch_ineligible_unmapped
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+
+        // Predicate 4 + the §5.1 fence: mark unstable (racing validated
+        // read-tier fills of this key now fail their seqlock re-check
+        // instead of publishing mid-patch bytes) → fence(SeqCst) →
+        // refcount re-check. A clone whose pin lands before this re-check
+        // is observed here (count 2 ⇒ CoW fallback); one that lands after
+        // observes instability at its validate-after-pin and retries.
+        if !allocator.begin_patch_sole_owner(dev_offset) {
+            // Back off: re-stabilize (content never changed) and CoW.
+            allocator.publish_block(dev_offset);
+            METRICS
+                .patch_ineligible_shared
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+
+        // The severed pooled payload: ONE userspace copy into a 4 KiB-
+        // aligned pooled backing (§5.4 lease severance — the transport
+        // lease slice never crosses the DMA), then ONE aligned DMA.
+        let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
+        if payload.len() > buf.capacity() {
+            buf.resize(payload.len(), 0);
+        }
+        buf.backing_mut()[..payload.len()].copy_from_slice(payload);
+        buf.set_written_len(payload.len());
+        let dma = device
+            .write_block(dev_offset + rel_start, buf.into_bytes())
+            .await;
+
+        // Re-stabilize + purge on BOTH exits (the upload_full_block
+        // invalidation set and ordering — after the DMA, before the ACK):
+        // RAM LRU / hot-block / NVMe read tier / GDS under the block key,
+        // plus the stale whole-file snapshots under the path.
+        allocator.publish_block(dev_offset);
+        self.router.cache.purge_block_key(&mapping);
+        self.router.cache.write_lru.remove(file_path);
+        self.router.cache.read_lru.remove(file_path);
+
+        match dma {
+            Ok(()) => {
+                METRICS.patch_writes.fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .patch_write_bytes
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(e) => {
+                // EIO for exactly this write: nothing acked, nothing
+                // parked, nothing lost; tiers purged and the word
+                // re-stabilized above, so no stale serve.
+                METRICS.patch_dma_errors.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
     /// Staged/striped active-block write path. Safe to call without holding the
     /// per-inode write lock: mutates each block under [`BLOCK_FLUSH_LOCKS`].
     ///
@@ -3637,6 +3829,49 @@ impl SqueezefsFilesystem {
         let block_size = self.router.block_size.load(Ordering::Relaxed);
         let start_block = offset / block_size;
         let end_block = (offset + data.len() as u64 - 1) / block_size;
+
+        // W1 sole-owner extent patch — the request-shape half of the §5.1
+        // predicate (design-random-small-writes), evaluated once per
+        // striped write. Every striped write resolves to exactly one of
+        // {patched, one `patch_ineligible_*` bucket} — the FIRST failing
+        // predicate in this order — so the decision ledger reconciles
+        // against invocations. The stream word is swapped UNCONDITIONALLY
+        // (predicate 6 needs the true previous end even while the knob is
+        // 0 or the shape is ineligible).
+        let prev_write_end = self.note_last_write_end(ino, offset, data.len() as u64);
+        let patch_cap = patch_max_bytes();
+        let try_patch = if patch_cap == 0 || data.is_empty() {
+            // Knob 0 = the §6 A/B lever: the patch path is OFF and the
+            // decision ledger stays silent.
+            false
+        } else if prev_write_end == Some(offset) {
+            // Predicate 6 — stream-adjacent: sequential streams keep the
+            // whole-block write-through economy.
+            METRICS
+                .patch_ineligible_adjacent
+                .fetch_add(1, Ordering::Relaxed);
+            false
+        } else if start_block != end_block
+            || data.len() as u64 > patch_cap
+            || offset + data.len() as u64 > existing_size
+        {
+            // Predicate 5 size/window class (one bucket by design, §5.4):
+            // spans blocks, exceeds SQUEEZEFS_PATCH_MAX_BYTES, or EXTENDS
+            // the file (a grown i_size owes a meta commit).
+            METRICS
+                .patch_ineligible_oversize
+                .fetch_add(1, Ordering::Relaxed);
+            false
+        } else if offset % 4096 != 0 || data.len() % 4096 != 0 {
+            // Predicate 5 alignment (v1 is LBA-aligned-only — the unaligned
+            // edge path is phase-2 behind its own torn-edge contract).
+            METRICS
+                .patch_ineligible_unaligned
+                .fetch_add(1, Ordering::Relaxed);
+            false
+        } else {
+            true
+        };
 
         let mut futures = Vec::new();
         let mut data_cursor = 0usize;
@@ -3671,6 +3906,39 @@ impl SqueezefsFilesystem {
                 let (block_guard, lock_waited) =
                     block_lock_acquire_timed(ino, b as u32, BlockLockSite::WriteCheckout).await;
                 METRICS.block_lock_wait.record(lock_waited);
+
+                // W1 sole-owner extent patch (§5.1): the request-shape half
+                // passed above (single block ⇒ this future is the whole
+                // request); the state half runs here under the held block
+                // lock. `true` = patched — one aligned in-place DMA, tiers
+                // purged, ACK: no checkout, no merge, no park, no meta.
+                // `false` = its `patch_ineligible_*` bucket counted — fall
+                // through to today's accumulation path. `Err` = DMA/verify
+                // failure surfaced to exactly this write.
+                if try_patch {
+                    let rel = write_start - b_start_offset;
+                    match self
+                        .try_sole_owner_patch(
+                            ino,
+                            b as u32,
+                            rel,
+                            file_data_slice,
+                            &cache_key,
+                            &file_path,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            std::mem::drop(block_guard);
+                            return Ok::<(), SqueezefsError>(());
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            std::mem::drop(block_guard);
+                            return Err(e);
+                        }
+                    }
+                }
 
                 // 1. Get existing block data (either from memory cache, NVMe staging cache, or read from backend/cache)
                 let wp_checkout = write_phase_start();
@@ -5400,7 +5668,8 @@ impl SqueezefsFilesystem {
     }
 
     /// Per-ino post-destroy teardown, exactly today's tail: lease release,
-    /// POSIX-lock cleanup, metadata/attr cache invalidation.
+    /// POSIX-lock cleanup, metadata/attr cache invalidation (+ the W1
+    /// stream-adjacency word, so the map's growth is bounded by live inos).
     async fn reclaim_teardown(&self, ino: u64) {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
@@ -5408,6 +5677,7 @@ impl SqueezefsFilesystem {
         self.active_posix_locks.retain(|key, _| key.0 != ino);
         self.router.metadata_cache.remove(&ino);
         self.attr_cache.invalidate(&ino);
+        self.last_write_end.remove_sync(&ino);
     }
 }
 

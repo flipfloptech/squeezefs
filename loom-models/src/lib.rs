@@ -53,6 +53,16 @@
 //!   accepted dirt (§4.5 dirty pinning); freeze-swap conserves records
 //!   across a racing apply (frozen + open == applied, dirty bit exact);
 //!   at most one freeze is ever in flight.
+//! - [`patch_clone_core`]: the W1 sole-owner patch × clone pin COMPOSED
+//!   two-word fence protocol (design-random-small-writes §5.1, review
+//!   Issue 15) — invariant: ¬(pin-validated ∧ patch-proceeded). Each side
+//!   is a store on one word followed by a load of the OTHER word (patch:
+//!   incarnation retire → fence → refcount peek; clone: refcount
+//!   try_acquire → fence → incarnation snapshot); Release/Acquire alone
+//!   admits the store-buffering outcome — both sides reading old — so
+//!   both interpose `fence(SeqCst)`. Modeled as ONE composition of
+//!   incarnation_core × refcount_core (per-protocol models structurally
+//!   cannot see SB across protocols).
 //! - [`conveyor_core`]: the per-volume commit conveyor's leader-election
 //!   / queue / drain core (metadata-throughput design §5.5 D5, PR M7) —
 //!   invariants: leader uniqueness (two racing electors never both win);
@@ -86,6 +96,8 @@ pub mod journal_core;
 pub mod lease_core;
 #[path = "../../src/meta_backend/kv/node_state_core.rs"]
 pub mod node_state_core;
+#[path = "../../src/patch_clone_core.rs"]
+pub mod patch_clone_core;
 #[path = "../../src/refcount_core.rs"]
 pub mod refcount_core;
 
@@ -93,7 +105,7 @@ pub mod refcount_core;
 mod models {
     use crate::{
         alloc_ext_core, conveyor_core, gauge_core, incarnation_core, journal_core, lease_core,
-        node_state_core,
+        node_state_core, patch_clone_core, refcount_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
@@ -222,6 +234,147 @@ mod models {
                 a ^ b,
                 "exactly one of two racing releases must observe the terminal 1->0"
             );
+        });
+    }
+
+    /// THE COMPOSED TWO-WORD MODEL (design-random-small-writes §5.1,
+    /// review Issue 15 — the RW2 loom obligation): W1 sole-owner patch ×
+    /// clone pin in ONE model, both interleaving orders, asserting
+    /// ¬(pin-validated ∧ patch-proceeded).
+    ///
+    /// Patch thread = the §5.1 mechanism's fence half exactly as shipped:
+    /// `incarnation_core::retire` (what `mark_incarnation_unstable` runs)
+    /// → `patch_clone_core::cross_word_fence()` → `refcount_core::peek`
+    /// (`BlockAllocator::begin_patch_sole_owner`), with the back-off
+    /// re-stabilize (`publish`) on refusal. Clone thread =
+    /// `refcount_core::try_acquire` → `cross_word_fence()` →
+    /// `incarnation_core::snapshot` (`BlockAllocator::pin_block_validated`).
+    ///
+    /// Why composed: each side is a store on one word then a load of the
+    /// OTHER word — the classic store-buffering shape. `retire`'s trailing
+    /// `Release` fence and `snapshot`'s `Acquire` load do NOT forbid both
+    /// sides reading the old value (patch sees refcount 1 AND clone sees
+    /// stable — the clone then completes referencing a block that mutates
+    /// afterward); per-protocol models cannot represent the cross-protocol
+    /// outcome at all. With both `SeqCst` fences the outcome is dead in
+    /// every interleaving loom explores. (Weakening either fence to
+    /// Release/Acquire fails this model — verified during development.)
+    #[test]
+    fn patch_clone_composed_never_mutates_a_validated_pin() {
+        use loom::sync::atomic::AtomicU32;
+        loom::model(|| {
+            // A mapped, durable, sole-owned striped block: stable word,
+            // refcount 1.
+            let word = Arc::new(AtomicU64::new(incarnation_core::STABLE_FIRST));
+            let rc = Arc::new(AtomicU32::new(1));
+
+            // Patch side (`begin_patch_sole_owner` + the §5.1 back-off).
+            let patcher = {
+                let word = word.clone();
+                let rc = rc.clone();
+                thread::spawn(move || {
+                    incarnation_core::retire(&word);
+                    patch_clone_core::cross_word_fence();
+                    let sole = refcount_core::peek(&rc) == 1;
+                    if sole {
+                        // In-place DMA happens here; publish re-stabilizes.
+                        incarnation_core::publish(&word);
+                    } else {
+                        // Back off: re-stabilize (content unchanged) + CoW.
+                        incarnation_core::publish(&word);
+                    }
+                    sole
+                })
+            };
+
+            // Clone side (`pin_block_validated`).
+            let pinned = refcount_core::try_acquire(&rc);
+            let snap = if pinned {
+                patch_clone_core::cross_word_fence();
+                incarnation_core::snapshot(&word)
+            } else {
+                None
+            };
+
+            let patched = patcher.join().unwrap();
+
+            // THE invariant — ¬(pin-validated ∧ patch-proceeded), stated
+            // at generation precision (the §5.1 interleaving closure): a
+            // pin validated against the PRE-PATCH word (gen 0 stable) and
+            // an in-place patch are mutually exclusive — that joint
+            // outcome IS the store-buffering corruption (both cross-word
+            // loads read stale; the completed clone then references a
+            // block that mutates afterward). A pin validated against the
+            // POST-publish word (gen 1) is the legitimate "a clone racing
+            // a write may see old or new" arm — the patch completed
+            // strictly before the validation and nothing mutates after.
+            assert!(
+                !(pinned && snap == Some(incarnation_core::STABLE_FIRST) && patched),
+                "store-buffering outcome: the clone validated its pin \
+                 against the pre-patch incarnation while the patch \
+                 proceeded in place — the §5.1 fence is broken"
+            );
+
+            // Progress accounting (both orders live in this state space):
+            // an unvalidated pin retries against a word the patch always
+            // re-stabilizes — the retry's snapshot must see stability.
+            if pinned && snap.is_none() {
+                assert!(
+                    incarnation_core::snapshot(&word).is_some(),
+                    "post-join the patch has re-stabilized (publish on both \
+                     exits): the clone's bounded retry can validate"
+                );
+            }
+            // The refcount is conserved: pin took one iff `pinned`.
+            let expect = 1 + u32::from(pinned);
+            assert_eq!(
+                refcount_core::peek(&rc),
+                expect,
+                "refcount conservation across the composition"
+            );
+        });
+    }
+
+    /// The patch-interleaving case for the incarnation seqlock alone
+    /// (design-random-small-writes risk R3 — the read-side half of W1):
+    /// a validated cache fill racing an IN-PLACE patch (retire → data
+    /// mutate → publish, same word ops as a reuse cycle but on a live
+    /// mapped key) never publishes mid-patch bytes — the §5.1
+    /// read-your-own-writes/racing-read argument's mechanical core.
+    #[test]
+    fn incarnation_validated_fill_never_serves_mid_patch_bytes() {
+        loom::model(|| {
+            let word = Arc::new(AtomicU64::new(incarnation_core::STABLE_FIRST));
+            let payload = Arc::new(AtomicU64::new(0));
+
+            let patcher = {
+                let word = word.clone();
+                let payload = payload.clone();
+                thread::spawn(move || {
+                    // begin_patch_sole_owner's word half…
+                    incarnation_core::retire(&word);
+                    patch_clone_core::cross_word_fence();
+                    // …the in-place DMA (payload stamped 1)…
+                    payload.store(1, Ordering::Relaxed);
+                    // …publish after the device write.
+                    incarnation_core::publish(&word);
+                })
+            };
+
+            // Reader = validated fill: snapshot, "device read", validate.
+            if let Some(before) = incarnation_core::snapshot(&word) {
+                let bytes = payload.load(Ordering::Relaxed);
+                if incarnation_core::still(&word, before) {
+                    assert_eq!(
+                        bytes,
+                        before >> 1,
+                        "validated fill published bytes from mid-patch \
+                         (snapshot gen {}, payload stamp {bytes})",
+                        before >> 1
+                    );
+                }
+            }
+            patcher.join().unwrap();
         });
     }
 

@@ -655,6 +655,8 @@ struct H {
 }
 
 async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
+    // Default W1 patch posture per test (knob=0 pins must never leak).
+    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     make_disk(uuid, alloc_ns, "128MB").await
 }
 
@@ -764,6 +766,12 @@ async fn advisory_integration_phases() {
     std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
     std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1");
     let h = make(*b"membudget-a-pr70", "mb_ns_a").await;
+    // Pin the parked-buffer machinery this suite drains: the phase-D
+    // fixture builds six PARKED partial blocks from aligned sub-block
+    // overwrites, which are W1 patch-eligible (RW2) and would never park.
+    // The R5 parked-drain authority still owns every patch-ineligible
+    // shape; extent_patch_tests owns the patched-shape (zero-park) twin.
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
     std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
 
@@ -834,6 +842,9 @@ async fn advisory_integration_phases() {
     // ---- Phase B: Red stops prefetch issue outright; Green resumes.
     std::env::remove_var("SQUEEZEFS_READ_RANGED_THRESHOLD");
     let h2 = make(*b"membudget-b-pr70", "mb_ns_b").await;
+    // Re-pin after make()'s default reset: phase D's parked fixture below
+    // rides h2 (see the phase-A pin comment).
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let ino_b = h2
         .fs
         .create(h2.req, 1, OsStr::new("mb_b"), libc::S_IFREG | 0o644, 0)
@@ -1056,6 +1067,10 @@ async fn advisory_integration_phases() {
     // never exceed the halved cap and every byte must survive.
     std::env::set_var("SQUEEZEFS_PARKED_GATE_ASSIST_MS", "0");
     let h4 = make_disk(*b"membudget-f-oom2", "mb_ns_f", "1MB").await;
+    // Re-pin after the constructor's default reset: phase F's Red
+    // admission-gate fixture needs the aligned 4 KiB overwrites to PARK
+    // (see the phase-A pin comment).
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let ino_f = h4
         .fs
         .create(h4.req, 1, OsStr::new("mb_f"), libc::S_IFREG | 0o644, 0)

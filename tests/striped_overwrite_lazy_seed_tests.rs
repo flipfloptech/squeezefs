@@ -49,6 +49,14 @@ struct H {
 
 async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
+    // Item-B pins the DEFERRAL (accumulation) machinery — the exact
+    // pipeline every W1-patch-INELIGIBLE shape (unaligned, overlay,
+    // shared, transform, decorated, hole) still rides. The aligned
+    // sub-block shapes this suite uses became W1 patch-eligible in RW2
+    // (they would neither defer nor park), so the binary pins the patch
+    // path OFF; tests/extent_patch_tests.rs owns the patched-shape twin
+    // contracts (incl. the sharpened crash blast-radius audit).
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let dlm = DlmClient::new("local").unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -440,6 +448,12 @@ async fn fsync_forces_merge_durably() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_inside_window_leaves_old_block_intact() {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
+    // ACCUMULATION-path crash contract (this suite's binary-wide pin; the
+    // sessions below bypass make()): an unfsynced DEFERRED write never
+    // pre-damages the old durable block. The W1-patched twin — foreign
+    // bytes never perturbed, the app-written window old-or-new — is pinned
+    // by extent_patch_tests::crash_after_acked_patch_*.
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let meta = NamedTempFile::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())

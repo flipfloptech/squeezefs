@@ -410,6 +410,19 @@ pub struct NvmeStaging {
     /// lets the merge worker skip crediting an entry that a racing
     /// re-stage has already replaced (the newer stage owns the budget).
     staged_ledger: std::sync::Arc<scc::HashMap<String, (u64, u64)>>,
+    /// Latch-free occupancy index of staged `active_block:` keys (RW2 —
+    /// design-random-small-writes §5.1 predicate 2 / review Issue 10): the
+    /// W1 patch predicate probes staged existence without the
+    /// `spawn_blocking` + shard-WRITE-lock hop and without even the shard
+    /// `read_recursive` (which parks behind an ACTIVE writer's ms-class
+    /// section). Maintained conservative-present: inserted BEFORE the ring
+    /// write (removed again on refusal), removed AFTER the ring removal —
+    /// so any window in which the entry exists has the key indexed. False
+    /// positives are harmless (the caller falls back to the accumulation
+    /// path); a false negative would let a patch race a pending writeback
+    /// flush of stale staged bytes — the corruption direction, excluded by
+    /// construction. Seeded from the recovered ring at startup.
+    active_block_index: std::sync::Arc<scc::HashMap<String, ()>>,
     /// Router hook for the merge worker: promotion must commit layout through
     /// `DataRouter` (RAM metadata cache + backend coherently, under the
     /// per-inode metadata lock). Weak — the router owns this cache.
@@ -621,11 +634,20 @@ impl NvmeStaging {
         // Orphan active blocks (crash leftovers; uploaded+removed by later
         // flushes or unlink) must not consume the staged budget, or a mount
         // over a dirty segment starts with the admission gate already pinned.
+        // The active-block occupancy index (RW2 predicate-2 probe) seeds
+        // from the SAME recovered key list: a recovered `active_block:`
+        // entry is a live overlay until recovery/flush/unlink removes it,
+        // and the patch path must see it.
         let staged_ledger: std::sync::Arc<scc::HashMap<String, (u64, u64)>> =
+            std::sync::Arc::new(scc::HashMap::new());
+        let active_block_index: std::sync::Arc<scc::HashMap<String, ()>> =
             std::sync::Arc::new(scc::HashMap::new());
         let mut initial_write_bytes = 0u64;
         for key in staging_nvme_cache.list_keys() {
             if key.starts_with(b"active_block:") {
+                if let Ok(k) = std::str::from_utf8(&key) {
+                    let _ = active_block_index.insert_sync(k.to_string(), ());
+                }
                 continue;
             }
             let Ok(file_id) = std::str::from_utf8(&key) else {
@@ -658,6 +680,7 @@ impl NvmeStaging {
                 initial_write_bytes,
             )),
             staged_ledger,
+            active_block_index,
             data_router: std::sync::Arc::new(std::sync::OnceLock::new()),
             space_freed_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             staged_writes_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
@@ -1048,6 +1071,13 @@ impl NvmeStaging {
 
         let key_bytes = Bytes::copy_from_slice(key.as_bytes());
 
+        // Conservative-present occupancy index (see the field doc): indexed
+        // BEFORE the ring write so the patch predicate can never miss a
+        // just-admitted overlay; un-indexed on refusal (nothing staged).
+        let indexed_here = self
+            .active_block_index
+            .insert_sync(key.to_string(), ())
+            .is_ok();
         let is_new = self.staging_nvme_cache.get(&key_bytes).is_none();
         let admitted = self.staging_nvme_cache.reserve_and_write(
             key_bytes,
@@ -1059,6 +1089,13 @@ impl NvmeStaging {
         if admitted && is_new {
             self.staged_writes_in_flight
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if !admitted && indexed_here {
+            // Refused and WE created the index entry: retract it. (Same-key
+            // put/remove callers hold the block's BLOCK_FLUSH_LOCKS stripe,
+            // so a pre-existing entry — insert refused — belongs to a live
+            // staged sibling and must survive this refusal.)
+            self.active_block_index.remove_sync(key);
         }
         admitted
     }
@@ -1077,9 +1114,7 @@ impl NvmeStaging {
     /// caller falls back to the accumulation path; a false NEGATIVE would
     /// let a patch race a pending writeback flush of stale staged bytes).
     pub fn has_staged_active_block(&self, key: &str) -> bool {
-        // RED scaffolding (PR RW2): wired by the implementation commit.
-        let _ = key;
-        false
+        self.active_block_index.read_sync(key, |_, _| ()).is_some()
     }
 
     /// Remove a packed active block write from staging_nvme_cache.
@@ -1094,6 +1129,11 @@ impl NvmeStaging {
                 self.staged_drained_notify.notify_waiters();
             }
         }
+        // Occupancy index: un-index strictly AFTER the ring removal
+        // (conservative-present — see the field doc). `remove_staged`
+        // routes plain file_id keys here too; those were never indexed and
+        // the remove is a no-op for them.
+        self.active_block_index.remove_sync(key);
         // Return the budget of a counted staged entry (unlink, spill purge,
         // layout transition). Active-block keys are never in the ledger.
         if let Some((_, (cost, _))) = self.staged_ledger.remove_sync(key) {

@@ -119,6 +119,9 @@ struct H {
 
 async fn make(test_id: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
+    // Default W1 patch posture; accumulation-pipeline pins set 0 AFTER
+    // their make() (never leaks forward).
+    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     let dlm = DlmClient::new("local").unwrap();
 
     let b = NamedTempFile::new().unwrap();
@@ -479,6 +482,12 @@ async fn staged_sibling_probe_fires_once_per_block_write() {
     rig_on();
     let _g = serial().await;
     let h = make("rw1_probe").await;
+    // RW1's §1.2 pipeline pin documents the ACCUMULATION path — the
+    // pipeline every W1-patch-ineligible shape still rides. The aligned
+    // storm shape became patch-eligible in RW2 (zero spills, zero seeds,
+    // zero churn), so this pin runs with the patch OFF; the flipped
+    // G-RW2 gate below measures the same shape with the patch ON.
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let ino = create(&h, "probe.dat").await;
     make_striped(&h, ino, 8, 3).await;
 
@@ -510,6 +519,12 @@ async fn ledger_buckets_reconcile_and_attribute_drivers() {
     rig_on();
     let _g = serial().await;
     let h = make("rw1_buckets").await;
+    // RW1's §1.2 pipeline pin documents the ACCUMULATION path — the
+    // pipeline every W1-patch-ineligible shape still rides. The aligned
+    // storm shape became patch-eligible in RW2 (zero spills, zero seeds,
+    // zero churn), so this pin runs with the patch OFF; the flipped
+    // G-RW2 gate below measures the same shape with the patch ON.
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let ino = create(&h, "buckets.dat").await;
     let blocks: u64 = PARKED_CAP + 24; // 280 distinct blocks > the parked cap
     make_striped(&h, ino, blocks, 11).await;
@@ -728,6 +743,12 @@ async fn write_rig_phases_and_sites_record() {
     rig_on();
     let _g = serial().await;
     let h = make("rw1_rig").await;
+    // RW1's §1.2 pipeline pin documents the ACCUMULATION path — the
+    // pipeline every W1-patch-ineligible shape still rides. The aligned
+    // storm shape became patch-eligible in RW2 (zero spills, zero seeds,
+    // zero churn), so this pin runs with the patch OFF; the flipped
+    // G-RW2 gate below measures the same shape with the patch ON.
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let ino = create(&h, "rig.dat").await;
     let blocks: u64 = PARKED_CAP + 16;
     make_striped(&h, ino, blocks, 29).await;

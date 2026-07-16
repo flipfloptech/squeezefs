@@ -670,6 +670,31 @@ impl BackendRouter {
         }
     }
 
+    /// [`Self::increment_refcount`] with the §5.1 **validate-after-pin**
+    /// step (design-random-small-writes; the clone side of the clone/patch
+    /// fence): pin, `fence(SeqCst)`, snapshot the incarnation word.
+    /// `PinnedUnstable` = the reference WAS taken but a patch may be
+    /// mid-flight — the caller must unpin, refetch the authoritative map,
+    /// and retry (the existing bounded refused-pin loop, extended).
+    #[must_use]
+    pub fn pin_block_validated(&self, block_key: &str) -> crate::block_allocator::PinOutcome {
+        use crate::block_allocator::PinOutcome;
+        // Decoration-tolerant, like `increment_refcount`: pin + word both
+        // belong to the BASE block.
+        let cleaned = clean_block_key(block_key);
+        if let Ok((be_id, offset)) = self.parse_block_key(&cleaned) {
+            if be_id == "backend_0" {
+                self.default_allocator.pin_block_validated(offset)
+            } else if let Some(be) = self.backends.get(&be_id) {
+                be.block_allocator.pin_block_validated(offset)
+            } else {
+                PinOutcome::Refused
+            }
+        } else {
+            PinOutcome::Refused
+        }
+    }
+
     fn punch_hole_sync(device_path: &str, offset: u64, size: u64) {
         #[cfg(target_os = "linux")]
         {
@@ -1524,9 +1549,14 @@ pub fn block_mapping_form(mapping_str: &str) -> &'static str {
 /// decorated form counts `patch_ineligible_decorated` and holes (unmapped)
 /// count `patch_ineligible_unmapped`.
 pub fn is_whole_block_mapping(mapping_str: &str) -> bool {
-    // RED scaffolding (PR RW2): wired by the implementation commit.
-    let _ = mapping_str;
-    false
+    // The base key may itself contain `://` (non-default backends); the
+    // decoration is parsed strictly AFTER that prefix — the same rule as
+    // `parse_block_mapping` / `block_mapping_form`.
+    let rest = match mapping_str.find("://") {
+        Some(pos) => &mapping_str[pos + 3..],
+        None => mapping_str,
+    };
+    !rest.is_empty() && !rest.contains(':')
 }
 
 impl DataRouter {
@@ -5665,33 +5695,56 @@ impl DataRouter {
             }
             updated_meta.file_id = Some(new_file_id);
         } else if meta.file_type == "striped" {
-            // All-or-nothing pin of every source block. A refusal means the
-            // snapshot map is stale (a block was freed/displaced since the
-            // fetch): undo partial pins, re-read the authoritative map under
-            // the per-inode metadata lock, and retry. Never proceed with an
-            // unpinned block — the clone would alias a reallocatable offset
-            // that reads as foreign bytes after reuse.
+            // All-or-nothing pin of every source block, VALIDATED (§5.1
+            // clone/patch fence, design-random-small-writes). Two ways a
+            // pin round fails:
+            //
+            // * **Refused** — the snapshot map is stale (a block was
+            //   freed/displaced since the fetch). Never proceed with an
+            //   unpinned block: the clone would alias a reallocatable
+            //   offset that reads as foreign bytes after reuse.
+            // * **PinnedUnstable** — the reference WAS taken, but the
+            //   validate-after-pin (pin-CAS → fence(SeqCst) → incarnation
+            //   snapshot) observed the block's word unstable: a W1 patch
+            //   may be mid-DMA on it. A completed clone must never
+            //   reference a block that mutates afterward, so unpin and
+            //   retry against the refetched authoritative map (a retry
+            //   that lands post-`publish_block` legitimately snapshots the
+            //   patched content — old-or-new is clone-vs-write semantics;
+            //   mutate-AFTER-completion is the corruption the fence kills).
+            //
+            // Both arms share the bounded retry: `attempt >= 3` is the
+            // accepted bounded EBUSY-class loud refusal (review Issue 16) —
+            // a point-in-time clone of a hot-mutating file has no progress
+            // guarantee worth a new lock-order edge.
             let src_ino = parse_inode_from_path(src);
             let mut current = meta.clone();
             let mut attempt = 0usize;
             loop {
                 let map = current.block_map.clone().unwrap_or_default();
                 let mut pinned: Vec<&String> = Vec::with_capacity(map.len());
-                let mut refused = None;
+                let mut retry = None;
                 for bk in map.values() {
-                    if self.backend_router.increment_refcount(bk) {
-                        pinned.push(bk);
-                    } else {
-                        refused = Some(bk.clone());
-                        break;
+                    match self.backend_router.pin_block_validated(bk) {
+                        crate::block_allocator::PinOutcome::Pinned => pinned.push(bk),
+                        crate::block_allocator::PinOutcome::PinnedUnstable => {
+                            // The unvalidated pin is undone with the rest.
+                            pinned.push(bk);
+                            retry = Some((bk.clone(), "unstable under a racing in-place patch"));
+                            break;
+                        }
+                        crate::block_allocator::PinOutcome::Refused => {
+                            retry = Some((bk.clone(), "freed concurrently"));
+                            break;
+                        }
                     }
                 }
-                match refused {
+                match retry {
                     None => {
                         updated_meta = current;
                         break;
                     }
-                    Some(bad) => {
+                    Some((bad, why)) => {
                         // Undo the partial pins (free_block = one decrement).
                         for bk in pinned {
                             let _ = self.backend_router.free_block(bk).await;
@@ -5699,9 +5752,9 @@ impl DataRouter {
                         attempt += 1;
                         if attempt >= 3 {
                             return Err(SqueezefsError::InvalidOperation(format!(
-                                "clone source {src} block {bad} freed concurrently \
-                                 (map still stale after {attempt} attempts); aborting \
-                                 to avoid an unpinned clone"
+                                "clone source {src} block {bad} {why} \
+                                 (map still contended after {attempt} attempts); aborting \
+                                 to avoid an unpinned/unvalidated clone"
                             )));
                         }
                         let _meta_guard = INODE_META_LOCKS.get_inode_lock(src_ino).lock().await;

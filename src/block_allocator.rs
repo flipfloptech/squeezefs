@@ -3,6 +3,21 @@ use crate::error::Result;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Outcome of [`BlockAllocator::pin_block_validated`] (§5.1 clone
+/// validate-after-pin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinOutcome {
+    /// Reference taken and the incarnation observed stable — the pin holds.
+    Pinned,
+    /// Reference taken but the incarnation is UNSTABLE (a patch may be
+    /// mid-flight): the caller must unpin this block too, refetch the
+    /// authoritative map, and retry.
+    PinnedUnstable,
+    /// Reference NOT taken (freed/untracked offset) — the caller must
+    /// re-resolve, never proceed unpinned.
+    Refused,
+}
+
 pub struct BlockAllocator {
     _client: Arc<MetaClient>,
     _volume_id: Box<str>,
@@ -140,9 +155,70 @@ impl BlockAllocator {
     /// offset (never allocated by this process / already freed) — callers
     /// must treat it as NOT provably sole-owned.
     pub fn refcount(&self, offset: u64) -> Option<u32> {
-        // RED scaffolding (PR RW2): wired by the implementation commit.
-        let _ = offset;
-        None
+        self.refcounts
+            .read_sync(&offset, |_, v| crate::refcount_core::peek(v))
+    }
+
+    /// W1 patch fence, steps 1a+1b of the §5.1 mechanism (the normative
+    /// clone/patch fence — docs/design-random-small-writes.md): retire the
+    /// offset's incarnation word (racing validated read-tier fills of this
+    /// key now fail their seqlock re-check instead of publishing mid-patch
+    /// bytes), interpose the cross-word `SeqCst` fence (the store-buffering
+    /// closure against `clone_file`'s pin-CAS → fence → snapshot side),
+    /// then re-read the refcount. `true` ⇔ this writer is provably the
+    /// sole owner and the in-place DMA may proceed.
+    ///
+    /// On `false` — the count grew (a clone pinned the block) or the
+    /// offset is untracked — the caller MUST [`Self::publish_block`] to
+    /// re-stabilize (content never changed) and fall back to the CoW path.
+    ///
+    /// Unstable-for-existing-offsets audit: `mark_incarnation_unstable`
+    /// was built for *ownership transitions* (allocate / free) of an
+    /// offset; the patch reuses it for a *content transition* of a LIVE
+    /// mapped offset. That reuse is sound because the word's contract is
+    /// "content is changing under this key — fills must not publish", not
+    /// "the key is dead": `fill_incarnation` returns `None` while
+    /// unstable, `fill_incarnation_still` fails across the retire→publish
+    /// generation bump, and `publish_block` (after the DMA, or on the
+    /// back-off/error paths) restores stability under a NEW generation so
+    /// no fill that snapshotted the old generation can validate.
+    pub fn begin_patch_sole_owner(&self, offset: u64) -> bool {
+        self.mark_incarnation_unstable(offset);
+        crate::patch_clone_core::cross_word_fence();
+        self.refcount(offset) == Some(1)
+    }
+
+    /// §5.1 clone amendment (a): pin + **validate-after-pin**. Takes one
+    /// reference exactly like [`Self::increment_refcount`]; on success it
+    /// interposes the cross-word `SeqCst` fence and snapshots the offset's
+    /// incarnation word. An UNSTABLE word means a patch may be mid-flight
+    /// on the pinned block: the caller must unpin (free_block = one
+    /// decrement), refetch the authoritative map, and retry — the exact
+    /// shape of the existing refused-pin retry loop, extended from "pin
+    /// refused" to "pin unvalidated" (bounded by the same `attempt >= 3`
+    /// loud refusal).
+    ///
+    /// The fence sits before the word *lookup* (not inside a
+    /// found-the-word arm) so the absent-word case — an offset whose first
+    /// in-process patch races this pin after a remount — is ordered too;
+    /// absent words are otherwise stable-by-definition (written before
+    /// this process, `UNKNOWN_STABLE`).
+    pub fn pin_block_validated(&self, offset: u64) -> PinOutcome {
+        if !self.increment_refcount(offset) {
+            return PinOutcome::Refused;
+        }
+        crate::patch_clone_core::cross_word_fence();
+        let stable = self
+            .incarnations
+            .read_sync(&offset, |_, v| {
+                crate::incarnation_core::snapshot(v).is_some()
+            })
+            .unwrap_or(true);
+        if stable {
+            PinOutcome::Pinned
+        } else {
+            PinOutcome::PinnedUnstable
+        }
     }
 
     pub fn volume_id(&self) -> &str {

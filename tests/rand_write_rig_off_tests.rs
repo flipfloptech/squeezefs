@@ -67,6 +67,11 @@ struct H {
 }
 
 async fn make(test_id: &str) -> H {
+    // The rig-off byte-identity/always-on-ledger pins document the
+    // ACCUMULATION path (probes fire per striped write); the aligned
+    // shapes used here are W1 patch-eligible since RW2 — pin the patch
+    // OFF for this binary (extent_patch_tests owns patch-on coverage).
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
     let dlm = DlmClient::new("local").unwrap();
 

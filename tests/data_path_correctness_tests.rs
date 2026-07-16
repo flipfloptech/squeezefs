@@ -51,6 +51,10 @@ async fn make() -> H {
     // Block size 64 KiB so we cover all three layouts:
     // inline <=4 KiB, staged 4 KiB..64 KiB, striped >64 KiB.
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
+    // Default W1 patch posture per test (a prior test in this binary may
+    // have pinned the CoW machinery with the knob at 0 — reset so knob
+    // state never leaks across tests).
+    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     let dlm = DlmClient::new("local").unwrap();
 
     let b = NamedTempFile::new().unwrap();
@@ -1019,6 +1023,15 @@ async fn test_nvme_tier_hit_does_not_repromote_into_ram_lru() {
 #[tokio::test]
 async fn test_write_through_reused_key_purges_stale_read_tiers() {
     let h = make().await;
+    // This test pins the CoW displace/free/reuse machinery (fresh key +
+    // freed offset + write-through taking the freed offset). At the 64 KiB
+    // sandbox block size a whole-block aligned overwrite is W1
+    // patch-ELIGIBLE (in place, same key — no displace, no reuse), which
+    // starves the machinery under test; disable the patch route for this
+    // test only. On real 4 MiB-block volumes whole-block overwrites always
+    // ride this CoW path (the 512 KiB patch cap forbids block-covering
+    // patches), so the pinned machinery is the production path.
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let block = 65536usize;
     let ino = create(&h, "reuse_purge").await;
     let path = format!("inode_{ino}");

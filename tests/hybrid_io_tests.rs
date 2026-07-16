@@ -65,6 +65,9 @@ struct H {
 }
 
 async fn make_with(uuid: [u8; 16], alloc_ns: &str) -> H {
+    // Default W1 patch posture per test (a knob=0 CoW-machinery pin in a
+    // prior test of this binary must never leak forward).
+    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "524288");
     let dlm = DlmClient::new("local").unwrap();
 
@@ -605,6 +608,19 @@ async fn mount_option_is_daemon_level_and_stripped() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_direct_buffered_coherence_091_shape() {
     let h = make_with(*b"hybrid-io-c-v001", "hyb_ns_c").await;
+    // This test pins the hybrid warm/purge machinery across COW
+    // DISPLACEMENT (a warmed entry dies with its incarnation) — its warm
+    // fixture assumes each overwrite mints a FRESH key with a clean
+    // ghost/escalation-cooldown slate. Under the W1 sole-owner patch (RW2)
+    // this 512 KiB-block shape patches IN PLACE: the key never displaces,
+    // so the per-key `EscalationCooldown` from the test's own earlier
+    // phases suppresses the second-touch re-admission window (FIND-RW2-B —
+    // a bounded admission-heuristic effect, not a correctness one: reads
+    // stay device-correct via the ranged path; the G-RW3 mixed rand-R/W +
+    // hybrid warm rows measure the live impact). Pin the CoW machinery
+    // explicitly; extent_patch_tests owns patched-shape read coherence.
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+
     let ino = create(&h, "hyb_c").await;
 
     // Buffered write → O_DIRECT read sees it (pre-durable: overlay serve).

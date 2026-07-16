@@ -2681,7 +2681,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::bench::run_invocation(&mountpoint, &inv).await?;
         }
         Commands::Clone {
-            meta_uri: _,
+            meta_uri,
             src,
             dest,
         } => {
@@ -2689,6 +2689,33 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let fs_name = "squeezefs".to_string();
             squeezefs::set_fs_prefix(&fs_name);
             let staging_dirs = vec![get_default_staging_dir()];
+
+            // D0 single-writer guard preflight (RW2 audit,
+            // docs/design-random-small-writes.md §5.1): this offline verb
+            // builds a THROWAWAY allocator whose RAM refcounts a live
+            // daemon never sees — cloning under a live write mount could
+            // pin nothing and alias blocks the daemon concurrently frees.
+            // Opening each meta volume takes the same flock + writer_claim
+            // the daemon holds: a live writer makes this REFUSE loudly
+            // (never bypass), and on success the held guards exclude a
+            // racing mount for the clone's duration.
+            let mut _writer_guards = Vec::new();
+            if let Some(uri) = meta_uri.as_deref() {
+                for path in parse_block_uri(uri, "sqmeta://")? {
+                    let be = squeezefs::meta_backend::kv::backend::KvMetaBackend::open(
+                        std::path::Path::new(&path),
+                    )
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "clone refused: meta volume '{path}' is not exclusively \
+                             claimable (a live writer may hold it — the single-writer \
+                             guard forbids offline clones under a live write mount): {e}"
+                        )
+                    })?;
+                    _writer_guards.push(be);
+                }
+            }
 
             let dlm = DlmClient::new(redis_url)?;
 

@@ -22,6 +22,7 @@ pub(crate) mod incarnation_core;
 pub mod meta_backend;
 pub mod nvmeof;
 pub mod p2p;
+pub(crate) mod patch_clone_core;
 pub mod recovery;
 pub(crate) mod refcount_core;
 pub mod routing;

@@ -23,6 +23,15 @@ pub(crate) mod atomic {
 
 use atomic::{AtomicU32, Ordering};
 
+/// Read-only observation of the current count (the RW2 accessor — the W1
+/// patch's post-retire sole-owner re-check reads through this, after
+/// [`crate::patch_clone_core::cross_word_fence`]). `Acquire` so the
+/// observation synchronizes with the releasing side's CAS; the cross-word
+/// SB closure is the caller's fence, not this load.
+pub fn peek(cell: &AtomicU32) -> u32 {
+    cell.load(Ordering::Acquire)
+}
+
 /// Take one reference iff the count is still nonzero. `false` means the
 /// block is (or is becoming) freed — the caller must treat it as gone.
 pub fn try_acquire(cell: &AtomicU32) -> bool {

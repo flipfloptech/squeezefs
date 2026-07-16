@@ -50,6 +50,8 @@ struct H {
 }
 
 async fn make_with(staging: bool, uuid: [u8; 16]) -> H {
+    // Default W1 patch posture per test (knob=0 pins must never leak).
+    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "524288");
     // R3 (PR 6) fixture pin: this suite's contracts exercise the
     // WHOLE-BLOCK fill/admission/hot-tier machinery with sub-block reads;
@@ -495,6 +497,14 @@ async fn displaced_key_purges_hot_tier_and_reads_serve_new_bytes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_hot_entry_under_dead_key_is_never_served() {
     let h = make().await;
+    // Pin the CoW displace/free machinery this test exists for: at this
+    // sandbox block size a whole-block aligned overwrite is W1
+    // patch-ELIGIBLE (in place, same key — no displacement), which
+    // starves the machinery under test. On real 4 MiB-block volumes the
+    // 512 KiB patch cap forbids block-covering patches, so the pinned
+    // machinery is the production whole-block-overwrite path;
+    // extent_patch_tests owns the patched-shape twin contracts.
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let ino = create(&h, "hot_stale").await;
     write_at(&h, ino, 0, &vec![0x21u8; BS as usize]).await;
     write_at(&h, ino, BS, &vec![0x2Fu8; BS as usize]).await; // striped layout

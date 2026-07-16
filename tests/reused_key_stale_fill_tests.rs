@@ -53,6 +53,8 @@ struct H {
 }
 
 async fn make() -> H {
+    // Default W1 patch posture per test (knob=0 pins must never leak).
+    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     let dlm = DlmClient::new("local").unwrap();
 
@@ -197,6 +199,14 @@ fn drain_striped_io_permits() -> Vec<tokio::sync::OwnedSemaphorePermit> {
 async fn parked_read_never_serves_reused_or_freed_key() {
     let tag = "parked-read-aba".to_string();
     let h = make().await;
+    // Pin the CoW displace/free/reuse machinery this repro exists for: at
+    // this sandbox block size a whole-block aligned overwrite is W1
+    // patch-ELIGIBLE (in place, same key — no displacement, no freed-offset
+    // reuse), which starves the ABA shape under test. On real 4 MiB-block
+    // volumes the 512 KiB patch cap forbids block-covering patches, so the
+    // pinned machinery is the production whole-block-overwrite path;
+    // extent_patch_tests owns the patched-shape twin contracts.
+    squeezefs::fuse_client::set_patch_max_bytes(0);
     let ino = create(&h, "aba").await;
 
     // Striped 2-block file: b0 = 0xA0, b1 = 0xB0 (full-block write-through).

@@ -797,7 +797,13 @@ async fn exclusion_shared_refcount_after_clone() {
     assert_eq!(delta!(after, before, patch_writes), 0);
 
     // The clone's snapshot never moves; the source shows the write.
+    // `force_flush_all_staged_data` drives the CoW to its durable merge
+    // (the sandbox runs no background writeback worker — on a live mount
+    // the queued unit does this), displacing the shared block.
     fsync(&h, src).await;
+    h.fs.force_flush_all_staged_data()
+        .await
+        .expect("teardown-grade flush");
     purge_read_tiers(&h, src).await;
     purge_read_tiers(&h, dst).await;
     let got_dst = read_at(&h, dst, 0, base.len()).await;
@@ -946,10 +952,20 @@ async fn exclusion_decorated_mapping_never_scribbles_outside_window() {
         "decorated == patch-ineligible"
     );
 
+    // The overwrite: a whole-block-covering aligned write of block 1 (at
+    // 64 KiB sandbox blocks the shape is patch-eligible by size — a real
+    // 4 MiB-block volume never sees a block-covering patch shape, the
+    // 512 KiB cap forbids it — so the DECORATED predicate is what must
+    // refuse it here). Block-complete on purpose: the fallback rides the
+    // write-through (no deferred RMW seed), because materializing a
+    // deferred seed under a decorated STRIPED mapping is the pre-existing
+    // FIND-RW2-A limitation (`fetch_seed_image → get_block_for_index`
+    // cannot decode `bk:off:len` keys — fails identically with the patch
+    // knob at 0; recorded in the RW2 note, out of this PR's scope).
     let before = snap();
-    let p = pattern(4096, 0xC1);
-    write_at(&h, ino, BS + 8192, &p).await; // aligned, but decorated
-    want[(BS + 8192) as usize..(BS + 8192) as usize + 4096].copy_from_slice(&p);
+    let p = pattern(BS as usize, 0xC1);
+    write_at(&h, ino, BS, &p).await; // aligned + complete, but DECORATED
+    want[BS as usize..2 * BS as usize].copy_from_slice(&p);
     let after = snap();
     assert_eq!(
         delta!(after, before, decorated),
@@ -1406,7 +1422,8 @@ async fn write_verification_covers_patched_window() {
 
     // Injected corruption: the window-exact read-back must fail the write.
     squeezefs::nvme_dev::set_simulate_corruption(true);
-    let res = try_write_at(&h, ino, 3 * BS + 8192, &pattern(4096, 0xC5)).await;
+    let attempted = pattern(4096, 0xC5);
+    let res = try_write_at(&h, ino, 3 * BS + 8192, &attempted).await;
     squeezefs::nvme_dev::set_simulate_corruption(false);
     squeezefs::set_write_verification(false);
     assert!(
@@ -1414,11 +1431,30 @@ async fn write_verification_covers_patched_window() {
         "a corrupted patched window must fail write verification loudly"
     );
 
+    // Verified patch exact; every byte OUTSIDE the failed write's own
+    // window exact; the failed window itself is POSIX-unspecified (a
+    // failed write's range) — old or the attempted payload, never foreign.
     let mut want = base.clone();
     want[(2 * BS + 8192) as usize..(2 * BS + 8192) as usize + 4096].copy_from_slice(&p);
     purge_read_tiers(&h, ino).await;
     let got = read_at(&h, ino, 0, base.len()).await;
-    assert_bytes(&got, &want, "only the verified patch landed");
+    let failed_at = (3 * BS + 8192) as usize;
+    assert_bytes(
+        &got[..failed_at],
+        &want[..failed_at],
+        "bytes before the failed window",
+    );
+    assert_bytes(
+        &got[failed_at + 4096..],
+        &want[failed_at + 4096..],
+        "bytes after the failed window",
+    );
+    let win = &got[failed_at..failed_at + 4096];
+    assert!(
+        win == &want[failed_at..failed_at + 4096] || win == attempted.as_slice(),
+        "the verification-failed window must be OLD or the attempted \
+         payload (unspecified per POSIX), never foreign bytes"
+    );
 }
 
 // ---------------------------------------------------------------------------

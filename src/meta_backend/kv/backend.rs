@@ -349,10 +349,11 @@ pub struct KvMetaBackend {
     /// §4.7/§4.6 retire tag for SMO frees: always `checkpoint_seq + 1`
     /// (the NEXT ledger record); shared with the SMO hooks.
     pub(super) retire_seq: Arc<AtomicU64>,
-    /// Ledger records written but not yet known durable:
-    /// `(ledger_seq, tail)` — the §4.6 pt 3 pending-reclaim watermark;
-    /// drained after the next barrier.
-    pub(super) pending_reclaim: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// Ledger records written but not yet known durable, by their
+    /// `journal_tail_seq` — the §4.6 pt 3 pending-reclaim watermark and,
+    /// since the Option-A coverage fix, the pending-free gate's clock too
+    /// (design-smo-replay-currency §2-A); drained after the next barrier.
+    pub(super) pending_reclaim: std::sync::Mutex<Vec<u64>>,
     /// Checkpoint-task lifecycle: shutdown flag + wake + join handle +
     /// liveness probe (`Weak<()>` of the token the task owns).
     shutting_down: AtomicBool,
@@ -427,6 +428,16 @@ pub struct KvMetaBackend {
     /// Reset on barrier success; latches `failed` at
     /// [`JOURNAL_FAILURE_LATCH`].
     barrier_failures: AtomicU64,
+    /// §4.7 at-cap forced cycles that failed to shrink `pending_count`
+    /// (design-smo-replay-currency PR 4 clause b, the `checkpoint_past`
+    /// precedent): the two `run_maintenance` arms bump it per forced
+    /// cycle without progress and reset it on any decrease; at
+    /// [`PENDING_FREE_FORCE_CYCLES`] the volume fails loud — a genuinely
+    /// wedged tail must present there, never as an unbounded retry loop.
+    /// Persists across maintenance passes on purpose: one pass usually
+    /// contributes one forced cycle (the aborted SMO's queue entry is
+    /// consumed; the next threshold wake re-drives it).
+    pub(super) pending_free_stalled_cycles: AtomicU64,
     /// Guard-event trace of this backend's `open` (test/ops surface): the
     /// pinned order `flock_acquired` → `claim_committed` →
     /// `claim_barriered` → `checkpoint_task_spawned`.
@@ -627,7 +638,7 @@ impl KvMetaBackend {
                 total_extents,
                 compaction_reserve_extents(total_extents),
                 pending_cap,
-                ledger.seq,
+                ledger.journal_tail_seq,
                 &recovery.entries,
             )
             .await?,
@@ -879,6 +890,7 @@ impl KvMetaBackend {
             guard_fenced: AtomicU64::new(0),
             pr_reacquires: AtomicU64::new(0),
             barrier_failures: AtomicU64::new(0),
+            pending_free_stalled_cycles: AtomicU64::new(0),
             guard_trace: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -1268,6 +1280,20 @@ impl KvMetaBackend {
         self.barrier_failures.store(0, Ordering::Release);
     }
 
+    /// Protocol-terminal fail-stop latch (the §4.4 pt 4 `failed`
+    /// semantics for non-guard, non-barrier terminals — currently the
+    /// §4.7 wedged-tail bound, design-smo-replay-currency PR 4 clause b):
+    /// mutations return EIO until remount; loud exactly once.
+    pub(super) fn fail_stop_loud(&self, why: &str) {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            log::error!(
+                "meta volume {}: {why}; volume marked FAILED (mutations return EIO \
+                 until remount)",
+                self.path.display()
+            );
+        }
+    }
+
     /// Barrier failed: classify and escalate (see [`Self::sync_device`]).
     fn note_barrier_failure(&self, e: &crate::error::SqueezefsError) {
         if let crate::error::SqueezefsError::Io(ioe) = e {
@@ -1293,15 +1319,23 @@ impl KvMetaBackend {
     /// Post-barrier bookkeeping (§4.6 pt 3, §4.7): every ledger record
     /// written before the barrier that just completed is now durable —
     /// advance `reusable_upto` to its tail (waking admission parkers),
-    /// release its pending frees, and advance the cache's durable tail
-    /// (torn-tail classifier + tombstone-elision floor).
+    /// release the pending frees **that tail covers**, and advance the
+    /// cache's durable tail (torn-tail classifier + tombstone-elision
+    /// floor). The pending-free gate rides the TAIL, not the record's
+    /// checkpoint seq (design-smo-replay-currency §2-A): record
+    /// durability certified the wrong thing — a record whose flush pass
+    /// skipped the flip-carrying interior (or whose tail a root swap's
+    /// dying floor clamped) is durable while the freeing swap/flips still
+    /// ride the replay window, and releasing on its generation is the
+    /// recycled-extent stale-route mechanism (child-seq mount refusals).
+    /// All three §4.6-pt-3 watermarks now advance on one clock.
     pub(super) fn after_durable_barrier(&self) {
-        let drained: Vec<(u64, u64)> = {
+        let drained: Vec<u64> = {
             let mut g = self.pending_reclaim.lock().unwrap();
             std::mem::take(&mut *g)
         };
-        for (ledger_seq, tail) in drained {
-            self.alloc.advance_durable(ledger_seq);
+        for tail in drained {
+            self.alloc.advance_durable(tail);
             self.cache.set_durable_tail(tail);
             self.ring.advance_reusable_upto(tail);
         }

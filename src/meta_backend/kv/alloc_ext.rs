@@ -53,14 +53,24 @@
 //! Freed:     value = [2, retire_seq: u64 LE]
 //! ```
 //!
-//! A `Freed` record carries the §4.7 pending-free tag — the checkpoint seq
-//! that stops referencing the extent (`retire_seq = 0` = never referenced
-//! by any checkpoint: a build abandoned before publication, immediately
-//! reusable). Replay rebuilds the pending list from these (§4.7 "pending-
-//! free is journaled"): `retire_seq ≤` the mounted ledger seq ⇒ the gate
-//! already passed (that record is durable — mount read a successor) ⇒
-//! released; `retire_seq >` mounted ⇒ still gated, parked pending until a
-//! **post-mount** checkpoint is durable.
+//! A `Freed` record's value carries the historical §4.7 pending-free tag
+//! — the checkpoint seq the freeing SMO expected to stop referencing the
+//! extent (`retire_seq = 0` = never referenced by any checkpoint: a build
+//! abandoned before publication, immediately reusable). The value is kept
+//! **byte-for-byte** (zero format change; kvparse and old volumes parse
+//! identically), but since the Option-A coverage fix
+//! (`docs/design-smo-replay-currency.md` §2-A) it is no longer the release
+//! gate: generation-durability certified the freeing checkpoint RECORD,
+//! not coverage of the freeing swap/flips, and the two decouple (reserve-
+//! skipped interiors, dying-floor-clamped root swaps) — the recycled-
+//! extent stale-route mechanism behind the child-seq mount-refusal class.
+//! Replay rebuilds the pending list from these records (§4.7 "pending-
+//! free is journaled"), and **every replayed non-zero-tag free parks**:
+//! a replayed free is in-window by construction (its entry sits at-or-
+//! past the mounted tail — nothing durable covers it; after a kill the
+//! mounted record itself can be page-cache-only), so it stays gated on
+//! its own record seq until the first **post-mount** durable checkpoint's
+//! tail passes it.
 //!
 //! ## ENOSPC + the compaction reserve (§4.7)
 //!
@@ -331,10 +341,16 @@ impl ExtentAllocator {
     /// journal's allocator deltas over it (§4.7 "Mount": pages, then
     /// records ≥ tail).
     ///
-    /// `mounted_seq` is the selected ledger record's checkpoint seq — the
-    /// §4.7 durability floor: replayed `Freed` tags ≤ it are released
-    /// (their gate already passed); tags > it are parked pending until a
-    /// post-mount checkpoint is durable. `replay` is the recovered window
+    /// `mounted_tail` is the selected ledger record's `journal_tail_seq`
+    /// — the coverage-gate watermark seed (design-smo-replay-currency
+    /// §2-A). Every replayed non-zero-tag `Freed` record **parks** gated
+    /// on its own record seq: replayed frees are in-window by
+    /// construction (`rec.seq ≥ mounted_tail`), so nothing durable covers
+    /// their freeing swap/flips — after a kill the mounted record itself
+    /// may exist only in page cache — and they release only once the
+    /// first post-mount durable checkpoint's tail passes them. A zero
+    /// historical tag (never referenced by any checkpoint) releases
+    /// immediately, as always. `replay` is the recovered window
     /// (`JournalRecovery::entries`), seq-sorted; the caller's tail rule
     /// (K6b) keeps alloc/free records in the window until their effects
     /// are durable in bitmap pages.
@@ -347,7 +363,7 @@ impl ExtentAllocator {
         total_extents: u64,
         reserve: u64,
         pending_cap: usize,
-        mounted_seq: u64,
+        mounted_tail: u64,
         replay: &[ReplayedEntry],
     ) -> Result<Self, KvError> {
         let pages = bitmap_pages_for(total_extents);
@@ -400,47 +416,76 @@ impl ExtentAllocator {
             }
         }
 
-        // The mounted ledger record is durable by virtue of having been
-        // read: its seq is the pending-free gate's floor (§4.7).
-        core.advance_durable(mounted_seq);
+        // The coverage-gate watermark seeds at the mounted tail: nothing
+        // at-or-past it is durably covered, so no replayed free can drain
+        // before a POST-mount checkpoint's tail passes it (design-smo-
+        // replay-currency §2-A mount gate).
+        core.advance_durable(mounted_tail);
 
-        // Replay the allocator deltas in seq order over the still-private
-        // core (per-key LWW: application order IS newest-wins — the K1
-        // fold shape). Deltas dirty their pages so the next checkpoint
+        // Fold the window's allocator deltas per-key LWW FIRST (the K1
+        // fold shape: newest record per extent wins — the records are
+        // `Put`s keyed by extent index precisely so replay is
+        // idempotent), then apply only the survivors. Folding first is
+        // load-bearing for the §2-A mount gate: a free superseded by a
+        // later in-window re-alloc of the same extent (the reuse chain a
+        // live gate-pass produced pre-crash) must fold AWAY — parking it
+        // would leave a FIFO entry whose post-mount drain clears a LIVE
+        // extent's bit. Deltas dirty their pages so the next checkpoint
         // persists what only the journal held.
-        let mut replay_dirty: Vec<u64> = Vec::new();
+        let mut folded: std::collections::BTreeMap<u64, (u64, AllocDelta)> =
+            std::collections::BTreeMap::new();
         for entry in replay {
             for (tree_id, rec) in &entry.records {
                 if *tree_id != TREE_ALLOC_RESERVED {
                     continue;
                 }
-                match decode_alloc_record(rec)? {
-                    AllocDelta::Allocated { extent } => {
-                        core.mark_allocated(extent);
-                    }
-                    AllocDelta::Freed { extent, retire_seq } => {
-                        if retire_seq <= mounted_seq {
-                            // The retiring checkpoint is durable (mount
-                            // selected it or a successor): gate passed.
-                            core.release(extent);
-                        } else {
-                            // Still gated: parked until a post-mount
-                            // checkpoint is durable (§4.7 "pending-free
-                            // is journaled — replay rebuilds it"). A full
-                            // FIFO here is a broken K6b tail discipline
-                            // (the load contract above), failed loud.
-                            core.free_pending(extent, retire_seq).map_err(|_| {
-                                KvError::Corrupt(format!(
-                                    "replayed pending-free overflow at extent {extent} \
-                                     (tag {retire_seq}): journal window exceeds the \
-                                     pending-free cap"
-                                ))
-                            })?;
-                        }
-                    }
-                }
-                replay_dirty.push(decode_extent_key(&rec.key)?);
+                let delta = decode_alloc_record(rec)?;
+                let extent = decode_extent_key(&rec.key)?;
+                // Entries arrive seq-sorted; per-key newest-wins is a
+                // plain overwrite (record seqs are strictly monotonic).
+                folded.insert(extent, (rec.seq, delta));
             }
+        }
+        // Apply survivors; parked finals push in seq order (the FIFO's
+        // non-decreasing-gate contract), not extent order.
+        let mut replay_dirty: Vec<u64> = Vec::with_capacity(folded.len());
+        let mut parked: Vec<(u64, u64)> = Vec::new(); // (rec seq, extent)
+        for (extent, (seq, delta)) in &folded {
+            match delta {
+                AllocDelta::Allocated { .. } => core.mark_allocated(*extent),
+                AllocDelta::Freed { retire_seq: 0, .. } => {
+                    // Never referenced by any checkpoint (a build
+                    // abandoned before publication): immediately
+                    // reusable, as always.
+                    core.release(*extent);
+                }
+                AllocDelta::Freed { .. } => parked.push((*seq, *extent)),
+            }
+            replay_dirty.push(*extent);
+        }
+        parked.sort_unstable();
+        for (seq, extent) in parked {
+            // In-window by construction ⇒ the freeing swap/flips are not
+            // durably covered (the mounted record itself may be page-
+            // cache-only after a kill): park gated on the record's own
+            // seq until the first post-mount durable checkpoint's tail
+            // passes it. The historical generation tag in the value
+            // stays byte-for-byte on disk but no longer gates (§2-A: it
+            // certified record durability, not flip coverage). The bit
+            // may live only in this same window (its claiming alloc
+            // folded away under this key's LWW; the pages may predate
+            // both) — set it before parking, idempotently, so the FIFO's
+            // claimed-while-pending contract holds. A full FIFO here is a
+            // broken K6b tail discipline (the load contract above),
+            // failed loud.
+            core.mark_allocated(extent);
+            core.free_pending(extent, seq).map_err(|_| {
+                KvError::Corrupt(format!(
+                    "replayed pending-free overflow at extent {extent} (record seq \
+                     {seq}): journal window exceeds the pending-free cap"
+                ))
+            })?;
+            super::META_KV_PENDING_FREE_PARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         let dirty: Vec<AtomicU64> = (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
@@ -526,30 +571,54 @@ impl ExtentAllocator {
         }
     }
 
-    /// Enter `extent` into the pending-free list tagged `retire_seq` — the
-    /// checkpoint seq that stops referencing it (§4.7). Not claimable
-    /// until [`Self::advance_durable`] covers the tag. Errors with the
-    /// typed [`KvError::PendingFreeFull`] at the §4.7 cap — the caller
-    /// forces a checkpoint rather than reusing unsafely.
-    pub fn free_pending(&self, extent: u64, retire_seq: u64) -> Result<(), KvError> {
+    /// Enter `extent` into the pending-free list gated on `gate_seq` —
+    /// the freeing SMO entry's **free-record journal seq** (§4.7 +
+    /// design-smo-replay-currency §2-A: the free record is the entry's
+    /// highest seq, so a durable tail past it proves every flip of that
+    /// entry is materialized). Not claimable until
+    /// [`Self::advance_durable`] covers the tag. Errors with the typed
+    /// [`KvError::PendingFreeFull`] at the §4.7 cap — the caller forces a
+    /// checkpoint rather than reusing unsafely (the at-cap protocol's
+    /// admission side is [`Self::pending_has_room`]).
+    pub fn free_pending(&self, extent: u64, gate_seq: u64) -> Result<(), KvError> {
         self.core
-            .free_pending(extent, retire_seq)
+            .free_pending(extent, gate_seq)
             .map_err(|_| KvError::PendingFreeFull {
                 pending: self.core.pending_count(),
-            })
+            })?;
+        super::META_KV_PENDING_FREE_PARKED.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
-    /// The §4.7 gate: the root-ledger record with checkpoint seq `seq` is
-    /// now *known durable* (post-barrier) — release every pending extent
-    /// whose tag it covers back to the claimable pool. Returns how many
-    /// extents were released (their pages are marked dirty for the next
-    /// checkpoint).
-    pub fn advance_durable(&self, seq: u64) -> u64 {
-        let released = self.core.advance_durable(seq);
+    /// Producer-side FIFO headroom (§4.7 at-cap protocol, design-smo-
+    /// replay-currency PR 4 clause a): the serialized SMO task checks
+    /// this at admission — BEFORE the swap — so `PendingFreeFull` can
+    /// only ever surface pre-swap (clean abort, claims released) and the
+    /// post-swap push is guaranteed to fit (this task is the FIFO's only
+    /// producer; drains only vacate).
+    pub fn pending_has_room(&self) -> bool {
+        self.core.pending_has_room()
+    }
+
+    /// The §4.7 coverage gate: a root-ledger record whose
+    /// `journal_tail_seq` is `tail` is now *known durable* (post-barrier)
+    /// — release every pending extent whose gate seq that tail covers
+    /// back to the claimable pool. Tails are journal-entry boundaries and
+    /// gate seqs sit strictly inside their entries (the free record is
+    /// never record 0 of an SMO entry), so `tail ≥ gate` here is
+    /// equivalent to the design's strict `tail > free.seq`. Returns how
+    /// many extents were released (their pages are marked dirty for the
+    /// next checkpoint).
+    pub fn advance_durable(&self, tail: u64) -> u64 {
+        let released = self.core.advance_durable(tail);
         for extent in &released {
             self.mark_dirty(*extent);
         }
-        released.len() as u64
+        let n = released.len() as u64;
+        if n > 0 {
+            super::META_KV_PENDING_FREE_RELEASED.fetch_add(n, Ordering::Relaxed);
+        }
+        n
     }
 
     /// Release an extent **no checkpoint ever referenced** (a node build

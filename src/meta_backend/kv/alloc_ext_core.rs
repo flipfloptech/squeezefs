@@ -18,21 +18,34 @@
 //!   budget-then-bit is safe* below), so a won budget always finds a clear
 //!   bit.
 //! - **Pending-free seq gate** (§4.7's CoW reuse rule; §4.6 pt 3 is its
-//!   ring twin): a freed extent enters a bounded FIFO of
-//!   `(extent, retire_seq)` entries — `retire_seq` = the checkpoint seq
-//!   that stops referencing it — with its bitmap bit **still set** and its
+//!   ring twin — and since the Option-A coverage fix,
+//!   `docs/design-smo-replay-currency.md` §2-A, the SAME clock): a freed
+//!   extent enters a bounded FIFO of `(extent, gate_seq)` entries —
+//!   `gate_seq` = the freeing SMO's **free-record journal seq**, the
+//!   entry's highest seq — with its bitmap bit **still set** and its
 //!   budget byte **not** freed. It becomes claimable only when
-//!   [`ExtCore::advance_durable`] passes its `retire_seq`, i.e. only after
-//!   that root-ledger record is *known durable* (post-barrier). Hence any
-//!   ledger record mount can select — newest valid or its predecessor —
-//!   references only never-overwritten extents (risk R3). The FIFO is a
-//!   bounded Vyukov-stamped MPMC ring; the drain stops at the first entry
-//!   the watermark does not cover — complete because retire seqs are
-//!   **non-decreasing in push order** (checkpoint seqs are monotonic and
-//!   frees are pushed by the serialized per-volume checkpoint/SMO task,
-//!   §4.6; debug-asserted). A full FIFO refuses the free
-//!   ([`PendingFreeFull`]) — §4.7: "capped; pressure forces a checkpoint
-//!   rather than unsafe reuse".
+//!   [`ExtCore::advance_durable`] passes its `gate_seq` with the **durable
+//!   journal tail**, i.e. only once a post-barrier root-ledger record's
+//!   tail covers the freeing entry: per-SMO-entry floor pinning
+//!   (`tail > free.seq ⇒ tail ≥ res.end`) then proves every flip of that
+//!   entry is materialized in the durable structure — durability of a
+//!   ledger *record* alone certified the wrong thing (the record's tail
+//!   can sit below the flips it does not cover: the recycled-extent
+//!   stale-route mechanism, child-seq mount refusals). Hence any route
+//!   replay can reach — mounted image or window flip — references only
+//!   never-overwritten extents (risk R3, §4.7 restored to the letter).
+//!   The FIFO is a bounded Vyukov-stamped MPMC ring; the drain stops at
+//!   the first entry the watermark does not cover — complete because gate
+//!   seqs are **non-decreasing in push order** (journal positions are
+//!   monotonic and frees are pushed by the serialized per-volume
+//!   checkpoint/SMO task, §4.6; debug-asserted). A full FIFO refuses the
+//!   free ([`PendingFreeFull`]) — §4.7: "capped; pressure forces a
+//!   checkpoint rather than unsafe reuse" — and [`ExtCore::pending_has_room`]
+//!   is the producer-side headroom probe that makes the caller's
+//!   at-cap protocol (SMO admission refusal + forced checkpoint cycles)
+//!   sound: the serialized SMO task is the only producer, so headroom
+//!   observed at admission still holds at the post-swap push (consumers
+//!   only ever vacate slots).
 //! - **Reserve accounting** (§4.7 ENOSPC semantics): `reserve` extents
 //!   (production: `max(8, 2 %)` — the wrapper computes it) are claimable
 //!   only by [`AllocClass::Internal`] (compaction / checkpoint / SMO
@@ -106,7 +119,9 @@ struct PendingSlot {
     stamp: AtomicU64,
     /// Extent index (stable while `stamp == pos + 1`).
     extent: AtomicU64,
-    /// The checkpoint seq that stops referencing the extent (§4.7).
+    /// The coverage gate (§4.7 + design-smo-replay-currency §2-A): the
+    /// freeing entry's free-record journal seq — released only once the
+    /// durable tail passes it.
     retire_seq: AtomicU64,
 }
 
@@ -200,7 +215,17 @@ impl ExtCore {
         head.saturating_sub(tail)
     }
 
-    /// Newest checkpoint seq known durable.
+    /// Producer-side headroom probe (the §4.7 at-cap protocol's admission
+    /// check): whether one more [`Self::free_pending`] would fit. Sound
+    /// for the serialized SMO task — the FIFO's only producer — because a
+    /// racing [`Self::advance_durable`] only ever *vacates* slots, so
+    /// headroom observed here still holds at the later push.
+    pub fn pending_has_room(&self) -> bool {
+        self.pending_count() < self.pending.len() as u64
+    }
+
+    /// Newest durable-coverage watermark (the durable journal tail since
+    /// the Option-A coverage fix).
     pub fn durable_seq(&self) -> u64 {
         self.durable_seq.load(Ordering::Acquire)
     }
@@ -292,11 +317,14 @@ impl ExtCore {
         }
     }
 
-    /// Enter `extent` into the pending-free FIFO tagged with `retire_seq`
-    /// — the checkpoint seq that stops referencing it (§4.7). The bit
-    /// stays set and the budget untouched until [`Self::advance_durable`]
-    /// covers the tag. Errors with [`PendingFreeFull`] at capacity (the
-    /// §4.7 cap — the caller forces a checkpoint, never reuses unsafely).
+    /// Enter `extent` into the pending-free FIFO gated on `retire_seq` —
+    /// the freeing entry's free-record journal seq (§4.7 + design-smo-
+    /// replay-currency §2-A: release requires the durable tail to pass
+    /// it, which per-SMO-entry floor pinning makes equivalent to "the
+    /// whole freeing entry is checkpoint-covered"). The bit stays set and
+    /// the budget untouched until [`Self::advance_durable`] covers the
+    /// tag. Errors with [`PendingFreeFull`] at capacity (the §4.7 cap —
+    /// the caller forces a checkpoint, never reuses unsafely).
     ///
     /// Contract: `retire_seq`s are non-decreasing in push order —
     /// guaranteed by the serialized per-volume checkpoint/SMO task (§4.6)
@@ -338,9 +366,29 @@ impl ExtCore {
                     Err(cur) => pos = cur,
                 }
             } else if stamp < pos {
-                // The consumer has not vacated this slot from a lap ago:
-                // the FIFO is full (§4.7 cap).
-                return Err(PendingFreeFull);
+                // A lap-old stamp means either (a) the FIFO is genuinely
+                // full — every slot occupied, cursor distance == cap — or
+                // (b) a draining consumer won this slot's previous-lap
+                // entry (tail already bumped) but has not yet stored the
+                // vacate stamp. (b) must NOT surface as full: the §4.7
+                // at-cap protocol's admission headroom check
+                // ([`Self::pending_has_room`]) reads the cursors, so a
+                // cursor-level vacancy the producer then fails to push
+                // into would break the clause-a soundness argument (the
+                // post-swap push must succeed under observed headroom —
+                // the loom model pins exactly this interleaving).
+                // Distinguish via the cursor distance and spin out the
+                // consumer's store — it is instructions away.
+                let tail = self.pending_tail.load(Ordering::Acquire);
+                if pos.saturating_sub(tail) >= cap {
+                    // Genuinely full (§4.7 cap).
+                    return Err(PendingFreeFull);
+                }
+                #[cfg(loom)]
+                loom::thread::yield_now();
+                #[cfg(not(loom))]
+                core::hint::spin_loop();
+                pos = self.pending_head.load(Ordering::Acquire);
             } else {
                 // A racing producer advanced the head past our read.
                 pos = self.pending_head.load(Ordering::Acquire);
@@ -348,13 +396,18 @@ impl ExtCore {
         }
     }
 
-    /// Advance the durable-checkpoint watermark to `seq` (monotonic
+    /// Advance the durable-coverage watermark to `seq` (monotonic
     /// `fetch_max`; stale advances are no-ops) and drain every pending
     /// entry the watermark now covers: bit cleared, budget incremented —
-    /// the extent is claimable again, and only now (§4.7: "it becomes
-    /// allocatable only after that root record is *known durable*").
-    /// Callers pass only post-barrier checkpoint seqs. Returns the
-    /// released extents (the wrapper marks their bitmap pages dirty).
+    /// the extent is claimable again, and only now. `seq` is the
+    /// **durable journal tail** of a post-barrier root-ledger record
+    /// (design-smo-replay-currency §2-A): a tail past the free record's
+    /// seq proves the whole freeing entry — flips included — is
+    /// materialized in the durable structure, which is what §4.7's "any
+    /// state replay can select references only never-overwritten extents"
+    /// actually requires (record durability alone certified less).
+    /// Returns the released extents (the wrapper marks their bitmap pages
+    /// dirty).
     pub fn advance_durable(&self, seq: u64) -> Vec<u64> {
         self.durable_seq.fetch_max(seq, Ordering::AcqRel);
         let durable = self.durable_seq.load(Ordering::Acquire);

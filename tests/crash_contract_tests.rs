@@ -1251,8 +1251,9 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
     // torn checkpoint's page writes may all have landed; newest-valid is
     // still safe, §4.7) + journal replay rebuild the full allocator
     // state: predecessor extents allocated (nothing lost), round-4
-    // claims allocated (their records replay), round-3 frees pending
-    // again (tags 4 > mounted 3), and NOTHING double-allocatable.
+    // claims allocated (their records replay — the per-key LWW finals),
+    // round-3 frees pending again (in-window ⇒ parked, design-smo-
+    // replay-currency §2-A), and NOTHING double-allocatable.
     let (_ring2, recovery) =
         JournalRing::recover(f.path(), 0, RING_PAGES, 0, mounted.journal_tail_seq)
             .await
@@ -1264,7 +1265,7 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
         TOTAL_EXTENTS,
         0,
         8,
-        mounted.seq,
+        mounted.journal_tail_seq,
         &recovery.entries,
     )
     .await
@@ -1293,8 +1294,10 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
 
     // The reconstruct closes: the first post-mount checkpoint (seq 4
     // again, bitmap generation above everything on disk — including the
-    // crashed round's landed pages) becomes durable, and only then do the
-    // predecessor's retired extents re-enter the pool.
+    // crashed round's landed pages) becomes durable with a tail past the
+    // replayed window — coverage of the freeing records, not mere record
+    // durability (§2-A) — and only then do the predecessor's retired
+    // extents re-enter the pool.
     let generation = loaded
         .resume_generation()
         .max(mounted.alloc_bitmap_generation)
@@ -1316,7 +1319,14 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
     .await
     .unwrap();
     uring_fs::fdatasync(f.path().to_path_buf()).await.unwrap();
-    assert_eq!(loaded.advance_durable(4), 2);
+    // The post-mount record's tail: past every replayed entry (the
+    // window fully re-covered by the fresh checkpoint's flush).
+    let covering_tail = recovery
+        .entries
+        .last()
+        .map(|e| e.seq + JOURNAL_PAGE_LEN)
+        .expect("the churn window is non-empty");
+    assert_eq!(loaded.advance_durable(covering_tail), 2);
     let mut reopened = Vec::new();
     while let Ok(e) = loaded.claim_internal() {
         reopened.push(e);

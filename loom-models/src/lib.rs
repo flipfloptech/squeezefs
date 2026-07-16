@@ -32,12 +32,17 @@
 //!   reserve), admitted bytes are conserved across transfer/release, and
 //!   the checkpoint carve-out is never consumable by user admissions.
 //! - [`alloc_ext_core`]: the KV extent allocator's lock-free bitmap /
-//!   pending-free / reserve core (CoW KV metadata design §4.7, PR K4) —
-//!   invariants: an extent is never handed to two concurrent claimers, a
-//!   pending-freed extent is never claimable before its checkpoint-durable
-//!   seq (the root-fallback soundness rule, risk R3), and the compaction
-//!   reserve is never consumable by user claims while internal claims
-//!   drain it exactly.
+//!   pending-free / reserve core (CoW KV metadata design §4.7, PR K4;
+//!   coverage-gate clock domain per design-smo-replay-currency §2-A,
+//!   Option A) — invariants: an extent is never handed to two concurrent
+//!   claimers; a pending-freed extent is never claimable before the
+//!   durable journal TAIL passes its free-record seq (the §4.7 reuse rule
+//!   restored to the letter — record-generation durability certified the
+//!   wrong thing; risk R3); the compaction reserve is never consumable by
+//!   user claims while internal claims drain it exactly; and the
+//!   single-producer headroom probe (`pending_has_room`, the PR 4 at-cap
+//!   admission check) is sound against racing drains — headroom observed
+//!   at SMO admission can never be invalidated before the post-swap push.
 //! - [`node_state_core`]: the KV node lifecycle word (CoW KV metadata
 //!   design §4.6/§10, PR K5 —
 //!   clean/dirty/serializing/superseded) — invariants: a commit's
@@ -754,13 +759,18 @@ mod models {
     }
 
     /// Extent-allocator invariant #2 (design §4.7 CoW reuse rule — the R3
-    /// root-fallback soundness gate): a pending-freed extent is NEVER
-    /// claimable before its retiring checkpoint is durable. A claimer
-    /// racing the durable-advance either fails (gate still closed) or
-    /// succeeds — and success PROVES the watermark had covered the tag,
-    /// because the drain is the only path that returns the bit.
+    /// root-fallback soundness gate, coverage-clocked per
+    /// design-smo-replay-currency §2-A): a pending-freed extent is NEVER
+    /// claimable before the durable journal tail passes its free-record
+    /// seq (the gate tag; the freeing entry's highest seq — coverage of
+    /// the whole entry, flips included, not mere record durability). A
+    /// claimer racing the tail-advance either fails (gate still closed)
+    /// or succeeds — and success PROVES the watermark had covered the
+    /// tag, because the drain is the only path that returns the bit. The
+    /// model's numbers are journal positions: free record at seq 7, the
+    /// covering post-barrier tail at 8 (a boundary past it).
     #[test]
-    fn alloc_ext_pending_free_never_claimable_before_durable_seq() {
+    fn alloc_ext_pending_free_never_claimable_before_covering_tail() {
         loom::model(|| {
             // One extent, no reserve: the pending extent is the only
             // possible claim, so any successful claim is THE reuse.
@@ -768,14 +778,24 @@ mod models {
             let e = core
                 .claim(alloc_ext_core::AllocClass::User)
                 .expect("the single extent claims");
-            core.free_pending(e, 1).expect("FIFO has room");
+            core.free_pending(e, 7).expect("FIFO has room");
 
-            // Thread: the checkpoint task — ledger record seq 1 becomes
-            // durable (post-barrier), opening the gate.
+            // A tail BELOW the free record (the swap-covering ledger
+            // record whose dying-floor-clamped tail sits under the SMO
+            // entry — durable, yet not coverage) must release nothing:
+            // the exact generation-gate bug shape.
+            assert!(
+                core.advance_durable(6).is_empty(),
+                "a durable tail below the free record released the extent — \
+                 record durability is not flip coverage (§2-A)"
+            );
+
+            // Thread: the checkpoint task — a later record's tail (8)
+            // passes the free record, opening the gate.
             let t = {
                 let core = Arc::clone(&core);
                 thread::spawn(move || {
-                    core.advance_durable(1);
+                    core.advance_durable(8);
                 })
             };
 
@@ -784,9 +804,9 @@ mod models {
                 Ok(got) => {
                     assert_eq!(got, e, "the only claimable extent is the drained one");
                     assert!(
-                        core.durable_seq() >= 1,
-                        "extent reused before its retiring checkpoint (tag 1) was durable \
-                         — the §4.7 gate is broken (R3)"
+                        core.durable_seq() >= 7,
+                        "extent reused before a durable tail covered its free record \
+                         (gate 7) — the §4.7 coverage gate is broken (R3/§2-A)"
                     );
                     true
                 }
@@ -806,6 +826,52 @@ mod models {
                 "the drained extent must be claimed exactly once (raced {raced}, retry {retry})"
             );
             assert_eq!(core.free_extents(), 0, "budget settles: one live claim");
+        });
+    }
+
+    /// Extent-allocator invariant #4 (design-smo-replay-currency PR 4
+    /// clause a): the single-producer headroom probe is sound against a
+    /// racing drain. The serialized SMO task observes `pending_has_room`
+    /// at admission and pushes post-swap; a concurrent `advance_durable`
+    /// only ever VACATES slots, so an observed headroom can never be
+    /// invalidated — the post-swap `free_pending` must succeed in every
+    /// interleaving (the post-swap `PendingFreeFull` error is
+    /// defense-in-depth, structurally unreachable under admission
+    /// headroom). Also pins the probe's refusal face: with the FIFO
+    /// genuinely full and no drain, headroom reads false.
+    #[test]
+    fn alloc_ext_headroom_observed_at_admission_holds_at_push() {
+        loom::model(|| {
+            // Cap 2, three extents: two parked entries saturate the FIFO.
+            let core = Arc::new(alloc_ext_core::ExtCore::new(3, 0, 2));
+            let a = core.claim(alloc_ext_core::AllocClass::User).expect("a");
+            let b = core.claim(alloc_ext_core::AllocClass::User).expect("b");
+            let c = core.claim(alloc_ext_core::AllocClass::User).expect("c");
+            core.free_pending(a, 3).expect("slot 1");
+            core.free_pending(b, 5).expect("slot 2");
+            assert!(
+                !core.pending_has_room(),
+                "a saturated FIFO must refuse admission headroom"
+            );
+
+            // Thread: a durable tail covering the first entry drains it.
+            let t = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || {
+                    core.advance_durable(4);
+                })
+            };
+
+            // Main = the serialized SMO task: admission headroom check,
+            // then the post-swap push. Drains only vacate, so headroom
+            // observed true MUST hold at the push.
+            if core.pending_has_room() {
+                core.free_pending(c, 9).expect(
+                    "headroom observed at admission was invalidated before the \
+                     post-swap push — the clause-a soundness argument is broken",
+                );
+            }
+            t.join().unwrap();
         });
     }
 

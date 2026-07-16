@@ -1113,3 +1113,101 @@ async fn pending_free_wedged_tail_fails_volume_loud_never_livelocks() {
          acking) nor an unbounded forced-cycle retry loop"
     );
 }
+
+/// PR 1(c) fixture-replay (design-smo-replay-currency §6): the §2-A gate
+/// decision over a REAL captured post-kill storm window. The chartered
+/// fixture source was a REFUSED round; post-C′/PR-3 dev no longer
+/// produces one at observable rate (8/8 recapture rounds CLEAN,
+/// 2026-07-16 — C′ closed the walks that *detected* the reuse), so the
+/// committed fixture (`.agents/findvsa/extract_pending_free_fixture.py`
+/// over `recapture.sh` round 8, kvparse.py-derived; full dump in
+/// `.agents/findvsa/capture-2026-07-16-pendingfree-expectations.txt`)
+/// pins the mechanism's PRECONDITION from real bytes instead — every
+/// in-window `Freed` final across the four post-kill meta volumes, with
+/// the mounted record's seq + tail:
+///
+/// 1. **Every checkpoint-referenced free in the window is uncovered**
+///    (`rec_seq ≥ mounted_tail` — in-window by construction): §2-A's
+///    premise, verified against real storm bytes, so "park them all at
+///    mount" releases nothing a durable tail already covers.
+/// 2. **The generation gate really released at load**: a substantial
+///    subset carries `retire_tag ≤ mounted_seq` (71/231 in the captured
+///    round) — extents the OLD mount gate handed back to the claimable
+///    pool while their freeing swap/flips rode the replay window. Those
+///    are the reuse-vs-fallback §4.7 law violations the coverage gate
+///    parks.
+/// 3. **The coverage gate parks 100 % of them** (`coverage_gate_parked ==
+///    in_window_frees`): the fixed mount decision, recomputed from the
+///    same rows.
+#[test]
+fn recaptured_window_pins_generation_gate_release() {
+    let raw = std::fs::read_to_string(format!(
+        "{}/tests/fixtures/findvsa3_pending_free_window.jsonl",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("fixture present");
+    let mut lines = raw.lines();
+    let hdr: serde_json::Value =
+        serde_json::from_str(lines.next().expect("header line")).expect("header json");
+    assert_eq!(hdr["row"], "header");
+    let images = hdr["images"].as_u64().expect("images");
+    let in_window = hdr["in_window_frees"].as_u64().expect("in_window_frees");
+    let gen_released = hdr["generation_gate_released"]
+        .as_u64()
+        .expect("generation_gate_released");
+    assert_eq!(images, 4, "the capture spans all four meta volumes");
+    assert!(
+        in_window >= 100,
+        "a storm-peak kill leaves a substantial in-window retirement \
+         population (got {in_window})"
+    );
+    assert!(
+        gen_released >= 1,
+        "the captured round must exhibit the §2-A face: generation-covered \
+         frees inside the replay window (the OLD mount gate released these \
+         at load while nothing durable covered their freeing swaps)"
+    );
+
+    let mut rows = 0u64;
+    let mut recomputed_released = 0u64;
+    let mut recomputed_parked = 0u64;
+    for line in lines {
+        let v: serde_json::Value = serde_json::from_str(line).expect("row json");
+        assert_eq!(v["row"], "free");
+        rows += 1;
+        let rec_seq = v["rec_seq"].as_u64().expect("rec_seq");
+        let retire_tag = v["retire_tag"].as_u64().expect("retire_tag");
+        let mounted_seq = v["mounted_seq"].as_u64().expect("mounted_seq");
+        let mounted_tail = v["mounted_tail"].as_u64().expect("mounted_tail");
+        assert!(retire_tag > 0, "sentinel frees are excluded by extraction");
+        // Pin 1: in-window by construction — nothing durable covers it.
+        assert!(
+            rec_seq >= mounted_tail,
+            "extent {} carries a free BELOW the mounted tail — a replayed \
+             free outside the window contradicts the §2-A premise",
+            v["extent"]
+        );
+        // Pin 2: the OLD gate's decision, recomputed from the raw fields.
+        let old_gate_released = retire_tag <= mounted_seq;
+        assert_eq!(
+            old_gate_released,
+            v["generation_gate_released"].as_bool().expect("flag"),
+            "extractor/consumer disagree on the generation-gate decision"
+        );
+        recomputed_released += u64::from(old_gate_released);
+        // Pin 3: the coverage gate parks it (release needs tail > rec_seq).
+        if mounted_tail <= rec_seq {
+            recomputed_parked += 1;
+        }
+    }
+    assert_eq!(rows, in_window, "header totals match the rows");
+    assert_eq!(
+        recomputed_released, gen_released,
+        "the §2-A violation count reproduces from the committed bytes"
+    );
+    assert_eq!(
+        recomputed_parked, in_window,
+        "the coverage gate parks EVERY in-window free — the fixed mount \
+         decision over the same real-storm rows"
+    );
+}

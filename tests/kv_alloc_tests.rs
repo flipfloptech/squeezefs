@@ -645,9 +645,12 @@ async fn test_load_short_region_reads_fresh() {
 
 /// The §4.7 mount rule end-to-end over one file: newest-valid pages, then
 /// journal alloc/free records ≥ tail replayed over them — allocs
-/// re-marked, gate-passed frees released, still-gated frees rebuilt as
-/// pending (never claimable before their checkpoint-durable seq), LWW per
-/// key across alloc→free→realloc chains.
+/// re-marked, never-referenced (tag 0) frees released, and every
+/// checkpoint-referenced free **parked** (design-smo-replay-currency
+/// §2-A mount gate: a replayed free is in-window by construction, so
+/// nothing durable covers its freeing swap/flips — it releases only once
+/// a post-mount durable tail passes its record seq), LWW per key across
+/// alloc→free→realloc chains.
 #[tokio::test]
 async fn test_journal_replay_rebuilds_alloc_free_and_pending() {
     // One file: ring pages [0, 4·4096), bitmap region after.
@@ -675,14 +678,17 @@ async fn test_journal_replay_rebuilds_alloc_free_and_pending() {
     // Post-checkpoint mutations that live ONLY in the journal (the §4.7
     // "bitmap is a checkpoint accelerator, not the sole truth" window):
     // - e2 allocated;
-    // - e0 freed under checkpoint 1 (tag 1 ≤ mounted ⇒ released at load);
-    // - e1 freed under checkpoint 2 (tag 2 > mounted ⇒ pending at load);
-    // - e3 allocated then freed-unreferenced (tag 0) then re-allocated:
-    //   the per-key LWW chain.
+    // - e0 freed with historical tag 1 and e1 with tag 2: BOTH park at
+    //   load regardless of the tag-vs-mounted-generation comparison —
+    //   the value's tag certified record durability, never coverage of
+    //   the freeing swap/flips (design-smo-replay-currency §2-A);
+    // - e3 allocated then freed-unreferenced (tag 0 — never referenced
+    //   by any checkpoint, immediately reusable as always) then
+    //   re-allocated: the per-key LWW chain.
     let e2 = alloc.claim_internal().unwrap();
     journal_append(&ring, vec![alloc_record(e2, 0)]).await;
     journal_append(&ring, vec![free_record(e0, 1, 0)]).await;
-    journal_append(&ring, vec![free_record(e1, 2, 0)]).await;
+    let e1_free_seq = journal_append(&ring, vec![free_record(e1, 2, 0)]).await;
     let e3 = alloc.claim_internal().unwrap();
     journal_append(
         &ring,
@@ -705,32 +711,34 @@ async fn test_journal_replay_rebuilds_alloc_free_and_pending() {
         total,
         2,
         8,
-        1, // mounted ledger seq: checkpoint 1 is the durability floor
+        0, // the mounted record's journal tail (whole window replays)
         &recovery.entries,
     )
     .await
     .unwrap();
 
-    assert!(!loaded.is_allocated(e0), "tag ≤ mounted ⇒ released at load");
     assert!(
-        loaded.is_allocated(e1),
-        "tag > mounted ⇒ rebuilt as pending, bit set"
+        loaded.is_allocated(e0) && loaded.is_allocated(e1),
+        "every checkpoint-referenced replayed free parks (in-window by \
+         construction — §2-A mount gate), bits set"
     );
-    assert_eq!(loaded.pending_count(), 1, "exactly e1 parked");
+    assert_eq!(loaded.pending_count(), 2, "exactly e0 + e1 parked");
     assert!(loaded.is_allocated(e2), "journal-only alloc re-marked");
     assert!(
         loaded.is_allocated(e3),
-        "LWW: alloc→free→realloc ends allocated"
+        "LWW: alloc→free(tag 0)→realloc ends allocated"
     );
 
-    // e1 is not claimable at any pressure until checkpoint 2 is durable.
+    // Neither parked extent is claimable at any pressure until a
+    // post-mount durable tail passes its free record.
     let mut claimed = HashSet::new();
     loop {
         match loaded.claim_internal() {
             Ok(e) => {
-                assert_ne!(
-                    e, e1,
-                    "pending extent handed out before its durable seq (R3 gate)"
+                assert!(
+                    e != e0 && e != e1,
+                    "pending extent handed out before a covering durable tail \
+                     (R3 / §2-A gate)"
                 );
                 assert!(claimed.insert(e), "double-allocated extent {e}");
             }
@@ -740,14 +748,19 @@ async fn test_journal_replay_rebuilds_alloc_free_and_pending() {
     }
     assert_eq!(
         claimed.len() as u64,
-        total - 3,
-        "everything except {{e1 pending, e2, e3 allocated}} claims exactly once"
+        total - 4,
+        "everything except {{e0, e1 pending; e2, e3 allocated}} claims exactly once"
     );
 
-    // Post-mount checkpoint 2 becomes durable: e1 drains and is claimable.
-    assert_eq!(loaded.advance_durable(2), 1);
+    // A post-mount durable tail covering only e0's earlier free entry
+    // drains exactly e0 (the FIFO drain stops at e1's uncovered gate)…
+    assert_eq!(loaded.advance_durable(e1_free_seq - 1), 1);
+    assert!(!loaded.is_allocated(e0));
+    assert!(loaded.is_allocated(e1), "e1 still gated");
+    // …and a tail covering e1's record drains it too.
+    assert_eq!(loaded.advance_durable(e1_free_seq), 1);
     assert!(!loaded.is_allocated(e1));
-    assert_eq!(loaded.claim_internal().unwrap(), e1);
+    assert_eq!(loaded.claim_internal().unwrap(), e0.min(e1));
 }
 
 /// Replayed garbage in a `TREE_ALLOC_RESERVED` record is structural

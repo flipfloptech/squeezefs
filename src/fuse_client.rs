@@ -2457,6 +2457,20 @@ impl SqueezefsFilesystem {
                     "meta_kv_checkpoints".into(),
                     load(&meta_kv::META_KV_CHECKPOINTS),
                 );
+                // Option A — pending-free coverage (design-smo-replay-
+                // currency §2-A): FIFO entry/exit counters; parked −
+                // released ≈ the per-volume `meta_kv_pending_free` sum
+                // (the backlog gauge — ≈ 1.4 % of the 65,536 cap at the
+                // measured 939-SMO/s storm rate). `parked` outrunning
+                // `released` on a quiet mount = a wedged coverage tail.
+                metrics.insert(
+                    "meta_kv_pending_free_parked".into(),
+                    load(&meta_kv::META_KV_PENDING_FREE_PARKED),
+                );
+                metrics.insert(
+                    "meta_kv_pending_free_released".into(),
+                    load(&meta_kv::META_KV_PENDING_FREE_RELEASED),
+                );
                 metrics.insert(
                     "meta_kv_commit_smo_retries".into(),
                     load(&meta_kv::META_KV_COMMIT_SMO_RETRIES),

@@ -146,6 +146,23 @@ pub static META_KV_NODE_REWRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Surfaced as `meta_kv_checkpoints` in PR K7.
 pub static META_KV_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
 
+/// Option A — pending-free coverage (design-smo-replay-currency §2-A,
+/// PR 4): retirements that entered the coverage-gated pending FIFO —
+/// live SMO frees plus mount-replayed frees re-parked in-window. With
+/// [`META_KV_PENDING_FREE_RELEASED`] this pairs into the backlog gauge
+/// (`parked − released ≈` the per-volume `meta_kv_pending_free` sum);
+/// steady-state backlog under the measured 939-SMO/s storm is ≈ 1.4 % of
+/// the 65,536 cap. Surfaced as `meta_kv_pending_free_parked`.
+pub static META_KV_PENDING_FREE_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Option A (§2-A): parked retirements released back to the claimable
+/// pool — only ever by a durable tail passing their free-record seq
+/// (`advance_durable` post-barrier). A `parked` that outruns `released`
+/// on a quiet mount means the coverage tail wedged (the at-cap protocol's
+/// forced cycles + bounded-loud terminal exist for exactly that).
+/// Surfaced as `meta_kv_pending_free_released`.
+pub static META_KV_PENDING_FREE_RELEASED: AtomicU64 = AtomicU64::new(0);
+
 /// PR M6 (design-metadata-throughput §5.4 D4): kernel post-op ctime
 /// writeback echoes (`fuse_update_ctime` → `fuse_flush_times` →
 /// times-only `FUSE_SETATTR`) **absorbed with zero journal entries** —

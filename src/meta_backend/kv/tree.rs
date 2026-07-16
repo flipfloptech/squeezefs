@@ -158,9 +158,13 @@ pub struct RootPtr {
 pub struct SmoJournal {
     /// The volume's journal ring (admission from the checkpoint reserve).
     pub ring: Arc<JournalRing>,
-    /// §4.7 pending-free tag source: the checkpoint seq that will stop
-    /// referencing extents freed *now* — i.e. the NEXT ledger record's
-    /// seq. The checkpoint task keeps it at `last_written_seq + 1`.
+    /// The historical §4.7 retire tag stamped into free-record VALUES
+    /// (byte-for-byte format compat): the checkpoint seq expected to stop
+    /// referencing extents freed *now* — the NEXT ledger record's seq;
+    /// the checkpoint task keeps it at `last_written_seq + 1`. Since the
+    /// Option-A coverage fix (design-smo-replay-currency §2-A) it no
+    /// longer gates release — the pending-free gate is the free record's
+    /// own journal seq against the durable tail.
     pub retire_seq: Arc<AtomicU64>,
     /// The volume's group-commit barrier (successor durability).
     pub sync: Arc<crate::meta_backend::sync_coalescer::SyncCoalescer>,
@@ -1162,6 +1166,23 @@ impl KvTree {
             // pointer record to them can exist in the ring: a replayed
             // pointer must never route to a torn image (§4.10).
             j.barrier().await?;
+            // §4.7 at-cap admission headroom (design-smo-replay-currency
+            // PR 4 clause a): this SMO will push exactly one pending free
+            // at step 3, and the serialized SMO task is the FIFO's only
+            // producer — headroom observed here still holds post-swap
+            // (drains only vacate slots). Refusing NOW keeps
+            // `PendingFreeFull` a clean pre-swap abort (claims released,
+            // floor restored by the caller) the maintenance arms remedy
+            // with a forced checkpoint cycle — never the post-swap
+            // custody leak (the extent falling out of the live FIFO).
+            if !ctx.alloc.pending_has_room() {
+                for e in &claimed_extents {
+                    ctx.alloc.release_unpublished(*e);
+                }
+                return Err(KvError::PendingFreeFull {
+                    pending: ctx.alloc.pending_count(),
+                });
+            }
             let mut recs: Vec<(u8, Record)> = Vec::new();
             if !is_root_swap {
                 for s in &successors {
@@ -1185,7 +1206,7 @@ impl KvTree {
                 .ring
                 .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
             {
-                Some(adm) => Some((adm, recs, retire_tag)),
+                Some(adm) => Some((adm, recs)),
                 None => {
                     for e in &claimed_extents {
                         ctx.alloc.release_unpublished(*e);
@@ -1216,13 +1237,13 @@ impl KvTree {
             // window — any commit that lands on a successor after the
             // swap reserves after this and carries higher seqs, so
             // replay applies the pointer record first.
-            let smo_entry = smo_prep.map(|(adm, mut recs, retire_tag)| {
+            let smo_entry = smo_prep.map(|(adm, mut recs)| {
                 let j = ctx.journal.as_ref().expect("prep implies hooks");
                 let res = j.ring.reserve_registered(adm);
                 for (i, (_tag, r)) in recs.iter_mut().enumerate() {
                     r.seq = res.start + i as u64;
                 }
-                (res, recs, retire_tag)
+                (res, recs)
             });
 
             // The bounded second merge: partition the delta that
@@ -1302,7 +1323,7 @@ impl KvTree {
                     // — and the SMO records that rebuild the routing —
                     // stays inside the replay window until a ledger
                     // record naming the new root covers them.
-                    let swap_floor = smo_entry.as_ref().map(|(res, _, _)| res.start).unwrap_or(0);
+                    let swap_floor = smo_entry.as_ref().map(|(res, _)| res.start).unwrap_or(0);
                     self.cache.note_dying_floor(swap_floor);
                     let (addr, seq) = match &new_root {
                         Some(r) => (r.addr(), r.node_seq()),
@@ -1328,7 +1349,7 @@ impl KvTree {
                                     // records ARE the pointer records, in
                                     // successor order — RAM apply and replay
                                     // must carry identical seqs.
-                                    Some((_, recs, _)) => recs[i].1.seq,
+                                    Some((_, recs)) => recs[i].1.seq,
                                     None => self.next_seq(),
                                 },
                                 RecordKind::Put,
@@ -1359,11 +1380,18 @@ impl KvTree {
 
         // ---- Step 3: after release — the SMO's entry bytes (§4.6:
         // reserve-in-window / write-after-release), then the old extent
-        // to pending-free (§4.7: reusable only once the retiring seq is
-        // durable), then parent maintenance if its delta crossed the
-        // threshold.
-        let retire_tag = match smo_entry {
-            Some((res, recs, retire_tag)) => {
+        // to pending-free gated on the FREE RECORD'S OWN SEQ (§4.7 +
+        // design-smo-replay-currency §2-A: the free record is the entry's
+        // highest seq — pushed last — so a durable tail past it proves
+        // every flip of this entry is materialized; the historical
+        // generation tag stays in the record VALUE, byte-for-byte), then
+        // parent maintenance if its delta crossed the threshold.
+        let free_gate_seq = match smo_entry {
+            Some((res, recs)) => {
+                let gate = recs
+                    .last()
+                    .map(|(_, r)| r.seq)
+                    .expect("an SMO entry always carries its free record");
                 let j = ctx.journal.as_ref().expect("entry implies hooks");
                 if let Err(e) = j.ring.commit_entry(&res, &recs).await {
                     // The swap already happened and RAM is authoritative;
@@ -1377,12 +1405,19 @@ impl KvTree {
                         j.path
                     );
                 }
-                retire_tag
+                gate
             }
             None => self.next_seq(),
         };
+        // Defense-in-depth only: the admission headroom check before
+        // `try_admit` (clause a above) makes this cap refusal unreachable
+        // — the serialized SMO task is the FIFO's only producer, so
+        // headroom at admission holds here. It stays as a `?` because a
+        // FIFO refusal at this point would be a protocol bug (a second
+        // producer), and the §4.4-pt-4-style loud abort is the right
+        // failure mode for that.
         ctx.alloc
-            .free_pending(self.cache.addr_extent(node.addr()), retire_tag)?;
+            .free_pending(self.cache.addr_extent(node.addr()), free_gate_seq)?;
         if let Some(parent) = &parent {
             let pg = parent.lock().read().await;
             let re = pg.overlay_bytes() >= cfg.writeback_delta_bytes;

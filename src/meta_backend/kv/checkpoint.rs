@@ -60,6 +60,17 @@
 //! budget. No task ever blocks on ring space while holding a node lock;
 //! parked user commits hold nothing the drain needs (§4.4 pt 5).
 //!
+//! The §4.7 pending-free cap rides the same discipline (design-smo-
+//! replay-currency PR 4): an SMO refused at the FIFO-headroom admission
+//! check surfaces as [`KvError::PendingFreeFull`] — the flush pass
+//! skips-and-defers that node exactly like the reserve arm (clause c),
+//! and the two `run_maintenance` arms remedy it with progress-audited
+//! forced cycles (`force_pending_free_cycle`, clause b): each forced
+//! cycle completes its non-SMO flushes, writes the ledger, barriers, and
+//! drains the FIFO via `after_durable_barrier`; `PENDING_FREE_FORCE_CYCLES`
+//! stalls without a `pending_count` decrease fail the volume loud (the
+//! genuinely-wedged-tail terminal — never an unbounded retry loop).
+//!
 //! ---
 //!
 //! **PR K3's half** — slot encode/decode, round-robin slot placement,
@@ -343,6 +354,52 @@ fn max_dirty_nodes() -> u64 {
 /// no other trigger fires (§4.6 pt 2 "every ≤ 1 s").
 const CHECKPOINT_MAX_AGE_MS: u128 = 1000;
 
+/// §4.7 at-cap forced-cycle bound (design-smo-replay-currency PR 4
+/// clause b; the [`KvMetaBackend::checkpoint_past`] precedent's shape):
+/// consecutive forced cycles without `pending_count` decreasing before
+/// the volume fails loud. Genuine wedges present here — a tail pinned by
+/// a skip loop fills the production cap in ≈ 70 s of sustained storm,
+/// too fast to leave to "the cadence will get to it", and a healthy
+/// convergence needs at most a couple of cycles (the first discharges
+/// dying floors, the second's tail covers the parked frees).
+const PENDING_FREE_FORCE_CYCLES: u64 = 8;
+
+/// The §4.7 at-cap remedy shared by both `run_maintenance` arms
+/// (design-smo-replay-currency PR 4 clause b): "pressure forces a
+/// checkpoint rather than unsafe reuse", made mechanism. One forced
+/// cycle (`barrier_now` — the FIFO drains via `after_durable_barrier`
+/// inside it), progress-audited on the backend so the bound spans
+/// maintenance passes: any `pending_count` decrease resets the stall
+/// counter; [`PENDING_FREE_FORCE_CYCLES`] stalls without progress fail
+/// the volume loud (never an unbounded retry loop — and never the
+/// pre-fix silent post-swap leak).
+async fn force_pending_free_cycle(
+    be: &Arc<KvMetaBackend>,
+    smo: &mut SmoContext,
+) -> Result<(), KvError> {
+    let before = be.allocator().pending_count();
+    be.checkpoint_cycle(smo, true).await?;
+    if be.allocator().pending_count() < before {
+        be.pending_free_stalled_cycles.store(0, Ordering::Release);
+        return Ok(());
+    }
+    let stalled = be
+        .pending_free_stalled_cycles
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    if stalled >= PENDING_FREE_FORCE_CYCLES {
+        let msg = format!(
+            "pending-free FIFO saturated ({} parked) and {stalled} forced checkpoint \
+             cycles released nothing — the durable tail is wedged below every parked \
+             retirement (§4.7 at-cap bound, design-smo-replay-currency PR 4)",
+            be.allocator().pending_count()
+        );
+        be.fail_stop_loud(&msg);
+        return Err(KvError::Corrupt(msg));
+    }
+    Ok(())
+}
+
 /// Spawn the per-volume checkpoint/writeback task (called by
 /// `KvMetaBackend::open`). The task holds a `Weak` backend reference —
 /// dropping the backend without `shutdown` reaps it on its next tick (the
@@ -501,7 +558,10 @@ async fn checkpoint_task(
 /// The maintenance-only wake body: drain every tree's threshold queue
 /// (bset appends + any compact/split the appends force). Journal-reserve
 /// exhaustion runs one full checkpoint cycle — the §4.4 pt 5 zero-ring-
-/// byte drain — exactly like the cadence tick's maintenance step.
+/// byte drain — exactly like the cadence tick's maintenance step; a
+/// pending-free-FIFO refusal (the SMO admission headroom check,
+/// design-smo-replay-currency PR 4 clause a) forces the same cycle
+/// through the progress-audited at-cap remedy (clause b).
 async fn maintenance_pass(be: &Arc<KvMetaBackend>) -> Result<(), KvError> {
     let mut smo = be.smo.lock().await;
     for tree in be.trees() {
@@ -510,6 +570,9 @@ async fn maintenance_pass(be: &Arc<KvMetaBackend>) -> Result<(), KvError> {
                 Ok(_) => break,
                 Err(KvError::JournalReserveExhausted { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
+                }
+                Err(KvError::PendingFreeFull { .. }) => {
+                    force_pending_free_cycle(be, &mut smo).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -551,13 +614,20 @@ async fn tick(
     }
 
     // 1. Threshold maintenance (appends + SMOs, serialized here — §4.6).
-    //    Reserve exhaustion runs a drain cycle and retries.
+    //    Reserve exhaustion runs a drain cycle and retries; a pending-
+    //    free-FIFO refusal (SMO admission headroom, design-smo-replay-
+    //    currency PR 4 clause a) forces the progress-audited at-cap
+    //    cycle (clause b) and retries the same way.
     for tree in be.trees() {
         loop {
             match tree.run_maintenance(&mut smo).await {
                 Ok(_) => break,
                 Err(KvError::JournalReserveExhausted { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
+                    *last_checkpoint = std::time::Instant::now();
+                }
+                Err(KvError::PendingFreeFull { .. }) => {
+                    force_pending_free_cycle(be, &mut smo).await?;
                     *last_checkpoint = std::time::Instant::now();
                 }
                 Err(e) => return Err(e),
@@ -671,6 +741,21 @@ impl KvMetaBackend {
                          deferred to the next cycle"
                     );
                 }
+                Err(KvError::PendingFreeFull { pending }) => {
+                    // design-smo-replay-currency PR 4 clause c: identical
+                    // skip-and-defer to the reserve arm (the floor was
+                    // restored inside checkpoint_flush_node), so a FORCED
+                    // cycle under a cap-saturated storm still completes
+                    // its non-SMO flushes, writes the ledger, barriers,
+                    // and drains the FIFO via after_durable_barrier —
+                    // aborting the whole cycle here would livelock the
+                    // at-cap remedy against the very pressure it exists
+                    // to relieve (ring reclamation wedging behind it).
+                    log::debug!(
+                        "checkpoint: pending-free FIFO full ({pending} parked) at node \
+                         {addr:#x}; SMO deferred to the next cycle"
+                    );
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -756,9 +841,11 @@ impl KvMetaBackend {
         }
         self.checkpoint_seq.store(ckpt_seq, Ordering::Release);
         self.last_ledger_tail.store(tail, Ordering::Release);
-        // SMO frees from here on are retired by the NEXT record.
+        // The NEXT record's seq still stamps the historical retire tag in
+        // free-record VALUES (byte-for-byte format compat) — the release
+        // GATE itself rides the tail (design-smo-replay-currency §2-A).
         self.retire_seq.store(ckpt_seq + 1, Ordering::Release);
-        self.pending_reclaim.lock().unwrap().push((ckpt_seq, tail));
+        self.pending_reclaim.lock().unwrap().push(tail);
         super::META_KV_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
 
         if barrier_now {

@@ -143,6 +143,22 @@ acked-create-loss evidence (drain-then-detach ordering + the mmap-region
 teardown class). These two rows are NOT allow-listed: they must go green when
 the SIGBUS charter lands — that is the gate doing its job.
 
+> **AMENDMENT (2026-07-16, FIND-VS-A fix —
+> `.benchmarks/2026-07-16-find-vs-a-fix.md`)**: the SIGBUS class is CLOSED
+> (root cause: the `squeezefs umount` CLI truncated the live daemon's
+> staging segment files to 6.25 MiB via a second 100 MiB-budget
+> `NvmeCache` mapping — the daemon's teardown drain then faulted beyond
+> the new EOF; fixed by a never-shrink invariant in `NvmeShard::new` plus
+> an umount CLI that reads `.stats` instead of mapping segments; repro
+> green 10/10 on both masks, churn-unmount soak 10/10). **These two R3
+> rows are re-runnable** — the fix note carries the re-run evidence. The
+> "journal entries never reached the device" inference above was
+> adjudicated WRONG in the forensics: the loss was v3 KV **SMO routing
+> currency vs the checkpoint tail** (acked records durable in retired /
+> un-routed node images), reproducible with plain kill-9 at storm peak,
+> no SIGBUS needed. Hardening landed narrows it ~10×; full closure is
+> chartered in the fix note (extent-reuse pointer-currency contract).
+
 ## FIND-VS-B — standing dev cargo-gate failure surfaced by this branch's merge gate (NOT a scoreboard row)
 
 Running the required cargo gate for this (Rust-free) branch surfaced
